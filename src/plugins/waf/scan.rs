@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 
+use super::BodyDirection;
 use super::Waf;
 use super::decode;
 use super::normalize;
@@ -241,93 +242,90 @@ impl Waf {
         body: &[u8],
         content_type: Option<&str>,
     ) -> ScanOutcome {
+        self.scan_body_rules(subject, body, content_type, BodyDirection::Request)
+    }
+
+    /// One bounded view policy for both HTTP directions and WS messages.
+    /// Admission, size limits, and the scan budget remain owned by the caller.
+    fn scan_body_rules(
+        &self,
+        subject: ScanSubject<'_>,
+        body: &[u8],
+        content_type: Option<&str>,
+        direction: BodyDirection,
+    ) -> ScanOutcome {
+        let (bytes, text_rules_active) = match direction {
+            BodyDirection::Request => (
+                self.compiled.body_bytes.as_ref(),
+                self.compiled.request_body_text_rules_active,
+            ),
+            BodyDirection::Response => (
+                self.compiled.response_body_bytes.as_ref(),
+                self.compiled.response_body_rules_active,
+            ),
+        };
         let mut outcome = ScanOutcome::default();
-        self.scan_bytes_set(
-            &mut outcome,
-            self.compiled.body_bytes.as_ref(),
-            body,
-            subject,
-        );
-        // JSON-path rules decode variants per selected scalar so whole-body
-        // normalization cannot rewrite unrelated `+` characters (for example
-        // `application/ld+json`) and bypass per-rule `fp_filters`.
-        self.scan_json_path_rules(&mut outcome, body, subject);
-        // Charset transcoding is needed only when the active pack has request
-        // body-text rules. A pack with only JSON-path rules or body-scoped
-        // encoding specials retains the old raw/lossy path and does no new
-        // per-request work. Eligibility was already decided before this
-        // scanner runs; decoding must never widen the content-type, multipart,
-        // or binary body gates. UTF-32 is tried first: a UTF-32LE BOM is
-        // `FF FE 00 00` and would otherwise be stolen by the UTF-16LE BOM.
-        // Bare `charset=utf-16` / `utf-32` with no BOM does not invent an
-        // endianness; both endiannesses are decoded and each successful view
-        // is scanned, plus the raw/lossy view. Ordinary UTF-8 still allocates
-        // nothing here.
-        let transcoded_views = if self.compiled.request_body_text_rules_active {
+        self.scan_bytes_set(&mut outcome, bytes, body, subject);
+        if direction == BodyDirection::Request {
+            // JSON-path rules normalize selected scalars, never the whole
+            // document: normalization must not rewrite unrelated '+' values.
+            self.scan_json_path_rules(&mut outcome, body, subject);
+        }
+        // Encoding-only packs also consume text views. JSON-path-only packs
+        // retain their semantic parser without allocating unused wide views.
+        let transcoded_views = if text_rules_active
+            || self.specials.encoding.is_some()
+            || self.specials.overlong_utf8.is_some()
+        {
             normalize::decode_wide_charset_body_views(body, content_type)
         } else {
             normalize::WideCharsetViews::empty()
         };
-        // A charset the WAF cannot transcode (UTF-7, ISO-2022-*, HZ-GB-2312,
-        // EBCDIC) can encode `<script>` as pure ASCII cover text, so a raw
-        // scan proves nothing about what the backend will parse. Report it
-        // through the existing encoding special so per-rule modes and
-        // overrides still apply, and keep the raw scan running as well.
+        let text = String::from_utf8_lossy(body);
         if transcoded_views.uninspectable_charset()
             && let Some(rule_index) = self.specials.encoding
         {
-            let text = String::from_utf8_lossy(body);
             self.push_special(&mut outcome, rule_index, text.as_ref(), subject);
         }
-        if transcoded_views.is_empty() || transcoded_views.include_lossy() {
-            let text = String::from_utf8_lossy(body);
-            self.scan_request_body_text_view(&mut outcome, text.as_ref(), subject);
-        }
+        // A declared charset adds coverage; it must not remove matches from
+        // raw text or its transformations (including mixed representations).
+        self.scan_body_text_view(&mut outcome, text.as_ref(), subject, direction);
         for decoded in transcoded_views.iter() {
-            // The initial bytes scan saw the wire representation. A
-            // transcoded body also needs one scan of its UTF-8 view before
-            // layered decoding.
-            self.scan_bytes_set(
-                &mut outcome,
-                self.compiled.body_bytes.as_ref(),
-                decoded.as_bytes(),
-                subject,
-            );
-            self.scan_request_body_text_view(&mut outcome, decoded, subject);
+            self.scan_bytes_set(&mut outcome, bytes, decoded.as_bytes(), subject);
+            self.scan_body_text_view(&mut outcome, decoded, subject, direction);
         }
         outcome
     }
 
     /// Layered decode, encoding specials, Luhn, and CIDR on one body-text view.
-    fn scan_request_body_text_view(
+    fn scan_body_text_view(
         &self,
         outcome: &mut ScanOutcome,
         text: &str,
         subject: ScanSubject<'_>,
+        direction: BodyDirection,
     ) {
-        // Re-scan decoded forms so payloads hidden behind JSON `\uXXXX`,
-        // HTML entities, or percent-encoding cannot evade the raw-byte set.
-        // Lossy UTF-8 keeps one hostile byte from disabling text decoding for
-        // the rest of an otherwise inspectable body. The same pass reports
-        // whether an encoding stacked deeper than the decode cap remains.
+        let (bytes, luhn, cidr) = match direction {
+            BodyDirection::Request => (
+                self.compiled.body_bytes.as_ref(),
+                &self.compiled.body_luhn_rules,
+                &self.compiled.body_cidr_rules,
+            ),
+            BodyDirection::Response => (
+                self.compiled.response_body_bytes.as_ref(),
+                &self.compiled.response_luhn_rules,
+                &self.compiled.response_cidr_rules,
+            ),
+        };
         let (variants, residual_encoding) = normalize::decoded_variants_with_residual(text);
-        // Flag overlong-UTF8 / double-encoding / null-byte markers and the
-        // beyond-cap residual in the body, mirroring the URL-side FE-ENCODING
-        // check (markers `percent_decode_plus` cannot recover, and stacks the
-        // layered decode cannot fully peel, are otherwise silent).
         self.scan_body_encoding_specials(outcome, text, residual_encoding, subject);
         for variant in variants {
-            self.scan_bytes_set(
-                outcome,
-                self.compiled.body_bytes.as_ref(),
-                variant.as_bytes(),
-                subject,
-            );
-            self.scan_luhn_rules(outcome, &variant, &self.compiled.body_luhn_rules, subject);
-            self.scan_cidr_rules(outcome, &variant, &self.compiled.body_cidr_rules, subject);
+            self.scan_bytes_set(outcome, bytes, variant.as_bytes(), subject);
+            self.scan_luhn_rules(outcome, &variant, luhn, subject);
+            self.scan_cidr_rules(outcome, &variant, cidr, subject);
         }
-        self.scan_luhn_rules(outcome, text, &self.compiled.body_luhn_rules, subject);
-        self.scan_cidr_rules(outcome, text, &self.compiled.body_cidr_rules, subject);
+        self.scan_luhn_rules(outcome, text, luhn, subject);
+        self.scan_cidr_rules(outcome, text, cidr, subject);
     }
 
     pub(super) fn run_response_header_scan(
@@ -360,61 +358,23 @@ impl Waf {
         outcome
     }
 
-    pub(super) fn run_response_body_scan(&self, ctx: &RequestContext, body: &[u8]) -> ScanOutcome {
-        self.scan_response_body_rules(ScanSubject::Http(ctx), body)
+    pub(super) fn run_response_body_scan(
+        &self,
+        ctx: &RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> ScanOutcome {
+        self.scan_response_body_rules(ScanSubject::Http(ctx), body, content_type)
     }
 
-    /// Response-side body rule engine, shared by the HTTP final-response-body
-    /// hook and by backend→client WebSocket application messages.
+    /// Response-side engine for HTTP bodies and backend→client WS messages.
     pub(super) fn scan_response_body_rules(
         &self,
         subject: ScanSubject<'_>,
         body: &[u8],
+        content_type: Option<&str>,
     ) -> ScanOutcome {
-        let mut outcome = ScanOutcome::default();
-        self.scan_bytes_set(
-            &mut outcome,
-            self.compiled.response_body_bytes.as_ref(),
-            body,
-            subject,
-        );
-        let text = String::from_utf8_lossy(body);
-        let (variants, residual_encoding) =
-            normalize::decoded_variants_with_residual(text.as_ref());
-        self.scan_body_encoding_specials(&mut outcome, text.as_ref(), residual_encoding, subject);
-        for variant in variants {
-            self.scan_bytes_set(
-                &mut outcome,
-                self.compiled.response_body_bytes.as_ref(),
-                variant.as_bytes(),
-                subject,
-            );
-            self.scan_luhn_rules(
-                &mut outcome,
-                &variant,
-                &self.compiled.response_luhn_rules,
-                subject,
-            );
-            self.scan_cidr_rules(
-                &mut outcome,
-                &variant,
-                &self.compiled.response_cidr_rules,
-                subject,
-            );
-        }
-        self.scan_luhn_rules(
-            &mut outcome,
-            text.as_ref(),
-            &self.compiled.response_luhn_rules,
-            subject,
-        );
-        self.scan_cidr_rules(
-            &mut outcome,
-            text.as_ref(),
-            &self.compiled.response_cidr_rules,
-            subject,
-        );
-        outcome
+        self.scan_body_rules(subject, body, content_type, BodyDirection::Response)
     }
 
     fn scan_text_set(
@@ -433,6 +393,16 @@ impl Waf {
         }
     }
 
+    /// Match a byte rule set over one inspection view.
+    ///
+    /// False-positive filtering is defined over the COMPLETE inspected target,
+    /// so a body carrying a non-UTF-8 byte must be filtered exactly like a
+    /// valid-UTF-8 one: the byte path used to record hits without consulting
+    /// either per-rule `fp_filters` or global `fp_capture_filters`, so an
+    /// operator inspecting binary or legacy-encoded content got false blocks
+    /// their filter should have suppressed (issue #5118). The lossy view is
+    /// materialized once per matched view — never per hit, and never for a view
+    /// nothing matched — and borrows outright when the bytes are already UTF-8.
     fn scan_bytes_set(
         &self,
         outcome: &mut ScanOutcome,
@@ -443,13 +413,13 @@ impl Waf {
         let Some(set) = set else {
             return;
         };
-        for index in set.set.matches(value) {
-            let rule_ref = &set.refs[index];
-            if let Ok(text) = std::str::from_utf8(value) {
-                self.push_if_allowed(outcome, rule_ref, text, subject, None);
-            } else {
-                self.push_if_allowed_bytes(outcome, rule_ref, subject);
-            }
+        let matches = set.set.matches(value);
+        if !matches.matched_any() {
+            return;
+        }
+        let text = String::from_utf8_lossy(value);
+        for index in matches {
+            self.push_if_allowed(outcome, &set.refs[index], text.as_ref(), subject, None);
         }
     }
 
@@ -812,20 +782,6 @@ impl Waf {
             && !self.exemptions.suppresses_value(value)
             && !rule.suppresses_text(value)
         {
-            outcome.push(RuleHit {
-                rule_index: rule_ref.rule_index,
-                target_name: rule_ref.target_name,
-            });
-        }
-    }
-
-    fn push_if_allowed_bytes(
-        &self,
-        outcome: &mut ScanOutcome,
-        rule_ref: &RuleRef,
-        subject: ScanSubject<'_>,
-    ) {
-        if self.rule_applies(subject, rule_ref.rule_index) {
             outcome.push(RuleHit {
                 rule_index: rule_ref.rule_index,
                 target_name: rule_ref.target_name,

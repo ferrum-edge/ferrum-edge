@@ -19,11 +19,13 @@ pub(crate) use ocsp_validation_tests::signed_ocsp_response_fixture;
 mod pem_bundle_redaction_tests;
 #[cfg(feature = "pkcs11")]
 mod pkcs11_key_encoding_tests;
+mod pkcs11_module_policy_tests;
 #[cfg(feature = "pkcs11")]
 mod pkcs11_softhsm_tests;
 mod renewal_lease_tests;
 mod san_allow_list_verifier_tests;
 mod source_redaction_tests;
+mod store_dir_permissions_tests;
 mod store_lock_timeout_config_tests;
 mod system_trust_roots_source_tests;
 mod tls_store_bounds_tests;

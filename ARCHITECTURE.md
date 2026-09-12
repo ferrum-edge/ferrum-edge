@@ -627,7 +627,7 @@ cargo test --all-features
 # Start with example config
 FERRUM_MODE=file \
 FERRUM_FILE_CONFIG_PATH=tests/config.yaml \
-cargo run
+cargo run -- run
 ```
 
 ### **2. Understanding the Codebase**

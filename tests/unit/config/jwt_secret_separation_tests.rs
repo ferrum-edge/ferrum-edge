@@ -3,24 +3,7 @@
 
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 
-use crate::unit::env_lock::ENV_LOCK;
-
-fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-    let _guard = ENV_LOCK.lock().unwrap();
-    for (k, v) in vars {
-        // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe {
-            std::env::set_var(k, v);
-        }
-    }
-    f();
-    for (k, _) in vars {
-        // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe {
-            std::env::remove_var(k);
-        }
-    }
-}
+use crate::unit::env_lock::with_env_vars;
 
 const SHARED_SECRET: &str = "shared-hmac-secret-32-chars-min!!";
 const ADMIN_SECRET: &str = "admin-secret-padding-32-chars!!!";
@@ -105,9 +88,8 @@ fn dp_mode_rejects_identical_admin_and_cp_dp_jwt_secrets() {
 }
 
 #[test]
-fn dp_mode_accepts_cp_dp_secret_without_admin_secret() {
-    // Admin JWT is enforced at DP serve time, not by EnvConfig required_for.
-    // With only the CP/DP secret configured there is no equality to reject.
+fn dp_mode_rejects_cp_dp_secret_without_admin_secret() {
+    // Admission must enforce the same admin credential requirement as DP startup.
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
@@ -119,10 +101,8 @@ fn dp_mode_accepts_cp_dp_secret_without_admin_secret() {
             unsafe {
                 std::env::remove_var("FERRUM_ADMIN_JWT_SECRET");
             }
-            let config = EnvConfig::from_env().expect("DP with only CP/DP secret must load");
-            assert_eq!(config.mode, OperatingMode::DataPlane);
-            assert!(config.admin_jwt_secret.is_none());
-            assert_eq!(config.cp_dp_grpc_jwt_secret.as_deref(), Some(CP_DP_SECRET));
+            let error = EnvConfig::from_env().expect_err("DP requires an admin secret");
+            assert!(error.contains("FERRUM_ADMIN_JWT_SECRET"));
         },
     );
 }

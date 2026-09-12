@@ -4,6 +4,8 @@
 //! listener rejects conflicting `Host` and `:authority` values, and requests
 //! that carry neither, before routing. `:authority`-only remains admitted.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::bind_quinn_client_endpoint;
 
@@ -317,7 +319,7 @@ impl rustls::client::danger::ServerCertVerifier for DangerousAcceptAnyServer {
 #[ignore]
 #[tokio::test]
 async fn functional_h3_host_authority_mismatch_rejected_before_backend() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_accepts = Arc::new(AtomicUsize::new(0));
     let backend_task =
@@ -398,7 +400,7 @@ async fn functional_h3_host_authority_mismatch_rejected_before_backend() {
 #[ignore]
 #[tokio::test]
 async fn functional_h3_missing_authority_and_host_rejected_before_backend() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_accepts = Arc::new(AtomicUsize::new(0));
     let backend_task =
@@ -473,7 +475,7 @@ async fn functional_h3_missing_authority_and_host_rejected_before_backend() {
 #[ignore]
 #[tokio::test]
 async fn functional_h3_authority_only_still_reaches_backend() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_accepts = Arc::new(AtomicUsize::new(0));
     let backend_task =

@@ -51,7 +51,11 @@ const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
 const DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: usize = 4;
 const MAX_INJECTOR_ADMISSION_REVIEW_BODY_SIZE_MIB: usize = 64;
 const MIB_BYTES: usize = 1024 * 1024;
-const DEFAULT_SIDECAR_IMAGE: &str = "ferrum-edge:latest";
+/// Helm chart default repository (`charts/*/values.yaml` `image.repository`).
+const DEFAULT_SIDECAR_IMAGE_REPOSITORY: &str = "ferrumedge/ferrum-edge";
+/// Build-pinned sidecar image. The tag spelling matches the `v*` release tag
+/// published by `.github/workflows/release.yml` (`TAG_NAME`), never `latest`.
+const DEFAULT_SIDECAR_IMAGE: &str = concat!("ferrumedge/ferrum-edge:v", env!("CARGO_PKG_VERSION"));
 const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
 const ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
     "traffic.sidecar.istio.io/excludeOutboundPorts";
@@ -187,8 +191,7 @@ impl InjectorConfig {
             .unwrap_or_else(|| DEFAULT_INJECTOR_LISTEN_ADDR.to_string())
             .parse::<SocketAddr>()
             .map_err(|e| format!("Invalid FERRUM_INJECTOR_LISTEN_ADDR: {e}"))?;
-        let sidecar_image = resolve_ferrum_var("FERRUM_INJECTOR_SIDECAR_IMAGE")
-            .unwrap_or_else(|| DEFAULT_SIDECAR_IMAGE.to_string());
+        let sidecar_image = resolve_sidecar_image()?;
         let sidecar_env = sidecar_env_from_runtime();
         let jwt_secret_ref = jwt_secret_ref_from_runtime()?;
         let sidecar_resources = container_resources_from_runtime(
@@ -204,6 +207,7 @@ impl InjectorConfig {
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_MODE")
                 .unwrap_or_else(|| "explicit".to_string()),
         )?;
+        validate_capture_image(capture_mode, &sidecar_image)?;
         let proxy_uid = parse_injector_proxy_uid(resolve_ferrum_var("FERRUM_MESH_PROXY_UID"))?;
         let exclude_outbound_ports =
             parse_port_list(resolve_ferrum_var("FERRUM_MESH_EXCLUDE_OUTBOUND_PORTS").as_deref())?;
@@ -282,6 +286,92 @@ impl InjectorConfig {
             admission_review_max_body_bytes,
         })
     }
+}
+
+/// Resolve the sidecar/init image: an explicit pin, or the build-pinned default.
+///
+/// `latest` and untagged references (Docker's implicit `latest`) are refused
+/// fail-closed. A digest-only reference is a pin, not a moving tag, and is
+/// accepted here; iptables capture still requires a `-ebpf-tools` tag.
+fn resolve_sidecar_image() -> Result<String, String> {
+    match resolve_ferrum_var("FERRUM_INJECTOR_SIDECAR_IMAGE") {
+        Some(raw) => {
+            let image = raw.trim();
+            if image.is_empty() {
+                return Err(
+                    "FERRUM_INJECTOR_SIDECAR_IMAGE is empty; pin an immutable tag \
+                     (for example ferrumedge/ferrum-edge:vX.Y.Z) or a digest. \
+                     Untagged references pull 'latest' and are refused"
+                        .to_string(),
+                );
+            }
+            validate_pinned_sidecar_image(image)?;
+            Ok(image.to_string())
+        }
+        None => {
+            warn!(
+                sidecar_image = %DEFAULT_SIDECAR_IMAGE,
+                "FERRUM_INJECTOR_SIDECAR_IMAGE is unset; using the build-pinned default. \
+                 Production deployments should set FERRUM_INJECTOR_SIDECAR_IMAGE explicitly"
+            );
+            Ok(DEFAULT_SIDECAR_IMAGE.to_string())
+        }
+    }
+}
+
+/// Refuse a moving `latest` channel or an untagged name (implicit `latest`).
+///
+/// Digest-only references (`repository@sha256:...`) are treated as pinned.
+fn validate_pinned_sidecar_image(image: &str) -> Result<(), String> {
+    let reference = image.split('@').next().unwrap_or_default();
+    let digest = image.split_once('@').map(|(_, digest)| digest.trim());
+    let has_digest = digest.is_some_and(|digest| !digest.is_empty());
+    let tag = reference
+        .rsplit('/')
+        .next()
+        .and_then(|component| component.rsplit_once(':'))
+        .map(|(_, tag)| tag)
+        .filter(|tag| !tag.is_empty());
+    match tag {
+        Some(tag) if tag.eq_ignore_ascii_case("latest") => Err(format!(
+            "FERRUM_INJECTOR_SIDECAR_IMAGE tag 'latest' is forbidden; pin an immutable \
+             tag (for example {DEFAULT_SIDECAR_IMAGE_REPOSITORY}:vX.Y.Z) or a digest. \
+             Production deployments must not rely on a moving latest channel"
+        )),
+        Some(_) => Ok(()),
+        None if has_digest => Ok(()),
+        None => Err(
+            "FERRUM_INJECTOR_SIDECAR_IMAGE is missing a tag; untagged references pull \
+             'latest' and are refused. Pin an immutable tag (for example \
+             ferrumedge/ferrum-edge:vX.Y.Z) or a digest"
+                .to_string(),
+        ),
+    }
+}
+
+/// The published tools tag is the deployment contract for shell-driven capture.
+/// A tag may also pin a digest; never rewrite that digest or infer capabilities
+/// from the injector process's own (different) container filesystem.
+fn validate_capture_image(capture_mode: CaptureMode, image: &str) -> Result<(), String> {
+    if capture_mode != CaptureMode::Iptables {
+        return Ok(());
+    }
+    let reference = image.split('@').next().unwrap_or_default();
+    let tag = reference
+        .rsplit('/')
+        .next()
+        .and_then(|component| component.rsplit_once(':'))
+        .map(|(_, tag)| tag);
+    if !tag.is_some_and(|tag| tag.ends_with("-ebpf-tools")) {
+        return Err(
+            "FERRUM_MESH_CAPTURE_MODE=iptables requires FERRUM_INJECTOR_SIDECAR_IMAGE \
+             with a -ebpf-tools tag providing /bin/sh, ip, iptables and ip6tables; \
+             plain and -ebpf images are distroless. Use repository:tag-ebpf-tools \
+             or repository:tag-ebpf-tools@sha256:digest"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_injector_admission_review_max_body_bytes_from_mib(
@@ -1018,6 +1108,8 @@ fn build_sidecar_patch_for_namespace(
         InjectionDecision::SkipNotSelected => return Ok(Vec::new()),
     }
 
+    validate_capture_image(config.capture_mode, &config.sidecar_image)?;
+
     if injected_shape_matches(pod, config, admission_namespace)? {
         return Ok(Vec::new());
     }
@@ -1123,27 +1215,17 @@ fn injection_decision(pod: &Value, config: &InjectorConfig) -> InjectionDecision
         .and_then(Value::as_object);
     let labels = pod.pointer("/metadata/labels").and_then(Value::as_object);
 
-    if inject_annotation_blocks_injection(
-        annotations
-            .and_then(|m| m.get("sidecar.istio.io/inject"))
-            .and_then(Value::as_str),
+    if inject_metadata_value_blocks_injection(
+        annotations.and_then(|m| m.get("sidecar.istio.io/inject")),
     ) {
         log_unrecognized_inject_annotation(annotations, "sidecar.istio.io/inject");
         return InjectionDecision::SkipNotSelected;
     }
-    if inject_annotation_blocks_injection(
-        annotations
-            .and_then(|m| m.get("ferrum.io/inject"))
-            .and_then(Value::as_str),
-    ) {
+    if inject_metadata_value_blocks_injection(annotations.and_then(|m| m.get("ferrum.io/inject"))) {
         log_unrecognized_inject_annotation(annotations, "ferrum.io/inject");
         return InjectionDecision::SkipNotSelected;
     }
-    if mesh_label_blocks_injection(
-        labels
-            .and_then(|m| m.get("ferrum.io/mesh"))
-            .and_then(Value::as_str),
-    ) {
+    if mesh_metadata_value_blocks_injection(labels.and_then(|m| m.get("ferrum.io/mesh"))) {
         log_unrecognized_mesh_label(labels);
         return InjectionDecision::SkipNotSelected;
     }
@@ -1175,19 +1257,12 @@ fn injection_decision(pod: &Value, config: &InjectorConfig) -> InjectionDecision
         return InjectionDecision::Inject;
     }
 
-    let opted_in = inject_annotation_opts_in(
-        annotations
-            .and_then(|m| m.get("ferrum.io/inject"))
-            .and_then(Value::as_str),
-    ) || inject_annotation_opts_in(
-        annotations
-            .and_then(|m| m.get("sidecar.istio.io/inject"))
-            .and_then(Value::as_str),
-    ) || mesh_label_opts_in(
-        labels
-            .and_then(|m| m.get("ferrum.io/mesh"))
-            .and_then(Value::as_str),
-    );
+    let opted_in =
+        inject_metadata_value_opts_in(annotations.and_then(|m| m.get("ferrum.io/inject")))
+            || inject_metadata_value_opts_in(
+                annotations.and_then(|m| m.get("sidecar.istio.io/inject")),
+            )
+            || mesh_metadata_value_opts_in(labels.and_then(|m| m.get("ferrum.io/mesh")));
 
     if opted_in {
         InjectionDecision::Inject
@@ -1199,13 +1274,75 @@ fn injection_decision(pod: &Value, config: &InjectorConfig) -> InjectionDecision
 /// Whether the pod requests the node's network namespace.
 ///
 /// The apiserver serializes `spec.hostNetwork` as a JSON boolean, but this
-/// guard protects a node-wide outage, so the stringly-typed spelling is
-/// accepted too: a hand-rolled or proxied AdmissionReview that sends
-/// `"hostNetwork": "true"` must not slip past into the iptables path.
+/// guard protects a node-wide outage, so non-canonical spellings from a
+/// hand-rolled or proxied AdmissionReview must not slip past into the iptables
+/// path. Any value the injector cannot interpret is treated as host-network so
+/// injection is skipped (fail closed).
 fn pod_uses_host_network(pod: &Value) -> bool {
     match pod.pointer("/spec/hostNetwork") {
+        None | Some(Value::Null) => false,
         Some(Value::Bool(value)) => *value,
-        Some(Value::String(value)) => value.eq_ignore_ascii_case("true"),
+        Some(Value::String(value)) => host_network_from_string(value),
+        Some(Value::Number(number)) => host_network_from_number(number),
+        Some(_) => true,
+    }
+}
+
+fn host_network_from_string(value: &str) -> bool {
+    if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") || value == "1" {
+        return true;
+    }
+    // Only an explicit false/0 clears the guard; every other spelling fails
+    // closed as host-network.
+    !(value.eq_ignore_ascii_case("false") || value == "0")
+}
+
+fn host_network_from_number(number: &serde_json::Number) -> bool {
+    if let Some(value) = number.as_i64() {
+        value != 0
+    } else if let Some(value) = number.as_u64() {
+        value != 0
+    } else if let Some(value) = number.as_f64() {
+        value != 0.0
+    } else {
+        true
+    }
+}
+
+fn metadata_string_value(value: Option<&Value>) -> Option<Result<&str, ()>> {
+    match value {
+        None => None,
+        Some(Value::String(raw)) => Some(Ok(raw.as_str())),
+        Some(_) => Some(Err(())),
+    }
+}
+
+fn inject_metadata_value_blocks_injection(value: Option<&Value>) -> bool {
+    match metadata_string_value(value) {
+        None => false,
+        Some(Ok(raw)) => inject_annotation_blocks_injection(Some(raw)),
+        Some(Err(())) => true,
+    }
+}
+
+fn mesh_metadata_value_blocks_injection(value: Option<&Value>) -> bool {
+    match metadata_string_value(value) {
+        None => false,
+        Some(Ok(raw)) => mesh_label_blocks_injection(Some(raw)),
+        Some(Err(())) => true,
+    }
+}
+
+fn inject_metadata_value_opts_in(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(raw)) => inject_annotation_opts_in(Some(raw.as_str())),
+        _ => false,
+    }
+}
+
+fn mesh_metadata_value_opts_in(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(raw)) => mesh_label_opts_in(Some(raw.as_str())),
         _ => false,
     }
 }
@@ -1260,29 +1397,47 @@ fn log_unrecognized_inject_annotation(
     annotations: Option<&serde_json::Map<String, Value>>,
     key: &str,
 ) {
-    let raw = annotations.and_then(|m| m.get(key)).and_then(Value::as_str);
-    if !inject_annotation_is_unrecognized(raw) {
+    let Some(value) = annotations.and_then(|m| m.get(key)) else {
         return;
+    };
+    match value {
+        Value::String(raw) if inject_annotation_is_unrecognized(Some(raw.as_str())) => {
+            warn!(
+                annotation = key,
+                value = raw.as_str(),
+                "Unrecognized inject annotation bool; refusing injection (fail closed)"
+            );
+        }
+        value if !matches!(value, Value::String(_)) => {
+            warn!(
+                annotation = key,
+                "Non-string inject annotation; refusing injection (fail closed)"
+            );
+        }
+        _ => {}
     }
-    warn!(
-        annotation = key,
-        value = raw,
-        "Unrecognized inject annotation bool; refusing injection (fail closed)"
-    );
 }
 
 fn log_unrecognized_mesh_label(labels: Option<&serde_json::Map<String, Value>>) {
-    let raw = labels
-        .and_then(|m| m.get("ferrum.io/mesh"))
-        .and_then(Value::as_str);
-    if !mesh_label_is_unrecognized(raw) {
+    let Some(value) = labels.and_then(|m| m.get("ferrum.io/mesh")) else {
         return;
+    };
+    match value {
+        Value::String(raw) if mesh_label_is_unrecognized(Some(raw.as_str())) => {
+            warn!(
+                label = "ferrum.io/mesh",
+                value = raw.as_str(),
+                "Unrecognized mesh label; refusing injection (fail closed)"
+            );
+        }
+        value if !matches!(value, Value::String(_)) => {
+            warn!(
+                label = "ferrum.io/mesh",
+                "Non-string mesh label; refusing injection (fail closed)"
+            );
+        }
+        _ => {}
     }
-    warn!(
-        label = "ferrum.io/mesh",
-        value = raw,
-        "Unrecognized mesh label; refusing injection (fail closed)"
-    );
 }
 
 fn ensure_metadata_annotations(pod: &Value, patch: &mut Vec<JsonPatchOperation>) {
@@ -2215,7 +2370,7 @@ mod tests {
         InjectorConfig {
             listen_addr: "127.0.0.1:9443".parse().expect("test addr"),
             namespace: "default".to_string(),
-            sidecar_image: "ferrum-edge:test".to_string(),
+            sidecar_image: "ferrum-edge:test-ebpf-tools".to_string(),
             sidecar_env: vec![(
                 "FERRUM_DP_CP_GRPC_URLS".to_string(),
                 "http://cp:50051".to_string(),
@@ -2927,6 +3082,82 @@ mod tests {
         assert!(
             patch.is_empty(),
             "a non-apiserver AdmissionReview spelling hostNetwork as a string must not slip past"
+        );
+    }
+
+    #[test]
+    fn host_network_skip_covers_non_boolean_encodings() {
+        let config = test_config(true, CaptureMode::Iptables);
+        for host_network in [
+            json!(1),
+            json!(1.0),
+            json!("1"),
+            json!("yes"),
+            json!(["true"]),
+            json!({"enabled": true}),
+            json!("True"),
+            json!("TRUE"),
+            json!(true),
+        ] {
+            let pod = host_network_pod(host_network.clone());
+            let patch = build_sidecar_patch_for_namespace(&pod, &config, Some("payments"))
+                .expect("host-network pod is admitted, not rejected");
+            assert!(
+                patch.is_empty(),
+                "hostNetwork={host_network:?} must skip injection"
+            );
+        }
+    }
+
+    #[test]
+    fn host_network_false_or_absent_encodings_are_still_injected() {
+        let config = test_config(true, CaptureMode::Iptables);
+        for host_network in [Value::Bool(false), Value::Null, json!("false"), json!(0)] {
+            let mut pod = host_network_pod(Value::Bool(true));
+            pod["spec"]["hostNetwork"] = host_network.clone();
+            let patch =
+                build_sidecar_patch_for_namespace(&pod, &config, Some("payments")).expect("patch");
+            assert!(
+                patch_has_named_container(&patch, "ferrum-edge"),
+                "expected sidecar container for hostNetwork={host_network:?}"
+            );
+            assert!(
+                patch_has_named_container(&patch, "ferrum-edge-init"),
+                "expected iptables init container for hostNetwork={host_network:?}"
+            );
+        }
+
+        let mut absent = host_network_pod(Value::Bool(true));
+        absent["spec"]
+            .as_object_mut()
+            .expect("spec object")
+            .remove("hostNetwork");
+        let patch =
+            build_sidecar_patch_for_namespace(&absent, &config, Some("payments")).expect("patch");
+        assert!(
+            patch_has_named_container(&patch, "ferrum-edge"),
+            "absent hostNetwork must still inject"
+        );
+    }
+
+    #[test]
+    fn non_string_inject_annotation_fails_closed() {
+        let pod = json!({
+            "metadata": {"annotations": {"ferrum.io/inject": 1}},
+            "spec": {
+                "serviceAccountName": "api",
+                "containers": [{"name": "app", "image": "app:test"}]
+            }
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(false, CaptureMode::Explicit),
+            None,
+        )
+        .expect("patch");
+        assert!(
+            patch.is_empty(),
+            "non-string inject annotation must fail closed rather than inject"
         );
     }
 
@@ -3905,6 +4136,7 @@ mod tests {
                 ("FERRUM_INJECTOR_TLS_CERT_PATH", None),
                 ("FERRUM_INJECTOR_TLS_KEY_PATH", None),
                 ("FERRUM_INJECTOR_ALLOW_PLAINTEXT", Some("true")),
+                ("FERRUM_INJECTOR_SIDECAR_IMAGE", None),
             ],
             || {
                 let env = EnvConfig::default();
@@ -3913,6 +4145,8 @@ mod tests {
                 assert_eq!(config.capture_mode, CaptureMode::Explicit);
                 assert_eq!(config.ip6tables_mode, Ip6TablesMode::Auto);
                 assert_eq!(config.trust_domain, DEFAULT_INJECTOR_TRUST_DOMAIN);
+                assert_eq!(config.sidecar_image, DEFAULT_SIDECAR_IMAGE);
+                assert!(!config.sidecar_image.contains("latest"));
                 assert!(config.tls_cert_path.is_none());
                 assert!(config.allow_plaintext);
             },

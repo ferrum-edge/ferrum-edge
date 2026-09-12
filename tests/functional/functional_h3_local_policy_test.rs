@@ -2,6 +2,8 @@
 //!
 //! Run: `cargo build --bin ferrum-edge && cargo test --test functional_tests functional_h3_local_policy -- --ignored --nocapture`
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::clients::{Http3Client, Http3Response};
 use crate::scaffolding::{reserve_colocated_tcp_udp, reserve_port};
 
@@ -514,7 +516,7 @@ impl ReleaseGate {
 }
 
 async fn spawn_holding_backend() -> (u16, Arc<AtomicUsize>, Arc<ReleaseGate>, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind holding backend");
     let port = listener.local_addr().expect("backend addr").port();

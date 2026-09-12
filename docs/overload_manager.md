@@ -132,7 +132,8 @@ Authenticated example (full snapshot):
     "file_descriptors": {
       "current": 1247,
       "max": 65536,
-      "ratio": 0.019
+      "ratio": 0.019,
+      "enforced": true
     },
     "connections": {
       "current": 1247,
@@ -182,6 +183,9 @@ so treat it as operational telemetry rather than an admission-control source.
 Mitigation knobs:
 - `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` bounds how long a peer can hold DTLS demux state before completing the handshake.
 - `FERRUM_UDP_MAX_SESSIONS` caps total UDP/DTLS sessions per proxy, including DTLS peers still in handshake.
+- `FERRUM_UDP_MAX_SESSIONS_PER_IP` caps how much of that table any one effective source IP may hold. The bound is taken on the ClientHello admission path, before any per-peer allocation, so a single spoofed-source or many-source-port client cannot fill the pre-handshake table and deny DTLS service to everyone else. It is the same gateway-wide counter the plain-UDP and TCP listeners use, and the demuxer releases its slot at accept handoff, so an established DTLS session is charged once rather than twice.
+
+Refused ClientHellos and abandoned handshakes are both reported through rate-limited, fixed-cardinality warnings that carry the count they withheld, so a spray shows up as a bounded number of records rather than one line per peer.
 
 ## Stream-Listener Bind Failures
 
@@ -244,8 +248,49 @@ resource that starts serving on a later reconcile clears its entry.
 
 | Platform | FD Monitoring | FD Limit |
 |----------|--------------|----------|
-| Linux | Kernel open-FD aggregate from `stat(/proc/self/fd).st_size` (Linux 6.2+); directory walk of `/proc/self/fd` on older kernels | `getrlimit(RLIMIT_NOFILE)` |
-| macOS | `proc_pidinfo(PROC_PIDLISTFDS)` | `getrlimit(RLIMIT_NOFILE)` |
+| Linux | Kernel open-FD aggregate from `stat(/proc/self/fd).st_size` (Linux 6.2+); directory walk of `/proc/self/fd` on older kernels | `getrlimit(RLIMIT_NOFILE)`, falling back to `/proc/sys/fs/nr_open` when the hard cap is unlimited |
+| macOS | `proc_pidinfo(PROC_PIDLISTFDS)` | `getrlimit(RLIMIT_NOFILE)`; an unlimited hard cap disables the FD tier |
 | Windows | Not available (ratios are 0.0) | Not available |
 
 Event loop latency and connection monitoring work on all platforms.
+
+### When FD pressure is not enforceable
+
+`pressure.file_descriptors.enforced` reports whether the FD tier is actually
+shedding. It is `false` — with `max` reported as `0` and `ratio` as `0.0` —
+whenever no enforceable per-process ceiling can be determined:
+
+- the platform has no `RLIMIT_NOFILE` (Windows), or `getrlimit` failed;
+- the hard cap is `RLIM_INFINITY` and the platform publishes no ceiling of its
+  own. On Linux the gateway reads `/proc/sys/fs/nr_open` — the bound
+  `setrlimit(RLIMIT_NOFILE)` is itself checked against — and measures pressure
+  against that, so the tier keeps working; macOS publishes no equivalent, so
+  the tier is disabled there.
+
+`raise_fd_limit()` raises the soft cap to the hard cap at startup, so an
+unlimited hard cap previously produced `max: 9223372036854775807` and a ratio
+that could never reach the 0.80 pressure or 0.95 critical threshold — a tier
+that looked healthy while doing nothing. It is now explicitly disabled instead,
+with a one-shot startup `warn!` naming the reason. Connection-based and
+request-based shedding are unaffected either way; set a finite `LimitNOFILE=`
+(systemd), `--ulimit nofile=` (Docker), or `/etc/security/limits.conf` value to
+re-enable the FD tier.
+
+### Monitor liveness under a saturated blocking pool
+
+The monitor counts open FDs on the tokio blocking pool, because the count may
+`stat` or walk `/proc` and must not stall a worker thread. That call is bounded
+by one `FERRUM_OVERLOAD_CHECK_INTERVAL_MS` budget: if the blocking pool is
+saturated — io_uring splice relays hold two blocking threads each for a
+connection's whole lifetime — the monitor keeps the previous FD count, logs a
+rate-limited `warn!`, and continues the loop. It deliberately does **not** fail
+closed to a maximal count, which would latch the gateway into permanent
+rejection with nothing to clear it. A genuine panic of the counting task still
+fails closed, because that is a bug signal rather than a load signal.
+
+The concurrent io_uring splice relay cap is derived from
+`FERRUM_BLOCKING_THREADS`: at most a quarter of the pool in relays, so at most
+half of it in blocking threads, leaving the other half for the monitor, config
+reload, and every other `spawn_blocking` user. At the default 512-thread pool
+that is 128 concurrent relays; relays beyond the cap fall back to the async
+splice path rather than queueing.

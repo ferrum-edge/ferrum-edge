@@ -41,7 +41,7 @@ permissions:
 # manual dispatches share one lane and run to completion.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('istio-status-cas-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('istio-status-cas-live-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('istio-status-cas-live-{0}', github.ref) || 'istio-status-cas-live-shared')) }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 # The kind cluster name is spelled literally in each step below rather than
 # through a workflow-level `env:`, so no step body depends on a rewritten

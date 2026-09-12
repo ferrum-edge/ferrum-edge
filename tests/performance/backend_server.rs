@@ -18,6 +18,8 @@ use tokio::time::{Duration, sleep};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+const MAX_ECHO_BODY_BYTES: usize = 16 * 1024;
+
 async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     let start_time = Instant::now();
 
@@ -63,14 +65,26 @@ async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<
         }
         (&Method::POST, "/api/echo") => {
             // Echo the request body back — used for POST payload benchmarks
-            let body_bytes = req.into_body().collect().await
-                .map(|c| c.to_bytes())
-                .unwrap_or_default();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/json")
-                .body(Full::new(body_bytes))
-                .unwrap()
+            match http_body_util::Limited::new(req.into_body(), MAX_ECHO_BODY_BYTES)
+                .collect()
+                .await
+            {
+                Ok(collected) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(collected.to_bytes()))
+                    .unwrap(),
+                Err(error) if error.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+                    Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(Full::new(Bytes::from_static(b"request body too large")))
+                        .unwrap()
+                }
+                Err(_) => Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Full::new(Bytes::from_static(b"failed to read request body")))
+                    .unwrap(),
+            }
         }
         (&Method::GET, "/api/data") => {
             // Larger payload for testing

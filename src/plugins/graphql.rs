@@ -28,13 +28,15 @@
 //! heuristic (e.g. it does not type-check or validate against a schema) and is
 //! intended as an edge filter layered in front of the backend GraphQL server.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::utils::body_transform::is_json_content_type;
 use super::utils::rate_limit::{
@@ -457,6 +459,23 @@ impl GraphqlPlugin {
             .await
     }
 
+    /// Claim one rate-limit bucket for this request, returning whether this
+    /// pass owes it a token.
+    ///
+    /// `before_proxy` and the final request-body re-check both apply the whole
+    /// policy, so without this claim an ordinary `request_transformer` body rule
+    /// — one that adds an `extensions` member, or merely reserializes the JSON —
+    /// charged the same operation twice and refused the first request under
+    /// `max_requests: 1`. Structural, alias, and introspection policy still runs
+    /// on every pass over the dispatched envelope; only the accounting is
+    /// once-per-bucket. A transform that selects a different operation type or
+    /// name lands on a different bucket, which is still unclaimed and therefore
+    /// still enforced.
+    fn charge_bucket_once(&self, ctx: &mut RequestContext, key: &str) -> bool {
+        ctx.graphql_charged_rate_buckets
+            .insert((self.instance_id, key.to_string()))
+    }
+
     /// Build the rate limit key based on `limit_by` config.
     fn rate_key(&self, ctx: &RequestContext, kind: &str, value: &str) -> String {
         let identity = if self.limit_by == "consumer" {
@@ -748,13 +767,11 @@ fn parse_document(query: &str) -> (Vec<OperationDef<'_>>, HashMap<&str, &str>) {
     while i < len {
         let c = bytes[i];
 
-        // Skip ignored tokens (whitespace, commas, comments).
-        if c.is_ascii_whitespace() || c == b',' {
-            i += 1;
-            continue;
-        }
-        if c == b'#' {
-            i = skip_line_comment(bytes, i);
+        // Skip the complete `Ignored` run (BOM, whitespace, line terminators,
+        // commas, comments) through the shared lexer-level scanner.
+        let after_ignored = skip_ignored(bytes, i);
+        if after_ignored != i {
+            i = after_ignored;
             continue;
         }
 
@@ -998,7 +1015,28 @@ fn skip_line_comment(bytes: &[u8], i: usize) -> usize {
     j
 }
 
-/// Skip ignored tokens (whitespace, commas, comments) starting at `i`.
+/// UTF-8 encoding of the GraphQL `UnicodeBOM` ignored token (U+FEFF).
+const UNICODE_BOM: &[u8] = "\u{feff}".as_bytes();
+
+/// Whether `bytes[i..]` starts with the UnicodeBOM ignored token.
+fn is_unicode_bom(bytes: &[u8], i: usize) -> bool {
+    bytes
+        .get(i..)
+        .is_some_and(|rest| rest.starts_with(UNICODE_BOM))
+}
+
+/// Skip GraphQL `Ignored` tokens starting at `i`.
+///
+/// This is the plugin's single lexer-level `Ignored` scanner and it implements
+/// the complete production: `UnicodeBOM` (U+FEFF), `WhiteSpace`, `LineTerminator`,
+/// `Comment`, and `Comma`. Every name scan (operation and fragment names, alias
+/// colons, directive names) goes through it, so a document's parsed operation
+/// identity and its structural measurements stay invariant under insertion or
+/// removal of legal ignored tokens at token boundaries. Omitting a token class
+/// here silently reclassifies a named operation as anonymous and bypasses the
+/// named-operation budget (`GHSA-wr84-jm45-wrwp`), exactly as the omitted
+/// comma/comment classes once did for alias accounting
+/// (`GHSA-hpxh-qrx9-m7r5`).
 fn skip_ignored(bytes: &[u8], mut i: usize) -> usize {
     let len = bytes.len();
     while i < len {
@@ -1007,6 +1045,8 @@ fn skip_ignored(bytes: &[u8], mut i: usize) -> usize {
             i += 1;
         } else if c == b'#' {
             i = skip_line_comment(bytes, i);
+        } else if is_unicode_bom(bytes, i) {
+            i += UNICODE_BOM.len();
         } else {
             break;
         }
@@ -1126,6 +1166,22 @@ fn analyze_selection_set<'a>(
                 i += 1;
                 continue;
             }
+            b'@' => {
+                // Directive: the `@` punctuator and its name are distinct
+                // lexical tokens, so legal ignored tokens may sit between them.
+                // Consume the name here rather than inferring directive context
+                // from the immediately preceding byte, which counted
+                // `@ skip(if: false)` as a selected field (#5130). The
+                // directive's arguments are skipped by the `(` arm.
+                let after_at = skip_ignored(bytes, i + 1);
+                if after_at < len && is_graphql_name_start(bytes[after_at]) {
+                    let (_, after_name) = read_name(bytes, after_at);
+                    i = after_name;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
             b'.' => {
                 // Fragment spread `...Name` or inline fragment
                 // (`... on Type { ... }`, `... { ... }`, `... @dir { ... }`).
@@ -1203,8 +1259,8 @@ fn analyze_selection_set<'a>(
             // `analyze_query` keeps a distinct keyword skip.
             let (ident, after_ident) = read_name(bytes, i);
 
-            // Look past whitespace for an alias `:`.
-            let j = skip_ws_only(bytes, after_ident);
+            // Look past ignored tokens for an alias `:`.
+            let j = skip_ignored(bytes, after_ident);
             if j < len && bytes[j] == b':' {
                 acc.alias_count += 1;
                 // The aliased field name follows and is counted on a later
@@ -1213,11 +1269,8 @@ fn analyze_selection_set<'a>(
                 continue;
             }
 
-            // A field. Skip directive names (prefixed by `@`).
-            if i > 0 && bytes[i - 1] == b'@' {
-                i = after_ident;
-                continue;
-            }
+            // A field: directive names never reach here, the `@` arm above
+            // consumes them together with their punctuator.
             if ident == "__schema" || ident == "__type" {
                 acc.is_introspection = true;
             }
@@ -1232,18 +1285,23 @@ fn analyze_selection_set<'a>(
     Some(())
 }
 
-/// Skip only ASCII whitespace (not commas/comments) starting at `i`.
-fn skip_ws_only(bytes: &[u8], mut i: usize) -> usize {
-    let len = bytes.len();
-    while i < len && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    i
+/// Character-level `Ignored` predicate for the whole-document fallback trim.
+/// Deliberately broader than the spec's `WhiteSpace`/`LineTerminator`: the
+/// fallback runs on documents the structured parser could not model, so
+/// trimming any Unicode whitespace stays as lenient as it has always been
+/// while still covering `Comma` and the `UnicodeBOM`.
+fn is_leading_ignored_char(c: char) -> bool {
+    c.is_whitespace() || c == ',' || c == '\u{feff}'
 }
 
+/// Trim the document's leading `Ignored` run before the whole-document fallback
+/// scan. Carries the same token classes as [`skip_ignored`] — including `Comma`
+/// and the `UnicodeBOM` — so a leading BOM cannot hide the `mutation` /
+/// `subscription` keyword and downgrade the operation type to `query`
+/// (`GHSA-wr84-jm45-wrwp`).
 fn trim_leading_ignored(mut query: &str) -> &str {
     loop {
-        query = query.trim_start();
+        query = query.trim_start_matches(is_leading_ignored_char);
         if !query.starts_with('#') {
             return query;
         }
@@ -1387,6 +1445,20 @@ fn analyze_query(query: &str) -> (u32, u32, u32, bool) {
             continue;
         }
 
+        if c == b'@' {
+            // Directive punctuator and directive name are distinct tokens; the
+            // name may follow legal ignored tokens and is never a selected
+            // field (#5130). Arguments are skipped by the paren tracking above.
+            let after_at = skip_ignored(bytes, i + 1);
+            if after_at < len && is_graphql_name_start(bytes[after_at]) {
+                let (_, after_name) = read_name(bytes, after_at);
+                i = after_name;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
         if c == b'{' {
             depth += 1;
             if depth > max_depth {
@@ -1428,11 +1500,8 @@ fn analyze_query(query: &str) -> (u32, u32, u32, bool) {
                 continue;
             }
 
-            // Skip whitespace after identifier
-            let mut j = i;
-            while j < len && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
+            // Skip ignored tokens after identifier
+            let j = skip_ignored(bytes, i);
 
             // Check if this is an alias (identifier followed by ':')
             if j < len && bytes[j] == b':' {
@@ -1443,12 +1512,10 @@ fn analyze_query(query: &str) -> (u32, u32, u32, bool) {
                 continue;
             }
 
-            // If we're inside a selection set (depth > 0), count as a field
+            // If we're inside a selection set (depth > 0), count as a field.
+            // Directive names never reach here — the `@` arm above consumes
+            // them together with their punctuator.
             if depth > 0 {
-                // Skip directive names (prefixed by @)
-                if start > 0 && bytes[start - 1] == b'@' {
-                    continue;
-                }
                 if ident == "__schema" || ident == "__type" {
                     is_introspection = true;
                 }
@@ -1595,10 +1662,14 @@ impl Plugin for GraphqlPlugin {
     /// (`GHSA-3xrr-4h3f-89pc`).
     ///
     /// Work is skipped for an UNCHANGED envelope through an instance-scoped
-    /// digest, so the ordinary untransformed request neither re-parses its query
-    /// nor spends a second rate-limit token. A CHANGED envelope is a different
-    /// operation and is charged as one — the earlier charge belonged to the
-    /// document the gateway was shown, this one to the document it dispatches.
+    /// digest, so the ordinary untransformed request does not re-parse its
+    /// query. A CHANGED envelope is re-parsed and re-decided in full, but rate
+    /// accounting is claimed per bucket for the whole request
+    /// (`charge_bucket_once`): a transform that leaves the operation type and
+    /// name alone — adding an `extensions` member, reserializing the JSON —
+    /// still costs exactly one token, while a transform that selects a
+    /// different operation lands on a bucket this request has not claimed and
+    /// is charged and enforced there.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
@@ -1817,9 +1888,16 @@ impl GraphqlPlugin {
             };
         }
 
-        // Check operation type rate limit
-        if let Some(spec) = self.type_rate_limits.get(op.op_type) {
-            let key = self.rate_key(ctx, "type", op.op_type);
+        // Check operation type rate limit. `charge_bucket_once` keeps the
+        // second (final-envelope) pass from spending another token on a budget
+        // this request already paid.
+        let type_bucket = self
+            .type_rate_limits
+            .get(op.op_type)
+            .map(|spec| (self.rate_key(ctx, "type", op.op_type), spec));
+        if let Some((key, spec)) = type_bucket
+            && self.charge_bucket_once(ctx, &key)
+        {
             match self.check_rate(&key, spec).await {
                 None => {
                     super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
@@ -1841,7 +1919,7 @@ impl GraphqlPlugin {
                             headers: json_content_type_header(),
                         };
                     }
-                    warn!(
+                    warn_sampled!(
                         op_type = %op.op_type,
                         plugin = "graphql",
                         "GraphQL operation type rate limit exceeded"
@@ -1866,11 +1944,16 @@ impl GraphqlPlugin {
             }
         }
 
-        // Check named operation rate limit
-        if let Some(ref op_name) = op.op_name
-            && let Some(spec) = self.operation_rate_limits.get(op_name)
+        // Check named operation rate limit, charged at most once per request
+        // like the operation-type bucket above.
+        let operation_bucket = op.op_name.as_ref().and_then(|op_name| {
+            self.operation_rate_limits
+                .get(op_name)
+                .map(|spec| (op_name, self.rate_key(ctx, "op", op_name), spec))
+        });
+        if let Some((op_name, key, spec)) = operation_bucket
+            && self.charge_bucket_once(ctx, &key)
         {
-            let key = self.rate_key(ctx, "op", op_name);
             match self.check_rate(&key, spec).await {
                 None => {
                     super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
@@ -1889,7 +1972,7 @@ impl GraphqlPlugin {
                             headers: json_content_type_header(),
                         };
                     }
-                    warn!(
+                    warn_sampled!(
                         operation = %op_name,
                         plugin = "graphql",
                         "GraphQL named operation rate limit exceeded"

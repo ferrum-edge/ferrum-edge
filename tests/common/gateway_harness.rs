@@ -37,9 +37,9 @@
 //!
 //! # Process identity (issue #3428)
 //!
-//! [`ephemeral_port`] binds `127.0.0.1:0` and drops the listener, so between
-//! reservation and the child's own bind another parallel gateway can claim
-//! either port. Readiness alone cannot tell the two apart: a bare TCP accept
+//! [`ephemeral_port`] leases a port across test processes and releases the socket
+//! for the child's own bind. Unrelated OS processes can still claim the port.
+//! Readiness alone cannot tell the two apart: a bare TCP accept
 //! proves only that *some* listener answers, and an unauthenticated `/health`
 //! is served identically by every gateway on the box.
 //!
@@ -80,6 +80,8 @@
 //! Callers that pin `FERRUM_ADMIN_JWT_SECRET` / `FERRUM_METRICS_BEARER_TOKEN`
 //! (or open `FERRUM_METRICS_ALLOWED_CIDRS`) keep their explicit value; identity
 //! is then only as unique as what they chose.
+
+use super::port_registry::TestSocket;
 
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -419,6 +421,64 @@ impl TestGateway {
 }
 
 impl Drop for TestGateway {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// An owned, panic-safe handle to a spawned gateway child.
+///
+/// A raw [`std::process::Child`] does **not** kill its process when dropped, so
+/// any early exit between spawn and the explicit shutdown call — an assertion
+/// panic, a `?`, an early `return` — leaves a live gateway reparented to init,
+/// still owning its listen ports and contaminating every later run on those
+/// fixed ports (issue #4991). Wrapping the child the instant it is spawned
+/// makes teardown a property of scope instead of a property of reaching the
+/// last line of a test.
+///
+/// Teardown goes through [`shutdown_gateway_child`], so the coverage build
+/// still gets its SIGTERM grace period rather than an immediate `kill`.
+pub struct GatewayChildGuard {
+    child: Option<Child>,
+}
+
+impl GatewayChildGuard {
+    /// Take ownership of a freshly spawned gateway.
+    pub fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Borrow the child for readiness probes (`try_wait`) and log reads.
+    pub fn child_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("gateway child was already reaped by this guard")
+    }
+
+    /// The child's OS process id while it is still owned.
+    pub fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
+    /// Whether the child has already exited on its own.
+    pub fn has_exited(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => true,
+        }
+    }
+
+    /// Shut the gateway down now. Idempotent: the guard's `Drop` becomes a
+    /// no-op afterwards, so an explicit shutdown and an unwind cannot both
+    /// reap the same child.
+    pub fn shutdown(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            shutdown_gateway_child(&mut child);
+        }
+    }
+}
+
+impl Drop for GatewayChildGuard {
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -780,6 +840,13 @@ impl TestGatewayBuilder {
     /// THIS child reported a listener bind that failed because the address was
     /// already in use.
     pub async fn spawn_classified(mut self) -> Result<TestGateway, GatewaySpawnFailure> {
+        // Classification reads the CHILD's own records, so the capture is not
+        // optional on this path: without it `detail` is the harness observation
+        // alone ("gateway process exited ... before proving ownership of admin
+        // port N"), which can never name a listener, and a genuinely lost port
+        // race is reported as `listener_addr_in_use=false` and panics instead
+        // of retrying on a fresh port (issue #4972).
+        self.capture_output = true;
         if self.auto_build
             && let Err(error) = ensure_gateway_built()
         {
@@ -825,8 +892,15 @@ impl TestGatewayBuilder {
     async fn try_spawn(&mut self) -> Result<TestGateway, Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = TempDir::new()?;
         let mut excluded_ports = collect_builder_pinned_ports(self);
-        let admin_port = ephemeral_port_excluding(&mut excluded_ports).await?;
-        let proxy_port = ephemeral_port_excluding(&mut excluded_ports).await?;
+        // Held, not merely sampled: the sockets stay bound until immediately
+        // before `cmd.spawn()` below, so no other process on the runner can
+        // take these numbers while the env, config file, and database are
+        // still being assembled (issue #4972).
+        let admin_hold = hold_ephemeral_port_excluding(&mut excluded_ports).await?;
+        let proxy_hold = hold_ephemeral_port_excluding(&mut excluded_ports).await?;
+        let admin_port = admin_hold.port;
+        let proxy_port = proxy_hold.port;
+        let mut port_holds = vec![admin_hold, proxy_hold];
         // Fresh per *attempt*, not per builder: a previous attempt's child may
         // still be winding down, and a retry must never be satisfiable by it.
         let identity = SpawnedGatewayIdentity::mint_for_builder(self);
@@ -853,11 +927,13 @@ impl TestGatewayBuilder {
         // allocated against the same exclusion set as this attempt's
         // admin/proxy ports so listeners cannot collide within the attempt.
         for key in &self.ephemeral_port_env {
-            let port = ephemeral_port_excluding(&mut excluded_ports).await?;
-            env.insert(key.clone(), port.to_string());
+            let hold = hold_ephemeral_port_excluding(&mut excluded_ports).await?;
+            env.insert(key.clone(), hold.port.to_string());
+            port_holds.push(hold);
         }
 
         let mut cmd = Command::new(&binary);
+        cmd.arg("run");
         if self.clear_env {
             cmd.env_clear();
             preserve_base_env(&mut cmd);
@@ -894,6 +970,10 @@ impl TestGatewayBuilder {
             cmd.stderr(Stdio::null());
         }
 
+        // Hand the reserved ports over: release them at the last possible
+        // moment so the window in which the child has not yet bound them is
+        // the spawn itself rather than every step since allocation.
+        drop(port_holds);
         let child = cmd.spawn()?;
 
         // A final sanity check: pull the db_url we ended up using back out,
@@ -1010,6 +1090,7 @@ impl TestGatewayBuilder {
         }
 
         let mut cmd = Command::new(&binary);
+        cmd.arg("run");
         if self.clear_env {
             cmd.env_clear();
             preserve_base_env(&mut cmd);
@@ -1102,6 +1183,17 @@ impl GatewaySpawnFailure {
             detail,
         })
     }
+
+    /// Whether attempt `attempt` (1-based, of `max_attempts`) may be re-rolled
+    /// on a fresh port set.
+    ///
+    /// Exactly one failure is retryable — THIS child losing an address race —
+    /// and only while a later attempt remains, so the last attempt always
+    /// surfaces its own diagnostic instead of the caller's loop falling
+    /// through to a contentless "the gateway never started".
+    pub fn is_retryable_port_race(&self, attempt: u32, max_attempts: u32) -> bool {
+        self.listener_addr_in_use && attempt < max_attempts
+    }
 }
 
 impl std::fmt::Display for GatewaySpawnFailure {
@@ -1116,8 +1208,16 @@ impl std::fmt::Display for GatewaySpawnFailure {
 
 /// The gateway's own listener-failure messages. A record must carry one of
 /// these AND an address-in-use indication to be classified retryable.
-const LISTENER_BIND_MARKERS: [&str; 2] =
-    ["Gateway listener task", "Stream listener(s) failed to bind"];
+///
+/// The first two interpolate the bind error into the message itself. The third
+/// is `crate::startup::flip_ready_off_on_listener_failure`, whose message is
+/// fixed and whose cause lives in a sibling `error` field — see
+/// [`record_reports_listener_addr_in_use`].
+const LISTENER_BIND_MARKERS: [&str; 3] = [
+    "Gateway listener task",
+    "Stream listener(s) failed to bind",
+    "Serving listener task exited with an error",
+];
 
 /// Spellings of `std::io::ErrorKind::AddrInUse`. The gateway interpolates the
 /// OS error string (Linux and macOS both render "Address already in use"), and
@@ -1143,24 +1243,53 @@ pub fn captured_output_reports_listener_addr_in_use(captured: &str) -> bool {
             return false;
         }
         match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(record) => {
-                let message = record
-                    .get("fields")
-                    .and_then(|fields| fields.get("message"))
-                    .or_else(|| record.get("message"))
-                    .and_then(serde_json::Value::as_str);
-                message.is_some_and(message_reports_listener_addr_in_use)
-            }
+            Ok(record) => record_reports_listener_addr_in_use(&record),
             Err(_) => message_reports_listener_addr_in_use(line),
         }
     })
 }
 
+/// Decide whether one structured tracing record is the gateway reporting a
+/// lost address race.
+///
+/// Two shapes qualify. The mode runtimes that interpolate the bind error into
+/// the message (`Gateway listener task '<name>' failed: <io error>`) are
+/// matched on the message alone. `flip_ready_off_on_listener_failure` — the
+/// path every admin/CP/mesh listener takes when its bind fails after the
+/// runtime is up — instead emits a FIXED message with the listener name and
+/// the rendered `io::Error` in sibling `listener` / `error` fields, so the
+/// address-in-use half is read from `error`. Both halves stay gateway-authored
+/// and the `error` field is only consulted once the record's own message names
+/// a listener failure, so a fixture- or operator-supplied string elsewhere in
+/// the record still cannot classify as a port race.
+fn record_reports_listener_addr_in_use(record: &serde_json::Value) -> bool {
+    let field = |name: &str| {
+        record
+            .get("fields")
+            .and_then(|fields| fields.get(name))
+            .or_else(|| record.get(name))
+            .and_then(serde_json::Value::as_str)
+    };
+    let Some(message) = field("message") else {
+        return false;
+    };
+    if message_reports_listener_addr_in_use(message) {
+        return true;
+    }
+    names_listener(message) && field("error").is_some_and(reports_addr_in_use)
+}
+
 fn message_reports_listener_addr_in_use(message: &str) -> bool {
-    let lowered = message.to_ascii_lowercase();
-    let names_listener = LISTENER_BIND_MARKERS.iter().any(|m| message.contains(m));
-    let names_addr_in_use = ADDR_IN_USE_MARKERS.iter().any(|m| lowered.contains(m));
-    names_listener && names_addr_in_use
+    names_listener(message) && reports_addr_in_use(message)
+}
+
+fn names_listener(message: &str) -> bool {
+    LISTENER_BIND_MARKERS.iter().any(|m| message.contains(m))
+}
+
+fn reports_addr_in_use(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    ADDR_IN_USE_MARKERS.iter().any(|m| lowered.contains(m))
 }
 
 #[derive(Debug)]
@@ -1534,14 +1663,46 @@ fn parse_listen_addr_port(addr: &str) -> Option<u16> {
     port_str.parse().ok()
 }
 
-/// Bind an ephemeral port, then drop the listener. Not race-free — the
-/// caller must retry if the gateway binds fail. This is what the
-/// `max_attempts` loop in [`TestGatewayBuilder::spawn`] exists for.
+/// Lease a port until test-process exit, releasing its socket for a gateway.
+/// The `max_attempts` loop still covers residual collisions with OS users that
+/// do not participate in the registry.
 pub async fn ephemeral_port() -> Result<u16, std::io::Error> {
-    let l = TcpListener::bind("127.0.0.1:0").await?;
-    let port = l.local_addr()?.port();
-    drop(l);
-    Ok(port)
+    let listener = TcpListener::bind_test("127.0.0.1:0").await?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// An ephemeral port kept bound until the caller hands it over.
+///
+/// The registry lease survives socket release; holding the socket additionally
+/// excludes unrelated OS users until the child's spawn call.
+pub struct HeldEphemeralPort {
+    /// The held port.
+    pub port: u16,
+    _listener: TcpListener,
+}
+
+/// Like [`ephemeral_port_excluding`], but keeps the listener bound. Drop the
+/// return value immediately before spawning the process that binds the port.
+pub async fn hold_ephemeral_port_excluding(
+    excluded: &mut HashSet<u16>,
+) -> Result<HeldEphemeralPort, std::io::Error> {
+    const MAX_ATTEMPTS: u32 = 50;
+    for _ in 0..MAX_ATTEMPTS {
+        let listener = TcpListener::bind_test("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        if excluded.contains(&port) {
+            continue;
+        }
+        excluded.insert(port);
+        return Ok(HeldEphemeralPort {
+            port,
+            _listener: listener,
+        });
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        "exhausted held ephemeral port allocation while excluding pinned ports",
+    ))
 }
 
 /// Like [`ephemeral_port`], but never returns a port already present in
@@ -1945,19 +2106,20 @@ const GATEWAY_CAPTURE_DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
 
 /// Scrub secrets and bound captured gateway logs for harness failure diagnostics.
 ///
-/// Replaces every provided non-empty secret (empty strings are skipped because
-/// replacing them would corrupt the entire capture), redacts URL userinfo
+/// Redacts URL userinfo before replacing every provided non-empty secret (empty
+/// strings are skipped because replacing them would corrupt the entire capture)
 /// (`scheme://user:pass@host`), and keeps only the trailing
 /// `GATEWAY_CAPTURE_DIAGNOSTIC_MAX_BYTES` so hosted CI stays actionable without
 /// dumping unbounded child output.
 pub fn scrub_gateway_capture_for_diagnostics(raw: &str, secrets: &[&str]) -> String {
-    let mut text = raw.to_string();
+    // Preserve URL delimiters until userinfo has been removed: a short caller
+    // secret such as `/`, `:`, or `@` could otherwise make the URL unrecognizable.
+    let mut text = scrub_url_userinfo_in_text(raw);
     for secret in secrets {
         if !secret.is_empty() {
             text = text.replace(secret, "***");
         }
     }
-    text = scrub_url_userinfo_in_text(&text);
     truncate_utf8_suffix(&text, GATEWAY_CAPTURE_DIAGNOSTIC_MAX_BYTES)
 }
 
@@ -2088,6 +2250,81 @@ mod port_allocation_tests {
         ));
         assert!(!captured_output_reports_listener_addr_in_use(""));
     }
+
+    /// Issue #4972: `flip_ready_off_on_listener_failure` keeps its message
+    /// fixed and puts the cause in a sibling `error` field, so a classifier
+    /// that only reads `fields.message` calls a lost admin-port race
+    /// `listener_addr_in_use=false` and the caller panics instead of retrying.
+    #[test]
+    fn listener_addr_in_use_classification_reads_the_structured_error_field() {
+        // Verbatim shape of the CP admin listener failure captured in CI.
+        let admin_race = r#"{"timestamp":"2026-09-09T00:00:00Z","level":"ERROR","fields":{"message":"Serving listener task exited with an error; marked serving degraded and flipped readiness to not-ready","listener":"CP admin HTTP listener","error":"Address already in use (os error 98)"},"target":"ferrum_edge::startup"}"#;
+        assert!(captured_output_reports_listener_addr_in_use(admin_race));
+
+        // The same listener failure with a DIFFERENT cause stays deterministic.
+        let denied = r#"{"level":"ERROR","fields":{"message":"Serving listener task exited with an error; marked serving degraded and flipped readiness to not-ready","listener":"CP admin HTTP listener","error":"Permission denied (os error 13)"}}"#;
+        assert!(!captured_output_reports_listener_addr_in_use(denied));
+
+        // An `error` field alone does not classify: the record's own message
+        // must still be a gateway-authored listener failure.
+        let unrelated = r#"{"level":"ERROR","fields":{"message":"Configuration validation failed: 1 invalid upstream reference(s) found","error":"Address already in use (os error 98)"}}"#;
+        assert!(!captured_output_reports_listener_addr_in_use(unrelated));
+
+        // Neither does a record with no message at all.
+        let messageless = r#"{"level":"ERROR","fields":{"listener":"CP admin HTTP listener","error":"Address already in use (os error 98)"}}"#;
+        assert!(!captured_output_reports_listener_addr_in_use(messageless));
+    }
+
+    /// The retry budget callers share: a classified port race is re-rolled
+    /// only while a later attempt remains, and nothing else is ever re-rolled.
+    #[test]
+    fn retryable_port_race_is_bounded_to_the_classified_race() {
+        let race = GatewaySpawnFailure {
+            listener_addr_in_use: true,
+            detail: "port race".to_string(),
+        };
+        assert!(race.is_retryable_port_race(1, 3));
+        assert!(race.is_retryable_port_race(2, 3));
+        // The final attempt surfaces its diagnostic rather than being consumed.
+        assert!(!race.is_retryable_port_race(3, 3));
+        assert!(!race.is_retryable_port_race(1, 1));
+
+        let deterministic = GatewaySpawnFailure {
+            listener_addr_in_use: false,
+            detail: "Configuration validation failed".to_string(),
+        };
+        assert!(!deterministic.is_retryable_port_race(1, 3));
+    }
+
+    #[tokio::test]
+    async fn held_ephemeral_port_cannot_be_stolen_until_dropped() {
+        let mut excluded = HashSet::new();
+        let hold = hold_ephemeral_port_excluding(&mut excluded)
+            .await
+            .expect("hold ephemeral port");
+        let port = hold.port;
+        assert!(excluded.contains(&port));
+        assert!(
+            TcpListener::bind_test(("127.0.0.1", port)).await.is_err(),
+            "a held reservation must keep the port from being stolen"
+        );
+        drop(hold);
+        TcpListener::bind_test(("127.0.0.1", port))
+            .await
+            .expect("released port must be bindable again");
+    }
+
+    #[tokio::test]
+    async fn held_ephemeral_ports_are_distinct() {
+        let mut excluded = HashSet::new();
+        let first = hold_ephemeral_port_excluding(&mut excluded)
+            .await
+            .expect("first hold");
+        let second = hold_ephemeral_port_excluding(&mut excluded)
+            .await
+            .expect("second hold");
+        assert_ne!(first.port, second.port);
+    }
 }
 
 #[cfg(test)]
@@ -2110,7 +2347,7 @@ mod ownership_proof_tests {
     }
 
     async fn spawn_fake_admin(behavior: FakeAdminBehavior) -> (u16, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind fake admin");
         let port = listener.local_addr().expect("addr").port();

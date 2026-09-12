@@ -29,6 +29,8 @@
 //!   cargo build --release --bin ferrum-edge
 //!   cargo test --test functional_tests test_load_stress_10k_proxies -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -264,7 +266,7 @@ async fn handle_backend_request(
 async fn start_hyper_backend(
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
 
     let handle = tokio::spawn(async move {
         loop {
@@ -384,15 +386,15 @@ impl LoadTestHarness {
         let observability_token = identity.observability_token.clone();
         let basic_auth_hmac_secret = "load-test-hmac-secret-54321-0123456789".to_string();
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         let admin_port = admin_listener.local_addr()?.port();
         drop(admin_listener);
 
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         let proxy_port = proxy_listener.local_addr()?.port();
         drop(proxy_listener);
 
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         let backend_port = backend_listener.local_addr()?.port();
         drop(backend_listener);
 
@@ -428,6 +430,7 @@ impl LoadTestHarness {
         // Run migrations for postgres
         if db_type == "postgres" {
             let migrate_status = Command::new(binary_path)
+                .arg("run")
                 .env("FERRUM_MODE", "migrate")
                 .env("FERRUM_DB_TYPE", db_type)
                 .env("FERRUM_DB_URL", db_url)
@@ -439,6 +442,7 @@ impl LoadTestHarness {
         }
 
         let mut cmd = Command::new(binary_path);
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env(
                 "FERRUM_ADMIN_JWT_MAX_TTL",

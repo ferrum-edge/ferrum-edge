@@ -3,6 +3,7 @@
 //! This module contains infrastructure that plugins share, keeping plugin
 //! implementation files focused on their core logic.
 
+pub mod ai_model_glob;
 pub mod ai_pii;
 pub mod ai_providers;
 pub mod ai_usage_stream;
@@ -14,6 +15,7 @@ pub mod body_transform;
 pub mod byte_budget;
 pub mod cache_headers;
 pub mod cert_hash;
+pub mod cert_validity;
 pub mod claim_header_fanout;
 pub mod claim_resolver;
 pub mod content_encoding;
@@ -28,6 +30,7 @@ pub mod jwks_cache;
 pub mod jwks_store;
 pub mod jwt_verifier;
 pub mod log_helpers;
+pub mod log_sampling;
 pub mod log_schema;
 pub mod metadata_redaction;
 pub mod openai_error;
@@ -42,6 +45,7 @@ pub mod route_header_transform;
 pub mod runtime_bool_gate;
 pub mod scope_role_check;
 pub mod session_cookie;
+pub mod sink_loss;
 pub mod size_limit;
 pub mod socket_host;
 pub mod sse;
@@ -70,8 +74,8 @@ pub use log_helpers::{
     redacted_endpoint_url, redacted_endpoint_url_str, validate_batch_config,
 };
 pub use summary_log_budget::{
-    QueuedSummaryPayload, admit_http_summary, admit_stream_summary, assemble_json_array,
-    assemble_ndjson,
+    JSON_ARRAY_FRAMING_BYTES, QueuedSummaryPayload, admit_http_summary, admit_stream_summary,
+    assemble_json_array, assemble_ndjson, json_array_len,
 };
 // Re-exported for external unit tests; unused inside the binary target.
 #[allow(unused_imports)]

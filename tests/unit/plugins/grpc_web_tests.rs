@@ -4332,3 +4332,604 @@ async fn capacity_refused_grpc_web_transform_installs_body_framed_terminal() {
         "the shared transform loop must consume the pending signal"
     );
 }
+
+// ── Message-format suffix preservation on the backend request (issue #5135) ──
+
+/// The native `Content-Type` the backend actually receives, from both hooks
+/// that write it.
+async fn native_request_content_types(client_ct: &str) -> (String, String) {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context(client_ct);
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let ingress = ctx.headers.get("content-type").cloned();
+
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let outbound = headers.get("content-type").cloned();
+    (
+        ingress.expect("ingress rewrite"),
+        outbound.expect("before_proxy rewrite"),
+    )
+}
+
+#[tokio::test]
+async fn request_translation_preserves_the_message_format_suffix() {
+    // Translation re-frames the transport, never the message payload, so a
+    // backend that picks its codec from the native content-type must still see
+    // the codec the browser sent.
+    for (client_ct, expected) in [
+        ("application/grpc-web+json", "application/grpc+json"),
+        ("application/grpc-web-text+json", "application/grpc+json"),
+        (
+            "application/grpc-web-text+custom-codec",
+            "application/grpc+custom-codec",
+        ),
+        ("application/grpc-web+thrift", "application/grpc+thrift"),
+        // A bare type and an explicit `+proto` name the same implicit `proto`
+        // serialization, so both keep the canonical bare native spelling.
+        ("application/grpc-web", "application/grpc"),
+        ("application/grpc-web+proto", "application/grpc"),
+        ("application/grpc-web-text", "application/grpc"),
+        ("application/grpc-web-text+proto", "application/grpc"),
+    ] {
+        let (ingress, outbound) = native_request_content_types(client_ct).await;
+        assert_eq!(ingress, expected, "ingress rewrite for {client_ct}");
+        assert_eq!(outbound, expected, "before_proxy rewrite for {client_ct}");
+    }
+}
+
+#[tokio::test]
+async fn request_translation_suffix_is_independent_of_accept_wire_mode() {
+    // Accept picks the RESPONSE encoding; it must not perturb the codec label
+    // the backend receives.
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web-text+json");
+    ctx.headers
+        .insert("accept".to_string(), "application/grpc-web".to_string());
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.headers.get("content-type").map(String::as_str),
+        Some("application/grpc+json")
+    );
+    assert_eq!(
+        ctx.metadata.get("grpc_web_original_ct").map(String::as_str),
+        Some("application/grpc-web+json")
+    );
+}
+
+#[tokio::test]
+async fn before_proxy_falls_back_to_bare_native_when_staging_is_forged() {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web+json");
+    plugin.on_request_received(&mut ctx).await;
+
+    // `ctx.metadata` is plugin-writable, so a non-native staged value must not
+    // be planted on the backend request.
+    let staging_key = ctx
+        .metadata
+        .keys()
+        .find(|key| key.ends_with(".native_ct"))
+        .expect("owner staged a native content-type")
+        .clone();
+    ctx.metadata
+        .insert(staging_key, "text/html; charset=utf-8".to_string());
+
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+}
+
+// ── Comma-coalesced binary request trailer metadata (issue #5136) ──
+
+#[tokio::test]
+async fn request_trailers_accept_comma_coalesced_binary_metadata() {
+    let message = request_frame(0x00, b"hello");
+    let cases = [
+        ("two padded members", "x-bin: YQ==,Yg==\r\n", "YQ==,Yg=="),
+        ("mixed padding", "x-bin: YQ==,Yg\r\n", "YQ==,Yg"),
+        (
+            "optional whitespace around members",
+            "x-bin: YQ== , Yg==\r\n",
+            "YQ== , Yg==",
+        ),
+        ("single unpadded member", "x-bin: YQ\r\n", "YQ"),
+    ];
+    let modes = [
+        ("binary", "application/grpc-web"),
+        ("text", "application/grpc-web-text"),
+    ];
+
+    for (case, block, expected) in cases {
+        let mut binary = message.clone();
+        binary.extend_from_slice(&request_frame(0x80, block.as_bytes()));
+        for (mode, ct) in modes {
+            let wire = if mode == "text" {
+                grpc_web_text_body(&binary)
+            } else {
+                binary.clone()
+            };
+            let (body, staged, outcome) = run_grpc_web_request_pipeline(ct, &wire).await;
+            assert!(
+                matches!(outcome, PluginResult::Continue),
+                "{case}/{mode}: comma-coalesced binary metadata is legal gRPC metadata"
+            );
+            assert_eq!(body, message, "{case}/{mode}: message bytes unchanged");
+            assert_eq!(
+                staged,
+                Some(vec![("x-bin".to_string(), expected.to_string())]),
+                "{case}/{mode}: the logical member sequence must be preserved"
+            );
+        }
+    }
+}
+
+#[test]
+fn comma_coalesced_binary_metadata_still_rejects_invalid_members() {
+    let message = request_frame(0x00, b"hello");
+    for (case, block) in [
+        ("empty trailing member", "x-bin: YQ==,\r\n"),
+        ("empty leading member", "x-bin: ,YQ==\r\n"),
+        ("empty interior member", "x-bin: YQ==,,Yg==\r\n"),
+        (
+            "whitespace-only interior member",
+            "x-bin: YQ==,   ,Yg==\r\n",
+        ),
+        ("non-base64 member", "x-bin: YQ==,not base64!\r\n"),
+    ] {
+        let mut body = message.clone();
+        body.extend_from_slice(&request_frame(0x80, block.as_bytes()));
+        assert!(
+            ferrum_edge::_test_support::split_grpc_web_request_trailer_frame(&body).is_err(),
+            "{case}: an invalid member must still fail the whole frame closed"
+        );
+    }
+}
+
+// ── Accept media-range parameters (issue #5137) ──
+
+#[test]
+fn accept_media_range_parameters_do_not_veto_an_accepted_representation() {
+    use ferrum_edge::_test_support::negotiate_grpc_web_response_media_type as negotiate;
+
+    // A refusal aimed at a parameterized variant Ferrum cannot produce must not
+    // suppress the unparameterized representation the client explicitly took.
+    for accept in [
+        "application/grpc-web+proto;q=1, application/grpc-web+proto;version=2;q=0",
+        "application/grpc-web+proto;version=2;q=0, application/grpc-web+proto;q=1",
+        "application/grpc-web+proto;version=2;q=0, */*",
+    ] {
+        assert_eq!(
+            negotiate("application/grpc-web+proto", Some(accept)).expect("negotiation"),
+            "application/grpc-web+proto",
+            "accept={accept}"
+        );
+    }
+
+    // Accept extension parameters follow `q` and do not constrain the range.
+    assert_eq!(
+        negotiate(
+            "application/grpc-web+proto",
+            Some("application/grpc-web-text;q=0.9;ext=on, application/grpc-web;q=0.2"),
+        )
+        .expect("negotiation"),
+        "application/grpc-web-text+proto"
+    );
+}
+
+#[test]
+fn accept_parameterized_ranges_match_type_without_vetoing_or_changing_mode() {
+    use ferrum_edge::_test_support::negotiate_grpc_web_response_media_type as negotiate;
+
+    // Non-`q` parameters still match when type/subtype/suffix match: a client
+    // whose only acceptable ranges carry charset=utf-8 must not be 406'd.
+    for (request, accept, expected) in [
+        (
+            "application/grpc-web+proto",
+            "application/grpc-web-text; charset=utf-8",
+            "application/grpc-web-text+proto",
+        ),
+        (
+            "application/grpc-web+json",
+            "text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8",
+            "application/grpc-web-text+json",
+        ),
+        (
+            "application/grpc-web+proto",
+            "application/grpc-web+proto;version=2",
+            "application/grpc-web+proto",
+        ),
+        (
+            "application/grpc-web+proto",
+            "application/grpc-web;charset=utf-8, application/grpc-web-text;charset=utf-8",
+            "application/grpc-web+proto",
+        ),
+        (
+            "application/grpc-web+proto",
+            "*/*;version=2",
+            "application/grpc-web+proto",
+        ),
+    ] {
+        assert_eq!(
+            negotiate(request, Some(accept)).expect("negotiation"),
+            expected,
+            "request={request}, accept={accept}"
+        );
+    }
+
+    // Parameters must not change the selected mode versus the same list without
+    // them, and must not let a parameterized later entry steal quality from an
+    // unparameterized match so an unrelated range can win.
+    let request = "application/grpc-web+proto";
+    assert_eq!(
+        negotiate(
+            request,
+            Some("application/grpc-web;q=1, application/grpc-web-text;charset=utf-8")
+        )
+        .expect("parameterized negotiation"),
+        negotiate(
+            request,
+            Some("application/grpc-web;q=1, application/grpc-web-text")
+        )
+        .expect("unparameterized negotiation"),
+    );
+    assert_eq!(
+        negotiate(
+            request,
+            Some("application/grpc-web;q=1, application/grpc-web-text;charset=utf-8")
+        )
+        .expect("parameterized negotiation"),
+        "application/grpc-web+proto"
+    );
+    assert_eq!(
+        negotiate(
+            request,
+            Some("*/*, application/grpc-web-text;charset=utf-8")
+        )
+        .expect("parameterized exact still beats wildcard"),
+        negotiate(request, Some("*/*, application/grpc-web-text"))
+            .expect("unparameterized exact beats wildcard"),
+    );
+    assert_eq!(
+        negotiate(
+            request,
+            Some("*/*, application/grpc-web-text;charset=utf-8")
+        )
+        .expect("parameterized exact still beats wildcard"),
+        "application/grpc-web-text+proto"
+    );
+    assert_eq!(
+        negotiate(
+            request,
+            Some(
+                "application/grpc-web;q=1, application/grpc-web+proto;version=2;q=0.1, application/grpc-web-text;q=0.5",
+            ),
+        )
+        .expect("parameterized quality must not be selected"),
+        "application/grpc-web+proto",
+    );
+
+    // A range whose type or suffix does not match still yields 406, with or
+    // without parameters.
+    for accept in [
+        "text/html",
+        "application/json;charset=utf-8",
+        "application/grpc-web-text+thrift;charset=utf-8",
+        "application/grpc-web-text+json;version=2",
+    ] {
+        assert!(
+            negotiate("application/grpc-web+proto", Some(accept)).is_err(),
+            "unrelated type or suffix must stay 406: {accept}"
+        );
+    }
+}
+
+// ── Non-gRPC HTTP error entities are never framed (issue #5138) ──
+
+/// Run the owner's buffered response pipeline for one backend answer and report
+/// the client-visible gRPC-Web body.
+async fn grpc_web_buffered_response_body(
+    client_ct: &str,
+    backend_status: u16,
+    backend_ct: Option<&str>,
+    backend_body: &[u8],
+) -> Vec<u8> {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context(client_ct);
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers = HashMap::new();
+    if let Some(content_type) = backend_ct {
+        response_headers.insert("content-type".to_string(), content_type.to_string());
+    }
+    plugin
+        .after_proxy(&mut ctx, backend_status, &mut response_headers)
+        .await;
+    let negotiated = response_headers
+        .get("content-type")
+        .cloned()
+        .expect("after_proxy relabels the representation");
+    plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            backend_body,
+            Some(negotiated.as_str()),
+            &response_headers,
+        )
+        .await
+        .expect("owner translation")
+}
+
+#[tokio::test]
+async fn buffered_non_grpc_error_entity_becomes_a_terminal_only_frame() {
+    // 503 + text/plain is an HTTP error document, not a gRPC message stream.
+    // Framing it produced bytes whose first octet (`s`) is not a frame flag, so
+    // the correctly mapped status was unreachable to a frame parser.
+    for backend_ct in [Some("text/plain"), Some("text/html; charset=utf-8"), None] {
+        let output = grpc_web_buffered_response_body(
+            "application/grpc-web",
+            503,
+            backend_ct,
+            b"service unavailable",
+        )
+        .await;
+        assert_eq!(
+            output.first(),
+            Some(&ferrum_edge::_test_support::GRPC_FRAME_TRAILER),
+            "backend_ct={backend_ct:?}: the body must start at a valid frame"
+        );
+        let payload = grpc_web_trailer_payload(&output);
+        assert!(
+            payload.contains("grpc-status: 14"),
+            "backend_ct={backend_ct:?}: mapped status must ride the frame: {payload}"
+        );
+        assert!(
+            !output.windows(7).any(|window| window == b"service"),
+            "backend_ct={backend_ct:?}: the HTTP error document must not be framed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn buffered_non_grpc_error_entity_is_dropped_in_text_mode_too() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let output = grpc_web_buffered_response_body(
+        "application/grpc-web-text",
+        503,
+        Some("text/plain"),
+        b"service unavailable",
+    )
+    .await;
+    let decoded = BASE64.decode(&output).expect("text mode emits base64");
+    assert_eq!(
+        decoded.first(),
+        Some(&ferrum_edge::_test_support::GRPC_FRAME_TRAILER)
+    );
+    let payload = grpc_web_trailer_payload(&decoded);
+    assert!(payload.contains("grpc-status: 14"), "{payload}");
+}
+
+#[tokio::test]
+async fn framed_backend_bodies_are_still_forwarded() {
+    let mut framed = vec![0x00u8];
+    framed.extend_from_slice(&5u32.to_be_bytes());
+    framed.extend_from_slice(b"hello");
+
+    // An ordinary HTTP 200 reply is forwarded verbatim even when the backend
+    // labelled it oddly, so no message bytes are discarded on a successful RPC.
+    for (case, status, backend_ct) in [
+        ("ok native", 200u16, Some("application/grpc")),
+        ("ok unlabelled", 200, None),
+        ("ok mislabelled", 200, Some("text/plain")),
+        // A backend that genuinely framed its error keeps its frames.
+        ("framed error", 503, Some("application/grpc")),
+        (
+            "framed error with suffix",
+            503,
+            Some("application/grpc+json"),
+        ),
+    ] {
+        let output =
+            grpc_web_buffered_response_body("application/grpc-web", status, backend_ct, &framed)
+                .await;
+        assert_eq!(
+            &output[..framed.len()],
+            &framed[..],
+            "{case}: backend message frames must be preserved"
+        );
+        assert_eq!(
+            output[framed.len()],
+            ferrum_edge::_test_support::GRPC_FRAME_TRAILER,
+            "{case}: exactly one terminal frame is appended"
+        );
+    }
+}
+
+#[tokio::test]
+async fn streaming_non_grpc_error_entity_is_drained_not_framed() {
+    use bytes::Bytes;
+    use ferrum_edge::_test_support::{
+        GRPC_FRAME_TRAILER, parse_grpc_frames,
+        proxy_body_into_grpc_web_streaming_suppressed_for_test, proxy_body_streaming_for_test,
+    };
+    use ferrum_edge::proxy::body::ProxyBodyError;
+    use futures_util::stream;
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let source = StreamBody::new(stream::iter(vec![
+        Ok::<_, ProxyBodyError>(Frame::data(Bytes::from_static(b"service "))),
+        Ok(Frame::data(Bytes::from_static(b"unavailable"))),
+    ]));
+    let body = proxy_body_streaming_for_test(Box::pin(source));
+    let mut body = proxy_body_into_grpc_web_streaming_suppressed_for_test(
+        body,
+        "application/grpc-web+proto",
+        503,
+        None,
+    );
+
+    let frame = body
+        .frame()
+        .await
+        .expect("a terminal frame is still emitted")
+        .expect("terminal frame readable");
+    let data = frame.data_ref().expect("terminal status rides DATA");
+    let frames = parse_grpc_frames(data);
+    assert_eq!(
+        frames.len(),
+        1,
+        "only the terminal frame reaches the client"
+    );
+    assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
+    assert!(
+        frames[0]
+            .1
+            .windows(b"grpc-status: 14".len())
+            .any(|window| window == b"grpc-status: 14"),
+        "the mapped status must be the whole body"
+    );
+    assert!(body.frame().await.is_none(), "the entity was drained");
+}
+
+// ── Request trailers never reach a transaction log (GHSA-9f6g-hqpq-v8h7) ──
+
+#[tokio::test]
+async fn staged_request_trailers_are_omitted_from_transaction_summaries() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ferrum_edge::plugins::TransactionSummary;
+
+    // A non-secret canary standing in for application trailing metadata: the
+    // container is base64, so a leak is reversible rather than opaque.
+    const CANARY: &str = "ferrum-canary-trailer-value";
+
+    let mut body = request_frame(0x00, b"hello");
+    body.extend_from_slice(&request_frame(
+        0x80,
+        format!("x-app-session: {CANARY}\r\n").as_bytes(),
+    ));
+
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    plugin
+        .transform_request_body_with_context(&mut ctx, &body, None, &headers)
+        .await;
+
+    // Backend dispatch still gets the native trailers: this is omission from the
+    // log projection, not removal of the transport contract.
+    assert_eq!(
+        ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx.metadata),
+        Some(vec![("x-app-session".to_string(), CANARY.to_string())]),
+        "native trailer delivery must be unaffected"
+    );
+
+    let log_metadata = ferrum_edge::_test_support::clone_log_metadata_for_test(&ctx);
+    assert!(
+        !log_metadata.contains_key("grpc_web.request_trailers"),
+        "the staging container must not reach a transaction summary"
+    );
+
+    // Serialize the real summary the way every logger sink does, and prove the
+    // canary is absent even if a producer put the container back.
+    let mut summary = TransactionSummary {
+        metadata: log_metadata,
+        ..TransactionSummary::default()
+    };
+    summary.metadata.insert(
+        "grpc_web.request_trailers".to_string(),
+        BASE64.encode(format!(r#"[["x-app-session","{CANARY}"]]"#)),
+    );
+    let rendered = serde_json::to_string(&summary).expect("summary serializes");
+    assert!(
+        !rendered.contains("grpc_web.request_trailers"),
+        "the container key must be omitted by every serializer: {rendered}"
+    );
+    let encoded = BASE64.encode(CANARY);
+    assert!(
+        !rendered.contains(CANARY) && !rendered.contains(&encoded),
+        "no trailer value, encoded or not, may reach a transaction log: {rendered}"
+    );
+}
+
+// ── expose_headers admission and normalization (issue #5134) ──
+
+#[tokio::test]
+async fn expose_headers_are_trimmed_lowercased_and_deduplicated() {
+    let plugin = create_plugin("grpc_web", &json!({"expose_headers": [" X-Ok ", "x-ok"]}))
+        .expect("valid config")
+        .expect("plugin constructed");
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+
+    let expose = response_headers
+        .get("access-control-expose-headers")
+        .expect("expose list");
+    let occurrences = expose
+        .split(',')
+        .filter(|token| token.trim() == "x-ok")
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "padded and case-variant spellings collapse to one lowercase entry: {expose}"
+    );
+    assert!(
+        !expose.contains("X-Ok"),
+        "accepted names are normalized to lowercase: {expose}"
+    );
+}
+
+#[test]
+fn expose_headers_field_admission_matches_the_documented_contract() {
+    // The constructor is the source of truth the OpenAPI component models; see
+    // `grpc_web_schema_matches_the_strict_runtime_shape` for the parity check.
+    for accepted in [
+        json!({}),
+        json!({"expose_headers": null}),
+        json!({"expose_headers": []}),
+        json!({"expose_headers": [" X-Ok "]}),
+        json!({"expose_headers": ["custom-header-bin", "x-request-id"]}),
+    ] {
+        assert!(
+            validate_plugin_config("grpc_web", &accepted).is_ok(),
+            "must accept: {accepted}"
+        );
+    }
+
+    for (case, rejected) in [
+        ("empty item", json!({"expose_headers": [""]})),
+        ("whitespace-only item", json!({"expose_headers": ["   "]})),
+        ("internal space", json!({"expose_headers": ["bad name"]})),
+        ("colon", json!({"expose_headers": ["bad:name"]})),
+        ("CRLF", json!({"expose_headers": ["x-ok\r\nx-injected"]})),
+        ("non-string item", json!({"expose_headers": [1]})),
+        ("not an array", json!({"expose_headers": "x-ok"})),
+    ] {
+        assert!(
+            validate_plugin_config("grpc_web", &rejected).is_err(),
+            "{case}: must be rejected: {rejected}"
+        );
+    }
+}

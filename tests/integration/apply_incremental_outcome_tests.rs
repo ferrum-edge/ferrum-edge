@@ -14,6 +14,8 @@
 //! to the polling loop in `src/modes/database.rs` to verify the cursor only
 //! advances on `Applied`/`Unchanged`, never on `Rejected`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::{collections::HashMap, sync::Arc};
 
 use base64::Engine;
@@ -2020,7 +2022,8 @@ async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
     plugin.plugin_name = "ldap_auth".to_string();
     plugin.config = serde_json::json!({
         "ldap_url": "ldaps://directory.example.test:636",
-        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test"
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test",
+        "canonical_identity_attribute": "uid"
     });
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
@@ -2044,7 +2047,8 @@ async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
     let mut invalid = valid;
     invalid.plugin_configs[0].config = serde_json::json!({
         "ldap_url": "ldap://directory.example.test:389",
-        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test"
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test",
+        "canonical_identity_attribute": "uid"
     });
     invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
     let outcome = state.update_config(invalid);
@@ -2750,7 +2754,7 @@ async fn apply_incremental_upstream_only_tls_change_reconciles_stream_listeners(
     std::fs::write(&ca_b_path, &ca_b_pem).expect("write ca b");
 
     // Backend: TLS echo server with a CA-B-signed cert.
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend echo listener");
     let backend_port = backend_listener

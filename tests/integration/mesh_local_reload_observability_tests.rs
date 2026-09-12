@@ -7,6 +7,8 @@
 //! clear only after the exact current recovery is accepted by the proxy apply
 //! lifecycle (not on provisional install / channel send).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -171,7 +173,7 @@ fn build_mesh_admin_state(config_rejected: Arc<AtomicBool>) -> AdminState {
 async fn start_test_admin(state: AdminState) -> (u16, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(

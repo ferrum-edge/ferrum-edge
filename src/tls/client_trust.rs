@@ -559,9 +559,10 @@ fn unique_signer_spkis<'a>(certs: &'a [X509Certificate<'a>]) -> Vec<SubjectPubli
 /// Prefers the digest of a uniquely verified signer SPKI from the accepted
 /// client-CA bundle. Matching the CRL issuer DN or Authority Key Identifier is
 /// not enough: two CA keys can deliberately share both. When no bundle key
-/// verifies, require one syntactically unambiguous AKI but include the complete
-/// signed CRL in a distinct conservative identity domain. That makes routine
-/// outside-bundle reissues retire sessions, but prevents a second signing key
+/// verifies, include the complete signed CRL in a distinct conservative identity
+/// domain. An absent AKI does not prevent that byte identity; a present malformed
+/// or duplicate AKI is still refused. That makes routine outside-bundle reissues
+/// retire sessions, but prevents a second signing key
 /// with colliding metadata from suppressing `CrlChanged`. Anything else fails
 /// closed — never fall back to issuer DN or AKI alone.
 fn crl_signer_key_identity(
@@ -611,9 +612,10 @@ fn conservative_unverified_crl_identity(
             _ => return Err(ClientTrustMaterialError),
         }
     }
-    let Some(key_id) = key_id else {
-        return Err(ClientTrustMaterialError);
-    };
+    // The complete signed DER already distinguishes outside-bundle CRLs.
+    // Absence of AKI therefore needs no invented key identity. Preserve the
+    // existing digest for valid AKIs and all validation of present extensions.
+    let key_id = key_id.unwrap_or_default();
     Ok(digest_of(&[
         ISSUER_DOMAIN_UNVERIFIED_CRL,
         crl.issuer().as_raw(),

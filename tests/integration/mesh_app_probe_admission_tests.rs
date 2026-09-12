@@ -8,6 +8,8 @@
 //! the active-probe budget, measured where it matters: the number of
 //! simultaneous loopback connections reaching the application container.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -40,7 +42,7 @@ fn spawn_slow_application() -> (
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind slow application");
+    let listener = std::net::TcpListener::bind_test("127.0.0.1:0").expect("bind slow application");
     listener.set_nonblocking(true).expect("nonblocking");
     let port = listener.local_addr().expect("addr").port();
     let listener = TcpListener::from_std(listener).expect("adopt listener");
@@ -92,7 +94,7 @@ async fn start_probe_server(
     admission: Arc<AppProbeAdmission>,
     probes_json: &str,
 ) -> RunningProbeServer {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind probe listener");
     let port = listener.local_addr().expect("addr").port();

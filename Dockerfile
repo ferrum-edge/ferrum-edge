@@ -20,7 +20,7 @@
 ARG FEATURES=cloud-secrets
 # Digest resolved 2026-08-31; the tag is kept for readability, the digest is authoritative.
 ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
-ARG IPROUTE2_BASE=debian:13-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+ARG IPROUTE2_BASE=debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 ARG IPROUTE2_VERSION=6.15.0-1
 ARG BPF_LINKER_VERSION=0.11.0
 ARG BPF_LINKER_AMD64_SHA256=10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450
@@ -113,7 +113,7 @@ WORKDIR /build
 # Copy only manifests and build script first, so Docker can cache the
 # expensive dependency download + compile step across source changes.
 COPY Cargo.toml Cargo.lock build.rs ./
-COPY build/protoc_preflight.rs ./build/
+COPY build/protoc_preflight.rs build/builtin_plugin_names.rs ./build/
 COPY proto ./proto
 COPY custom_plugins ./custom_plugins
 # Vendored crates referenced by [patch.crates-io] in Cargo.toml. Must be
@@ -183,6 +183,7 @@ ENV PATH="/app:${PATH}" \
 EXPOSE 8000 8443 9000 9443 50051
 
 # Health check using the built-in CLI subcommand (no curl needed)
+# Infer the effective admin host/port, including endpoint secret suffixes.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/app/ferrum-edge", "health"]
 
@@ -284,6 +285,7 @@ ENV PATH="/app:${PATH}" \
 
 EXPOSE 8000 8443 9000 9443 50051
 
+# Infer the effective admin host/port, including endpoint secret suffixes.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/app/ferrum-edge", "health"]
 

@@ -7,6 +7,8 @@
 //! - gRPC error responses are properly formatted when backend is unavailable
 //! - Auth plugins work with gRPC metadata (HTTP/2 headers)
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -431,7 +433,7 @@ fn create_test_proxy_state_with_env(
 /// - The request path echoed in a custom `x-echo-path` header
 /// - The request body echoed back
 async fn start_mock_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -504,7 +506,7 @@ async fn start_mock_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) 
 /// (Hyper reconstructs the latter from `:authority`) so RFC 9113 §8.3.1
 /// agreement can be asserted on the native-gRPC outbound path.
 async fn start_host_echoing_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -563,7 +565,7 @@ async fn start_host_echoing_grpc_backend() -> (SocketAddr, tokio::task::JoinHand
 /// an incomplete frontend upload never dispatches a partial primary request.
 async fn start_counting_grpc_echo_backend()
 -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(AtomicUsize::new(0));
     let service_requests = Arc::clone(&requests);
@@ -605,7 +607,7 @@ async fn start_counting_grpc_echo_backend()
 
 async fn start_connection_counting_backend()
 -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let connection_count = Arc::new(AtomicUsize::new(0));
     let task_count = Arc::clone(&connection_count);
@@ -623,7 +625,7 @@ async fn start_connection_counting_backend()
 /// Uses an internal listener approach to avoid port race conditions:
 /// we accept connections ourselves and feed them to the gateway's handler.
 async fn start_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let gateway_addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -914,7 +916,10 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
                 Method::POST,
                 "/grpc-accept/my.Service/Unary",
                 "application/grpc-web+json",
-                Some("text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8"),
+                // Non-`q` parameters still match type/subtype/suffix (issue #5137
+                // narrower rule). charset after `q` is accept-ext and is also
+                // ignored for selection; either placement must negotiate text+json.
+                Some("text/html, Application/Grpc-Web-Text+Json; Q=0.8; charset=utf-8"),
             )
             .await
             .unwrap_or_else(|error| panic!("{version:?} text-negotiated request failed: {error}"));
@@ -943,6 +948,51 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
              (last status={last_text_status}, content-type={last_text_ct:?}, \
              vary={last_text_vary:?}, {} body bytes)",
             last_text_body_len
+        );
+
+        // Issue #5137: a `q=0` refusal aimed at a parameterized variant must
+        // not suppress the unparameterized representation the same list
+        // explicitly accepted.
+        let (status, headers, _body) = send_http_request_with_accept(
+            gateway_addr,
+            version,
+            Method::POST,
+            "/grpc-accept/my.Service/Unary",
+            "application/grpc-web+proto",
+            Some("application/grpc-web+proto;q=1, application/grpc-web+proto;version=2;q=0"),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{version:?} parameterized-refusal request failed: {error}")
+        });
+        assert_ne!(
+            status, 406,
+            "{version:?} a parameterized refusal must not veto an accepted representation"
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc-web+proto")
+        );
+
+        // A parameterized-only Accept still matches on type/subtype/suffix
+        // (the H3 functional client and browsers send charset=utf-8 this way).
+        let (status, headers, _body) = send_http_request_with_accept(
+            gateway_addr,
+            version,
+            Method::POST,
+            "/grpc-accept/my.Service/Unary",
+            "application/grpc-web+proto",
+            Some("application/grpc-web+proto;version=2"),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{version:?} parameterized-only request failed: {error}"));
+        assert_ne!(
+            status, 406,
+            "{version:?} a parameterized type match must not 406 on its own"
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc-web+proto")
         );
 
         let text_request = BASE64.encode([0u8, 0, 0, 0, 0]);
@@ -986,7 +1036,13 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
             last_binary_body_len
         );
 
-        for accept in ["text/html", "application/grpc-web;q=broken"] {
+        for accept in [
+            "text/html",
+            "application/grpc-web;q=broken",
+            // A parameterized range whose type/suffix does not match is still
+            // Not Acceptable — parameters must not make an unrelated range win.
+            "application/grpc-web-text+thrift;charset=utf-8",
+        ] {
             let (status, headers, body) = send_http_request_with_accept(
                 gateway_addr,
                 version,
@@ -1149,7 +1205,7 @@ async fn start_grpc_backend_echoing_request_trailers() -> (SocketAddr, tokio::ta
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -2744,7 +2800,7 @@ async fn start_streaming_grpc_backend(
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -2937,7 +2993,7 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -3057,7 +3113,7 @@ async fn start_grpc_backend_that_errors_after_data_frame()
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -3678,7 +3734,7 @@ async fn start_grpc_backend_with_custom_trailer_fixture()
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -3794,7 +3850,7 @@ async fn start_grpc_web_cadence_backend() -> (SocketAddr, tokio::task::JoinHandl
     use http_body_util::StreamBody;
     use tokio_stream::wrappers::ReceiverStream;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -4880,7 +4936,7 @@ async fn start_streaming_response_backend(
     use http_body::Frame;
     use http_body_util::{BodyExt, StreamBody};
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -4961,7 +5017,7 @@ async fn start_clean_grpc_streaming_backend() -> (SocketAddr, tokio::task::JoinH
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {

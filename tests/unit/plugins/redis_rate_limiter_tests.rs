@@ -299,6 +299,141 @@ fn test_from_plugin_config_rejects_malformed_redis_urls() {
     }
 }
 
+// ── Database selector admission (issue #5005) ─────────────────────────────
+//
+// redis-rs derives the database from the URL path and refuses a non-integer
+// selector — but only when the client is constructed, which every Redis-backed
+// plugin defers to first use. `validate` therefore exited 0 on
+// `redis://host/banana`, the gateway never became ready, and every correctly
+// formed request was answered with a fail-closed refusal naming nothing.
+// The check belongs to the shared parser, so all of its consumers get it.
+
+/// Selectors no Redis-family server can address must be refused at admission.
+#[test]
+fn from_plugin_config_rejects_an_unusable_database_selector() {
+    for redis_url in [
+        // Not a number at all (the reported reproduction).
+        "redis://cache.internal:6379/banana",
+        "rediss://cache.internal:6380/banana",
+        // Numeric-looking but not an integer.
+        "redis://cache.internal:6379/0.5",
+        "redis://cache.internal:6379/1_000",
+        "redis://cache.internal:6379/%30",
+        // More than one path segment: redis-rs parses the whole trimmed path.
+        "redis://cache.internal:6379/0/1",
+        "redis://cache.internal:6379/db/0",
+        // Out of range in both directions.
+        "redis://cache.internal:6379/-1",
+        "redis://cache.internal:6379/2147483648",
+        "redis://cache.internal:6379/99999999999999999999",
+    ] {
+        let config = json!({
+            "sync_mode": "redis",
+            "redis_url": redis_url,
+        });
+        assert!(
+            RedisConfig::from_plugin_config(&config, "ferrum:test").is_err(),
+            "redis_url must fail admission: {redis_url}"
+        );
+    }
+}
+
+/// The same selectors are refused while `sync_mode` is still `local`, so a later
+/// toggle cannot activate a URL that admission never validated.
+#[test]
+fn from_plugin_config_rejects_a_latent_unusable_database_selector() {
+    let config = json!({
+        "sync_mode": "local",
+        "redis_url": "redis://cache.internal:6379/banana",
+    });
+    assert!(
+        RedisConfig::from_plugin_config(&config, "ferrum:test").is_err(),
+        "a latent unusable database selector must fail closed"
+    );
+}
+
+/// Every legitimate selector shape still passes: absent, bare slash, the usual
+/// small indexes, and the largest index a server could be configured for.
+#[test]
+fn from_plugin_config_accepts_every_usable_database_selector() {
+    for redis_url in [
+        "redis://cache.internal:6379",
+        "redis://cache.internal:6379/",
+        "redis://cache.internal:6379/0",
+        "redis://cache.internal:6379/15",
+        "rediss://cache.internal:6380/9",
+        "redis://user:pass@cache.internal:6379/3",
+        "redis://cache.internal:6379/2147483647",
+        "redis://cache.internal:6379/0?protocol=resp3",
+    ] {
+        let config = json!({ "sync_mode": "redis", "redis_url": redis_url });
+        let parsed = RedisConfig::from_plugin_config(&config, "ferrum:test")
+            .unwrap_or_else(|error| panic!("{redis_url} must be admitted: {error}"));
+        assert_eq!(
+            parsed.map(|config| config.url),
+            Some(redis_url.to_string()),
+            "the admitted URL must be preserved byte-for-byte"
+        );
+    }
+}
+
+/// The diagnostic names the field and the accepted shape, and never echoes the
+/// URL: `redis_url` is a documented place to encode ACL credentials.
+#[test]
+fn an_unusable_database_selector_is_diagnosed_without_echoing_the_url() {
+    let secret = "super-secret-redis-pw";
+    let config = json!({
+        "sync_mode": "redis",
+        "redis_url": format!("redis://acl:{secret}@cache.internal:6379/banana"),
+    });
+    let err = RedisConfig::from_plugin_config(&config, "ferrum:test")
+        .err()
+        .unwrap_or_else(|| {
+            panic!("an unusable database selector must be rejected at construction")
+        });
+    assert!(
+        err.contains("redis_url") && err.contains("database number"),
+        "diagnostic must name the field and the accepted shape: {err}"
+    );
+    assert!(
+        !err.contains(secret) && !err.contains("cache.internal") && !err.contains("banana"),
+        "redis_url diagnostic must not echo secrets or the URL: {err}"
+    );
+}
+
+/// The check lives in the shared parser, so a rate-limit consumer and a direct
+/// consumer (`hmac_auth`'s shared replay authority — the reported reproduction)
+/// both refuse the same URL at plugin construction instead of at first use.
+#[tokio::test]
+async fn every_redis_backed_plugin_refuses_an_unusable_database_selector() {
+    let unusable = "redis://127.0.0.1:6379/banana";
+
+    let err = create_rate_limit_plugin_with_config_id(
+        "rate_limiting",
+        &json!({
+            "limits": [{ "scope": "default", "requests_per_minute": 10 }],
+            "sync_mode": "redis",
+            "redis_url": unusable,
+        }),
+        Some("rl-1"),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("rate_limiting must refuse an unusable database selector"));
+    assert!(err.contains("database number"), "got: {err}");
+
+    let err = ferrum_edge::plugins::create_plugin(
+        "hmac_auth",
+        &json!({
+            "replay_scope": "shared",
+            "sync_mode": "redis",
+            "redis_url": unusable,
+        }),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("hmac_auth must refuse an unusable database selector"));
+    assert!(err.contains("database number"), "got: {err}");
+}
+
 /// Issue #4173: a configured exclusive CA that cannot be loaded must not
 /// silently fall back to redis-rs default (system/public) roots.
 #[test]
@@ -309,7 +444,8 @@ fn redis_tls_fails_closed_when_configured_ca_cannot_be_loaded() {
     let config = make_config("rediss://cache.internal:6380/0", true);
 
     let err = RedisRateLimitClient::new(config, None, false, Some(missing_path))
-        .expect_err("unloadable exclusive CA must refuse construction");
+        .err()
+        .unwrap_or_else(|| panic!("unloadable exclusive CA must refuse construction"));
     assert!(
         err.contains("exclusive CA bundle") && err.contains("refusing to fall back"),
         "diagnostic must name the fail-closed exclusive-CA decision: {err}"
@@ -403,7 +539,8 @@ fn test_from_plugin_config_rejects_insecure_fragment_without_echoing_the_url() {
         "redis_tls": true,
     });
     let err = RedisConfig::from_plugin_config(&config, "ferrum:test")
-        .expect_err("fragment-bearing redis_url must be rejected at construction");
+        .err()
+        .unwrap_or_else(|| panic!("fragment-bearing redis_url must be rejected at construction"));
     assert!(
         err.contains("fragment"),
         "diagnostic must name the rejected shape: {err}"
@@ -474,7 +611,10 @@ fn test_rate_limiting_plugin_rejects_insecure_redis_url_fragment() {
         "redis_tls": true,
     });
     let err = create_rate_limit_plugin_with_config_id("rate_limiting", &config, Some("rl-1"))
-        .expect_err("rate_limiting must fail construction on a fragment-bearing redis_url");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("rate_limiting must fail construction on a fragment-bearing redis_url")
+        });
     assert!(err.contains("fragment"), "got: {err}");
     assert!(
         !err.contains("cache.internal") && !err.contains("#insecure"),
@@ -576,11 +716,28 @@ fn connect_timeout_is_installed_into_redis_connection_config_above_and_below_one
     }
 
     let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    let pooled_config = "screened_async_connection_config(self.connect_timeout())";
+    let shared_helper = ".set_connection_timeout(Some(connect_timeout))";
     assert!(
-        source.contains(
-            "redis::AsyncConnectionConfig::new().set_connection_timeout(Some(self.connect_timeout()))"
-        ),
+        source.contains(pooled_config),
         "inner AsyncConnectionConfig must carry Ferrum's timeout, not the crate 1s default"
+    );
+    assert!(
+        source.contains(shared_helper),
+        "the shared connection-config helper must install Ferrum's connect timeout"
+    );
+    // Issue #5006: the pooled and dedicated paths dial with the crate's 500ms
+    // command cap disabled so the INFO screens get the configured deadline, then
+    // re-arm a bounded per-command deadline before the connection is published.
+    let rearm = "conn.set_response_timeout(SCREENED_COMMAND_RESPONSE_TIMEOUT);";
+    assert!(
+        source.contains(rearm),
+        "a screened connection must be re-armed with a bounded command deadline"
+    );
+    let screened_sites = source.matches("self.screen_and_arm(&mut conn)").count();
+    assert_eq!(
+        screened_sites, 2,
+        "both the pooled and the dedicated connect paths must screen and re-arm"
     );
 }
 
@@ -1638,7 +1795,8 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
         "redis://{USER}:{PASSWORD}@cache.internal:6379/0?auth={TOKEN}"
     ));
     let err = RedisConfig::from_plugin_config(&leaked_shape, "ferrum:test")
-        .expect_err("non-object config must be rejected");
+        .err()
+        .unwrap_or_else(|| panic!("non-object config must be rejected"));
     assert!(
         err.contains("must be a JSON object"),
         "unexpected non-object diagnostic: {err}"
@@ -1657,7 +1815,8 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
         }),
         "ferrum:test",
     )
-    .expect_err("invalid sync_mode must be rejected");
+    .err()
+    .unwrap_or_else(|| panic!("invalid sync_mode must be rejected"));
     assert!(
         sync_err.contains("'sync_mode'") && sync_err.contains("'local' or 'redis'"),
         "unexpected sync_mode diagnostic: {sync_err}"
@@ -1678,7 +1837,8 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
         }),
         "ferrum:test",
     )
-    .expect_err("non-redis scheme must be rejected");
+    .err()
+    .unwrap_or_else(|| panic!("non-redis scheme must be rejected"));
     assert!(
         url_err.contains("'redis_url'") && url_err.contains("scheme"),
         "unexpected url diagnostic: {url_err}"
@@ -1697,7 +1857,8 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
         }),
         "ferrum:test",
     )
-    .expect_err("unparseable redis_url must be rejected");
+    .err()
+    .unwrap_or_else(|| panic!("unparseable redis_url must be rejected"));
     assert!(
         parse_err.contains("'redis_url'") && parse_err.contains("valid URL"),
         "unexpected parse diagnostic: {parse_err}"
@@ -1792,6 +1953,82 @@ fn classify_memory_info_accepts_unlimited_or_noeviction_only() {
         classify_memory_info("maxmemory:\r\nmaxmemory_policy:\r\n"),
         MemoryPolicyScreen::Unproven
     );
+}
+
+/// GHSA-26gf-943w-w5x8: the no-eviction prerequisite is a property of what the
+/// consumer retains, not of how it logs. A client whose retained record IS the
+/// control must demand the screen; a counter or cache client must not, because
+/// eviction only costs it accuracy and requiring `INFO MEMORY` of it would
+/// refuse deployments that are perfectly safe.
+#[test]
+fn only_retention_authorities_require_the_no_eviction_screen() {
+    let config = make_config("redis://127.0.0.1:6379/0", false);
+    let counters = RedisRateLimitClient::new(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(
+        !counters.requires_no_eviction_screen_for_test(),
+        "a counter/cache client must keep the topology-only screen"
+    );
+
+    let replay = RedisRateLimitClient::for_replay_authority(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(replay.requires_no_eviction_screen_for_test());
+
+    let retention = RedisRateLimitClient::for_retention_authority(config, None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(
+        retention.requires_no_eviction_screen_for_test(),
+        "an idempotency authority must prove the endpoint retains its records"
+    );
+}
+
+/// The three memory-policy verdicts, applied exactly as a freshly established
+/// connection applies them: a proven non-evicting endpoint is usable, a proven
+/// evicting one is terminal for the client generation (no recovery ping can
+/// make the next operation correct), and an unproven screen is a recoverable
+/// outage that leaves the consumer's failure policy in charge.
+#[test]
+fn retention_authority_admits_only_a_proven_non_evicting_endpoint() {
+    use ferrum_edge::_test_support::MemoryPolicyScreen;
+
+    let config = make_config("redis://127.0.0.1:6379/0", false);
+
+    let usable = RedisRateLimitClient::for_retention_authority(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(usable.apply_memory_policy_screen_for_test(MemoryPolicyScreen::Usable));
+    assert!(usable.is_available());
+    assert!(!usable.is_topology_unsupported());
+
+    let evicting = RedisRateLimitClient::for_retention_authority(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(!evicting.apply_memory_policy_screen_for_test(MemoryPolicyScreen::UnsafeEviction));
+    assert!(!evicting.is_available());
+    assert!(
+        evicting.is_topology_unsupported(),
+        "a proven evicting endpoint is configuration, not an outage"
+    );
+    // Terminal means terminal: a later successful probe cannot republish it.
+    assert!(!evicting.publish_reachable_for_test());
+    assert!(!evicting.is_available());
+
+    let unproven = RedisRateLimitClient::for_retention_authority(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(!unproven.apply_memory_policy_screen_for_test(MemoryPolicyScreen::Unproven));
+    assert!(!unproven.is_available());
+    assert!(
+        !unproven.is_topology_unsupported(),
+        "an unproven screen must stay recoverable"
+    );
+    assert!(unproven.publish_reachable_for_test());
+    assert!(unproven.is_available());
+
+    // A counter/cache client never runs the screen, so even a proven evicting
+    // verdict leaves it usable.
+    let counters = RedisRateLimitClient::new(config, None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(counters.apply_memory_policy_screen_for_test(MemoryPolicyScreen::UnsafeEviction));
+    assert!(counters.is_available());
+    assert!(!counters.is_topology_unsupported());
 }
 
 #[test]
@@ -2358,6 +2595,96 @@ async fn an_endpoint_that_never_answers_info_fails_closed_within_the_connect_tim
     let _ = server.shutdown.send(());
 }
 
+/// Issue #5006: the proactive `INFO CLUSTER` screen on a NEW pooled connection
+/// must obey the configured `redis_connect_timeout_seconds`, not redis-rs'
+/// 500ms command-response default. A healthy server that answers `INFO` after
+/// 750ms fits a 2-second screen; before the fix the inner cap refused it, and
+/// every replacement pooled connection repeated the refusal even after the
+/// background recovery probe (which never had the shorter cap) reported the
+/// endpoint healthy.
+#[tokio::test]
+async fn a_slow_info_screen_still_fits_the_configured_probe_deadline() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let slow_screen = Duration::from_millis(750);
+    let server = spawn_screened_redis_server(info, slow_screen, Duration::ZERO).await;
+    let client = screened_client(server.port, 2);
+
+    let served = client.get_bytes("{ferrum%3Atest:probe}").await;
+    assert_eq!(
+        served,
+        Ok(None),
+        "an INFO answered inside the configured deadline must not refuse the endpoint"
+    );
+    assert!(client.is_available());
+    assert!(!client.is_topology_unsupported());
+    assert_eq!(server.infos.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        server.gets.load(Ordering::Relaxed),
+        1,
+        "the screened connection must go on to serve the policy command"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The relaxed screen bound is a deadline, not its removal: an `INFO` slower
+/// than the configured deadline is still an ordinary retryable outage and the
+/// unscreened connection still carries no command.
+#[tokio::test]
+async fn an_info_screen_slower_than_the_configured_deadline_fails_closed() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let over_deadline = Duration::from_millis(2_500);
+    let server = spawn_screened_redis_server(info, over_deadline, Duration::ZERO).await;
+    let client = screened_client(server.port, 1);
+
+    let refused = client.get_bytes("{ferrum%3Atest:probe}").await;
+    assert!(
+        refused.is_err(),
+        "a screen that misses its deadline must fail closed"
+    );
+    assert!(!client.is_available());
+    assert!(
+        !client.is_topology_unsupported(),
+        "an unanswered probe is a retryable outage, not proof of Cluster topology"
+    );
+    assert_eq!(
+        server.gets.load(Ordering::Relaxed),
+        0,
+        "a policy command must never run on a connection that was not screened"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The relaxed bound is scoped to the screen. Once the connection is published,
+/// ordinary commands keep a bounded per-command response deadline, so a backend
+/// that goes silent mid-command cannot pin a hot-path request to the far larger
+/// connect/screen budget.
+#[tokio::test]
+async fn a_screened_connection_still_bounds_ordinary_command_replies() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let stalled = Duration::from_secs(30);
+    let server = spawn_screened_redis_server(info, Duration::ZERO, stalled).await;
+    // A 60-second connect/screen budget: only the per-command response
+    // deadline can end this GET.
+    let client = screened_client(server.port, 60);
+
+    let started = std::time::Instant::now();
+    let refused = client.get_bytes("{ferrum%3Atest:stalled}").await;
+    let elapsed = started.elapsed();
+    assert!(
+        refused.is_err(),
+        "a silent command reply must not be awaited without a bound"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "ordinary commands must stay bounded after the screen, took {elapsed:?}"
+    );
+    assert!(!client.is_available());
+
+    let _ = server.shutdown.send(());
+}
+
 /// A command whose reply lands *after* another task proved Cluster topology must
 /// be reported as a failure, so the consumer's `redis_failure_policy` governs.
 /// Over-counting one operation is safer than admitting traffic against a
@@ -2839,7 +3166,8 @@ fn cached_pool_pins_multiplexed_connection_not_connection_manager() {
     );
 
     // Both connect helpers dial multiplexed connections directly, and the
-    // pooled path screens topology before publishing into the ArcSwap slot.
+    // pooled path screens topology (and arms the per-command response
+    // deadline) before publishing into the ArcSwap slot.
     let publish = source
         .find("slot.connection.store(Arc::new(Some(conn.clone())))")
         .expect("pooled publication site");
@@ -2847,7 +3175,7 @@ fn cached_pool_pins_multiplexed_connection_not_connection_manager() {
         .find("match self.connect_multiplexed(client).await {")
         .expect("pooled establishment site");
     let screen = source[establish..publish]
-        .find("self.screen_established_connection(&mut conn)")
+        .find("self.screen_and_arm(&mut conn)")
         .expect("pooled path must screen topology before publishing");
     assert!(
         screen > 0,
@@ -3197,12 +3525,13 @@ fn mask_source(source: &str) -> MaskedSource {
     }
 }
 
-/// Macro names whose arguments become log records.
-const TRACING_MACROS: [&str; 12] = [
+/// Macro names whose arguments become log records, including sampled wrappers.
+const TRACING_MACROS: [&str; 13] = [
     "trace",
     "debug",
     "info",
     "warn",
+    "warn_sampled",
     "error",
     "event",
     "span",
@@ -3545,6 +3874,10 @@ fn identity_log_guard_catches_arbitrary_field_names_and_render_forms() {
         r#"fn f() { debug!("window for {key} tripped"); }"#,
         // Path-qualified macro.
         r#"fn f() { tracing::warn!(field = %total_key, "x"); }"#,
+        // Sampling wrappers retain the same recorded-value boundary.
+        r#"fn f() { warn_sampled!(anything_at_all = %key, "denied"); }"#,
+        r#"fn f() { warn_sampled!(?redis_key, "denied"); }"#,
+        r#"fn f() { crate::warn_sampled!("window for {key} tripped"); }"#,
         // Identity values that do not spell "key".
         r#"fn f() { warn!(who = %authenticated_identity, "x"); }"#,
     ];
@@ -3558,6 +3891,7 @@ fn identity_log_guard_catches_arbitrary_field_names_and_render_forms() {
     let allowed = [
         // Documented non-identity operator config.
         r#"fn f() { warn!(key_prefix = %self.config.key_prefix, "x"); }"#,
+        r#"fn f() { warn_sampled!(key_prefix = %self.config.key_prefix, "x"); }"#,
         // Ordinary bindings and non-tracing macros are not log records.
         r#"fn f() { let previous_key = b(); assert!(!previous_key.is_empty()); }"#,
         r#"fn f() { panic!("{previous_key}"); }"#,

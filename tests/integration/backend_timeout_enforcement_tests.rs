@@ -14,6 +14,8 @@
 //! suite (`scripted_backend_tests.rs`, `scripted_backend_h2_tests.rs`,
 //! `scripted_backend_h3_tests.rs`).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::Http2Client;
 use crate::scaffolding::backends::{
     HttpStep, RequestMatcher, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
@@ -611,17 +613,44 @@ const DRAIN_WATERMARK_MS: u64 = 400;
 // reads leaves the remainder parked in the gateway's own send queue.
 const DRAIN_PROBE_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 
-/// Fill `stream`'s send queue as far as the kernel will take it, returning the
-/// bytes accepted. Stops at the first `WouldBlock`, which is exactly the state
-/// a stalled backend leaves the gateway in.
+/// How long `fill_send_queue` keeps offering bytes after the first short write.
+const FILL_DEADLINE: Duration = Duration::from_millis(200);
+
+/// Receive buffer pinned on the never-reading peer's listener.
+///
+/// Accepted sockets inherit the listening socket's `SO_RCVBUF`, so this caps
+/// how much the peer's kernel can absorb on the fixture's behalf before the
+/// sender sees real backpressure.
+const NEVER_READING_PEER_RCVBUF: usize = 16 * 1024;
+
+/// Fill `stream`'s send queue until it stops draining, returning the bytes
+/// accepted.
+///
+/// A single `WouldBlock` is not evidence of a stall: it only says the socket
+/// was full at that instant, and a loopback peer's kernel keeps absorbing into
+/// its own receive buffer for a while afterwards, which lets the send queue
+/// drain and makes the watch correctly report progress (issue #4983 observed
+/// exactly that on macOS). So keep offering bytes across writable readiness
+/// under a bounded deadline: the loop ends when writability stops coming back,
+/// which IS persistent backpressure — the state a stalled backend leaves the
+/// gateway in — or when the deadline expires.
 async fn fill_send_queue(stream: &TcpStream, total: usize) -> usize {
     let chunk = vec![b'x'; 64 * 1024];
+    let started = Instant::now();
     let mut written = 0;
-    while written < total {
+    while written < total && started.elapsed() < FILL_DEADLINE {
         match stream.try_write(&chunk[..chunk.len().min(total - written)]) {
             Ok(0) => break,
             Ok(n) => written += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Readiness that never returns is the stall this fixture wants.
+                if tokio::time::timeout(Duration::from_millis(50), stream.writable())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Err(_) => break,
         }
     }
@@ -636,9 +665,16 @@ async fn send_queue_drain_watch_terminates_a_peer_that_never_reads() {
         // `docs/configuration.md` next to `backend_write_timeout_ms`.
         return;
     }
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind never-reading peer");
+    // Constrain what the peer's kernel will absorb for a socket nobody reads.
+    // Without this the fixture can hand the whole probe upload to the peer's
+    // receive buffer, the send queue drains, and the watch correctly reports
+    // progress instead of the stall the test is about.
+    socket2::SockRef::from(&listener)
+        .set_recv_buffer_size(NEVER_READING_PEER_RCVBUF)
+        .expect("pin the never-reading peer receive buffer");
     let addr = listener.local_addr().expect("local addr");
     // Accept and then never call `recv()` — the #4411 backend exactly.
     let peer = tokio::spawn(async move {
@@ -680,7 +716,7 @@ async fn send_queue_drain_watch_lets_a_reading_peer_finish() {
     if !ferrum_edge::_test_support::send_queue_probe_supported() {
         return;
     }
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind reading peer");
     let addr = listener.local_addr().expect("local addr");
@@ -880,15 +916,26 @@ mod vendored_established_hook {
         }
     }
 
-    /// A backend that answers every request on the same connection, so the
-    /// second request is a pooled reuse rather than a second dial.
+    /// A backend that answers every request on the same connection, so a second
+    /// request can be a pooled reuse rather than a second dial.
+    ///
+    /// Every response body is the client's source port for the connection that
+    /// carried the request, which is what lets the test below name the physical
+    /// connection each request actually travelled over instead of assuming the
+    /// pool returned one by some deadline.
     fn spawn_keepalive_backend(listener: tokio::net::TcpListener) {
         tokio::spawn(async move {
             loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
+                let Ok((mut socket, peer)) = listener.accept().await else {
                     return;
                 };
                 tokio::spawn(async move {
+                    let body = peer.port().to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
                     // One response per complete request head, so a request that
                     // arrives across two reads cannot desynchronize the
                     // connection and make reqwest open a second one.
@@ -903,11 +950,7 @@ mod vendored_established_hook {
                             pending.windows(4).position(|window| window == b"\r\n\r\n")
                         {
                             pending.drain(..end + 4);
-                            if socket
-                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                                .await
-                                .is_err()
-                            {
+                            if socket.write_all(response.as_bytes()).await.is_err() {
                                 return;
                             }
                         }
@@ -917,9 +960,24 @@ mod vendored_established_hook {
         });
     }
 
+    /// Duplicate a descriptor the hook reported so it can be queried after this
+    /// call, without taking ownership of the connection's own socket.
+    fn probe_socket(fd: &OwnedFd) -> std::net::TcpStream {
+        std::net::TcpStream::from(fd.try_clone().expect("duplicate the reported descriptor"))
+    }
+
+    /// Requests to issue while waiting for the client to reuse a pooled
+    /// connection. hyper returns a finished connection to the pool from a task
+    /// it spawns after the body completes, so the FIRST reuse attempt can race
+    /// that return and dial again (issue #4888). Every dial that loses the race
+    /// leaves one more idle connection in the pool, so the next checkout finds
+    /// one; this bound only exists so a client that never pools fails loudly
+    /// instead of looping forever.
+    const REUSE_ATTEMPTS: usize = 8;
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn established_reports_the_dialed_socket_once_per_physical_connection() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let addr = listener.local_addr().expect("local addr");
@@ -932,27 +990,67 @@ mod vendored_established_hook {
             .build()
             .expect("client");
 
+        // Issue requests until the backend reports one of its connections a
+        // second time: that request provably travelled over an already-open
+        // physical connection, whatever the pool did on the way there.
         let url = format!("http://{addr}/");
-        for _ in 0..2 {
+        let mut served_by = Vec::new();
+        let mut reused_port = None;
+        for _ in 0..REUSE_ATTEMPTS {
             let response = client.get(url.as_str()).send().await.expect("response");
             assert_eq!(response.status(), reqwest::StatusCode::OK);
-            assert_eq!(response.text().await.expect("body"), "ok");
+            let port: u16 = response
+                .text()
+                .await
+                .expect("body")
+                .parse()
+                .expect("the backend names the client source port that served the request");
+            if served_by.contains(&port) {
+                reused_port = Some(port);
+                break;
+            }
+            served_by.push(port);
         }
+        let reused_port = reused_port.expect(
+            "the client never reused a pooled connection, so the hook's per-connection \
+             contract could not be exercised",
+        );
 
         let sockets = admission.sockets.lock().expect("lock");
+        // Every connection the pool holds is still open, so source ports cannot
+        // repeat: one record per port IS one record per physical connection.
+        let mut reported: Vec<u16> = sockets
+            .iter()
+            .map(|fd| probe_socket(fd).local_addr().expect("local address").port())
+            .collect();
+        reported.sort_unstable();
+        let mut unique = reported.clone();
+        unique.dedup();
         assert_eq!(
-            sockets.len(),
-            1,
+            reported, unique,
             "established must fire exactly once per NEW physical connection; \
-             two requests over one pooled connection dial once"
+             a repeated source port means one connection was reported twice"
         );
+        // And a request carried by an already-open connection adds no record:
+        // the reused connection is named exactly once, not once per request.
+        assert_eq!(
+            reported.iter().filter(|port| **port == reused_port).count(),
+            1,
+            "established must not fire for a pooled reuse; the connection that \
+             served two requests was reported {reported:?}"
+        );
+
         // The reported descriptor is THIS connection's socket, not an arbitrary
         // open fd: its peer is the backend the client dialed.
-        let probe = std::net::TcpStream::from(
-            sockets[0]
-                .try_clone()
-                .expect("duplicate the reported descriptor"),
-        );
+        let probe = sockets
+            .iter()
+            .map(probe_socket)
+            .find(|probe| {
+                probe
+                    .local_addr()
+                    .is_ok_and(|local| local.port() == reused_port)
+            })
+            .expect("the reused connection must have been reported");
         assert_eq!(
             probe.peer_addr().expect("peer address").port(),
             addr.port(),

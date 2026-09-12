@@ -13,15 +13,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 from run_unit_ci import (
-    MINIMUM_PASSED, REQUIRED_TESTS, compiler_identity, main, proc_metrics,
-    validate_output, validate_usage,
+    MINIMUM_PASSED, REQUIRED_TESTS, UNIT_SHARD_MINIMUM_PASSED, compiler_identity, main,
+    minimum_passed, proc_metrics, validate_output, validate_usage,
 )
 
 
+# The Unit Tests job is a four-shard matrix; the shard's targets arrive through
+# job-level `UNIT_PRECOMPILE_TARGETS` / `UNIT_TARGET` env (see ci.yml), so the
+# literal step commands are shard-independent and stay pinned here.
 COMMANDS = {
-    "default-build": "cargo test --lib --test unit_tests --no-run",
+    "default-build": "cargo test $UNIT_PRECOMPILE_TARGETS --no-run",
     "default-lib": "cargo test --lib",
-    "default-unit": "cargo test --test unit_tests",
+    "default-unit": 'cargo test --test "$UNIT_TARGET"',
     "acme-build": "cargo test --features acme --lib --test acme_dns01_tests --no-run",
     "acme-outbound": "cargo test --features acme --lib tls::acme::client::tests",
     "acme-dns": "cargo test --features acme --test acme_dns01_tests",
@@ -37,21 +40,45 @@ STEPS = {
     "acme-dns": "Run ACME DNS-01 hook cancellation regressions",
     "acme-renewal": "Run ACME renewal crash-recovery regressions",
 }
+# The optional `acme` feature compiles the library a second time, so its four
+# phases live in their own path-gated job (`test-acme`) instead of extending
+# the monolithic Unit Tests critical path on every pull request.
+# Steps that only one shard executes carry exactly this condition line
+# (immediately after `- name:`); every other phase step is unconditional.
+STEP_CONDITIONS = {
+    "default-lib": "if: matrix.shard == 'lib'",
+    "default-unit": "if: matrix.shard != 'lib'",
+}
+STEP_JOBS = {
+    "default-build": "test-unit",
+    "default-lib": "test-unit",
+    "default-unit": "test-unit",
+    "acme-build": "test-acme",
+    "acme-outbound": "test-acme",
+    "acme-dns": "test-acme",
+    "acme-renewal": "test-acme",
+}
 
 
 def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]:
     errors = []
-    job = re.search(r"(?ms)^  test-unit:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)
-    if job is None:
-        return ["missing test-unit job"]
+    jobs: dict[str, str] = {}
+    for job_name in sorted(set(STEP_JOBS.values())):
+        job = re.search(rf"(?ms)^  {re.escape(job_name)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)
+        if job is None:
+            return [f"missing {job_name} job"]
+        jobs[job_name] = job[1]
     # These steps have a deliberately small, literal shape. Comments cannot
     # satisfy a command, and conditions/continue-on-error/extra shell fail closed.
-    steps = re.split(r"(?m)^(?=      - )", job[1])
-    last_position = -1
+    last_position = {job_name: -1 for job_name in jobs}
     for phase, name in STEPS.items():
+        job_name = STEP_JOBS[phase]
+        job_body = jobs[job_name]
+        steps = re.split(r"(?m)^(?=      - )", job_body)
         candidates = [step for step in steps if step.startswith(f"      - name: {name}\n")]
         expected = [
             f"- name: {name}",
+            *([STEP_CONDITIONS[phase]] if phase in STEP_CONDITIONS else []),
             "run: |",
             "set -euo pipefail",
             'mkdir -p "$RUNNER_TEMP/unit-ci"',
@@ -63,13 +90,14 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
             "RUST_BACKTRACE: 1",
         ]
         if phase.endswith("-build"):
-            expected[4] = expected[4].replace("--no-run 2>&1", "--no-run --timings 2>&1")
-            expected[4:4] = [
+            command_index = expected.index(next(line for line in expected if "/usr/bin/time" in line))
+            expected[command_index] = expected[command_index].replace("--no-run 2>&1", "--no-run --timings 2>&1")
+            expected[command_index:command_index] = [
                 f'python3 .github/scripts/run_unit_ci.py {phase} --sample-parent "$$" &',
                 "unit_sampler_pid=$!",
                 "trap 'kill \"$unit_sampler_pid\" 2>/dev/null || true; wait \"$unit_sampler_pid\" || true' EXIT",
             ]
-            expected[8:8] = [
+            expected[command_index + 4:command_index + 4] = [
                 'kill "$unit_sampler_pid"',
                 'wait "$unit_sampler_pid"',
                 "trap - EXIT",
@@ -79,14 +107,29 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
             line.strip() for line in candidates[0].splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ] != expected:
-            errors.append(f"test-unit must run the unconditional, fail-closed {phase} command")
-        position = job[1].find(f"      - name: {name}\n")
-        if position <= last_position:
-            errors.append(f"test-unit phase missing or out of order: {phase}")
-        last_position = position
-    executable = "\n".join(line for line in job[1].splitlines() if not line.lstrip().startswith("#"))
+            errors.append(f"{job_name} must run the unconditional, fail-closed {phase} command")
+        position = job_body.find(f"      - name: {name}\n")
+        if position <= last_position[job_name]:
+            errors.append(f"{job_name} phase missing or out of order: {phase}")
+        last_position[job_name] = position
+    executable = "\n".join(
+        line
+        for body in jobs.values()
+        for line in body.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    for shard_line in ('precompile: "--lib"', 'precompile: "--test unit_tests"'):
+        if shard_line not in jobs["test-unit"]:
+            errors.append(f"test-unit matrix must keep the `{shard_line}` shard")
+    for target in ("unit_tests", "unit_plugins_a_tests", "unit_plugins_b_tests", "unit_gateway_core_tests"):
+        if f"target: {target}\n" not in jobs["test-unit"]:
+            errors.append(f"test-unit matrix must run the {target} target")
     if re.search(r"cargo test[^\n]*--features acme[^\n]*--test unit_tests", executable):
         errors.append("ACME must not recompile the monolithic unit_tests target")
+    if re.search(r"(?m)^\s+cargo test[^\n]*--features acme", "\n".join(
+        line for line in jobs["test-unit"].splitlines() if not line.lstrip().startswith("#")
+    )):
+        errors.append("ACME phases must not run inside the monolithic Unit Tests job")
     try:
         cargo = tomllib.loads(manifest)
         targets = [target for target in cargo.get("test", []) if target.get("name") == "acme_dns01_tests"]
@@ -117,7 +160,7 @@ def check_repository() -> list[str]:
 
 def output_for(phase: str, *, passed: int | None = None, ignored: int = 0, filtered: int = 0) -> str:
     names = REQUIRED_TESTS.get(phase, set())
-    count = MINIMUM_PASSED[phase] if passed is None else passed
+    count = minimum_passed(phase) if passed is None else passed
     return "\n".join(f"test {name} ... ok" for name in sorted(names)) + (
         f"\ntest result: ok. {count} passed; 0 failed; {ignored} ignored; "
         f"0 measured; {filtered} filtered out; finished in 0.10s\n"
@@ -147,18 +190,36 @@ class CompileTelemetryTests(unittest.TestCase):
         self.assertEqual(compiler_identity("sccache", b"sccache\0--secret\0value\0"), {"comm": "sccache"})
 
 
+PHASES_WITH_FLOORS = (*MINIMUM_PASSED, "default-unit")
+
+
 class SelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.shard_env = patch.dict("os.environ", {"UNIT_SHARD": "core"})
+        self.shard_env.start()
+        self.addCleanup(self.shard_env.stop)
+
     def test_every_existing_acme_test_is_required(self):
         self.assertEqual({key: len(value) for key, value in REQUIRED_TESTS.items()}, {
             "acme-outbound": 20, "acme-dns": 2, "acme-renewal": 16,
         })
-        for phase in MINIMUM_PASSED:
+        for phase in PHASES_WITH_FLOORS:
             validate_output(phase, output_for(phase))
-            validate_output(phase, output_for(phase, passed=MINIMUM_PASSED[phase] + 1))
+            validate_output(phase, output_for(phase, passed=minimum_passed(phase) + 1))
+
+    def test_every_unit_shard_has_its_own_floor(self):
+        for shard, floor in UNIT_SHARD_MINIMUM_PASSED.items():
+            with self.subTest(shard=shard), patch.dict("os.environ", {"UNIT_SHARD": shard}):
+                validate_output("default-unit", output_for("default-unit", passed=floor))
+                with self.assertRaises(ValueError):
+                    validate_output("default-unit", output_for("default-unit", passed=floor - 1))
+        for shard in ("", "unknown", "CORE"):
+            with self.subTest(shard=shard), patch.dict("os.environ", {"UNIT_SHARD": shard}), self.assertRaises(ValueError):
+                validate_output("default-unit", output_for("default-unit", passed=100000))
 
     def test_missing_empty_failed_or_duplicate_summary_is_rejected(self):
-        for phase in MINIMUM_PASSED:
-            for output in ("", output_for(phase, passed=0), output_for(phase, passed=MINIMUM_PASSED[phase] - 1),
+        for phase in PHASES_WITH_FLOORS:
+            for output in ("", output_for(phase, passed=0), output_for(phase, passed=minimum_passed(phase) - 1),
                            output_for(phase).replace("0 failed", "1 failed"), output_for(phase) * 2):
                 with self.subTest(phase=phase, output=output), self.assertRaises(ValueError):
                     validate_output(phase, output)
@@ -170,7 +231,7 @@ class SelectionTests(unittest.TestCase):
                     validate_output(phase, output_for(phase).replace(f"test {name} ... ok", "test unrelated ... ok"))
 
     def test_ignored_and_filtered_selections_fail_closed(self):
-        for phase in MINIMUM_PASSED:
+        for phase in PHASES_WITH_FLOORS:
             if phase != "default-lib":
                 with self.subTest(phase=phase), self.assertRaises(ValueError):
                     validate_output(phase, output_for(phase, ignored=1))
@@ -227,6 +288,14 @@ class ContractTests(unittest.TestCase):
 
     def test_monolith_rebuild_missing_target_or_feature_gate_are_rejected(self):
         self.assertTrue(self.check(workflow=self.workflow.replace("--test acme_dns01_tests", "--test unit_tests")))
+        for before, after in (
+            ('precompile: "--lib"', 'precompile: "--tests"'),
+            ("target: unit_plugins_b_tests\n", "target: unit_tests\n"),
+            ("if: matrix.shard == 'lib'\n        # Covers", "if: false\n        # Covers"),
+            ("if: matrix.shard != 'lib'\n        run: |", "if: matrix.shard == 'core'\n        run: |"),
+        ):
+            with self.subTest(before=before):
+                self.assertTrue(self.check(workflow=self.workflow.replace(before, after, 1)))
         for before, after in (
             ('required-features = ["acme"]', 'required-features = []'),
             ('name = "acme_dns01_tests"', 'name = "missing_tests"'),

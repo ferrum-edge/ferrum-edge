@@ -539,27 +539,13 @@ FULL_CI_CONTRACT_PATHS = frozenset(
     }
 )
 
-# These files deliberately trigger one or more live datapath suites. The
-# required-CI verifier mechanically checks this set against both
-# live_suite_path_filter.py and node-waypoint-ebpf-live.yml.
-FULL_CI_DOCUMENTATION_PATHS = frozenset(
-    {
-        "docs/ci_cd.md",
-        "docs/configuration.md",
-        "docs/cp_dp_mode.md",
-        "docs/mesh.md",
-        "docs/mesh_multicluster_federation_runbook.md",
-        "docs/mesh_supported_matrix.md",
-        "docs/node_agent.md",
-        # Trigger of the CNI install-lifecycle live suite (issue #3908); the
-        # required-CI verifier proves this set covers every live-suite
-        # documentation trigger.
-        "docs/node_agent_security.md",
-        "docs/plans/node_waypoint_transport_adr.md",
-        "docs/spire_deployment.md",
-        "docs/tcp_udp_proxy.md",
-    }
-)
+# Documentation never schedules a live datapath suite on a pull request any
+# more: every live suite (the ci.yml kernel/netns/two-cluster jobs and the
+# dedicated Kind workflows) runs on every push to `main`, so a docs-only diff
+# stays in light mode. The set is kept so the required-CI verifier can still
+# prove parity with the live-suite classifiers, which now declare no
+# documentation triggers either.
+FULL_CI_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 
 # Vendored-patch lifecycle governance inputs. The fail-closed parity gate that
 # reads them (`scripts/check_vendored_patch_lifecycle.py`, run by the
@@ -591,38 +577,25 @@ HELM_PATTERNS = [
         r"^\.github/scripts/extract_rendered_prometheus_rules\.py$",
         r"^\.github/scripts/validate_prometheus_metric_contract\.py$",
         r"^\.github/scripts/verify_mesh_production_readiness\.py$",
+        r"^\.github/scripts/check_node_agent_chart_runtime\.py$",
+        r"^\.github/scripts/verify_trusted_local_action\.py$",
         r"^scripts/check_helm_values_schema_parity\.py$",
-        r"^\.github/actions/",
+        r"^\.github/actions/(?:package-ferrum-runtime-image|setup-kubernetes-tools)/",
         r"^docs/prometheus_metric_contract\.json$",
         r"^docs/prometheus_metrics\.md$",
-        r"^\.cargo/",
-        r"^vendor/",
         r"^Dockerfile(?:\..*)?$",
         r"^\.dockerignore$",
-        r"^Cargo\.(?:toml|lock)$",
-        r"^rust-toolchain\.toml$",
-        r"^build\.rs$",
-        r"^proto/",
-        r"^ferrum\.conf$",
-        r"^src/lib\.rs$",
-        r"^src/overload\.rs$",
-        r"^src/runtime_metrics\.rs$",
-        r"^src/(?:main|gateway_entry|startup|cli)\.rs$",
-        r"^src/config/",
+        # Kubernetes-facing runtime surfaces the chart install actually drives:
+        # CRD/controller reconciliation, the k8s config source, the injector,
+        # the node agent, and the CNI binary. Everything else the gateway runs
+        # inside the kind cluster is already covered by the unit/functional
+        # shards on the same PR and by this job on every push to `main`.
+        r"^src/bin/ferrum-cni\.rs$",
+        r"^src/cni/",
         r"^src/config_sources/k8s/",
-        r"^src/logging/",
-        r"^src/modes/(?:control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$",
-        r"^src/modes/mesh/",
-        r"^src/admin/",
-        r"^src/dns/",
-        r"^src/grpc/",
-        r"^src/identity/",
         r"^src/k8s_controller/",
-        r"^src/proxy/client_ip\.rs$",
-        r"^src/secrets/",
-        r"^src/tls/",
-        r"^src/util/sharding\.rs$",
-        r"^src/xds/",
+        r"^src/modes/(?:injector|node_agent|node_agent_cni_server)\.rs$",
+        r"^src/modes/mesh/",
     )
 ]
 
@@ -633,12 +606,13 @@ HELM_PATTERNS = [
 LIVE_SUITE_SHARED_PATTERNS = (
     r"^\.github/workflows/ci\.yml$",
     r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker)/",
-    r"^Cargo\.(?:toml|lock)$",
-    r"^\.cargo/",
-    r"^rust-toolchain\.toml$",
-    r"^build\.rs$",
-    r"^vendor/",
 )
+
+# Build-graph inputs (Cargo manifests, the lockfile, vendored crates, the
+# toolchain pin, build.rs, proto) no longer schedule the live kernel/netns/
+# two-cluster jobs on a pull request. Those jobs run on every push to `main`;
+# a dependency bump that breaks a live datapath turns `main` red for that
+# commit rather than costing every dependabot PR three privileged suites.
 
 # Intentionally absent from all three per-suite gates (they were in the old
 # single `run_ebpf_live` union). None of the ci.yml live jobs execute them, so
@@ -694,68 +668,37 @@ EBPF_KERNEL_LIVE_PATTERNS = compile_path_patterns(
         r"^src/capture/",
         r"^src/ebpf/",
         r"^src/modes/node_agent\.rs$",
-        r"^src/proxy/mod\.rs$",
-        r"^src/socket_opts\.rs$",
     ),
 )
 
 # `netns-capture-live`: in-lib netns/TPROXY/SO_ORIGINAL_DST tests plus the
-# privileged `functional_mesh_live_source_capture_*` e2e (NetnsUdpCaptureManager,
-# production REDIRECT, HBONE/mTLS relay). Distinct from the dedicated
-# ambient-host-udp-live workflow.
-#
-# The two functional tests spawn real mesh-mode gateways, so the gate also
-# covers the production boundaries they traverse rather than only capture
-# producers: HBONE pool/proxy, mesh-mode runtime (native MeshSubscribe client),
-# mesh gRPC subscribe (`src/grpc/mesh_*` plus JWT audience, the shared
-# `cp_server` default issuer, and `GrpcJwtSecret` minting), identity/SVID,
-# TLS/SPIFFE, mesh policy plugins, route selection, and `mesh_trust_registry`
-# (attached to the HBONE/mTLS pools). Unrelated CP trust serving stays out.
+# privileged `functional_mesh_live_source_capture_*` e2e. Only the capture
+# producers, the mesh-mode runtime that materialises them, and the e2e test
+# itself schedule it on a pull request; the shared proxy/TLS/gRPC/identity
+# trees it also traverses are exercised by the ordinary unit/functional shards
+# on the PR and by this suite on every push to `main`.
 NETNS_CAPTURE_LIVE_PATTERNS = compile_path_patterns(
     LIVE_SUITE_SHARED_PATTERNS,
     (
-        r"^proto/",
         r"^src/capture/",
-        r"^src/grpc/(?:mesh_|auth\.rs$|cp_server\.rs$|dp_client\.rs$)",
-        r"^src/identity/",
         r"^src/modes/mesh/",
         r"^src/modes/(?:node_agent|node_agent_cni_server)\.rs$",
-        r"^src/plugins/mesh/",
-        r"^src/router_cache\.rs$",
-        r"^src/service_discovery/mesh\.rs$",
-        r"^src/socket_opts\.rs$",
-        r"^src/tls/",
-        r"^src/proxy/(?:backend_dispatch|hbone_pool|hbone_proxy|host_udp_capture|host_udp_capture_live_tests|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_trust_registry|mesh_udp_capture|mesh_udp_frame|mod|netns_capture|netns_udp_capture|tcp_proxy|udp_batch|udp_placement_migration)\.rs$",
+        r"^src/proxy/(?:host_udp_capture|host_udp_capture_live_tests|mesh_udp_capture|mesh_udp_frame|netns_capture|netns_udp_capture|udp_placement_migration)\.rs$",
         r"^tests/functional/functional_mesh_mode_test\.rs$",
     ),
 )
 
-# `two-cluster-mesh-live`: `functional_mesh_live_two_cluster_cross_cluster_protocol_matrix`
-# plus `tests/functional/fixtures/two_cluster_spire.sh`. Cross-cluster HBONE,
-# identity/SPIRE, east-west materialization, and mesh subscribe — not the
-# in-lib kernel or netns primitive tests.
-#
-# Extra shared production helpers the matrix actually uses:
-# - `src/socket_opts.rs`: `SO_ORIGINAL_DST` after `install_tcp_capture` REDIRECT
-# - `src/proxy/mesh_trust_registry.rs`: federated / wrong-TD fail-closed
-# - `src/grpc/auth.rs` + `src/grpc/cp_server.rs` + `src/grpc/dp_client.rs`:
-#   native MeshSubscribe JWT authentication and shared issuer default
-# Not included: `src/proxy/netns_capture.rs` (sidecar binds in its own netns)
-# and CP-side trust serving (`cp_trust`).
+# `two-cluster-mesh-live`: cross-cluster HBONE, identity/SPIRE, east-west
+# materialisation, and native MeshSubscribe. Same owner-path principle.
 TWO_CLUSTER_LIVE_PATTERNS = compile_path_patterns(
     LIVE_SUITE_SHARED_PATTERNS,
     (
-        r"^proto/",
-        r"^src/capture/",
-        r"^src/grpc/(?:mesh_|auth\.rs$|cp_server\.rs$|dp_client\.rs$)",
+        r"^src/grpc/mesh_",
         r"^src/identity/",
         r"^src/modes/mesh/",
         r"^src/plugins/mesh/",
-        r"^src/proxy/(?:backend_dispatch|grpc_proxy|hbone_pool|hbone_proxy|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_trust_registry|mesh_udp_capture|mesh_udp_frame|mod|netns_udp_capture|tcp_proxy)\.rs$",
-        r"^src/router_cache\.rs$",
+        r"^src/proxy/(?:hbone_pool|hbone_proxy|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_trust_registry)\.rs$",
         r"^src/service_discovery/mesh\.rs$",
-        r"^src/socket_opts\.rs$",
-        r"^src/tls/",
         r"^tests/functional/functional_mesh_mode_test\.rs$",
         r"^tests/functional/fixtures/two_cluster_spire\.sh$",
     ),
@@ -817,6 +760,169 @@ PKCS11_PATTERNS = [
     )
 ]
 
+
+# Inputs that change what the Rust build graph compiles. Any of these forces
+# the complete compile-and-test lane (unit, lint, artifacts, functional,
+# integration) and, through the per-job groups below, every feature-gated job.
+RUST_BUILD_GRAPH_PATTERNS = (
+    r"^\.github/workflows/ci\.yml$",
+    r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker)/",
+    r"^\.github/scripts/(?:run_unit_ci|test_unit_ci)\.py$",
+    r"^Cargo\.(?:toml|lock)$",
+    r"^\.cargo/",
+    r"^\.config/nextest\.toml$",
+    r"^rust-toolchain\.toml$",
+    r"^build\.rs$",
+    r"^proto/",
+    r"^vendor/",
+    r"^ebpf/",
+    r"^custom_plugins/",
+)
+
+# `run_rust`: the compile-and-test lane. Source, every test tree except the
+# Kubernetes shell suites under `tests/k8s/` (owned by the dedicated live
+# workflows), the operator config template and OpenAPI document (both have
+# parity unit tests), and the build graph.
+RUST_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *RUST_BUILD_GRAPH_PATTERNS,
+        r"^src/",
+        r"^tests/(?!k8s/)",
+        r"^ferrum\.conf$",
+        r"^openapi\.yaml$",
+        r"^deny\.toml$",
+    )
+]
+
+# `run_acme`: the optional `acme` feature is compiled in its own job so the
+# monolithic unit job does not pay for a second library compile on every PR.
+ACME_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *RUST_BUILD_GRAPH_PATTERNS,
+        r"^src/tls/",
+        r"^tests/acme_dns01/",
+        r"^tests/unit/tls/",
+    )
+]
+
+# `run_conformance`: the Istio/xDS compatibility matrix under
+# tests/conformance and the mesh translation surfaces it exercises.
+CONFORMANCE_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *RUST_BUILD_GRAPH_PATTERNS,
+        r"^tests/conformance/",
+        r"^tests/conformance_tests\.rs$",
+        r"^src/modes/mesh/",
+        r"^src/modes/control_plane\.rs$",
+        r"^src/config_sources/",
+        r"^src/k8s_controller/",
+        r"^src/plugins/mesh/",
+        r"^src/plugins/mesh_route_dispatch\.rs$",
+        r"^src/plugins/mod\.rs$",
+        r"^src/xds/",
+        r"^src/identity/",
+        r"^src/capture/",
+        r"^src/tls/spiffe\.rs$",
+        r"^src/config/types\.rs$",
+        r"^src/grpc/",
+    )
+]
+
+# `run_service_integration`: testcontainers suites (Consul, LDAP, Kafka,
+# MySQL, Hydra OIDC / introspection, ClickHouse) and the code they drive.
+SERVICE_INTEGRATION_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *RUST_BUILD_GRAPH_PATTERNS,
+        r"^tests/service_integration/",
+        r"^src/service_discovery/",
+        r"^src/plugins/(?:ldap_auth|kafka_logging|oauth2_introspection|oidc_relying_party|api_chargeback|api_chargeback_sink|chargeback)\.rs$",
+        r"^src/plugins/utils/",
+        r"^src/config/(?:db_backend|db_loader|migrations|mongo_store)",
+        r"^src/config/migrations/",
+        r"^src/fips/",
+        r"^src/util/",
+    )
+]
+
+# `run_ebpf_userspace`: the aya loader only compiles under `--features ebpf`.
+EBPF_USERSPACE_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *RUST_BUILD_GRAPH_PATTERNS,
+        r"^src/ebpf/",
+        r"^src/capture/",
+        r"^src/modes/(?:node_agent|node_agent_cni_server)\.rs$",
+    )
+]
+
+# `run_fuzz_smoke`: the fuzz crate's deterministic property tests. The crate
+# links the gateway library with the `fuzzing` feature, but only the parsers
+# reached through `src/fuzz_support.rs` are under test.
+FUZZ_SMOKE_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        r"^\.github/workflows/ci\.yml$",
+        r"^fuzz/",
+        r"^Cargo\.(?:toml|lock)$",
+        r"^vendor/",
+        r"^src/lib\.rs$",
+        r"^src/fuzz_support\.rs$",
+        r"^src/config/file_loader\.rs$",
+        r"^src/config_sources/k8s/",
+        r"^src/identity/spiffe",
+        r"^src/plugins/otel_tracing\.rs$",
+        r"^src/plugins/mod\.rs$",
+        r"^src/proxy/(?:datagram_client_address|mesh_udp_frame|proxy_protocol)\.rs$",
+    )
+]
+
+# `run_platform_build`: the `pr-build` profile link check with
+# `--features cloud-secrets`. The debug gateway binary is already linked by
+# the test-artifact job on every Rust PR, so only feature-graph, linker, and
+# secrets-provider inputs schedule the extra profile on a pull request.
+PLATFORM_BUILD_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *RUST_BUILD_GRAPH_PATTERNS,
+        r"^src/secrets/",
+        r"^src/(?:main|cli|gateway_entry|startup)\.rs$",
+    )
+]
+
+# `run_vendor_patches`: the vendored crates' own regression suites.
+VENDOR_PATCH_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        r"^\.github/workflows/ci\.yml$",
+        r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker)/",
+        r"^vendor/",
+        r"^Cargo\.(?:toml|lock)$",
+        r"^rust-toolchain\.toml$",
+    )
+]
+
+# `run_dependency_audit`: cargo-deny plus the vendored-patch lifecycle and
+# advisory-expiry gates it hosts.
+DEPENDENCY_AUDIT_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        r"^\.github/workflows/ci\.yml$",
+        r"^Cargo\.(?:toml|lock)$",
+        r"^ebpf/",
+        r"^deny\.toml$",
+        r"^vendor/",
+        r"^docs/dependency-policy\.md$",
+        r"^docs/vendored-patch-lifecycle\.json$",
+        r"^docs/upstream-",
+        r"^PRODUCTION_READINESS\.md$",
+        r"^scripts/(?:check_advisory_expiry\.sh|check_vendored_patch_lifecycle\.py)$",
+    )
+]
+
 JOB_GATE_NAMES = (
     "run_helm",
     "run_ebpf_kernel_live",
@@ -825,6 +931,16 @@ JOB_GATE_NAMES = (
     "run_ebpf_build",
     "run_secrets_backends",
     "run_pkcs11",
+    "run_rust",
+    "run_artifacts",
+    "run_acme",
+    "run_conformance",
+    "run_service_integration",
+    "run_ebpf_userspace",
+    "run_fuzz_smoke",
+    "run_platform_build",
+    "run_vendor_patches",
+    "run_dependency_audit",
 )
 
 # Scripts whose logic controls the gate decisions themselves. Changing either
@@ -939,6 +1055,7 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
     if any(path in GATE_CONTROLLER_PATHS for path in changed_files):
         return {name: True for name in JOB_GATE_NAMES}
 
+    run_rust = any_path_matches(RUST_PATTERNS, changed_files)
     return {
         "run_helm": any_path_matches(HELM_PATTERNS, changed_files),
         "run_ebpf_kernel_live": any_path_matches(
@@ -955,6 +1072,28 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
             SECRETS_BACKENDS_PATTERNS, changed_files
         ),
         "run_pkcs11": any_path_matches(PKCS11_PATTERNS, changed_files),
+        "run_rust": run_rust,
+        # The debug gateway binary + nextest archives feed the Rust shards and
+        # the Helm chart's kind cluster, so either consumer schedules them.
+        "run_artifacts": run_rust or any_path_matches(HELM_PATTERNS, changed_files),
+        "run_acme": any_path_matches(ACME_PATTERNS, changed_files),
+        "run_conformance": any_path_matches(CONFORMANCE_PATTERNS, changed_files),
+        "run_service_integration": any_path_matches(
+            SERVICE_INTEGRATION_PATTERNS, changed_files
+        ),
+        "run_ebpf_userspace": any_path_matches(
+            EBPF_USERSPACE_PATTERNS, changed_files
+        ),
+        "run_fuzz_smoke": any_path_matches(FUZZ_SMOKE_PATTERNS, changed_files),
+        "run_platform_build": any_path_matches(
+            PLATFORM_BUILD_PATTERNS, changed_files
+        ),
+        "run_vendor_patches": any_path_matches(
+            VENDOR_PATCH_PATTERNS, changed_files
+        ),
+        "run_dependency_audit": any_path_matches(
+            DEPENDENCY_AUDIT_PATTERNS, changed_files
+        ),
     }
 
 
@@ -1136,10 +1275,13 @@ def self_test() -> int:
         ("pull_request", ["README.md", "LICENSE-COMMERCIAL.md"], "light"),
         ("pull_request", [".agents/skills/opus-agents/scripts/dispatch-agent.sh"], "light"),
         ("pull_request", [".claude/rules/testing.md"], "light"),
-        ("pull_request", ["docs/mesh.md"], "full"),
-        ("pull_request", ["docs/cp_dp_mode.md"], "full"),
-        ("pull_request", ["docs/configuration.md"], "full"),
-        ("pull_request", ["docs/plans/node_waypoint_transport_adr.md"], "full"),
+        # Documentation no longer schedules live suites on a pull request.
+        ("pull_request", ["docs/mesh.md"], "light"),
+        ("pull_request", ["docs/cp_dp_mode.md"], "light"),
+        ("pull_request", ["docs/configuration.md"], "light"),
+        ("pull_request", ["docs/ci_cd.md"], "light"),
+        ("pull_request", ["docs/plans/node_waypoint_transport_adr.md"], "light"),
+        # Executable contract inputs and governance inputs stay full.
         ("pull_request", ["docs/prometheus_metric_contract.json"], "full"),
         ("pull_request", ["docs/prometheus_metrics.md"], "full"),
         (
@@ -1166,6 +1308,8 @@ def self_test() -> int:
         ("pull_request", ["src/proxy/mod.rs"], "full"),
         ("pull_request", ["docs/admin_api.md", "Cargo.lock"], "full"),
         ("pull_request", [".github/workflows/ci.yml"], "full"),
+        ("pull_request", [".github/workflows/perf-benchmark.yml"], "full"),
+        ("pull_request", ["scripts/check_advisory_expiry.sh"], "full"),
         ("pull_request", ["tests/README.md", "tests/unit_tests.rs"], "full"),
         ("pull_request", [], "full"),
         ("merge_group", ["docs/admin_api.md"], "light"),
@@ -1199,31 +1343,25 @@ def self_test() -> int:
         if any(path in reason for path in changed):
             failures.append("unclassifiable reason must not echo changed paths")
 
+    # Every gated job is off unless a path it owns changed. `run_rust` is the
+    # broad compile-and-test lane; the others are the narrow feature/live gates.
+    rust_only = {name: False for name in JOB_GATE_NAMES} | {
+        "run_rust": True,
+        "run_artifacts": True,
+    }
+    # Source changes: the same lane (performance regression is out of band).
+    src_only = rust_only
     gate_cases = [
+        # Nothing Rust-related: only planning/policy run.
         (
             "pull_request",
-            ["charts/ferrum-gateway/values.yaml"],
-            {"run_helm": True},
+            [".github/workflows/perf-benchmark.yml"],
+            {name: False for name in JOB_GATE_NAMES},
         ),
         (
             "pull_request",
-            ["docs/prometheus_metric_contract.json"],
-            {"run_helm": True},
-        ),
-        (
-            "pull_request",
-            ["docs/prometheus_metrics.md"],
-            {"run_helm": True},
-        ),
-        (
-            "pull_request",
-            [".github/scripts/validate_prometheus_metric_contract.py"],
-            {"run_helm": True},
-        ),
-        (
-            "pull_request",
-            [".github/scripts/extract_rendered_prometheus_rules.py"],
-            {"run_helm": True},
+            ["docs/admin_api.md", "README.md"],
+            {name: False for name in JOB_GATE_NAMES},
         ),
         (
             "pull_request",
@@ -1232,45 +1370,250 @@ def self_test() -> int:
         ),
         (
             "pull_request",
-            ["src/backend_conn_limit.rs"],
+            ["comparison/README.md", "examples/foo.yaml"],
             {name: False for name in JOB_GATE_NAMES},
+        ),
+        # Helm and the shared contract inputs.
+        (
+            "pull_request",
+            ["charts/ferrum-gateway/values.yaml"],
+            {
+                "run_helm": True,
+                "run_artifacts": True,
+                "run_rust": False,
+                "run_platform_build": False,
+            },
         ),
         (
             "pull_request",
-            ["docs/cp_dp_mode.md"],
-            {name: False for name in JOB_GATE_NAMES},
+            ["Dockerfile"],
+            {
+                "run_helm": True,
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+            },
         ),
+        ("pull_request", ["docs/prometheus_metric_contract.json"], {"run_helm": True}),
+        ("pull_request", ["docs/prometheus_metrics.md"], {"run_helm": True}),
+        (
+            "pull_request",
+            [".github/scripts/validate_prometheus_metric_contract.py"],
+            {"run_helm": True, "run_rust": False},
+        ),
+        (
+            "pull_request",
+            [".github/scripts/extract_rendered_prometheus_rules.py"],
+            {"run_helm": True},
+        ),
+        # Ordinary source and test changes: the compile-and-test lane only.
+        ("pull_request", ["src/backend_conn_limit.rs"], src_only),
+        ("pull_request", ["src/proxy/tcp_proxy.rs"], src_only),
+        ("pull_request", ["src/router_cache.rs"], src_only),
+        ("pull_request", ["src/plugins/cors.rs"], src_only),
+        ("pull_request", ["tests/unit/plugins/cors_tests.rs"], rust_only),
+        ("pull_request", ["tests/functional/functional_admin_test.rs"], rust_only),
+        ("pull_request", ["ferrum.conf"], rust_only),
+        ("pull_request", ["openapi.yaml"], rust_only),
         (
             "pull_request",
             ["src/modes/grpc_tls_reload.rs"],
-            {"run_helm": True},
+            src_only,
         ),
-        # Per-suite positives: kernel loader/program, netns capture, two-cluster.
+        # Build-graph inputs fan out to every compile-based job, but the
+        # privileged live suites stay on main.
         (
             "pull_request",
-            ["src/ebpf/loader.rs"],
+            ["Cargo.lock"],
             {
-                "run_ebpf_kernel_live": True,
+                "run_rust": True,
+                "run_acme": True,
+                "run_conformance": True,
+                "run_service_integration": True,
+                "run_ebpf_userspace": True,
+                "run_fuzz_smoke": True,
+                "run_platform_build": True,
+                "run_vendor_patches": True,
+                "run_dependency_audit": True,
+                "run_secrets_backends": True,
+                "run_pkcs11": True,
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+                "run_ebpf_build": False,
+            },
+        ),
+        (
+            "pull_request",
+            ["rust-toolchain.toml"],
+            {
+                "run_rust": True,
+                "run_acme": True,
+                "run_conformance": True,
+                "run_ebpf_kernel_live": False,
                 "run_netns_capture_live": False,
                 "run_two_cluster_live": False,
             },
         ),
         (
             "pull_request",
-            ["src/proxy/netns_capture.rs"],
+            [".github/workflows/ci.yml"],
             {
-                "run_ebpf_kernel_live": False,
+                "run_rust": True,
+                "run_helm": True,
+                "run_ebpf_kernel_live": True,
                 "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+                "run_secrets_backends": True,
+                "run_pkcs11": True,
+                "run_acme": True,
+                "run_conformance": True,
+                "run_service_integration": True,
+                "run_ebpf_userspace": True,
+                "run_fuzz_smoke": True,
+                "run_platform_build": True,
+                "run_vendor_patches": True,
+                "run_dependency_audit": True,
+                "run_ebpf_build": False,
+            },
+        ),
+        # Feature-gated compile jobs.
+        (
+            "pull_request",
+            ["src/tls/acme.rs"],
+            src_only | {"run_acme": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/mod.rs"],
+            src_only | {"run_acme": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["tests/acme_dns01/mod.rs"],
+            rust_only | {"run_acme": True},
+        ),
+        (
+            "pull_request",
+            ["src/secrets/vault.rs"],
+            src_only | {"run_secrets_backends": True, "run_platform_build": True},
+        ),
+        (
+            "pull_request",
+            ["src/tls/pkcs11.rs"],
+            src_only | {"run_pkcs11": True, "run_acme": True},
+        ),
+        (
+            "pull_request",
+            ["tests/conformance/istio_virtual_service.rs"],
+            rust_only | {"run_conformance": True},
+        ),
+        (
+            "pull_request",
+            ["src/modes/mesh/policy.rs"],
+            src_only
+            | {
+                "run_helm": True,
+                "run_conformance": True,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/xds/mod.rs"],
+            src_only | {"run_conformance": True},
+        ),
+        (
+            "pull_request",
+            ["tests/service_integration/ldap.rs"],
+            rust_only | {"run_service_integration": True},
+        ),
+        (
+            "pull_request",
+            ["src/plugins/ldap_auth.rs"],
+            src_only | {"run_service_integration": True},
+        ),
+        (
+            "pull_request",
+            ["src/service_discovery/consul.rs"],
+            src_only | {"run_service_integration": True},
+        ),
+        (
+            "pull_request",
+            ["src/ebpf/loader.rs"],
+            src_only
+            | {"run_ebpf_userspace": True, "run_ebpf_kernel_live": True},
+        ),
+        (
+            "pull_request",
+            ["ebpf/ferrum-ebpf/src/main.rs"],
+            {
+                "run_rust": True,
+                "run_ebpf_build": True,
+                "run_ebpf_userspace": True,
+                "run_ebpf_kernel_live": True,
+                "run_dependency_audit": True,
+                "run_netns_capture_live": False,
                 "run_two_cluster_live": False,
             },
         ),
         (
             "pull_request",
-            ["src/socket_opts.rs"],
+            ["fuzz/fuzz_targets/traceparent.rs"],
+            {"run_fuzz_smoke": True, "run_rust": False},
+        ),
+        (
+            "pull_request",
+            ["src/fuzz_support.rs"],
+            src_only | {"run_fuzz_smoke": True},
+        ),
+        (
+            "pull_request",
+            ["src/proxy/proxy_protocol.rs"],
+            src_only | {"run_fuzz_smoke": True},
+        ),
+        (
+            "pull_request",
+            ["vendor/h3-0.0.8-ferrum-patched/src/lib.rs"],
             {
-                "run_ebpf_kernel_live": True,
+                "run_rust": True,
+                "run_vendor_patches": True,
+                "run_dependency_audit": True,
+                "run_fuzz_smoke": True,
+                "run_helm": False,
+                "run_netns_capture_live": False,
+            },
+        ),
+        (
+            "pull_request",
+            ["deny.toml"],
+            {"run_dependency_audit": True, "run_rust": True},
+        ),
+        (
+            "pull_request",
+            ["docs/vendored-patch-lifecycle.json", "docs/dependency-policy.md"],
+            {"run_dependency_audit": True, "run_rust": False},
+        ),
+        (
+            "pull_request",
+            ["scripts/check_advisory_expiry.sh"],
+            {"run_dependency_audit": True, "run_rust": False},
+        ),
+        (
+            "pull_request",
+            ["tests/performance/mesh/benches/rr_selection.rs"],
+            {"run_rust": True, "run_platform_build": False},
+        ),
+        # Live suites: only their owner paths schedule them on a PR.
+        (
+            "pull_request",
+            ["src/proxy/netns_capture.rs"],
+            src_only
+            | {
+                "run_ebpf_kernel_live": False,
                 "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
+                "run_two_cluster_live": False,
             },
         ),
         (
@@ -1284,505 +1627,37 @@ def self_test() -> int:
         ),
         (
             "pull_request",
-            ["src/proxy/host_udp_capture_live_tests.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": False,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/proxy/udp_placement_migration.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": False,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/modes/mesh/mod.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
             ["src/proxy/hbone_proxy.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/grpc/mesh_server.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/identity/mod.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["tests/functional/fixtures/two_cluster_spire.sh"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": False,
-                "run_two_cluster_live": True,
-            },
-        ),
-        # Cross-gate positives for the repaired production boundaries: exact
-        # kernel / netns / two-cluster values, not merely substring presence.
-        (
-            "pull_request",
-            ["src/proxy/mod.rs"],
-            {
-                "run_ebpf_kernel_live": True,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/proxy/hbone_pool.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/proxy/mesh_trust_registry.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/modes/mesh/config_consumer/native_client.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/grpc/auth.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/grpc/dp_client.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/tls/mod.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/grpc/cp_server.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/proxy/backend_dispatch.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/proxy/tcp_proxy.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/router_cache.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/service_discovery/mesh.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/plugins/mesh/mesh_authz.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["ebpf/ferrum-ebpf/src/main.rs"],
-            {
-                "run_ebpf_build": True,
-                "run_ebpf_kernel_live": True,
-                "run_netns_capture_live": False,
-                "run_two_cluster_live": False,
-            },
-        ),
-        # Shared compile/CI inputs fire every live suite. The functional harness
-        # is an input only for the jobs that actually run tests from that file
-        # (netns + two-cluster). Kernel live tests live in src/ebpf/loader.rs.
-        (
-            "pull_request",
-            ["Cargo.lock"],
-            {
-                "run_ebpf_kernel_live": True,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            ["rust-toolchain.toml"],
-            {
-                "run_ebpf_kernel_live": True,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            [".github/actions/setup-rust-ci/action.yml"],
-            {
-                "run_helm": True,
-                "run_ebpf_kernel_live": True,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            [".github/workflows/ci.yml"],
-            {
-                "run_helm": True,
-                "run_ebpf_kernel_live": True,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        (
-            "pull_request",
-            [".github/actions/setup-bpf-linker/action.yml"],
-            {
-                "run_ebpf_kernel_live": True,
-                "run_netns_capture_live": False,
-                "run_two_cluster_live": False,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/modes/node_agent.rs"],
-            {
-                "run_ebpf_kernel_live": True,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": False,
-            },
-        ),
-        (
-            "pull_request",
-            ["tests/functional/functional_mesh_mode_test.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
+            src_only | {"run_two_cluster_live": True, "run_netns_capture_live": False},
         ),
         (
             "pull_request",
             ["src/capture/mod.rs"],
-            {
+            src_only
+            | {
                 "run_ebpf_kernel_live": True,
                 "run_netns_capture_live": True,
-                "run_two_cluster_live": True,
-            },
-        ),
-        # Meaningful negatives: dedicated ambient-host-UDP / image / k8s-tooling
-        # / unrelated CP trust serving must not resurrect the old union gate.
-        # Mesh TLS is a shared netns+two-cluster security boundary (see
-        # src/tls/mod.rs above), not a kernel-live input.
-        (
-            "pull_request",
-            ["tests/k8s/ambient_host_udp_live/run.sh"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": False,
+                "run_ebpf_userspace": True,
+                "run_conformance": True,
                 "run_two_cluster_live": False,
             },
         ),
         (
             "pull_request",
-            ["Dockerfile"],
-            {
-                "run_helm": True,
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": False,
-                "run_two_cluster_live": False,
-            },
-        ),
-        (
-            "pull_request",
-            [".github/actions/setup-kubernetes-tools/action.yml"],
-            {
-                "run_helm": True,
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": False,
-                "run_two_cluster_live": False,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/grpc/cp_trust.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": False,
-                "run_two_cluster_live": False,
-            },
-        ),
-        # Plugin/admin-only: full CI, but none of the expensive live suites.
-        (
-            "pull_request",
-            ["src/plugins/cors.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": False,
-                "run_two_cluster_live": False,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/admin/mod.rs"],
-            {
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": False,
-                "run_two_cluster_live": False,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/secrets/env.rs"],
-            {"run_secrets_backends": True, "run_pkcs11": False},
-        ),
-        (
-            "pull_request",
-            ["tests/secrets_functional/cross_backend.rs"],
-            {"run_secrets_backends": True, "run_pkcs11": False},
-        ),
-        (
-            "pull_request",
-            ["src/main.rs"],
-            {"run_secrets_backends": True, "run_pkcs11": False},
-        ),
-        (
-            "pull_request",
-            ["src/gateway_entry.rs"],
-            {"run_secrets_backends": True, "run_pkcs11": False},
-        ),
-        (
-            "pull_request",
-            ["src/config/env_config.rs"],
-            {"run_secrets_backends": True, "run_pkcs11": False},
-        ),
-        (
-            "pull_request",
-            ["src/tls/source/mod.rs"],
-            {"run_secrets_backends": True, "run_pkcs11": True},
-        ),
-        (
-            "pull_request",
-            ["src/tls/pkcs11.rs"],
-            {"run_pkcs11": True, "run_secrets_backends": False},
-        ),
-        (
-            "pull_request",
-            ["tests/unit/tls/pkcs11_softhsm_tests.rs"],
-            {"run_pkcs11": True, "run_secrets_backends": False},
-        ),
-        (
-            "pull_request",
-            ["src/tls/mod.rs"],
-            {"run_pkcs11": True, "run_secrets_backends": False},
+            ["src/socket_opts.rs"],
+            src_only,
         ),
         (
             "pull_request",
             ["src/tls/backend.rs"],
-            {"run_pkcs11": True, "run_secrets_backends": False},
+            src_only | {"run_acme": True, "run_pkcs11": True},
         ),
         (
             "pull_request",
-            ["src/config/types.rs"],
-            {"run_pkcs11": True, "run_secrets_backends": False},
+            ["tests/functional/fixtures/two_cluster_spire.sh"],
+            {"run_two_cluster_live": True, "run_rust": True},
         ),
-        (
-            "pull_request",
-            ["src/tls/inventory.rs"],
-            {"run_pkcs11": True, "run_secrets_backends": False},
-        ),
-        (
-            "pull_request",
-            ["src/plugins/cors.rs"],
-            {"run_secrets_backends": False, "run_pkcs11": False},
-        ),
-        (
-            "pull_request",
-            ["src/admin/mod.rs"],
-            {"run_secrets_backends": False, "run_pkcs11": False},
-        ),
-        (
-            "pull_request",
-            ["src/startup.rs"],
-            {"run_secrets_backends": False, "run_pkcs11": False},
-        ),
-        (
-            "pull_request",
-            ["tests/unit/secrets/env_tests.rs"],
-            {"run_secrets_backends": False, "run_pkcs11": False},
-        ),
-        (
-            "pull_request",
-            ["tests/unit/tls/acme_store_ha_tests.rs"],
-            {"run_pkcs11": False, "run_secrets_backends": False},
-        ),
-        (
-            "pull_request",
-            ["Cargo.lock"],
-            {"run_secrets_backends": True, "run_pkcs11": True},
-        ),
-        (
-            "pull_request",
-            ["Cargo.toml"],
-            {"run_secrets_backends": True, "run_pkcs11": True},
-        ),
-        (
-            "pull_request",
-            ["vendor/tungstenite-0.29.0-ferrum-patched/src/lib.rs"],
-            {"run_secrets_backends": True, "run_pkcs11": True},
-        ),
-        (
-            "pull_request",
-            [".github/actions/setup-rust-ci/action.yml"],
-            {"run_secrets_backends": True, "run_pkcs11": True},
-        ),
-        (
-            "pull_request",
-            ["rust-toolchain.toml"],
-            {"run_secrets_backends": True, "run_pkcs11": True},
-        ),
-        (
-            "pull_request",
-            [".github/workflows/ci.yml"],
-            {"run_secrets_backends": True, "run_pkcs11": True},
-        ),
-        (
-            "pull_request",
-            ["build.rs"],
-            {"run_secrets_backends": True, "run_pkcs11": True},
-        ),
-        (
-            "pull_request",
-            ["proto/ferrum.proto"],
-            {"run_secrets_backends": True, "run_pkcs11": True},
-        ),
-        (
-            "pull_request",
-            [".cargo/config.toml"],
-            {"run_secrets_backends": True, "run_pkcs11": True},
-        ),
-        (
-            "pull_request",
-            [".config/nextest.toml"],
-            {"run_secrets_backends": True, "run_pkcs11": False},
-        ),
-        (
-            "pull_request",
-            ["src/tls/frontend_reload.rs"],
-            {"run_pkcs11": True, "run_secrets_backends": False},
-        ),
-        (
-            "pull_request",
-            ["src/../secrets/env.rs"],
-            {name: True for name in JOB_GATE_NAMES},
-        ),
-        (
-            "pull_request",
-            ["docs/admin_api.md", "docs/`evil`.md"],
-            {name: True for name in JOB_GATE_NAMES},
-        ),
-        (
-            "pull_request",
-            ["/src/secrets/env.rs"],
-            {name: True for name in JOB_GATE_NAMES},
-        ),
-        (
-            "pull_request",
-            ["src/secrets/env.rs;"],
-            {name: True for name in JOB_GATE_NAMES},
-        ),
-        (
-            "pull_request",
-            ["docs/admin_api.md"],
-            {name: False for name in JOB_GATE_NAMES},
-        ),
-        # Full CI, but none of the expensive path-gated suites.
-        (
-            "pull_request",
-            ["docs/vendored-patch-lifecycle.json", "docs/dependency-policy.md"],
-            {name: False for name in JOB_GATE_NAMES},
-        ),
+        # Gate controllers force every suite on.
         (
             "pull_request",
             [".github/scripts/pr_ci_plan.py"],
@@ -1793,37 +1668,10 @@ def self_test() -> int:
             [".github/scripts/live_suite_path_filter.py"],
             {name: True for name in JOB_GATE_NAMES},
         ),
-        (
-            "pull_request",
-            [],
-            {name: True for name in JOB_GATE_NAMES},
-        ),
-        (
-            "merge_group",
-            ["docs/admin_api.md"],
-            {name: False for name in JOB_GATE_NAMES},
-        ),
-        (
-            "merge_group",
-            ["charts/ferrum-gateway/values.yaml"],
-            {"run_helm": True},
-        ),
-        (
-            "merge_group",
-            ["src/secrets/env.rs"],
-            {"run_secrets_backends": True, "run_pkcs11": False},
-        ),
-        (
-            "merge_group",
-            ["src/tls/pkcs11.rs"],
-            {"run_pkcs11": True, "run_secrets_backends": False},
-        ),
-        (
-            "merge_group",
-            [],
-            {name: True for name in JOB_GATE_NAMES},
-        ),
-        ("push", ["docs/admin_api.md"], {name: True for name in JOB_GATE_NAMES}),
+        # Non-PR events and empty diffs schedule everything.
+        ("push", ["docs/ci_cd.md"], {name: True for name in JOB_GATE_NAMES}),
+        ("pull_request", [], {name: True for name in JOB_GATE_NAMES}),
+        ("merge_group", ["README.md"], {name: False for name in JOB_GATE_NAMES}),
         ("workflow_dispatch", [], {name: True for name in JOB_GATE_NAMES}),
     ]
     for event_name, changed, expected in gate_cases:

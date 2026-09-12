@@ -101,12 +101,24 @@ lifetime.
 
 - `vendored_established_hook::established_reports_the_dialed_socket_once_per_physical_connection`
   — the patch's whole contract, asserted directly against a live reqwest client:
-  the callback fires **exactly once** for two requests over one pooled
-  connection (so it tracks physical connections, not requests), the descriptor
-  it reports has the dialed backend as its peer (so it is that connection's
-  socket and not an arbitrary open fd), and it answers a send-queue query. If
-  the callback stops firing, the acceptance tests below would silently degrade
-  to `backend_read_timeout_ms` instead of failing; this one fails.
+  the callback fires **exactly once** per physical connection (so it tracks
+  connections, not requests), the descriptor it reports has the dialed backend
+  as its peer (so it is that connection's socket and not an arbitrary open fd),
+  and it answers a send-queue query. If the callback stops firing, the
+  acceptance tests below would silently degrade to `backend_read_timeout_ms`
+  instead of failing; this one fails.
+
+  The keep-alive backend answers every request with the client source port that
+  carried it, so the test names the physical connection each request actually
+  travelled over. That is what makes the assertion deterministic (issue #4888):
+  hyper returns a finished HTTP/1.1 connection to the pool from a task it spawns
+  after the response body completes, so a request issued straight after the
+  previous body can race that return and legitimately dial again. The test keeps
+  requesting until the backend reports a source port twice — that request
+  provably reused an open connection — then asserts every reported descriptor
+  names a distinct source port and the reused connection was reported exactly
+  once. The hook itself cannot double-fire: `with_admission` awaits one connect
+  attempt and calls `established` at most once on success.
 - `in_process_kernel_absorb_write_timeout_maps_to_504` and
   `in_process_h2c_kernel_absorb_write_timeout_maps_to_504` — the issue's
   reproduction end to end: a 2 MiB POST to a backend that `accept()`s and never

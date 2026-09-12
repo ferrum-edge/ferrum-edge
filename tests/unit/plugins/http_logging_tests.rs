@@ -4,6 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use ferrum_edge::plugins::utils::handle_http_batch_response;
+use ferrum_edge::plugins::utils::sink_loss::{
+    SinkLossReason, dropped_total, dropped_total_all_reasons,
+};
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, http_logging::HttpLogging};
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
@@ -24,6 +28,11 @@ fn start_http_logging(plugin: &HttpLogging) {
         .expect("http_logging live tests require start_background_tasks");
     plugin.commit_background_tasks();
 }
+
+// Tests that increment or observe `http_logging` `batch_discard` share the
+// `http_logging_sink_loss` lock: those counters are process-global, and cargo
+// runs this file in parallel. A concurrent 401 discard is what made the
+// 3-record 4xx delta read as 4 in hosted CI.
 
 async fn spawn_http_logging_keepalive_server(
     responses: Vec<(u16, &'static [u8])>,
@@ -494,6 +503,7 @@ async fn test_http_logging_buffer_full_drops_gracefully() {
 }
 
 #[tokio::test]
+#[serial_test::serial(http_logging_sink_loss)]
 async fn test_http_logging_stream_disconnect_does_not_panic() {
     let plugin = HttpLogging::new(
         &json!({
@@ -738,6 +748,7 @@ async fn malformed_endpoint_rejection_does_not_echo_credentials() {
 /// `slow_threshold_ms = 0` forces the slow-call warning on the same request, so
 /// one fixture covers three of the advisory's failure classes at once.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(http_logging_sink_loss)]
 async fn connect_failure_retry_and_slow_call_diagnostics_are_redacted() {
     let (logs, guard) = super::plugin_utils::capture_logs();
 
@@ -789,6 +800,7 @@ async fn connect_failure_retry_and_slow_call_diagnostics_are_redacted() {
 
 /// Non-2xx status classification must not name the endpoint either.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(http_logging_sink_loss)]
 async fn status_failure_diagnostics_are_redacted() {
     let (logs, guard) = super::plugin_utils::capture_logs();
 
@@ -833,4 +845,137 @@ async fn status_failure_diagnostics_are_redacted() {
         "the 401 discard diagnostic must have been emitted: {captured}"
     );
     assert_endpoint_sentinels_absent(&captured, "http_logging status failure");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(http_logging_sink_loss)]
+async fn non_retryable_4xx_records_batch_discard_once_per_record() {
+    for (status, records) in [
+        (reqwest::StatusCode::BAD_REQUEST, 4u64),
+        (reqwest::StatusCode::UNAUTHORIZED, 2u64),
+    ] {
+        let before = dropped_total("http_logging", SinkLossReason::BatchDiscard);
+        let response = http::Response::builder()
+            .status(status)
+            .body("")
+            .unwrap()
+            .into();
+        handle_http_batch_response(
+            "HTTP logging",
+            "http_logging",
+            records as usize,
+            Ok(response),
+        )
+        .await
+        .expect("non-retryable 4xx must discard without retry");
+        assert_eq!(
+            dropped_total("http_logging", SinkLossReason::BatchDiscard) - before,
+            records,
+            "status {status} must count every discarded record once"
+        );
+    }
+
+    let before = dropped_total_all_reasons("http_logging");
+    let response = http::Response::builder()
+        .status(reqwest::StatusCode::OK)
+        .body("")
+        .unwrap()
+        .into();
+    handle_http_batch_response("HTTP logging", "http_logging", 5, Ok(response))
+        .await
+        .expect("2xx remains success");
+    assert_eq!(
+        dropped_total_all_reasons("http_logging"),
+        before,
+        "a successful batch must increment no loss counter"
+    );
+
+    let before = dropped_total("http_logging", SinkLossReason::BatchDiscard);
+    let response = http::Response::builder()
+        .status(reqwest::StatusCode::TOO_MANY_REQUESTS)
+        .body("")
+        .unwrap()
+        .into();
+    handle_http_batch_response("HTTP logging", "http_logging", 3, Ok(response))
+        .await
+        .expect_err("429 must remain retryable");
+    assert_eq!(
+        dropped_total("http_logging", SinkLossReason::BatchDiscard),
+        before,
+        "retryable 4xx must not be counted as a terminal discard"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(http_logging_sink_loss)]
+async fn http_logging_permanent_4xx_counts_records_once_and_survives_reload() {
+    let dropped_before = dropped_total("http_logging", SinkLossReason::BatchDiscard);
+    let (endpoint, _connections, requests) =
+        spawn_http_logging_keepalive_server(vec![(400, b"no")]).await;
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 3,
+            "flush_interval_ms": 100,
+            "max_retries": 2,
+            "retry_delay_ms": 50,
+        }),
+        default_client(),
+    )
+    .unwrap();
+    start_http_logging(&plugin);
+    let summary = create_test_transaction_summary();
+    for _ in 0..3 {
+        plugin.log(&summary).await;
+    }
+    wait_for_count(&requests, 1).await;
+    // Exact +3: `>=` would also trip if another http_logging 4xx test leaked
+    // into this process-global series (CI saw left: 4 from a concurrent 401).
+    for _ in 0..100 {
+        if dropped_total("http_logging", SinkLossReason::BatchDiscard) == dropped_before + 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let dropped_after = dropped_total("http_logging", SinkLossReason::BatchDiscard);
+    assert_eq!(
+        dropped_after - dropped_before,
+        3,
+        "a rejected batch of 3 must increment batch_discard by 3"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "non-retryable 400 must be attempted exactly once"
+    );
+
+    drop(plugin);
+    let (ok_endpoint, _, ok_requests) =
+        spawn_http_logging_keepalive_server(vec![(200, b"OK")]).await;
+    let reloaded = HttpLogging::new(
+        &json!({
+            "endpoint_url": ok_endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+        }),
+        default_client(),
+    )
+    .unwrap();
+    start_http_logging(&reloaded);
+    assert_eq!(
+        dropped_total("http_logging", SinkLossReason::BatchDiscard),
+        dropped_after,
+        "reconstructing the plugin must not reset process-cumulative loss"
+    );
+    reloaded.log(&create_test_transaction_summary()).await;
+    wait_for_count(&ok_requests, 1).await;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            dropped_total("http_logging", SinkLossReason::BatchDiscard),
+            dropped_after,
+            "a successful reload batch must increment no loss counter"
+        );
+    }
 }

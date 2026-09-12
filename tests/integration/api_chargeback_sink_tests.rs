@@ -773,3 +773,439 @@ fn wire_contract_rejects_string_against_uint64() {
         "type mismatch must name field and column type, got {error}"
     );
 }
+
+fn lifecycle_sink_config(server: &MockServer) -> Value {
+    json!({
+        "clickhouse": {"url": server.uri(), "timeout_ms": 1000},
+        "batch": {"size": 100, "flush_interval_ms": 600000, "buffer_capacity": 100},
+        "retry": {"max_attempts": 1, "initial_delay_ms": 1, "max_delay_ms": 1, "jitter": false},
+        "spool": {"enabled": false},
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.25}]
+    })
+}
+
+fn sink_metric(name: &str) -> u64 {
+    let prefix = format!("chargeback_sink_{name} ");
+    ferrum_edge::plugins::api_chargeback_sink::render_prometheus()
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix)?.parse().ok())
+        .unwrap_or(0)
+}
+
+async fn wait_for_sink_metric(name: &str, expected: u64) {
+    for _ in 0..200 {
+        if sink_metric(name) == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(sink_metric(name), expected, "metric {name}");
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn pending_rows_remain_visible_across_replacement_and_graceful_retirement() {
+    wait_for_sink_metric("per_event_pending", 0).await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let config = lifecycle_sink_config(&server);
+    let received = sink_metric("per_event_received_total");
+    let persisted = sink_metric("per_event_persisted_total");
+    let dropped = sink_metric("per_event_dropped_total");
+    let pending = sink_metric("per_event_pending");
+    let old = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    old.start_background_tasks().unwrap();
+    old.commit_background_tasks();
+    old.log(&per_event_summary("retired-pending")).await;
+    wait_for_sink_metric("queue_depth", 0).await;
+    assert_eq!(sink_metric("queue_outstanding"), 1);
+    assert_eq!(sink_metric("per_event_pending"), pending + 1);
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    let replacement =
+        ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    replacement.start_background_tasks().unwrap();
+    replacement.commit_background_tasks();
+    assert_ne!(old.active_generation(), replacement.active_generation());
+    assert_eq!(sink_metric("queue_outstanding"), 0);
+    assert_eq!(sink_metric("per_event_pending"), pending + 1);
+    // An in-flight old-generation hook can finish after replacement publication.
+    old.log(&per_event_summary("late-retired-hook")).await;
+    replacement.log(&per_event_summary("new-pending")).await;
+    assert_eq!(sink_metric("per_event_received_total"), received + 3);
+    assert_eq!(sink_metric("per_event_pending"), pending + 3);
+    drop(old);
+    drop(replacement);
+    wait_for_sink_metric("per_event_persisted_total", persisted + 3).await;
+    assert_eq!(sink_metric("per_event_dropped_total"), dropped);
+    assert_eq!(sink_metric("per_event_pending"), pending);
+    let requests = server.received_requests().await.unwrap();
+    let rows: Vec<Value> = requests
+        .iter()
+        .flat_map(|request| std::str::from_utf8(&request.body).unwrap().lines())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        3,
+        "retirement must actually deliver pending rows"
+    );
+    let identities: std::collections::HashSet<_> = rows
+        .iter()
+        .map(|row| row["event_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(identities.len(), 3);
+    assert!(rows.iter().all(|row| row["charge_call"] == 0.25));
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn failed_unspooled_delivery_is_counted_after_retirement_and_reload() {
+    wait_for_sink_metric("per_event_pending", 0).await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let config = lifecycle_sink_config(&server);
+    let received = sink_metric("per_event_received_total");
+    let persisted = sink_metric("per_event_persisted_total");
+    let dropped = sink_metric("per_event_dropped_total");
+    let pending = sink_metric("per_event_pending");
+    let old = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    old.start_background_tasks().unwrap();
+    old.commit_background_tasks();
+    old.log(&per_event_summary("will-fail-on-retirement")).await;
+    let replacement =
+        ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    replacement.start_background_tasks().unwrap();
+    replacement.commit_background_tasks();
+    drop(old);
+    wait_for_sink_metric("per_event_dropped_total", dropped + 1).await;
+    assert_eq!(sink_metric("per_event_received_total"), received + 1);
+    assert_eq!(sink_metric("per_event_persisted_total"), persisted);
+    assert_eq!(sink_metric("per_event_pending"), pending);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let status: Value =
+        serde_json::from_str(&ferrum_edge::plugins::api_chargeback_sink::render_status_json())
+            .unwrap();
+    assert_eq!(status["totals"]["per_event"]["dropped_total"], dropped + 1);
+    assert_eq!(status["instances"][0]["per_event"]["dropped_total"], 0);
+    drop(replacement);
+    assert_eq!(sink_metric("per_event_dropped_total"), dropped + 1);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn free_tiers_emit_counted_zero_charge_rows_with_and_without_bandwidth() {
+    wait_for_sink_metric("per_event_pending", 0).await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let emitted_after = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+    for bandwidth in [false, true] {
+        let mut config = lifecycle_sink_config(&server);
+        config["batch"]["size"] = json!(1);
+        config["pricing_tiers"] = json!([{"status_codes": [200], "price_per_call": 0}]);
+        if bandwidth {
+            config["bandwidth_pricing"] = json!({"price_per_byte_sent": 0.5});
+        }
+        let plugin =
+            ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+        plugin.start_background_tasks().unwrap();
+        plugin.commit_background_tasks();
+        let mut summary = per_event_summary("free-tier");
+        summary.bytes_sent = 2;
+        plugin.log(&summary).await;
+        if !bandwidth {
+            summary.response_status_code = 404;
+            plugin.log(&summary).await;
+        }
+        drop(plugin);
+    }
+    wait_for_sink_metric("per_event_pending", 0).await;
+    let requests = wait_for_post_requests(&server, 2).await;
+    assert_eq!(requests.len(), 2, "unconfigured status must not emit a row");
+    let mut rows: Vec<Value> = requests
+        .iter()
+        .map(|request| request.body_json().unwrap())
+        .collect();
+    rows.sort_by(|a, b| {
+        a["charge_total"]
+            .as_f64()
+            .partial_cmp(&b["charge_total"].as_f64())
+            .unwrap()
+    });
+    let emitted_before = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+    for row in &rows {
+        assert_eq!(row["call_count"], 1);
+        assert_eq!(row["charge_call"], 0.0);
+        assert!(row["consumer_name"].is_null());
+        assert!(row["route_id"].is_null());
+        let received_at = row["received_at"].as_i64().unwrap();
+        assert!((emitted_after..=emitted_before).contains(&received_at));
+    }
+    assert_eq!(rows[0]["charge_total"], 0.0);
+    assert_eq!(rows[1]["charge_total"], 1.0);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn detected_websocket_flavor_prices_h1_h2_h3_handshakes_equally() {
+    wait_for_sink_metric("per_event_pending", 0).await;
+    use std::sync::Arc;
+
+    use ferrum_edge::_test_support::set_request_http_flavor_for_test;
+    use ferrum_edge::config::types::HttpFlavor;
+    use ferrum_edge::plugins::{RequestContext, log_with_mirror};
+    use ferrum_edge::proxy::backend_dispatch::detect_http_flavor;
+    use http::{Request, Version};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let mut config = lifecycle_sink_config(&server);
+    config["batch"]["size"] = json!(1);
+    config["pricing_tiers"] = json!([
+        {"status_codes": [101], "price_per_call": 0.25},
+        {"status_codes": [200], "price_per_call": 0.75},
+        {"status_codes": [403, 503], "price_per_call": 0.5}
+    ]);
+    let sink =
+        Arc::new(ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap());
+    sink.start_background_tasks().unwrap();
+    sink.commit_background_tasks();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![sink];
+    for (name, version, status, expected_flavor) in [
+        ("h1", Version::HTTP_11, 101, HttpFlavor::WebSocket),
+        ("h2", Version::HTTP_2, 200, HttpFlavor::WebSocket),
+        ("h3", Version::HTTP_3, 200, HttpFlavor::WebSocket),
+        ("plain", Version::HTTP_2, 200, HttpFlavor::Plain),
+        ("rejected", Version::HTTP_3, 403, HttpFlavor::WebSocket),
+        ("grpc", Version::HTTP_2, 200, HttpFlavor::Grpc),
+    ] {
+        let mut request = Request::builder()
+            .method(
+                if expected_flavor == HttpFlavor::WebSocket && version != Version::HTTP_11 {
+                    "CONNECT"
+                } else {
+                    "GET"
+                },
+            )
+            .uri("https://billing.example/socket")
+            .version(version)
+            .body(())
+            .unwrap();
+        if expected_flavor == HttpFlavor::WebSocket {
+            if version == Version::HTTP_11 {
+                request
+                    .headers_mut()
+                    .insert("upgrade", "websocket".parse().unwrap());
+                request
+                    .headers_mut()
+                    .insert("connection", "upgrade".parse().unwrap());
+                request
+                    .headers_mut()
+                    .insert("sec-websocket-version", "13".parse().unwrap());
+                request.headers_mut().insert(
+                    "sec-websocket-key",
+                    "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
+                );
+            } else if version == Version::HTTP_3 {
+                request
+                    .extensions_mut()
+                    .insert(h3::ext::Protocol::WEB_SOCKET);
+            } else {
+                request
+                    .extensions_mut()
+                    .insert(hyper::ext::Protocol::from_static("websocket"));
+            }
+        } else if expected_flavor == HttpFlavor::Grpc {
+            request
+                .headers_mut()
+                .insert("content-type", "application/grpc".parse().unwrap());
+        }
+        let flavor = detect_http_flavor(&request);
+        assert_eq!(flavor, expected_flavor);
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".into(),
+            request.method().to_string(),
+            "/socket".into(),
+        );
+        set_request_http_flavor_for_test(&mut ctx, flavor);
+        let mut summary = per_event_summary(name);
+        summary.proxy_id = Some(name.to_string());
+        summary.response_status_code = status;
+        summary.http_method = request.method().to_string();
+        if flavor == HttpFlavor::Grpc {
+            summary
+                .metadata
+                .insert("request_protocol".into(), "grpc".into());
+            summary.metadata.insert("grpc_status".into(), "14".into());
+        }
+        log_with_mirror(&plugins, &summary, &ctx).await;
+    }
+    let requests = wait_for_post_requests(&server, 6).await;
+    let rows: HashMap<String, Value> = requests
+        .iter()
+        .map(|request| {
+            let row: Value = request.body_json().unwrap();
+            (row["proxy_id"].as_str().unwrap().to_string(), row)
+        })
+        .collect();
+    assert_eq!(rows.len(), 6);
+    for name in ["h1", "h2", "h3"] {
+        assert_eq!(rows[name]["protocol"], "ws");
+        assert_eq!(rows[name]["status_code"], 101);
+        assert_eq!(rows[name]["charge_call"], 0.25);
+        assert_eq!(rows[name]["call_count"], 1);
+    }
+    assert_eq!(rows["h1"]["http_status_code"], 101);
+    assert_eq!(rows["h2"]["http_status_code"], 200);
+    assert_eq!(rows["h3"]["http_status_code"], 200);
+    assert_eq!(rows["plain"]["protocol"], "http");
+    assert_eq!(rows["plain"]["charge_call"], 0.75);
+    assert_eq!(rows["rejected"]["status_code"], 403);
+    assert_eq!(rows["rejected"]["charge_call"], 0.5);
+    assert_eq!(rows["grpc"]["status_code"], 503);
+    assert_eq!(rows["grpc"]["grpc_status"], 14);
+    assert_eq!(rows["grpc"]["charge_call"], 0.5);
+    drop(plugins);
+    wait_for_sink_metric("per_event_pending", 0).await;
+}
+
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn runtime_cancellation_counts_memory_loss_without_claiming_a_process_crash_flush() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(wait_for_sink_metric("per_event_pending", 0));
+    let received = sink_metric("per_event_received_total");
+    let persisted = sink_metric("per_event_persisted_total");
+    let dropped = sink_metric("per_event_dropped_total");
+    let pending = sink_metric("per_event_pending");
+    let (plugin, server) = runtime.block_on(async {
+        let server = MockServer::start().await;
+        let config = lifecycle_sink_config(&server);
+        let plugin =
+            ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+        plugin.start_background_tasks().unwrap();
+        plugin.commit_background_tasks();
+        plugin.log(&per_event_summary("cancel-pending")).await;
+        wait_for_sink_metric("queue_depth", 0).await;
+        assert_eq!(sink_metric("queue_outstanding"), 1);
+        assert_eq!(sink_metric("per_event_pending"), pending + 1);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        (plugin, server)
+    });
+    // Tokio cancellation executes Rust destructors. SIGKILL/power loss does not.
+    drop(runtime);
+    assert_eq!(sink_metric("per_event_received_total"), received + 1);
+    assert_eq!(sink_metric("per_event_persisted_total"), persisted);
+    assert_eq!(sink_metric("per_event_dropped_total"), dropped + 1);
+    assert_eq!(sink_metric("per_event_pending"), pending);
+    drop(plugin);
+    drop(server);
+}
+
+#[test]
+fn chargeback_process_counters_start_fresh_only_in_a_new_process() {
+    const CHILD: &str = "FERRUM_TEST_CHARGEBACK_COUNTER_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert_eq!(sink_metric("per_event_received_total"), 0);
+        assert_eq!(sink_metric("per_event_dropped_total"), 0);
+        assert_eq!(sink_metric("queue_full_drops_total"), 0);
+        let status: Value =
+            serde_json::from_str(&ferrum_edge::plugins::api_chargeback_sink::render_status_json())
+                .unwrap();
+        assert_eq!(status["totals"]["export"]["events_enqueued_total"], 0);
+        assert_eq!(status["totals"]["per_event"]["pending"], 0);
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "integration::api_chargeback_sink_tests::chargeback_process_counters_start_fresh_only_in_a_new_process",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn failed_export_settles_once_only_after_spool_write_with_unchanged_identity() {
+    wait_for_sink_metric("per_event_pending", 0).await;
+    use ferrum_edge::plugins::api_chargeback_sink::decode_spool_file_for_tests;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = lifecycle_sink_config(&server);
+    config["batch"]["size"] = json!(1);
+    config["spool"] = json!({
+        "enabled": true,
+        "dir": temp.path().to_string_lossy(),
+        "compression": "none",
+        "replay_interval_secs": 3600
+    });
+    let persisted = sink_metric("per_event_persisted_total");
+    let dropped = sink_metric("per_event_dropped_total");
+    let pending = sink_metric("per_event_pending");
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().unwrap();
+    plugin.commit_background_tasks();
+    plugin.log(&per_event_summary("spool-settlement")).await;
+    // Retire before yielding so the replayer cannot claim this new row while
+    // the test inspects it; the flush and spool delivery owners must still drain.
+    drop(plugin);
+    wait_for_sink_metric("per_event_persisted_total", persisted + 1).await;
+    assert_eq!(sink_metric("per_event_pending"), pending);
+    assert_eq!(sink_metric("per_event_dropped_total"), dropped);
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        !requests.is_empty(),
+        "must actually attempt ClickHouse delivery"
+    );
+    let posted: Value = requests[0].body_json().unwrap();
+    let mut dirs = vec![temp.path().to_path_buf()];
+    let mut rows = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "ndjson") {
+                let body = decode_spool_file_for_tests(&path).unwrap();
+                rows.extend(
+                    body.lines()
+                        .map(|line| serde_json::from_str::<Value>(line).unwrap()),
+                );
+            }
+        }
+    }
+    assert_eq!(rows.len(), 1, "failed export must leave one durable row");
+    assert_eq!(rows[0]["event_id"], posted["event_id"]);
+    assert_eq!(rows[0]["charge_total"], posted["charge_total"]);
+    assert_eq!(rows[0]["call_count"], 1);
+    assert_eq!(sink_metric("per_event_persisted_total"), persisted + 1);
+}

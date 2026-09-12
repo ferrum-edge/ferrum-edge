@@ -1802,6 +1802,34 @@ fn every_client_to_backend_path_is_gated() {
         "every client→backend send must go through the authorization-aware commit"
     );
 
+    // The shared listener's inline path is non-blocking since issue #5045, so it
+    // carries its own copy of the gate, and anything it hands to the bounded
+    // per-session writer is still committed through the same one. Detailed
+    // coverage of that writer lives in `udp_egress_isolation_tests`.
+    let admit = body_of("fn forward_client_datagram_without_blocking(")
+        .split("\n}\n")
+        .next()
+        .expect("the non-blocking admission body");
+    let admit_gate = admit
+        .find("session.refuse_if_authorization_expired().is_some()")
+        .expect("the admission gate");
+    let admit_publish = admit
+        .find("publish_session_request_budget(")
+        .expect("the admission budget publish");
+    assert!(
+        admit_gate < admit_publish,
+        "the non-blocking admission refuses an expired credential before it \
+         publishes a budget, queues a payload, or sends"
+    );
+    let writer = body_of("fn spawn_session_egress_writer<F, Fut>(")
+        .split("\n}\n")
+        .next()
+        .expect("the egress writer body");
+    assert!(
+        writer.contains("forward_client_datagram_commit("),
+        "a queued client→backend datagram is committed through the same gate"
+    );
+
     let commit = body_of("async fn forward_client_datagram_commit<F>(")
         .split("\n}\n")
         .next()

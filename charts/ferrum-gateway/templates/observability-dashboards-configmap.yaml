@@ -20,8 +20,7 @@ metadata:
   name: {{ .Values.metrics.dashboards.configMapName | default (include "ferrum-gateway.suffixedName" (dict "base" (include "ferrum-gateway.fullname" .) "suffix" "-dashboards")) }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "ferrum-gateway.labels" . | nindent 4 }}
-    app.kubernetes.io/component: gateway-metrics
+    {{- include "ferrum-gateway.labels" (dict "root" . "component" "gateway-metrics") | nindent 4 }}
     {{- with .Values.metrics.dashboards.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

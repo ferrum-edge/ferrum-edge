@@ -17,7 +17,6 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::time::sleep;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -39,10 +38,9 @@ fn cert_paths() -> (PathBuf, PathBuf) {
 }
 
 async fn alloc_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 fn https_client() -> reqwest::Client {

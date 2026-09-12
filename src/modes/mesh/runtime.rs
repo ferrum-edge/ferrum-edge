@@ -280,6 +280,77 @@ pub struct XdsConvergenceSnapshot {
     pub version_skew: bool,
 }
 
+/// Closed, non-sensitive category for a proxy-runtime slice refusal
+/// (issue #4812).
+///
+/// Every variant is a compile-time label, so the reason the control plane
+/// retains can never carry credentials, request data, or unbounded bytes. The
+/// wire form is the `MeshSliceRejectReason` proto enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshSliceRuntimeRejectReason {
+    /// The slice could not be converted into a serving gateway configuration.
+    ConfigBuild,
+    /// `ProxyState::update_mesh_config` refused the converted configuration.
+    ProxyRefused,
+    /// Effective gateway trust material for this slice was unusable.
+    TrustUnusable,
+    /// Inbound mTLS live-reload preparation failed, or the slice made an
+    /// overridden inbound app port newly selectable while live reload is off.
+    TlsReload,
+    /// Owner-scoped NodeWaypoint DTLS candidate build failed.
+    DtlsCandidate,
+}
+
+impl MeshSliceRuntimeRejectReason {
+    /// Fixed-cardinality diagnostic label. Never caller-supplied text.
+    pub const fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::ConfigBuild => "runtime_config_build",
+            Self::ProxyRefused => "runtime_proxy_refused",
+            Self::TrustUnusable => "runtime_trust_unusable",
+            Self::TlsReload => "runtime_tls_reload",
+            Self::DtlsCandidate => "runtime_dtls_candidate",
+        }
+    }
+}
+
+/// The proxy runtime's verdict on a received mesh slice (issue #4812).
+///
+/// Distinct from [`MeshSliceInstall`]: installing a slice only makes it the
+/// RECEIVED slice, while this is the second, independent gate that decides
+/// whether it becomes the SERVING generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshSliceRuntimeOutcome {
+    /// The slice is the serving generation.
+    Applied,
+    /// The runtime refused the slice; the previous generation keeps serving.
+    Rejected(MeshSliceRuntimeRejectReason),
+}
+
+impl MeshSliceRuntimeOutcome {
+    pub const fn accepted(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+
+    pub const fn reject_reason(self) -> Option<MeshSliceRuntimeRejectReason> {
+        match self {
+            Self::Applied => None,
+            Self::Rejected(reason) => Some(reason),
+        }
+    }
+}
+
+/// One published runtime verdict, bound to the exact slice version it judged.
+///
+/// The version binding is what keeps a late verdict from being reported against
+/// a newer slice: the native `MeshSubscribe` client only reports a verdict whose
+/// version matches the slice it last installed on its own stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshSliceRuntimeVerdict {
+    pub version: String,
+    pub outcome: MeshSliceRuntimeOutcome,
+}
+
 /// Lock-free holder for the current Layer 2 mesh slice.
 #[derive(Clone)]
 pub struct MeshRuntimeState {
@@ -315,6 +386,12 @@ pub struct MeshRuntimeState {
     /// fallback CP cannot roll this data plane back to an older generation.
     /// Cold path only — nothing on the proxy request path reads it.
     revision_gate: Arc<MeshRevisionGate>,
+    /// Latest proxy-runtime acceptance verdict, published for the CP
+    /// slice-status report path (issue #4812). Single-slot `watch`, written
+    /// once per apply verdict and read only by the configuration consumer —
+    /// never on the proxy request path, and never unbounded: a superseded
+    /// verdict is replaced rather than queued.
+    runtime_verdict_tx: Arc<watch::Sender<Option<Arc<MeshSliceRuntimeVerdict>>>>,
 }
 
 /// Outcome of [`MeshRuntimeState::install_slice`].
@@ -348,6 +425,7 @@ impl MeshRuntimeState {
     pub fn new() -> Self {
         let (revision_tx, _) = watch::channel(0u64);
         let (applied_revision_tx, _) = watch::channel(0u64);
+        let (runtime_verdict_tx, _) = watch::channel(None);
         Self {
             current: Arc::new(ArcSwap::new(Arc::new(None))),
             applied: Arc::new(ArcSwap::new(Arc::new(None))),
@@ -363,6 +441,7 @@ impl MeshRuntimeState {
             xds_convergence: Arc::new(ArcSwap::new(Arc::new(None))),
             config_stream: Arc::new(ArcSwap::new(Arc::new(None))),
             revision_gate: Arc::new(MeshRevisionGate::new()),
+            runtime_verdict_tx: Arc::new(runtime_verdict_tx),
         }
     }
 
@@ -512,7 +591,7 @@ impl MeshRuntimeState {
     /// installer share exactly one ordering decision.
     ///
     /// Admission is PROVISIONAL: it only makes the candidate the received
-    /// slice. The watermark is finalized by [`Self::record_applied_slice`] when
+    /// slice. The watermark is finalized by [`Self::record_applied_slice_with_token`] when
     /// the proxy runtime accepts it, or returned to the last applied generation
     /// by [`Self::record_rejected_slice`] when the runtime refuses it.
     ///
@@ -546,39 +625,36 @@ impl MeshRuntimeState {
         MeshSliceInstall::Installed
     }
 
-    /// Publish a slice after the mesh proxy runtime accepts it.
-    ///
-    /// This is the COMMIT half of the config-revision lifecycle (issue #2473):
-    /// the freshness gate's authoritative last-good watermark advances here,
-    /// when the generation actually became live, not when it was received.
-    /// Committing first means any observer woken by the applied-slice watcher
-    /// already sees a watermark consistent with the slice it is about to read.
-    pub fn record_applied_slice(&self, slice: &MeshSlice) {
-        let token = self.begin_revision_apply(slice);
-        self.record_applied_slice_with_token(slice, token);
-    }
-
     /// Capture the config-revision apply capability before asynchronous proxy
     /// preparation begins. A concurrent operator reset invalidates the token,
     /// so completion of pre-reset work cannot restore the cleared watermark.
-    pub(crate) fn begin_revision_apply(&self, slice: &MeshSlice) -> Option<MeshRevisionApplyToken> {
+    pub fn begin_revision_apply(&self, slice: &MeshSlice) -> Option<MeshRevisionApplyToken> {
         self.revision_gate
             .begin_apply(slice.revision.as_ref(), slice_content_identity(slice))
     }
 
     /// Commit a runtime-accepted slice with the capability captured before its
     /// asynchronous apply began.
-    pub(crate) fn record_applied_slice_with_token(
+    ///
+    /// A missing token refuses publication and preserves the last committed
+    /// snapshot and watermark. Callers must obtain a token before preparing or
+    /// publishing a generation. An explicit reset may invalidate a token that
+    /// was captured correctly; its cleared watermarks remain cleared while the
+    /// snapshot still reflects the proxy's completed apply.
+    pub fn record_applied_slice_with_token(
         &self,
         slice: &MeshSlice,
         token: Option<MeshRevisionApplyToken>,
-    ) {
-        if let Some(token) = token {
-            let content = slice_content_identity(slice);
-            let _ = self
-                .revision_gate
-                .commit_applied(slice.revision.as_ref(), content, token);
-        }
+    ) -> bool {
+        let Some(token) = token else {
+            self.revision_gate
+                .reject_missing_apply_token(slice.revision.as_ref());
+            return false;
+        };
+        let content = slice_content_identity(slice);
+        let _ = self
+            .revision_gate
+            .commit_applied(slice.revision.as_ref(), content, token);
         // GAP-3E: refresh RTDS-driven consumers only after proxy config
         // acceptance. Rejected slices must not mutate live log/transformer
         // state while the proxy keeps serving the previous accepted config.
@@ -592,6 +668,36 @@ impl MeshRuntimeState {
         self.last_applied_at.store(Arc::new(Some(Utc::now())));
         self.applied_revision_tx
             .send_modify(|revision| *revision += 1);
+        // Issue #4812: the control plane's slice-drift surface must learn the
+        // RUNTIME verdict, not just the install-time one. Publishing here — the
+        // single commit point every runtime-acceptance path funnels through —
+        // means no future apply stage can forget to report success.
+        self.publish_runtime_verdict(&slice.version, MeshSliceRuntimeOutcome::Applied);
+        true
+    }
+
+    /// Publish the proxy runtime's verdict on `version` for the configuration
+    /// consumer to report to the control plane (issue #4812).
+    ///
+    /// Single-slot and non-blocking: a verdict superseded before the consumer
+    /// observes it is replaced, never queued, so a flapping control plane
+    /// cannot grow DP memory or add work to the request path. Reporting is
+    /// best-effort observability and never gates the apply itself.
+    pub fn publish_runtime_verdict(&self, version: &str, outcome: MeshSliceRuntimeOutcome) {
+        self.runtime_verdict_tx
+            .send_replace(Some(Arc::new(MeshSliceRuntimeVerdict {
+                version: version.to_string(),
+                outcome,
+            })));
+    }
+
+    /// Observe runtime verdicts published after this call. The current value is
+    /// marked seen, so a consumer attaching to a new stream never replays a
+    /// verdict for a slice a previous stream delivered.
+    pub fn subscribe_runtime_verdict(
+        &self,
+    ) -> watch::Receiver<Option<Arc<MeshSliceRuntimeVerdict>>> {
+        self.runtime_verdict_tx.subscribe()
     }
 
     /// Finalize a received candidate the mesh proxy runtime REFUSED.
@@ -696,7 +802,7 @@ impl MeshRuntimeState {
 ///
 /// Passing is not applying. It records only that this stage did not refuse the
 /// candidate; the stage that actually installs the generation still commits
-/// through [`MeshRuntimeState::record_applied_slice`].
+/// through [`MeshRuntimeState::record_applied_slice_with_token`].
 #[must_use = "an unresolved evaluation rolls the config-revision watermark back on drop"]
 pub struct MeshSliceEvaluation {
     state: MeshRuntimeState,
@@ -955,7 +1061,9 @@ mod tests {
             version: "accepted".to_string(),
             ..MeshSlice::default()
         };
-        state.record_applied_slice(&accepted);
+        assert!(state.install_slice(accepted.clone()).installed());
+        let token = state.begin_revision_apply(&accepted);
+        state.record_applied_slice_with_token(&accepted, token);
 
         assert_eq!(
             state

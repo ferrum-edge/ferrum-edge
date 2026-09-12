@@ -9,6 +9,8 @@
 //! `Content-Type` the client can simply omit or mismatch, and a nonempty body
 //! with no applicable declared media type must fail closed with 415.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::ports::reserve_port;
@@ -215,8 +217,7 @@ impl ContractHarness {
                     continue;
                 }
             };
-            let https_port = reservation.port;
-            drop(reservation);
+            let https_port = reservation.drop_and_take_port();
 
             match TestGateway::builder()
                 .mode_file(contract_config(backend.port))
@@ -665,7 +666,7 @@ struct CapturingBackend {
 
 impl CapturingBackend {
     async fn spawn() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind capture backend");
         let port = listener.local_addr().expect("local addr").port();

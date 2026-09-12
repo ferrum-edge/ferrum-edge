@@ -17,10 +17,11 @@
 //! Three shapes that Hyper would reject during parse (conflicting
 //! `Content-Length` values, HTTP/1.0 + `Transfer-Encoding`, invalid UTF-8 on
 //! the request line) are identified here and answered with a precomputed
-//! JSON `400` written directly to the socket. Hyper never sees those
-//! requests. A well-formed head takes the same in-place observe path and the
-//! same vectored writes as on `main`. Other Hyper parse failures the scanner
-//! cannot name stay Hyper's empty-bodied `400`.
+//! JSON `400` written directly to the socket only for the connection's first
+//! head, before any response bytes. Later malformed heads stay with Hyper so
+//! earlier responses are preserved. A well-formed head takes the same in-place
+//! observe path and the same vectored writes as on `main`. Other Hyper parse
+//! failures the scanner cannot name stay Hyper's empty-bodied `400`.
 //!
 //! The envelope carries the same shape as a handler-layer protocol reject
 //! (`Content-Type: application/json`, a fixed `{"error":"..."}` body,
@@ -52,6 +53,8 @@ pub(super) const PARSE_HINT_HTTP10_TRANSFER_ENCODING: u8 = 2;
 /// protocol error. Length-bound so the window width cannot drift from it.
 const HTTP_10_VERSION: &[u8] = b"HTTP/1.0";
 pub(super) const PARSE_HINT_INVALID_REQUEST_TARGET_UTF8: u8 = 3;
+/// Captured when the hint is published, before the malformed head is counted.
+const PARSE_HINT_PRIOR_HEAD: u8 = 0x80;
 
 const JSON_CONFLICTING_CONTENT_LENGTH: &str =
     r#"{"error":"Multiple Content-Length headers with conflicting values"}"#;
@@ -162,6 +165,16 @@ impl H1FramingSignals {
         if hint == PARSE_HINT_NONE {
             return;
         }
+        // HeadScanner publishes hints before push() accounts for the current
+        // head. Any produced entry therefore belongs to an earlier request,
+        // including one in this same read or still awaiting its response.
+        // Leave later malformed heads to Hyper: arming our envelope would
+        // discard that read and swallow the earlier request's response.
+        let hint = if self.produced.load(Ordering::Relaxed) > 0 {
+            hint | PARSE_HINT_PRIOR_HEAD
+        } else {
+            hint
+        };
         let _ = self.parse_reject_hint.compare_exchange(
             PARSE_HINT_NONE,
             hint,
@@ -305,11 +318,11 @@ pub(super) struct H1FramingGuardIo<T> {
     /// write backpressure a pipelined malformed request would splice the
     /// envelope into the middle of the previous response.
     ///
-    /// The envelope is therefore armed only before the first response byte —
-    /// the fresh-connection case, which is every real client that sends one
-    /// malformed request. A malformed request pipelined behind a response
-    /// falls back to Hyper's own empty-bodied `400`, the same documented
-    /// residual as the parse failures the scanner cannot name.
+    /// The envelope is therefore armed only before the first response byte,
+    /// and `store_parse_reject_hint` records whether this is the first head.
+    /// The latter also protects parsed-but-unanswered requests, even within
+    /// the same read. Later malformed heads fall back to Hyper's own
+    /// empty-bodied `400`, preserving the earlier response.
     ///
     /// An interim `100 Continue` that hyper writes for an `Expect:
     /// 100-continue` request also sets this flag, one request earlier than a
@@ -441,14 +454,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for H1FramingGuardIo<T> {
                     .observe(&buf.filled()[filled_before..], &this.signals);
             }
             if this.parse_reject.is_idle() {
-                let hint = this.signals.take_parse_reject_hint();
+                let stored_hint = this.signals.take_parse_reject_hint();
+                let hint = stored_hint & !PARSE_HINT_PRIOR_HEAD;
                 if hint != PARSE_HINT_NONE {
-                    if this.wrote_response_bytes {
-                        // See `wrote_response_bytes`: writing the envelope now
-                        // would interleave it with an in-flight response.
+                    if this.wrote_response_bytes || stored_hint & PARSE_HINT_PRIOR_HEAD != 0 {
+                        // Preserve earlier requests even when their response
+                        // has not started yet or they share this read.
                         tracing::debug!(
                             parse_reject_hint = hint,
-                            "HTTP/1 parse reject after a response began; \
+                            "HTTP/1 parse reject after a prior head or response bytes; \
                              deferring to Hyper's empty 400"
                         );
                     } else {
@@ -734,6 +748,18 @@ impl H1StreamScanner {
                     match step {
                         HeadStep::Continue => None,
                         HeadStep::Complete(outcome) => {
+                            if matches!(outcome.framing, BodyFraming::Invalid)
+                                && signals.parse_reject_hint.load(Ordering::Relaxed)
+                                    & !PARSE_HINT_PRIOR_HEAD
+                                    == PARSE_HINT_CONFLICTING_CONTENT_LENGTH
+                            {
+                                // Hyper rejects this head before dispatch. Stop
+                                // here without poisoning earlier queued heads
+                                // or publishing a decision for the rejected one.
+                                self.state = H1State::Disabled;
+                                signals.disable_observation();
+                                return true;
+                            }
                             if !signals.push(outcome.conflict) {
                                 Some(H1State::Disabled)
                             } else {
@@ -1714,6 +1740,50 @@ mod tests {
             written, ENVELOPE_CONFLICTING_CONTENT_LENGTH,
             "a malformed first request must get the JSON envelope"
         );
+    }
+
+    #[test]
+    fn parse_reject_envelope_preserves_prior_unanswered_heads() {
+        let valid = b"GET /PROOF HTTP/1.1\r\nHost: x\r\n\r\n";
+        let response = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nPROOF";
+        for malformed in [
+            CONFLICTING_CL_HEAD,
+            b"POST / HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"GET /\xff HTTP/1.1\r\nHost: x\r\n\r\n",
+        ] {
+            for split_reads in [false, true] {
+                let combined = [valid.as_slice(), malformed].concat();
+                let reads = if split_reads {
+                    vec![valid.as_slice(), malformed]
+                } else {
+                    vec![combined.as_slice()]
+                };
+                let (mut guard, signals) =
+                    H1FramingGuardIo::new(MockIo::new(&reads), TEST_MAX_HEAD_BYTES, None);
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                let mut storage = [0u8; 4096];
+                for (index, chunk) in reads.iter().enumerate() {
+                    let mut buf = ReadBuf::new(&mut storage);
+                    assert!(matches!(
+                        Pin::new(&mut guard).poll_read(&mut cx, &mut buf),
+                        Poll::Ready(Ok(()))
+                    ));
+                    assert_eq!(buf.filled(), *chunk, "must preserve every request byte");
+                    if index == 0 {
+                        // Simulate dispatch without any response yet. Consuming
+                        // the first entry must not re-enable the envelope.
+                        assert_eq!(signals.next_conflict(), H1FramingResult::Clear);
+                    }
+                }
+                assert!(guard.inner.written.is_empty());
+                assert!(matches!(
+                    Pin::new(&mut guard).poll_write(&mut cx, response),
+                    Poll::Ready(Ok(n)) if n == response.len()
+                ));
+                assert_eq!(guard.inner.written, response);
+                assert_eq!(signals.take_parse_rejects(), 0);
+            }
+        }
     }
 
     #[test]

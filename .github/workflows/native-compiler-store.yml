@@ -1,0 +1,240 @@
+name: Native Compiler Store Transfer
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/native-compiler-store.yml
+      - .github/scripts/native_compiler_store.py
+      - .github/native-cache-envelope/CompilerStore.Dockerfile
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/native-compiler-store.yml
+      - .github/scripts/native_compiler_store.py
+      - .github/native-cache-envelope/CompilerStore.Dockerfile
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: Bounded streaming compiler-store contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: python .github/scripts/native_compiler_store.py self-test
+
+  produce:
+    name: Build the property suite and capture its completed compiler store
+    needs: contracts
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main' &&
+       github.repository == 'ferrum-edge/ferrum-edge')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Match the isolated production Fuzz lane: it installs no mold linker.
+    # An explicit empty RUSTFLAGS overrides root .cargo/config.toml flags.
+    env:
+      RUSTFLAGS: ""
+    outputs:
+      archive-sha256: ${{ steps.capture.outputs.sha256 }}
+      artifact-id: ${{ steps.handoff.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Install the pinned property-suite toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+      - name: Install the required property-suite build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - uses: ./.github/actions/setup-sccache
+      # No Actions cache restore/save: the source is this successful build,
+      # so another lane cannot evict the producer's input before capture.
+      - name: Build and run the actual locked property suite
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          cargo test --locked
+          "$RUSTC_WRAPPER" --show-stats
+          "$RUSTC_WRAPPER" --stop-server
+      - name: Export the quiescent compiler store with bounded streaming
+        id: capture
+        run: |
+          set -euo pipefail
+          python .github/scripts/native_compiler_store.py export
+          digest="$(jq -er '.archive_sha256' "$RUNNER_TEMP/ferrum-native-compiler/proof.json")"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Hand off data to a separate publishing runner
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'ferrum-edge/ferrum-edge'
+        id: handoff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-compiler-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ferrum-native-compiler/context/cache.bin
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Validate the handoff and publish an inert compiler-store image
+    needs: produce
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'ferrum-edge/ferrum-edge'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.produce.outputs.artifact-id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/ferrum-native-compiler/delivery
+      - name: Validate every byte before publication
+        env:
+          COMPILER_ARCHIVE_SHA256: ${{ needs.produce.outputs.archive-sha256 }}
+        run: |
+          set -euo pipefail
+          python .github/scripts/native_compiler_store.py restore
+          mkdir "$RUNNER_TEMP/ferrum-native-compiler/context"
+          mv "$RUNNER_TEMP/ferrum-native-compiler/delivery/cache.bin" \
+            "$RUNNER_TEMP/ferrum-native-compiler/context/cache.bin"
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - name: Publish the bounded data image without running it
+        id: publish
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ${{ runner.temp }}/ferrum-native-compiler/context
+          file: .github/native-cache-envelope/CompilerStore.Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ghcr.io/ferrum-edge/ferrum-edge-buildcache:native-compiler-v1-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: io.ferrum.native-compiler.run=${{ github.run_id }}-${{ github.run_attempt }}
+
+  anonymous-reader:
+    name: Restore the exact digest anonymously on a fresh runner
+    needs: [produce, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Pull and copy data without registry credentials or execution
+        env:
+          CACHE_DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$CACHE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          export DOCKER_CONFIG
+          DOCKER_CONFIG="$(mktemp -d "$RUNNER_TEMP/native-compiler-anonymous.XXXXXX")"
+          mkdir -p "$RUNNER_TEMP/ferrum-native-compiler/delivery"
+          docker pull "ghcr.io/ferrum-edge/ferrum-edge-buildcache@$CACHE_DIGEST"
+          docker create --name ferrum-native-compiler-reader \
+            "ghcr.io/ferrum-edge/ferrum-edge-buildcache@$CACHE_DIGEST"
+          docker cp ferrum-native-compiler-reader:/cache.bin \
+            "$RUNNER_TEMP/ferrum-native-compiler/delivery/cache.bin"
+          printf '%s\n' "$CACHE_DIGEST" > "$RUNNER_TEMP/ferrum-native-compiler/digest.txt"
+      - name: Verify byte identity before making the fresh store available
+        env:
+          COMPILER_ARCHIVE_SHA256: ${{ needs.produce.outputs.archive-sha256 }}
+        run: python .github/scripts/native_compiler_store.py restore
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-compiler-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ferrum-native-compiler/proof.json
+            ${{ runner.temp }}/ferrum-native-compiler/digest.txt
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove the owned inert container
+        if: always()
+        run: docker rm --force ferrum-native-compiler-reader
+
+  cleanup:
+    name: Delete only this invocation's handoff and registry version
+    needs: [produce, publish, anonymous-reader]
+    if: always() && needs.produce.result == 'success' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'ferrum-edge/ferrum-edge'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      packages: write
+    steps:
+      - name: Verify exact handoff ownership before deletion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_ID: ${{ needs.produce.outputs.artifact-id }}
+          ARTIFACT_NAME: native-compiler-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api "/repos/ferrum-edge/ferrum-edge/actions/artifacts/$ARTIFACT_ID" \
+            | jq -e --arg name "$ARTIFACT_NAME" --arg sha "$GITHUB_SHA" \
+              --arg run "$GITHUB_RUN_ID" \
+              '.name == $name and .workflow_run.head_sha == $sha and
+               (.workflow_run.id | tostring) == $run' > /dev/null
+          gh api --method DELETE \
+            "/repos/ferrum-edge/ferrum-edge/actions/artifacts/$ARTIFACT_ID"
+          printf 'Deleted owned handoff artifact %s\n' "$ARTIFACT_ID"
+      - name: Match exact digest and sole owned tag before registry deletion
+        if: always() && needs.publish.result == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE_DIGEST: ${{ needs.publish.outputs.digest }}
+          CACHE_TAG: native-compiler-v1-proof-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$CACHE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$CACHE_TAG" =~ ^native-compiler-v1-proof-[0-9]+-[0-9]+$ ]]
+          gh api --paginate --slurp \
+            '/orgs/ferrum-edge/packages/container/ferrum-edge-buildcache/versions?per_page=100' \
+            > "$RUNNER_TEMP/native-compiler-versions.json"
+          version_id="$(jq -er --arg digest "$CACHE_DIGEST" --arg tag "$CACHE_TAG" \
+            '[.[][] | select(.name == $digest and .metadata.container.tags == [$tag])] |
+             if length == 1 then .[0].id else error("expected one exclusively owned version") end' \
+            "$RUNNER_TEMP/native-compiler-versions.json")"
+          [[ "$version_id" =~ ^[1-9][0-9]*$ ]]
+          gh api \
+            "/orgs/ferrum-edge/packages/container/ferrum-edge-buildcache/versions/$version_id" \
+            | jq -e --arg digest "$CACHE_DIGEST" --arg tag "$CACHE_TAG" \
+              '.name == $digest and .metadata.container.tags == [$tag]' > /dev/null
+          gh api --method DELETE \
+            "/orgs/ferrum-edge/packages/container/ferrum-edge-buildcache/versions/$version_id"
+          printf 'Deleted owned compiler-store version %s (%s)\n' "$version_id" "$CACHE_DIGEST"

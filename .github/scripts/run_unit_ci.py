@@ -114,11 +114,29 @@ def sample_compile(phase: str, parent: int) -> None:
 
 MINIMUM_PASSED = {
     "default-lib": 5880,
-    "default-unit": 18239,
     "acme-outbound": 20,
     "acme-dns": 2,
     "acme-renewal": 16,
 }
+# `default-unit` runs one of the four external unit targets per matrix shard
+# (`UNIT_SHARD`); each shard proves its own floor. The floors are conservative
+# (about 85% of the counted `#[test]` attributes in each target) so a shard
+# cannot silently lose a large module; raise them as the suites grow.
+UNIT_SHARD_MINIMUM_PASSED = {
+    "core": 3600,
+    "plugins-a": 4000,
+    "plugins-b": 4000,
+    "gateway-core": 4600,
+}
+
+
+def minimum_passed(phase: str) -> int:
+    if phase == "default-unit":
+        shard = os.environ.get("UNIT_SHARD", "")
+        if shard not in UNIT_SHARD_MINIMUM_PASSED:
+            raise ValueError(f"{phase}: UNIT_SHARD must name a known unit shard, got {shard!r}")
+        return UNIT_SHARD_MINIMUM_PASSED[shard]
+    return MINIMUM_PASSED[phase]
 RESULT = re.compile(
     r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; "
     r"(\d+) measured; (\d+) filtered out; finished in ([0-9.]+)s$",
@@ -182,7 +200,7 @@ def validate_output(phase: str, output: str) -> str:
     if len(results) != 1:
         raise ValueError(f"{phase}: expected exactly one successful libtest summary")
     passed, failed, ignored, measured, filtered = map(int, results[0][:5])
-    if passed < MINIMUM_PASSED[phase] or failed or measured:
+    if passed < minimum_passed(phase) or failed or measured:
         raise ValueError(f"{phase}: missing required passing test count")
     # Default inline tests intentionally leave existing live/opt-in tests ignored;
     # the separate unchanged kTLS step supplies its required live-kernel proof.

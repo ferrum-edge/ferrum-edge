@@ -1,11 +1,12 @@
 //! General request rate limiting with optional Redis-backed failover.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tracing::warn;
 
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
@@ -25,6 +26,72 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const RATE_LIMIT_IDENTITY_HEADER: &str = "x-ratelimit-identity";
+
+/// Shared request-metadata key naming which composed `rate_limiting` instance
+/// currently owns the single public `x-ratelimit-*` header set.
+///
+/// The three telemetry keys are deliberately NOT instance-scoped: their header
+/// names are a fixed public contract, so exactly one instance's values may be
+/// published and they must stay internally consistent. Every instance opts into
+/// the shared rejection finalizer (`applies_after_proxy_on_reject`), so without
+/// an explicit owner the last `after_proxy` in plugin order re-published its own
+/// staged budget over the refusal — a client could receive `429` alongside
+/// `x-ratelimit-remaining: 98` from a sibling that admitted the same request.
+const RATE_LIMIT_AUTHORITY_KEY: &str = "ratelimit_authority";
+
+/// Encoded [`HeaderAuthority::Refused`] verdict.
+const RATE_LIMIT_AUTHORITY_REFUSED: &str = "refused";
+
+/// Prefix of an encoded [`HeaderAuthority::Admitted`] verdict, followed by the
+/// admitted budget's remaining count.
+const RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX: &str = "admitted:";
+
+/// Which composed limiter's telemetry the public `x-ratelimit-*` headers carry.
+///
+/// Ordering is total and independent of plugin order, so two limiters on one
+/// route publish the same headers however they are prioritized:
+/// a refusal outranks every admitted budget (the refusing limiter is the one
+/// that produced the status the client sees), and among admitted budgets the
+/// tightest `remaining` wins — the same "tightest window" rule a single
+/// instance already applies across its own windows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeaderAuthority {
+    Admitted(u64),
+    Refused,
+}
+
+impl HeaderAuthority {
+    fn encode(self) -> String {
+        match self {
+            Self::Refused => RATE_LIMIT_AUTHORITY_REFUSED.to_string(),
+            Self::Admitted(remaining) => {
+                format!("{RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX}{remaining}")
+            }
+        }
+    }
+
+    /// Whether this verdict may take the public header set from `existing`.
+    ///
+    /// An absent or unrecognized owner yields to the candidate: staged
+    /// telemetry with no recorded owner cannot be attributed, and publishing
+    /// the current verdict is the fail-safe direction.
+    fn outranks(self, existing: Option<&str>) -> bool {
+        let Some(existing) = existing else {
+            return true;
+        };
+        if existing == RATE_LIMIT_AUTHORITY_REFUSED {
+            // One request has at most one refusal: it short-circuits the chain.
+            return false;
+        }
+        match self {
+            Self::Refused => true,
+            Self::Admitted(remaining) => existing
+                .strip_prefix(RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX)
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_none_or(|current| remaining < current),
+        }
+    }
+}
 
 /// `rate_limiting`-specific top-level config keys (excludes shared Redis fields).
 const RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] = &["limit_by", "expose_headers", "limits"];
@@ -219,6 +286,23 @@ impl RateLimiting {
         &self,
     ) -> Option<super::utils::rate_limit::RedisFailurePolicy> {
         self.limiter.redis_failure_policy()
+    }
+
+    /// Mark this policy's centralized store unavailable so the next enforcement
+    /// decision takes the fail-closed path. `false` for a local-only policy.
+    ///
+    /// Lets composition tests drive a real `503` through `on_request_received`
+    /// with a live `RequestContext`, instead of only through the key-level
+    /// helper below. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn mark_redis_unavailable_for_test(&self) -> bool {
+        match self.limiter.redis_client_arc_for_test() {
+            Some(client) => {
+                client.mark_unavailable_for_test();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Mark the centralized store unavailable, run one admission against the
@@ -479,17 +563,75 @@ impl RateLimiting {
             return;
         }
 
+        // An outcome with no remaining count has nothing to publish, so it must
+        // not displace what a sibling already staged. (`allow()` only omits it
+        // when a policy has no windows at all, which admission rejects.)
+        let Some(remaining) = outcome.remaining else {
+            return;
+        };
+
+        // A composed sibling may already own the public header set. Only the
+        // tightest admitted budget publishes, so the client is told to back off
+        // against the limit that will actually refuse it next.
+        let authority = HeaderAuthority::Admitted(remaining);
+        let owner = ctx.metadata.get(RATE_LIMIT_AUTHORITY_KEY);
+        if !authority.outranks(owner.map(String::as_str)) {
+            return;
+        }
+
         // Intentionally does not store the rate-limit key/identity: it would be
         // injected onto the downstream response by after_proxy and disclose the
         // gateway's internal consumer/SPIFFE identity to the client.
+        self.claim_published_headers(ctx, authority);
         if let Some(limit) = outcome.limit {
             ctx.metadata
                 .insert("ratelimit_limit".to_string(), limit.to_string());
         }
-        if let Some(remaining) = outcome.remaining {
+        ctx.metadata
+            .insert("ratelimit_remaining".to_string(), remaining.to_string());
+        if let Some(window) = outcome.window_seconds {
             ctx.metadata
-                .insert("ratelimit_remaining".to_string(), remaining.to_string());
+                .insert("ratelimit_window".to_string(), window.to_string());
         }
+    }
+
+    /// Record a new owner and drop every value the previous one staged.
+    ///
+    /// Clearing is what makes the takeover complete: `after_proxy` publishes
+    /// whichever of the three keys are present, so a partial overwrite would
+    /// mix this limiter's `limit` with a sibling's `remaining`.
+    fn claim_published_headers(&self, ctx: &mut RequestContext, authority: HeaderAuthority) {
+        for &(meta_key, _) in EXPOSED_RATELIMIT_HEADERS {
+            ctx.metadata.remove(meta_key);
+        }
+        ctx.metadata
+            .insert(RATE_LIMIT_AUTHORITY_KEY.to_string(), authority.encode());
+    }
+
+    /// Take the public header set for a refusal produced by this limiter.
+    ///
+    /// The refusing limiter authored the status the client sees, so its verdict
+    /// is the only telemetry that may describe the response. A sibling that
+    /// admitted this request earlier is discarded, and the shared rejection
+    /// finalizer then re-publishes these values from every instance identically
+    /// instead of restoring the admitted budget.
+    ///
+    /// A fail-closed refusal publishes nothing at all: this gateway has no
+    /// authoritative counter to report, which is also why `reject` sets no
+    /// headers on `ENFORCEMENT_UNAVAILABLE_STATUS`. `expose_headers: false` on
+    /// the refusing limiter likewise publishes nothing — that policy's verdict
+    /// is that the client is told no budget.
+    fn claim_refusal_headers(&self, outcome: &RateLimitOutcome, ctx: &mut RequestContext) {
+        self.claim_published_headers(ctx, HeaderAuthority::Refused);
+        if outcome.enforcement_unavailable || !self.expose_headers {
+            return;
+        }
+        if let Some(limit) = outcome.limit {
+            ctx.metadata
+                .insert("ratelimit_limit".to_string(), limit.to_string());
+        }
+        ctx.metadata
+            .insert("ratelimit_remaining".to_string(), "0".to_string());
         if let Some(window) = outcome.window_seconds {
             ctx.metadata
                 .insert("ratelimit_window".to_string(), window.to_string());
@@ -530,9 +672,15 @@ impl RateLimiting {
             )
             .await
         else {
+            // A capacity denial carries no budget of its own, and a composed
+            // sibling's admitted budget must not be published as its verdict.
+            self.claim_published_headers(ctx, HeaderAuthority::Refused);
             return self.reject_capacity();
         };
         if !outcome.allowed {
+            // The refusing limiter owns the client-visible telemetry from here
+            // on; see `claim_refusal_headers`.
+            self.claim_refusal_headers(&outcome, ctx);
             if outcome.enforcement_unavailable {
                 // The shared failover backend emits one bounded operational
                 // warning per outage. Avoid an attacker-rate warning/metric for
@@ -544,7 +692,7 @@ impl RateLimiting {
             // username, authenticated identity, SPIFFE ID, or client IP), so it
             // is never logged. Enforcement outcomes are attributed through the
             // transaction summary, which applies metadata redaction.
-            warn!(plugin = "rate_limiting", "Rate limit exceeded");
+            warn_sampled!(plugin = "rate_limiting", "Rate limit exceeded");
             return self.reject(&outcome);
         }
 
@@ -574,7 +722,7 @@ impl RateLimiting {
             }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             // Identity-bearing key deliberately omitted (see `check_rate`).
-            warn!(plugin = "rate_limiting", "Rate limit exceeded (stream)");
+            warn_sampled!(plugin = "rate_limiting", "Rate limit exceeded (stream)");
             return self.reject(&outcome);
         }
 

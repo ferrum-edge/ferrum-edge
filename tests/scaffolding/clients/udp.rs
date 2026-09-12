@@ -6,6 +6,8 @@
 //! `recv_datagram_with_timeout` — because scripted-backend tests model
 //! UDP as discrete datagrams, not streams.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -28,7 +30,7 @@ impl UdpClient {
     /// `UdpSocket::connect` just sets the default send destination; the
     /// kernel still accepts datagrams from other sources unless filtered.
     pub async fn connect(peer: impl Into<SocketAddr>) -> io::Result<Self> {
-        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let socket = UdpSocket::bind_test("127.0.0.1:0").await?;
         let peer = peer.into();
         socket.connect(peer).await?;
         Ok(Self {
@@ -44,7 +46,7 @@ impl UdpClient {
     /// exercise passthrough-SNI flows where the gateway hands every
     /// datagram to the same backend regardless of source pinning.
     pub async fn bind(peer: impl Into<SocketAddr>) -> io::Result<Self> {
-        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let socket = UdpSocket::bind_test("127.0.0.1:0").await?;
         Ok(Self {
             socket,
             peer: peer.into(),

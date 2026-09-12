@@ -1,7 +1,9 @@
 # Coverage
 
 Ferrum Edge uses `cargo-llvm-cov` for Rust line coverage. The measured local
-and CI scope is `--lib`, `--test unit_tests`, and `--test integration_tests`.
+and CI scope is `--lib`, the four unit targets (`--test unit_tests`,
+`--test unit_plugins_a_tests`, `--test unit_plugins_b_tests`,
+`--test unit_gateway_core_tests`), and `--test integration_tests`.
 Functional tests, conformance tests, custom plugins, vendored crates, and
 performance workspaces are outside the default baseline because they either
 spawn subprocesses, use separate coverage reporters, or are not actionable for
@@ -108,7 +110,7 @@ PR coverage is mode-aware:
 
 - Pull requests that touch only plugin coverage-relevant files keep the
   plugin-specific mode: they run the `lib-unit` shard (`--lib` and
-  `--test unit_tests`) and the merge job reuses that shard's profraw/artifacts
+  the four unit targets) and the merge job reuses that shard's profraw/artifacts
   instead of re-collecting coverage. The changed-line plugin gate still applies
   to coverable `src/plugins/` lines. This mode is used only when all
   coverage-relevant changes are plugin-scoped; mixed plugin and core changes

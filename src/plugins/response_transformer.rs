@@ -10,6 +10,16 @@
 //! `should_buffer_response_body_for_content_type()` so unbounded SSE remains
 //! streaming.
 //!
+//! Header rules never participate in that buffering decision: they need no
+//! body. The one buffered-view exception is REQUEST-qualified — a TRANSLATED
+//! gRPC-Web response retains the merged initial-header + trailer compatibility
+//! view this plugin's header rules police, and
+//! `ResponseTransformer::request_retains_grpc_web_trailer_policy` is the form
+//! every caller outside `should_stream_response_body` must use. Evaluating the
+//! bare capability there instead withheld an ordinary SSE or binary response
+//! until origin EOF merely because the instance carried an unrelated header
+//! rule.
+//!
 //! Rules are validated at construction time:
 //!
 //! - Unknown top-level and per-rule properties are rejected (no silent typos).
@@ -20,6 +30,8 @@
 //!   (same complete syntax accepted at H1/H2/H3 emission), including
 //!   rejection of non-CR/LF forbidden control bytes.
 //! - Header keys are pre-lowercased.
+//! - Set-Cookie cannot be renamed from or to: its multi-value encoding is
+//!   bound to that name, regardless of the number of cookies.
 //! - Protocol-managed hop-by-hop and framing destinations (`Connection`,
 //!   `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`,
 //!   `Transfer-Encoding`, `Upgrade`, `Content-Length`) are rejected for
@@ -239,6 +251,21 @@ impl ResponseTransformer {
             return BoundedResponseBodyConstruction::Unchanged;
         }
         body_transform::apply_body_rules_bounded(body, &self.body_rules, ceiling)
+    }
+
+    /// Whether THIS request's terminal metadata is policed over the buffered
+    /// gRPC-Web compatibility view.
+    ///
+    /// [`Plugin::requires_buffered_grpc_web_trailer_policy`] answers the
+    /// capability question only: the shared response decision already narrows it
+    /// to a request `grpc_web` translated. Any caller that evaluates the
+    /// predicate outside that narrowing must re-apply it here, or an ordinary
+    /// HTTP response — `text/event-stream`, a binary download — loses
+    /// incremental delivery because the instance happens to carry an unrelated
+    /// response header rule.
+    fn request_retains_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        super::grpc_web::request_is_grpc_web_translated(ctx)
+            && self.requires_buffered_grpc_web_trailer_policy(ctx)
     }
 
     fn static_rules_may_modify_content_type(&self) -> bool {
@@ -592,6 +619,17 @@ impl ResponseTransformer {
                     })?;
                 }
 
+                // The newline-joined cookie representation is bound to its
+                // header name. Moving it loses values or replaces backend cookies.
+                if matches!(operation, HeaderOp::Rename)
+                    && (key == "set-cookie" || new_key.as_deref() == Some("set-cookie"))
+                {
+                    return Err(format!(
+                        "response_transformer: rule[{idx}]: rename source or destination \
+                         'set-cookie' is not supported; cookie values must retain their header name"
+                    ));
+                }
+
                 // Protocol-managed framing / connection-control destinations are
                 // owned by the final client-wire sanitizer. Reject add/update of
                 // those keys and rename *to* those keys so a later instance or a
@@ -905,6 +943,12 @@ impl Plugin for ResponseTransformer {
     }
 
     fn requires_buffered_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        // Policy-bearing header configuration only. The shared response
+        // decision in `should_stream_response_body` consults this solely for a
+        // request `grpc_web` already translated, so this answer is scoped to
+        // that compatibility view — see
+        // `Self::request_retains_grpc_web_trailer_policy` for the
+        // request-qualified form every other caller must use.
         self.rules_enabled
             && (!self.header_rules.is_empty() || ctx.route_override_response_transform.is_some())
     }
@@ -1060,7 +1104,7 @@ impl Plugin for ResponseTransformer {
         if !self.should_buffer_response_body(ctx) {
             return false;
         }
-        if self.requires_buffered_grpc_web_trailer_policy(ctx) {
+        if self.request_retains_grpc_web_trailer_policy(ctx) {
             return true;
         }
         !content_type.is_some_and(|ct| {

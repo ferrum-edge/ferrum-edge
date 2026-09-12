@@ -12,6 +12,9 @@
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+#[path = "../../common/crl_fixtures.rs"]
+mod crl_fixtures;
+
 use ferrum_edge::tls::TrustFencedStream;
 use ferrum_edge::tls::client_trust::{
     self, ClientTrustMaterial, ClientTrustPublicationOutcome, ClientTrustRetirementReason,
@@ -1021,4 +1024,34 @@ fn scope_and_reason_labels_are_stable() {
         "crl_changed"
     );
     assert_eq!(ClientTrustScope::ALL.len(), 4);
+}
+
+#[test]
+fn outside_bundle_crls_without_aki_have_stable_distinct_identities() {
+    let trusted = generate_ca("trusted");
+    let first_signer = generate_ca("shared-outside-issuer");
+    let second_signer = generate_ca("shared-outside-issuer");
+    let no_aki = |ca: &TestCa, number| {
+        crl_fixtures::without_authority_key_identifier(
+            &crl_pem(ca, &[7], number),
+            ca.issuer.key(),
+            &ca.cert_pem,
+        )
+    };
+    let first = no_aki(&first_signer, 1);
+    let reissued = no_aki(&first_signer, 2);
+    let second = no_aki(&second_signer, 1);
+    let before = material(&[&trusted.cert_pem], &[&first]);
+    assert_eq!(before, material(&[&trusted.cert_pem], &[&first]));
+    for changed in [&reissued, &second] {
+        let after = material(&[&trusted.cert_pem], &[changed]);
+        assert_ne!(before, after);
+        assert_eq!(
+            after.withdrawal_relative_to(&before),
+            Some(ClientTrustRetirementReason::CrlChanged)
+        );
+    }
+    // A verified signer retains semantic reissue behavior without AKI.
+    let verified = material(&[&first_signer.cert_pem], &[&first]);
+    assert_eq!(verified, material(&[&first_signer.cert_pem], &[&reissued]));
 }

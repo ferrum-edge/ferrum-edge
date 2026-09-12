@@ -6,6 +6,8 @@
 //! Marked with `#[ignore]` — run with:
 //!   cargo test --test functional_tests -- --ignored functional_cli
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -37,10 +39,9 @@ fn binary_abs_path() -> std::path::PathBuf {
 }
 
 async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Wait until `child` owns `admin_port`. Unauthenticated `/health` and
@@ -597,6 +598,95 @@ fn hermetic_validate_command(temp_dir: &TempDir, args: &[&str]) -> Command {
     cmd.arg("validate").args(args);
     apply_hermetic_env(&mut cmd, temp_dir);
     cmd
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_file_admission_validate_and_run_agree() {
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../fixtures/file_admission_cases.json")).unwrap();
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let spec = temp_dir.path().join("resources.json");
+        std::fs::write(&spec, serde_json::to_vec(&case["config"]).unwrap()).unwrap();
+        let mut command = hermetic_validate_command(
+            &temp_dir,
+            &["--mode", "file", "--spec", spec.to_str().unwrap()],
+        );
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::from(command)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("file validate must terminate")
+        .expect("run file validate");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some(expected) = case["expected_error"].as_str() {
+            assert_eq!(output.status.code(), Some(1), "{name}: {combined}");
+            assert!(combined.contains(expected), "{name}: {combined}");
+
+            let failed = crate::common::TestGateway::builder()
+                .skip_auto_build()
+                .clear_env()
+                .mode_file(serde_json::to_string(&case["config"]).unwrap())
+                .max_attempts(1)
+                .spawn_expect_failure(Duration::from_secs(30))
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let diagnostic = failed.combined_output();
+            assert_eq!(failed.status.and_then(|status| status.code()), Some(1));
+            assert!(diagnostic.contains(expected), "{name}: {diagnostic}");
+            assert!(
+                diagnostic.contains("Configuration validation failed:"),
+                "run must reject at file admission: {name}: {diagnostic}"
+            );
+        } else {
+            assert!(output.status.success(), "{name}: {combined}");
+            assert!(
+                combined.contains("Validation passed."),
+                "{name}: {combined}"
+            );
+
+            // TCP fixture ports are replaced on every attempt; only a reported
+            // listener bind race permits another spawn. The harness proves
+            // readiness with this child's authenticated health identity.
+            let attempts = crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS;
+            let mut started = false;
+            for attempt in 1..=attempts {
+                let mut config = case["config"].clone();
+                let reservation = reserve_port().await.unwrap();
+                let port = reservation.port;
+                if config["proxies"][0].get("listen_port").is_some() {
+                    config["proxies"][0]["listen_port"] = port.into();
+                }
+                let builder = crate::common::TestGateway::builder()
+                    .skip_auto_build()
+                    .clear_env()
+                    .mode_file(serde_json::to_string(&config).unwrap())
+                    .reserve_listener_port(port)
+                    .env("FERRUM_POOL_WARMUP_ENABLED", "false");
+                reservation.drop_and_take_port();
+                match builder.spawn_classified().await {
+                    Ok(mut gateway) => {
+                        gateway.shutdown();
+                        started = true;
+                        break;
+                    }
+                    Err(error) if error.is_retryable_port_race(attempt, attempts) => {}
+                    Err(error) => panic!("{name}: {error}"),
+                }
+            }
+            assert!(started, "{name}: valid file must reach owned readiness");
+        }
+    }
 }
 
 /// Database-mode `validate` in the hermetic environment.
@@ -1783,8 +1873,8 @@ async fn functional_cli_run_starts_and_stops() {
             "--mode",
             "file",
         ])
-        .env("FERRUM_PROXY_HTTP_PORT", "18990")
-        .env("FERRUM_ADMIN_HTTP_PORT", "18991")
+        .env("FERRUM_PROXY_HTTP_PORT", ephemeral_port().await.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", ephemeral_port().await.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1857,8 +1947,8 @@ async fn functional_cli_run_with_verbose() {
             "file",
             "-v",
         ])
-        .env("FERRUM_PROXY_HTTP_PORT", "18992")
-        .env("FERRUM_ADMIN_HTTP_PORT", "18993")
+        .env("FERRUM_PROXY_HTTP_PORT", ephemeral_port().await.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", ephemeral_port().await.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1910,8 +2000,8 @@ async fn functional_cli_reload_sends_sighup() {
             "--mode",
             "file",
         ])
-        .env("FERRUM_PROXY_HTTP_PORT", "18994")
-        .env("FERRUM_ADMIN_HTTP_PORT", "18995")
+        .env("FERRUM_PROXY_HTTP_PORT", ephemeral_port().await.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", ephemeral_port().await.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2201,7 +2291,7 @@ async fn functional_cli_spec_flag_infers_file_mode() {
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
 
-        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         let echo_server = tokio::spawn(async move {
             loop {
@@ -2309,7 +2399,7 @@ async fn functional_cli_precedence_flag_beats_env_var() {
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
 
-        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         let echo_server = tokio::spawn(async move {
             loop {
@@ -2422,11 +2512,11 @@ async fn functional_cli_precedence_env_beats_conf_file() {
         // Hold decoy port listeners so that (a) no other CI process can
         // grab them (eliminating false-positive port collisions) and
         // (b) the gateway would fatal-fail if it tried to bind them.
-        let conf_proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let conf_proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind decoy proxy");
         let conf_proxy_port = conf_proxy_listener.local_addr().unwrap().port();
-        let conf_admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let conf_admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind decoy admin");
         let conf_admin_port = conf_admin_listener.local_addr().unwrap().port();
@@ -3226,7 +3316,7 @@ async fn functional_cli_validate_injector_loads_tls_without_binding() {
         .unwrap();
     std::fs::write(&key_path, key.serialize_pem()).unwrap();
     // An already-bound port proves validation does not start the webhook.
-    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied = std::net::TcpListener::bind_test("127.0.0.1:0").unwrap();
     let listen_addr = occupied.local_addr().unwrap().to_string();
     for (material, valid) in [
         (None, false),
@@ -3359,4 +3449,513 @@ async fn functional_cli_validate_migration_reads_without_mutation() {
             .to_string_lossy()
             .contains("backup")
     }));
+}
+
+const EMPTY_POOL_SHARD_CONFIG: &str =
+    "version: '1'\nproxies: []\nconsumers: []\nplugin_configs: []\nupstreams: []\n";
+
+async fn start_gateway_with_one_pool_shard(
+    mode: &str,
+    cp_address: Option<&str>,
+) -> (crate::common::TestGateway, Option<String>) {
+    let attempts = crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS;
+    for attempt in 1..=attempts {
+        let mut builder = crate::common::TestGateway::builder()
+            .skip_auto_build()
+            .clear_env()
+            .capture_output()
+            .env("FERRUM_POOL_SHARD_AMOUNT", "1")
+            .env("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true");
+        let mut reservation = None;
+        let mut address = None;
+        builder = match mode {
+            "file" => builder.mode_file(EMPTY_POOL_SHARD_CONFIG),
+            "database" => builder.mode_database_sqlite(),
+            "cp" => {
+                let held = reserve_port().await.unwrap();
+                let value = format!("127.0.0.1:{}", held.port);
+                builder = builder.reserve_listener_port(held.port);
+                reservation = Some(held);
+                address = Some(value.clone());
+                builder.mode_cp(crate::common::DbType::Sqlite, Some(value))
+            }
+            "dp" => builder.mode_dp(vec![format!("http://{}", cp_address.unwrap())]),
+            _ => panic!("unsupported fixture mode {mode}"),
+        };
+        if let Some(reservation) = reservation {
+            reservation.drop_and_take_port();
+        }
+        match builder.spawn_classified().await {
+            Ok(gateway) => return (gateway, address),
+            Err(error) if error.is_retryable_port_race(attempt, attempts) => {}
+            Err(error) => panic!("{mode} with one pool shard: {error}"),
+        }
+    }
+    unreachable!("the final failed attempt returns its diagnostic")
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_pool_shard_one_validates_and_starts_file_database_cp_and_dp() {
+    let temp_dir = TempDir::new().unwrap();
+    let spec = temp_dir.path().join("resources.yaml");
+    std::fs::write(&spec, EMPTY_POOL_SHARD_CONFIG).unwrap();
+    for value in [0usize, 1, 2, 3, 64, 1 << 30] {
+        let mut command = hermetic_validate_command(
+            &temp_dir,
+            &["--mode", "file", "--spec", spec.to_str().unwrap()],
+        );
+        command
+            .env("FERRUM_POOL_SHARD_AMOUNT", value.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::from(command)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("validate must terminate")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "shard override {value}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Validation passed."));
+    }
+    for mode in ["file", "database"] {
+        let (mut gateway, _) = start_gateway_with_one_pool_shard(mode, None).await;
+        gateway.shutdown();
+    }
+    let (mut cp, address) = start_gateway_with_one_pool_shard("cp", None).await;
+    let (mut dp, _) = start_gateway_with_one_pool_shard("dp", address.as_deref()).await;
+    dp.shutdown();
+    cp.shutdown();
+}
+
+// These regressions execute an installed copy of the actual CLI in isolated
+// working directories. CI builds the binary before the functional shards run.
+fn installed_cli_command(directory: &TempDir, args: &[&str]) -> Command {
+    let install_dir = directory.path().join("bin");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    let executable = install_dir.join(if cfg!(windows) {
+        "ferrum-edge.exe"
+    } else {
+        "ferrum-edge"
+    });
+    if !executable.exists() && std::fs::hard_link(binary_abs_path(), &executable).is_err() {
+        std::fs::copy(binary_abs_path(), &executable).unwrap();
+    }
+    let mut command = Command::new(executable);
+    apply_hermetic_env(&mut command, directory);
+    command.args(args);
+    command
+}
+
+async fn cli_contract_output(command: Command) -> std::process::Output {
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(20), command.output())
+        .await
+        .expect("CLI must terminate within the bounded probe budget")
+        .expect("execute installed CLI")
+}
+
+fn cli_contract_diagnostic(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_bare_invocation_requires_subcommand() {
+    let directory = TempDir::new().unwrap();
+    let output = cli_contract_output(installed_cli_command(&directory, &[])).await;
+    assert!(!output.status.success());
+    assert!(cli_contract_diagnostic(&output).contains("Usage:"));
+    for args in [
+        vec!["version"],
+        vec!["--help"],
+        vec!["run", "--help"],
+        vec!["health", "--help"],
+    ] {
+        let output = cli_contract_output(installed_cli_command(&directory, &args)).await;
+        assert!(output.status.success());
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_spec_discovery_preserves_every_explicit_layer() {
+    const VALID: &str = "version: '1'\nproxies: []\nconsumers: []\nplugin_configs: []\n";
+    for layer in ["conf", "env", "cli", "discovery", "settings_suffix"] {
+        let directory = TempDir::new().unwrap();
+        let chosen = directory.path().join("chosen.yaml");
+        std::fs::write(&chosen, VALID).unwrap();
+        std::fs::write(directory.path().join("resources.yaml"), "invalid: [").unwrap();
+        let settings = directory.path().join("chosen.conf");
+        let mut command = installed_cli_command(&directory, &["validate"]);
+        std::fs::write(
+            &settings,
+            format!("FERRUM_FILE_CONFIG_PATH={}\n", chosen.display()),
+        )
+        .unwrap();
+        command.env("FERRUM_CONF_PATH", &settings);
+        match layer {
+            "conf" => {}
+            "settings_suffix" => {
+                let reference = directory.path().join("settings-reference");
+                std::fs::write(&reference, settings.to_str().unwrap()).unwrap();
+                command
+                    .env_remove("FERRUM_CONF_PATH")
+                    .env("FERRUM_CONF_PATH_FILE", reference);
+            }
+            "env" | "cli" => {
+                std::fs::write(&settings, "FERRUM_FILE_CONFIG_PATH=missing-conf.yaml\n").unwrap();
+                let env_path = if layer == "env" {
+                    chosen.as_os_str()
+                } else {
+                    std::ffi::OsStr::new("missing-env.yaml")
+                };
+                command.env("FERRUM_FILE_CONFIG_PATH", env_path);
+                if layer == "cli" {
+                    command.arg("--spec").arg(&chosen);
+                }
+            }
+            "discovery" => {
+                std::fs::write(&settings, "").unwrap();
+                std::fs::write(directory.path().join("resources.yaml"), VALID).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let output = cli_contract_output(command).await;
+        assert!(
+            output.status.success(),
+            "{layer}: {}",
+            cli_contract_diagnostic(&output)
+        );
+        assert!(cli_contract_diagnostic(&output).contains("Validation passed."));
+    }
+}
+
+/// Smallest file-mode spec that actually loads. `GatewayConfig::plugin_configs`
+/// has no serde default (unlike `consumers` / `upstreams`), so a spec that lists
+/// only `version` and `proxies` fails deserialization and the gateway exits 1
+/// during startup — long before any listener binds.
+const MINIMAL_FILE_SPEC: &str = "version: '1'\nproxies: []\nplugin_configs: []\n";
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_dp_admin_secret_and_listener_admission_match_run() {
+    for subcommand in ["validate", "run"] {
+        for invalid in ["dp-secret", "listener", "settings-key", "settings-suffix"] {
+            let directory = TempDir::new().unwrap();
+            let mut command = installed_cli_command(&directory, &[subcommand]);
+            let expected = match invalid {
+                "dp-secret" => {
+                    command
+                        .env("FERRUM_MODE", "dp")
+                        .env("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051")
+                        .env(
+                            "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                            "fixture-cp-secret-at-least-32-characters",
+                        );
+                    "FERRUM_ADMIN_JWT_SECRET"
+                }
+                _ => {
+                    let spec = directory.path().join("valid.yaml");
+                    // `plugin_configs` carries no serde default, so a spec that
+                    // omits it is rejected at load. Keep the fixture genuinely
+                    // valid so each case fails on the surface it names.
+                    std::fs::write(&spec, MINIMAL_FILE_SPEC).unwrap();
+                    command
+                        .env("FERRUM_MODE", "file")
+                        .env("FERRUM_FILE_CONFIG_PATH", spec);
+                    if invalid == "listener" {
+                        command
+                            .env("FERRUM_PROXY_HTTP_PORT", "9010")
+                            .env("FERRUM_ADMIN_HTTP_PORT", "9010");
+                        "FERRUM_PROXY_HTTP_PORT and FERRUM_ADMIN_HTTP_PORT"
+                    } else {
+                        let settings = directory.path().join("invalid.conf");
+                        let key = if invalid == "settings-key" {
+                            "FERRUM_UNKNOWN_SETTING"
+                        } else {
+                            "FERRUM_ADMIN_HTTP_PORT_FILE"
+                        };
+                        std::fs::write(&settings, format!("{key}=private-fixture-value\n"))
+                            .unwrap();
+                        command.env("FERRUM_CONF_PATH", settings);
+                        key
+                    }
+                }
+            };
+            let output = cli_contract_output(command).await;
+            let diagnostic = cli_contract_diagnostic(&output);
+            assert!(
+                !output.status.success(),
+                "{subcommand}/{invalid}: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains(expected),
+                "{subcommand}/{invalid}: {diagnostic}"
+            );
+            assert!(!diagnostic.contains("private-fixture-value"));
+        }
+    }
+    let directory = TempDir::new().unwrap();
+    let mut command = installed_cli_command(&directory, &["validate", "--mode", "dp"]);
+    command
+        .env("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051")
+        .env(
+            "FERRUM_CP_DP_GRPC_JWT_SECRET",
+            "fixture-cp-secret-at-least-32-characters",
+        )
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "fixture-admin-secret-at-least-32-characters",
+        );
+    let output = cli_contract_output(command).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        cli_contract_diagnostic(&output)
+    );
+}
+
+async fn reserve_cli_probe_listener(host: &str) -> (u16, TcpListener) {
+    for _ in 0..crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS {
+        let reservation = reserve_port().await.unwrap();
+        let port = reservation.port;
+        if host == "127.0.0.1" {
+            return (port, reservation.into_listener());
+        }
+        // Keep the IPv4 reservation until the fixture owns the other address.
+        // Retry a competing bind with a new reservation, never the same port.
+        match TcpListener::bind_test((host, port)).await {
+            Ok(listener) => return (port, listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => panic!("bind health fixture: {error}"),
+        }
+    }
+    panic!("health fixture exhausted its bind attempts");
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_health_infers_endpoint_and_fetches_only_needed_sources() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for case in [
+        "settings",
+        "env",
+        "suffix",
+        "wildcard",
+        "mapped",
+        "specific",
+        "v6wildcard",
+        "explicit",
+        "live",
+    ] {
+        if case == "specific" && !cfg!(target_os = "linux") {
+            continue;
+        }
+        let directory = TempDir::new().unwrap();
+        let bind_host = match case {
+            "specific" => "127.0.0.2",
+            "v6wildcard" => "::1",
+            _ => "127.0.0.1",
+        };
+        let (port, listener) = reserve_cli_probe_listener(bind_host).await;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let size = socket.read(&mut buf).await.unwrap();
+                assert!(size > 0 && request.len() < 8192);
+                request.extend_from_slice(&buf[..size]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let mut command = installed_cli_command(&directory, &["health"]);
+        let settings = directory.path().join("health.conf");
+        std::fs::write(
+            &settings,
+            format!("FERRUM_ADMIN_HTTP_PORT={port}\nFERRUM_ADMIN_BIND_ADDRESS=127.0.0.1\n"),
+        )
+        .unwrap();
+        command
+            .env("FERRUM_CONF_PATH", &settings)
+            .env(
+                "FERRUM_ADMIN_JWT_SECRET_FILE",
+                directory.path().join("unrelated-missing-secret"),
+            )
+            .env("FERRUM_DB_URL_VAULT", "unused-unrelated-provider-reference");
+        match case {
+            "env" => {
+                std::fs::write(
+                    &settings,
+                    "FERRUM_ADMIN_HTTP_PORT=0\nFERRUM_ADMIN_BIND_ADDRESS=192.0.2.1\n",
+                )
+                .unwrap();
+                command
+                    .env("FERRUM_ADMIN_HTTP_PORT", port.to_string())
+                    .env("FERRUM_ADMIN_BIND_ADDRESS", "127.0.0.1");
+            }
+            "suffix" => {
+                for (key, value) in [
+                    ("FERRUM_CONF_PATH", settings.to_str().unwrap().to_string()),
+                    ("FERRUM_ADMIN_HTTP_PORT", port.to_string()),
+                    ("FERRUM_ADMIN_BIND_ADDRESS", "127.0.0.1".to_string()),
+                ] {
+                    let reference = directory.path().join(key);
+                    std::fs::write(&reference, value).unwrap();
+                    command
+                        .env_remove(key)
+                        .env(format!("{key}_FILE"), reference);
+                }
+            }
+            "wildcard" => {
+                command.env("FERRUM_ADMIN_BIND_ADDRESS", "0.0.0.0");
+            }
+            "mapped" => {
+                command.env("FERRUM_ADMIN_BIND_ADDRESS", "::ffff:127.0.0.1");
+            }
+            "specific" => {
+                command.env("FERRUM_ADMIN_BIND_ADDRESS", "127.0.0.2");
+            }
+            "v6wildcard" => {
+                command.env("FERRUM_ADMIN_BIND_ADDRESS", "::");
+            }
+            "explicit" => {
+                command
+                    .arg("--port")
+                    .arg(port.to_string())
+                    .args(["--host", "127.0.0.1"])
+                    .env("FERRUM_CONF_PATH", directory.path().join("missing.conf"))
+                    .env(
+                        "FERRUM_ADMIN_HTTP_PORT_FILE",
+                        directory.path().join("unused-port"),
+                    );
+            }
+            "live" => {
+                command.arg("--live");
+            }
+            _ => {}
+        }
+        let output = cli_contract_output(command).await;
+        if !output.status.success() {
+            server.abort();
+            panic!("{case}: {}", cli_contract_diagnostic(&output));
+        }
+        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let path = if case == "live" { "/live" } else { "/health" };
+        assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+        let host = match case {
+            "mapped" => "[::ffff:127.0.0.1]",
+            "specific" => "127.0.0.2",
+            "v6wildcard" => "[::1]",
+            _ => "127.0.0.1",
+        };
+        assert!(request.contains(&format!("Host: {host}:{port}\r\n")));
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_health_rejects_invalid_endpoint_sources_without_values() {
+    for (value, expected) in [
+        (
+            "private-invalid-port",
+            "FERRUM_ADMIN_HTTP_PORT must be an integer",
+        ),
+        ("0", "disabled"),
+    ] {
+        let directory = TempDir::new().unwrap();
+        let reference = directory.path().join("private-source-reference");
+        std::fs::write(&reference, value).unwrap();
+        let mut command = installed_cli_command(&directory, &["health"]);
+        command
+            .env("FERRUM_ADMIN_HTTP_PORT_FILE", &reference)
+            .env("FERRUM_ADMIN_HTTPS_PORT", "0");
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        assert!(!output.status.success());
+        assert!(diagnostic.contains(expected), "{diagnostic}");
+        assert!(!diagnostic.contains("private-invalid-port"));
+        assert!(!diagnostic.contains("private-source-reference"));
+    }
+    let directory = TempDir::new().unwrap();
+    let mut command = installed_cli_command(&directory, &["health"]);
+    command
+        .env("FERRUM_ADMIN_HTTP_PORT", "9000")
+        .env("FERRUM_ADMIN_HTTP_PORT_FILE", "private-unread-source");
+    let output = cli_contract_output(command).await;
+    let diagnostic = cli_contract_diagnostic(&output);
+    assert!(!output.status.success());
+    assert!(diagnostic.contains("Multiple secret sources configured for FERRUM_ADMIN_HTTP_PORT"));
+    assert!(!diagnostic.contains("private-unread-source"));
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_health_uses_secret_endpoint_for_tls_gateway() {
+    use rcgen::{CertificateParams, KeyPair};
+
+    let directory = TempDir::new().unwrap();
+    let cert_path = directory.path().join("admin.crt");
+    let key_path = directory.path().join("admin.key");
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = CertificateParams::new(vec!["localhost".into()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    let mut gateway = crate::common::TestGateway::builder()
+        .skip_auto_build()
+        .clear_env()
+        .mode_file(MINIMAL_FILE_SPEC)
+        .env("FERRUM_ADMIN_TLS_CERT_PATH", cert_path.to_str().unwrap())
+        .env("FERRUM_ADMIN_TLS_KEY_PATH", key_path.to_str().unwrap())
+        .env_ephemeral_port("FERRUM_ADMIN_HTTPS_PORT")
+        .spawn()
+        .await
+        .unwrap();
+    let port = gateway.env_port("FERRUM_ADMIN_HTTPS_PORT").unwrap();
+    let http_source = directory.path().join("http-port");
+    let https_source = directory.path().join("https-port");
+    let host_source = directory.path().join("admin-host");
+    std::fs::write(&http_source, "0").unwrap();
+    std::fs::write(&https_source, port.to_string()).unwrap();
+    std::fs::write(&host_source, "127.0.0.1").unwrap();
+    let mut command = installed_cli_command(&directory, &["health", "--tls-no-verify"]);
+    command
+        .env("FERRUM_ADMIN_HTTP_PORT_FILE", http_source)
+        .env("FERRUM_ADMIN_HTTPS_PORT_FILE", https_source)
+        .env("FERRUM_ADMIN_BIND_ADDRESS_FILE", host_source)
+        .env(
+            "FERRUM_ADMIN_TLS_KEY_PATH_FILE",
+            "unrelated-unread-server-key",
+        );
+    let output = cli_contract_output(command).await;
+    gateway.shutdown();
+    assert!(
+        output.status.success(),
+        "{}",
+        cli_contract_diagnostic(&output)
+    );
 }

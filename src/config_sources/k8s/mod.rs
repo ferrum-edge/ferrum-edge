@@ -54,11 +54,12 @@ pub(crate) use istio::{SidecarOutboundPolicy, classify_sidecar_outbound_traffic_
 // predicate, so a UDP ServiceEntry is never reported as fully accepted while its
 // egress lane is silently skipped.
 pub(crate) use istio::service_entry_port_protocol_is_udp;
-// Same shared-predicate contract for the egress wildcard-host refusal (issue
-// #4535): a wildcard `spec.hosts[]` element with no declared `endpoints[]` is
-// skipped by every egress materialization branch, so the status writer reports
-// it as deferred through the SAME predicate rather than re-deriving the rule.
-pub(crate) use istio::service_entry_spec_has_unresolvable_wildcard_host;
+// Same shared-predicate contract for the stream-family egress wildcard-host
+// refusal (issue #4535): a wildcard `spec.hosts[]` element with no declared
+// `endpoints[]` is skipped by the stream-family materialization branch (HTTP
+// dispatch concretizes the target per request instead), so the status writer
+// reports it as deferred through the SAME predicate rather than re-deriving it.
+pub(crate) use istio::service_entry_spec_has_unresolvable_stream_wildcard_host;
 
 use std::collections::{HashMap, HashSet};
 
@@ -87,6 +88,8 @@ use crate::plugins::utils::fault_roll::MAX_FAULT_DELAY_MS;
 /// "this object is malformed". Emit it verbatim inside a diagnostic that also
 /// names the offending field.
 pub(crate) const UNSUPPORTED_SHAPE_MARKER: &str = "is not implemented by Ferrum";
+/// Shared translator/status marker for known but unimplemented filter actions.
+pub(crate) const INCOMPATIBLE_FILTERS_MARKER: &str = "incompatible Gateway API filters";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct K8sMetadata {

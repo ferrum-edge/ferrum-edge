@@ -1464,3 +1464,131 @@ fn test_statsd_logging_for_each_udp_datagram_stays_mtu_safe() {
     assert!(joined.contains("other:1|c"));
     assert!(!joined.contains(&over));
 }
+
+fn required_max_entry_bytes_from_error(err: &str) -> usize {
+    let marker = "requires at least ";
+    let Some(offset) = err.find(marker) else {
+        panic!("missing required-bytes diagnostic: {err}");
+    };
+    let rest = &err[offset + marker.len()..];
+    let digits = rest.split(" bytes").next().unwrap_or(rest);
+    match digits.parse() {
+        Ok(value) => value,
+        Err(_) => panic!("required bytes not an integer: {err}"),
+    }
+}
+
+#[tokio::test]
+async fn test_statsd_rejects_prefix_budget_that_cannot_hold_a_record() {
+    let prefix = "p".repeat(256);
+    let err = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "prefix": prefix,
+            "max_entry_bytes": 1024,
+            "buffer_max_bytes": 2050
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("256-byte prefix with max_entry_bytes 1024 must be rejected");
+    assert!(err.contains("max_entry_bytes"), "got: {err}");
+    assert!(err.contains("requires at least"), "got: {err}");
+    let required = required_max_entry_bytes_from_error(&err);
+    assert!(
+        required > 1024,
+        "minimum ordinary record must exceed 1024 with a 256-byte prefix: {err}"
+    );
+
+    let at_floor = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "prefix": prefix,
+            "max_entry_bytes": required
+        }),
+        default_client(),
+    );
+    assert!(
+        at_floor.is_ok(),
+        "exact minimum budget must admit: {}",
+        at_floor.err().unwrap_or_default()
+    );
+
+    let just_under = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "prefix": prefix,
+            "max_entry_bytes": required - 1
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("one byte under the minimum ordinary record must be rejected");
+    assert!(just_under.contains("max_entry_bytes"), "got: {just_under}");
+
+    let padded = format!(" {} ", "a".repeat(256));
+    StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "prefix": padded
+        }),
+        default_client(),
+    )
+    .expect("trimmed 256-byte prefix must admit under the default entry budget");
+
+    StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "max_entry_bytes": 1024
+        }),
+        default_client(),
+    )
+    .expect("namespace-derived short prefix must admit max_entry_bytes 1024");
+
+    let omitted = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "prefix": "ferrum",
+            "schema": {"omit": ["http_method", "response_status_code", "proxy_id"]}
+        }),
+        default_client(),
+    );
+    assert!(
+        omitted.is_ok(),
+        "schema omit must still construct with an adequate budget: {}",
+        omitted.err().unwrap_or_default()
+    );
+}
+
+#[tokio::test]
+async fn test_statsd_short_prefix_small_entry_budget_still_emits() {
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
+    let port = socket.local_addr().expect("local addr").port();
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": port,
+            "prefix": "ferrum",
+            "max_entry_bytes": 1024,
+            "flush_interval_ms": 50,
+            "max_batch_lines": 1
+        }),
+        default_client(),
+    )
+    .expect("short prefix with max_entry_bytes 1024 must construct");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+    let mut buf = [0u8; 2048];
+    let (n, _) = timeout(Duration::from_secs(10), socket.recv_from(&mut buf))
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for statsd datagram"))
+        .expect("receive statsd datagram");
+    let payload = std::str::from_utf8(&buf[..n]).expect("utf8");
+    assert!(
+        payload.contains("ferrum.request.count:1|c"),
+        "collector must receive HTTP metrics: {payload}"
+    );
+}

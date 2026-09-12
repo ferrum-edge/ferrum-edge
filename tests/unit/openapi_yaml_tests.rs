@@ -273,6 +273,292 @@ fn transaction_log_schema_closed_object_keys_match_openapi() {
 }
 
 #[test]
+fn transaction_log_schema_openapi_matches_constructor_admission() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    // Issue #5168: the document admitted schema shapes the constructor
+    // rejects — empty names, empty list entries / rename targets / derived
+    // names / static keys, null static values, duplicate `order` entries, and
+    // control characters in a metadata prefix — so schema-driven tooling
+    // approved configurations that fail at load. Both surfaces must agree.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/TransactionLogSchemaConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("TransactionLogSchemaConfig schema compiles");
+
+    for config in [
+        json!({ "schemas": {} }),
+        json!({ "schemas": { "": {} } }),
+        json!({ "schemas": { "basic": { "omit": [""] } } }),
+        json!({ "schemas": { "basic": { "rename": { "proxy_id": "" } } } }),
+        json!({ "schemas": { "basic": { "rename": { "": "route_id" } } } }),
+        json!({ "schemas": { "basic": { "order": ["*", "*"] } } }),
+        json!({ "schemas": { "basic": { "static_fields": { "stamp": null } } } }),
+        json!({ "schemas": { "basic": { "static_fields": { "": "v1" } } } }),
+        json!({
+            "schemas": { "basic": { "derived_fields": [{ "name": "", "kind": "outcome" }] } }
+        }),
+        json!({
+            "schemas": { "basic": { "metadata": { "mode": "flatten", "prefix": "bad\u{1}" } } }
+        }),
+        json!({ "schemas": { "basic": { "metadata": { "mode": "nested", "prefix": 3 } } } }),
+        json!({
+            "schemas": { "basic": { "metadata": { "mode": "omit", "on_collision": "bad" } } }
+        }),
+    ] {
+        let documented = validator.validate(&config);
+        let runtime = validate_plugin_config("transaction_log_schema", &config);
+        assert!(documented.is_err(), "schema should reject: {config}");
+        assert!(runtime.is_err(), "runtime should reject: {config}");
+    }
+
+    for config in [
+        json!({ "schemas": { "basic": {} } }),
+        json!({
+            "schemas": {
+                "basic": {
+                    "summary_type": "http",
+                    "omit": ["request_user_agent"],
+                    "rename": { "proxy_id": "route_id" },
+                    "order": ["route_id", "*"],
+                    "static_fields": { "env": "production" },
+                    "derived_fields": [{ "name": "outcome", "kind": "outcome" }],
+                    "metadata": { "mode": "flatten", "prefix": "meta_" },
+                    "timestamp_format": "epoch_ms"
+                }
+            }
+        }),
+    ] {
+        let documented = validator.validate(&config);
+        let runtime = validate_plugin_config("transaction_log_schema", &config);
+        assert!(documented.is_ok(), "schema should accept: {config}");
+        assert!(runtime.is_ok(), "runtime should accept: {config}");
+    }
+
+    // Non-global scope is rejected by the admin write path, so the
+    // `PluginConfig` branch must not admit it either.
+    let plugin_branch = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/PluginConfig",
+        "components": spec["components"].clone()
+    });
+    let plugin_validator = jsonschema::draft202012::options()
+        .build(&plugin_branch)
+        .expect("PluginConfig schema compiles");
+    let mut plugin = json!({
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": { "schemas": { "basic": {} } }
+    });
+    assert!(plugin_validator.validate(&plugin).is_ok());
+    plugin["scope"] = json!("proxy_group");
+    assert!(plugin_validator.validate(&plugin).is_err());
+}
+
+#[test]
+fn api_chargeback_sink_schema_matches_constructor_admission() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::api_chargeback_sink::ApiChargebackSink;
+    use ferrum_edge::plugins::transaction_log_schema::TransactionLogSchema;
+    use ferrum_edge::plugins::utils::log_schema::{CHARGE_EVENT_FIELDS, registry};
+
+    // Issue #5393: keep the shared log-schema constraints, then narrow only
+    // the sink's projection to the charge-event family used by its constructor.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackSinkConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("ApiChargebackSinkConfig schema compiles");
+    let shared_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/SummaryLogSchema",
+        "components": spec["components"].clone()
+    });
+    let shared_validator = jsonschema::draft202012::options()
+        .build(&shared_schema)
+        .expect("SummaryLogSchema schema compiles");
+    let base = json!({
+        "clickhouse": { "url": "https://clickhouse.example:8443" },
+        "spool": { "enabled": false },
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.01 }]
+    });
+    let http_client = PluginHttpClient::default();
+    let assert_admission = |config: &serde_json::Value, expected: bool| {
+        let documented = validator.validate(config);
+        let runtime = ApiChargebackSink::new(config, http_client.clone(), "ferrum");
+        assert_eq!(
+            documented.is_ok(),
+            expected,
+            "unexpected schema admission for {config}: {documented:?}"
+        );
+        assert_eq!(
+            runtime.is_ok(),
+            expected,
+            "unexpected constructor admission for {config}: {:?}",
+            runtime.err()
+        );
+    };
+    assert_admission(&base, true);
+
+    for projection in [
+        json!({ "summary_type": "http" }),
+        json!({ "summary_type": "stream" }),
+        json!({ "summary_type": "both" }),
+        json!({ "timestamp_format": "rfc3339" }),
+        json!({ "timestamp_format": "epoch_ms" }),
+        json!({ "timestamp_format": "epoch_s" }),
+        json!({ "metadata": {} }),
+        json!({ "metadata": { "mode": "nested" } }),
+        json!({ "metadata": { "mode": "omit" } }),
+        json!({ "metadata": { "mode": "flatten" } }),
+        json!({ "derived_fields": [{ "name": "host", "kind": "backend_host" }] }),
+    ] {
+        assert!(
+            shared_validator.validate(&projection).is_ok(),
+            "other logging families retain support for {projection}"
+        );
+        let mut config = base.clone();
+        config["schema"] = projection;
+        assert_admission(&config, false);
+    }
+
+    for projection in [
+        json!({}),
+        json!({ "order": ["*"] }),
+        json!({ "omit": ["node_id", "node_id"] }),
+        json!({
+            "omit": ["node_id", "pricing_version"],
+            "rename": { "proxy_id": "route_key", "charge_total": "amount" },
+            "order": ["amount", "record_kind", "*"],
+            "static_fields": { "ledger": "prod", "shard": 3 },
+            "derived_fields": [
+                { "name": "status_group", "kind": "status_class" },
+                { "name": "record_kind", "kind": "summary_kind" },
+                { "name": "call_outcome", "kind": "outcome" }
+            ]
+        }),
+    ] {
+        let mut config = base.clone();
+        config["schema"] = projection;
+        assert_admission(&config, true);
+    }
+
+    for projection in [
+        json!(null),
+        json!([]),
+        json!({ "summary_type": null }),
+        json!({ "timestamp_format": null }),
+        json!({ "metadata": null }),
+        json!({ "unknown": true }),
+        json!({ "omit": [""] }),
+        json!({ "omit": ["latency_total_ms"] }),
+        json!({ "rename": { "backend_target": "backend" } }),
+        json!({ "rename": { "proxy_id": "" } }),
+        json!({ "order": ["*", "*"] }),
+        json!({ "static_fields": { "stamp": null } }),
+        json!({ "static_fields": { "": "v1" } }),
+        json!({ "derived_fields": [{ "name": "", "kind": "outcome" }] }),
+        json!({ "derived_fields": [{ "name": "result", "kind": "unknown" }] }),
+        json!({ "derived_fields": [{ "name": "result", "kind": "outcome", "extra": 1 }] }),
+    ] {
+        let mut config = base.clone();
+        config["schema"] = projection;
+        assert_admission(&config, false);
+    }
+
+    let documented_fields: BTreeSet<&str> = spec
+        .pointer("/components/schemas/ApiChargebackSinkLogField/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("charge-event field inventory")
+        .iter()
+        .map(|field| field.as_str().expect("field name"))
+        .collect();
+    let runtime_fields: BTreeSet<&str> =
+        CHARGE_EVENT_FIELDS.iter().map(|field| field.name).collect();
+    assert_eq!(documented_fields, runtime_fields);
+    for field in runtime_fields {
+        for projection in [
+            json!({ "omit": [field] }),
+            json!({ "rename": { (field): "projected_value" } }),
+        ] {
+            let mut config = base.clone();
+            config["schema"] = projection;
+            assert_admission(&config, true);
+        }
+    }
+
+    for reference in [json!(""), json!(null), json!(7), json!({}), json!([])] {
+        let mut config = base.clone();
+        config["schema_ref"] = reference;
+        assert_admission(&config, false);
+    }
+    for projection in [json!({}), json!(null)] {
+        for reference in [json!("portable"), json!(null)] {
+            let mut config = base.clone();
+            config["schema"] = projection.clone();
+            config["schema_ref"] = reference;
+            assert_admission(&config, false);
+        }
+    }
+
+    // A reference is only a string in OpenAPI. Its definition must pass the
+    // same family checks when resolved; staging keeps the live registry intact.
+    let definitions = json!({
+        "schemas": {
+            "portable": { "rename": { "proxy_id": "route_key" }, "order": ["*"] },
+            "summary": { "summary_type": "both" },
+            "timestamp": { "timestamp_format": "rfc3339" },
+            "metadata": { "metadata": { "mode": "nested" } },
+            "backend": { "derived_fields": [{ "name": "host", "kind": "backend_host" }] },
+            "summary_field": { "omit": ["latency_total_ms"] }
+        }
+    });
+    registry::begin_reload().expect("begin isolated schema staging");
+    let registered = TransactionLogSchema::new(&definitions);
+    let results: Vec<_> = [
+        ("portable", true),
+        ("summary", false),
+        ("timestamp", false),
+        ("metadata", false),
+        ("backend", false),
+        ("summary_field", false),
+        ("missing", false),
+    ]
+    .into_iter()
+    .map(|(name, expected)| {
+        let mut config = base.clone();
+        config["schema_ref"] = json!(name);
+        let documented = validator.validate(&config).is_ok();
+        let runtime = ApiChargebackSink::new(&config, http_client.clone(), "ferrum");
+        (name, expected, documented, runtime)
+    })
+    .collect();
+    registry::abort_reload().expect("discard isolated schema staging");
+    assert!(registered.is_ok(), "portable definitions must compile");
+    for (name, expected, documented, runtime) in results {
+        assert!(documented, "nonempty reference is schema-valid: {name}");
+        assert_eq!(
+            runtime.is_ok(),
+            expected,
+            "unexpected resolved admission for {name}: {:?}",
+            runtime.err()
+        );
+    }
+}
+
+#[test]
 fn typed_component_properties_match_serde_field_inventories() {
     use ferrum_edge::config::types::{
         ActiveHealthCheck, BackendTlsConfig, CircuitBreakerConfig, ConsulConfig, Consumer,
@@ -324,7 +610,9 @@ fn typed_component_properties_match_serde_field_inventories() {
         rust_only = ["credentials"],
         schema_only = []
     );
-    check!(PluginConfig, "PluginConfig");
+    // Properties live on PluginConfigBase; PluginConfig/Create/Replace compose
+    // presence requirements on top of that shared bag.
+    check!(PluginConfig, "PluginConfigBase");
     check!(PluginAssociation, "PluginAssociation");
     check!(Upstream, "Upstream");
     check!(UpstreamTarget, "UpstreamTarget");
@@ -366,6 +654,43 @@ fn typed_component_properties_match_serde_field_inventories() {
     check!(RetryConfig, "RetryConfig");
     check!(MeshEgressScopeSnapshot, "MeshEgressScopeSnapshot");
     check!(MeshEgressScopeResource, "MeshEgressScopeResource");
+}
+
+#[test]
+fn circuit_breaker_config_documents_cooldown_seconds_input_alias() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let timeout_seconds = spec
+        .pointer("/components/schemas/CircuitBreakerConfig/properties/timeout_seconds")
+        .expect("CircuitBreakerConfig.timeout_seconds");
+    let timeout_description = timeout_seconds["description"]
+        .as_str()
+        .expect("timeout_seconds description");
+    assert!(
+        timeout_description.contains("cooldown_seconds"),
+        "timeout_seconds must document the cooldown_seconds input alias: {timeout_description}"
+    );
+    assert!(
+        timeout_description.contains("never returned"),
+        "timeout_seconds must say the alias is never returned: {timeout_description}"
+    );
+    // The alias is a real accepted input key, so the schema lists it (the
+    // serde/OpenAPI field-inventory parity test requires that) as a
+    // write-only, deprecated property pointing back at `timeout_seconds`.
+    let alias = spec
+        .pointer("/components/schemas/CircuitBreakerConfig/properties/cooldown_seconds")
+        .expect("CircuitBreakerConfig.cooldown_seconds is documented as an input alias");
+    assert_eq!(alias["writeOnly"], serde_json::Value::Bool(true));
+    assert_eq!(alias["deprecated"], serde_json::Value::Bool(true));
+    assert_eq!(alias["type"], timeout_seconds["type"]);
+    assert_eq!(alias["format"], timeout_seconds["format"]);
+    let alias_description = alias["description"]
+        .as_str()
+        .expect("cooldown_seconds description");
+    assert!(
+        alias_description.contains("alias for `timeout_seconds`"),
+        "cooldown_seconds must point back at timeout_seconds: {alias_description}"
+    );
 }
 
 #[test]
@@ -467,10 +792,10 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
     assert!(!password_pattern.is_match("embedded\0null"));
     assert!(password_pattern.is_match("tabs\tand\nnewlines\rremain valid"));
 
-    let plugin_config = &spec["components"]["schemas"]["PluginConfig"];
+    let plugin_config = &spec["components"]["schemas"]["PluginConfigBase"];
     let config_description = plugin_config["properties"]["config"]["description"]
         .as_str()
-        .expect("PluginConfig config description");
+        .expect("PluginConfigBase config description");
     assert!(config_description.contains("Disabled plugin configs are stored without construction"));
     assert!(config_description.contains("Enabling performs full validation"));
 
@@ -1613,8 +1938,9 @@ fn collect_openapi_inventory(
 
 #[test]
 fn openapi_inventory_has_unique_operations_resolved_refs_and_no_orphan_schemas() {
-    let spec: serde_json::Value =
-        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let yaml: Value = serde_yaml::from_str(include_str!("../../openapi.yaml"))
+        .expect("openapi.yaml parses without duplicate mapping keys");
+    let spec = serde_json::to_value(yaml).expect("openapi.yaml is JSON-compatible");
     let mut operation_ids = Vec::new();
 
     for (path, path_item) in spec["paths"].as_object().expect("paths is an object") {
@@ -1921,6 +2247,12 @@ fn access_control_schema_matches_runtime_validation() {
             "runtime should reject schema-invalid config: {config}"
         );
     }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(
+        plugin_docs.contains("at most 255 Unicode characters"),
+        "access_control docs must state the 255-character username and group limits"
+    );
 }
 
 #[test]
@@ -2018,6 +2350,208 @@ fn grpc_method_router_schema_matches_runtime_validation() {
             "config should be invalid: {config}"
         );
     }
+}
+
+/// Issue #5004: `RateLimitingConfig` / `RateLimitingRuleConfig` must admit
+/// exactly what the constructor admits, so schema-driven editors and clients do
+/// not disagree with file/admin admission. Table-driven both ways; the three
+/// rules JSON Schema cannot express are asserted explicitly as residuals rather
+/// than implied to be parity.
+#[test]
+fn rate_limiting_schema_and_runtime_admission_agree() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/RateLimitingConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("RateLimitingConfig schema compiles");
+
+    for config in [
+        // Baseline.
+        json!({"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 2}]}),
+        // `null` is the same as omitting the dimension, and the parser
+        // normalizes ASCII case on limit_by / sync_mode / scope.
+        json!({
+            "limit_by": null,
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 2}]
+        }),
+        json!({
+            "limit_by": "IP",
+            "sync_mode": "LOCAL",
+            "limits": [{"scope": "DEFAULT", "window_seconds": 60, "max_requests": 2}]
+        }),
+        json!({
+            "limit_by": "spiffe",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        // Consumer-scoped rules alongside the required default rule.
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 1000}
+            ]
+        }),
+        // The exact documented Redis example (docs/plugins.md).
+        json!({
+            "limit_by": "consumer",
+            "expose_headers": true,
+            "sync_mode": "redis",
+            "redis_url": "redis://redis-host:6379/0",
+            "redis_tls": true,
+            "redis_key_prefix": "myapp:rate_limiting",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {
+                    "scope": "consumers",
+                    "consumers": ["premium-app", "partner-app"],
+                    "requests_per_minute": 1000
+                },
+                {
+                    "scope": "consumers",
+                    "consumers": ["batch-worker"],
+                    "window_seconds": 60,
+                    "max_requests": 250
+                }
+            ]
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema should accept: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("rate_limiting", &config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
+        );
+    }
+
+    for config in [
+        // No `scope: default` rule at all.
+        json!({
+            "limit_by": "consumer",
+            "limits": [{"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 1}]
+        }),
+        // Two default rules.
+        json!({
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "default", "requests_per_minute": 10}
+            ]
+        }),
+        // A consumers rule without `limit_by: consumer` (explicit and implied).
+        json!({
+            "limit_by": "ip",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10}
+            ]
+        }),
+        json!({
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10}
+            ]
+        }),
+        // `limit_by: null` means `ip`, so it is not a consumer dimension either.
+        json!({
+            "limit_by": null,
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10}
+            ]
+        }),
+        // One identity repeated inside a single consumers rule.
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {
+                    "scope": "consumers",
+                    "consumers": ["alice", "alice"],
+                    "requests_per_minute": 10
+                }
+            ]
+        }),
+        // Centralized mode without an endpoint.
+        json!({
+            "sync_mode": "redis",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        // Latent/explicit Redis scalars the constructor bounds.
+        json!({
+            "redis_key_prefix": "",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        json!({
+            "redis_connect_timeout_seconds": 0,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        json!({
+            "redis_connect_timeout_seconds": -1,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        json!({
+            "redis_health_check_interval_seconds": 0,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        // Issue #5005: an unusable database selector.
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/banana",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema should reject: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("rate_limiting", &config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+
+    // Documented residuals: the constructor is stricter than any JSON Schema
+    // can be here, so these are refused at admission and accepted by the
+    // schema. Both halves are asserted so a future schema tightening (or a
+    // constructor relaxation) has to update this list deliberately.
+    for config in [
+        // One identity named in two *different* consumers rules.
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 20}
+            ]
+        }),
+        // An out-of-range TCP port in redis_url.
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:99999/0",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "documented residual must still be schema-valid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("rate_limiting", &config).is_err(),
+            "documented residual must be refused at admission: {config}"
+        );
+    }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(
+        plugin_docs.contains("Three residual rules JSON Schema cannot express"),
+        "rate_limiting docs must state which admission rules the schema cannot express"
+    );
 }
 
 #[test]
@@ -2123,10 +2657,573 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
     }
 }
 
+const REDIS_URL_DATABASE_SELECTOR_PATTERN: &str =
+    r"^rediss?://[^/?#\s]+(?:/\d{0,10})?(?:\?[^\s#]*)?$";
+
+fn plugin_docs_section<'a>(plugin_docs: &'a str, plugin_name: &str) -> &'a str {
+    plugin_docs
+        .split(&format!("### `{plugin_name}`"))
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .unwrap_or_else(|| panic!("{plugin_name} docs section"))
+}
+
+fn component_validator(spec: &serde_json::Value, schema_name: &str) -> jsonschema::Validator {
+    let validator_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": format!("#/components/schemas/{schema_name}"),
+        "components": spec["components"].clone()
+    });
+    jsonschema::draft202012::options()
+        .build(&validator_schema)
+        .unwrap_or_else(|error| panic!("{schema_name} schema compiles: {error}"))
+}
+
+fn assert_schema_and_constructor(
+    validator: &jsonschema::Validator,
+    plugin_name: &str,
+    name: &str,
+    config: &serde_json::Value,
+    schema_valid: bool,
+    constructor_valid: bool,
+) {
+    assert_eq!(
+        validator.validate(config).is_ok(),
+        schema_valid,
+        "{plugin_name} {name}: unexpected schema result for {config}"
+    );
+    match (
+        ferrum_edge::plugins::create_plugin(plugin_name, config),
+        constructor_valid,
+    ) {
+        (Ok(Some(_)), true) | (Err(_), false) => {}
+        (Ok(None), _) => panic!("{plugin_name} {name}: factory returned None"),
+        (Ok(Some(_)), false) => {
+            panic!("{plugin_name} {name}: constructor accepted {config}")
+        }
+        (Err(err), true) => {
+            panic!("{plugin_name} {name}: constructor rejected {config}: {err}")
+        }
+    }
+}
+
+fn redis_sync_mode_guard<'a>(
+    schema: &'a serde_json::Value,
+    schema_name: &str,
+) -> &'a serde_json::Value {
+    schema["allOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{schema_name} allOf"))
+        .iter()
+        .find(|guard| {
+            guard["if"]["properties"]["sync_mode"]["pattern"] == json!("^[rR][eE][dD][iI][sS]$")
+        })
+        .unwrap_or_else(|| panic!("{schema_name} sync_mode=redis conditional guard"))
+}
+
+/// Issue #5358 / #5360: `WsRateLimitingConfig` must admit the same configs the
+/// constructor admits, except arithmetic burst/refill residuals the schema
+/// cannot express. `redis_key_prefix` must not promise shared instance budgets.
+#[test]
+fn ws_rate_limiting_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/WsRateLimitingConfig")
+        .expect("WsRateLimitingConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["sync_mode"]["pattern"],
+        json!("^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$")
+    );
+    assert!(schema["properties"]["sync_mode"].get("enum").is_none());
+    assert_eq!(
+        schema["properties"]["redis_key_prefix"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    let redis_guard = redis_sync_mode_guard(schema, "WsRateLimitingConfig");
+    assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
+    assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
+
+    let prefix_description = schema["properties"]["redis_key_prefix"]["description"]
+        .as_str()
+        .expect("redis_key_prefix description");
+    assert!(
+        prefix_description.contains("per-instance UUID"),
+        "redis_key_prefix must describe the instance UUID that partitions keys"
+    );
+    assert!(
+        !prefix_description.contains("every instance configured with the same prefix increments"),
+        "redis_key_prefix must not promise shared per-connection budgets"
+    );
+
+    let docs = plugin_docs_section(include_str!("../../docs/plugins.md"), "ws_rate_limiting");
+    assert!(
+        docs.contains("per-instance UUID"),
+        "docs/plugins.md ws_rate_limiting section must describe instance UUID isolation"
+    );
+    assert!(
+        !docs.contains(
+            "setting it explicitly is the documented opt-in for a deliberately shared budget"
+        ),
+        "docs/plugins.md ws_rate_limiting must not promise shared instance budgets"
+    );
+    assert!(
+        docs.contains("Parsed case-insensitively"),
+        "docs/plugins.md ws_rate_limiting must document sync_mode case folding"
+    );
+
+    let validator = component_validator(&spec, "WsRateLimitingConfig");
+    let accepted = [
+        json!({}),
+        json!({"frames_per_second": 50, "burst_size": 100}),
+        json!({"sync_mode": "LOCAL"}),
+        json!({
+            "sync_mode": "REDIS",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
+        json!({
+            "frames_per_second": 50,
+            "burst_size": 100,
+            "close_reason": "Rate limit exceeded",
+            "sync_mode": "redis",
+            "redis_url": "redis://redis-host:6379/2"
+        }),
+        json!({"close_reason": "レート制限"}),
+    ];
+    for config in &accepted {
+        assert_schema_and_constructor(
+            &validator,
+            "ws_rate_limiting",
+            "accepted",
+            config,
+            true,
+            true,
+        );
+    }
+
+    let rejected = [
+        json!({"sync_mode": "redis"}),
+        json!({"redis_key_prefix": ""}),
+        json!({"redis_health_check_interval_seconds": 0}),
+        json!({"redis_health_check_interval_seconds": -1}),
+        json!({"redis_connect_timeout_seconds": 0}),
+        json!({"frames_per_second": 0}),
+        json!({"sync_mode": "mysql"}),
+        json!({"frames_per_secod": 10}),
+    ];
+    for config in &rejected {
+        assert_schema_and_constructor(
+            &validator,
+            "ws_rate_limiting",
+            "rejected",
+            config,
+            false,
+            false,
+        );
+    }
+
+    // Integer-multiple / refill-window constraints stay constructor-only.
+    assert_schema_and_constructor(
+        &validator,
+        "ws_rate_limiting",
+        "non-integral burst residual",
+        &json!({"frames_per_second": 3, "burst_size": 10}),
+        true,
+        false,
+    );
+    assert_schema_and_constructor(
+        &validator,
+        "ws_rate_limiting",
+        "refill window residual",
+        &json!({"frames_per_second": 1, "burst_size": 4000}),
+        true,
+        false,
+    );
+}
+
+/// Issue #5317: `AiRateLimiterConfig` must admit exactly what the constructor
+/// admits — the unsigned bounds on `token_limit` and the Redis durations, the
+/// non-empty key prefix, the `sync_mode: redis` → `redis_url` dependency, and
+/// the case/whitespace-normalized `provider` / `sync_mode` spellings.
+///
+/// One residual stays constructor-only: a `token_limit` ABOVE `u64::MAX`. The
+/// schema publishes `maximum: 18446744073709551615`, but a JSON parser that
+/// normalizes an out-of-range integer literal to `f64` cannot distinguish it
+/// from the bound itself, so the case is not asserted through this validator.
+#[test]
+fn ai_rate_limiter_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiRateLimiterConfig")
+        .expect("AiRateLimiterConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(schema["properties"]["token_limit"]["minimum"], json!(1));
+    assert_eq!(
+        schema["properties"]["token_limit"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["sync_mode"]["pattern"],
+        json!("^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$")
+    );
+    assert!(schema["properties"]["sync_mode"].get("enum").is_none());
+    assert_eq!(
+        schema["properties"]["redis_key_prefix"]["minLength"],
+        json!(1)
+    );
+    for duration in [
+        "redis_connect_timeout_seconds",
+        "redis_health_check_interval_seconds",
+    ] {
+        assert_eq!(
+            schema["properties"][duration]["minimum"],
+            json!(1),
+            "{duration} must publish the constructor's positive bound"
+        );
+        assert_eq!(
+            schema["properties"][duration]["maximum"].as_f64(),
+            Some(u64::MAX as f64),
+            "{duration} must publish the constructor's unsigned ceiling"
+        );
+    }
+    let redis_guard = redis_sync_mode_guard(schema, "AiRateLimiterConfig");
+    assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
+    assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
+
+    let docs = plugin_docs_section(include_str!("../../docs/plugins.md"), "ai_rate_limiter");
+    assert!(
+        docs.contains("parsed case-insensitively"),
+        "docs/plugins.md ai_rate_limiter must document sync_mode case folding"
+    );
+    assert!(
+        docs.contains("positive unsigned 64-bit integer"),
+        "docs/plugins.md ai_rate_limiter must document the positive duration bounds"
+    );
+
+    let validator = component_validator(&spec, "AiRateLimiterConfig");
+    let accepted = [
+        json!({"token_limit": 100}),
+        json!({"token_limit": 1, "window_seconds": 2678400}),
+        json!({"token_limit": 100, "provider": " OPENAI "}),
+        json!({"token_limit": 100, "provider": "OpenAi"}),
+        json!({"token_limit": 100, "sync_mode": "LOCAL"}),
+        json!({"token_limit": 100, "redis_key_prefix": "shared"}),
+        json!({"token_limit": 100, "redis_connect_timeout_seconds": 1}),
+        json!({"token_limit": 100, "redis_health_check_interval_seconds": 1}),
+        json!({
+            "token_limit": 500000,
+            "window_seconds": 3600,
+            "count_mode": "total_tokens",
+            "limit_by": "consumer",
+            "expose_headers": true,
+            "on_unmetered_response": "charge_estimate",
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_failure_policy": "fail_closed"
+        }),
+    ];
+    for config in &accepted {
+        assert_schema_and_constructor(
+            &validator,
+            "ai_rate_limiter",
+            "accepted",
+            config,
+            true,
+            true,
+        );
+    }
+
+    let rejected = [
+        json!({}),
+        json!({"token_limit": 0}),
+        json!({"token_limit": -1}),
+        json!({"token_limit": 100, "window_seconds": 2678401}),
+        json!({"token_limit": 100, "provider": "gemini"}),
+        json!({"token_limit": 100, "sync_mode": "database"}),
+        json!({"token_limit": 100, "sync_mode": "redis"}),
+        json!({"token_limit": 100, "redis_key_prefix": ""}),
+        json!({"token_limit": 100, "redis_connect_timeout_seconds": 0}),
+        json!({"token_limit": 100, "redis_connect_timeout_seconds": -1}),
+        json!({"token_limit": 100, "redis_health_check_interval_seconds": 0}),
+        json!({"token_limit": 100, "redis_health_check_interval_seconds": -1}),
+        json!({"token_limit": 100, "count_mode": "completion_token"}),
+        json!({"token_limit": 100, "toke_limit": 100}),
+    ];
+    for config in &rejected {
+        assert_schema_and_constructor(
+            &validator,
+            "ai_rate_limiter",
+            "rejected",
+            config,
+            false,
+            false,
+        );
+    }
+}
+
+/// Issue #5359 / #5361: `UdpRateLimitingConfig` must require Redis URLs, bound
+/// numeric fields, accept case-normalized sync_mode, and describe per-second
+/// rates rather than per-window caps.
+#[test]
+fn udp_rate_limiting_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/UdpRateLimitingConfig")
+        .expect("UdpRateLimitingConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["sync_mode"]["pattern"],
+        json!("^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$")
+    );
+    assert!(schema["properties"]["sync_mode"].get("enum").is_none());
+    assert_eq!(
+        schema["properties"]["redis_key_prefix"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["datagrams_per_second"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    assert_eq!(
+        schema["properties"]["bytes_per_second"]["maximum"].as_f64(),
+        Some(u64::MAX as f64),
+    );
+    let redis_guard = redis_sync_mode_guard(schema, "UdpRateLimitingConfig");
+    assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
+    assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
+
+    for field in ["datagrams_per_second", "bytes_per_second"] {
+        let description = schema["properties"][field]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} description"));
+        assert!(
+            description.contains("per second"),
+            "{field} must be documented as a per-second rate"
+        );
+        assert!(
+            description.contains("× window_seconds") || description.contains("* window_seconds"),
+            "{field} must give rate × window_seconds as the effective cap"
+        );
+        assert!(
+            !description.contains("Maximum datagrams per `window_seconds`")
+                && !description.contains("Maximum bytes per `window_seconds`"),
+            "{field} must not label the input rate as a per-window cap"
+        );
+    }
+
+    let docs = plugin_docs_section(include_str!("../../docs/plugins.md"), "udp_rate_limiting");
+    assert!(
+        docs.contains("Sustained datagram rate per second"),
+        "docs/plugins.md udp_rate_limiting must describe a per-second datagram rate"
+    );
+    assert!(
+        docs.contains("Sustained payload-byte rate per second"),
+        "docs/plugins.md udp_rate_limiting must describe a per-second byte rate"
+    );
+    assert!(
+        !docs.contains("Maximum datagrams per `window_seconds`"),
+        "docs/plugins.md must not label datagrams_per_second as a per-window cap"
+    );
+    assert!(
+        docs.contains("window_seconds: 4"),
+        "docs/plugins.md udp_rate_limiting must include a non-unit-window example"
+    );
+    assert!(
+        docs.contains("Parsed case-insensitively"),
+        "docs/plugins.md udp_rate_limiting must document sync_mode case folding"
+    );
+
+    let validator = component_validator(&spec, "UdpRateLimitingConfig");
+    let accepted = [
+        json!({"datagrams_per_second": 1}),
+        json!({"bytes_per_second": 1}),
+        json!({"datagrams_per_second": 1000, "bytes_per_second": 1048576}),
+        json!({"datagrams_per_second": 1, "sync_mode": "LOCAL"}),
+        json!({
+            "datagrams_per_second": 1,
+            "sync_mode": "REDIS",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
+        json!({"datagrams_per_second": 1, "window_seconds": 4}),
+        json!({
+            "datagrams_per_second": 1000,
+            "bytes_per_second": 1048576,
+            "window_seconds": 4
+        }),
+    ];
+    for config in &accepted {
+        assert_schema_and_constructor(
+            &validator,
+            "udp_rate_limiting",
+            "accepted",
+            config,
+            true,
+            true,
+        );
+    }
+
+    let rejected = [
+        json!({}),
+        json!({"datagrams_per_second": 1, "sync_mode": "redis"}),
+        json!({"datagrams_per_second": 1, "redis_key_prefix": ""}),
+        json!({"datagrams_per_second": 1, "redis_connect_timeout_seconds": 0}),
+        json!({"datagrams_per_second": 1, "redis_health_check_interval_seconds": 0}),
+        json!({"datagrams_per_second": 1, "redis_health_check_interval_seconds": -1}),
+        json!({"datagrams_per_second": 1, "window_seconds": 2678401}),
+        json!({"datagrams_per_second": 1, "sync_mdoe": "redis"}),
+    ];
+    for config in &rejected {
+        assert_schema_and_constructor(
+            &validator,
+            "udp_rate_limiting",
+            "rejected",
+            config,
+            false,
+            false,
+        );
+    }
+
+    // Checked rate × window overflow stays constructor-only.
+    assert_schema_and_constructor(
+        &validator,
+        "udp_rate_limiting",
+        "rate-window overflow residual",
+        &json!({"datagrams_per_second": u64::MAX, "window_seconds": 2}),
+        true,
+        false,
+    );
+}
+
+/// Issue #5394: the four Redis-backed rate-limit components publish the
+/// constructor's numeric database-selector rule on `redis_url`.
+#[test]
+fn redis_url_database_selector_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let expected_pattern = json!(REDIS_URL_DATABASE_SELECTOR_PATTERN);
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    for (schema_name, plugin_name, redis_config) in [
+        (
+            "RateLimitingConfig",
+            "rate_limiting",
+            json!({
+                "limits": [{"scope": "default", "requests_per_minute": 10}],
+                "sync_mode": "redis"
+            }),
+        ),
+        (
+            "AiRateLimiterConfig",
+            "ai_rate_limiter",
+            json!({"token_limit": 1000, "sync_mode": "redis"}),
+        ),
+        (
+            "WsRateLimitingConfig",
+            "ws_rate_limiting",
+            json!({"sync_mode": "redis"}),
+        ),
+        (
+            "UdpRateLimitingConfig",
+            "udp_rate_limiting",
+            json!({"datagrams_per_second": 1, "sync_mode": "redis"}),
+        ),
+    ] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert_eq!(
+            schema["properties"]["redis_url"]["pattern"], expected_pattern,
+            "{schema_name} redis_url pattern must admit only numeric database selectors"
+        );
+        let description = schema["properties"]["redis_url"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{schema_name} redis_url description"));
+        assert!(
+            description.contains("2147483647"),
+            "{schema_name} redis_url must document the i32 database-selector ceiling"
+        );
+        let docs = plugin_docs_section(plugin_docs, plugin_name);
+        assert!(
+            docs.contains("2147483647"),
+            "docs/plugins.md {plugin_name} redis_url row must document the selector ceiling"
+        );
+
+        let validator = component_validator(&spec, schema_name);
+        let mut accepted = redis_config.clone();
+        accepted["redis_url"] = json!("redis://cache.internal:6379/0");
+        assert!(
+            validator.validate(&accepted).is_ok(),
+            "{schema_name} must accept a numeric database selector: {accepted}"
+        );
+        let mut ceiling = redis_config.clone();
+        ceiling["redis_url"] = json!("redis://cache.internal:6379/2147483647");
+        assert!(
+            validator.validate(&ceiling).is_ok(),
+            "{schema_name} must accept the i32 selector ceiling: {ceiling}"
+        );
+        let mut no_path = redis_config.clone();
+        no_path["redis_url"] = json!("redis://cache.internal:6379");
+        assert!(
+            validator.validate(&no_path).is_ok(),
+            "{schema_name} must accept a URL with no database path: {no_path}"
+        );
+
+        for (name, url) in [
+            ("non-numeric", "redis://cache.internal:6379/banana"),
+            ("multi-segment", "redis://cache.internal:6379/0/1"),
+            ("eleven-digit", "redis://cache.internal:6379/21474836480"),
+        ] {
+            let mut rejected = redis_config.clone();
+            rejected["redis_url"] = json!(url);
+            assert!(
+                validator.validate(&rejected).is_err(),
+                "{schema_name} must reject {name} database selector: {rejected}"
+            );
+        }
+    }
+}
+
 #[test]
 fn graphql_config_schema_matches_runtime_validation() {
     use ferrum_edge::plugins::create_plugin;
     use ferrum_edge::plugins::graphql::GRAPHQL_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
+    };
     use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 
     let spec: serde_json::Value =
@@ -2179,6 +3276,21 @@ fn graphql_config_schema_matches_runtime_validation() {
         Some(&json!(1))
     );
 
+    // Issue #5129: the three u32 policy limits carry their runtime range, so a
+    // schema-driven authoring tool refuses exactly what the constructor refuses.
+    for field in ["max_depth", "max_complexity", "max_aliases"] {
+        assert_eq!(
+            schema["properties"][field]["minimum"],
+            json!(0),
+            "{field} must advertise the unsigned floor"
+        );
+        assert_eq!(
+            schema["properties"][field]["maximum"],
+            json!(u32::MAX),
+            "{field} must advertise the 32-bit ceiling"
+        );
+    }
+
     let schema_fields: BTreeSet<_> = schema["properties"]
         .as_object()
         .expect("GraphqlConfig properties")
@@ -2213,6 +3325,20 @@ fn graphql_config_schema_matches_runtime_validation() {
     assert!(docs.contains("valid GraphQL Names"));
     assert!(docs.contains("`2`, not `2.0`"));
     assert!(docs.contains("validated even while `sync_mode` is `local`"));
+    // Issue #5129 / #5133: the operator-facing table states the enforced ranges
+    // for the u32 policy limits and for both rate-entry fields.
+    assert!(
+        docs.contains(&format!("`0..={}`", u32::MAX)),
+        "docs/plugins.md graphql section must document the u32 policy-limit range"
+    );
+    assert!(
+        docs.contains(&format!("`1..={MAX_RATE_LIMIT_MAX_REQUESTS}`")),
+        "docs/plugins.md graphql section must document the max_requests ceiling"
+    );
+    assert!(
+        docs.contains(&format!("`1..={MAX_RATE_LIMIT_WINDOW_SECONDS}`")),
+        "docs/plugins.md graphql section must document the window_seconds ceiling"
+    );
 
     let validator_schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2227,6 +3353,13 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!({"max_depth": 5}),
         json!({"max_complexity": 100}),
         json!({"max_aliases": 3}),
+        // Issue #5129 boundaries: zero and u32::MAX are admitted by both.
+        json!({"max_depth": 0}),
+        json!({"max_complexity": 0}),
+        json!({"max_aliases": 0}),
+        json!({"max_depth": 4294967295u32}),
+        json!({"max_complexity": 4294967295u32}),
+        json!({"max_aliases": 4294967295u32}),
         json!({"introspection_allowed": false}),
         json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {
@@ -2288,6 +3421,13 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!({"operation_rate_limits": {"": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60, "burst": 2}}}),
         json!({"max_depth": 5, "introspection_allowd": false}),
+        // Issue #5129 boundaries: below zero and above u32::MAX are refused by both.
+        json!({"max_depth": -1}),
+        json!({"max_complexity": -1}),
+        json!({"max_aliases": -1}),
+        json!({"max_depth": 4294967296u64}),
+        json!({"max_complexity": 4294967296u64}),
+        json!({"max_aliases": 4294967296u64}),
         json!({"max_depth": 5, "sync_mdoe": "redis", "redis_url": "redis://localhost:6379/0"}),
         json!({
             "max_depth": 5,
@@ -2371,9 +3511,11 @@ fn request_deduplication_schema_matches_runtime_validation() {
         schema["properties"]["applicable_methods"]["minItems"],
         json!(1)
     );
+    // Issue #5070: the runtime trims each method before validating it, so the
+    // published item pattern tolerates exactly that padding.
     assert_eq!(
         schema["properties"]["applicable_methods"]["items"]["pattern"],
-        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+        json!("^\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+\\s*$")
     );
     assert_eq!(
         schema["properties"]["redis_key_prefix"]["minLength"],
@@ -2393,11 +3535,16 @@ fn request_deduplication_schema_matches_runtime_validation() {
         schema["properties"]["redis_url"]["pattern"],
         json!("^rediss?://[^/?#\\s]+(?:/[^?#\\s]*)?(?:\\?[^\\s#]*)?$")
     );
+    // Issue #5070: the runtime lowercases `sync_mode` before comparing it, so
+    // the conditional selects on the same case-insensitive value rather than a
+    // `const` that would refuse a valid `"REDIS"` deployment's `redis_url`.
     let redis_guard = schema["allOf"]
         .as_array()
         .expect("RequestDeduplicationConfig allOf")
         .iter()
-        .find(|guard| guard["if"]["properties"]["sync_mode"]["const"] == json!("redis"))
+        .find(|guard| {
+            guard["if"]["properties"]["sync_mode"]["pattern"] == json!("^[Rr][Ee][Dd][Ii][Ss]$")
+        })
         .expect("sync_mode=redis conditional guard");
     assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
     assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
@@ -2421,6 +3568,49 @@ fn request_deduplication_schema_matches_runtime_validation() {
             redis_guard["else"]["properties"][redis_only],
             json!(false),
             "{redis_only} must be refused outside sync_mode=redis"
+        );
+    }
+
+    // Issue #5070: explicit null is rejected by the constructor
+    // (`'anonymous_caller_scope' must be a string`), so the property is not
+    // nullable, and the enum carries the alias spelling the shared parser
+    // accepts.
+    assert_eq!(
+        schema["properties"]["anonymous_caller_scope"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        schema["properties"]["anonymous_caller_scope"]["enum"],
+        json!(["caller_address", "caller-address", "shared"])
+    );
+
+    // Issue #5070: every bounded unsigned field publishes the u64 ceiling the
+    // constructor enforces, so an oversized value is refused by both.
+    for bounded in [
+        "ttl_seconds",
+        "inflight_ttl_seconds",
+        "max_entries",
+        "max_entry_size_bytes",
+        "max_total_size_bytes",
+    ] {
+        assert_eq!(schema["properties"][bounded]["minimum"], json!(1));
+        assert_eq!(
+            schema["properties"][bounded]["maximum"].as_f64(),
+            Some(u64::MAX as f64),
+            "{bounded} must publish the unsigned 64-bit ceiling"
+        );
+    }
+
+    // Issue #5070: JSON Schema `enum` cannot express case-insensitivity, so the
+    // two normalized-value properties must SAY so rather than silently
+    // disagreeing with admission.
+    for normalized in ["sync_mode", "anonymous_caller_scope"] {
+        let description = schema["properties"][normalized]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{normalized} carries a description"));
+        assert!(
+            description.contains("case-insensitiv"),
+            "{normalized} must document the runtime normalization the enum cannot express"
         );
     }
 
@@ -2494,6 +3684,13 @@ fn request_deduplication_schema_matches_runtime_validation() {
             "redis_url": "redis://cache.internal:6379",
             "on_redis_unavailable": "local_only"
         }),
+        // Issue #5070: the constructor trims each method, accepts the hyphen
+        // spelling of the anonymous scope, and requires `redis_url` under a
+        // case-insensitive `sync_mode` — all now expressible in the schema.
+        json!({"applicable_methods": [" POST "]}),
+        json!({"anonymous_caller_scope": "caller_address"}),
+        json!({"anonymous_caller_scope": "caller-address"}),
+        json!({"anonymous_caller_scope": "shared"}),
     ];
     for config in &accepted {
         assert!(
@@ -2556,6 +3753,15 @@ fn request_deduplication_schema_matches_runtime_validation() {
             "redis_url": "redis://host:6379",
             "redis_health_check_interval_seconds": 0
         }),
+        // Issue #5070: explicit null is not "omitted", an unknown scope is
+        // refused, and the bounded unsigned fields refuse zero.
+        json!({"anonymous_caller_scope": null}),
+        json!({"anonymous_caller_scope": "everyone"}),
+        json!({"ttl_seconds": 0}),
+        json!({"inflight_ttl_seconds": 0}),
+        json!({"max_entries": 0}),
+        json!({"max_entry_size_bytes": 0}),
+        json!({"max_total_size_bytes": 0}),
     ];
     for config in &rejected {
         assert!(
@@ -2565,6 +3771,25 @@ fn request_deduplication_schema_matches_runtime_validation() {
         assert!(
             create_plugin("request_deduplication", config).is_err(),
             "config should be runtime-invalid: {config}"
+        );
+    }
+
+    // Issue #5070, documented limitation: JSON Schema cannot express the
+    // runtime's case-insensitive, whitespace-trimming enum parsing. These two
+    // shapes are admitted by the gateway and refused by a strict validator;
+    // both property descriptions say so (asserted above). Pinned here so the
+    // divergence stays a known, described one instead of silent drift.
+    for config in [
+        json!({"sync_mode": "LOCAL"}),
+        json!({"anonymous_caller_scope": " SHARED "}),
+    ] {
+        assert!(
+            create_plugin("request_deduplication", &config).is_ok(),
+            "the gateway normalizes {config}"
+        );
+        assert!(
+            validator.validate(&config).is_err(),
+            "the schema cannot express the normalization for {config}"
         );
     }
 }
@@ -2621,25 +3846,30 @@ fn ldap_auth_schema_matches_runtime_invariants() {
     for config in [
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},dc=example,dc=com"
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldap://ldap.example.com:389",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "starttls": true
         }),
         json!({
             "ldap_url": "ldap://directory.example.test:389",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "allow_plaintext": true
         }),
         json!({
             "ldap_url": "ldap://127.0.0.1:389",
-            "bind_dn_template": "uid={username},dc=example,dc=com"
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldap://LOCALHOST:389",
-            "bind_dn_template": "uid={username},dc=example,dc=com"
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
@@ -2652,12 +3882,14 @@ fn ldap_auth_schema_matches_runtime_invariants() {
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "group_base_dn": "ou=groups,dc=example,dc=com",
             "required_groups": ["admins"]
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "group_base_dn": "ou=groups,dc=example,dc=com",
             "group_filter": "(member={user_dn})",
             "required_groups": ["admins"],
@@ -2675,7 +3907,8 @@ fn ldap_auth_schema_matches_runtime_invariants() {
         json!({"ldap_url": "ldaps://ldap.example.com:636"}),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid=static,dc=example,dc=com"
+            "bind_dn_template": "uid=static,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
@@ -2691,6 +3924,25 @@ fn ldap_auth_schema_matches_runtime_invariants() {
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "secret"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
+            "search_filter": "(uid={username})"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
             "search_base_dn": "ou=users,dc=example,dc=com",
             "search_filter": "(uid=static)",
             "canonical_identity_attribute": "uid",
@@ -2700,11 +3952,13 @@ fn ldap_auth_schema_matches_runtime_invariants() {
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "required_groups": ["admins"]
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "group_base_dn": "ou=groups,dc=example,dc=com",
             "group_filter": "(cn=admins)",
             "required_groups": ["admins"]
@@ -2712,48 +3966,159 @@ fn ldap_auth_schema_matches_runtime_invariants() {
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "starttls": true
         }),
         json!({
             "ldap_url": "ldap://directory.example.test:389",
-            "bind_dn_template": "uid={username},dc=example,dc=com"
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldaps://admin:secret@ldap.example.com:636",
-            "bind_dn_template": "uid={username},dc=example,dc=com"
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "connect_timeout_seconds": 0
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "request_timeout_seconds": 301
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "max_concurrent_requests": 0
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "cache_ttl_seconds": 86401
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "max_cache_entries": 0
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "required_group": ["admins"]
         }),
     ] {
         assert_component_validity(&spec, "LdapAuthConfig", &config, false);
+    }
+}
+
+#[test]
+fn ldap_auth_value_constraints_match_runtime_admission() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::ldap_auth::LdapAuth;
+
+    fn merge(base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+        let mut config = base;
+        let object = config.as_object_mut().expect("config object");
+        for (key, value) in extra.as_object().expect("extra object") {
+            object.insert(key.clone(), value.clone());
+        }
+        config
+    }
+
+    fn direct_bind(extra: serde_json::Value) -> serde_json::Value {
+        let base = json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
+        });
+        merge(base, extra)
+    }
+
+    fn search_bind(extra: serde_json::Value) -> serde_json::Value {
+        let base = json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})",
+            "canonical_identity_attribute": "uid",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "service-secret"
+        });
+        merge(base, extra)
+    }
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/LdapAuthConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("LdapAuthConfig schema compiles");
+
+    // Value-level admission probed in issue #5038. RFC 4515 filter syntax is
+    // deliberately absent from this table: the grammar is not expressible as a
+    // `pattern`, so filter syntax stays an admission-only rule.
+    let admitted = vec![
+        // A password is opaque: it is taken verbatim, never trimmed.
+        search_bind(json!({"service_account_password": "  padded  "})),
+        direct_bind(json!({"max_cache_entries": 1_000_000})),
+        // An empty userinfo carries no credential.
+        direct_bind(json!({"ldap_url": "ldaps://@localhost"})),
+        direct_bind(json!({"ldap_url": "ldaps://[2001:db8::50]:636"})),
+        direct_bind(json!({"hide_credentials": false})),
+    ];
+    let refused = vec![
+        // Whitespace-only identifiers trim to empty.
+        direct_bind(json!({"canonical_identity_attribute": "  "})),
+        direct_bind(json!({"group_attribute": "  "})),
+        direct_bind(json!({"group_filter": "  "})),
+        search_bind(json!({"service_account_dn": "  "})),
+        search_bind(json!({"search_base_dn": "  "})),
+        direct_bind(json!({"group_base_dn": "  ", "required_groups": ["a"]})),
+        direct_bind(json!({"group_base_dn": "ou=g,dc=e", "required_groups": ["  "]})),
+        search_bind(json!({"service_account_password": ""})),
+        // Every resource knob is bounded.
+        direct_bind(json!({"max_cache_entries": 1_000_001})),
+        // A hostname is required and an explicit port must fit in 16 bits.
+        direct_bind(json!({"ldap_url": "ldaps://"})),
+        direct_bind(json!({"ldap_url": "ldaps://localhost:65536"})),
+        // The scheme is case-sensitive and the value is never trimmed.
+        direct_bind(json!({"ldap_url": "  ldap://127.0.0.1:389  "})),
+        direct_bind(json!({"ldap_url": "LDAP://127.0.0.1:389"})),
+        direct_bind(json!({"ldap_url": "ldaps://admin:secret@localhost"})),
+        direct_bind(json!({"hide_credentials": "yes"})),
+    ];
+
+    for config in admitted {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "OpenAPI must admit {config}"
+        );
+        assert!(
+            LdapAuth::new(&config, PluginHttpClient::default()).is_ok(),
+            "runtime must admit {config}"
+        );
+    }
+    for config in refused {
+        assert!(
+            validator.validate(&config).is_err(),
+            "OpenAPI must refuse {config}"
+        );
+        assert!(
+            LdapAuth::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime must refuse {config}"
+        );
     }
 }
 
@@ -2852,6 +4217,15 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
     });
     assert!(validator.validate(&valid).is_ok());
 
+    for status in 200..300 {
+        let mut committed_fallback = valid.clone();
+        committed_fallback["fallback_on_status_codes"] = json!([429, status]);
+        assert!(validator.validate(&committed_fallback).is_err());
+    }
+    let mut rejection_fallback = valid.clone();
+    rejection_fallback["fallback_on_status_codes"] = json!([100, 199, 300, 429, 599]);
+    assert!(validator.validate(&rejection_fallback).is_ok());
+
     for invalid in [
         json!({"providers": [{"name": "p", "provider_type": "openai"}], "fallback_on_netwrok_errors": true}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "model_paterns": []}]}),
@@ -2860,12 +4234,59 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "model_mapping": {"gpt-../unsafe": "gpt-4o"}}]}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 0}]}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 67_108_865}]}),
+        // Issue #5260: the component used to admit configurations the
+        // constructor rejects, so `validate` reported success for a file that
+        // could never load. An empty or absent static credential is a
+        // configuration error for every provider type that reads one.
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": ""}]}),
+        json!({"providers": [{"name": "p", "provider_type": "anthropic"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "google_vertex", "google_project_id": "proj", "google_region": "us-central1", "google_service_account_json": ""}]}),
+        // Providers that interpolate the resolved model into the endpoint path
+        // restrict every provider-native model identifier to a safe URL path
+        // component.
+        json!({"providers": [{"name": "p", "provider_type": "google_gemini", "api_key": "test", "default_model": "family/model"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "aws_bedrock", "aws_region": "us-east-1", "model_mapping": {"gpt-4o": "family/model"}}]}),
+        // The endpoint path components exclude the traversal sequence exactly
+        // as `validate_url_path_component` does at load.
+        json!({"providers": [{"name": "p", "provider_type": "azure_openai", "api_key": "test", "azure_resource": "res", "azure_deployment": "v..1"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "azure_openai", "api_key": "test", "azure_resource": "res", "azure_deployment": "dep", "azure_api_version": "v..1"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "google_vertex", "google_project_id": "a..b", "google_region": "us-central1", "google_service_account_json": "{}"}]}),
     ] {
         assert!(
             validator.validate(&invalid).is_err(),
             "schema accepted {invalid}"
         );
     }
+
+    // The tightening must not reject what the constructor accepts: the model
+    // component rule is provider-conditional, and the credential rule does not
+    // apply to the two provider types that never read `api_key`.
+    for accepted in [
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "default_model": "family/model"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "model_mapping": {"gpt-4o": "family/model"}}]}),
+        json!({"providers": [{"name": "b", "provider_type": "aws_bedrock", "aws_region": "us-east-1"}]}),
+        json!({"providers": [{"name": "v", "provider_type": "google_vertex", "google_project_id": "proj", "google_region": "us-central1", "google_service_account_json": "{}"}]}),
+        json!({"providers": [{"name": "g", "provider_type": "google_gemini", "api_key": "test", "default_model": "gemini-1.5-pro"}]}),
+    ] {
+        assert!(
+            validator.validate(&accepted).is_ok(),
+            "schema rejected {accepted}"
+        );
+    }
+
+    // Issue #5262: a completed 2xx that cannot be normalized is terminal, so
+    // the component overview must not still promise priority fallback for it.
+    let description = schema["description"]
+        .as_str()
+        .expect("AiFederationConfig must document itself");
+    assert!(
+        !description.contains("malformed provider success responses"),
+        "AiFederationConfig still promises fallback after a completed malformed success"
+    );
+    assert!(
+        description.contains("response_normalization_failed"),
+        "AiFederationConfig must state that a completed 2xx normalization failure is terminal"
+    );
 }
 
 #[test]
@@ -2965,6 +4386,71 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
     ] {
         assert_component_validity(&spec, "AiStreamRouterConfig", &invalid, false);
     }
+
+    // Issue #5303: the component must accept nothing the constructor rejects,
+    // and must accept the explicit nulls the constructor reads as omission.
+    let provider_with = |overrides: serde_json::Value| {
+        let mut provider = json!({
+            "name": "p",
+            "provider_type": "openai",
+            "endpoint": "https://a.example.com/v1",
+            "api_key": "k",
+            "model_patterns": ["gpt-*"]
+        });
+        if let (Some(base), Some(extra)) = (provider.as_object_mut(), overrides.as_object()) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        json!({ "providers": [provider] })
+    };
+
+    for valid in [
+        // Every optional field the constructor treats as omitted when null.
+        json!({
+            "enabled": null,
+            "fail_on_missing_model": null,
+            "fail_on_no_matching_provider": null,
+            "inject_usage_options": null,
+            "normalize_response_stream": null,
+            "providers": [{
+                "name": "p",
+                "provider_type": "anthropic",
+                "endpoint": "https://a.example.com/v1",
+                "api_key": "k",
+                "model_patterns": ["claude-*"],
+                "priority": null,
+                "allow_plaintext": null,
+                "anthropic_version": null,
+                "inherit_backend_tls": null
+            }]
+        }),
+        // Plaintext with the opt-in the constructor requires.
+        provider_with(json!({
+            "endpoint": "http://internal.example.com/v1",
+            "allow_plaintext": true
+        })),
+        provider_with(json!({"priority": 4294967295u64})),
+    ] {
+        assert_component_validity(&spec, "AiStreamRouterConfig", &valid, true);
+    }
+
+    for invalid in [
+        provider_with(json!({"priority": 4294967296u64})),
+        provider_with(json!({"name": ""})),
+        provider_with(json!({"api_key": ""})),
+        provider_with(json!({"model_patterns": [""]})),
+        provider_with(json!({"endpoint": "not-url"})),
+        provider_with(json!({"endpoint": "ftp://api.example.com/a"})),
+        // HTTP without the plaintext opt-in, and with it explicitly disabled.
+        provider_with(json!({"endpoint": "http://internal.example.com/v1"})),
+        provider_with(json!({
+            "endpoint": "http://internal.example.com/v1",
+            "allow_plaintext": false
+        })),
+    ] {
+        assert_component_validity(&spec, "AiStreamRouterConfig", &invalid, false);
+    }
 }
 
 #[test]
@@ -3009,11 +4495,15 @@ fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
         schema["max_cache_entries"]["default"],
         json!(ferrum_edge::plugins::ldap_auth::LDAP_AUTH_DEFAULT_MAX_CACHE_ENTRIES)
     );
+    assert_eq!(
+        schema["max_cache_entries"]["maximum"],
+        json!(ferrum_edge::plugins::ldap_auth::LDAP_AUTH_MAX_CACHE_ENTRIES_LIMIT)
+    );
 
     let guide = include_str!("../../docs/cache_management.md");
     assert!(guide.contains("**Default limit:** 10,000 entries. Caching is disabled by default."));
     assert!(guide.contains("`cache_ttl_seconds` (default `0`, disabled; maximum `86,400`"));
-    assert!(guide.contains("`max_cache_entries` (default `10,000`)"));
+    assert!(guide.contains("`max_cache_entries` (default `10,000`; maximum `1,000,000`)"));
     assert!(guide.contains("| `ldap_auth` | `max_cache_entries` | `10000` |"));
     assert!(guide.contains("| `ldap_auth` | `cache_ttl_seconds` | `0` |"));
 }
@@ -3193,6 +4683,127 @@ fn hmac_auth_config_root_is_closed_and_matches_openapi() {
         schema["properties"]["replay_max_entries"]["default"],
         json!(ferrum_edge::plugins::hmac_auth::DEFAULT_HMAC_REPLAY_MAX_ENTRIES)
     );
+}
+
+/// Issue #5001: key-set parity is not acceptance parity. `HmacAuthConfig` had
+/// no conditional constraints at all, so schema-based tooling approved
+/// deployments the gateway refuses to start with — an empty configuration,
+/// unsafe v1 without its acknowledgement, v2 without a replay scope, and every
+/// impossible Redis/scope pairing. This is the real schema-vs-runtime
+/// acceptance matrix.
+#[test]
+fn hmac_auth_schema_acceptance_matches_runtime_admission() {
+    use ferrum_edge::plugins::create_plugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let validator_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/HmacAuthConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&validator_schema)
+        .expect("HmacAuthConfig schema compiles");
+
+    let redis_url = "redis://127.0.0.1:6379/0";
+    let accepted = [
+        json!({"replay_scope": "process"}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 60}),
+        json!({"replay_scope": "process", "replay_max_entries": 1}),
+        json!({"replay_scope": "process", "sync_mode": "local"}),
+        json!({"signing_profile": "ferrum-hmac-v2", "replay_scope": "process"}),
+        json!({
+            "signing_profile": "ferrum-hmac-v2",
+            "replay_scope": "process",
+            "allow_unsafe_replayable_v1": false
+        }),
+        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": true}),
+        json!({
+            "replay_scope": "shared",
+            "sync_mode": "redis",
+            "redis_url": redis_url
+        }),
+    ];
+    for config in &accepted {
+        assert!(
+            validator.validate(config).is_ok(),
+            "config should be schema-valid: {config}"
+        );
+        assert!(
+            create_plugin("hmac_auth", config).is_ok(),
+            "config should be runtime-valid: {config}"
+        );
+    }
+
+    let rejected = [
+        // Profile / acknowledgement / scope admission (the #5001 matrix).
+        json!({}),
+        json!({"clock_skew_seconds": 60}),
+        json!({"signing_profile": "ferrum-hmac-v1"}),
+        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": false}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "replay_scope": "process"
+        }),
+        json!({"replay_scope": "process", "allow_unsafe_replayable_v1": true}),
+        json!({"replay_scope": "shared"}),
+        json!({"replay_scope": "shared", "sync_mode": "redis"}),
+        json!({"replay_scope": "process", "sync_mode": "redis", "redis_url": redis_url}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "sync_mode": "redis",
+            "redis_url": redis_url
+        }),
+        // Scalar spellings: the enums are exact on both surfaces.
+        json!({"replay_scope": " PROCESS "}),
+        json!({"replay_scope": "Process"}),
+        json!({"replay_scope": "process", "signing_profile": " ferrum-hmac-v2 "}),
+        json!({"replay_scope": "process", "signing_profile": "FERRUM-HMAC-V2"}),
+        json!({
+            "replay_scope": "shared",
+            "sync_mode": "REDIS",
+            "redis_url": redis_url
+        }),
+        // Types, bounds, and the closed key set.
+        json!({"replay_scope": "process", "replay_max_entries": 0}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 0}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 301}),
+        json!({"replay_scope": true}),
+        json!({"replay_scope": "process", "replay_scop": "shared"}),
+        json!({"replay_scope": "process", "require_digest": true}),
+    ];
+    for config in &rejected {
+        assert!(
+            validator.validate(config).is_err(),
+            "config should be schema-invalid: {config}"
+        );
+        assert!(
+            create_plugin("hmac_auth", config).is_err(),
+            "config should be runtime-invalid: {config}"
+        );
+    }
+}
+
+/// The enclosing `PluginConfig` branch must demand `config` too: an omitted
+/// `config` defaults to null and `HmacAuth::build` refuses a non-object.
+#[test]
+fn hmac_auth_plugin_config_branch_requires_a_config_object() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let branch = spec
+        .pointer("/components/schemas/PluginConfigBase/allOf/0/then/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("enabled PluginConfigBase allOf")
+        .iter()
+        .find(|entry| {
+            entry.pointer("/if/properties/plugin_name/const") == Some(&json!("hmac_auth"))
+        })
+        .expect("hmac_auth PluginConfig branch");
+
+    assert_eq!(branch.pointer("/then/required"), Some(&json!(["config"])));
 }
 
 #[test]
@@ -3631,10 +5242,35 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
 }
 
 fn plugin_config_schema_mapping(spec: &serde_json::Value) -> BTreeMap<String, String> {
-    let all_of = spec
-        .pointer("/components/schemas/PluginConfig/allOf")
+    let base_all_of = spec
+        .pointer("/components/schemas/PluginConfigBase/allOf")
         .and_then(serde_json::Value::as_array)
-        .expect("PluginConfig allOf should be an array");
+        .expect("PluginConfigBase allOf should be an array");
+    assert!(
+        base_all_of.len() >= 2,
+        "PluginConfigBase must gate construction and keep the prometheus_metrics scope guard"
+    );
+    let enabled_gate = &base_all_of[0];
+    assert_eq!(
+        enabled_gate.pointer("/if/properties/enabled/not/const"),
+        Some(&json!(false)),
+        "plugin-specific construction schemas must not apply when enabled is false"
+    );
+    assert_eq!(
+        base_all_of[1].pointer("/if/properties/plugin_name/const"),
+        Some(&json!("prometheus_metrics")),
+        "disabled prometheus_metrics must still require global scope"
+    );
+    assert_eq!(
+        base_all_of[1].pointer("/then/properties/scope/const"),
+        Some(&json!("global")),
+        "disabled prometheus_metrics must still require global scope"
+    );
+
+    let all_of = enabled_gate
+        .pointer("/then/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("enabled PluginConfigBase conditionals should be an array");
 
     let mut mapping = BTreeMap::new();
     for entry in all_of {
@@ -3754,8 +5390,20 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         "ws_message_size_limiting should reject a zero max_message_bytes"
     );
 
+    let empty_termination = plugin_config("request_termination", Some(json!({})));
+    assert!(
+        validator.validate(&empty_termination).is_ok(),
+        "empty request_termination config remains the maintenance-mode default"
+    );
+    let omitted_termination = plugin_config("request_termination", None);
+    assert!(
+        validator.validate(&omitted_termination).is_err(),
+        "enabled request_termination rows must require config"
+    );
+
     for (plugin_name, config) in [
         ("correlation_id", json!({})),
+        ("security_headers", json!({})),
         ("bot_detection", json!({})),
         ("udp_rate_limiting", json!({"datagrams_per_second": 100})),
         (
@@ -3788,6 +5436,12 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         ("correlation_id", Some(serde_json::Value::Null)),
         ("correlation_id", Some(json!([]))),
         ("correlation_id", Some(json!({"echo_downsteam": false}))),
+        ("security_headers", None),
+        ("security_headers", Some(serde_json::Value::Null)),
+        (
+            "security_headers",
+            Some(json!({"set": {"Content-Length": "ordinary"}})),
+        ),
         ("bot_detection", None),
         ("bot_detection", Some(serde_json::Value::Null)),
         ("bot_detection", Some(json!([]))),
@@ -3833,6 +5487,142 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         validator.validate(&custom).is_ok(),
         "custom plugins should keep generic PluginConfig config shape"
     );
+}
+
+/// Issue #4996: shared PluginConfig/Create/Replace must admit the same null,
+/// disabled, and POST-default bodies as `validate_plugin_config_definition`
+/// and PUT's explicit `enabled` presence check, without loosening enabled
+/// construction or PUT replace semantics.
+#[test]
+fn plugin_config_shared_schema_matches_admin_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    assert_eq!(
+        spec["paths"]["/plugins/config"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        json!("#/components/schemas/PluginConfigCreate")
+    );
+    assert_eq!(
+        spec["paths"]["/plugins/config/{id}"]["put"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        json!("#/components/schemas/PluginConfigReplace")
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["BatchCreateRequest"]["properties"]["plugin_configs"]["items"]
+            ["$ref"],
+        json!("#/components/schemas/PluginConfigCreate")
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfigBase"]["properties"]["config"]["type"],
+        json!(["object", "null"])
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfigCreate"]["allOf"][1]["required"],
+        json!(["plugin_name", "scope"])
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfigReplace"]["allOf"][1]["required"],
+        json!(["plugin_name", "scope", "enabled"])
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfig"]["allOf"][1]["required"],
+        json!(["plugin_name", "scope", "enabled"])
+    );
+
+    let stdout_null = json!({
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": null
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &stdout_null, true);
+    assert_component_validity(&spec, "PluginConfig", &stdout_null, true);
+    assert_component_validity(&spec, "PluginConfigReplace", &stdout_null, true);
+
+    let disabled_http_logging = json!({
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "enabled": false,
+        "config": {}
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &disabled_http_logging, true);
+    assert_component_validity(&spec, "PluginConfig", &disabled_http_logging, true);
+    assert_component_validity(&spec, "PluginConfigReplace", &disabled_http_logging, true);
+
+    let post_defaults = json!({
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "config": {}
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &post_defaults, true);
+    assert_component_validity(&spec, "PluginConfig", &post_defaults, false);
+    assert_component_validity(&spec, "PluginConfigReplace", &post_defaults, false);
+
+    let enabled_http_logging_missing_endpoint = json!({
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {}
+    });
+    assert_component_validity(
+        &spec,
+        "PluginConfigCreate",
+        &enabled_http_logging_missing_endpoint,
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "PluginConfig",
+        &enabled_http_logging_missing_endpoint,
+        false,
+    );
+
+    let object_only_null = json!({
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": null
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &object_only_null, false);
+    assert_component_validity(&spec, "PluginConfigReplace", &object_only_null, false);
+
+    let mut missing_config = json!({
+        "plugin_name": "http_logging",
+        "scope": "global"
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &missing_config, false);
+    missing_config["enabled"] = json!(false);
+    for component in ["PluginConfigCreate", "PluginConfig", "PluginConfigReplace"] {
+        assert_component_validity(&spec, component, &missing_config, true);
+    }
+
+    for plugin_name in ["prometheus_metrics", "mtls_auth", "compression"] {
+        let body = json!({
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "enabled": true,
+            "config": null
+        });
+        assert_component_validity(&spec, "PluginConfigCreate", &body, true);
+    }
+
+    // Generic scope restrictions still apply when construction is skipped.
+    for plugin_name in ["prometheus_metrics", "transaction_log_schema"] {
+        let mut body = json!({
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "enabled": false,
+            "config": {}
+        });
+        for component in ["PluginConfigCreate", "PluginConfig", "PluginConfigReplace"] {
+            assert_component_validity(&spec, component, &body, true);
+        }
+        body["scope"] = json!("proxy_group");
+        for component in ["PluginConfigCreate", "PluginConfig", "PluginConfigReplace"] {
+            assert_component_validity(&spec, component, &body, false);
+        }
+    }
 }
 
 #[test]
@@ -4396,7 +6186,7 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
     let runtime_overlay = spec
         .pointer("/components/schemas/RequestTransformerConfig/properties/runtime_overlay_scope")
         .expect("runtime_overlay_scope remains published");
-    assert_eq!(runtime_overlay["type"], json!("string"));
+    assert_eq!(runtime_overlay["type"], json!(["string", "null"]));
     assert_eq!(runtime_overlay["minLength"], json!(1));
     assert_eq!(runtime_overlay["pattern"], json!("\\S"));
     assert_eq!(
@@ -4404,6 +6194,52 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             .expect("default_enabled remains published")["default"],
         json!(true)
     );
+
+    // Every optional field whose constructor treats explicit `null` as absent
+    // must admit `null` in the schema too.
+    for field in [
+        "apply_route_overrides",
+        "default_enabled",
+        "runtime_overlay_resolved_enabled",
+    ] {
+        let property = spec
+            .pointer(&format!(
+                "/components/schemas/RequestTransformerConfig/properties/{field}"
+            ))
+            .unwrap_or_else(|| panic!("{field} remains published"));
+        assert_eq!(
+            property["type"],
+            json!(["boolean", "null"]),
+            "{field} must admit the explicit null the constructor accepts"
+        );
+    }
+
+    // The no-effect config is rejected by the schema, not only by the
+    // constructor: either a non-empty `rules` array or the route-only opt-in.
+    assert!(
+        spec.pointer("/components/schemas/RequestTransformerConfig/anyOf")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|branches| branches.len() == 2),
+        "RequestTransformerConfig must model non-empty rules vs route-only opt-in"
+    );
+
+    // Per-operation field sets ARE expressible in Draft 2020-12, and every rule
+    // variant composes the one shared contract.
+    let contract = json!("#/components/schemas/TransformerOperationFieldExactness");
+    for variant in [
+        "RequestTransformerHeaderRule",
+        "RequestTransformerQueryRule",
+        "RequestTransformerBodyRule",
+    ] {
+        let composed = spec
+            .pointer(&format!("/components/schemas/{variant}/allOf"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("{variant} must compose the operation contract"));
+        assert!(
+            composed.iter().any(|branch| branch["$ref"] == contract),
+            "{variant} must reference the shared operation-field contract"
+        );
+    }
 
     for config in [
         json!({
@@ -4487,6 +6323,47 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
                 "value": "tab\there"
             }]
         }),
+        // Route-only opt-in: the translator-owned consumer carries no static
+        // rules at all.
+        json!({"apply_route_overrides": true}),
+        json!({"rules": [], "apply_route_overrides": true}),
+        // Explicit `null` on a field the constructor treats as absent.
+        json!({
+            "rules": [{"operation": "remove", "target": "header", "key": "x-audit"}],
+            "default_enabled": null
+        }),
+        json!({
+            "rules": [{"operation": "remove", "target": "header", "key": "x-audit"}],
+            "apply_route_overrides": null,
+            "runtime_overlay_scope": null,
+            "runtime_overlay_resolved_enabled": null
+        }),
+        // A numeric segment is an ordinary array index for add/update/remove.
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "body",
+                "key": "items.0.name",
+                "value": "first"
+            }]
+        }),
+        // An ESCAPED numeric segment is a literal key, so rename still accepts it.
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "counts\\.0",
+                "new_key": "counts_first"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "user.old",
+                "new_key": "user.new"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, true);
         assert!(
@@ -4545,6 +6422,113 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
                 "vaule": "green"
             }]
         }),
+        // A config with no effect.
+        json!({}),
+        json!({"rules": []}),
+        json!({"apply_route_overrides": false}),
+        json!({"apply_route_overrides": null}),
+        // Per-operation required / forbidden properties, for every target.
+        json!({"rules": [{"operation": "update", "target": "header", "key": "x-audit"}]}),
+        json!({"rules": [{"operation": "add", "target": "query", "key": "audit"}]}),
+        json!({"rules": [{"operation": "add", "target": "body", "key": "audit"}]}),
+        json!({"rules": [{"operation": "rename", "target": "header", "key": "x-old"}]}),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "header",
+                "key": "x-audit",
+                "value": "unused"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "query",
+                "key": "audit",
+                "new_key": "moved"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Old",
+                "new_key": "X-New",
+                "value": "blue"
+            }]
+        }),
+        // Operation-incompatible extras are rejected by PRESENCE, so an explicit
+        // `null` fails exactly as a string would — body rules included.
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "body",
+                "key": "secret",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "body",
+                "key": "state",
+                "value": "public",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "body",
+                "key": "secret",
+                "value": null
+            }]
+        }),
+        // Header field-name grammar.
+        json!({"rules": [{"operation": "remove", "target": "header", "key": "bad name"}]}),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Old",
+                "new_key": "bad name"
+            }]
+        }),
+        // CR / LF in query strings is request-target injection.
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "query",
+                "key": "audit",
+                "value": "yes\r\nx: 1"
+            }]
+        }),
+        // Array indices are not renameable.
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "items.0",
+                "new_key": "first"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "first",
+                "new_key": "items.0"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, false);
         assert!(
@@ -4552,23 +6536,6 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime accepted OpenAPI-invalid request_transformer config: {config}"
         );
     }
-
-    // Operation-incompatible extras are known OpenAPI properties but still fail
-    // runtime construction (schema cannot encode per-operation field sets).
-    let incompatible = json!({
-        "rules": [{
-            "operation": "update",
-            "target": "header",
-            "key": "X-Color",
-            "value": "blue",
-            "new_key": "X-Ignored"
-        }]
-    });
-    assert_component_validity(&spec, "RequestTransformerConfig", &incompatible, true);
-    assert!(
-        RequestTransformer::new(&incompatible).is_err(),
-        "runtime must reject operation-incompatible header fields: {incompatible}"
-    );
 }
 
 #[test]
@@ -4642,7 +6609,7 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
     let runtime_overlay = spec
         .pointer("/components/schemas/ResponseTransformerConfig/properties/runtime_overlay_scope")
         .expect("runtime_overlay_scope remains published");
-    assert_eq!(runtime_overlay["type"], json!("string"));
+    assert_eq!(runtime_overlay["type"], json!(["string", "null"]));
     assert_eq!(runtime_overlay["minLength"], json!(1));
     assert_eq!(runtime_overlay["pattern"], json!("\\S"));
     assert_eq!(
@@ -4650,6 +6617,45 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
             .expect("default_enabled remains published")["default"],
         json!(true)
     );
+
+    for field in [
+        "apply_route_overrides",
+        "default_enabled",
+        "runtime_overlay_resolved_enabled",
+    ] {
+        let property = spec
+            .pointer(&format!(
+                "/components/schemas/ResponseTransformerConfig/properties/{field}"
+            ))
+            .unwrap_or_else(|| panic!("{field} remains published"));
+        assert_eq!(
+            property["type"],
+            json!(["boolean", "null"]),
+            "{field} must admit the explicit null the constructor accepts"
+        );
+    }
+
+    assert!(
+        spec.pointer("/components/schemas/ResponseTransformerConfig/anyOf")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|branches| branches.len() == 2),
+        "ResponseTransformerConfig must model non-empty rules vs route-only opt-in"
+    );
+
+    let contract = json!("#/components/schemas/TransformerOperationFieldExactness");
+    for variant in [
+        "ResponseTransformerHeaderRule",
+        "ResponseTransformerBodyRule",
+    ] {
+        let composed = spec
+            .pointer(&format!("/components/schemas/{variant}/allOf"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("{variant} must compose the operation contract"));
+        assert!(
+            composed.iter().any(|branch| branch["$ref"] == contract),
+            "{variant} must reference the shared operation-field contract"
+        );
+    }
 
     for config in [
         json!({
@@ -4677,6 +6683,32 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
         json!({
             "rules": [{
                 "operation": "add", "target": "header", "key": "X-Edge", "value": "tab\there"
+            }]
+        }),
+        json!({"apply_route_overrides": true}),
+        json!({"rules": [], "apply_route_overrides": true}),
+        json!({
+            "rules": [{"operation": "remove", "target": "header", "key": "X-Internal"}],
+            "apply_route_overrides": null,
+            "runtime_overlay_scope": null,
+            "default_enabled": null,
+            "runtime_overlay_resolved_enabled": null
+        }),
+        // Set-Cookie is renameable neither way, but every other operation on it
+        // stays available.
+        json!({"rules": [{"operation": "remove", "target": "header", "key": "Set-Cookie"}]}),
+        json!({
+            "rules": [{
+                "operation": "add", "target": "header", "key": "Set-Cookie", "value": "a=1"
+            }]
+        }),
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "items.0"}]}),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "counts\\.0",
+                "new_key": "counts_first"
             }]
         }),
     ] {
@@ -4717,6 +6749,72 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
                 "vaule": "green"
             }]
         }),
+        json!({}),
+        json!({"rules": []}),
+        json!({"apply_route_overrides": false}),
+        json!({"rules": [{"operation": "update", "target": "header", "key": "x-audit"}]}),
+        json!({"rules": [{"operation": "add", "target": "body", "key": "audit"}]}),
+        json!({"rules": [{"operation": "rename", "target": "header", "key": "x-old"}]}),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "header",
+                "key": "x-audit",
+                "value": "unused"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "body",
+                "key": "secret",
+                "new_key": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "body",
+                "key": "state",
+                "value": "public",
+                "new_key": null
+            }]
+        }),
+        json!({"rules": [{"operation": "remove", "target": "header", "key": "bad name"}]}),
+        // Set-Cookie's newline-joined multi-value encoding is name-bound.
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "Set-Cookie",
+                "new_key": "X-Cookies"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Cookies",
+                "new_key": "SET-COOKIE"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "items.0",
+                "new_key": "first"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "ResponseTransformerConfig", &config, false);
         assert!(
@@ -4724,23 +6822,6 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime accepted OpenAPI-invalid response_transformer config: {config}"
         );
     }
-
-    // Operation-incompatible extras are known OpenAPI properties but still fail
-    // runtime construction (schema cannot encode per-operation field sets).
-    let incompatible = json!({
-        "rules": [{
-            "operation": "update",
-            "target": "header",
-            "key": "X-Color",
-            "value": "blue",
-            "new_key": "X-Ignored"
-        }]
-    });
-    assert_component_validity(&spec, "ResponseTransformerConfig", &incompatible, true);
-    assert!(
-        ResponseTransformer::new(&incompatible).is_err(),
-        "runtime must reject operation-incompatible header fields: {incompatible}"
-    );
 }
 
 #[test]
@@ -4777,22 +6858,25 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         );
     }
 
+    // Each instance carries a rule-bearing key: the schema now refuses a
+    // configuration with no validation rule at all, exactly as the constructor
+    // does (issue #5122).
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": 0}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 0}),
         true,
     );
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": -1}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": -1}),
         false,
     );
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"grpc_max_decompressed_size_bytes": "10"}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": "10"}),
         false,
     );
 
@@ -4861,6 +6945,11 @@ fn stdout_logging_schema_rejects_unknown_outer_and_filter_keys() {
         json!({}),
         json!({"filter": null}),
         json!({"filter": {"status_code_min": 500, "errors_only": true}}),
+        json!({"filter": {"status_code_max": 599}}),
+        json!({"filter": {"min_latency_ms": 250}}),
+        json!({"filter": {"errors_only": false}}),
+        json!({"filter": {"expression": {"op": "errors_only"}}}),
+        json!({"schema": {}}),
         json!({"schema_ref": "common"}),
     ] {
         assert_component_validity(&spec, "StdoutLoggingConfig", &valid, true);
@@ -4870,8 +6959,85 @@ fn stdout_logging_schema_rejects_unknown_outer_and_filter_keys() {
         json!({"log_level": "info"}),
         json!({"filter": {"error_only": true}}),
         json!({"filter": {"min_latency_msec": 100}}),
+        json!({
+            "filter": {
+                "expression": {"op": "errors_only"},
+                "status_code_min": 500
+            }
+        }),
+        json!({
+            "filter": {
+                "expression": {"op": "errors_only"},
+                "status_code_max": 599
+            }
+        }),
+        json!({
+            "filter": {
+                "expression": {"op": "errors_only"},
+                "min_latency_ms": 10
+            }
+        }),
+        json!({
+            "filter": {
+                "expression": {"op": "errors_only"},
+                "errors_only": false
+            }
+        }),
+        json!({"schema": {}, "schema_ref": "known"}),
     ] {
         assert_component_validity(&spec, "StdoutLoggingConfig", &invalid, false);
+    }
+}
+
+#[test]
+fn http_logging_schema_rejects_unknown_keys_and_invalid_endpoints() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/HttpLoggingConfig")
+        .expect("HttpLoggingConfig exists");
+    assert_eq!(schema.get("additionalProperties"), Some(&json!(false)));
+    assert_eq!(schema.get("required"), Some(&json!(["endpoint_url"])));
+
+    let endpoint = "http://127.0.0.1:29001/ingest";
+    for valid in [
+        json!({"endpoint_url": endpoint}),
+        json!({"endpoint_url": "http://[::1]/logs"}),
+        json!({"endpoint_url": "HTTP://localhost:9200/logs"}),
+        json!({
+            "endpoint_url": endpoint,
+            "custom_headers": {
+                "Authorization": "Bearer token",
+                "X-Custom": "x",
+                "authorization": "Bearer other"
+            }
+        }),
+        json!({"endpoint_url": endpoint, "schema": {}}),
+        json!({"endpoint_url": endpoint, "schema_ref": "known"}),
+    ] {
+        assert_component_validity(&spec, "HttpLoggingConfig", &valid, true);
+    }
+    for invalid in [
+        json!({"endpoint_url": endpoint, "typo": 1}),
+        json!({"endpoint_url": ""}),
+        json!({"endpoint_url": "ftp://localhost"}),
+        json!({"endpoint_url": "http:///ingest"}),
+        json!({"endpoint_url": "http://user:pass@localhost"}),
+        json!({
+            "endpoint_url": endpoint,
+            "custom_headers": {"bad name": "x"}
+        }),
+        json!({
+            "endpoint_url": endpoint,
+            "custom_headers": {"X-Token": "bad\r\nvalue"}
+        }),
+        json!({
+            "endpoint_url": endpoint,
+            "schema": {},
+            "schema_ref": "known"
+        }),
+    ] {
+        assert_component_validity(&spec, "HttpLoggingConfig", &invalid, false);
     }
 }
 
@@ -4907,6 +7073,11 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
     assert_eq!(
         schema["properties"]["security_protocol"]["default"],
         json!("plaintext")
+    );
+    assert_eq!(schema["properties"]["topic"]["maxLength"], json!(249));
+    assert_eq!(
+        schema["properties"]["message_timeout_ms"]["maximum"],
+        json!(2147483647)
     );
 
     for valid in [
@@ -4956,6 +7127,160 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
     }
 }
 
+/// The retained-byte lease and the `key_field: none` partitioning contract must
+/// not drift back to their pre-#5218 / pre-#5219 text on any operator surface.
+///
+/// Both claims were stale in opposite directions: the budget was described as
+/// released at `send`, when it is held through terminal delivery; and `none` was
+/// described as round-robin, when it simply omits the key and lets librdkafka's
+/// own (sticky, consistent-random) partitioner choose.
+#[test]
+fn kafka_logging_operator_surfaces_describe_the_implemented_behavior() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/KafkaLoggingConfig")
+        .expect("KafkaLoggingConfig exists");
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let kafka_section = plugin_docs
+        .split_once("### `kafka_logging`")
+        .and_then(|(_, rest)| rest.split_once("\n### "))
+        .map(|(section, _)| section)
+        .expect("docs/plugins.md has a bounded kafka_logging section");
+
+    let buffer_description = schema["properties"]["buffer_max_bytes"]["description"]
+        .as_str()
+        .expect("buffer_max_bytes description");
+    assert!(
+        buffer_description.contains("NOT released when librdkafka send returns"),
+        "the OpenAPI budget description must state that the lease survives handoff"
+    );
+    assert!(
+        !buffer_description.contains("Bytes are released when librdkafka send returns"),
+        "the OpenAPI budget description must not claim release at handoff"
+    );
+    assert!(
+        kafka_section.contains("The charge is **not** released when `send` returns"),
+        "docs/plugins.md must state that the lease survives handoff"
+    );
+    assert!(
+        !kafka_section.contains("Bytes release when librdkafka `send` returns"),
+        "docs/plugins.md must not claim release at handoff"
+    );
+
+    let key_field_description = schema["properties"]["key_field"]["description"]
+        .as_str()
+        .expect("key_field description");
+    assert!(
+        key_field_description.contains("consistent_random"),
+        "the OpenAPI key_field description must name the librdkafka partitioner"
+    );
+    assert!(
+        !key_field_description.contains("round-robin"),
+        "the OpenAPI key_field description must not promise round-robin"
+    );
+    assert!(
+        kafka_section.contains("consistent_random"),
+        "docs/plugins.md must name the librdkafka partitioner for key_field none"
+    );
+    assert!(
+        !kafka_section.contains("round-robin"),
+        "docs/plugins.md must not promise round-robin partition assignment"
+    );
+
+    // The retained-bytes gauge HELP is published from the contract inventory.
+    for surface in [
+        include_str!("../../docs/prometheus_metrics.md"),
+        include_str!("../../docs/prometheus_metric_contract.json"),
+    ] {
+        assert!(
+            !surface.contains("awaiting librdkafka admission"),
+            "the retained-bytes gauge must not describe a userspace-only budget"
+        );
+    }
+}
+
+/// The component must admit exactly what `KafkaLogging::new` admits (#5217).
+///
+/// Every syntactic case below was reproduced against the constructor; a client
+/// generated from this schema has to reach the same verdict, or preflight is
+/// useless. Two constraints stay deliberately outside the schema because JSON
+/// Schema cannot express them: `buffer_max_bytes >= max_entry_bytes` (an
+/// unrestricted sibling-number comparison) and whether a `schema_ref` names a
+/// schema some `transaction_log_schema` plugin actually registered. Both are
+/// stated in the component descriptions instead.
+#[test]
+fn kafka_logging_schema_matches_runtime_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let long_topic = "a".repeat(249);
+    let too_long_topic = "a".repeat(250);
+    let base = |extra: serde_json::Value| -> serde_json::Value {
+        let mut config = json!({"broker_list": "127.0.0.1:9092", "topic": "audit-logs"});
+        for (key, value) in extra.as_object().expect("overrides are an object") {
+            config[key] = value.clone();
+        }
+        config
+    };
+
+    for valid in [
+        base(json!({"topic": long_topic})),
+        base(json!({"topic": "a.b_c-d"})),
+        base(json!({"topic": "..."})),
+        base(json!({"message_timeout_ms": 0})),
+        base(json!({"message_timeout_ms": 2147483647})),
+        base(json!({"schema_ref": "named"})),
+        base(json!({"producer_config": {"linger.ms": "50"}})),
+        base(json!({"producer_config": {"queue.buffering.max.messages": "100000"}})),
+        base(json!({"producer_config": {"queue.buffering.max.kbytes": "262144"}})),
+        base(json!({"producer_config": {"message.max.bytes": "4194304"}})),
+        base(json!({
+            "security_protocol": "ssl",
+            "producer_config": {"ssl.cipher.suites": "DEFAULT"}
+        })),
+        base(json!({
+            "security_protocol": "sasl_ssl",
+            "sasl_username": " padded ",
+            "sasl_password": " padded ",
+            "producer_config": {"sasl.kerberos.service.name": "kafka"}
+        })),
+    ] {
+        assert_component_validity(&spec, "KafkaLoggingConfig", &valid, true);
+    }
+
+    for invalid in [
+        // Kafka topic syntax (#5213).
+        base(json!({"topic": "."})),
+        base(json!({"topic": ".."})),
+        base(json!({"topic": "bad/name"})),
+        base(json!({"topic": "bad name"})),
+        base(json!({"topic": too_long_topic})),
+        // Runtime integer bounds and the non-empty schema reference (#5217).
+        base(json!({"message_timeout_ms": -1})),
+        base(json!({"message_timeout_ms": 2147483648u64})),
+        base(json!({"schema_ref": ""})),
+        base(json!({"schema": {}, "schema_ref": "named"})),
+        // Normalized enum spellings the constructor refuses (#5217).
+        base(json!({"security_protocol": "PLAINTEXT"})),
+        base(json!({"key_field": " none "})),
+        base(json!({"acks": " 1 "})),
+        base(json!({"compression": " gzip "})),
+        // producer_config refusals, namespaces, and budgets (#5215, #5217).
+        base(json!({"producer_config": {"security.protocol": "ssl"}})),
+        base(json!({"producer_config": {"sasl.password": "secret"}})),
+        base(json!({"producer_config": {"transactional.id": "audit"}})),
+        base(json!({"producer_config": {"queue.buffering.max.messages": "100001"}})),
+        base(json!({"producer_config": {"queue.buffering.max.messages": "0"}})),
+        base(json!({"producer_config": {"queue.buffering.max.kbytes": "262145"}})),
+        base(json!({"producer_config": {"message.max.bytes": "4194305"}})),
+        base(json!({"producer_config": {"ssl.cipher.suites": "DEFAULT"}})),
+        base(json!({"producer_config": {"sasl.kerberos.service.name": "kafka"}})),
+    ] {
+        assert_component_validity(&spec, "KafkaLoggingConfig", &invalid, false);
+    }
+}
+
 #[test]
 fn correlation_id_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::correlation_id::CorrelationId;
@@ -4968,6 +7293,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "x-request-id", "echo_downstream": false}),
         json!({"header_name": "X-Correlation-ID", "echo_downstream": true}),
         json!({"header_name": " X-Trimmed-ID "}),
+        json!({"header_name": "\u{0085}x-audit\u{0085}"}),
+        json!({"header_name": "a".repeat(65_535)}),
         json!({"header_name": null, "echo_downstream": null}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &valid, true);
@@ -4983,6 +7310,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!(true),
         json!({"echo_downsteam": false}),
         json!({"header_name": "x:request-id"}),
+        json!({"header_name": "\u{feff}x-audit\u{feff}"}),
+        json!({"header_name": "a".repeat(65_536)}),
         json!({"header_name": 42}),
         json!({"echo_downstream": "true"}),
         json!({"header_name": "API-Key"}),
@@ -5144,6 +7473,17 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
     });
     assert_component_validity(&spec, "LokiLoggingConfig", &valid, true);
     assert!(LokiLogging::new(&valid, PluginHttpClient::default()).is_ok());
+    assert_component_validity(
+        &spec,
+        "PluginConfig",
+        &json!({
+            "plugin_name": "loki_logging",
+            "scope": "global",
+            "enabled": true,
+            "config": valid
+        }),
+        true,
+    );
     let valid_minima = json!({
         "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
         "labels": {"_a": ""},
@@ -5157,6 +7497,18 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
     });
     assert_component_validity(&spec, "LokiLoggingConfig", &valid_minima, true);
     assert!(LokiLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let url_whitespace = json!({
+        "endpoint_url": " http://127.0.0.1:3100/push "
+    });
+    assert_component_validity(&spec, "LokiLoggingConfig", &url_whitespace, true);
+    assert!(LokiLogging::new(&url_whitespace, PluginHttpClient::default()).is_ok());
+    let unicode_header = json!({
+        "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
+        "custom_headers": {"X-Example": "café"}
+    });
+    assert_component_validity(&spec, "LokiLoggingConfig", &unicode_header, true);
+    assert!(LokiLogging::new(&unicode_header, PluginHttpClient::default()).is_ok());
 
     let mut invalid = vec![
         json!({"endpoint_url": "https://logs.example.com/push", "endpont_url": "typo"}),
@@ -5177,6 +7529,20 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
         json!({"endpoint_url": "https://logs.example.com/push", "retry_delay_ms": 0}),
         json!({"endpoint_url": "https://logs.example.com/push", "max_entry_bytes": 1023}),
         json!({"endpoint_url": "https://logs.example.com/push", "buffer_max_bytes": 268435457}),
+        json!({
+            "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
+            "schema": {},
+            "schema_ref": "example"
+        }),
+        json!({
+            "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
+            "schema_ref": ""
+        }),
+        json!({"endpoint_url": "http://127.0.0.1:99999/push"}),
+        json!({
+            "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
+            "buffer_max_bytes": 1024
+        }),
     ];
     let oversized_header_name = "x".repeat(LOKI_MAX_CUSTOM_HEADER_NAME_BYTES + 1);
     let mut oversized_headers = serde_json::Map::new();
@@ -5195,11 +7561,129 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
     }
     for config in invalid {
         assert_component_validity(&spec, "LokiLoggingConfig", &config, false);
+        assert_component_validity(
+            &spec,
+            "PluginConfig",
+            &json!({
+                "plugin_name": "loki_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": config.clone()
+            }),
+            false,
+        );
         assert!(
             LokiLogging::new(&config, PluginHttpClient::default()).is_err(),
             "runtime accepted OpenAPI-invalid Loki config: {config}"
         );
     }
+}
+
+#[tokio::test]
+async fn ws_logging_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::ws_logging::{
+        WS_DEFAULT_BUFFER_MAX_BYTES, WS_DEFAULT_MAX_ENTRY_BYTES, WS_LOGGING_CONFIG_KEYS,
+        WS_MAX_BUFFER_MAX_BYTES, WS_MAX_MAX_ENTRY_BYTES, WsLogging,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/WsLoggingConfig")
+        .expect("WsLoggingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(schema["properties"]["endpoint_url"]["minLength"], 1);
+    assert_eq!(schema["properties"]["schema_ref"]["minLength"], 1);
+    assert_eq!(
+        schema["allOf"][0]["not"]["required"],
+        json!(["schema", "schema_ref"])
+    );
+    let budget_desc = schema["properties"]["buffer_max_bytes"]["description"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        budget_desc.contains("2 * (max_entry_bytes + 1)") && budget_desc.contains("Runtime"),
+        "buffer_max_bytes must document the sibling-field runtime bound: {budget_desc}"
+    );
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("WsLogging properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = WS_LOGGING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "ws_logging runtime/OpenAPI key drift");
+    assert_eq!(
+        schema["properties"]["max_entry_bytes"]["default"],
+        json!(WS_DEFAULT_MAX_ENTRY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["max_entry_bytes"]["maximum"],
+        json!(WS_MAX_MAX_ENTRY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["buffer_max_bytes"]["default"],
+        json!(WS_DEFAULT_BUFFER_MAX_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["buffer_max_bytes"]["maximum"],
+        json!(WS_MAX_BUFFER_MAX_BYTES)
+    );
+
+    let valid = json!({
+        "endpoint_url": "WS://127.0.0.1:39999/ingest",
+        "batch_size": 50,
+        "flush_interval_ms": 1000,
+        "buffer_capacity": 10000,
+        "max_entry_bytes": WS_DEFAULT_MAX_ENTRY_BYTES,
+        "buffer_max_bytes": WS_DEFAULT_BUFFER_MAX_BYTES,
+        "schema": {}
+    });
+    assert_component_validity(&spec, "WsLoggingConfig", &valid, true);
+    assert!(WsLogging::new(&valid, PluginHttpClient::default()).is_ok());
+    let valid_minima = json!({"endpoint_url": "ws://127.0.0.1:39999/ingest"});
+    assert_component_validity(&spec, "WsLoggingConfig", &valid_minima, true);
+    assert!(WsLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let runtime_and_schema_invalid = [
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "unexpected": true}),
+        json!({"endpoint_url": ""}),
+        json!({"endpoint_url": "http://127.0.0.1:39999/ingest"}),
+        json!({"endpoint_url": "ws://user:password@127.0.0.1:39999/ingest"}),
+        json!({"endpoint_url": "ws:///ingest"}),
+        json!({
+            "endpoint_url": "ws://127.0.0.1:39999/ingest",
+            "schema": {},
+            "schema_ref": "example"
+        }),
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "schema_ref": ""}),
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "batch_size": 0}),
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "flush_interval_ms": 99}),
+    ];
+    for config in runtime_and_schema_invalid {
+        assert_component_validity(&spec, "WsLoggingConfig", &config, false);
+        assert!(
+            WsLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid ws_logging config: {config}"
+        );
+    }
+
+    // Sibling-field arithmetic cannot be expressed in standard JSON Schema.
+    let runtime_only = json!({
+        "endpoint_url": "ws://127.0.0.1:39999/ingest",
+        "max_entry_bytes": 65536,
+        "buffer_max_bytes": 2050
+    });
+    assert_component_validity(&spec, "WsLoggingConfig", &runtime_only, true);
+    assert!(
+        WsLogging::new(&runtime_only, PluginHttpClient::default()).is_err(),
+        "runtime must still reject a buffer below 2 * (max_entry_bytes + 1)"
+    );
 }
 
 #[tokio::test]
@@ -5219,8 +7703,8 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
     );
     assert_eq!(
         schema["properties"]["global_tags"]["propertyNames"]["pattern"],
-        "^[A-Za-z_][A-Za-z0-9_.-]*$",
-        "global_tags keys must encode the runtime ASCII tag-key grammar"
+        "^(?!(namespace|method|status_class|status|grpc_status|proxy|protocol|error_class|error|cause|direction|body_outcome|body_error|result|io_side)$)[A-Za-z_][A-Za-z0-9_.-]*$",
+        "global_tags keys must encode the runtime ASCII tag-key grammar and reserved-name exclusion"
     );
     assert_eq!(
         schema["properties"]["global_tags"]["propertyNames"]["maxLength"], 64,
@@ -5230,8 +7714,8 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
         .as_str()
         .unwrap_or("");
     assert!(
-        prefix_desc.contains("Unicode characters") && prefix_desc.contains("UTF-8 bytes"),
-        "prefix description must distinguish OpenAPI character maxLength from runtime byte cap: {prefix_desc}"
+        prefix_desc.contains("UTF-8 bytes") && prefix_desc.contains("sanitization"),
+        "prefix description must document the runtime post-sanitization byte cap: {prefix_desc}"
     );
 
     let documented = schema["properties"]
@@ -5279,10 +7763,28 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
     });
     assert_component_validity(&spec, "StatsdLoggingConfig", &valid, true);
     assert!(StatsdLogging::new(&valid, PluginHttpClient::default()).is_ok());
+    assert_component_validity(
+        &spec,
+        "PluginConfig",
+        &json!({
+            "plugin_name": "statsd_logging",
+            "scope": "global",
+            "enabled": true,
+            "config": valid
+        }),
+        true,
+    );
 
     let valid_minima = json!({"host": "127.0.0.1"});
     assert_component_validity(&spec, "StatsdLoggingConfig", &valid_minima, true);
     assert!(StatsdLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let prefix_padded = json!({
+        "host": "127.0.0.1",
+        "prefix": format!(" {} ", "a".repeat(256))
+    });
+    assert_component_validity(&spec, "StatsdLoggingConfig", &prefix_padded, true);
+    assert!(StatsdLogging::new(&prefix_padded, PluginHttpClient::default()).is_ok());
 
     let runtime_and_schema_invalid = [
         json!({"host": "statsd.example.test", "prot": 9125}),
@@ -5303,9 +7805,27 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
         json!({"host": "statsd.example.test", "global_tags": null}),
         json!({"host": "statsd.example.test", "schema": null}),
         json!({"host": null}),
+        json!({"host": "statsd.example.test", "schema": {}, "schema_ref": "example"}),
+        json!({"host": "statsd.example.test", "schema_ref": ""}),
+        json!({"host": ""}),
+        json!({"host": "127.0.0.1:8125"}),
+        json!({"host": "statsd.example.test", "prefix": ""}),
+        json!({"host": "127.0.0.1", "global_tags": {"method": "example"}}),
+        json!({"host": "127.0.0.1", "buffer_max_bytes": 2050}),
     ];
     for config in runtime_and_schema_invalid {
         assert_component_validity(&spec, "StatsdLoggingConfig", &config, false);
+        assert_component_validity(
+            &spec,
+            "PluginConfig",
+            &json!({
+                "plugin_name": "statsd_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": config.clone()
+            }),
+            false,
+        );
         assert!(
             StatsdLogging::new(&config, PluginHttpClient::default()).is_err(),
             "runtime accepted OpenAPI-invalid StatsD config: {config}"
@@ -5377,7 +7897,7 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
     assert_eq!(schema["properties"]["write_timeout_ms"]["default"], 5000);
     assert_eq!(
         schema["properties"]["tls_server_name"]["pattern"],
-        r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$",
+        r"^(?:[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?\.?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$",
     );
     let connect_desc = schema["properties"]["connect_timeout_ms"]["description"]
         .as_str()
@@ -5413,6 +7933,18 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
     }
     assert!(tcp_docs.contains("KeepLastKnownGood"));
     assert!(tcp_docs.contains("at-least-once"));
+    assert!(
+        tcp_docs.contains("268435456") || tcp_docs.contains("256 MiB"),
+        "tcp_logging docs must name the 256 MiB buffer_max_bytes ceiling"
+    );
+    assert!(
+        tcp_docs.contains("ssl_enabled"),
+        "Logstash TLS instructions must use ssl_enabled"
+    );
+    assert!(
+        !tcp_docs.contains("ssl_enable =>"),
+        "removed Logstash ssl_enable option must not remain in tcp_logging docs"
+    );
 
     let valid = json!({
         "host": "logs.example.com",
@@ -5443,6 +7975,27 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
     assert_component_validity(&spec, "TcpLoggingConfig", &valid_minima, true);
     assert!(TcpLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
 
+    let padded_host = json!({"host": " 127.0.0.1 ", "port": 5140});
+    assert_component_validity(&spec, "TcpLoggingConfig", &padded_host, true);
+    assert!(
+        TcpLogging::new(&padded_host, PluginHttpClient::default()).is_ok(),
+        "runtime trims surrounding host whitespace"
+    );
+
+    for tls_server_name in ["localhost.", "log_sink.local"] {
+        let config = json!({
+            "host": "127.0.0.1",
+            "port": 6514,
+            "tls": true,
+            "tls_server_name": tls_server_name
+        });
+        assert_component_validity(&spec, "TcpLoggingConfig", &config, true);
+        assert!(
+            TcpLogging::new(&config, PluginHttpClient::default()).is_ok(),
+            "rustls-accepted TLS identity {tls_server_name} must admit"
+        );
+    }
+
     let runtime_and_schema_invalid = [
         json!({"host": "logs.example.com", "port": 6514, "tlls": true}),
         json!({"host": "logs.example.com", "port": 6514, "write_timeot_ms": 1000}),
@@ -5469,6 +8022,16 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
         }),
         json!({"host": "logs.example.com", "port": 6514, "tls": true, "tls_server_name": " logs.example.com"}),
         json!({"host": "logs.example.com", "port": 6514, "tls": true, "tls_server_name": "logs.example.com "}),
+        json!({"host": "http://localhost", "port": 5140}),
+        json!({"host": "localhost:9000", "port": 5140}),
+        json!({
+            "host": "127.0.0.1",
+            "port": 45123,
+            "schema": {"static_fields": {"audit": "ok"}},
+            "schema_ref": "audit"
+        }),
+        json!({"host": "127.0.0.1", "port": 45123, "buffer_max_bytes": 2050}),
+        json!({"host": "[localhost]", "port": 5140}),
     ];
     for config in runtime_and_schema_invalid {
         assert_component_validity(&spec, "TcpLoggingConfig", &config, false);
@@ -5509,6 +8072,121 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
             .insert((*key).to_string(), serde_json::Value::Null);
         assert_component_validity(&spec, "TcpLoggingConfig", &config, false);
     }
+}
+
+#[test]
+fn udp_logging_schema_matches_runtime_admission() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::udp_logging::{UDP_LOGGING_CONFIG_KEYS, UdpLogging};
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/UdpLoggingConfig")
+        .expect("UdpLoggingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("UdpLogging properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = UDP_LOGGING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "udp_logging runtime/OpenAPI key drift");
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let udp_docs = plugin_docs
+        .split("### `udp_logging`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("udp_logging docs section");
+    for key in UDP_LOGGING_CONFIG_KEYS {
+        assert!(
+            udp_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md udp_logging section missing `{key}`"
+        );
+    }
+    assert!(
+        udp_docs.contains("268435456") || udp_docs.contains("256 MiB"),
+        "udp_logging docs must name the 256 MiB buffer_max_bytes ceiling"
+    );
+
+    let valid = json!({"host": "127.0.0.1", "port": 45123});
+    assert_component_validity(&spec, "UdpLoggingConfig", &valid, true);
+    assert!(UdpLogging::new(&valid, PluginHttpClient::default()).is_ok());
+    validate_plugin_config("udp_logging", &valid).expect("shared validation accepts minima");
+
+    let padded_host = json!({"host": " 127.0.0.1 ", "port": 45123});
+    assert_component_validity(&spec, "UdpLoggingConfig", &padded_host, true);
+    validate_plugin_config("udp_logging", &padded_host)
+        .expect("shared validation trims host whitespace");
+    assert!(
+        UdpLogging::new(&padded_host, PluginHttpClient::default()).is_ok(),
+        "constructor trims host whitespace"
+    );
+
+    let runtime_and_schema_invalid = [
+        json!({"host": "http://localhost", "port": 45123}),
+        json!({"host": "localhost:9000", "port": 45123}),
+        json!({"host": "[localhost]", "port": 45123}),
+        json!({
+            "host": "127.0.0.1",
+            "port": 45123,
+            "schema": {"static_fields": {"audit": "ok"}},
+            "schema_ref": "audit"
+        }),
+        json!({
+            "host": "127.0.0.1",
+            "port": 45123,
+            "dtls": true,
+            "dtls_ca_cert_path": " "
+        }),
+        json!({"host": "127.0.0.1", "port": 45123, "buffer_max_bytes": 2050}),
+        json!({"host": "127.0.0.1", "port": 45123, "max_entry_bytes": 0}),
+        json!({"host": "127.0.0.1", "port": 45123, "max_entry_bytes": null}),
+        json!({"host": "127.0.0.1", "port": 45123, "max_entry_bytes": "65536"}),
+        json!({"host": "127.0.0.1", "port": 45123, "buffer_max_bytes": 268435457}),
+    ];
+    for config in runtime_and_schema_invalid {
+        assert_component_validity(&spec, "UdpLoggingConfig", &config, false);
+        assert!(
+            UdpLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid udp_logging config: {config}"
+        );
+        assert!(
+            validate_plugin_config("udp_logging", &config).is_err(),
+            "shared validation accepted OpenAPI-invalid udp_logging config: {config}"
+        );
+    }
+
+    let valid_explicit_min_pair = json!({
+        "host": "127.0.0.1",
+        "port": 45123,
+        "max_entry_bytes": 1024,
+        "buffer_max_bytes": 2050
+    });
+    assert_component_validity(&spec, "UdpLoggingConfig", &valid_explicit_min_pair, true);
+    validate_plugin_config("udp_logging", &valid_explicit_min_pair)
+        .expect("explicit minimum byte pair must validate");
+    assert!(
+        UdpLogging::new(&valid_explicit_min_pair, PluginHttpClient::default()).is_ok(),
+        "explicit minimum byte pair must construct"
+    );
+
+    let valid_max_pair = json!({
+        "host": "127.0.0.1",
+        "port": 45123,
+        "max_entry_bytes": 1048576,
+        "buffer_max_bytes": 268435456
+    });
+    assert_component_validity(&spec, "UdpLoggingConfig", &valid_max_pair, true);
+    validate_plugin_config("udp_logging", &valid_max_pair)
+        .expect("maximum byte pair must validate");
 }
 
 #[test]
@@ -5580,6 +8258,146 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
     assert!(err.contains("mirror_protcol"), "got: {err}");
     assert!(err.contains("allowed keys"), "got: {err}");
     validate_plugin_config("request_mirror", &typo).expect_err("shared admission must reject typo");
+
+    // Issue #5152: the component schema is compared against ACTUAL constructor
+    // admission, not just against the key inventory. Every case below must be
+    // accepted (or rejected) by both, so a schema-backed editor cannot reject a
+    // valid nullable/defaulted config or approve a malformed host, an
+    // incomplete credential-forwarding opt-in, or an invalid policy list.
+    let shared_client = PluginHttpClient::default();
+    let mut accepted: Vec<serde_json::Value> = vec![
+        // Minimal, plus both documented examples.
+        json!({"mirror_host": "127.0.0.1"}),
+        json!({
+            "mirror_host": "shadow.internal",
+            "mirror_port": 8443,
+            "mirror_protocol": "https",
+            "percentage": 50.0,
+            "mirror_request_body": true,
+            "max_in_flight": 64,
+            "max_retained_request_body_bytes": 33554432,
+            "max_mirrored_request_body_bytes": 4194304
+        }),
+        json!({
+            "mirror_host": "mirror.example.com",
+            "mirror_port": 8080,
+            "mirror_protocol": "https",
+            "mirror_path": "/shadow",
+            "percentage": 100.0,
+            "mirror_request_body": true,
+            "max_response_body_bytes": 1048576
+        }),
+        // The runtime lowercases the protocol, so uppercase is the same setting.
+        json!({"mirror_host": "127.0.0.1", "mirror_protocol": "HTTPS"}),
+        json!({"mirror_host": "[2001:db8::10]"}),
+        // Paired, fail-closed credential-forwarding opt-ins.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["authorization"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["access_token"]
+        }),
+        json!({"mirror_host": "127.0.0.1", "sensitive_header_patterns": ["x-vault-"]}),
+        json!({"mirror_host": "127.0.0.1", "percentage": 0}),
+        json!({"mirror_host": "127.0.0.1", "mirror_path": ""}),
+    ];
+    // Every optional scalar and list accepts an explicit JSON null (the runtime
+    // treats null as omitted), so the schema must not reject it by type.
+    for key in REQUEST_MIRROR_CONFIG_KEYS
+        .iter()
+        .filter(|key| **key != "mirror_host")
+    {
+        let mut config = json!({"mirror_host": "127.0.0.1"});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert((*key).to_string(), serde_json::Value::Null);
+        accepted.push(config);
+    }
+
+    let rejected: Vec<serde_json::Value> = vec![
+        json!({"mirror_host": "127.0.0.1", "mirror_protocol": "ftp"}),
+        // Host admission: a bare host only.
+        json!({"mirror_host": ""}),
+        json!({"mirror_host": " "}),
+        json!({"mirror_host": "https://example.test"}),
+        json!({"mirror_host": "example.test:80"}),
+        json!({"mirror_host": null}),
+        // Half an opt-in is a configuration error, never a partial grant.
+        json!({"mirror_host": "127.0.0.1", "forward_sensitive_headers": true}),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": []
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_header_allowlist": ["authorization"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["auth token"]
+        }),
+        json!({"mirror_host": "127.0.0.1", "forward_sensitive_query": true}),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query_allowlist": ["access_token"]
+        }),
+        // Operator pattern lists reject blank entries.
+        json!({"mirror_host": "127.0.0.1", "sensitive_header_patterns": [" "]}),
+        json!({"mirror_host": "127.0.0.1", "sensitive_query_patterns": [""]}),
+        // Numeric bounds.
+        json!({"mirror_host": "127.0.0.1", "max_in_flight": 0}),
+        json!({"mirror_host": "127.0.0.1", "max_response_body_bytes": 0}),
+        json!({"mirror_host": "127.0.0.1", "mirror_timeout_ms": 0}),
+        json!({"mirror_host": "127.0.0.1", "mirror_timeout_ms": 300001}),
+        json!({"mirror_host": "127.0.0.1", "mirror_path": "/a?b"}),
+    ];
+
+    for config in &accepted {
+        assert_component_validity(&spec, "RequestMirrorConfig", config, true);
+        assert!(
+            RequestMirror::new(config, shared_client.clone()).is_ok(),
+            "runtime must accept the schema-valid config {config}"
+        );
+    }
+    for config in &rejected {
+        assert_component_validity(&spec, "RequestMirrorConfig", config, false);
+        assert!(
+            RequestMirror::new(config, shared_client.clone()).is_err(),
+            "runtime must reject the schema-invalid config {config}"
+        );
+    }
+
+    // Documented, deliberate schema limitations: these runtime rules compare
+    // sibling values or inspect a JSON number's lexical form, which Draft
+    // 2020-12 cannot express. The component description names each one.
+    for runtime_only_rejection in [
+        // The allowlist entry is a valid header name but is not a header the
+        // deny-by-default policy strips.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["x-page"]
+        }),
+        // An explicit per-body ceiling above the (defaulted) aggregate budget.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "max_mirrored_request_body_bytes": 67108865
+        }),
+        // A whole-valued float is not an integer literal.
+        json!({"mirror_host": "127.0.0.1", "max_response_body_bytes": 1.0}),
+    ] {
+        assert!(
+            RequestMirror::new(&runtime_only_rejection, shared_client.clone()).is_err(),
+            "runtime must still reject {runtime_only_rejection}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5913,6 +8731,81 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
             "runtime accepted OpenAPI-invalid compression config: {config}"
         );
     }
+
+    // Constructor admission is the source of truth; the schema previously
+    // ACCEPTED each of these while `validate` exited 1 (issue #5095), and
+    // accepted content-type rules the matcher can never equal (issue #5096).
+    for config in [
+        json!({"algorithms": []}),
+        json!({"content_types": []}),
+        json!({"content_types": [""]}),
+        json!({"content_types": ["\u{e9}"]}),
+        json!({"content_types": [" "]}),
+        json!({"content_types": ["application/json; charset=utf-8"]}),
+        json!({"content_types": ["application/json "]}),
+        json!({"content_types": null}),
+        json!({"min_content_length": -1}),
+        json!({"max_decompressed_request_size": 0}),
+        json!({"max_decompressed_request_size": 33_554_433}),
+        json!({"brotli_quality": 12}),
+    ] {
+        assert_component_validity(&spec, "CompressionConfig", &config, false);
+        assert!(
+            CompressionPlugin::new(&config).is_err(),
+            "runtime accepted a config the schema now rejects: {config}"
+        );
+    }
+
+    // A `min_content_length` past `u64::MAX` is runtime-rejected (it is not an
+    // unsigned integer any more). The schema's `maximum` cannot bind it: the
+    // value only survives JSON parsing as an `f64`, and `u64::MAX` rounds to the
+    // same `f64`, so this stays a runtime-only assertion rather than a parity
+    // case that would silently depend on float behaviour.
+    let past_u64: serde_json::Value =
+        serde_json::from_str(r#"{"min_content_length": 18446744073709551616}"#)
+            .expect("oversized literal parses");
+    assert!(
+        CompressionPlugin::new(&past_u64).is_err(),
+        "runtime must reject a min_content_length past u64::MAX"
+    );
+
+    // Explicit null is "omitted" for every optional field the constructor reads
+    // through its `optional_*` helpers. `content_types` is deliberately NOT one
+    // of them, and is covered above.
+    for field in [
+        "algorithms",
+        "min_content_length",
+        "max_decompressed_request_size",
+        "gzip_level",
+        "brotli_quality",
+        "remove_accept_encoding",
+        "decompress_request",
+    ] {
+        let mut object = serde_json::Map::new();
+        object.insert(field.to_string(), serde_json::Value::Null);
+        let config = serde_json::Value::Object(object);
+        assert_component_validity(&spec, "CompressionConfig", &config, true);
+        assert!(
+            CompressionPlugin::new(&config).is_ok(),
+            "runtime must treat an explicit null {field} as omitted"
+        );
+    }
+
+    // Values both surfaces must keep accepting, so the tightened bounds did not
+    // over-constrain the documented shapes.
+    for config in [
+        json!({"content_types": ["application/vnd.api+json", "text/csv"]}),
+        json!({"min_content_length": 0}),
+        json!({"max_decompressed_request_size": 1}),
+        json!({"max_decompressed_request_size": 33_554_432}),
+        json!({"brotli_quality": 11}),
+    ] {
+        assert_component_validity(&spec, "CompressionConfig", &config, true);
+        assert!(
+            CompressionPlugin::new(&config).is_ok(),
+            "runtime rejected a schema-valid compression config: {config}"
+        );
+    }
 }
 
 #[test]
@@ -5935,6 +8828,10 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": ["10.0.0.0/8"]}),
         json!({"allow": [], "deny": ["192.0.2.0/24"]}),
         json!({"allow": ["2001:db8::/32"], "deny": [], "mode": "deny_first"}),
+        json!({"allow": ["0.0.0.0/0", "255.255.255.255/32"]}),
+        json!({"allow": ["::/0", "2001:db8::1/128"]}),
+        json!({"allow": ["::ffff:127.0.0.1/96", "::ffff:127.0.0.1/128"]}),
+        json!({"allow": [" [::1] ", " fe80::1%eth0/64 "]}),
     ] {
         assert_component_validity(&spec, "IpRestrictionConfig", &config, true);
         assert!(
@@ -5956,6 +8853,13 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": "10.0.0.0/8"}),
         json!({"allow": [""]}),
         json!({"allow": ["   "]}),
+        json!({"allow": ["not-an-ip"]}),
+        json!({"allow": ["300.1.1.1"]}),
+        json!({"allow": ["127.0.0.1/33"]}),
+        json!({"allow": ["::/129"]}),
+        json!({"allow": ["::ffff:127.0.0.1/95"]}),
+        json!({"allow": ["010.1.2.3"]}),
+        json!({"allow": ["+10.1.2.3"]}),
     ] {
         assert_component_validity(&spec, "IpRestrictionConfig", &config, false);
         assert!(
@@ -6001,6 +8905,14 @@ fn grpc_web_schema_matches_the_strict_runtime_shape() {
         json!({}),
         json!({"expose_headers": ["x-request-id"]}),
         json!({"expose_headers": []}),
+        // Field-level parity (issue #5134): the constructor treats an explicit
+        // null as the empty list and trims ASCII OWS off each item, and the
+        // schema has to say the same thing.
+        json!({"expose_headers": null}),
+        json!({"expose_headers": [" X-Ok "]}),
+        json!({"expose_headers": ["custom-header-bin", "x-request-id"]}),
+        // Names differing only in case are accepted and collapse to one entry.
+        json!({"expose_headers": ["X-Request-Id", "x-request-id"]}),
     ] {
         assert_component_validity(&spec, "GrpcWebConfig", &config, true);
         assert!(
@@ -6017,6 +8929,13 @@ fn grpc_web_schema_matches_the_strict_runtime_shape() {
         json!(true),
         json!({"expose_header": ["x-request-id"]}),
         json!({"expose_headers": ["x-request-id"], "extra": true}),
+        // Item constraints the schema previously did not model at all.
+        json!({"expose_headers": [""]}),
+        json!({"expose_headers": ["   "]}),
+        json!({"expose_headers": ["bad name"]}),
+        json!({"expose_headers": ["bad:name"]}),
+        json!({"expose_headers": ["x-request-id\r\nx-injected"]}),
+        json!({"expose_headers": [1]}),
     ] {
         assert_component_validity(&spec, "GrpcWebConfig", &config, false);
         assert!(
@@ -6505,6 +9424,28 @@ fn upstream_runtime_serialization_is_covered_by_openapi() {
 }
 
 #[test]
+fn proxy_allowed_ws_origins_description_rejects_star_wildcard() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let description = spec
+        .pointer("/components/schemas/Proxy/properties/allowed_ws_origins/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("allowed_ws_origins description");
+    assert!(
+        description.contains("Empty array (default) allows all origins"),
+        "OpenAPI must state empty list is allow-all: {description}"
+    );
+    assert!(
+        description.contains("`*` is not a wildcard"),
+        "OpenAPI must state star is not a wildcard: {description}"
+    );
+    assert!(
+        description.contains("rejected at Admin API"),
+        "OpenAPI must state admission rejects star: {description}"
+    );
+}
+
+#[test]
 fn config_schemas_reject_nulls_that_rust_does_not_accept() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -6739,6 +9680,7 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
                 current: 10,
                 max: 100,
                 ratio: 0.1,
+                enforced: true,
             },
             connections: ConnPressure {
                 current: 2,
@@ -6954,11 +9896,44 @@ fn ai_prompt_shield_schema_matches_runtime_validation() {
         json!({"patterns": []}),
         json!({"max_scan_bytes": 0}),
         json!({"patterns": ["email"], "scan_field": "all"}),
+        // A `custom_patterns` entry is as closed as the top level: an
+        // unsupported nested member is refused by both surfaces, not read as
+        // name/regex and dropped.
+        json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "account", "regex": "ACCT-[0-9]+", "note": "x"}]
+        }),
+        // The published `name` bound and the constructor's agree.
+        json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "n".repeat(200), "regex": "ACCT-[0-9]+"}]
+        }),
     ] {
         assert_component_validity(&spec, "AiPromptShieldConfig", &config, false);
         assert!(
             AiPromptShield::new(&config).is_err(),
             "runtime should reject schema-invalid config: {config}"
+        );
+    }
+
+    // `max_scan_bytes` publishes an explicit numeric domain whose bound every
+    // JSON number representation holds exactly, so the component and the
+    // constructor reach the same verdict at, just above, and far above it.
+    // Written through `from_str` because `json!` would need the literals to fit
+    // a Rust integer type.
+    for (raw, expected_valid) in [
+        (r#"{"max_scan_bytes":9007199254740991}"#, true),
+        (r#"{"max_scan_bytes":1024.0}"#, true),
+        (r#"{"max_scan_bytes":9007199254740992}"#, false),
+        (r#"{"max_scan_bytes":18446744073709551616}"#, false),
+        (r#"{"max_scan_bytes":1024.5}"#, false),
+    ] {
+        let config: serde_json::Value = serde_json::from_str(raw).expect("fixture parses");
+        assert_component_validity(&spec, "AiPromptShieldConfig", &config, expected_valid);
+        assert_eq!(
+            AiPromptShield::new(&config).is_ok(),
+            expected_valid,
+            "component and constructor must agree on {raw}"
         );
     }
 }
@@ -6988,6 +9963,98 @@ fn jwt_auth_schema_rejects_unknown_config_keys() {
             "schema should reject unknown jwt_auth key: {config}"
         );
     }
+}
+
+#[test]
+fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
+    use ferrum_edge::plugins::prometheus_metrics::PrometheusMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/PrometheusMetricsConfig")
+        .expect("PrometheusMetricsConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let schema_fields: BTreeSet<&str> = schema["properties"]
+        .as_object()
+        .expect("PrometheusMetricsConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        schema_fields,
+        BTreeSet::from([
+            "cache_invalidation_min_age_ms",
+            "mesh_series_budget_per_family",
+            "render_cache_ttl_seconds",
+            "stale_entry_ttl_seconds",
+        ])
+    );
+    assert!(
+        !schema_fields.contains("schema") && !schema_fields.contains("schema_ref"),
+        "schema/schema_ref must not be accepted properties"
+    );
+
+    let uint64_max = json!(u64::MAX);
+    for field in [
+        "render_cache_ttl_seconds",
+        "stale_entry_ttl_seconds",
+        "cache_invalidation_min_age_ms",
+    ] {
+        assert_eq!(schema["properties"][field]["format"], json!("uint64"));
+        assert_eq!(schema["properties"][field]["minimum"], json!(0));
+        assert_eq!(schema["properties"][field]["maximum"], uint64_max);
+    }
+    assert_eq!(
+        schema["properties"]["mesh_series_budget_per_family"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["mesh_series_budget_per_family"]["maximum"],
+        json!(1_000_000)
+    );
+
+    for config in [
+        serde_json::Value::Null,
+        json!({}),
+        json!({"render_cache_ttl_seconds": 0}),
+        json!({"render_cache_ttl_seconds": u64::MAX}),
+        json!({"stale_entry_ttl_seconds": u64::MAX}),
+        json!({"cache_invalidation_min_age_ms": u64::MAX}),
+        json!({"mesh_series_budget_per_family": 1}),
+        json!({"mesh_series_budget_per_family": 1_000_000}),
+    ] {
+        assert_component_validity(&spec, "PrometheusMetricsConfig", &config, true);
+        PrometheusMetrics::new(&config, "ferrum")
+            .unwrap_or_else(|err| panic!("constructor must accept {config}: {err}"));
+    }
+
+    for config in [
+        json!({"render_cache_ttl_secnds": 10}),
+        json!({"schema": {}}),
+        json!({"schema_ref": "x"}),
+        json!({"render_cache_ttl_seconds": -1}),
+        json!({"stale_entry_ttl_seconds": -1}),
+        json!({"cache_invalidation_min_age_ms": -1}),
+        json!({"mesh_series_budget_per_family": 0}),
+        json!({"mesh_series_budget_per_family": 1_000_001}),
+    ] {
+        assert_component_validity(&spec, "PrometheusMetricsConfig", &config, false);
+        assert!(
+            PrometheusMetrics::new(&config, "ferrum").is_err(),
+            "constructor must reject {config}"
+        );
+    }
+
+    let over = serde_json::from_str("18446744073709551616")
+        .expect("u64::MAX+1 must parse as a JSON number");
+    let mut over_range = json!({});
+    over_range
+        .as_object_mut()
+        .expect("object")
+        .insert("render_cache_ttl_seconds".to_string(), over);
+    assert_component_validity(&spec, "PrometheusMetricsConfig", &over_range, false);
 }
 
 #[test]
@@ -7460,6 +10527,403 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
     );
 }
 
+fn proxy_alerts_channel_config(channel: serde_json::Value) -> serde_json::Value {
+    json!({
+        "channels": { "ops": channel },
+        "rules": [{
+            "name": "r",
+            "type": "status_code_count",
+            "status_codes": [500],
+            "threshold_count": 1,
+            "channels": ["ops"]
+        }]
+    })
+}
+
+fn proxy_alerts_rule_config(rule: serde_json::Value) -> serde_json::Value {
+    json!({
+        "channels": {
+            "ops": {
+                "type": "webhook",
+                "url": "http://127.0.0.1:54321/",
+                "body_template": "{}"
+            }
+        },
+        "rules": [rule]
+    })
+}
+
+fn assert_proxy_alerts_schema_and_constructor(
+    validator: &jsonschema::Validator,
+    name: &str,
+    config: &serde_json::Value,
+    schema_valid: bool,
+    constructor_valid: bool,
+) {
+    assert_eq!(
+        validator.validate(config).is_ok(),
+        schema_valid,
+        "{name}: unexpected schema result for {config}"
+    );
+    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(config);
+    match (parsed, constructor_valid) {
+        (Ok(_), true) | (Err(_), false) => {}
+        (Ok(_), false) => panic!("{name}: constructor accepted {config}"),
+        (Err(err), true) => panic!("{name}: constructor rejected {config}: {err}"),
+    }
+}
+
+#[test]
+fn proxy_alerts_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let description = spec["components"]["schemas"]["ProxyAlertsConfig"]["description"]
+        .as_str()
+        .expect("ProxyAlertsConfig description");
+    for contract in [
+        "OptionalFailOpen",
+        "HTTP 400",
+        "delivery_retry_max_ms >= delivery_retry_base_ms",
+        "UTF-8 byte",
+        "case-insensitive",
+        "ferrum-edge validate",
+    ] {
+        assert!(
+            description.contains(contract),
+            "ProxyAlertsConfig description missing `{contract}`"
+        );
+    }
+
+    let docs = include_str!("../../docs/proxy_alerts.md");
+    let plugins_docs = include_str!("../../docs/plugins.md");
+    let notifications_docs = include_str!("../../docs/notifications.md");
+    for (path, text, needle) in [
+        ("docs/proxy_alerts.md", docs, "OptionalFailOpen"),
+        ("docs/proxy_alerts.md", docs, "ferrum-edge validate"),
+        ("docs/proxy_alerts.md", docs, "constructor-only"),
+        ("docs/plugins.md", plugins_docs, "OptionalFailOpen"),
+        (
+            "docs/notifications.md",
+            notifications_docs,
+            "case-insensitive",
+        ),
+        (
+            "docs/notifications.md",
+            notifications_docs,
+            "character ceiling",
+        ),
+    ] {
+        assert!(text.contains(needle), "{path} missing `{needle}`");
+    }
+
+    assert_eq!(
+        spec.pointer(
+            "/components/schemas/ProxyAlertsConfig/properties/max_concurrent_dispatches/maximum",
+        )
+        .and_then(serde_json::Value::as_u64),
+        Some(4_294_967_295)
+    );
+    let method_schema = spec
+        .pointer("/components/schemas/ProxyAlertsWebhookChannel/properties/method")
+        .expect("webhook method schema");
+    assert!(
+        method_schema.get("enum").is_none(),
+        "webhook method must not be an uppercase-only enum"
+    );
+    assert_eq!(
+        method_schema["pattern"],
+        json!("^[Pp][Oo][Ss][Tt]$|^[Pp][Uu][Tt]$|^[Pp][Aa][Tt][Cc][Hh]$")
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/ProxyAlertsEmailChannel/allOf")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(2),
+        "email channel must encode username/password pairing"
+    );
+
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ProxyAlertsConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .unwrap_or_else(|error| panic!("ProxyAlertsConfig schema compiles: {error}"));
+
+    let webhook = json!({
+        "type": "webhook",
+        "url": "http://127.0.0.1:54321/",
+        "body_template": "{}"
+    });
+    let mut method_post = webhook.clone();
+    method_post["method"] = json!("post");
+    let mut method_patch = webhook.clone();
+    method_patch["method"] = json!("pAtCh");
+    let mut empty_url = webhook.clone();
+    empty_url["url"] = json!("");
+    let mut ftp_url = webhook.clone();
+    ftp_url["url"] = json!("ftp://example.test/");
+    let mut empty_url_env = webhook.clone();
+    empty_url_env
+        .as_object_mut()
+        .expect("webhook object")
+        .remove("url");
+    empty_url_env["url_env"] = json!("");
+    let mut unbalanced = webhook.clone();
+    unbalanced["body_template"] = json!("${");
+
+    let email = json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    });
+    let mut email_username_only = email.clone();
+    email_username_only["username"] = json!("alerts");
+    let mut email_empty_subject = email.clone();
+    email_empty_subject["subject_template"] = json!("");
+    let mut email_empty_host = email.clone();
+    email_empty_host["smtp_host"] = json!("");
+    let mut email_dots = email.clone();
+    email_dots["from"] = json!("a..b@example.test");
+    let mut email_long_subject = email.clone();
+    email_long_subject["subject_template"] = json!("é".repeat(600));
+
+    let mut too_many_dispatches = proxy_alerts_channel_config(webhook.clone());
+    too_many_dispatches["max_concurrent_dispatches"] = json!(4_294_967_296_u64);
+    let mut retry_inversion = proxy_alerts_channel_config(webhook.clone());
+    retry_inversion["delivery_retry_base_ms"] = json!(2000);
+    retry_inversion["delivery_retry_max_ms"] = json!(100);
+
+    let cases: [(&str, serde_json::Value, bool, bool); 25] = [
+        (
+            "minimal webhook",
+            proxy_alerts_channel_config(webhook.clone()),
+            true,
+            true,
+        ),
+        (
+            "method post",
+            proxy_alerts_channel_config(method_post),
+            true,
+            true,
+        ),
+        (
+            "method pAtCh",
+            proxy_alerts_channel_config(method_patch),
+            true,
+            true,
+        ),
+        (
+            "slack",
+            proxy_alerts_channel_config(json!({
+                "type": "slack",
+                "webhook_url": "https://hooks.slack.com/services/x/y/z"
+            })),
+            true,
+            true,
+        ),
+        (
+            "teams",
+            proxy_alerts_channel_config(json!({
+                "type": "teams",
+                "webhook_url": "https://outlook.office.com/webhook/x"
+            })),
+            true,
+            true,
+        ),
+        (
+            "discord",
+            proxy_alerts_channel_config(json!({
+                "type": "discord",
+                "webhook_url": "https://discord.com/api/webhooks/x"
+            })),
+            true,
+            true,
+        ),
+        (
+            "email",
+            proxy_alerts_channel_config(email.clone()),
+            true,
+            true,
+        ),
+        (
+            "error_rate",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "latency_percentile",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "latency_percentile",
+                "metric": "backend_total_ms",
+                "percentile": 95,
+                "threshold_ms": 1500,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "error_class",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "error_class",
+                "classes": ["connection_refused"],
+                "threshold_count": 1,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "stream_disconnect_cause",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "stream_disconnect_cause",
+                "causes": ["backend_error"],
+                "threshold_count": 1,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "grpc_status_count",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "grpc_status_count",
+                "grpc_statuses": [14, "OTHER"],
+                "threshold_count": 1,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "grpc_status_rate",
+            proxy_alerts_rule_config(json!({
+                "name": "r",
+                "type": "grpc_status_rate",
+                "grpc_statuses": [14],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            })),
+            true,
+            true,
+        ),
+        (
+            "disabled draft",
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "webhook",
+                        "url": "http://127.0.0.1:54321/",
+                        "body_template": "{}"
+                    }
+                },
+                "rules": [
+                    { "enabled": false, "unknown_draft_field": true },
+                    {
+                        "name": "r",
+                        "type": "status_code_count",
+                        "status_codes": [500],
+                        "threshold_count": 1,
+                        "channels": ["ops"]
+                    }
+                ]
+            }),
+            true,
+            true,
+        ),
+        (
+            "empty url",
+            proxy_alerts_channel_config(empty_url),
+            false,
+            false,
+        ),
+        (
+            "ftp url",
+            proxy_alerts_channel_config(ftp_url),
+            false,
+            false,
+        ),
+        (
+            "empty url_env",
+            proxy_alerts_channel_config(empty_url_env),
+            false,
+            false,
+        ),
+        (
+            "email username without password",
+            proxy_alerts_channel_config(email_username_only),
+            false,
+            false,
+        ),
+        (
+            "empty subject_template",
+            proxy_alerts_channel_config(email_empty_subject),
+            false,
+            false,
+        ),
+        (
+            "empty smtp_host",
+            proxy_alerts_channel_config(email_empty_host),
+            false,
+            false,
+        ),
+        (
+            "repeated local-part dots",
+            proxy_alerts_channel_config(email_dots),
+            false,
+            false,
+        ),
+        (
+            "max_concurrent_dispatches exceeds u32",
+            too_many_dispatches,
+            false,
+            false,
+        ),
+        (
+            "unbalanced webhook placeholder",
+            proxy_alerts_channel_config(unbalanced),
+            true,
+            false,
+        ),
+        (
+            "email subject byte bound",
+            proxy_alerts_channel_config(email_long_subject),
+            true,
+            false,
+        ),
+        (
+            "delivery retry sibling comparison",
+            retry_inversion,
+            true,
+            false,
+        ),
+    ];
+
+    for (name, config, schema_ok, constructor_ok) in cases {
+        assert_proxy_alerts_schema_and_constructor(
+            &validator,
+            name,
+            &config,
+            schema_ok,
+            constructor_ok,
+        );
+    }
+}
+
 #[test]
 fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::ai_prompt_compressor::AiPromptCompressor;
@@ -7775,6 +11239,507 @@ async fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
     }
 }
 
+/// Table-driven component-versus-constructor contract for every admission rule
+/// the component can express (issue #5273).
+///
+/// The unknown-key test above proves the two key SETS agree; this one proves
+/// the two ADMISSION decisions agree for the type, null, enum, non-empty,
+/// conditional, numeric, and string-grammar constraints.
+///
+/// Descriptor-file dependencies are deliberately kept out: `grpc.descriptor_path`
+/// points at a path that does not exist, which the constructor treats as
+/// "enrollment retained, body excerpts omitted" rather than a config error, so
+/// these cases compare schema against shape and never against node-local file
+/// state.
+#[tokio::test]
+async fn ai_transcript_audit_schema_matches_runtime_admission_contract() {
+    use ferrum_edge::plugins::ai_transcript_audit::AiTranscriptAudit;
+    use ferrum_edge::plugins::utils::PluginHttpClient;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let http_client = PluginHttpClient::default();
+
+    // The minimum admissible sink, plus whatever a case overrides on it.
+    let sink = |extra: serde_json::Value| {
+        let overlay = extra.as_object().expect("sink overlay is an object");
+        let mut base = json!({"endpoint_url": "https://audit.example.com/ingest"});
+        for (key, value) in overlay {
+            base[key] = value.clone();
+        }
+        base
+    };
+    // A single-method gRPC enrollment whose descriptor is intentionally absent.
+    let grpc = |method: serde_json::Value| {
+        json!({
+            "descriptor_path": "/nonexistent/ferrum-ai-transcript-audit-descriptor.bin",
+            "methods": {"/test.Greeter/SayHello": method}
+        })
+    };
+    // 8 code points, 16 UTF-8 bytes: admitted under a byte-counted minimum,
+    // refused under the character-counted one the schema and the constructor
+    // now agree on.
+    let short_multibyte_secret = "\u{00e9}".repeat(8);
+
+    let cases: Vec<(&str, serde_json::Value, bool)> = vec![
+        // ---- null keeps the documented default for every fixed scalar ----
+        (
+            "mode null",
+            json!({
+                "mode": null,
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "capture.request null",
+            json!({
+                "capture": {"request": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "sink.on_sink_error null",
+            json!({
+                "sink": sink(json!({"on_sink_error": null}))
+            }),
+            true,
+        ),
+        (
+            "limits.max_entry_bytes null",
+            json!({
+                "limits": {"max_entry_bytes": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "privacy.path_mode null",
+            json!({
+                "privacy": {"path_mode": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "redaction.builtins null",
+            json!({
+                "redaction": {"builtins": null},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        // ---- null is a TYPE ERROR where the runtime has no default path ----
+        (
+            "sink null",
+            json!({
+                "sink": null
+            }),
+            false,
+        ),
+        (
+            "sink.batch_size null",
+            json!({
+                "sink": sink(json!({"batch_size": null}))
+            }),
+            false,
+        ),
+        (
+            "sink.custom_headers null",
+            json!({
+                "sink": sink(json!({"custom_headers": null}))
+            }),
+            false,
+        ),
+        (
+            "redaction.custom_patterns null",
+            json!({
+                "redaction": {"custom_patterns": null},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "grpc null",
+            json!({
+                "grpc": null,
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- capture.streaming_response accepts the string spellings ----
+        (
+            "streaming_response 'true'",
+            json!({
+                "capture": {"streaming_response": "true"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "streaming_response 'false'",
+            json!({
+                "capture": {"streaming_response": "false"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "streaming_response 'sampled'",
+            json!({
+                "capture": {"streaming_response": "sampled"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "streaming_response 'maybe'",
+            json!({
+                "capture": {"streaming_response": "maybe"},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- full_body needs the explicit unredacted-capture opt-in ----
+        (
+            "full_body without opt-in",
+            json!({
+                "mode": "full_body",
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "full_body with opt-in",
+            json!({
+                "mode": "full_body",
+                "allow_full_body": true,
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        // ---- at least one capture direction must stay enabled ----
+        (
+            "every capture direction off",
+            json!({
+                "capture": {
+                    "request": false,
+                    "response": false,
+                    "streaming_response": false
+                },
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "request+response off, streaming defaulted off",
+            json!({
+                "capture": {"request": false, "response": false},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "request+response off, streaming on",
+            json!({
+                "capture": {
+                    "request": false,
+                    "response": false,
+                    "streaming_response": true
+                },
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        // ---- an emptied pattern set is a silent pass-through redactor ----
+        (
+            "empty pattern set in redacted_body",
+            json!({
+                "redaction": {"builtins": []},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "empty pattern set in metadata_only",
+            json!({
+                "mode": "metadata_only",
+                "redaction": {"builtins": []},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "empty builtins with a custom pattern",
+            json!({
+                "redaction": {
+                    "builtins": [],
+                    "custom_patterns": [{"name": "ticket", "regex": "T-[0-9]+"}]
+                },
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "empty pattern set in hash_only",
+            json!({
+                "mode": "hash_only",
+                "redaction": {"builtins": []},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "empty pattern set in hash_only under path_mode redact",
+            json!({
+                "mode": "hash_only",
+                "redaction": {"builtins": []},
+                "privacy": {"path_mode": "redact"},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- the hash_secret minimum is counted in CHARACTERS ----
+        (
+            "hash_secret of 16 characters",
+            json!({
+                "redaction": {"hash_secret": "fleet-stable-key"},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "hash_secret of 8 characters / 16 bytes",
+            json!({
+                "redaction": {"hash_secret": short_multibyte_secret},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        // ---- numeric and string grammar ----
+        (
+            "max_records_per_minute at the u64 ceiling",
+            json!({
+                "sampling": {"max_records_per_minute": u64::MAX},
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "negative max_records_per_minute",
+            json!({
+                "sampling": {"max_records_per_minute": -1},
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "ftp collector scheme",
+            json!({
+                "sink": sink(json!({"endpoint_url": "ftp://audit.example.com/ingest"}))
+            }),
+            false,
+        ),
+        (
+            "uppercase https collector scheme",
+            json!({
+                "sink": sink(json!({"endpoint_url": "HTTPS://audit.example.com/ingest"}))
+            }),
+            true,
+        ),
+        (
+            "empty collector url",
+            json!({
+                "sink": sink(json!({"endpoint_url": ""}))
+            }),
+            false,
+        ),
+        // ---- gRPC method shape ----
+        (
+            "duplicate grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": ["name", "name"]
+                })),
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "distinct grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": ["name"]
+                })),
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "null grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": null
+                })),
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "empty grpc text_fields",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": []
+                })),
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "grpc method with only a null request_type",
+            json!({
+                "grpc": grpc(json!({"request_type": null})),
+                "sink": sink(json!({}))
+            }),
+            false,
+        ),
+        (
+            "grpc method with a null request_type and a real response_type",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": null,
+                    "response_type": "test.Reply"
+                })),
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+        (
+            "grpc max_messages null",
+            json!({
+                "grpc": {
+                    "descriptor_path": "/nonexistent/ferrum-descriptor.bin",
+                    "methods": {"/test.Greeter/SayHello": {"request_type": "test.Hello"}},
+                    "max_messages": null
+                },
+                "sink": sink(json!({}))
+            }),
+            true,
+        ),
+    ];
+
+    for (label, config, expected_valid) in cases {
+        assert_component_validity(&spec, "AiTranscriptAuditConfig", &config, expected_valid);
+        let runtime_valid = AiTranscriptAudit::new(&config, http_client.clone()).is_ok();
+        assert_eq!(
+            runtime_valid, expected_valid,
+            "runtime/schema admission drift for {label}: {config}"
+        );
+    }
+
+    // Checks ordinary JSON Schema cannot express. The component documents each
+    // of these as runtime-only; the contract here is that the schema stays
+    // permissive while the constructor still refuses, so a schema-driven editor
+    // never blocks a valid config and never claims one of these is admissible.
+    let runtime_only: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "max_entry_bytes below the worst-case serialized-record contract",
+            json!({
+                "limits": {"max_entry_bytes": 1},
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "buffer_max_bytes below the max_entry_bytes retained charge",
+            json!({
+                "limits": {"max_entry_bytes": 16777216, "buffer_max_bytes": 65536},
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "capture limits over the cross-field aggregate",
+            json!({
+                "limits": {
+                    "max_request_bytes": 1048576,
+                    "max_response_bytes": 1048576,
+                    "max_stream_capture_bytes": 1048576
+                },
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "custom pattern that is not a valid Rust regex",
+            json!({
+                "redaction": {"custom_patterns": [{"name": "bad", "regex": "([a-z"}]},
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "cleartext collector without the loopback opt-in",
+            json!({
+                "sink": sink(json!({"endpoint_url": "http://127.0.0.1:9000/ingest"}))
+            }),
+        ),
+        (
+            "cleartext non-loopback collector with the loopback opt-in",
+            json!({
+                "sink": sink(json!({
+                    "endpoint_url": "http://audit.example.com/ingest",
+                    "allow_insecure_loopback": true
+                }))
+            }),
+        ),
+        (
+            "collector url carrying userinfo credentials",
+            json!({
+                "sink": sink(json!({"endpoint_url": "https://u:p@audit.example.com/x"}))
+            }),
+        ),
+        (
+            "sink header template referencing the process environment",
+            json!({
+                "sink": sink(json!({"custom_headers": {"X-A": "${FERRUM_DB_URL}"}}))
+            }),
+        ),
+        (
+            "two grpc method keys that normalize to one path",
+            json!({
+                "grpc": {
+                    "descriptor_path": "/nonexistent/ferrum-descriptor.bin",
+                    "methods": {
+                        "/test.Greeter/SayHello": {"request_type": "test.Hello"},
+                        "test.Greeter/SayHello": {"request_type": "test.Hello"}
+                    }
+                },
+                "sink": sink(json!({}))
+            }),
+        ),
+        (
+            "grpc text_fields that differ only by segment whitespace",
+            json!({
+                "grpc": grpc(json!({
+                    "request_type": "test.Hello",
+                    "text_fields": ["outer.name", "outer . name"]
+                })),
+                "sink": sink(json!({}))
+            }),
+        ),
+    ];
+
+    for (label, config) in runtime_only {
+        assert_component_validity(&spec, "AiTranscriptAuditConfig", &config, true);
+        assert!(
+            AiTranscriptAudit::new(&config, http_client.clone()).is_err(),
+            "runtime must still refuse the documented runtime-only check {label}: {config}"
+        );
+    }
+}
+
 /// `grpc.max_message_bytes` / `grpc.max_messages` carry immutable deployment
 /// maxima. The decoded-byte scan budget bounds decoded payload, not frame
 /// count, so an unbounded `max_messages` would let a body of legal zero-length
@@ -7864,6 +11829,53 @@ fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
         validator.validate(&json!({"max_limt": 32})).is_err(),
         "schema must reject unknown adaptive_concurrency policy keys"
     );
+
+    for field in [
+        "max_tracked_keys",
+        "min_limit",
+        "initial_limit",
+        "max_limit",
+        "min_samples",
+        "increase_step",
+    ] {
+        assert_eq!(
+            schema["properties"][field]["maximum"],
+            json!(u64::MAX),
+            "{field} must publish the u64 maximum"
+        );
+        assert_eq!(schema["properties"][field]["format"], json!("uint64"));
+        let mut at_max = serde_json::Map::new();
+        at_max.insert(field.to_string(), json!(u64::MAX));
+        assert_component_validity(
+            &spec,
+            "AdaptiveConcurrencyConfig",
+            &serde_json::Value::Object(at_max),
+            true,
+        );
+        let above_json = format!(r#"{{"{field}": 18446744073709551616}}"#);
+        let above = serde_json::from_str(&above_json)
+            .unwrap_or_else(|error| panic!("{field} 2^64 JSON number parses: {error}"));
+        assert_component_validity(&spec, "AdaptiveConcurrencyConfig", &above, false);
+        let mut admitted = json!({
+            "min_limit": 1,
+            "initial_limit": 32,
+            "max_limit": 1024,
+            "max_tracked_keys": 10000,
+            "min_samples": 20,
+            "increase_step": 1
+        });
+        admitted[field] = json!(u64::MAX);
+        if matches!(field, "min_limit" | "initial_limit") {
+            admitted["initial_limit"] = json!(u64::MAX);
+            admitted["max_limit"] = json!(u64::MAX);
+        }
+        ferrum_edge::plugins::validate_plugin_config("adaptive_concurrency", &admitted)
+            .unwrap_or_else(|error| panic!("{field}=u64::MAX must be admitted: {error}"));
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("adaptive_concurrency", &above).is_err(),
+            "{field} above u64 must be rejected at runtime"
+        );
+    }
 }
 
 #[test]
@@ -8152,6 +12164,272 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         true,
     );
     MeshRouteDispatch::new(&status_only_redirect).expect("status-only redirects are runtime-valid");
+
+    // Component/runtime parity corpus (issue #5374): tagged match cardinality,
+    // accepted optional nulls, constructor normalization, destination /
+    // backend-TLS pairing, and numeric boundaries. Every entry must get the
+    // SAME verdict from the JSON Schema component and from the constructor.
+    fn parity_rule(patch: serde_json::Value) -> serde_json::Value {
+        let mut rule = json!({
+            "match": {"methods": ["GET"]},
+            "destination": {"backend_host": "api.internal", "backend_port": 8443}
+        });
+        if let (Some(base), Some(fields)) = (rule.as_object_mut(), patch.as_object()) {
+            for (key, value) in fields {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        json!({"rules": [rule]})
+    }
+
+    for (label, config, accepted) in [
+        (
+            "methods_no_operator",
+            parity_rule(json!({"match": {"methods": [{}]}})),
+            false,
+        ),
+        (
+            "methods_two_operators",
+            parity_rule(json!({"match": {"methods": [{"exact": "GET", "prefix": "G"}]}})),
+            false,
+        ),
+        (
+            "methods_empty_exact",
+            parity_rule(json!({"match": {"methods": [{"exact": ""}]}})),
+            false,
+        ),
+        (
+            "methods_space_in_exact",
+            parity_rule(json!({"match": {"methods": ["GET POST"]}})),
+            false,
+        ),
+        (
+            "methods_lowercase_exact",
+            parity_rule(json!({"match": {"methods": ["get"]}})),
+            true,
+        ),
+        (
+            "methods_extension_exact",
+            parity_rule(json!({"match": {"methods": [{"exact": "M-SEARCH"}]}})),
+            true,
+        ),
+        (
+            "methods_regex_is_not_a_token",
+            parity_rule(json!({"match": {"methods": [{"regex": "^GET POST$"}]}})),
+            true,
+        ),
+        (
+            "headers_no_operator",
+            parity_rule(json!({"match": {"headers": {"x-a": {}}}})),
+            false,
+        ),
+        (
+            "headers_invalid_name",
+            parity_rule(json!({"match": {"headers": {"x bad": "v"}}})),
+            false,
+        ),
+        (
+            "headers_empty_name",
+            parity_rule(json!({"match": {"headers": {"": "v"}}})),
+            false,
+        ),
+        (
+            "match_uri_null",
+            parity_rule(json!({"match": {"methods": ["GET"], "uri": null}})),
+            true,
+        ),
+        (
+            "match_authority_null",
+            parity_rule(json!({"match": {"methods": ["GET"], "authority": null}})),
+            true,
+        ),
+        (
+            "match_source_namespace_empty",
+            parity_rule(json!({"match": {"source_namespace": ""}})),
+            false,
+        ),
+        (
+            "match_ignore_uri_case_without_uri",
+            parity_rule(json!({"match": {"methods": ["GET"], "ignore_uri_case": true}})),
+            false,
+        ),
+        (
+            "rule_fault_null_is_accepted",
+            parity_rule(json!({"fault": null})),
+            true,
+        ),
+        (
+            "rule_rewrite_null_is_accepted",
+            parity_rule(json!({"rewrite": null})),
+            true,
+        ),
+        (
+            "rule_redirect_null_is_accepted",
+            parity_rule(json!({"redirect": null})),
+            true,
+        ),
+        (
+            "fault_delay_null_with_abort",
+            parity_rule(json!({"fault": {
+                "delay": null,
+                "abort": {"status_code": 503, "percentage": 1.0}
+            }})),
+            true,
+        ),
+        (
+            "fault_abort_grpc_status_null",
+            parity_rule(json!({"fault": {"abort": {
+                "status_code": 503,
+                "percentage": 1.0,
+                "grpc_status": null
+            }}})),
+            true,
+        ),
+        (
+            "destination_backend_port_overflow",
+            parity_rule(json!({"destination": {
+                "backend_host": "api.internal",
+                "backend_port": 65536
+            }})),
+            false,
+        ),
+        (
+            "destination_host_without_port",
+            parity_rule(json!({"destination": {"backend_host": "api.internal"}})),
+            false,
+        ),
+        (
+            "destination_port_without_host",
+            parity_rule(json!({"destination": {"backend_port": 8443}})),
+            false,
+        ),
+        (
+            "destination_upstream_with_direct_backend",
+            parity_rule(json!({"destination": {
+                "upstream_id": "api",
+                "backend_host": "api.internal",
+                "backend_port": 8443
+            }})),
+            false,
+        ),
+        (
+            "destination_empty",
+            parity_rule(json!({"destination": {}})),
+            false,
+        ),
+        (
+            "destination_backend_host_with_embedded_port",
+            parity_rule(json!({"destination": {
+                "backend_host": "api.internal:8443",
+                "backend_port": 8443
+            }})),
+            false,
+        ),
+        (
+            "destination_backend_host_bare_ipv6",
+            parity_rule(json!({"destination": {"backend_host": "::1", "backend_port": 8443}})),
+            true,
+        ),
+        (
+            "destination_backend_host_bracketed_ipv6",
+            parity_rule(json!({"destination": {
+                "backend_host": "[2001:db8::1]",
+                "backend_port": 8443
+            }})),
+            true,
+        ),
+        (
+            "backend_tls_client_cert_without_key",
+            parity_rule(json!({"destination": {
+                "backend_host": "api.internal",
+                "backend_port": 8443,
+                "backend_tls": {"client_cert_path": "/tls/client.pem"}
+            }})),
+            false,
+        ),
+        (
+            "backend_tls_without_direct_backend",
+            parity_rule(json!({"destination": {
+                "upstream_id": "api",
+                "backend_tls": {"sni": "api.internal"}
+            }})),
+            false,
+        ),
+        (
+            "timeout_ms_negative",
+            parity_rule(json!({"timeout_ms": -1})),
+            false,
+        ),
+        (
+            "timeout_ms_zero_is_no_timeout",
+            parity_rule(json!({"timeout_ms": 0})),
+            true,
+        ),
+        (
+            "retry_max_retries_over_bound",
+            parity_rule(json!({"retry": {"max_retries": 999}})),
+            false,
+        ),
+        (
+            "retry_status_code_below_bound",
+            parity_rule(json!({"retry": {"retryable_status_codes": [99]}})),
+            false,
+        ),
+        (
+            "retry_methods_lowercase_normalize",
+            parity_rule(json!({"retry": {"retryable_methods": ["get"]}})),
+            true,
+        ),
+        (
+            "retry_backoff_over_bound",
+            parity_rule(json!({"retry": {"backoff": {"fixed": {"delay_ms": 300_001}}}})),
+            false,
+        ),
+        (
+            "redirect_scheme_uppercase_normalize",
+            parity_rule(json!({"redirect": {"scheme": "HTTPS"}})),
+            true,
+        ),
+        (
+            "redirect_scheme_unsupported",
+            parity_rule(json!({"redirect": {"scheme": "ftp"}})),
+            false,
+        ),
+        (
+            "redirect_port_with_derive_port",
+            parity_rule(json!({"redirect": {
+                "port": 8443,
+                "derive_port": "FROM_REQUEST_PORT"
+            }})),
+            false,
+        ),
+        (
+            "minimal_redirect_rule",
+            json!({"rules": [{"redirect": {}}]}),
+            true,
+        ),
+        (
+            "empty_match_without_route_action",
+            json!({"rules": [{"destination": {"upstream_id": "api"}}]}),
+            false,
+        ),
+        (
+            "action_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "fault": {"abort": {"status_code": 503, "percentage": 100.0}}
+            }]}),
+            true,
+        ),
+    ] {
+        assert_component_validity(&spec, "MeshRouteDispatchConfig", &config, accepted);
+        assert_eq!(
+            MeshRouteDispatch::new(&config).is_ok(),
+            accepted,
+            "runtime disagreed with the component schema for {label}"
+        );
+    }
 }
 
 #[test]
@@ -8242,6 +12520,47 @@ fn delete_proxy_cleanup_orphaned_upstream_query_has_openapi_parity() {
     assert!(
         upstream_desc.contains("cleanup_orphaned_upstream=false"),
         "DELETE /upstreams/{{id}} must point at the proxy-delete opt-out: {upstream_desc}"
+    );
+}
+
+#[test]
+fn omitted_backend_scheme_https_default_has_openapi_and_docs_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let scheme_desc =
+        spec["components"]["schemas"]["Proxy"]["properties"]["backend_scheme"]["description"]
+            .as_str()
+            .expect("Proxy.backend_scheme description");
+    assert!(
+        scheme_desc.contains("defaults to `https` when omitted"),
+        "OpenAPI must document the HTTP-family https default: {scheme_desc}"
+    );
+    assert!(
+        scheme_desc.contains("Plaintext backends must set `backend_scheme: http`"),
+        "OpenAPI must tell operators how to reach plaintext backends: {scheme_desc}"
+    );
+
+    let created = spec["paths"]["/proxies"]["post"]["responses"]["201"]["description"]
+        .as_str()
+        .expect("POST /proxies 201 description");
+    assert!(
+        created.contains("defaults to `https` when omitted"),
+        "POST /proxies 201 must document the stored https default: {created}"
+    );
+
+    let create_desc = spec["components"]["schemas"]["ProxyCreate"]["description"]
+        .as_str()
+        .expect("ProxyCreate description");
+    assert!(
+        create_desc.contains("Plaintext backends must set `backend_scheme: http`"),
+        "ProxyCreate must document the plaintext-backend requirement: {create_desc}"
+    );
+
+    let admin_docs = include_str!("../../docs/admin_api.md");
+    assert!(
+        admin_docs.contains("Plaintext backends need `backend_scheme: http`"),
+        "docs/admin_api.md must note the plaintext-backend scheme next to POST /proxies"
     );
 }
 
@@ -8544,6 +12863,7 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
             "domain",
             "encryption_secret",
             "encryption_secret_previous",
+            "hide_session_cookie",
             "http_only",
             "idle_ttl_secs",
             "max_cookie_bytes",
@@ -8593,6 +12913,7 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
 fn transaction_debugger_schema_matches_closed_runtime_surface() {
     use ferrum_edge::plugins::transaction_debugger::{
         DEFAULT_BODY_CAPTURE_BYTES, MAX_BODY_CAPTURE_BYTES, TRANSACTION_DEBUGGER_CONFIG_KEYS,
+        TransactionDebugger,
     };
 
     let spec: serde_json::Value =
@@ -8627,10 +12948,26 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
     for field in ["log_request_body", "log_response_body"] {
         assert_eq!(schema["properties"][field]["default"], json!(false));
     }
+    let header_items = &schema["properties"]["redacted_headers"]["items"];
+    assert_eq!(header_items["minLength"], json!(1));
+    assert_eq!(
+        header_items["pattern"],
+        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+    );
     let body_field_items = &schema["properties"]["redacted_body_fields"]["items"];
     assert_eq!(body_field_items["minLength"], json!(1));
-    assert_eq!(body_field_items["maxLength"], json!(128));
-    assert_eq!(body_field_items["pattern"], json!("\\S"));
+    assert!(
+        body_field_items.get("maxLength").is_none() || body_field_items["maxLength"].is_null(),
+        "maxLength must not reject names that are 128 characters after trim"
+    );
+    assert_eq!(
+        body_field_items["pattern"],
+        json!("^\\s*\\S(?:[\\s\\S]{0,126}\\S)?\\s*$")
+    );
+    let admission_rules = schema["allOf"]
+        .as_array()
+        .expect("TransactionDebuggerConfig admission allOf");
+    assert_eq!(admission_rules.len(), 4);
 
     let description = schema["description"]
         .as_str()
@@ -8674,10 +13011,74 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         "over_capture_limit",
         "unknown_length",
         "typed request provenance",
+        "metadata: {mode: omit}",
+        "default unprojected",
     ] {
         assert!(
             plugin_docs.contains(contract),
             "docs/plugins.md missing transaction_debugger contract `{contract}`"
+        );
+    }
+    assert!(
+        !plugin_docs.contains("The plugin never dumps the complete metadata map."),
+        "docs must not claim schema diagnostics omit the metadata map"
+    );
+
+    // Instance-based schema/runtime parity for constructor admission.
+    let padded_body_field = format!(" {} ", "x".repeat(128));
+    for valid in [
+        json!({}),
+        json!({"redacted_headers": []}),
+        json!({"redacted_headers": ["x-internal-id"]}),
+        json!({"redacted_body_fields": []}),
+        json!({"schema": {}}),
+        json!({
+            "log_request_body": true,
+            "redacted_body_fields": ["demo"]
+        }),
+        json!({
+            "log_request_body": true,
+            "log_response_body": true,
+            "max_request_body_bytes": 256,
+            "max_response_body_bytes": 256
+        }),
+        json!({
+            "log_request_body": true,
+            "redacted_body_fields": [padded_body_field]
+        }),
+    ] {
+        assert_component_validity(&spec, "TransactionDebuggerConfig", &valid, true);
+        TransactionDebugger::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+    // Named-schema existence is config-graph validation, not this component.
+    assert_component_validity(
+        &spec,
+        "TransactionDebuggerConfig",
+        &json!({"schema_ref": "absent"}),
+        true,
+    );
+
+    for invalid in [
+        json!({"max_request_body_bytes": 256}),
+        json!({"log_response_body": false, "max_response_body_bytes": 256}),
+        json!({"redacted_body_fields": ["demo"]}),
+        json!({"redacted_headers": [""]}),
+        json!({"redacted_headers": ["invalid header"]}),
+        json!({"schema": {}, "schema_ref": "absent"}),
+        json!({"unknown": true}),
+        json!({"log_request_body": null}),
+        json!({"log_request_body": true, "max_request_body_bytes": 0}),
+        json!({"log_request_body": true, "max_request_body_bytes": 8193}),
+        json!({
+            "log_request_body": true,
+            "redacted_body_fields": ["x".repeat(129)]
+        }),
+    ] {
+        assert_component_validity(&spec, "TransactionDebuggerConfig", &invalid, false);
+        assert!(
+            TransactionDebugger::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
         );
     }
 }
@@ -8766,9 +13167,9 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
     }
 
     let plugin_config_desc = spec
-        .pointer("/components/schemas/PluginConfig/properties/config/description")
+        .pointer("/components/schemas/PluginConfigBase/properties/config/description")
         .and_then(|v| v.as_str())
-        .expect("PluginConfig.config description");
+        .expect("PluginConfigBase.config description");
     assert!(
         plugin_config_desc.contains("OptionalFailOpen"),
         "generic PluginConfig.config must document OptionalFailOpen omission"
@@ -8999,6 +13400,8 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
 
 #[test]
 fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
+    use ferrum_edge::plugins::security_headers::SecurityHeaders;
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let schema = spec
@@ -9055,6 +13458,64 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
     ] {
         assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
+
+    for valid in [
+        json!({}),
+        json!({"override_existing": null}),
+        json!({"hsts": {"max_age": null, "include_subdomains": null, "preload": null}}),
+        json!({"hsts": {"max_age": u64::MAX}}),
+    ] {
+        assert_component_validity(&spec, "SecurityHeadersConfig", &valid, true);
+        SecurityHeaders::new(&valid).unwrap_or_else(|error| {
+            panic!("schema-valid security_headers config {valid} failed runtime: {error}")
+        });
+    }
+
+    for invalid in [
+        json!({"set": {"Content-Length": "ordinary"}}),
+        json!({"set": {"Connection": "close"}}),
+        json!({"set": {"Keep-Alive": "timeout=5"}}),
+        json!({"set": {"Proxy-Authenticate": "Basic"}}),
+        json!({"set": {"Proxy-Connection": "close"}}),
+        json!({"set": {"TE": "trailers"}}),
+        json!({"set": {"Trailer": "X-Checksum"}}),
+        json!({"set": {"Transfer-Encoding": "chunked"}}),
+        json!({"set": {"Upgrade": "websocket"}}),
+        json!({
+            "content_type_options": false,
+            "frame_options": false,
+            "referrer_policy": false,
+            "remove": []
+        }),
+        json!({
+            "content_type_options": "",
+            "frame_options": "",
+            "referrer_policy": "",
+            "remove": null
+        }),
+    ] {
+        assert_component_validity(&spec, "SecurityHeadersConfig", &invalid, false);
+        assert!(
+            SecurityHeaders::new(&invalid).is_err(),
+            "schema-invalid security_headers config passed runtime: {invalid}"
+        );
+    }
+
+    assert_eq!(
+        schema["properties"]["hsts"]["oneOf"][3]["properties"]["max_age"]["maximum"],
+        json!(u64::MAX)
+    );
+    let above_hsts = serde_json::from_str(r#"{"hsts":{"max_age":18446744073709551616}}"#)
+        .expect("2^64 JSON number parses");
+    assert_component_validity(&spec, "SecurityHeadersConfig", &above_hsts, false);
+    assert!(
+        SecurityHeaders::new(&above_hsts).is_err(),
+        "hsts.max_age above u64 must be rejected at runtime"
+    );
+    assert!(
+        SecurityHeaders::new(&json!({"hsts": {"max_age": 1.0}})).is_err(),
+        "hsts.max_age JSON floats must be rejected at runtime"
+    );
 }
 
 #[test]
@@ -9217,6 +13678,28 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
         &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 86401}),
         false,
     );
+    assert_eq!(
+        schema["properties"]["max_connections_per_key"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": u64::MAX}),
+        true,
+    );
+    let above = serde_json::from_str(r#"{"max_connections_per_key": 18446744073709551616}"#)
+        .expect("2^64 JSON number parses");
+    assert_component_validity(&spec, "TcpConnectionThrottleConfig", &above, false);
+    ferrum_edge::plugins::validate_plugin_config(
+        "tcp_connection_throttle",
+        &json!({"max_connections_per_key": u64::MAX}),
+    )
+    .expect("u64::MAX connection limit must be admitted");
+    assert!(
+        ferrum_edge::plugins::validate_plugin_config("tcp_connection_throttle", &above).is_err(),
+        "connection limit above u64 must be rejected at runtime"
+    );
     for text in [schema_text.as_str(), plugin_docs, cache_docs] {
         assert!(
             text.contains("process-local"),
@@ -9251,6 +13734,9 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
 
 #[test]
 fn spec_expose_schema_matches_strict_runtime_null_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::spec_expose::SpecExpose;
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let schema = spec
@@ -9259,6 +13745,22 @@ fn spec_expose_schema_matches_strict_runtime_null_contract() {
 
     assert_eq!(schema["additionalProperties"], false);
     assert_eq!(schema["required"], json!(["spec_url"]));
+    assert_eq!(
+        schema["properties"]["spec_url"]["pattern"],
+        r"^\s*https?://[^/@?#]+(?:[/?#].*)?\s*$"
+    );
+    assert_eq!(
+        schema["properties"]["content_type"]["pattern"],
+        r"^[\u0009\u0020-\u007E]*[!-~][\u0009\u0020-\u007E]*$"
+    );
+    assert_eq!(
+        schema["properties"]["cache_ttl_seconds"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_eq!(
+        schema["properties"]["max_response_body_bytes"]["maximum"],
+        json!(u64::MAX)
+    );
     for (field, scalar_type) in [
         ("content_type", "string"),
         ("tls_no_verify", "boolean"),
@@ -9284,15 +13786,48 @@ fn spec_expose_schema_matches_strict_runtime_null_contract() {
         }),
         true,
     );
+    assert_component_validity(
+        &spec,
+        "SpecExposeConfig",
+        &json!({ "spec_url": " https://example.com/spec " }),
+        true,
+    );
+    SpecExpose::new(
+        &json!({ "spec_url": " https://example.com/spec " }),
+        PluginHttpClient::default(),
+    )
+    .expect("trimmed spec_url must remain accepted");
+
     for invalid in [
         json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verfy": true}),
         json!({"spec_url": "https://example.com/openapi.yaml", "content_type": 7}),
         json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verify": "false"}),
         json!({"spec_url": "https://example.com/openapi.yaml", "cache_ttl_seconds": -1}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "cache_ttl_seconds": 1e20}),
         json!({"spec_url": "https://example.com/openapi.yaml", "max_response_body_bytes": 0}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "max_response_body_bytes": 1e20}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "content_type": "   "}),
+        json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "content_type": "application/yaml\r\nx-bad: yes"
+        }),
+        json!({"spec_url": "ftp://example.com/openapi.yaml"}),
+        json!({"spec_url": "https:///openapi.yaml"}),
+        json!({"spec_url": "https://user:pass@example.com/openapi.yaml"}),
+        json!({"spec_url": "not a url"}),
     ] {
         assert_component_validity(&spec, "SpecExposeConfig", &invalid, false);
+        assert!(
+            SpecExpose::new(&invalid, PluginHttpClient::default()).is_err(),
+            "schema-invalid spec_expose config unexpectedly passed runtime: {invalid}"
+        );
     }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(plugin_docs.contains("must be nonempty after trim"));
+    assert!(plugin_docs.contains("Must be greater than zero"));
+    assert!(plugin_docs.contains("decoded to identity"));
+    assert!(plugin_docs.contains("reject-path `after_proxy`"));
 }
 
 #[test]
@@ -9416,6 +13951,98 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
 }
 
 #[test]
+fn fault_injection_schema_matches_runtime_contract() {
+    use ferrum_edge::plugins::fault_injection::FaultInjectionPlugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let scope_pattern = spec
+        .pointer(
+            "/components/schemas/FaultInjectionConfig/properties/runtime_overlay_scope/pattern",
+        )
+        .and_then(serde_json::Value::as_str)
+        .expect("runtime_overlay_scope pattern");
+    assert!(
+        scope_pattern.contains("\\u0085") || scope_pattern.contains('\u{0085}'),
+        "scope pattern must encode Rust White_Space including U+0085, got {scope_pattern}"
+    );
+    assert!(
+        !scope_pattern.contains("\\S"),
+        "scope pattern must not use ECMAScript \\S: {scope_pattern}"
+    );
+
+    let body_type = spec
+        .pointer("/components/schemas/FaultInjectionConfig/properties/abort/properties/body/type")
+        .expect("abort.body type");
+    assert!(
+        body_type.as_array().is_some_and(|types| {
+            types.iter().any(|value| value == "string") && types.iter().any(|value| value == "null")
+        }),
+        "abort.body must accept string or null, got {body_type}"
+    );
+
+    for valid in [
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": null}}),
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": ""}}),
+        json!({"abort": {"status_code": 503, "percentage": 100}}),
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": "fault injected"}}),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "checkout"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "\u{FEFF}"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": null
+        }),
+        serde_json::from_str(r#"{"abort":{"status_code":503.0,"percentage":100}}"#)
+            .expect("integral status"),
+        serde_json::from_str(r#"{"delay":{"duration_ms":80.0,"percentage":100}}"#)
+            .expect("integral duration"),
+        serde_json::from_str(
+            r#"{"abort":{"status_code":503,"percentage":100,"grpc_status":14.0}}"#,
+        )
+        .expect("integral grpc status"),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &valid, true);
+        FaultInjectionPlugin::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+
+    for invalid in [
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": 1}}),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "\u{0085}"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "\u{00A0}"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": " \t "
+        }),
+        serde_json::from_str(r#"{"abort":{"status_code":503.1,"percentage":100}}"#)
+            .expect("fractional status"),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &invalid, false);
+        assert!(
+            FaultInjectionPlugin::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("abort.body: null"));
+    assert!(guide.contains("application/json"));
+    assert!(guide.contains("text/plain"));
+}
+
+#[test]
 fn request_termination_schema_matches_strict_runtime_contract() {
     use ferrum_edge::plugins::request_termination::{
         REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
@@ -9464,6 +14091,23 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     let runtime_trigger: BTreeSet<_> = REQUEST_TERMINATION_TRIGGER_KEYS.iter().copied().collect();
     assert_eq!(trigger_fields, runtime_trigger);
 
+    let request_termination_branch = spec
+        .pointer("/components/schemas/PluginConfigBase/allOf/0/then/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("enabled PluginConfigBase allOf")
+        .iter()
+        .find(|entry| {
+            entry
+                .pointer("/if/properties/plugin_name/const")
+                .and_then(serde_json::Value::as_str)
+                == Some("request_termination")
+        })
+        .expect("request_termination PluginConfig branch");
+    assert_eq!(
+        request_termination_branch.pointer("/then/required"),
+        Some(&json!(["config"]))
+    );
+
     let status_desc = schema["properties"]["status_code"]["description"]
         .as_str()
         .unwrap_or_default();
@@ -9502,6 +14146,7 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         json!({}),
         json!({"status_code": 451, "message": "unavailable"}),
         json!({"status_code": 204}),
+        json!({"status_code": 204, "body": ""}),
         json!({"body": "", "message": "ignored"}),
         json!({
             "status_code": 403,
@@ -9519,6 +14164,14 @@ fn request_termination_schema_matches_strict_runtime_contract() {
             "content_type": "application/json",
             "message": "{invalid"
         }),
+        json!({"trigger": {"path_prefix": "*"}}),
+        json!({"trigger": {"path_prefix": "/"}}),
+        json!({
+            "content_type": "application/xml",
+            "body": "<ok/>",
+            "message": "\u{0001}"
+        }),
+        serde_json::from_str(r#"{"status_code":503.0}"#).expect("integral JSON number"),
     ] {
         assert_component_validity(&spec, "RequestTerminationConfig", &valid, true);
         RequestTermination::new(&valid)
@@ -9535,11 +14188,20 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         json!({"status_code": 700}),
         json!({"status_code": null}),
         json!({"content_type": null}),
+        json!({"content_type": ""}),
+        json!({"content_type": "   "}),
         json!({"body": null}),
         json!({"message": null}),
         json!({"trigger": null}),
         json!({"trigger": {"path_prefix": null}}),
+        json!({"trigger": {"path_prefix": ""}}),
+        json!({"trigger": {"path_prefix": "admin"}}),
+        json!({"trigger": {"path_prefix": "/a?b"}}),
+        json!({"trigger": {"path_prefix": "/admin "}}),
+        json!({"trigger": {"path_prefix": "/a/../b"}}),
         json!({"trigger": {"header": null}}),
+        json!({"trigger": {"header": ""}}),
+        json!({"trigger": {"header": "invalid name"}}),
         json!({"trigger": {"header": "x-policy", "header_value": null}}),
         json!({"trigger": {}}),
         json!({"trigger": {"path_prefix": "/a", "header": "x-policy"}}),
@@ -9547,22 +14209,13 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         json!({"trigger": {"header_value": "1"}}),
         json!({"trigger": {"path_prefix": "/a", "extra": true}}),
         json!({"unknown": true}),
+        json!({"status_code": 204, "body": "x"}),
+        json!({"content_type": "application/xml", "message": "\u{0001}"}),
     ] {
         assert_component_validity(&spec, "RequestTerminationConfig", &invalid, false);
         assert!(
             RequestTermination::new(&invalid).is_err(),
             "schema-invalid config unexpectedly passed runtime: {invalid}"
-        );
-    }
-
-    // Runtime contracts deliberately left to construction-time validation.
-    for runtime_only in [
-        json!({"status_code": 204, "body": "x"}),
-        json!({"content_type": "application/xml", "message": "\u{0001}"}),
-    ] {
-        assert!(
-            RequestTermination::new(&runtime_only).is_err(),
-            "runtime must reject {runtime_only}"
         );
     }
 
@@ -9577,6 +14230,9 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("unambiguous JSON value"));
     assert!(guide.contains("fail safe into that envelope"));
     assert!(guide.contains(r#"message: '{"error":"scheduled-maintenance"}'"#));
+    assert!(guide.contains("trailers-only"));
+    assert!(guide.contains("INTERNAL"));
+    assert!(guide.contains("query delimiter"));
 }
 
 #[test]
@@ -9613,15 +14269,46 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         schema["properties"]["max_total_size_bytes"]["minimum"],
         json!(1)
     );
-    // ttl_seconds intentionally has no minimum: the runtime accepts 0.
-    assert!(schema["properties"]["ttl_seconds"]["minimum"].is_null());
+    // Issue #5144: `format: uint64` asserts no bound under Draft 2020-12, so
+    // every unsigned field carries its explicit range. ttl_seconds keeps a zero
+    // minimum because the runtime accepts 0.
+    assert_eq!(schema["properties"]["ttl_seconds"]["minimum"], json!(0));
+    assert_eq!(
+        schema["properties"]["ttl_seconds"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_eq!(
+        schema["properties"]["max_entries"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_eq!(
+        schema["properties"]["max_entry_size_bytes"]["maximum"],
+        json!(u64::MAX)
+    );
+    assert_eq!(
+        schema["properties"]["max_total_size_bytes"]["maximum"],
+        json!(u64::MAX)
+    );
     assert_eq!(
         schema["properties"]["cacheable_methods"]["minItems"],
         json!(1)
     );
+    // Issue #5144: the runtime admits only case-insensitive GET/HEAD, not every
+    // RFC 9110 method token.
     assert_eq!(
         schema["properties"]["cacheable_methods"]["items"]["pattern"],
-        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+        json!("^([Gg][Ee][Tt]|[Hh][Ee][Aa][Dd])$")
+    );
+    // Issue #5144: `anonymous_caller_scope` is trimmed and ASCII-lowercased,
+    // and `caller-address` is an accepted alias, so a canonical-only enum
+    // rejected values the constructor admits.
+    assert!(
+        schema["properties"]["anonymous_caller_scope"]["enum"].is_null(),
+        "a canonical-only enum cannot describe the normalized scope domain"
+    );
+    assert!(
+        schema["properties"]["anonymous_caller_scope"]["pattern"].is_string(),
+        "anonymous_caller_scope must publish its accepted spellings"
     );
     assert_eq!(
         schema["properties"]["cacheable_status_codes"]["minItems"],
@@ -9679,8 +14366,15 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"ttl_seconds": 0}),
         // Positive capacity boundary values.
         json!({"max_entries": 1, "max_entry_size_bytes": 1, "max_total_size_bytes": 1}),
-        // Extension-method casing is accepted and uppercased by the runtime.
+        // Method casing is accepted and uppercased by the runtime.
         json!({"cacheable_methods": ["get"]}),
+        json!({"cacheable_methods": ["Head"]}),
+        // Issue #5144: the normalized/alias scope spellings the constructor
+        // admits must validate too.
+        json!({"anonymous_caller_scope": "caller_address"}),
+        json!({"anonymous_caller_scope": "caller-address"}),
+        json!({"anonymous_caller_scope": " SHARED "}),
+        json!({"anonymous_caller_scope": "Shared"}),
         // Status-code boundary values (1xx / 206 / 304 are excluded below).
         json!({"cacheable_status_codes": [200, 599]}),
         // An explicitly empty Vary list is accepted (no extra key dimensions).
@@ -9748,6 +14442,20 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"cacheable_status_codes": [200, 206]}),
         json!({"vary_by_headers": [""]}),
         json!({"vary_by_headers": ["bad header"]}),
+        // Issue #5144: body-bearing and non-retrieval methods are refused by
+        // the constructor and must fail the schema too.
+        json!({"cacheable_methods": ["POST"]}),
+        json!({"cacheable_methods": ["OPTIONS"]}),
+        json!({"cacheable_methods": ["GET", "POST"]}),
+        // Negative and out-of-u64 unsigned scalars.
+        json!({"ttl_seconds": -1}),
+        json!({"max_entries": -1}),
+        json!({"max_entry_size_bytes": -1}),
+        json!({"max_total_size_bytes": -1}),
+        // An unknown scope spelling stays refused by both.
+        json!({"anonymous_caller_scope": "caller address"}),
+        json!({"anonymous_caller_scope": "callerAddress"}),
+        json!({"anonymous_caller_scope": ""}),
     ] {
         assert_component_validity(&spec, "ResponseCachingConfig", &invalid, false);
         assert!(
@@ -9757,6 +14465,30 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         assert!(
             validate_plugin_config("response_caching", &invalid).is_err(),
             "shared admission accepted OpenAPI-invalid response_caching config: {invalid}"
+        );
+    }
+
+    // Issue #5144: an unsigned value beyond u64 cannot be written with `json!`,
+    // so it is parsed from its literal wire form. JSON numbers that large are
+    // carried as doubles, so the case is taken a full binade past u64::MAX
+    // rather than at 2^64, where the two are indistinguishable in double
+    // precision.
+    for literal in [
+        r#"{"ttl_seconds": 36893488147419103232}"#,
+        r#"{"max_entries": 36893488147419103232}"#,
+        r#"{"max_entry_size_bytes": 36893488147419103232}"#,
+        r#"{"max_total_size_bytes": 36893488147419103232}"#,
+    ] {
+        let invalid: serde_json::Value =
+            serde_json::from_str(literal).expect("oversized unsigned literal parses");
+        assert_component_validity(&spec, "ResponseCachingConfig", &invalid, false);
+        assert!(
+            ResponseCaching::new(&invalid).is_err(),
+            "runtime accepted an out-of-u64 response_caching value: {literal}"
+        );
+        assert!(
+            validate_plugin_config("response_caching", &invalid).is_err(),
+            "shared admission accepted an out-of-u64 response_caching value: {literal}"
         );
     }
 
@@ -9838,11 +14570,53 @@ fn response_mock_schema_matches_strict_runtime_contract() {
 
     assert_eq!(rule["properties"]["path"]["minLength"], 1);
     assert_eq!(rule["properties"]["method"]["minLength"], 1);
-    assert_eq!(rule["properties"]["status_code"]["minimum"], 100);
-    assert_eq!(rule["properties"]["status_code"]["maximum"], 599);
+    assert_eq!(
+        rule["properties"]["method"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["method"]["pattern"],
+        "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    );
+    let status_one_of = rule["properties"]["status_code"]["oneOf"]
+        .as_array()
+        .expect("status_code oneOf");
+    assert_eq!(status_one_of.len(), 3);
+    assert_eq!(status_one_of[0]["type"], "null");
+    assert_eq!(status_one_of[1]["const"], 101);
+    assert_eq!(status_one_of[2]["minimum"], 200);
+    assert_eq!(status_one_of[2]["maximum"], 599);
+    assert_eq!(
+        rule["properties"]["headers"]["type"],
+        json!(["object", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["headers"]["propertyNames"]["pattern"],
+        "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    );
+    assert!(
+        rule["properties"]["headers"]["propertyNames"]["not"]["pattern"]
+            .as_str()
+            .expect("protocol-managed header exclusion")
+            .contains("[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]")
+    );
     assert_eq!(
         rule["properties"]["headers"]["additionalProperties"]["type"],
         "string"
+    );
+    assert_eq!(
+        rule["properties"]["body"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        rule["properties"]["delay_ms"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(rule["properties"]["delay_ms"]["minimum"], 0);
+    assert_eq!(rule["properties"]["delay_ms"]["maximum"], 3600000);
+    assert_eq!(
+        schema["properties"]["passthrough_on_no_match"]["type"],
+        json!(["boolean", "null"])
     );
 
     let description = schema["description"].as_str().expect("description");
@@ -9912,6 +14686,17 @@ fn response_mock_schema_matches_strict_runtime_contract() {
             }]
         }),
         json!({
+            "passthrough_on_no_match": null,
+            "rules": [{
+                "method": null,
+                "path": "/",
+                "status_code": null,
+                "headers": null,
+                "body": null,
+                "delay_ms": null
+            }]
+        }),
+        json!({
             "rules": [{
                 "path": "/api/v1",
                 "status_code": 599,
@@ -9925,6 +14710,7 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "body": "must-not-be-sent"
             }]
         }),
+        json!({"rules": [{"path": "/", "delay_ms": 3600000}]}),
     ] {
         assert_component_validity(&spec, "ResponseMockConfig", &valid, true);
         assert!(
@@ -9943,10 +14729,14 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         }),
         json!({"rules": [{"path": "", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "method": "", "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "method": "BAD METHOD", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 99, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 100, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 103, "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 199, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 600, "body": "ok"}]}),
+        json!({"rules": [{"path": "/", "delay_ms": -1}]}),
+        json!({"rules": [{"path": "/", "delay_ms": 3600001}]}),
         json!({"rules": [{"body": "missing-path"}]}),
         json!({"rules": []}),
         json!({}),
@@ -9956,24 +14746,22 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "headers": {"x-mock": 42}
             }]
         }),
+        json!({
+            "rules": [{
+                "path": "/",
+                "headers": {"Content-Length": "3"}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "path": "/",
+                "headers": {"connection": "close"}
+            }]
+        }),
     ] {
-        // OpenAPI keeps minimum 100 / maximum 599; runtime rejects unsupported
-        // informational statuses (100, 102–199) as the authoritative boundary.
-        let runtime_err = ResponseMock::new(&invalid).is_err();
-        if invalid
-            .pointer("/rules/0/status_code")
-            .and_then(|v| v.as_u64())
-            .is_some_and(|code| matches!(code, 100 | 103))
-        {
-            assert!(
-                runtime_err,
-                "informational status must fail runtime: {invalid}"
-            );
-            continue;
-        }
         assert_component_validity(&spec, "ResponseMockConfig", &invalid, false);
         assert!(
-            runtime_err,
+            ResponseMock::new(&invalid).is_err(),
             "schema-invalid config unexpectedly passed runtime: {invalid}"
         );
     }
@@ -9984,10 +14772,22 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("WebSocket handshake contract"));
     assert!(guide.contains("never establishes an upgraded frame stream"));
     assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
+    assert!(guide.contains("Omitted or explicit `null`"));
+    assert!(guide.contains("0`–`3600000"));
     assert!(guide.contains("Status / body wire semantics"));
     assert!(guide.contains("informational statuses"));
     assert!(guide.contains("Native gRPC exclusion"));
     assert!(guide.contains("native gRPC unsupported"));
+
+    let features = include_str!("../../FEATURES.md");
+    assert!(
+        features.contains("relative only for prefix"),
+        "FEATURES.md must qualify prefix-only relative mock paths"
+    );
+    assert!(
+        features.contains("host-only"),
+        "FEATURES.md must mention host-only full-path matching"
+    );
 
     let matrix = include_str!("../../docs/plugin_execution_order.md");
     assert!(
@@ -10382,27 +15182,28 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
 
     let provider_schema =
         spec["components"]["schemas"]["AiRateLimiterConfig"]["properties"]["provider"].clone();
-    let enum_values: Vec<String> = provider_schema["enum"]
-        .as_array()
-        .expect("provider enum must be present")
-        .iter()
-        .map(|v| v.as_str().expect("enum entry is string").to_string())
-        .collect();
-    assert_eq!(
-        enum_values,
-        vec![
-            "auto",
-            "openai",
-            "anthropic",
-            "google",
-            "cohere",
-            "mistral",
-            "bedrock",
-            "tgi"
-        ],
-        "provider enum must match the runtime accepted set"
+    // Issue #5317: the constructor trims Unicode whitespace and lower-cases the
+    // value, which an `enum` cannot express — it rejected normalized spellings
+    // the gateway admits. The accepted-spelling pattern replaces it.
+    assert!(
+        provider_schema.get("enum").is_none(),
+        "provider must publish an accepted-spelling pattern, not a canonical-only enum"
+    );
+    assert!(
+        provider_schema["pattern"].is_string(),
+        "provider must publish an accepted-spelling pattern"
     );
 
+    let enum_values = [
+        "auto",
+        "openai",
+        "anthropic",
+        "google",
+        "cohere",
+        "mistral",
+        "bedrock",
+        "tgi",
+    ];
     for supported in &enum_values {
         let config = json!({ "token_limit": 100000, "provider": supported });
         assert!(
@@ -10413,7 +15214,26 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
             .unwrap_or_else(|err| panic!("runtime must accept provider '{supported}': {err}"));
     }
 
-    for rejected in &["gemini", "vertex", "openai_compatible", "gpt", ""] {
+    // Normalized spellings the constructor admits must validate too.
+    for normalized in &[" OPENAI ", "OpenAi", "\tTgi\n", "  bedrock"] {
+        let config = json!({ "token_limit": 100000, "provider": normalized });
+        assert!(
+            validator.validate(&config).is_ok(),
+            "normalized provider '{normalized}' should be accepted by the schema"
+        );
+        AiRateLimiter::new(&config, PluginHttpClient::default())
+            .unwrap_or_else(|err| panic!("runtime must accept provider '{normalized}': {err}"));
+    }
+
+    for rejected in &[
+        "gemini",
+        "vertex",
+        "openai_compatible",
+        "gpt",
+        "",
+        " ",
+        "open ai",
+    ] {
         let config = json!({ "token_limit": 100000, "provider": rejected });
         assert!(
             validator.validate(&config).is_err(),
@@ -10509,6 +15329,109 @@ fn body_validator_schema_is_closed_and_matches_the_runtime_key_set() {
         schema["properties"]["json_schema_draft"]["enum"],
         json!(["draft2020-12", "draft7"])
     );
+}
+
+/// Issue #5122: the published `BodyValidatorConfig` schema must accept exactly
+/// the configurations the runtime constructor admits.
+///
+/// Two node-local dependencies stay runtime-only and are deliberately not
+/// represented statically: the descriptor file must exist, and every configured
+/// message type must resolve inside it. Everything else — rule presence,
+/// non-empty schemas/strings/map entries, unsigned bounds, media-type and
+/// Clark-notation shape, and gRPC method-path selectors — is asserted in both
+/// directions so a generated client cannot build a configuration the gateway
+/// then refuses.
+#[test]
+fn body_validator_schema_admits_exactly_what_the_constructor_admits() {
+    use ferrum_edge::plugins::body_validator::BodyValidator;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for config in [
+        // No validation rule at all.
+        json!({}),
+        json!({"validate_xml": false}),
+        json!({"response_validate_xml": false}),
+        json!({"required_fields": []}),
+        // Present but unusable rule values.
+        json!({"json_schema": {}}),
+        json!({"response_json_schema": {}}),
+        json!({"required_fields": [""]}),
+        json!({"response_required_fields": [""]}),
+        json!({"required_xml_elements": ["two words"]}),
+        json!({"required_xml_elements": ["{unclosed"]}),
+        json!({"response_required_xml_elements": ["two words"]}),
+        // Out-of-domain integers.
+        json!({"validate_xml": true, "xml_max_entities": -1}),
+        json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": -1}),
+        // Malformed media types.
+        json!({"validate_xml": true, "content_types": ["application"]}),
+        json!({"validate_xml": true, "content_types": [""]}),
+        json!({"validate_xml": true, "response_content_types": ["json"]}),
+        // Protobuf cross-field shape.
+        json!({"protobuf_request_type": "audit.Message"}),
+        json!({"protobuf_response_type": "audit.Message"}),
+        json!({"protobuf_descriptor_path": ""}),
+        json!({"protobuf_descriptor_path": "/srv/audit.bin"}),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {}
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {"/audit.Service/Echo": {}}
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {
+                "audit.Service/Echo": {"request": "audit.Message"}
+            }
+        }),
+    ] {
+        assert!(
+            BodyValidator::validate_config(&config).is_err(),
+            "runtime admission must reject {config}"
+        );
+        assert_component_validity(&spec, "BodyValidatorConfig", &config, false);
+    }
+
+    for config in [
+        json!({"validate_xml": true}),
+        json!({"response_validate_xml": true}),
+        json!({"required_fields": ["name"]}),
+        json!({"response_required_fields": ["id"]}),
+        json!({"json_schema": {"type": "object"}}),
+        json!({"response_json_schema": {"type": "object"}}),
+        json!({"required_xml_elements": ["item", "{}item"]}),
+        json!({"response_required_xml_elements": ["{urn:x}item"]}),
+        // An empty media list means "every valid media type", and an explicit
+        // zero cap disables the decompressed ceiling; both must survive.
+        json!({"validate_xml": true, "content_types": []}),
+        json!({"validate_xml": true, "xml_max_entities": 0}),
+        json!({
+            "validate_xml": true,
+            "content_types": ["application/json; charset=utf-8"]
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_request_type": "audit.Message"
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_response_type": "audit.Message"
+        }),
+        json!({
+            "protobuf_descriptor_path": "/srv/audit.bin",
+            "protobuf_method_messages": {
+                "/audit.Service/Echo": {"request": "audit.Message"}
+            }
+        }),
+    ] {
+        BodyValidator::validate_config(&config)
+            .unwrap_or_else(|error| panic!("runtime must accept {config}: {error}"));
+        assert_component_validity(&spec, "BodyValidatorConfig", &config, true);
+    }
 }
 
 /// Advisory GHSA-8594-2xhc-8g38: the observability sinks whose endpoint may
@@ -10842,4 +15765,1995 @@ fn mesh_plugin_config_roots_are_closed_and_match_openapi() {
         let runtime_fields: BTreeSet<&str> = runtime_keys.iter().copied().collect();
         assert_eq!(schema_fields, runtime_fields, "{schema_name} key drift");
     }
+}
+
+/// Issues #5380–#5383: `__mesh_bpf_metrics` OpenAPI and docs must match
+/// constructor admission. The constructor is the source of truth.
+#[test]
+fn mesh_bpf_metrics_schema_matches_constructor_admission() {
+    use ferrum_edge::plugins::mesh::bpf_metrics::{
+        DEFAULT_METRIC_PREFIX, MESH_BPF_METRICS_CONFIG_KEYS, MeshBpfMetrics,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/MeshBpfMetricsConfig")
+        .expect("MeshBpfMetricsConfig component exists");
+    let description = schema["description"]
+        .as_str()
+        .expect("MeshBpfMetricsConfig description");
+    for contract in [
+        "OptionalFailOpen",
+        "scope: global",
+        "ferrum_mesh_bpf",
+        "Non-object configs",
+        "trimmed",
+    ] {
+        assert!(
+            description.contains(contract),
+            "MeshBpfMetricsConfig description missing `{contract}`"
+        );
+    }
+
+    assert_eq!(
+        schema["type"],
+        json!(["object", "null", "string", "array", "number", "boolean"])
+    );
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["prefix"]["pattern"],
+        json!(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*$")
+    );
+    assert_eq!(
+        schema["properties"]["prefix"]["default"],
+        json!(DEFAULT_METRIC_PREFIX)
+    );
+    assert_eq!(MESH_BPF_METRICS_CONFIG_KEYS, ["prefix"].as_slice());
+
+    let bpf_branch = spec
+        .pointer("/components/schemas/PluginConfigBase/allOf/0/then/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("enabled PluginConfigBase allOf")
+        .iter()
+        .find(|entry| {
+            entry
+                .pointer("/if/properties/plugin_name/const")
+                .and_then(serde_json::Value::as_str)
+                == Some("__mesh_bpf_metrics")
+        })
+        .expect("__mesh_bpf_metrics PluginConfig branch");
+    assert_eq!(
+        bpf_branch.pointer("/then/properties/scope/const"),
+        Some(&json!("global"))
+    );
+
+    let component_cases = [
+        (json!({}), true),
+        (json!({"prefix": "tenantA_bpf"}), true),
+        (json!({"prefix": " tenantA_bpf "}), true),
+        (json!({"prefix": "\ttenantB_bpf\n"}), true),
+        (json!({"prefix": "_leading_underscore"}), true),
+        (serde_json::Value::Null, true),
+        (json!("ignored"), true),
+        (json!([]), true),
+        (json!(7), true),
+        (json!(false), true),
+        (json!({"prefix": ""}), false),
+        (json!({"prefix": "  "}), false),
+        (json!({"prefix": "1tenant_bpf"}), false),
+        (json!({"prefix": "with spaces"}), false),
+        (json!({"prefix": "tenant-A"}), false),
+        (json!({"prefix": "tenantA.bpf"}), false),
+        (json!({"prefix": 7}), false),
+        (json!({"prefix": null}), false),
+        (json!({"prefix": ["tenantA_bpf"]}), false),
+        (json!({"prefx": "tenantA_bpf"}), false),
+        (json!({"prefix": "tenantA_bpf", "extra": true}), false),
+    ];
+    for (config, expected_valid) in component_cases {
+        assert_component_validity(&spec, "MeshBpfMetricsConfig", &config, expected_valid);
+        let constructed = MeshBpfMetrics::new(&config);
+        assert_eq!(
+            constructed.is_ok(),
+            expected_valid,
+            "constructor disagrees with MeshBpfMetricsConfig for {config}: {:?}",
+            constructed.err()
+        );
+    }
+
+    let wrapper_cases = [
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefix": "tenantA_bpf"}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefix": " tenantA_bpf "}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "proxy",
+                "enabled": true,
+                "proxy_id": "http",
+                "config": {}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "proxy_group",
+                "enabled": true,
+                "config": {}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "proxy",
+                "enabled": false,
+                "proxy_id": "http",
+                "config": {}
+            }),
+            true,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefx": "x"}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": {"prefix": "  "}
+            }),
+            false,
+        ),
+        (
+            json!({
+                "plugin_name": "__mesh_bpf_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": null
+            }),
+            true,
+        ),
+    ];
+    for (instance, expected_valid) in wrapper_cases {
+        assert_component_validity(&spec, "PluginConfig", &instance, expected_valid);
+    }
+
+    // POST's omitted enabled field defaults to true, so the global-scope
+    // restriction must run through the shared construction gate as well.
+    let mut post_defaults = json!({
+        "plugin_name": "__mesh_bpf_metrics",
+        "scope": "global",
+        "config": null
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &post_defaults, true);
+    post_defaults["scope"] = json!("proxy_group");
+    assert_component_validity(&spec, "PluginConfigCreate", &post_defaults, false);
+
+    let plugins_docs = include_str!("../../docs/plugins.md");
+    let section = plugins_docs
+        .split("### `__mesh_bpf_metrics`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("__mesh_bpf_metrics docs section");
+    for needle in [
+        "| `prefix` | String | `ferrum_mesh_bpf` |",
+        "`str::trim`",
+        "[A-Za-z_][A-Za-z0-9_]*",
+        "OptionalFailOpen",
+        "scope: global",
+        "prefix: tenantA_bpf",
+        "no declared length limit",
+    ] {
+        assert!(
+            section.contains(needle),
+            "docs/plugins.md __mesh_bpf_metrics section missing `{needle}`"
+        );
+    }
+
+    let mesh_docs = include_str!("../../docs/mesh.md");
+    for needle in [
+        "capped exponential backoff",
+        "1s, 2s, 4s, 8s, 16s, and 30s",
+        "does not stop the consumer",
+        "never start the consumer task",
+        "`str::trim`",
+        "[A-Za-z_][A-Za-z0-9_]*",
+        "default `ferrum_mesh_bpf`",
+    ] {
+        assert!(
+            mesh_docs.contains(needle),
+            "docs/mesh.md missing `{needle}`"
+        );
+    }
+    assert!(
+        !mesh_docs.contains("the consumer logs one info line at startup and exits"),
+        "docs/mesh.md must not claim a missing pin stops the consumer"
+    );
+}
+
+/// Issues #5111–#5115: size-limiting plugin configs are closed objects whose
+/// integer size fields advertise an enforceable uint64 maximum. `format: uint64`
+/// alone does not constrain Draft 2020-12 validators.
+#[test]
+fn size_limiting_plugin_configs_are_closed_and_bounded_in_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let uint64_max = json!(u64::MAX);
+    for (schema_name, runtime_keys, size_fields) in [
+        (
+            "RequestSizeLimitingConfig",
+            &["max_bytes"][..],
+            &["max_bytes"][..],
+        ),
+        (
+            "ResponseSizeLimitingConfig",
+            &["max_bytes", "require_buffered_check"][..],
+            &["max_bytes"][..],
+        ),
+        (
+            "WsMessageSizeLimitingConfig",
+            &["close_reason", "max_frame_bytes", "max_message_bytes"][..],
+            &["max_frame_bytes", "max_message_bytes"][..],
+        ),
+    ] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "{schema_name} must reject unknown properties"
+        );
+
+        let schema_fields: BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{schema_name} properties"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let runtime_fields: BTreeSet<&str> = runtime_keys.iter().copied().collect();
+        assert_eq!(schema_fields, runtime_fields, "{schema_name} key drift");
+
+        for field in size_fields {
+            assert_eq!(
+                schema["properties"][field]["minimum"],
+                json!(1),
+                "{schema_name}.{field} must be a positive integer"
+            );
+            assert_eq!(
+                schema["properties"][field]["maximum"], uint64_max,
+                "{schema_name}.{field} must advertise the uint64 upper bound"
+            );
+            assert_eq!(
+                schema["properties"][field]["format"],
+                json!("uint64"),
+                "{schema_name}.{field} stays uint64"
+            );
+        }
+
+        let mut component_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": format!("#/components/schemas/{schema_name}")
+        });
+        component_schema
+            .as_object_mut()
+            .expect("schema should be object")
+            .insert("components".to_string(), spec["components"].clone());
+        let component_validator = jsonschema::draft202012::options()
+            .build(&component_schema)
+            .unwrap_or_else(|error| panic!("{schema_name} schema compiles: {error}"));
+
+        let minimal = match schema_name {
+            "RequestSizeLimitingConfig" | "ResponseSizeLimitingConfig" => {
+                json!({"max_bytes": 1})
+            }
+            "WsMessageSizeLimitingConfig" => json!({"max_frame_bytes": 1}),
+            _ => unreachable!(),
+        };
+        assert!(
+            component_validator.validate(&minimal).is_ok(),
+            "{schema_name} must accept the documented minimal config: {minimal}"
+        );
+
+        let mut unknown = minimal.clone();
+        unknown
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert("max_bytez".to_string(), json!(64));
+        assert!(
+            component_validator.validate(&unknown).is_err(),
+            "{schema_name} must reject an unknown key: {unknown}"
+        );
+
+        let at_max = {
+            let mut at_max = minimal.clone();
+            for field in size_fields {
+                at_max
+                    .as_object_mut()
+                    .expect("minimal config is an object")
+                    .insert((*field).to_string(), json!(u64::MAX));
+            }
+            at_max
+        };
+        assert!(
+            component_validator.validate(&at_max).is_ok(),
+            "{schema_name} must accept u64::MAX: {at_max}"
+        );
+
+        let over = serde_json::from_str("18446744073709551616")
+            .expect("u64::MAX+1 must parse as a JSON number");
+        let mut over_range = minimal.clone();
+        over_range
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert(size_fields[0].to_string(), over);
+        assert!(
+            component_validator.validate(&over_range).is_err(),
+            "{schema_name} must reject u64::MAX+1: {over_range}"
+        );
+    }
+
+    let mut plugin_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/PluginConfig"
+    });
+    plugin_schema
+        .as_object_mut()
+        .expect("schema should be object")
+        .insert("components".to_string(), spec["components"].clone());
+    let plugin_validator = jsonschema::draft202012::options()
+        .build(&plugin_schema)
+        .expect("PluginConfig schema compiles");
+
+    let plugin_config = |plugin_name: &str, config: serde_json::Value| -> serde_json::Value {
+        json!({
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        })
+    };
+
+    for (plugin_name, minimal) in [
+        ("request_size_limiting", json!({"max_bytes": 1})),
+        ("response_size_limiting", json!({"max_bytes": 1})),
+        ("ws_message_size_limiting", json!({"max_frame_bytes": 1})),
+    ] {
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, minimal.clone()))
+                .is_ok(),
+            "{plugin_name} PluginConfig branch must accept the documented minimal config"
+        );
+
+        let mut unknown = minimal.clone();
+        unknown
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert("max_bytez".to_string(), json!(64));
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, unknown))
+                .is_err(),
+            "{plugin_name} PluginConfig branch must reject an unknown key"
+        );
+
+        let mut at_max = minimal.clone();
+        let size_field = if plugin_name == "ws_message_size_limiting" {
+            "max_frame_bytes"
+        } else {
+            "max_bytes"
+        };
+        at_max
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert(size_field.to_string(), json!(u64::MAX));
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, at_max))
+                .is_ok(),
+            "{plugin_name} PluginConfig branch must accept u64::MAX"
+        );
+
+        let over = serde_json::from_str("18446744073709551616")
+            .expect("u64::MAX+1 must parse as a JSON number");
+        let mut over_range = minimal;
+        over_range
+            .as_object_mut()
+            .expect("minimal config is an object")
+            .insert(size_field.to_string(), over);
+        assert!(
+            plugin_validator
+                .validate(&plugin_config(plugin_name, over_range))
+                .is_err(),
+            "{plugin_name} PluginConfig branch must reject u64::MAX+1"
+        );
+    }
+}
+
+/// Three-way parity for the `ai_semantic_firewall` extraction-path allowlist.
+///
+/// The same list exists in three places — the Rust constants that
+/// `validate_extraction_paths` admits and `extract_known_path` dispatches on,
+/// the `enum` + `default` arrays `openapi.yaml` publishes, and the
+/// "Supported provider shapes" tables in `docs/plugins.md`. A provider shape
+/// added to the code but not the schema is silently unconfigurable, and one
+/// added to the schema but not the code is accepted at config load and then
+/// extracts nothing — the exact silent-bypass class GHSA-8gc3-h5c8-jjxx was.
+/// Order is asserted too, so the published defaults stay the declared defaults.
+#[test]
+fn ai_semantic_firewall_extraction_paths_match_openapi_and_docs() {
+    let (request_paths, response_paths) =
+        ferrum_edge::_test_support::ai_semantic_firewall_extraction_paths_for_test();
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let extraction = spec
+        .pointer("/components/schemas/AiSemanticFirewallConfig/properties/extraction/properties")
+        .expect("AiSemanticFirewallConfig extraction properties");
+
+    for (field, runtime) in [
+        ("request_json_paths", request_paths),
+        ("response_json_paths", response_paths),
+    ] {
+        let expected: Vec<serde_json::Value> = runtime
+            .iter()
+            .map(|path| serde_json::Value::String((*path).to_string()))
+            .collect();
+        let enum_values = extraction[field]["items"]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} items.enum"));
+        assert_eq!(
+            enum_values, &expected,
+            "{field} enum must equal the runtime allowlist, in order"
+        );
+        let defaults = extraction[field]["default"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} default"));
+        assert_eq!(
+            defaults, &expected,
+            "{field} default must equal the runtime default set, in order"
+        );
+    }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    for path in request_paths.iter().chain(response_paths.iter()) {
+        assert!(
+            plugin_docs.contains(&format!("`{path}`")),
+            "docs/plugins.md must document the supported extraction path {path}"
+        );
+    }
+}
+
+/// Issue #5022: `JwtAuthConfig` must reject exactly what `JwtAuth::new` rejects.
+/// Schema-driven tooling previously approved configurations `ferrum-edge
+/// validate` and the admin API refuse.
+#[test]
+fn jwt_auth_schema_matches_runtime_admission() {
+    use ferrum_edge::plugins::jwt_auth::JwtAuth;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let accepted = [
+        json!({}),
+        json!({"token_lookup": "header:Authorization"}),
+        json!({"token_lookup": "header:X-Token"}),
+        json!({"token_lookup": "query:token"}),
+        json!({"consumer_claim_field": "client_id"}),
+        json!({"expected_issuer": "https://issuer.example"}),
+        json!({"expected_issuers": ["https://issuer.example"]}),
+        json!({"audiences": ["payments-api"]}),
+        json!({"leeway_secs": 300}),
+        json!({"require_exp": false, "require_nbf": true}),
+    ];
+    for config in &accepted {
+        assert_component_validity(&spec, "JwtAuthConfig", config, true);
+        assert!(
+            JwtAuth::new(config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
+        );
+    }
+
+    let rejected = [
+        json!({"token_lookup": "foo"}),
+        json!({"token_lookup": "header:   "}),
+        json!({"token_lookup": "header:x bad"}),
+        json!({"token_lookup": " header:Authorization"}),
+        json!({"token_lookup": "query:a b"}),
+        json!({"token_lookup": ""}),
+        json!({"consumer_claim_field": ""}),
+        json!({"expected_issuer": ""}),
+        json!({"expected_issuer": "https://a", "expected_issuers": ["https://b"]}),
+        json!({"expected_issuers": [""]}),
+        json!({"audiences": [""]}),
+        json!({"leeway_secs": -1}),
+        json!({"leeway_secs": 301}),
+        json!({"audience": ["payments-api"]}),
+    ];
+    for config in &rejected {
+        assert_component_validity(&spec, "JwtAuthConfig", config, false);
+        assert!(
+            JwtAuth::new(config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+}
+
+/// Issue #5023: `JwksAuthConfig` must encode the constructor's structural and
+/// cross-field admission rules. The two rules JSON Schema cannot practically
+/// express — the closed reserved-destination list for `output_claim_headers`
+/// and `jwks_refresh_interval_secs` <= the effective `jwks_max_stale_seconds` —
+/// are stated in the property descriptions instead and are deliberately absent
+/// from the rejected set below.
+#[test]
+fn jwks_auth_schema_matches_runtime_admission() {
+    const JWKS_URI: &str = "https://idp.example.com/jwks";
+    const DISCOVERY_URL: &str = "https://idp.example.com/.well-known/openid-configuration";
+    const ISSUER: &str = "https://idp.example.com";
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let inline = || json!({"keys": []});
+    // One remote provider plus the supplied per-provider overrides.
+    let remote = |extra: serde_json::Value| {
+        let mut provider = json!({"jwks_uri": JWKS_URI});
+        merge_into_object(&mut provider, &extra);
+        json!({"providers": [provider]})
+    };
+    // One inline provider plus the supplied per-provider overrides.
+    let local = |extra: serde_json::Value| {
+        let mut provider = json!({"jwks": inline()});
+        merge_into_object(&mut provider, &extra);
+        json!({"providers": [provider]})
+    };
+
+    let accepted = [
+        remote(json!({})),
+        remote(json!({"issuer": ISSUER})),
+        remote(json!({"from_headers": [{"name": "x-token", "prefix": null}]})),
+        remote(json!({"from_headers": [{"name": "x-token", "prefix": "Token "}]})),
+        remote(json!({"from_params": ["token"]})),
+        remote(json!({"required_scopes": ["admin"], "scope_claim": "realm.scope"})),
+        remote(json!({"jwks_max_stale_seconds": 600})),
+        remote(json!({"output_claim_headers": [{"header": "x-claim", "claim": "sub"}]})),
+        local(json!({})),
+        json!({"providers": [{"discovery_url": DISCOVERY_URL}]}),
+        json!({"providers": [{"jwks_uri": "http://127.0.0.1:9000/jwks"}]}),
+        json!({"providers": [{"jwks_uri": "http://localhost:9000/jwks"}]}),
+        local(json!({
+            "issuer": ISSUER,
+            "require_dpop": true,
+            "dpop_replay_scope": "process"
+        })),
+    ];
+    for config in &accepted {
+        assert_component_validity(&spec, "JwksAuthConfig", config, true);
+    }
+
+    let rejected = [
+        json!({"providers": []}),
+        json!({"providers": [{}]}),
+        remote(json!({"scope_claim": "a..b"})),
+        remote(json!({"role_claim": ".roles"})),
+        remote(json!({"claim_headers_separator": ""})),
+        remote(json!({"required_scopes": [""]})),
+        remote(json!({"from_headers": [{"name": "x token"}]})),
+        remote(json!({"output_claim_headers": [{"header": "x bad", "claim": "sub"}]})),
+        remote(json!({"discovery_url": DISCOVERY_URL})),
+        remote(json!({"jwks": inline()})),
+        json!({"providers": [{"jwks_uri": "not a url"}]}),
+        json!({"providers": [{"jwks_uri": "http://idp.example.com/jwks"}]}),
+        json!({"providers": [{"jwks_uri": "https://u:p@idp.example.com/jwks"}]}),
+        local(json!({"jwks_max_stale_seconds": 600})),
+        local(json!({"require_dpop": true})),
+        local(json!({"issuer": ISSUER, "require_dpop": true})),
+        local(json!({"dpop_replay_scope": "process"})),
+        json!({"providers": [{"jwks_uri": JWKS_URI}], "scope_claim": "a..b"}),
+        json!({"providers": [{"jwks_uri": JWKS_URI}], "claim_headers_separator": ""}),
+    ];
+    for config in &rejected {
+        assert_component_validity(&spec, "JwksAuthConfig", config, false);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("jwks_auth", config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+}
+
+/// Shallow-merge every member of `extra` into the `target` JSON object.
+fn merge_into_object(target: &mut serde_json::Value, extra: &serde_json::Value) {
+    let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) else {
+        panic!("merge_into_object expects two JSON objects");
+    };
+    for (key, value) in extra {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+/// Bidirectional parity for `ai_semantic_firewall`: the published component and
+/// the constructor must return the SAME verdict, so a schema-validating client
+/// can preflight a configuration `ferrum-edge validate` will accept.
+#[test]
+fn ai_semantic_firewall_schema_matches_runtime_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    const ENDPOINT: &str = "http://127.0.0.1:1/v1/embeddings";
+    let provider = json!({"type": "openai_compatible_embeddings", "endpoint": ENDPOINT});
+
+    let accepted = [
+        json!({"provider": provider}),
+        json!({"enabled": false}),
+        json!({"provider": provider, "enabled": false}),
+        json!({
+            "provider": provider,
+            "inspect": {"request": false, "response": true},
+            "builtins": {"response_leakage": true}
+        }),
+        // An empty extraction list is fine while no rule in that direction runs.
+        json!({
+            "provider": provider,
+            "inspect": {"request": false, "response": true},
+            "extraction": {"request_json_paths": []}
+        }),
+        // Ids and examples are trimmed, so padded text is admissible.
+        json!({
+            "provider": provider,
+            "custom_rules": [{"id": " a ", "examples": [" reference "]}]
+        }),
+        json!({
+            "provider": provider,
+            "builtins": {"prompt_injection": {"examples_mode": "replace", "examples": ["x"]}}
+        }),
+        json!({"provider": provider, "streaming_response": "inspect", "streaming": {}}),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"window": "tokens", "tokenizer": "chars4", "max_window_tokens": 2}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_hold_ms": 100, "on_hold_timeout": "on_error"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"enforcement": "detect", "max_hold_ms": 100, "on_hold_timeout": "forward"}
+        }),
+    ];
+    for config in &accepted {
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", config, true);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
+        );
+    }
+
+    let rejected = [
+        json!({"provider": provider, "inspect": {"request": false, "response": false}}),
+        json!({"provider": provider, "builtins": {}}),
+        // Request-only rules with request inspection disabled.
+        json!({
+            "provider": provider,
+            "inspect": {"request": false, "response": true},
+            "builtins": {"prompt_injection": true}
+        }),
+        json!({"provider": provider, "extraction": {"request_json_paths": []}}),
+        // provider.type is an exact one-value vocabulary: no aliases, no padding.
+        json!({"provider": {"type": "openai_compatible", "endpoint": ENDPOINT}}),
+        json!({"provider": {"type": "openai-compatible", "endpoint": ENDPOINT}}),
+        json!({"provider": {"type": " openai_compatible_embeddings ", "endpoint": ENDPOINT}}),
+        json!({"provider": provider, "custom_rules": [{"id": " ", "examples": ["reference"]}]}),
+        json!({"provider": provider, "custom_rules": [{"id": "a", "examples": [" "]}]}),
+        json!({
+            "provider": provider,
+            "builtins": {"prompt_injection": {"examples_mode": "replace"}}
+        }),
+        // Disabled nested packs still validate the tuning blocks they carry.
+        json!({
+            "enabled": false,
+            "builtins": {"prompt_injection": {"enabled": false, "examples_mode": "replace"}}
+        }),
+        json!({"provider": provider, "streaming": {}}),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"window": "tokens"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"tokenizer": "chars4"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"overlap_bytes": -1}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"on_hold_timeout": "on_error"}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"enforcement": "detect", "max_hold_ms": 100, "on_hold_timeout": "cut"}
+        }),
+        // A disabled instance still validates the blocks it carries.
+        json!({"provider": {"type": "bogus"}, "enabled": false}),
+        // Materializing an advertised default must never invalidate a config:
+        // these two token-only fields therefore carry no schema default.
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_window_tokens": 256}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"overlap_tokens": 32}
+        }),
+    ];
+    for config in &rejected {
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", config, false);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+
+    // Cross-field numeric comparisons and id uniqueness are NOT expressible in
+    // standard JSON Schema. The component describes them; the constructor is
+    // the only gate. Keep this list in sync with that description.
+    let constructor_only = [
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {
+                "window": "tokens",
+                "tokenizer": "chars4",
+                "max_window_tokens": 2,
+                "overlap_tokens": 32
+            }
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_window_bytes": 64, "overlap_bytes": 128}
+        }),
+        json!({
+            "provider": provider,
+            "custom_rules": [
+                {"id": "dup", "examples": ["a"]},
+                {"id": "dup", "examples": ["b"]}
+            ]
+        }),
+    ];
+    for config in &constructor_only {
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", config, true);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", config).is_err(),
+            "constructor must still reject what the schema cannot express: {config}"
+        );
+    }
+}
+
+/// One table, both directions: every row must be admitted — or refused — by
+/// the published component and by the constructor alike.
+///
+/// The component is what generated clients, config forms, and external
+/// validation tooling enforce, so a row either side accepts alone is a config
+/// an operator can be told is valid and then cannot start (issue #5013).
+#[test]
+fn oauth2_introspection_schema_and_constructor_admit_the_same_configs() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::oauth2_introspection::Oauth2Introspection;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    // Every provider override the constructor accepts must be representable.
+    let provider_properties = spec
+        .pointer(
+            "/components/schemas/Oauth2IntrospectionConfig/properties/providers/items/properties",
+        )
+        .and_then(serde_json::Value::as_object)
+        .expect("OAuth2 introspection provider properties exist");
+    for field in [
+        "token_hint_param",
+        "scope_claim",
+        "role_claim",
+        "consumer_identity_claim",
+        "consumer_header_claim",
+    ] {
+        assert!(
+            provider_properties.contains_key(field),
+            "the provider schema must declare the accepted key {field}"
+        );
+    }
+
+    // Loopback endpoints keep `client_auth.method: none` admissible, so the
+    // rows below isolate the field under test.
+    let loopback = "http://127.0.0.1:32123/introspect";
+    let provider = |patch: serde_json::Value| -> serde_json::Value {
+        let mut object = json!({
+            "introspection_endpoint": loopback,
+            "client_auth": {"method": "none"}
+        });
+        let object_map = object.as_object_mut().expect("provider object");
+        for (key, value) in patch.as_object().expect("patch object") {
+            object_map.insert(key.clone(), value.clone());
+        }
+        json!({"providers": [object]})
+    };
+
+    let cases = [
+        ("minimal loopback provider", provider(json!({})), true),
+        (
+            "documented https example",
+            json!({"providers": [{
+                "introspection_endpoint": "https://idp.example.com/oauth2/introspect",
+                "issuer": "https://idp.example.com/",
+                "audiences": ["api://edge"],
+                "client_auth": {
+                    "method": "client_secret_basic",
+                    "client_id": "ferrum-edge",
+                    "client_secret": "introspection-client-secret"
+                },
+                "required_scopes": ["orders:read"],
+                "claim_headers": {"sub": "X-Authenticated-Subject"}
+            }]}),
+            true,
+        ),
+        ("empty provider", json!({"providers": [{}]}), false),
+        (
+            "both endpoints",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "discovery_url": "http://127.0.0.1:32123/.well-known/openid-configuration",
+                "client_auth": {"method": "none"}
+            }]}),
+            false,
+        ),
+        (
+            "discovery only",
+            json!({"providers": [{
+                "discovery_url": "http://127.0.0.1:32123/.well-known/openid-configuration",
+                "client_auth": {"method": "none"}
+            }]}),
+            true,
+        ),
+        (
+            "client_auth omitted",
+            json!({"providers": [{"introspection_endpoint": loopback}]}),
+            false,
+        ),
+        (
+            "client_secret_basic without credentials",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "client_secret_basic"}
+            }]}),
+            false,
+        ),
+        (
+            "unused client_auth key of the wrong type",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "none", "client_secret": 123}
+            }]}),
+            false,
+        ),
+        (
+            "timeout below range",
+            provider(json!({"request_timeout_ms": 99})),
+            false,
+        ),
+        (
+            "timeout zero",
+            provider(json!({"request_timeout_ms": 0})),
+            false,
+        ),
+        (
+            "timeout above range",
+            provider(json!({"request_timeout_ms": 30001})),
+            false,
+        ),
+        (
+            "timeout in range",
+            provider(json!({"request_timeout_ms": 5000})),
+            true,
+        ),
+        (
+            "positive TTL above range",
+            provider(json!({"positive_cache_ttl_secs": 86401})),
+            false,
+        ),
+        (
+            "positive TTL disabled",
+            provider(json!({"positive_cache_ttl_secs": 0})),
+            true,
+        ),
+        (
+            "negative TTL above range",
+            provider(json!({"negative_cache_ttl_secs": 301})),
+            false,
+        ),
+        ("blank issuer", provider(json!({"issuer": ""})), false),
+        (
+            "blank audience",
+            provider(json!({"audiences": [""]})),
+            false,
+        ),
+        (
+            "blank query location",
+            provider(json!({"from_params": [""]})),
+            false,
+        ),
+        (
+            "claim path with an empty segment",
+            provider(json!({"scope_claim": "x..y"})),
+            false,
+        ),
+        (
+            "claim header targeting a reserved name",
+            provider(json!({"claim_headers": {"sub": "authorization"}})),
+            false,
+        ),
+        (
+            "claim header with an invalid name",
+            provider(json!({"claim_headers": {"sub": "bad header"}})),
+            false,
+        ),
+        (
+            "token location with an invalid header name",
+            provider(json!({"from_headers": [{"name": "bad header"}]})),
+            false,
+        ),
+        (
+            "token location with a null prefix",
+            provider(json!({"from_headers": [{"name": "x-token", "prefix": null}]})),
+            true,
+        ),
+        (
+            "blank token hint",
+            provider(json!({"token_hint_param": ""})),
+            false,
+        ),
+        (
+            "null token hint",
+            provider(json!({"token_hint_param": null})),
+            true,
+        ),
+        (
+            "token hint",
+            provider(json!({"token_hint_param": "access_token"})),
+            true,
+        ),
+        (
+            "unsupported endpoint scheme",
+            provider(json!({"introspection_endpoint": "file:///tmp/x"})),
+            false,
+        ),
+        (
+            "unparseable endpoint",
+            provider(json!({"introspection_endpoint": "nonsense"})),
+            false,
+        ),
+        (
+            "empty endpoint",
+            provider(json!({"introspection_endpoint": ""})),
+            false,
+        ),
+        (
+            "unknown provider key",
+            provider(json!({"introspection_endpoiint": loopback})),
+            false,
+        ),
+        (
+            "blank global claim path",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "none"}
+            }], "scope_claim": ""}),
+            false,
+        ),
+    ];
+
+    for (label, config, expected_valid) in cases {
+        assert_component_validity(&spec, "Oauth2IntrospectionConfig", &config, expected_valid);
+        let constructed = Oauth2Introspection::new(&config, PluginHttpClient::default());
+        assert_eq!(
+            constructed.is_ok(),
+            expected_valid,
+            "{label}: constructor disagrees with the component; error: {:?}",
+            constructed.err()
+        );
+    }
+}
+
+/// The OPA counterpart of the table above (issue #5058).
+///
+/// `max_cache_total_bytes`-style cross-field rules stay runtime-only and are
+/// documented rather than modelled; every row here is expressible in both.
+#[test]
+fn opa_schema_and_constructor_admit_the_same_configs() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::opa::Opa;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let base = |patch: serde_json::Value| -> serde_json::Value {
+        let mut config = json!({
+            "opa_host": "http://127.0.0.1:8181",
+            "policy_path": "ferrum/authz/allow"
+        });
+        let config_map = config.as_object_mut().expect("config object");
+        for (key, value) in patch.as_object().expect("patch object") {
+            config_map.insert(key.clone(), value.clone());
+        }
+        config
+    };
+
+    let cases = [
+        ("minimal", base(json!({})), true),
+        (
+            "null response ceiling",
+            base(json!({"max_response_bytes": null})),
+            true,
+        ),
+        (
+            "null body ceiling",
+            base(json!({"max_body_bytes": null})),
+            true,
+        ),
+        (
+            "zero response ceiling",
+            base(json!({"max_response_bytes": 0})),
+            false,
+        ),
+        (
+            "zero body ceiling",
+            base(json!({"max_body_bytes": 0})),
+            false,
+        ),
+        (
+            "both fail-posture flags",
+            base(json!({"fail_open": false, "fail_closed": true})),
+            false,
+        ),
+        ("fail_open alone", base(json!({"fail_open": true})), true),
+        (
+            "fail_closed alone",
+            base(json!({"fail_closed": true})),
+            true,
+        ),
+        (
+            "timeout above the clamp",
+            base(json!({"timeout_ms": 30001})),
+            true,
+        ),
+        ("empty policy path", base(json!({"policy_path": ""})), false),
+        (
+            "absolute policy path",
+            base(json!({"policy_path": "/audit/allow"})),
+            false,
+        ),
+        (
+            "empty policy segment",
+            base(json!({"policy_path": "audit//allow"})),
+            false,
+        ),
+        (
+            "percent-encoded policy path",
+            base(json!({"policy_path": "audit%2Fallow"})),
+            false,
+        ),
+        (
+            "policy path with a query",
+            base(json!({"policy_path": "audit/allow?x=y"})),
+            false,
+        ),
+        (
+            "policy path with a fragment",
+            base(json!({"policy_path": "audit/allow#x"})),
+            false,
+        ),
+        (
+            "dot policy segment",
+            base(json!({"policy_path": "a/./b"})),
+            false,
+        ),
+        (
+            "unsupported host scheme",
+            base(json!({"opa_host": "ftp://localhost"})),
+            false,
+        ),
+        (
+            "host with a query",
+            base(json!({"opa_host": "http://127.0.0.1:8181?x=y"})),
+            false,
+        ),
+        (
+            "host with credentials",
+            base(json!({"opa_host": "http://user:pass@127.0.0.1:8181"})),
+            false,
+        ),
+        (
+            "host with a base path",
+            base(json!({"opa_host": "http://127.0.0.1:8181/base"})),
+            true,
+        ),
+        (
+            "outbound content-type override",
+            base(json!({"headers": {"Content-Type": "text/plain"}})),
+            false,
+        ),
+        (
+            "invalid outbound header name",
+            base(json!({"headers": {"Bad Header": "x"}})),
+            false,
+        ),
+        (
+            "protocol-managed deny header",
+            base(json!({"deny_headers": {"Content-Length": "3"}})),
+            false,
+        ),
+        (
+            "protocol-managed fail-closed header",
+            base(json!({"fail_closed_headers": {"Connection": "close"}})),
+            false,
+        ),
+        (
+            "ordinary deny header",
+            base(json!({"deny_headers": {"X-Policy": "denied"}})),
+            true,
+        ),
+        (
+            "blank redaction name",
+            base(json!({"redact_headers": [""]})),
+            false,
+        ),
+        (
+            "invalid redaction name",
+            base(json!({"redact_headers": ["Bad Header"]})),
+            false,
+        ),
+        (
+            "unknown key",
+            base(json!({"decision_pointr": ["result"]})),
+            false,
+        ),
+    ];
+
+    for (label, config, expected_valid) in cases {
+        assert_component_validity(&spec, "OpaPluginConfig", &config, expected_valid);
+        let constructed = Opa::new(&config, PluginHttpClient::default());
+        assert_eq!(
+            constructed.is_ok(),
+            expected_valid,
+            "{label}: constructor disagrees with the component; error: {:?}",
+            constructed.err()
+        );
+    }
+}
+
+/// The `MeshAuthzConfig` component must agree with what the plugin constructor
+/// actually admits — both directions. A schema that accepts a document the
+/// gateway rejects sends operators into a failed reload; one that rejects a
+/// supported document blocks a valid policy. The cases below are the ones the
+/// audit found disagreeing (issue #5066).
+#[test]
+fn mesh_authz_component_matches_runtime_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let policy = |rules: serde_json::Value| {
+        json!({
+            "name": "deny-admin",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": rules,
+        })
+    };
+    let deny_admin = json!([{"action": "deny", "to": [{"paths": ["/admin/*"]}]}]);
+    let custom = json!([{"action": {"custom": {"provider": "ext"}}}]);
+    let no_action = json!([{"to": [{"paths": ["/admin/*"]}]}]);
+    let rule_typo = json!([{"action": "deny", "not_path": ["/a"]}]);
+    let match_typo = json!([{"action": "deny", "to": [{"not_path": ["/a"]}]}]);
+
+    for valid in [
+        // An omitted `config:` block deserializes to null for every plugin.
+        serde_json::Value::Null,
+        json!({}),
+        json!({"trust_domain_aliases": null}),
+        json!({"trust_domain_aliases": ["cluster.local"]}),
+        json!({"trusted_hbone_assertors": null}),
+        json!({"trusted_hbone_assertors": []}),
+        json!({"trusted_hbone_assertors": ["ztunnel", "waypoint"]}),
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": null}]}),
+        // The constructor trims the scope value, exactly as it trims the
+        // assertor; the schema expresses that with a pattern, not an enum.
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": " same_namespace "}]}),
+        json!({"trusted_hbone_assertors": [
+            {"assertor": "spiffe://cluster.local/ns/istio-system/sa/ztunnel", "scope": "mesh_wide"}
+        ]}),
+        json!({"mesh_policies": []}),
+        json!({"mesh_policies": [policy(deny_admin)]}),
+        json!({"mesh_policies": [policy(custom)]}),
+        json!({"mesh_policies": [{
+            "name": "scoped", "namespace": "default",
+            "scope": {"kind": "workload_selector", "selector": {"labels": {"app": "api"}}},
+        }]}),
+        json!({"node_waypoint_route_upstreams": [
+            {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 8080}]}
+        ]}),
+    ] {
+        assert_component_validity(&spec, "MeshAuthzConfig", &valid, true);
+    }
+
+    for invalid in [
+        // A non-object root builds a policy-free instance that allows
+        // everything, so it is refused rather than degraded.
+        json!(7),
+        json!("mesh_policies"),
+        json!([]),
+        // Unknown root key (the #4525 contract, kept).
+        json!({"mesh_policy": []}),
+        // A policy document with no identity or scope.
+        json!({"mesh_policies": [{}]}),
+        // `action` is required on every rule.
+        json!({"mesh_policies": [policy(no_action)]}),
+        // Closed grammar at each nesting level.
+        json!({"mesh_policies": [policy(rule_typo)]}),
+        json!({"mesh_policies": [policy(match_typo)]}),
+        json!({"mesh_policies": [{
+            "name": "scoped", "namespace": "default",
+            "scope": {"kind": "workload_selector", "selector": {"labelz": {}}},
+        }]}),
+        // Wrong-typed scoping flag: silently reading it as false would
+        // re-enable the construction-time scope filter on a node waypoint.
+        json!({"per_pod_policy_scoping": "true"}),
+        json!({"ambient_udp_source_scoping": 1}),
+        // Grant exclusivity and the exact-SPIFFE requirement for mesh_wide.
+        json!({"trusted_hbone_assertors": [
+            {"assertor": "waypoint", "asserts": [], "scope": "same_namespace"}
+        ]}),
+        json!({"trusted_hbone_assertors": [{"assertor": "waypoint", "scope": "mesh_wide"}]}),
+        // Trust-domain grammar.
+        json!({"trust_domain_aliases": ["not/a/domain"]}),
+        // uint16 has a numeric ceiling, not just a format hint.
+        json!({"node_waypoint_route_upstreams": [
+            {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 65536}]}
+        ]}),
+    ] {
+        assert_component_validity(&spec, "MeshAuthzConfig", &invalid, false);
+    }
+}
+
+/// `mesh_authz` is a public built-in that appears in `/plugins`, the execution
+/// order table, and the protocol matrix, so the public guide must carry its
+/// configuration and behavior reference (issue #5065).
+#[test]
+fn mesh_authz_public_guide_documents_its_configuration_contract() {
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(
+        guide.contains("### `mesh_authz`"),
+        "docs/plugins.md must carry a mesh_authz section"
+    );
+
+    let section = guide
+        .split("### `mesh_authz`")
+        .nth(1)
+        .expect("mesh_authz section")
+        .split("\n### ")
+        .next()
+        .expect("mesh_authz section body");
+
+    // Every accepted root key, including the injection-only ones an operator
+    // will see echoed back by `GET /plugins`.
+    for key in [
+        "mesh_slice",
+        "mesh_policies",
+        "namespace",
+        "labels",
+        "per_pod_policy_scoping",
+        "ambient_udp_source_scoping",
+        "trust_domain_aliases",
+        "trusted_hbone_assertors",
+        "cluster_domain",
+        "cluster_domains",
+        "node_waypoint_route_upstreams",
+    ] {
+        assert!(
+            section.contains(&format!("`{key}`")),
+            "docs/plugins.md mesh_authz section must document `{key}`"
+        );
+    }
+
+    for contract in [
+        "2075",
+        "FailClosed",
+        "implicit-deny",
+        "**Strict configuration admission.**",
+        "**Trusted identity is required.**",
+    ] {
+        assert!(
+            section.contains(contract),
+            "docs/plugins.md mesh_authz section must state: {contract}"
+        );
+    }
+}
+
+/// The CUSTOM outcome vocabulary in `docs/mesh.md` must stay in lock-step with
+/// the closed reason enum (issue #5068). The exhaustive match makes a NEW
+/// reason a compile error here rather than a silently undocumented label, and
+/// the assertions pin BOTH the metric labels and the finer per-request reason
+/// tokens the metric folds into them.
+#[test]
+fn mesh_custom_authorization_outcome_documentation_matches_the_reason_enum() {
+    use ferrum_edge::plugins::mesh::ext_authz::MeshExtAuthzReason as Reason;
+
+    // The `outcome` metric label `record()` folds each reason into.
+    let metric_outcome = |reason: Reason| -> &'static str {
+        match reason {
+            Reason::Allowed => "allowed",
+            Reason::DeniedByProvider => "denied_by_provider",
+            Reason::ProviderUnbound => "provider_unbound",
+            Reason::ProviderError => "provider_error",
+            Reason::ProviderConflict => "provider_conflict",
+            Reason::Unexecutable => "unexecutable",
+            Reason::Timeout => "timeout",
+            Reason::TransportError | Reason::RequestBuildFailed => "transport_error",
+            Reason::ResponseTooLarge | Reason::ResponseReadFailed => "response_refused",
+            Reason::BodyUnavailable => "body_unavailable",
+            Reason::BodyTooLarge => "body_too_large",
+            Reason::ConcurrencyExhausted => "concurrency_exhausted",
+        }
+    };
+
+    let reasons = [
+        Reason::Allowed,
+        Reason::DeniedByProvider,
+        Reason::ProviderUnbound,
+        Reason::ProviderError,
+        Reason::ProviderConflict,
+        Reason::Unexecutable,
+        Reason::Timeout,
+        Reason::TransportError,
+        Reason::RequestBuildFailed,
+        Reason::ResponseTooLarge,
+        Reason::ResponseReadFailed,
+        Reason::BodyUnavailable,
+        Reason::BodyTooLarge,
+        Reason::ConcurrencyExhausted,
+    ];
+
+    let mesh_docs = include_str!("../../docs/mesh.md");
+    let mut outcomes: BTreeSet<&'static str> = BTreeSet::new();
+    for reason in reasons {
+        let token = reason.as_str();
+        assert!(
+            mesh_docs.contains(&format!("`{token}`")),
+            "docs/mesh.md must document the reason token `{token}`"
+        );
+        outcomes.insert(metric_outcome(reason));
+    }
+
+    assert_eq!(outcomes.len(), 12, "the outcome label set is twelve values");
+    for outcome in &outcomes {
+        assert!(
+            mesh_docs.contains(&format!("| `{outcome}` |")),
+            "docs/mesh.md outcome table must carry a row for `{outcome}`"
+        );
+    }
+    assert!(
+        !mesh_docs.contains("`response_refused`, `body_unavailable`"),
+        "docs/mesh.md must not restate the outcome set as a prose list that can drift"
+    );
+}
+
+/// The CUSTOM failure reference must not promise `failOpen` for the refusals
+/// that are decided without a provider, and must not describe cancellation as
+/// producing an allow (issue #5069).
+#[test]
+fn mesh_custom_authorization_failure_documentation_matches_the_runtime() {
+    let mesh_docs = include_str!("../../docs/mesh.md");
+
+    assert!(
+        mesh_docs.contains("**unconditional fixed `403` refusals**"),
+        "docs/mesh.md must document the unbound-provider / absent-executor refusal"
+    );
+    assert!(
+        mesh_docs.contains("it never synthesizes an allow"),
+        "docs/mesh.md must describe cancellation as ending the request"
+    );
+    assert!(
+        !mesh_docs.contains("and task cancellation are all failed checks"),
+        "docs/mesh.md must not restate the corrected fail-open claim"
+    );
+    assert!(
+        mesh_docs.contains("capped at **128 process-wide**"),
+        "docs/mesh.md must state the shared process-wide check budget"
+    );
+}
+
+/// Issues #5176, #5177, #5178, #5181, #5189: the published
+/// `serverless_function` grammar and the constructor's admission rules must
+/// describe the same set of accepted configurations.
+#[test]
+fn serverless_function_schema_matches_runtime_admission() {
+    use ferrum_edge::plugins::create_plugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let properties = spec
+        .pointer("/components/schemas/ServerlessFunctionConfig/properties")
+        .expect("ServerlessFunctionConfig properties exist");
+
+    fn compile_pattern(value: &serde_json::Value) -> Regex {
+        let raw = value["pattern"].as_str().expect("published pattern");
+        Regex::new(raw).expect("published pattern compiles")
+    }
+    let pattern_for = |field: &str| compile_pattern(&properties[field]);
+
+    // Issue #5177: `format: uint64` is not an assertion, so the ceiling the
+    // runtime can actually represent must be published as `maximum`.
+    for field in ["timeout_ms", "max_response_body_bytes"] {
+        assert_eq!(
+            properties[field]["maximum"].as_u64(),
+            Some(u64::MAX),
+            "{field} must publish the u64 ceiling"
+        );
+        assert_eq!(properties[field]["minimum"].as_u64(), Some(1), "{field}");
+    }
+
+    // Issue #5176: `forward_headers` entries are HTTP field-name tokens.
+    let header_item = &properties["forward_headers"]["items"];
+    assert_eq!(header_item["minLength"].as_u64(), Some(1));
+    let header_pattern = compile_pattern(header_item);
+    assert!(header_pattern.is_match("x-request-id"));
+    assert!(header_pattern.is_match("X-Request-ID"));
+    assert!(!header_pattern.is_match(""));
+    assert!(!header_pattern.is_match("bad header"));
+    assert!(!header_pattern.is_match("bad:header"));
+
+    // Issue #5189: a credential must be representable as an HTTP field value.
+    for field in ["azure_function_key", "gcp_bearer_token"] {
+        let pattern = pattern_for(field);
+        assert!(pattern.is_match("ordinary-credential=="), "{field}");
+        assert!(!pattern.is_match("audit\ncredential"), "{field}");
+        assert!(!pattern.is_match("audit\rcredential"), "{field}");
+        assert!(!pattern.is_match("audit\u{0}credential"), "{field}");
+        assert!(!pattern.is_match("audit\u{7f}credential"), "{field}");
+    }
+
+    // Issue #5181: the Lambda Invoke identifier grammars.
+    assert_eq!(
+        properties["aws_function_name"]["maxLength"].as_u64(),
+        Some(170)
+    );
+    assert_eq!(properties["aws_qualifier"]["maxLength"].as_u64(), Some(128));
+    let name_pattern = pattern_for("aws_function_name");
+    for accepted in [
+        "my-function",
+        "my_function.v2",
+        "my-function:prod",
+        "my-function:$LATEST",
+        "123456789012:function:my-function",
+        "arn:aws:lambda:us-east-1:123456789012:function:my-function",
+        "arn:aws-cn:lambda:cn-north-1:123456789012:function:my-function:prod",
+    ] {
+        assert!(name_pattern.is_match(accepted), "name={accepted}");
+    }
+    for rejected in [" ", "my function", "my/function", "my-function:bad alias"] {
+        assert!(!name_pattern.is_match(rejected), "name={rejected:?}");
+    }
+    let qualifier_pattern = pattern_for("aws_qualifier");
+    for accepted in ["$LATEST", "prod", "1", "blue-green_2"] {
+        assert!(qualifier_pattern.is_match(accepted), "qualifier={accepted}");
+    }
+    for rejected in ["not a qualifier", "bad/alias", ""] {
+        assert!(
+            !qualifier_pattern.is_match(rejected),
+            "qualifier={rejected:?}"
+        );
+    }
+
+    // Issue #5178: one lexical URL contract for both URL-valued fields.
+    let url_pattern = pattern_for("function_url");
+    for accepted in [
+        "http://127.0.0.1/a%20b",
+        "https://functions.example/api/transform",
+        "https://functions.example:65535/api/transform",
+        "https://[2001:db8::1]:8443/api/transform",
+        "http://127.0.0.1:0/pre",
+    ] {
+        assert!(url_pattern.is_match(accepted), "url={accepted}");
+    }
+    for rejected in [
+        "https://:1234",
+        "https://127.0.0.1:65536/pre",
+        "http://127.0.0.1/a b",
+        "http://user:pass@127.0.0.1/pre",
+        "https://functions.example/api#fragment",
+    ] {
+        assert!(!url_pattern.is_match(rejected), "url={rejected}");
+    }
+    let endpoint_pattern = pattern_for("aws_endpoint_url");
+    for accepted in ["http://localhost:4566", "http://localhost:4566/"] {
+        assert!(endpoint_pattern.is_match(accepted), "endpoint={accepted}");
+    }
+    for rejected in [
+        "https://example.com/lambda",
+        "https://example.com?token=secret",
+        "https://:1234",
+        "https://127.0.0.1:65536",
+    ] {
+        assert!(!endpoint_pattern.is_match(rejected), "endpoint={rejected}");
+    }
+
+    // Runtime parity for the same inputs: every schema rejection above is also
+    // a constructor rejection, and the accepted base configuration builds.
+    let base = json!({
+        "provider": "azure_functions",
+        "function_url": "http://127.0.0.1:45678/pre"
+    });
+    assert!(create_plugin("serverless_function", &base).is_ok());
+    for extra in [
+        json!({"function_url": "https://:1234"}),
+        json!({"function_url": "https://127.0.0.1:65536/pre"}),
+        json!({"function_url": "http://127.0.0.1/a b"}),
+        json!({"forward_headers": [""]}),
+        json!({"forward_headers": ["bad header"]}),
+        json!({"azure_function_key": "audit\ncredential"}),
+        json!({"gcp_bearer_token": "audit\ncredential"}),
+        json!({"aws_function_name": "bad name"}),
+        json!({"aws_qualifier": "not a qualifier"}),
+        json!({"aws_endpoint_url": "https://example.com/lambda"}),
+    ] {
+        let mut config = base.clone();
+        merge_into_object(&mut config, &extra);
+        assert!(
+            create_plugin("serverless_function", &config).is_err(),
+            "runtime must reject the schema-invalid config: {config}"
+        );
+    }
+}
+
+/// Issue #5239: the `ApiChargebackConfig` component must reject exactly what the
+/// constructor rejects — no-op pricing, blank currency, out-of-range or
+/// duplicate status codes, negative timer/budget values, simultaneous `schema`
+/// and `schema_ref`, and projection features the billing-row record family
+/// cannot express.
+#[test]
+fn api_chargeback_schema_admits_only_constructible_configs() {
+    use ferrum_edge::plugins::api_chargeback::ApiChargeback;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("ApiChargebackConfig schema compiles");
+
+    // The minimal effective configuration: a nonempty tier counts even at a
+    // zero price, because an explicitly zero-priced tier still meters calls.
+    let base = json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0}]});
+    let with = |patch: serde_json::Value| -> serde_json::Value {
+        let mut config = base.clone();
+        let object = config.as_object_mut().expect("base is an object");
+        for (key, value) in patch.as_object().expect("patch is an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        config
+    };
+    let accept = |config: serde_json::Value| {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "OpenAPI must admit {config}"
+        );
+        ApiChargeback::new(&config, "ferrum")
+            .unwrap_or_else(|err| panic!("runtime must admit {config}: {err}"));
+    };
+    let reject = |config: serde_json::Value| {
+        assert!(
+            validator.validate(&config).is_err(),
+            "OpenAPI must reject {config}"
+        );
+        assert!(
+            ApiChargeback::new(&config, "ferrum").is_err(),
+            "runtime must reject {config}"
+        );
+    };
+
+    let documented_per_call = json!({
+        "currency": "USD",
+        "pricing_tiers": [
+            {"status_codes": [200, 201, 202, 204], "price_per_call": 0.00001},
+            {"status_codes": [301, 302], "price_per_call": 0.000005}
+        ]
+    });
+    let documented_combined = json!({
+        "currency": "USD",
+        "pricing_tiers": [
+            {"status_codes": [200, 201, 202, 204], "price_per_call": 0.00001}
+        ],
+        "bandwidth_pricing": {
+            "price_per_byte_sent": 0.0000000001,
+            "price_per_byte_received": 0.0000000002
+        },
+        "stream_connection_pricing": {"price_per_connection": 0.0005}
+    });
+    let supported_derived = json!({
+        "schema": {"derived_fields": [{"name": "row_kind", "kind": "summary_kind"}]}
+    });
+
+    accept(base.clone());
+    accept(json!({"bandwidth_pricing": {"price_per_byte_sent": 0.01}}));
+    accept(json!({"bandwidth_pricing": {"price_per_byte_received": 0.02}}));
+    accept(json!({"stream_connection_pricing": {"price_per_connection": 5}}));
+    accept(json!({"pricing_tiers": [{"status_codes": [100, 599], "price_per_call": 1}]}));
+    accept(documented_per_call);
+    accept(documented_combined);
+    accept(with(json!({"schema": {"omit": ["proxy_name"]}})));
+    accept(with(
+        json!({"schema": {"rename": {"total_calls": "calls"}}}),
+    ));
+    accept(with(supported_derived));
+
+    let unrepresentable_derived = json!({
+        "schema": {"derived_fields": [{"name": "host", "kind": "backend_host"}]}
+    });
+
+    // No effective pricing: the plugin would record nothing.
+    reject(json!({}));
+    reject(json!({"bandwidth_pricing": {}}));
+    reject(json!({"bandwidth_pricing": {"price_per_byte_sent": 0}}));
+    reject(json!({"stream_connection_pricing": {"price_per_connection": 0}}));
+    reject(json!({"pricing_tiers": []}));
+    // Currency is trimmed and must not be empty.
+    reject(with(json!({"currency": ""})));
+    reject(with(json!({"currency": " \t "})));
+    // Status codes must be real HTTP statuses, distinct within a tier.
+    reject(json!({"pricing_tiers": [{"status_codes": [99], "price_per_call": 1}]}));
+    reject(json!({"pricing_tiers": [{"status_codes": [600], "price_per_call": 1}]}));
+    reject(json!({"pricing_tiers": [{"status_codes": [200, 200], "price_per_call": 1}]}));
+    // Timer / budget knobs are unsigned 64-bit integers.
+    reject(with(json!({"render_cache_ttl_seconds": -1})));
+    reject(with(json!({"stale_entry_ttl_seconds": -1})));
+    reject(with(json!({"cache_invalidation_min_age_ms": -1})));
+    reject(with(json!({"cleanup_interval_seconds": -1})));
+    reject(with(json!({"max_entries": 0})));
+    reject(with(json!({"max_retained_bytes": 0})));
+    // Projection surface: mutually exclusive, and narrowed to the billing row.
+    reject(with(json!({"schema": {}, "schema_ref": "missing"})));
+    reject(with(json!({"schema": {"order": ["proxy_id"]}})));
+    reject(with(json!({"schema": {"summary_type": "http"}})));
+    reject(with(json!({"schema": {"timestamp_format": "epoch_ms"}})));
+    reject(with(json!({"schema": {"metadata": {"mode": "omit"}}})));
+    reject(with(json!({"schema": {"omit": ["response_status_code"]}})));
+    reject(with(json!({"schema": {"rename": {"client_ip": "ip"}}})));
+    reject(with(unrepresentable_derived));
+
+    // Constraints that stay runtime-only must be documented as such rather than
+    // silently missing from the component.
+    let component = spec
+        .pointer("/components/schemas/ApiChargebackConfig")
+        .expect("ApiChargebackConfig exists");
+    let description = component["description"].as_str().expect("a description");
+    assert!(
+        description.contains("Runtime-only admission"),
+        "the component must name the constraints JSON Schema cannot express"
+    );
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `api_chargeback`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("api_chargeback docs section");
+    assert!(
+        section.contains("Precise admission rules"),
+        "docs/plugins.md must state the exact admission rules"
+    );
+    assert!(
+        section.contains("unsigned 64-bit integer"),
+        "docs/plugins.md must state the unsigned bound on the timer knobs"
+    );
+}
+
+/// Namespace-scoped Admin mutations that can carry
+/// `X-Ferrum-Namespace-Unserved: true` on an accepted response (issue #5447),
+/// paired with the success statuses the dispatcher can return for them.
+///
+/// This is `LIVE_APPLIED_CONFIG_MUTATIONS` minus the two `/namespaces` registry
+/// operations: the namespace header does not select a tenant on a global
+/// registry route, so `is_namespace_scoped_route` excludes them and they must
+/// never claim the header.
+///
+/// The deferred `202` is deliberately absent from every row. `?apply=async` is
+/// already a no-op for a namespace this process does not serve — the covering
+/// cursor is `None`, so the handler returns the synchronous success status — so
+/// `AcceptedDeferred` must not declare the header either.
+const UNSERVED_NAMESPACE_MARKED_MUTATIONS: &[(&str, &[&str])] = &[
+    ("batchCreate", &["201"]),
+    ("restoreConfig", &["200"]),
+    ("createProxy", &["201"]),
+    ("updateProxy", &["200"]),
+    ("deleteProxy", &["204"]),
+    ("createConsumer", &["201"]),
+    ("updateConsumer", &["200"]),
+    ("deleteConsumer", &["204"]),
+    ("updateConsumerCredentials", &["200"]),
+    ("appendConsumerCredential", &["200"]),
+    ("deleteConsumerCredentials", &["204"]),
+    ("deleteConsumerCredentialByIndex", &["200"]),
+    ("createPluginConfig", &["201"]),
+    ("updatePluginConfig", &["200"]),
+    ("deletePluginConfig", &["204"]),
+    ("createUpstream", &["201"]),
+    ("updateUpstream", &["200"]),
+    ("deleteUpstream", &["204"]),
+    ("createGatewayTrustBundle", &["201"]),
+    ("updateGatewayTrustBundle", &["200"]),
+    ("deleteGatewayTrustBundle", &["204"]),
+    ("submitApiSpec", &["201"]),
+    ("replaceApiSpec", &["200"]),
+    ("deleteApiSpec", &["204"]),
+];
+
+const UNSERVED_NAMESPACE_HEADER_NAME: &str = "X-Ferrum-Namespace-Unserved";
+const UNSERVED_NAMESPACE_HEADER_REF: &str = "#/components/headers/X-Ferrum-Namespace-Unserved";
+
+fn response_declares_unserved_namespace_header(
+    spec: &serde_json::Value,
+    response: &serde_json::Value,
+) -> bool {
+    let resolved = resolve_openapi_value(spec, response);
+    match resolved.pointer("/headers/X-Ferrum-Namespace-Unserved") {
+        Some(header) => {
+            header.get("$ref").and_then(serde_json::Value::as_str)
+                == Some(UNSERVED_NAMESPACE_HEADER_REF)
+        }
+        None => false,
+    }
+}
+
+/// The runtime stamps `X-Ferrum-Namespace-Unserved` from one place, so the
+/// spec must declare it on exactly the responses that place can reach:
+/// the accepted-mutation statuses of namespace-scoped routes, and nothing else.
+/// A generated client that never sees the header cannot detect the issue #5447
+/// silent failure, and a client told to expect it on a read or on a global
+/// route would branch on a field the gateway never sends.
+#[test]
+fn unserved_namespace_header_is_declared_on_exactly_the_accepted_namespace_mutations() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    // The runtime constant and the spec key must be the same field name.
+    let runtime_header = ferrum_edge::admin::NAMESPACE_UNSERVED_HEADER;
+    assert_eq!(
+        runtime_header, UNSERVED_NAMESPACE_HEADER_NAME,
+        "the runtime header name drifted from the documented spelling"
+    );
+    let header = spec
+        .pointer("/components/headers/X-Ferrum-Namespace-Unserved")
+        .expect("X-Ferrum-Namespace-Unserved header component");
+    assert_eq!(header["required"], false, "the marker is optional");
+    assert_eq!(
+        header["schema"]["enum"],
+        json!(["true"]),
+        "the gateway only ever sends the literal `true`"
+    );
+    let header_description = header["description"]
+        .as_str()
+        .expect("the header component is documented");
+    for expected in ["cp", "GET /status", "2xx"] {
+        assert!(
+            header_description.contains(expected),
+            "the header description must explain `{expected}`: {header_description}"
+        );
+    }
+
+    // Deferred 202 can never carry it: an unserved write captures no covering
+    // cursor, so `?apply=async` returns the synchronous success status instead.
+    let accepted_deferred = spec
+        .pointer("/components/responses/AcceptedDeferred")
+        .expect("AcceptedDeferred response component");
+    assert!(
+        !response_declares_unserved_namespace_header(&spec, accepted_deferred),
+        "an unserved write never reaches the deferred 202 path"
+    );
+
+    let mut expected_sites: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut table_ids = BTreeSet::new();
+    for (operation_id, success_statuses) in UNSERVED_NAMESPACE_MARKED_MUTATIONS {
+        assert!(
+            table_ids.insert(*operation_id),
+            "duplicate marked-mutation operationId `{operation_id}`"
+        );
+        let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
+        let responses = operation["responses"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{method} {path} responses is an object"));
+        for status in *success_statuses {
+            let response = responses.get(*status).unwrap_or_else(|| {
+                panic!("{method} {path} ({operation_id}) missing success status {status}")
+            });
+            assert!(
+                response_declares_unserved_namespace_header(&spec, response),
+                "{method} {path} ({operation_id}) {status} must declare \
+                 {UNSERVED_NAMESPACE_HEADER_REF}"
+            );
+            expected_sites.insert((operation_id.to_string(), (*status).to_string()));
+        }
+    }
+
+    // Inverse direction: nothing outside the table may claim the header. This is
+    // what keeps a read route, a `503`, or a `/namespaces` registry operation
+    // from documenting a marker the dispatcher will not send.
+    let mut documented_sites: BTreeSet<(String, String)> = BTreeSet::new();
+    for (path, path_item) in spec["paths"].as_object().expect("paths is an object") {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item {path} is an object"));
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = path_item.get(*method) else {
+                continue;
+            };
+            let operation_id = operation["operationId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method} {path} is missing operationId"));
+            let Some(responses) = operation["responses"].as_object() else {
+                continue;
+            };
+            for (status, response) in responses {
+                if response_declares_unserved_namespace_header(&spec, response) {
+                    documented_sites.insert((operation_id.to_string(), status.clone()));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        documented_sites, expected_sites,
+        "openapi.yaml declares the unserved-namespace marker somewhere the \
+         dispatcher does not stamp it (or is missing a site it does)"
+    );
+
+    // The header parameter that causes the condition must point at both
+    // mitigations so a client reading only the parameter still finds them.
+    let parameter_description = spec
+        .pointer("/components/parameters/XFerrumNamespace/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("XFerrumNamespace is documented");
+    assert!(
+        parameter_description.contains(UNSERVED_NAMESPACE_HEADER_NAME)
+            && parameter_description.contains("GET /status"),
+        "the namespace parameter must name the marker and the discovery surface: \
+         {parameter_description}"
+    );
+}
+
+/// `/health` and `/status` publish which namespace this process's data plane
+/// routes (issue #5447). The schema must stay a fixed three-field report on the
+/// authenticated tier: it is the one-call discovery surface downstream
+/// provisioning tooling branches on, so its shape is API, and it must never
+/// grow into a listing of the other tenants a shared database holds.
+#[test]
+fn health_namespace_serving_report_is_a_fixed_authenticated_detail_block() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let schema = spec
+        .pointer("/components/schemas/NamespaceServingReport")
+        .expect("NamespaceServingReport exists");
+    let fields: BTreeSet<String> = schema["properties"]
+        .as_object()
+        .expect("the schema declares properties")
+        .keys()
+        .cloned()
+        .collect();
+    let expected_fields: BTreeSet<String> =
+        ["active", "data_plane_single_namespace", "serving_scope"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    assert_eq!(
+        fields, expected_fields,
+        "the serving report must stay exactly the three documented fields"
+    );
+    assert_eq!(
+        schema["required"],
+        json!(["active", "serving_scope", "data_plane_single_namespace"])
+    );
+    assert_eq!(
+        schema["properties"]["active"]["type"],
+        json!(["string", "null"]),
+        "`active` is null when the process has no data plane"
+    );
+    assert_eq!(
+        schema["properties"]["serving_scope"]["enum"],
+        json!([
+            "single-namespace-data-plane",
+            "control-plane",
+            "no-data-plane"
+        ]),
+        "the serving scope must stay the closed set the runtime emits"
+    );
+    assert_eq!(
+        schema["properties"]["data_plane_single_namespace"]["type"],
+        json!("boolean")
+    );
+
+    // The runtime emits these labels from `NamespaceServingScope::as_str`; the
+    // handler assigns the block under `namespace` on `HealthResponse`.
+    let admin_source = include_str!("../../src/admin/mod.rs");
+    for label in [
+        "single-namespace-data-plane",
+        "control-plane",
+        "no-data-plane",
+    ] {
+        assert!(
+            admin_source.contains(&format!("\"{label}\"")),
+            "src/admin/mod.rs must emit the `{label}` serving-scope label"
+        );
+    }
+
+    let health = spec
+        .pointer("/components/schemas/HealthResponse")
+        .expect("HealthResponse exists");
+    assert_eq!(
+        health["properties"]["namespace"]["$ref"],
+        json!("#/components/schemas/NamespaceServingReport")
+    );
+    let description = health["description"]
+        .as_str()
+        .expect("HealthResponse documents its tiering");
+    assert!(
+        description.contains("`namespace`"),
+        "the detailed-tier field list must name the serving report: {description}"
+    );
 }

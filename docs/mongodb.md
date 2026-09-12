@@ -660,7 +660,7 @@ FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up \
   FERRUM_DB_TYPE=mongodb \
   FERRUM_DB_URL="mongodb://localhost:27017" \
   FERRUM_MONGO_DATABASE=ferrum \
-  ferrum-edge
+  ferrum-edge run
 ```
 
 `FERRUM_MIGRATE_ACTION=status` connects and compares live indexes with that

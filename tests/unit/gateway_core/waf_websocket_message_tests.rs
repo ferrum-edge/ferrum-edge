@@ -257,7 +257,7 @@ async fn monitor_mode_never_closes_a_session() {
 
 #[tokio::test]
 async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
-    let (logs, guard) = crate::unit::plugins::plugin_utils::capture_logs();
+    let (logs, guard) = crate::unit::plugins::plugin_utils::capture_debug_logs();
     let mut config = enforcing_request_rule();
     config["mode"] = json!("monitor");
     config["log_to_stdout"] = json!(true);
@@ -270,21 +270,22 @@ async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
 
     assert_eq!(outgoing, original);
     let captured = logs.contents();
+    let hit = captured
+        .lines()
+        .find(|line| {
+            line.contains("DEBUG") && line.contains("WAF rule matched on a WebSocket message")
+        })
+        .expect("each WebSocket rule hit retains its debug diagnostic");
     assert!(
-        captured.contains("WAF rule matched on a WebSocket message"),
-        "expected per-message warning: {captured}"
-    );
-    assert!(
-        captured.contains("action=monitored"),
+        hit.contains("action=monitored"),
         "monitor-mode hit must log monitored effective action: {captured}"
     );
     assert!(
-        captured.contains("rule_action=enforce"),
+        hit.contains("rule_action=enforce"),
         "configured enforce action must remain visible: {captured}"
     );
     assert!(
-        !captured
-            .split_whitespace()
+        !hit.split_whitespace()
             .any(|field| field.trim_end_matches(',') == "action=block"),
         "must not log the legacy exact action=block field: {captured}"
     );
@@ -292,7 +293,7 @@ async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
 
 #[tokio::test]
 async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
-    let (logs, guard) = crate::unit::plugins::plugin_utils::capture_logs();
+    let (logs, guard) = crate::unit::plugins::plugin_utils::capture_debug_logs();
     let mut config = enforcing_request_rule();
     config["log_to_stdout"] = json!(true);
     let plugins = vec![waf(config)];
@@ -304,16 +305,18 @@ async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
 
     assert_policy_close(&outgoing);
     let captured = logs.contents();
+    let hit = captured
+        .lines()
+        .find(|line| {
+            line.contains("DEBUG") && line.contains("WAF rule matched on a WebSocket message")
+        })
+        .expect("each WebSocket rule hit retains its debug diagnostic");
     assert!(
-        captured.contains("WAF rule matched on a WebSocket message"),
-        "expected per-message warning: {captured}"
-    );
-    assert!(
-        captured.contains("action=blocked"),
+        hit.contains("action=blocked"),
         "enforce-mode hit must log blocked effective action: {captured}"
     );
     assert!(
-        captured.contains("rule_action=enforce"),
+        hit.contains("rule_action=enforce"),
         "configured enforce action must remain visible: {captured}"
     );
 }
@@ -720,4 +723,74 @@ async fn anomaly_scoring_is_evaluated_per_message() {
     let both = Message::Text("alpha and beta".into());
     let outgoing = relay_to_backend(&plugins, &ctx, both).await;
     assert_policy_close(&outgoing);
+}
+
+// ── Issue #5118: fp filters govern non-UTF-8 binary messages too ────────────
+
+/// A binary message carrying non-UTF-8 bytes went down the byte-match path,
+/// which recorded the hit without consulting per-rule `fp_filters` or global
+/// `fp_capture_filters`. WebSocket messages carry no Content-Type, so this is
+/// the ordinary shape of binary WebSocket traffic, not an edge case.
+fn fp_filtered_request_rule(global: bool) -> Value {
+    let mut rule = json!({
+        "id": "CUSTOM-WS-FP",
+        "name": "prohibited request token",
+        "category": "custom",
+        "target": "body_text",
+        "match_kind": "contains",
+        "pattern": PROHIBITED,
+        "action": "enforce"
+    });
+    let mut config = json!({ "include_default_rules": false });
+    if global {
+        config["global_exemptions"] = json!({ "fp_capture_filters": ["allow-note"] });
+    } else {
+        rule["fp_filters"] = json!(["allow-note"]);
+    }
+    config["custom_rules"] = json!([rule]);
+    config
+}
+
+fn non_utf8_message(payload: &str) -> Message {
+    let mut bytes = payload.as_bytes().to_vec();
+    bytes.push(0xff);
+    Message::Binary(bytes.into())
+}
+
+#[tokio::test]
+async fn non_utf8_binary_message_honours_per_rule_fp_filters() {
+    let plugins = vec![waf(fp_filtered_request_rule(false))];
+    let ctx = upgrade_ctx("/ws");
+    let filtered = format!("{PROHIBITED} allow-note");
+
+    let outgoing = relay_to_backend(&plugins, &ctx, non_utf8_message(&filtered)).await;
+
+    assert_eq!(
+        outgoing,
+        non_utf8_message(&filtered),
+        "a filtered binary message must be forwarded verbatim"
+    );
+}
+
+#[tokio::test]
+async fn non_utf8_binary_message_honours_global_fp_capture_filters() {
+    let plugins = vec![waf(fp_filtered_request_rule(true))];
+    let ctx = upgrade_ctx("/ws");
+    let filtered = format!("{PROHIBITED} allow-note");
+
+    let outgoing = relay_to_backend(&plugins, &ctx, non_utf8_message(&filtered)).await;
+
+    assert_eq!(outgoing, non_utf8_message(&filtered));
+}
+
+#[tokio::test]
+async fn a_non_utf8_binary_filter_miss_is_still_blocked() {
+    for global in [false, true] {
+        let plugins = vec![waf(fp_filtered_request_rule(global))];
+        let ctx = upgrade_ctx("/ws");
+
+        let outgoing = relay_to_backend(&plugins, &ctx, non_utf8_message(PROHIBITED)).await;
+
+        assert_policy_close(&outgoing);
+    }
 }

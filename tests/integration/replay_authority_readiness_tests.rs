@@ -21,6 +21,8 @@
 //!   contract, and
 //! - `/live` staying healthy throughout.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -105,7 +107,7 @@ fn admin_state() -> AdminState {
 
 async fn start_admin() -> (String, tokio::sync::watch::Sender<bool>) {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind admin");
     let addr = listener.local_addr().expect("admin addr");
@@ -195,7 +197,7 @@ async fn spawn_gated_replay_redis(
 ) -> (u16, Arc<AtomicBool>, tokio::sync::oneshot::Sender<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind fake redis");
     let port = listener.local_addr().expect("local addr").port();

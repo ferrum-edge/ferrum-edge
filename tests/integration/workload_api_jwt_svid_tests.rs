@@ -34,6 +34,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::common::workload_api_socket_paths::{admitted_socket_base, workload_api_socket_path};
+
 use async_trait::async_trait;
 use ferrum_edge::identity::attestation::{AttestError, Attestor, PeerInfo, WorkloadIdentity};
 use ferrum_edge::identity::ca::{CertificateAuthority, bootstrap, internal};
@@ -150,16 +152,15 @@ fn internal_ca_with_jwt_source(source: &JwtKeySource) -> Arc<internal::InternalC
     )
 }
 
-/// A unique socket path under the system temp dir.
+/// A unique socket path this test binary owns.
 ///
-/// Deliberately short: `sockaddr_un.sun_path` is ~104 bytes, and a long
-/// per-test path is the classic reason a UDS test fails with a bare `EINVAL`.
+/// Not the raw system temp directory: the production ancestor policy refuses a
+/// symlinked directory component, and the ordinary macOS `TMPDIR` lives under
+/// `/var`, which is a symlink. The shared helper resolves a canonical parent
+/// that also leaves room for the private staging directory inside
+/// `sockaddr_un.sun_path` (issue #4984).
 fn socket_path(label: &str) -> PathBuf {
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock is after the epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("fe-wl-{label}-{}.sock", unique % 1_000_000_000))
+    workload_api_socket_path(label)
 }
 
 /// Dial a Unix socket with the same connector shape the production client uses.
@@ -745,12 +746,17 @@ async fn shutdown_does_not_unlink_an_artifact_that_replaced_our_socket() {
 async fn a_socket_path_under_an_untrusted_ancestor_is_refused_before_bind() {
     // Validation covers every directory component, so a pristine parent under a
     // world-writable ancestor is still refused — and nothing is created.
-    let base = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir canonicalizes");
+    // `<base>/anc-<n>/p` is the deepest parent any fixture here builds, so the
+    // base is chosen with room for both components: the socket must be refused
+    // for the world-writable ancestor below, not for a parent too long to leave
+    // the private staging directory room inside `sockaddr_un.sun_path`.
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock is after the epoch")
         .as_nanos();
-    let ancestor = base.join(format!("fe-wl-anc-{}", unique % 1_000_000_000));
+    let ancestor_name = format!("anc-{}", unique % 1_000_000);
+    let base = admitted_socket_base(1 + ancestor_name.len() + 2);
+    let ancestor = base.join(ancestor_name);
     let parent = ancestor.join("p");
     std::fs::create_dir_all(&parent).expect("create ancestor/parent");
     {
@@ -936,12 +942,15 @@ async fn publication_leaves_no_staging_artifact_behind() {
     // afterwards — no `.fw-*` directory, no staged alias, no half-published
     // inode. The lock is intentionally retained so blocked flock waiters and a
     // newcomer can never coordinate through different inodes at one pathname.
-    let base = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir canonicalizes");
+    // A dedicated parent, so the directory listing below sees only what the
+    // listener published. Sized through the shared helper for the same reason
+    // as every other socket here: a canonical base with staging headroom.
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock is after the epoch")
         .as_nanos();
-    let parent = base.join(format!("fe-wl-stg-{}", unique % 1_000_000_000));
+    let parent_name = format!("stg-{}", unique % 1_000_000);
+    let parent = admitted_socket_base(1 + parent_name.len()).join(parent_name);
     std::fs::create_dir(&parent).expect("create the socket's parent directory");
     {
         use std::os::unix::fs::PermissionsExt;

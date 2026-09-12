@@ -119,7 +119,9 @@ permissions:
 
 concurrency:
   group: fips-build-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  cancel-in-progress: true
+  # Pushes to main are never cancelled: at most one newer push waits behind
+  # the run in flight, so main converges on a complete exact-SHA FIPS verdict.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -414,7 +416,9 @@ jobs:
           shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
           cache-directories: ${{ github.workspace }}/.cache/sccache
           cache-on-failure: "true"
-          save-if: ${{ github.event.pull_request.head.repo.fork != true }}
+          # Main-only saves: the FIPS gate no longer runs on most pull
+          # requests, and PR-scoped saves were evicting the shared lanes.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Record rust-cache restore
         if: github.event.inputs.force_cold_cache != 'true'
@@ -426,7 +430,7 @@ jobs:
             --name rust-cache \
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips-contract save-if=non-fork fork=${FORK_PR:-false}"
+            --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips-contract save-if=main-push fork=${FORK_PR:-false}"
 
       # The stable cache crosses runners. AWS-LC's CMake build tree does not:
       # an incremental rerun can feed the restored libbcm archive back through

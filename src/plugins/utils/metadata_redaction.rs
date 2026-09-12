@@ -77,6 +77,20 @@ pub const DEFAULT_SENSITIVE_METADATA_KEYS: &[&str] = &[
 /// request state; this prefix is the fail-closed observability contract.
 pub const INTERNAL_ONLY_METADATA_KEY_PREFIX: &str = "_dedup_";
 
+/// Request-private staging key holding the COMPLETE validated gRPC-Web request
+/// trailer block as a base64 JSON array.
+///
+/// It is a transport container, not observability metadata: the client's own
+/// trailing metadata (which may carry application credentials) is inside it, and
+/// the names are embedded in the encoded value rather than being the outer key,
+/// so name-based sensitive classification cannot reach them and base64 is
+/// reversible. The response-side counterpart `grpc_web_shadowed_trailers` is
+/// already treated as sensitive for exactly this reason; the request container
+/// is omitted outright, which is the stronger contract. Owner is
+/// `crate::plugins::grpc_web`, which reads it from `ctx.metadata` at dispatch
+/// only — never from a log projection.
+pub const INTERNAL_ONLY_GRPC_WEB_REQUEST_TRAILERS_KEY: &str = "grpc_web.request_trailers";
+
 /// Prefix reserved for internal mesh metric plans and lifecycle markers.
 pub const INTERNAL_ONLY_MESH_METRICS_PREFIX: &str = "mesh.metrics.";
 
@@ -304,7 +318,16 @@ pub fn is_mesh_metrics_internal_metadata_key(key: &str) -> bool {
 /// [`is_dedup_internal_metadata_key`] for the earlier in-process strip and
 /// retains `mesh.metrics.*` until built-in observers consume it.
 pub fn is_internal_only_metadata_key(key: &str) -> bool {
-    is_mesh_metrics_internal_metadata_key(key) || is_dedup_internal_metadata_key(key)
+    is_mesh_metrics_internal_metadata_key(key)
+        || is_dedup_internal_metadata_key(key)
+        || is_grpc_web_request_trailers_metadata_key(key)
+}
+
+/// Returns true for the gRPC-Web request-trailer staging container
+/// (ASCII case-insensitive). See
+/// [`INTERNAL_ONLY_GRPC_WEB_REQUEST_TRAILERS_KEY`].
+pub fn is_grpc_web_request_trailers_metadata_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case(INTERNAL_ONLY_GRPC_WEB_REQUEST_TRAILERS_KEY)
 }
 
 /// Strip request-deduplication lifecycle keys before building an in-process

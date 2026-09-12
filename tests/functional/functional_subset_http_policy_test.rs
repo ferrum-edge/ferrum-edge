@@ -8,6 +8,8 @@
 //! Run: `cargo build --bin ferrum-edge && cargo test --test functional_tests \
 //!   functional_subset_http_policy -- --ignored --nocapture`
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::{
     H2Step, MatchHeaders, ScriptedH2Backend, ScriptedTlsBackend, TcpStep, TestCa, TlsConfig,
     reserve_port,
@@ -529,7 +531,8 @@ fn assert_subset_preparation(config: &GatewayConfig, expected: ExpectedSubsetPre
             target.port,
             strip_len,
             target.path.as_deref(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             backend_url,
             format!(
@@ -845,7 +848,7 @@ async fn spawn_holding_backend() -> (
     watch::Sender<bool>,
     JoinHandle<BackendTaskResult>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind holding backend");
     let port = listener.local_addr().expect("backend addr").port();
@@ -919,7 +922,7 @@ async fn spawn_status_script_backend(
     watch::Sender<bool>,
     JoinHandle<BackendTaskResult>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind status backend");
     let port = listener.local_addr().expect("backend addr").port();

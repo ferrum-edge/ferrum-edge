@@ -18,7 +18,10 @@
 //!   `large_window = true`, so a handful of header bits can ask it for a 1 GiB
 //!   ring buffer. RFC 7932 caps the `br` window at 24 bits, and a peer that
 //!   named `br` has not agreed to anything larger. `gzip` is decoded through
-//!   `MultiGzDecoder`, whose DEFLATE window RFC 1951 fixes at 32 KiB.
+//!   `flate2::bufread::GzDecoder`, whose DEFLATE window RFC 1951 fixes at
+//!   32 KiB. Each gzip coding must contain exactly one complete member; any
+//!   remaining bytes, including another valid member, are rejected. Request
+//!   normalization and both representation gates share this rule.
 //! * **Charged before allocation.** Every growth of the output buffer is
 //!   reserved against an aggregate budget BEFORE the allocator is asked for it,
 //!   and topped up to the capacity the allocator actually returned. The active
@@ -100,8 +103,8 @@ pub(crate) fn projected_decode_output_capacity(decoded_len: usize, limit: usize)
 ///
 /// Derivation, from the locked sources:
 ///
-/// * `flate2::read::MultiGzDecoder::new` wraps the input in
-///   `std::io::BufReader::new` — one 8 KiB buffer (`flate2` `src/gz/read.rs`);
+/// * `flate2::bufread::GzDecoder` reads the input slice directly, without an
+///   additional `std::io::BufReader` allocation;
 /// * `flate2`'s `Decompress` holds a boxed `miniz_oxide` `InflateState`
 ///   (`flate2` `src/ffi/miniz_oxide.rs`). `InflateState` is
 ///   dominated by `dict: [u8; TINFL_LZ_DICT_SIZE]` = 32 KiB plus a
@@ -109,8 +112,8 @@ pub(crate) fn projected_decode_output_capacity(decoded_len: usize, limit: usize)
 ///   `[i16; 1024] + [i16; 576]` = 3,200 B each (`miniz_oxide`
 ///   `src/inflate/core.rs`), i.e. well under 16 KiB of tables and scalars.
 ///
-/// That is on the order of 56 KiB. DEFLATE's window is fixed at 32 KiB by
-/// RFC 1951, so nothing in the stream can enlarge it. `256 KiB` is a ~4.5x
+/// That is on the order of 48 KiB. DEFLATE's window is fixed at 32 KiB by
+/// RFC 1951, so nothing in the stream can enlarge it. `256 KiB` is a >5x
 /// margin for allocator overhead and for a future `miniz_oxide` that grows its
 /// state, and is still small enough that gzip decodes are not rationed.
 pub(crate) const GZIP_DECODER_SCRATCH_BYTES: usize = 256 * 1024;
@@ -206,7 +209,7 @@ pub(crate) enum ChargedDecodeError {
     /// A coding token this decoder does not implement.
     Unsupported,
     /// A supported coding whose stream is malformed, truncated, Large Window
-    /// Brotli, or followed by trailing bytes.
+    /// Brotli, or followed by trailing bytes (including another gzip member).
     Malformed,
     /// The decode would have produced more than the caller's ceiling.
     TooLarge,
@@ -411,13 +414,22 @@ pub(crate) fn decode_one_coding(
     // capacity refusal alike — which is what returns the codec's heap charge
     // before the next pass asks for its own.
     match coding {
-        SupportedCoding::Gzip => read_decoded_bounded(
-            flate2::read::MultiGzDecoder::new(data).take(take),
-            limit,
-            concurrent_bytes,
-            reservation,
-            budget,
-        ),
+        SupportedCoding::Gzip => {
+            // BufRead over the slice leaves all bytes after the first member
+            // visible, without read-ahead hiding a suffix in an internal buffer.
+            let mut decoder = flate2::bufread::GzDecoder::new(data);
+            let decoded = read_decoded_bounded(
+                (&mut decoder).take(take),
+                limit,
+                concurrent_bytes,
+                reservation,
+                budget,
+            )?;
+            if !decoder.into_inner().is_empty() {
+                return Err(ChargedDecodeError::Malformed);
+            }
+            Ok(decoded)
+        }
         SupportedCoding::Brotli => read_decoded_bounded(
             StrictBrotliReader::new(data).take(take),
             limit,
@@ -426,4 +438,109 @@ pub(crate) fn decode_one_coding(
             budget,
         ),
     }
+}
+
+/// Whether `decoded_len` is within `ratio`:1 of `raw_len`.
+///
+/// Mirrors [`crate::plugins::utils::content_encoding`]'s amplification rule
+/// exactly, including its two deliberate exemptions: a zero ratio disables the
+/// check, and a zero-length input has no meaningful ratio (the absolute
+/// ceilings still apply to both). An overflowing product means the absolute
+/// ceiling is the binding bound, so the ratio abstains rather than wrapping
+/// into a smaller one.
+fn amplification_is_within_bounds(raw_len: usize, decoded_len: usize, ratio: u32) -> bool {
+    if ratio == 0 || raw_len == 0 {
+        return true;
+    }
+    match raw_len.checked_mul(ratio as usize) {
+        Some(limit) => decoded_len <= limit,
+        None => true,
+    }
+}
+
+/// Decode an ordered `#content-coding` list into one plaintext buffer with the
+/// strict codecs and the aggregate charge this module owns.
+///
+/// This is the charged counterpart of
+/// [`crate::plugins::utils::content_encoding::decode_content_encoding`], for the
+/// one caller that REWRITES the request rather than merely inspecting it:
+/// `compression`'s opt-in `decompress_request` normalizer
+/// (`GHSA-q76p-952x-7c3v`). That normalizer decodes unauthenticated upload bytes
+/// on the request path, so it needs exactly what the representation gates need —
+/// Large-Window-refusing `br`, and every byte of the decode's working set
+/// reserved against `FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES` BEFORE it is
+/// allocated:
+///
+/// * the ACTIVE decoder's own heap ceiling, charged before the decoder is
+///   constructed (a `br` decoder sizes its ring buffer from the stream header
+///   before it emits one output byte);
+/// * every growth of the output buffer, topped up to the capacity the allocator
+///   actually returned;
+/// * on a stacked list, the previous pass's still-resident buffer concurrently
+///   with the next pass's output.
+///
+/// `codings` are canonical lowercase tokens in APPLICATION order (the order the
+/// field lists them); they are undone in reverse. The caller has already parsed
+/// the field, bounded the layer COUNT, and resolved `identity`, so an
+/// `identity` member here is an unsupported coding rather than a no-op.
+///
+/// The charge is released when this returns: the reservation is local and the
+/// plaintext is handed back as a plain `Vec`. That is the DECODE working set
+/// bound the advisory names — the surviving plaintext is separately bounded per
+/// request by `max_decompressed_request_size` and the wire body limit, and the
+/// buffered-request budget charges the body the caller publishes.
+pub(crate) fn decode_charged_content_coding_chain(
+    codings: &[String],
+    body: &[u8],
+    limits: crate::plugins::utils::content_encoding::DecodeLimits,
+    budget: BudgetRef<'_>,
+) -> Result<Vec<u8>, ChargedDecodeError> {
+    if codings.is_empty() {
+        // The caller resolved `identity`-only lists before reaching here, so an
+        // empty list means the parse and this decode disagreed. Fail closed.
+        return Err(ChargedDecodeError::Malformed);
+    }
+
+    let ratio = limits.max_amplification_ratio;
+    let mut reservation = ResponseBufferReservation::new();
+    let mut current: Option<Vec<u8>> = None;
+    let mut cumulative = 0usize;
+    for coding in codings.iter().rev() {
+        // The previous pass's buffer is this pass's input and stays resident for
+        // the whole of it, so it is charged concurrently with this pass's
+        // output. The FIRST pass reads straight out of the caller's wire bytes,
+        // which this decode does not own.
+        let (input, concurrent) = match current.as_ref() {
+            Some(previous) => (previous.as_slice(), previous.capacity()),
+            None => (body, 0),
+        };
+        let input_len = input.len();
+        let decoded = decode_one_coding(
+            coding,
+            input,
+            limits.max_decoded_bytes,
+            concurrent,
+            &mut reservation,
+            budget,
+        )?;
+        if !amplification_is_within_bounds(input_len, decoded.len(), ratio) {
+            return Err(ChargedDecodeError::TooLarge);
+        }
+        cumulative = prospective_retained_len(cumulative, decoded.len());
+        if cumulative > limits.max_cumulative_bytes {
+            return Err(ChargedDecodeError::TooLarge);
+        }
+        current = Some(decoded);
+    }
+
+    let Some(plaintext) = current else {
+        // Unreachable: the list is non-empty and every pass assigns.
+        return Err(ChargedDecodeError::Malformed);
+    };
+    // End-to-end amplification against the ORIGINAL coded body, which a
+    // per-layer check alone does not bound for a stacked chain.
+    if !amplification_is_within_bounds(body.len(), plaintext.len(), ratio) {
+        return Err(ChargedDecodeError::TooLarge);
+    }
+    Ok(plaintext)
 }

@@ -351,6 +351,37 @@ def shard_plan(reason: str, shards: set[str], plugin_gate: bool) -> CoveragePlan
 
 
 def select_plan(event_name: str, changed_files: list[str]) -> CoveragePlan:
+    """Coverage policy: instrumented shards run on `main`, not on pull requests.
+
+    Coverage is a regression backstop (absolute floors with headroom), so it
+    belongs with the other long-running main-only validation: a commit that
+    trips a floor turns `main` red and is simply not releasable. A pull
+    request therefore skips every instrumented shard unless it edits the
+    coverage controllers themselves, in which case the full matrix runs so
+    the tooling change is exercised before it lands. Pushes to `main`,
+    schedules, and manual dispatches always run the full matrix.
+    `select_scoped_plan` keeps the path-scoped shard classification for
+    diagnostics and for any future opt-in.
+    """
+
+    if not is_path_gated_event(event_name):
+        return full_plan(f"full coverage is required for {event_name}")
+    if not changed_files:
+        return full_plan(
+            "no changed files were detected; defaulting to full coverage"
+        )
+    if any(not is_well_formed_repo_path(path) for path in changed_files):
+        return full_plan(
+            "malformed or hostile changed-path transport; defaulting to full coverage"
+        )
+    if any(is_controller_path(path) for path in changed_files):
+        return full_plan("coverage controller files changed")
+    return skip_plan(
+        "instrumented coverage runs on every push to main; pull requests skip it"
+    )
+
+
+def select_scoped_plan(event_name: str, changed_files: list[str]) -> CoveragePlan:
     if not is_path_gated_event(event_name):
         return full_plan(f"full coverage is required for {event_name}")
 
@@ -474,7 +505,7 @@ def _expect_plan(
     shards: tuple[str, ...],
     plugin_gate: bool | None = None,
 ) -> str | None:
-    plan = select_plan(event_name, changed)
+    plan = select_scoped_plan(event_name, changed)
     if plan.mode != mode:
         return f"{event_name} {changed!r}: expected mode {mode}, selected {plan.mode}"
     if plan.shards != shards:
@@ -677,6 +708,32 @@ def self_test() -> int:
             failures.append(
                 "changed-file transport must preserve boundary whitespace for fail-closed validation"
             )
+    policy_cases = [
+        ("pull_request", ["src/admin/mod.rs"], "skip"),
+        ("pull_request", ["src/plugins/cors.rs"], "skip"),
+        ("pull_request", ["src/proxy/mod.rs", "Cargo.lock"], "skip"),
+        ("pull_request", ["docs/admin_api.md"], "skip"),
+        ("merge_group", ["src/admin/mod.rs"], "skip"),
+        ("pull_request", [".github/workflows/coverage.yml"], "full"),
+        ("pull_request", ["scripts/check_coverage_thresholds.py"], "full"),
+        ("pull_request", [".github/scripts/coverage_plan.py"], "full"),
+        ("pull_request", [], "full"),
+        ("pull_request", ["src/admin/../cli.rs"], "full"),
+        ("push", ["docs/admin_api.md"], "full"),
+        ("schedule", [], "full"),
+        ("workflow_dispatch", [], "full"),
+    ]
+    for event_name, changed, mode in policy_cases:
+        plan = select_plan(event_name, changed)
+        if plan.mode != mode:
+            failures.append(
+                f"policy {event_name} {changed!r}: expected mode {mode}, selected {plan.mode}"
+            )
+        if mode == "full" and plan.shards != CANONICAL_SHARD_ORDER:
+            failures.append(f"policy {event_name} {changed!r}: full plan must schedule every shard")
+        if mode == "skip" and plan.shards:
+            failures.append(f"policy {event_name} {changed!r}: skip plan must schedule no shard")
+
     for event_name, changed, mode, shards, plugin_gate in cases:
         failure = _expect_plan(event_name, changed, mode, shards, plugin_gate)
         if failure:
@@ -690,7 +747,7 @@ def self_test() -> int:
                 f"classified {sorted(classified or [])}"
             )
             continue
-        plan = select_plan("pull_request", [path])
+        plan = select_scoped_plan("pull_request", [path])
         if LIB_UNIT_SHARD not in plan.shards:
             failures.append(f"{path}: non-skip ownership plan omitted lib-unit")
         if set(plan.shards) - {LIB_UNIT_SHARD} != set(expected):
@@ -726,13 +783,13 @@ def self_test() -> int:
                 f"classifiable file {path} has no ownership-lock representative"
             )
 
-    admin_plan = select_plan("pull_request", ["src/admin/mod.rs"])
+    admin_plan = select_scoped_plan("pull_request", ["src/admin/mod.rs"])
     if PROTOCOLS_SHARD in admin_plan.shards or MESH_ROUTING_SHARD in admin_plan.shards:
         failures.append("admin diffs must not select protocol or mesh-routing shards")
     if ADMIN_API_SHARD not in admin_plan.shards or ADMIN_CONFIG_SHARD not in admin_plan.shards:
         failures.append("admin diffs must select both admin-bearing integration shards")
 
-    config_plan = select_plan("pull_request", ["src/config/env_config.rs"])
+    config_plan = select_scoped_plan("pull_request", ["src/config/env_config.rs"])
     if config_plan.mode != "full" or config_plan.shards != all_shards:
         failures.append("config diffs must select the full shard matrix")
     if ADMIN_API_SHARD not in config_plan.shards or ADMIN_CONFIG_SHARD not in config_plan.shards:
@@ -742,41 +799,41 @@ def self_test() -> int:
     if PROTOCOLS_SHARD not in config_plan.shards:
         failures.append("config diffs must keep the protocol shard")
 
-    identity_plan = select_plan("pull_request", ["src/identity/mod.rs"])
+    identity_plan = select_scoped_plan("pull_request", ["src/identity/mod.rs"])
     if identity_plan.mode != "full" or identity_plan.shards != all_shards:
         failures.append("identity diffs must select the full shard matrix")
 
-    tls_plan = select_plan("pull_request", ["src/tls/mod.rs"])
+    tls_plan = select_scoped_plan("pull_request", ["src/tls/mod.rs"])
     if not MESH_SHARDS.issubset(tls_plan.shards) or PROTOCOLS_SHARD not in tls_plan.shards:
         failures.append("tls diffs must select mesh and protocol shards")
     if any(shard in tls_plan.shards for shard in ADMIN_SHARDS):
         failures.append("tls diffs must not select admin shards")
 
-    dns_plan = select_plan("pull_request", ["src/dns/mod.rs"])
+    dns_plan = select_scoped_plan("pull_request", ["src/dns/mod.rs"])
     if dns_plan.mode != "full" or dns_plan.shards != all_shards:
         failures.append("dns diffs must select the full shard matrix")
 
-    grpc_plan = select_plan("pull_request", ["src/grpc/cp_server.rs"])
+    grpc_plan = select_scoped_plan("pull_request", ["src/grpc/cp_server.rs"])
     if grpc_plan.mode != "full" or grpc_plan.shards != all_shards:
         failures.append("grpc diffs must select the full shard matrix")
 
-    pool_plan = select_plan("pull_request", ["src/pool/mod.rs"])
+    pool_plan = select_scoped_plan("pull_request", ["src/pool/mod.rs"])
     if pool_plan.mode != "full" or pool_plan.shards != all_shards:
         failures.append("pool diffs must select the full shard matrix")
 
-    connection_pool_plan = select_plan("pull_request", ["src/connection_pool.rs"])
+    connection_pool_plan = select_scoped_plan("pull_request", ["src/connection_pool.rs"])
     if connection_pool_plan.mode != "full" or connection_pool_plan.shards != all_shards:
         failures.append("connection_pool diffs must select the full shard matrix")
 
-    proxy_plan = select_plan("pull_request", ["src/proxy/mod.rs"])
+    proxy_plan = select_scoped_plan("pull_request", ["src/proxy/mod.rs"])
     if proxy_plan.mode != "full" or proxy_plan.shards != all_shards:
         failures.append("proxy diffs must select the full shard matrix")
 
-    xds_plan = select_plan("pull_request", ["src/xds/mod.rs"])
+    xds_plan = select_scoped_plan("pull_request", ["src/xds/mod.rs"])
     if xds_plan.mode != "full" or xds_plan.shards != all_shards:
         failures.append("xds diffs must select the full shard matrix")
 
-    control_plane_plan = select_plan("pull_request", ["src/modes/control_plane.rs"])
+    control_plane_plan = select_scoped_plan("pull_request", ["src/modes/control_plane.rs"])
     if control_plane_plan.mode != "full" or control_plane_plan.shards != all_shards:
         failures.append("control_plane diffs must select the full shard matrix")
 
@@ -785,7 +842,7 @@ def self_test() -> int:
         "src/modes/database.rs",
         "src/modes/file.rs",
     ):
-        serving_plan = select_plan("pull_request", [mode_path])
+        serving_plan = select_scoped_plan("pull_request", [mode_path])
         if set(serving_plan.shards) != set(admin_and_protocol):
             failures.append(
                 f"{mode_path} diffs must select admin and protocol shards"
@@ -793,7 +850,7 @@ def self_test() -> int:
         if any(shard in serving_plan.shards for shard in MESH_SHARDS):
             failures.append(f"{mode_path} diffs must not select mesh shards")
 
-    config_sources_plan = select_plan(
+    config_sources_plan = select_scoped_plan(
         "pull_request", ["src/config_sources/k8s/core.rs"]
     )
     if ADMIN_CONFIG_SHARD not in config_sources_plan.shards:
@@ -803,21 +860,21 @@ def self_test() -> int:
     if ADMIN_API_SHARD in config_sources_plan.shards or PROTOCOLS_SHARD in config_sources_plan.shards:
         failures.append("config_sources diffs must not select admin-api or protocol shards")
 
-    mesh_plan = select_plan("pull_request", ["src/modes/mesh/config.rs"])
+    mesh_plan = select_scoped_plan("pull_request", ["src/modes/mesh/config.rs"])
     if any(shard in mesh_plan.shards for shard in ADMIN_SHARDS):
         failures.append("mesh diffs must not select admin shards")
     if PROTOCOLS_SHARD in mesh_plan.shards:
         failures.append("mesh diffs must not select the protocol shard")
 
-    protocol_plan = select_plan("pull_request", ["src/http3/server.rs"])
+    protocol_plan = select_scoped_plan("pull_request", ["src/http3/server.rs"])
     if any(shard in protocol_plan.shards for shard in ADMIN_SHARDS | MESH_SHARDS):
         failures.append("protocol diffs must not select admin or mesh shards")
 
-    plugin_only = select_plan("pull_request", ["src/plugins/cors.rs"])
+    plugin_only = select_scoped_plan("pull_request", ["src/plugins/cors.rs"])
     if plugin_only.shards != lib_unit or plugin_only.mode != "plugin":
         failures.append("plugin-only diffs must stay on plugin mode with lib-unit only")
 
-    mixed = select_plan("pull_request", ["src/plugins/cors.rs", "src/proxy/http.rs"])
+    mixed = select_scoped_plan("pull_request", ["src/plugins/cors.rs", "src/proxy/http.rs"])
     if mixed.mode == "plugin":
         failures.append("mixed plugin and core diffs must not stay in plugin mode")
     if mixed.mode != "full" or mixed.shards != all_shards:

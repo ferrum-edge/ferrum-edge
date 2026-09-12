@@ -39,6 +39,8 @@
 //!   cargo build --bin ferrum-edge
 //!   cargo test --test functional_tests -- --ignored --nocapture functional_overload
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
@@ -145,10 +147,9 @@ fn gateway_binary_path() -> &'static str {
 }
 
 async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Derive a per-spawn-attempt observability credential from the test process,
@@ -205,6 +206,7 @@ fn start_gateway(
     let binary_path = gateway_binary_path();
 
     let mut cmd = std::process::Command::new(binary_path);
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
@@ -528,7 +530,7 @@ async fn teardown(mut gw: std::process::Child, stop: Arc<AtomicBool>) {
 
 /// Spawn a slow backend. Returns (port, stop_flag, join_handle).
 async fn spawn_slow_backend(delay_ms: u64) -> (u16, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
@@ -565,8 +567,7 @@ async fn spawn_h3_overload_harness(yaml: String) -> (GatewayHarness, u16, tempfi
     let mut last_error = None;
     for attempt in 1..=STARTUP_ATTEMPTS {
         let reservation = reserve_port().await.expect("reserve HTTPS port");
-        let https_port = reservation.port;
-        drop(reservation);
+        let https_port = reservation.drop_and_take_port();
 
         let scratch = tempfile::tempdir().expect("frontend TLS scratch");
         let ca = TestCa::new("overload-h3-frontend").expect("frontend CA");

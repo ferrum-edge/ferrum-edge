@@ -12,6 +12,34 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- printf "%s:%s" .Values.image.repository (include "ferrum-mesh.imageTag" .) -}}
 {{- end -}}
 
+{{/* Promote only a tag, never an explicit digest, to the shell-capable image. */}}
+{{- define "ferrum-mesh.toolsImageTag" -}}
+{{- if hasSuffix "-ebpf-tools" . -}}
+{{- . -}}
+{{- else -}}
+{{- printf "%s-ebpf-tools" (trimSuffix "-ebpf" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* The injector's capture mode comes from its own env, not Ambient's mode. */}}
+{{- define "ferrum-mesh.injectorSidecarImage" -}}
+{{- $env := .Values.injector.env | default dict -}}
+{{- $mode := index $env "FERRUM_MESH_CAPTURE_MODE" | default "explicit" | toString | lower -}}
+{{- $override := index $env "FERRUM_INJECTOR_SIDECAR_IMAGE" | default "" | toString -}}
+{{- if $override -}}
+{{- $reference := first (splitList "@" $override) -}}
+{{- $component := last (splitList "/" $reference) -}}
+{{- if and (eq $mode "iptables") (not (and (contains ":" $component) (hasSuffix "-ebpf-tools" $component))) -}}
+{{- fail "iptables injection requires injector.env.FERRUM_INJECTOR_SIDECAR_IMAGE with a -ebpf-tools tag; an explicit image or digest is never rewritten" -}}
+{{- end -}}
+{{- $override -}}
+{{- else if eq $mode "iptables" -}}
+{{- printf "%s:%s" .Values.image.repository (include "ferrum-mesh.toolsImageTag" (include "ferrum-mesh.imageTag" .)) -}}
+{{- else -}}
+{{- include "ferrum-mesh.image" . -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 Chart-level imagePullSecrets block for a mesh pod spec. Emits nothing when
 image.pullSecrets is empty, so the default install renders no key at all. The
@@ -460,13 +488,12 @@ True when the bind is loopback (or empty, which the binary defaults to
 
 Decided from the PARSED address rather than a prefix string, so every spelling
 the runtime's `IpAddr::is_loopback()` accepts is classified the same way here:
-any address in 127.0.0.0/8, `::1` in any valid contraction, and the IPv4-mapped
-form of a 127/8 address (which the runtime canonicalizes to IPv4).
+any address in 127.0.0.0/8 and `::1` in any valid contraction. IPv4-mapped
+127/8 addresses remain IPv6, so the runtime does not classify them as loopback.
 */}}
 {{- define "ferrum-mesh.isLoopbackBind" -}}
 {{- $bind := . | toString | trim | trimPrefix "[" | trimSuffix "]" -}}
 {{- $v4 := include "ferrum-mesh.ipv4ToInt" $bind -}}
-{{- if eq $v4 "" -}}{{- $v4 = include "ferrum-mesh.ipv4MappedToInt" $bind -}}{{- end -}}
 {{- if eq $bind "" -}}
 true
 {{- else if ne $v4 "" -}}
@@ -510,7 +537,7 @@ trim, lowercase, accept true/false/1/0 only. Returns canonical "true" or
 */}}
 {{- define "ferrum-mesh.parseEnvBool" -}}
 {{- $field := .field -}}
-{{- $lower := lower (trim (toString (.value | default ""))) -}}
+{{- $lower := lower (trim (toString .value)) -}}
 {{- if not (has $lower (list "true" "false" "1" "0")) -}}
 {{- fail (printf "%s is not a valid boolean; expected true, false, 1, or 0" $field) -}}
 {{- end -}}

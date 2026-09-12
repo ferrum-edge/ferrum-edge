@@ -11,6 +11,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_credential_rotation
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{
     TestGateway, empty_digest_header, generate_hmac_signature, hmac_authority_from_url,
 };
@@ -38,7 +40,7 @@ impl RotationTestHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Backend echo server — hold the listener and pass it to the echo
         // task to avoid the drop-and-rebind race on the backend port.
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         let backend_port = backend_listener.local_addr()?.port();
         let backend_handle = start_echo_backend_on(backend_listener);
 

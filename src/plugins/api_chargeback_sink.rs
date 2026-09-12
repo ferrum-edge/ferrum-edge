@@ -21,6 +21,8 @@
 //! generation for every stable plugin-config ID — never a process-wide
 //! last-constructor-wins singleton.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc};
@@ -44,13 +46,14 @@ use url::Url;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finite_charge};
-use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
+use super::chargeback::{HttpBillingOutcome, http_billing_outcome, is_websocket_handshake};
 use super::utils::byte_budget::{
     GrowableProcessReservation, JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError,
     ProcessByteReservation, ReservedPayload, RetainedByteCeiling, materialize_reserved_buffer,
     materialize_reserved_payload, process_ceiling,
 };
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
+use super::utils::sink_loss::SinkLossReason;
 use super::utils::{
     BatchConfig, BatchingLogger, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
     HARD_MAX_BUFFER_MAX_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, LoggerHooks,
@@ -63,8 +66,8 @@ use crate::dns::DnsCacheResolver;
 use crate::observability_delivery::DeliveryWorkerControl;
 use crate::plugins::utils::log_schema::view::status_class;
 use crate::plugins::utils::log_schema::{
-    DerivedKind, FieldSpec, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
-    SummarySchema, TimestampFormat, resolve_schema,
+    DerivedKind, EmittedKeys, FieldSpec, MetadataPolicy, SchemaCapabilities, SchemaSerializable,
+    SchemaView, SummarySchema, TimestampFormat, resolve_schema,
 };
 use tokio::sync::mpsc;
 
@@ -78,8 +81,16 @@ const SNAPSHOT_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_FINALIZE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_FIELD_LEN: usize = 512;
 const MAX_METADATA_FIELD_LEN: usize = 256;
+/// Byte ceiling for the operator-configured `currency` and `pricing_version`
+/// labels.
+///
+/// Unlike request-derived fields these are copied into every `ChargeEvent`
+/// without bounding, so they are admitted at the same per-field ceiling the
+/// event budget reserves rather than truncated (truncation would merge two
+/// distinct pricing or currency identities into one exported row).
+const MAX_LABEL_LEN: usize = MAX_FIELD_LEN;
 /// Conservative ceiling for one owned [`ChargeEvent`] after field bounding.
-const MAX_CHARGE_EVENT_BYTES: usize = 96 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_FIELD_LEN * 4);
+const MAX_CHARGE_EVENT_BYTES: usize = 224 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_FIELD_LEN * 4);
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
 const SPOOL_JOB_WARN_EVERY: u64 = 100;
 /// Bound refreshes when another process mutates the shared spool during quota eviction.
@@ -418,11 +429,17 @@ impl BorrowedPendingDeltas<'_> {
         &self.events
     }
 
-    /// Give up ownership after a durable write: nothing is restored.
-    fn commit(mut self) -> usize {
-        let count = self.events.len();
-        self.events = Vec::new();
-        count
+    /// Give up ownership of the rows a durable write actually covered.
+    ///
+    /// A snapshot larger than one artifact is spooled as several bounded
+    /// artifacts, so a retry can land a prefix and then fail. Only that prefix
+    /// is released; the remainder is restored on drop and retried with its
+    /// event identity unchanged, so nothing is lost and nothing is charged
+    /// twice.
+    fn commit_prefix(&mut self, written: usize) -> usize {
+        let written = written.min(self.events.len());
+        self.events.drain(..written);
+        written
     }
 }
 
@@ -464,7 +481,7 @@ impl CompactSnapshotRecovery {
         // filesystem work begins. `attempt_lock` remains held until the
         // borrowed set commits or is restored, so another retry cannot mistake
         // the temporary empty vector for durable success.
-        let borrowed = self.borrow_pending();
+        let mut borrowed = self.borrow_pending();
         if borrowed.events().is_empty() {
             return true;
         }
@@ -475,7 +492,14 @@ impl CompactSnapshotRecovery {
             );
             return false;
         };
-        if let Err(error) = spool.write_events(borrowed.events()) {
+        let outcome = spool_snapshot_chunks(spool, borrowed.events());
+        let delivered = borrowed.commit_prefix(outcome.written);
+        if delivered > 0 {
+            self.metrics
+                .snapshot_emits_total
+                .fetch_add(delivered as u64, Ordering::Relaxed);
+        }
+        if let Some(error) = outcome.error {
             self.metrics.spool_available.store(false, Ordering::Release);
             self.metrics.record_failure(
                 FailureReason::Serialize,
@@ -485,16 +509,13 @@ impl CompactSnapshotRecovery {
                 plugin = PLUGIN_NAME,
                 generation = self.generation,
                 plugin_config_id = %self.plugin_config_id,
+                durable_rows = delivered,
                 error = %error,
-                "Chargeback sink compact snapshot recovery could not spool pending deltas"
+                "Chargeback sink compact snapshot recovery could not spool every pending delta"
             );
-            // `borrowed` drops here and restores the pending set.
+            // `borrowed` drops here and restores the undelivered remainder.
             return false;
         }
-        let delivered = borrowed.commit();
-        self.metrics
-            .snapshot_emits_total
-            .fetch_add(delivered as u64, Ordering::Relaxed);
         true
     }
 }
@@ -1575,7 +1596,7 @@ impl SchemaSerializable for ChargeEvent {
     fn serialize_metadata<S>(
         &self,
         _policy: &MetadataPolicy,
-        _emitted: &mut std::collections::HashSet<String>,
+        _emitted: &EmittedKeys<'_>,
         _map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -1592,6 +1613,11 @@ impl SchemaSerializable for ChargeEvent {
 struct SinkSummary {
     mode: SinkMode,
     pricing_version: String,
+    /// Structurally redacted ClickHouse endpoint (`scheme://host:port/redacted`).
+    ///
+    /// Never the spool owner's `sanitized_endpoint`: that value keeps the URL
+    /// path so durable ownership stays stable, and a path can carry a
+    /// credential the admin config projection redacts for non-admin readers.
     endpoint: String,
     database: String,
     table: String,
@@ -1673,6 +1699,67 @@ struct SinkRuntime {
 struct QueuedChargeEvent {
     event: ChargeEvent,
     lease: Arc<ByteLease>,
+    accounting: Option<Arc<PendingCharge>>,
+}
+
+/// One lifetime owner per newly emitted event; retries and spool handoffs share
+/// it. Cancellation runs Drop, but process termination cannot run this code.
+struct PendingCharge {
+    metrics: Arc<SinkMetrics>,
+    persisted: AtomicBool,
+}
+
+impl PendingCharge {
+    fn new(metrics: Arc<SinkMetrics>) -> Self {
+        metrics
+            .per_event_received_total
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics,
+            persisted: AtomicBool::new(false),
+        }
+    }
+
+    /// Owner for a row whose durable copy already exists.
+    ///
+    /// Snapshot mode writes the spool artifact *before* enqueueing the same
+    /// events for low-latency ClickHouse delivery, and the spool write is a
+    /// documented settlement point. The delivery attempt therefore must not be
+    /// able to report billing loss for a row that is durable and replayable:
+    /// the settled ledger records it as persisted at creation, and a later
+    /// `persist` after an acknowledged export is the usual idempotent no-op.
+    fn already_persisted(metrics: Arc<SinkMetrics>) -> Self {
+        metrics
+            .per_event_received_total
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .per_event_persisted_total
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics,
+            persisted: AtomicBool::new(true),
+        }
+    }
+
+    fn persist(&self) {
+        if !self.persisted.swap(true, Ordering::AcqRel) {
+            self.metrics
+                .per_event_persisted_total
+                .fetch_add(1, Ordering::Relaxed);
+            invalidate_status_cache();
+        }
+    }
+}
+
+impl Drop for PendingCharge {
+    fn drop(&mut self) {
+        if !self.persisted.load(Ordering::Acquire) {
+            self.metrics
+                .per_event_dropped_total
+                .fetch_add(1, Ordering::Relaxed);
+            invalidate_status_cache();
+        }
+    }
 }
 
 enum SpoolJob {
@@ -1996,12 +2083,19 @@ fn start_spool_delivery_with_clone_ceiling(
                             };
                             let (events, leases): (Vec<_>, Vec<_>) = queued_events
                                 .into_iter()
-                                .map(|queued| (queued.event, queued.lease))
+                                .map(|queued| (queued.event, (queued.lease, queued.accounting)))
                                 .unzip();
                             let spool = Arc::clone(&spool);
                             let metrics = Arc::clone(&metrics_for_worker);
                             let write_result = tokio::task::spawn_blocking(move || {
                                 let result = spool.write_events(&events);
+                                if result.is_ok() {
+                                    for (_, accounting) in &leases {
+                                        if let Some(accounting) = accounting {
+                                            accounting.persist();
+                                        }
+                                    }
+                                }
                                 // Keep retained bytes charged until the actual
                                 // blocking write finishes, even if its async
                                 // waiter is cancelled during a timed-out drain.
@@ -2018,7 +2112,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                     invalidate_status_cache();
                                 }
                                 Ok(Err(error)) => {
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         error = %error,
                                         "Chargeback sink async spool write failed"
@@ -2029,7 +2123,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                     );
                                 }
                                 Err(error) => {
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         error = %error,
                                         "Chargeback sink async spool write task failed"
@@ -2076,7 +2170,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                 }
                                 Ok(Err(error)) => {
                                     metrics.spool_available.store(false, Ordering::Release);
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         generation,
                                         error = %error,
@@ -2085,7 +2179,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                     job.restage();
                                 }
                                 Err(error) => {
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         generation,
                                         error = %error,
@@ -2487,88 +2581,183 @@ impl Drop for SnapshotLifecycle {
     }
 }
 
+/// Fixed-cardinality process totals. No policy IDs, retired runtimes, payloads,
+/// or credentials are retained. Late completions update these same atomics.
+static PROCESS_METRICS: OnceLock<SinkMetrics> = OnceLock::new();
+
+fn process_metrics() -> &'static SinkMetrics {
+    PROCESS_METRICS.get_or_init(SinkMetrics::default)
+}
+
+#[derive(Default)]
+struct SinkCounter {
+    value: AtomicU64,
+    process: Option<&'static SinkCounter>,
+}
+
+impl SinkCounter {
+    fn load(&self, ordering: Ordering) -> u64 {
+        self.value.load(ordering)
+    }
+
+    fn fetch_add(&self, value: u64, ordering: Ordering) -> u64 {
+        if let Some(process) = self.process {
+            process.value.fetch_add(value, ordering);
+        }
+        self.value.fetch_add(value, ordering)
+    }
+}
+
 struct SinkMetrics {
-    events_enqueued_total: AtomicU64,
-    events_exported_total: AtomicU64,
-    failures_total: AtomicU64,
+    per_event_dropped_total: SinkCounter,
+    per_event_persisted_total: SinkCounter,
+    per_event_received_total: SinkCounter,
+    events_enqueued_total: SinkCounter,
+    events_exported_total: SinkCounter,
+    failures_total: SinkCounter,
     failure_reasons: FailureReasonCounters,
     /// Observed queue depth at/above the high-water mark (telemetry only).
-    queue_high_water_hits_total: AtomicU64,
+    queue_high_water_hits_total: SinkCounter,
     /// High-water events whose durable spool-delivery handoff actually accepted
     /// the job. Saturation/closure of the delivery queue is counted by spool
     /// loss metrics instead.
-    queue_high_water_diversions_total: AtomicU64,
+    queue_high_water_diversions_total: SinkCounter,
     /// Events lost because the bounded in-memory channel was actually full and
     /// no durable overflow path accepted ownership. Never incremented for
     /// shutdown/unavailable admission.
-    queue_full_drops_total: AtomicU64,
-    queue_byte_budget_exhausted_total: AtomicU64,
-    spool_drops_total: AtomicU64,
+    queue_full_drops_total: SinkCounter,
+    queue_byte_budget_exhausted_total: SinkCounter,
+    spool_drops_total: SinkCounter,
     spool_available: AtomicBool,
-    spool_prepare_failures_total: AtomicU64,
-    spool_jobs_enqueued_total: AtomicU64,
-    spool_jobs_written_total: AtomicU64,
-    spool_jobs_lost_total: AtomicU64,
-    spool_events_lost_total: AtomicU64,
+    spool_prepare_failures_total: SinkCounter,
+    spool_jobs_enqueued_total: SinkCounter,
+    spool_jobs_written_total: SinkCounter,
+    spool_jobs_lost_total: SinkCounter,
+    spool_events_lost_total: SinkCounter,
     /// HTTP attempts made by bounded streaming replay, including isolation
     /// children after a permanent batch rejection.
-    spool_replay_attempts_total: AtomicU64,
+    spool_replay_attempts_total: SinkCounter,
     /// Rejected rows durably handed to the private dead-letter payload store.
-    spool_dead_letter_rows_total: AtomicU64,
+    spool_dead_letter_rows_total: SinkCounter,
     /// Retained spool records this identity does not own: pre-namespace layouts
     /// and namespaces orphaned by a destination/configuration change. Never
     /// replayed, never deleted; reported so operators can reconcile them.
     spool_unbound_files: AtomicU64,
     spool_unbound_namespaces: AtomicU64,
-    snapshot_emits_total: AtomicU64,
-    snapshot_overflow_spooled_total: AtomicU64,
-    snapshot_overflow_pending_total: AtomicU64,
-    snapshot_cardinality_rejections_total: AtomicU64,
+    snapshot_emits_total: SinkCounter,
+    snapshot_overflow_spooled_total: SinkCounter,
+    snapshot_overflow_pending_total: SinkCounter,
+    snapshot_cardinality_rejections_total: SinkCounter,
     last_success_at: AtomicI64,
     last_failure_at: AtomicI64,
     last_replay_at: AtomicI64,
     last_failure_reason: RwLock<Option<String>>,
     last_spool_job_warn_at: AtomicI64,
     latency: LatencyHistogram,
+    process_totals: bool,
 }
 
 impl Default for SinkMetrics {
     fn default() -> Self {
         Self {
-            events_enqueued_total: AtomicU64::new(0),
-            events_exported_total: AtomicU64::new(0),
-            failures_total: AtomicU64::new(0),
+            per_event_dropped_total: SinkCounter::default(),
+            per_event_persisted_total: SinkCounter::default(),
+            per_event_received_total: SinkCounter::default(),
+            events_enqueued_total: SinkCounter::default(),
+            events_exported_total: SinkCounter::default(),
+            failures_total: SinkCounter::default(),
             failure_reasons: FailureReasonCounters::default(),
-            queue_high_water_hits_total: AtomicU64::new(0),
-            queue_high_water_diversions_total: AtomicU64::new(0),
-            queue_full_drops_total: AtomicU64::new(0),
-            queue_byte_budget_exhausted_total: AtomicU64::new(0),
-            spool_drops_total: AtomicU64::new(0),
+            queue_high_water_hits_total: SinkCounter::default(),
+            queue_high_water_diversions_total: SinkCounter::default(),
+            queue_full_drops_total: SinkCounter::default(),
+            queue_byte_budget_exhausted_total: SinkCounter::default(),
+            spool_drops_total: SinkCounter::default(),
             spool_available: AtomicBool::new(false),
-            spool_prepare_failures_total: AtomicU64::new(0),
-            spool_jobs_enqueued_total: AtomicU64::new(0),
-            spool_jobs_written_total: AtomicU64::new(0),
-            spool_jobs_lost_total: AtomicU64::new(0),
-            spool_events_lost_total: AtomicU64::new(0),
-            spool_replay_attempts_total: AtomicU64::new(0),
-            spool_dead_letter_rows_total: AtomicU64::new(0),
+            spool_prepare_failures_total: SinkCounter::default(),
+            spool_jobs_enqueued_total: SinkCounter::default(),
+            spool_jobs_written_total: SinkCounter::default(),
+            spool_jobs_lost_total: SinkCounter::default(),
+            spool_events_lost_total: SinkCounter::default(),
+            spool_replay_attempts_total: SinkCounter::default(),
+            spool_dead_letter_rows_total: SinkCounter::default(),
             spool_unbound_files: AtomicU64::new(0),
             spool_unbound_namespaces: AtomicU64::new(0),
-            snapshot_emits_total: AtomicU64::new(0),
-            snapshot_overflow_spooled_total: AtomicU64::new(0),
-            snapshot_overflow_pending_total: AtomicU64::new(0),
-            snapshot_cardinality_rejections_total: AtomicU64::new(0),
+            snapshot_emits_total: SinkCounter::default(),
+            snapshot_overflow_spooled_total: SinkCounter::default(),
+            snapshot_overflow_pending_total: SinkCounter::default(),
+            snapshot_cardinality_rejections_total: SinkCounter::default(),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
             last_replay_at: AtomicI64::new(0),
             last_failure_reason: RwLock::new(None),
             last_spool_job_warn_at: AtomicI64::new(0),
             latency: LatencyHistogram::default(),
+            process_totals: false,
         }
     }
 }
 
 impl SinkMetrics {
+    fn event_counts(&self) -> (u64, u64, u64, u64) {
+        let persisted = self.per_event_persisted_total.load(Ordering::Relaxed);
+        let dropped = self.per_event_dropped_total.load(Ordering::Relaxed);
+        let received = self.per_event_received_total.load(Ordering::Relaxed);
+        let pending = received.saturating_sub(persisted).saturating_sub(dropped);
+        (received, persisted, dropped, pending)
+    }
+
+    fn event_accounting(&self) -> Value {
+        let (received, persisted, dropped, pending) = self.event_counts();
+        serde_json::json!({
+            "received_total": received,
+            "persisted_total": persisted,
+            "dropped_total": dropped,
+            "pending": pending,
+        })
+    }
+
+    fn with_process_totals() -> Self {
+        let mut metrics = Self {
+            process_totals: true,
+            ..Self::default()
+        };
+        let process = process_metrics();
+        metrics.per_event_dropped_total.process = Some(&process.per_event_dropped_total);
+        metrics.per_event_persisted_total.process = Some(&process.per_event_persisted_total);
+        metrics.per_event_received_total.process = Some(&process.per_event_received_total);
+        metrics.events_enqueued_total.process = Some(&process.events_enqueued_total);
+        metrics.events_exported_total.process = Some(&process.events_exported_total);
+        metrics.failures_total.process = Some(&process.failures_total);
+        metrics.queue_high_water_hits_total.process = Some(&process.queue_high_water_hits_total);
+        metrics.queue_high_water_diversions_total.process =
+            Some(&process.queue_high_water_diversions_total);
+        metrics.queue_full_drops_total.process = Some(&process.queue_full_drops_total);
+        metrics.queue_byte_budget_exhausted_total.process =
+            Some(&process.queue_byte_budget_exhausted_total);
+        metrics.spool_drops_total.process = Some(&process.spool_drops_total);
+        metrics.spool_prepare_failures_total.process = Some(&process.spool_prepare_failures_total);
+        metrics.spool_jobs_enqueued_total.process = Some(&process.spool_jobs_enqueued_total);
+        metrics.spool_jobs_written_total.process = Some(&process.spool_jobs_written_total);
+        metrics.spool_jobs_lost_total.process = Some(&process.spool_jobs_lost_total);
+        metrics.spool_events_lost_total.process = Some(&process.spool_events_lost_total);
+        metrics.spool_replay_attempts_total.process = Some(&process.spool_replay_attempts_total);
+        metrics.spool_dead_letter_rows_total.process = Some(&process.spool_dead_letter_rows_total);
+        metrics.snapshot_emits_total.process = Some(&process.snapshot_emits_total);
+        metrics.snapshot_overflow_spooled_total.process =
+            Some(&process.snapshot_overflow_spooled_total);
+        metrics.snapshot_overflow_pending_total.process =
+            Some(&process.snapshot_overflow_pending_total);
+        metrics.snapshot_cardinality_rejections_total.process =
+            Some(&process.snapshot_cardinality_rejections_total);
+        metrics.failure_reasons.network.process = Some(&process.failure_reasons.network);
+        metrics.failure_reasons.http_4xx.process = Some(&process.failure_reasons.http_4xx);
+        metrics.failure_reasons.http_5xx.process = Some(&process.failure_reasons.http_5xx);
+        metrics.failure_reasons.serialize.process = Some(&process.failure_reasons.serialize);
+        metrics.failure_reasons.tls.process = Some(&process.failure_reasons.tls);
+        metrics.failure_reasons.timeout.process = Some(&process.failure_reasons.timeout);
+        metrics
+    }
+
     fn record_spool_job_loss(&self, events: u64, reason: &'static str) {
         self.spool_jobs_lost_total.fetch_add(1, Ordering::Relaxed);
         self.spool_events_lost_total
@@ -2597,12 +2786,12 @@ impl SinkMetrics {
 
 #[derive(Default)]
 struct FailureReasonCounters {
-    network: AtomicU64,
-    http_4xx: AtomicU64,
-    http_5xx: AtomicU64,
-    serialize: AtomicU64,
-    tls: AtomicU64,
-    timeout: AtomicU64,
+    network: SinkCounter,
+    http_4xx: SinkCounter,
+    http_5xx: SinkCounter,
+    serialize: SinkCounter,
+    tls: SinkCounter,
+    timeout: SinkCounter,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2662,6 +2851,9 @@ impl SinkMetrics {
         self.last_success_at
             .store(unix_timestamp_seconds(), Ordering::Relaxed);
         self.latency.observe(elapsed.as_secs_f64());
+        if self.process_totals {
+            process_metrics().latency.observe(elapsed.as_secs_f64());
+        }
         invalidate_status_cache();
     }
 }
@@ -2850,6 +3042,15 @@ impl ApiChargebackSink {
         // dormant until commit_background_tasks; ACTIVE_SINKS stays unpublished.
         let parsed_url = parse_clickhouse_url(&self.config.clickhouse.url)?;
         let endpoint = sanitized_endpoint(&parsed_url);
+        // Diagnostic rendering for the JWT-authenticated status surface.
+        // `endpoint` keeps the URL path because the spool owner digest is a
+        // stable durable identity, but a ClickHouse URL path can itself carry a
+        // reusable credential and the admin plugin-config projection already
+        // withholds it from non-admin readers. Status therefore renders the
+        // structural `scheme://host:port/redacted` form every other
+        // HTTP-backed sink uses, so no reader recovers a path token the config
+        // read path redacts (GHSA-wq9r-g773-7c4q).
+        let status_endpoint = redacted_endpoint_url(&parsed_url);
         let insert_url = build_insert_url(&parsed_url, &self.config.clickhouse);
         // Structural, not substring: nothing from the INSERT query string is
         // copied into the diagnostic rendering.
@@ -2866,7 +3067,7 @@ impl ApiChargebackSink {
         } else {
             None
         };
-        let metrics = Arc::new(SinkMetrics::default());
+        let metrics = Arc::new(SinkMetrics::with_process_totals());
         let generation = NEXT_SINK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let spool = if self.config.spool.enabled {
             // Ownership binds the stable plugin-config id, the Ferrum namespace
@@ -2934,6 +3135,8 @@ impl ApiChargebackSink {
                 if snapshot_events_are_pre_spooled {
                     // Snapshot charges are already durably owned; acknowledge
                     // ownership without counting a fresh high-water diversion.
+                    // Their `PendingCharge` was created already settled, so
+                    // dropping it here cannot report billing loss either.
                     invalidate_status_cache();
                     return true;
                 }
@@ -2951,19 +3154,23 @@ impl ApiChargebackSink {
             on_failed_batch: Some(Arc::new(
                 move |batch: Arc<Vec<QueuedChargeEvent>>, error| {
                     if snapshot_events_are_pre_spooled {
-                        return;
+                        // The spool already owns every row in this batch, and
+                        // each carries an already-settled `PendingCharge`, so
+                        // a failed delivery is not a loss to re-own or report.
+                        return true;
                     }
                     if let Some(enqueue) = failed_enqueue.as_ref() {
                         // Terminal failure receives the shared batch handle; spool
                         // ownership continues under the same Arc without cloning
                         // ChargeEvent records.
-                        let _ = enqueue.try_enqueue(batch, "export failure");
+                        enqueue.try_enqueue(batch, "export failure")
                     } else {
-                        warn!(
+                        warn_sampled!(
                             plugin = PLUGIN_NAME,
                             error = %error,
                             "Chargeback sink export failed and spool is disabled; batch was lost"
                         );
+                        false
                     }
                 },
             )),
@@ -3018,7 +3225,7 @@ impl ApiChargebackSink {
             summary: SinkSummary {
                 mode: self.config.mode,
                 pricing_version: self.config.pricing_version.clone(),
-                endpoint,
+                endpoint: status_endpoint,
                 database: self.config.clickhouse.database.clone(),
                 table: self.config.clickhouse.table.clone(),
                 batch_size: self.config.batch.size,
@@ -3722,7 +3929,7 @@ pub fn render_prometheus() -> String {
     let sinks = active_sinks().load_full();
     let (pending_finalizations, pending_bytes, oldest_age, _full, _compact) =
         pending_snapshot_finalization_stats();
-    if sinks.is_empty() && pending_finalizations == 0 {
+    if sinks.is_empty() && pending_finalizations == 0 && PROCESS_METRICS.get().is_none() {
         return String::new();
     }
     render_prometheus_for_sinks(
@@ -3766,106 +3973,54 @@ pub fn active_spool_inventory_walks_for_tests() -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
-fn disabled_status_snapshot() -> Value {
-    let (pending, pending_bytes, oldest_age, _full, _compact) =
-        pending_snapshot_finalization_stats();
-    serde_json::json!({
-        "enabled": false,
-        "instance_count": 0,
-        "snapshot_finalizations_pending": pending,
-        "snapshot_finalizations_pending_bytes": pending_bytes,
-        "snapshot_finalizations_oldest_age_secs": oldest_age,
-        "snapshot_finalization_recovery_policy": SNAPSHOT_FINALIZATION_RECOVERY_POLICY,
-        "totals": {
-            "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0, "high_water_diversions_total": 0, "full_drops_total": 0},
-            "spool": {
-                "files": 0,
-                "bytes": 0,
-                "drops_total": 0,
-                "prepare_failures_total": 0,
-                "available": false
-            },
-            "export": {
-                "events_enqueued_total": 0,
-                "events_exported_total": 0,
-                "failures_total": 0
-            }
-        },
-        "instances": []
-    })
-}
-
 fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Value {
-    if sinks.is_empty() {
-        return disabled_status_snapshot();
-    }
-
     let instances: Vec<Value> = sinks
         .values()
         .map(|runtime| runtime.status_snapshot())
         .collect();
 
     let mut queue_depth = 0u64;
+    let mut queue_outstanding = 0u64;
     let mut queue_capacity = 0u64;
-    let mut high_water = 0u64;
-    let mut high_water_diversions = 0u64;
-    let mut full_drops = 0u64;
+    let high_water = process_metrics()
+        .queue_high_water_hits_total
+        .load(Ordering::Relaxed);
+    let high_water_diversions = process_metrics()
+        .queue_high_water_diversions_total
+        .load(Ordering::Relaxed);
+    let full_drops = process_metrics()
+        .queue_full_drops_total
+        .load(Ordering::Relaxed);
     let mut spool_files = 0u64;
     let mut spool_bytes = 0u64;
-    let mut spool_drops = 0u64;
-    let mut spool_prepare_failures = 0u64;
+    let spool_drops = process_metrics().spool_drops_total.load(Ordering::Relaxed);
+    let spool_prepare_failures = process_metrics()
+        .spool_prepare_failures_total
+        .load(Ordering::Relaxed);
     let mut spool_unbound_files = 0u64;
     let mut spool_unbound_namespaces = 0u64;
-    let mut spool_replay_attempts = 0u64;
-    let mut spool_dead_letter_rows = 0u64;
+    let spool_replay_attempts = process_metrics()
+        .spool_replay_attempts_total
+        .load(Ordering::Relaxed);
+    let spool_dead_letter_rows = process_metrics()
+        .spool_dead_letter_rows_total
+        .load(Ordering::Relaxed);
     let mut spool_enabled_any = false;
     let mut spool_all_available = true;
-    let mut events_enqueued = 0u64;
-    let mut events_exported = 0u64;
-    let mut failures = 0u64;
+    let events_enqueued = process_metrics()
+        .events_enqueued_total
+        .load(Ordering::Relaxed);
+    let events_exported = process_metrics()
+        .events_exported_total
+        .load(Ordering::Relaxed);
+    let failures = process_metrics().failures_total.load(Ordering::Relaxed);
 
     for runtime in sinks.values() {
         queue_depth = queue_depth.saturating_add(runtime.logger.queue_depth() as u64);
+        queue_outstanding =
+            queue_outstanding.saturating_add(runtime.logger.outstanding_count() as u64);
         queue_capacity = queue_capacity.saturating_add(runtime.logger.buffer_capacity() as u64);
-        high_water = high_water.saturating_add(
-            runtime
-                .metrics
-                .queue_high_water_hits_total
-                .load(Ordering::Relaxed),
-        );
-        high_water_diversions = high_water_diversions.saturating_add(
-            runtime
-                .metrics
-                .queue_high_water_diversions_total
-                .load(Ordering::Relaxed),
-        );
-        full_drops = full_drops.saturating_add(
-            runtime
-                .metrics
-                .queue_full_drops_total
-                .load(Ordering::Relaxed),
-        );
-        events_enqueued = events_enqueued.saturating_add(
-            runtime
-                .metrics
-                .events_enqueued_total
-                .load(Ordering::Relaxed),
-        );
-        events_exported = events_exported.saturating_add(
-            runtime
-                .metrics
-                .events_exported_total
-                .load(Ordering::Relaxed),
-        );
-        failures = failures.saturating_add(runtime.metrics.failures_total.load(Ordering::Relaxed));
-        spool_prepare_failures = spool_prepare_failures.saturating_add(
-            runtime
-                .metrics
-                .spool_prepare_failures_total
-                .load(Ordering::Relaxed),
-        );
-        spool_drops =
-            spool_drops.saturating_add(runtime.metrics.spool_drops_total.load(Ordering::Relaxed));
+
         let unbound_files = runtime.metrics.spool_unbound_files.load(Ordering::Relaxed);
         spool_unbound_files = spool_unbound_files.saturating_add(unbound_files);
         let unbound_ns = runtime
@@ -3873,18 +4028,7 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
             .spool_unbound_namespaces
             .load(Ordering::Relaxed);
         spool_unbound_namespaces = spool_unbound_namespaces.saturating_add(unbound_ns);
-        spool_replay_attempts = spool_replay_attempts.saturating_add(
-            runtime
-                .metrics
-                .spool_replay_attempts_total
-                .load(Ordering::Relaxed),
-        );
-        spool_dead_letter_rows = spool_dead_letter_rows.saturating_add(
-            runtime
-                .metrics
-                .spool_dead_letter_rows_total
-                .load(Ordering::Relaxed),
-        );
+
         if let Some(spool) = runtime.spool.as_ref() {
             spool_enabled_any = true;
             let stats = spool.cached_stats();
@@ -3899,15 +4043,17 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
     let (pending, pending_bytes, oldest_age, _full, _compact) =
         pending_snapshot_finalization_stats();
     serde_json::json!({
-        "enabled": true,
+        "enabled": !sinks.is_empty(),
         "instance_count": sinks.len(),
         "snapshot_finalizations_pending": pending,
         "snapshot_finalizations_pending_bytes": pending_bytes,
         "snapshot_finalizations_oldest_age_secs": oldest_age,
         "snapshot_finalization_recovery_policy": SNAPSHOT_FINALIZATION_RECOVERY_POLICY,
         "totals": {
+            "per_event": process_metrics().event_accounting(),
             "queue": {
                 "depth": queue_depth,
+                "outstanding": queue_outstanding,
                 "capacity": queue_capacity,
                 "high_water_hits_total": high_water,
                 "high_water_diversions_total": high_water_diversions,
@@ -3970,7 +4116,9 @@ impl SinkRuntime {
                 "max_delay_ms": self.summary.retry_max_delay_ms,
                 "jitter": self.summary.retry_jitter,
             },
+            "per_event": self.metrics.event_accounting(),
             "queue": {
+                "outstanding": self.logger.outstanding_count(),
                 "depth": self.logger.queue_depth(),
                 "capacity": self.logger.buffer_capacity(),
                 "high_water_hits_total": self.metrics.queue_high_water_hits_total.load(Ordering::Relaxed),
@@ -4083,105 +4231,69 @@ fn render_prometheus_for_sinks(
 ) -> String {
     let mut output = String::with_capacity(4096 * sinks.len().max(1));
 
-    // Preserve the existing metric names as process-wide aggregates across
-    // every current accepted instance. Per-instance identity and counters live in
-    // the authenticated status endpoint; avoiding generation labels keeps
-    // scrape cardinality stable across reloads and prevents aggregate +
-    // component double-counting in ordinary PromQL sums.
-    let mut events_enqueued = 0u64;
-    let mut events_exported = 0u64;
-    let mut failure_network = 0u64;
-    let mut failure_http_4xx = 0u64;
-    let mut failure_http_5xx = 0u64;
-    let mut failure_serialize = 0u64;
-    let mut failure_tls = 0u64;
-    let mut failure_timeout = 0u64;
+    // Cumulative counters outlive all generations; gauges describe live state.
+    let process = process_metrics();
+    let events_enqueued = process.events_enqueued_total.load(Ordering::Relaxed);
+    let events_exported = process.events_exported_total.load(Ordering::Relaxed);
+    let failure_network = process.failure_reasons.network.load(Ordering::Relaxed);
+    let failure_http_4xx = process.failure_reasons.http_4xx.load(Ordering::Relaxed);
+    let failure_http_5xx = process.failure_reasons.http_5xx.load(Ordering::Relaxed);
+    let failure_serialize = process.failure_reasons.serialize.load(Ordering::Relaxed);
+    let failure_tls = process.failure_reasons.tls.load(Ordering::Relaxed);
+    let failure_timeout = process.failure_reasons.timeout.load(Ordering::Relaxed);
     let mut queue_depth = 0u64;
+    let mut queue_outstanding = 0u64;
     let mut spool_bytes = 0u64;
     let mut spool_files = 0u64;
-    let mut spool_drops = 0u64;
-    let mut spool_prepare_failures = 0u64;
-    let mut spool_jobs_enqueued = 0u64;
-    let mut spool_jobs_written = 0u64;
-    let mut spool_jobs_lost = 0u64;
-    let mut spool_events_lost = 0u64;
+    let spool_drops = process.spool_drops_total.load(Ordering::Relaxed);
+    let spool_prepare_failures = process.spool_prepare_failures_total.load(Ordering::Relaxed);
+    let spool_jobs_enqueued = process.spool_jobs_enqueued_total.load(Ordering::Relaxed);
+    let spool_jobs_written = process.spool_jobs_written_total.load(Ordering::Relaxed);
+    let spool_jobs_lost = process.spool_jobs_lost_total.load(Ordering::Relaxed);
+    let spool_events_lost = process.spool_events_lost_total.load(Ordering::Relaxed);
     let mut spool_unbound_files = 0u64;
     let mut spool_unbound_namespaces = 0u64;
-    let mut spool_replay_attempts = 0u64;
-    let mut spool_dead_letter_rows = 0u64;
+    let spool_replay_attempts = process.spool_replay_attempts_total.load(Ordering::Relaxed);
+    let spool_dead_letter_rows = process.spool_dead_letter_rows_total.load(Ordering::Relaxed);
     let mut spool_enabled_any = false;
     let mut spool_all_available = true;
     let mut queue_retained_bytes = 0u64;
-    let mut queue_byte_budget_exhausted = 0u64;
-    let mut queue_high_water_hits = 0u64;
-    let mut queue_high_water_diversions = 0u64;
-    let mut queue_full_drops = 0u64;
-    let mut snapshot_emits = 0u64;
+    let queue_byte_budget_exhausted = process
+        .queue_byte_budget_exhausted_total
+        .load(Ordering::Relaxed);
+    let queue_high_water_hits = process.queue_high_water_hits_total.load(Ordering::Relaxed);
+    let queue_high_water_diversions = process
+        .queue_high_water_diversions_total
+        .load(Ordering::Relaxed);
+    let queue_full_drops = process.queue_full_drops_total.load(Ordering::Relaxed);
+    let snapshot_emits = process.snapshot_emits_total.load(Ordering::Relaxed);
     let mut snapshot_entries = 0u64;
     let mut snapshot_retained_bytes = 0u64;
-    let mut snapshot_overflow_spooled = 0u64;
-    let mut snapshot_overflow_pending = 0u64;
-    let mut snapshot_cardinality_rejections = 0u64;
+    let snapshot_overflow_spooled = process
+        .snapshot_overflow_spooled_total
+        .load(Ordering::Relaxed);
+    let snapshot_overflow_pending = process
+        .snapshot_overflow_pending_total
+        .load(Ordering::Relaxed);
+    let snapshot_cardinality_rejections = process
+        .snapshot_cardinality_rejections_total
+        .load(Ordering::Relaxed);
     let mut any_snapshot = false;
-    let mut latency_counts: Vec<u64> = Vec::new();
-    let mut latency_sum = 0.0f64;
-    let mut latency_total = 0u64;
-    let mut latency_buckets: &'static [f64] = &[];
 
     for runtime in sinks.values() {
         let metrics = &runtime.metrics;
-        events_enqueued =
-            events_enqueued.saturating_add(metrics.events_enqueued_total.load(Ordering::Relaxed));
-        events_exported =
-            events_exported.saturating_add(metrics.events_exported_total.load(Ordering::Relaxed));
-        failure_network =
-            failure_network.saturating_add(metrics.failure_reasons.network.load(Ordering::Relaxed));
-        failure_http_4xx = failure_http_4xx
-            .saturating_add(metrics.failure_reasons.http_4xx.load(Ordering::Relaxed));
-        failure_http_5xx = failure_http_5xx
-            .saturating_add(metrics.failure_reasons.http_5xx.load(Ordering::Relaxed));
-        failure_serialize = failure_serialize
-            .saturating_add(metrics.failure_reasons.serialize.load(Ordering::Relaxed));
-        failure_tls =
-            failure_tls.saturating_add(metrics.failure_reasons.tls.load(Ordering::Relaxed));
-        failure_timeout =
-            failure_timeout.saturating_add(metrics.failure_reasons.timeout.load(Ordering::Relaxed));
+
         queue_depth = queue_depth.saturating_add(runtime.logger.queue_depth() as u64);
-        spool_drops = spool_drops.saturating_add(metrics.spool_drops_total.load(Ordering::Relaxed));
-        spool_prepare_failures = spool_prepare_failures
-            .saturating_add(metrics.spool_prepare_failures_total.load(Ordering::Relaxed));
-        spool_jobs_enqueued = spool_jobs_enqueued
-            .saturating_add(metrics.spool_jobs_enqueued_total.load(Ordering::Relaxed));
-        spool_jobs_written = spool_jobs_written
-            .saturating_add(metrics.spool_jobs_written_total.load(Ordering::Relaxed));
-        spool_jobs_lost =
-            spool_jobs_lost.saturating_add(metrics.spool_jobs_lost_total.load(Ordering::Relaxed));
-        spool_events_lost = spool_events_lost
-            .saturating_add(metrics.spool_events_lost_total.load(Ordering::Relaxed));
-        spool_replay_attempts = spool_replay_attempts
-            .saturating_add(metrics.spool_replay_attempts_total.load(Ordering::Relaxed));
-        spool_dead_letter_rows = spool_dead_letter_rows
-            .saturating_add(metrics.spool_dead_letter_rows_total.load(Ordering::Relaxed));
+        queue_outstanding =
+            queue_outstanding.saturating_add(runtime.logger.outstanding_count() as u64);
+
         let unbound_files = metrics.spool_unbound_files.load(Ordering::Relaxed);
         spool_unbound_files = spool_unbound_files.saturating_add(unbound_files);
         let unbound_ns = metrics.spool_unbound_namespaces.load(Ordering::Relaxed);
         spool_unbound_namespaces = spool_unbound_namespaces.saturating_add(unbound_ns);
         queue_retained_bytes =
             queue_retained_bytes.saturating_add(runtime.byte_budget.used() as u64);
-        queue_byte_budget_exhausted = queue_byte_budget_exhausted.saturating_add(
-            metrics
-                .queue_byte_budget_exhausted_total
-                .load(Ordering::Relaxed),
-        );
-        queue_high_water_hits = queue_high_water_hits
-            .saturating_add(metrics.queue_high_water_hits_total.load(Ordering::Relaxed));
-        queue_high_water_diversions = queue_high_water_diversions.saturating_add(
-            metrics
-                .queue_high_water_diversions_total
-                .load(Ordering::Relaxed),
-        );
-        queue_full_drops =
-            queue_full_drops.saturating_add(metrics.queue_full_drops_total.load(Ordering::Relaxed));
+
         let spool_stats = runtime
             .spool
             .as_ref()
@@ -4197,37 +4309,54 @@ fn render_prometheus_for_sinks(
         }
         if runtime.summary.mode == SinkMode::Snapshot {
             any_snapshot = true;
-            snapshot_emits =
-                snapshot_emits.saturating_add(metrics.snapshot_emits_total.load(Ordering::Relaxed));
-            snapshot_overflow_spooled = snapshot_overflow_spooled.saturating_add(
-                metrics
-                    .snapshot_overflow_spooled_total
-                    .load(Ordering::Relaxed),
-            );
-            snapshot_overflow_pending = snapshot_overflow_pending.saturating_add(
-                metrics
-                    .snapshot_overflow_pending_total
-                    .load(Ordering::Relaxed),
-            );
-            snapshot_cardinality_rejections = snapshot_cardinality_rejections.saturating_add(
-                metrics
-                    .snapshot_cardinality_rejections_total
-                    .load(Ordering::Relaxed),
-            );
+
             if let Some(status) = snapshot_accumulator_gauges(runtime.generation) {
                 snapshot_entries = snapshot_entries.saturating_add(status.0);
                 snapshot_retained_bytes = snapshot_retained_bytes.saturating_add(status.1);
             }
         }
-        if latency_buckets.is_empty() {
-            latency_buckets = metrics.latency.buckets;
-            latency_counts = vec![0u64; latency_buckets.len()];
-        }
-        for (idx, count) in latency_counts.iter_mut().enumerate() {
-            *count = count.saturating_add(metrics.latency.counts[idx].load(Ordering::Relaxed));
-        }
-        latency_sum += f64::from_bits(metrics.latency.sum_bits.load(Ordering::Relaxed));
-        latency_total = latency_total.saturating_add(metrics.latency.count.load(Ordering::Relaxed));
+    }
+
+    let latency_buckets = process.latency.buckets;
+    let latency_counts: Vec<u64> = process
+        .latency
+        .counts
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .collect();
+    let latency_sum = f64::from_bits(process.latency.sum_bits.load(Ordering::Relaxed));
+    let latency_total = process.latency.count.load(Ordering::Relaxed);
+
+    let (received, persisted, dropped, pending) = process.event_counts();
+    for (name, kind, help, value) in [
+        (
+            "per_event_received_total",
+            "counter",
+            "New per-event rows presented to bounded sink admission, including refusals.",
+            received,
+        ),
+        (
+            "per_event_persisted_total",
+            "counter",
+            "New per-event rows acknowledged by ClickHouse or written to spool at least once.",
+            persisted,
+        ),
+        (
+            "per_event_dropped_total",
+            "counter",
+            "New per-event rows whose last memory owner was lost before acknowledgement or spooling.",
+            dropped,
+        ),
+        (
+            "per_event_pending",
+            "gauge",
+            "New per-event rows still awaiting acknowledgement or spooling, including retired workers.",
+            pending,
+        ),
+    ] {
+        output.push_str(&format!(
+            "# HELP chargeback_sink_{name} {help}\n# TYPE chargeback_sink_{name} {kind}\nchargeback_sink_{name} {value}\n"
+        ));
     }
 
     output.push_str("# HELP chargeback_sink_events_enqueued_total Chargeback sink events admitted to the in-memory channel or accepted by a durable overflow handoff.\n");
@@ -4257,6 +4386,12 @@ fn render_prometheus_for_sinks(
             reason, value
         ));
     }
+    output.push_str("# HELP chargeback_sink_queue_outstanding Current accepted generations' queued, batched, and exporting rows.\n");
+    output.push_str("# TYPE chargeback_sink_queue_outstanding gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_outstanding {}\n",
+        queue_outstanding
+    ));
     output.push_str("# HELP chargeback_sink_queue_depth Chargeback sink in-memory queue depth.\n");
     output.push_str("# TYPE chargeback_sink_queue_depth gauge\n");
     output.push_str(&format!("chargeback_sink_queue_depth {}\n", queue_depth));
@@ -4302,7 +4437,12 @@ fn render_prometheus_for_sinks(
         "chargeback_sink_snapshot_finalizations_oldest_age_seconds {}\n",
         pending_finalization_oldest_age_secs
     ));
-    if any_snapshot || pending_finalizations > 0 {
+    if any_snapshot
+        || pending_finalizations > 0
+        || snapshot_overflow_spooled > 0
+        || snapshot_overflow_pending > 0
+        || snapshot_cardinality_rejections > 0
+    {
         output.push_str("# HELP chargeback_sink_snapshot_entries Snapshot accumulator identities retained in memory.\n");
         output.push_str("# TYPE chargeback_sink_snapshot_entries gauge\n");
         output.push_str(&format!(
@@ -4459,7 +4599,7 @@ fn render_prometheus_for_sinks(
         "chargeback_sink_export_latency_seconds_count {}\n",
         latency_total
     ));
-    if any_snapshot {
+    if any_snapshot || snapshot_emits > 0 || snapshot_cardinality_rejections > 0 {
         output.push_str("# HELP chargeback_sink_snapshot_emits_total Chargeback sink snapshot delta events emitted.\n");
         output.push_str("# TYPE chargeback_sink_snapshot_emits_total counter\n");
         output.push_str(&format!(
@@ -4747,7 +4887,14 @@ async fn send_batch(
     // this slice borrow here does not release their leases early.
     drop(events);
     match post_json_each_row(cfg, body, event_count).await {
-        DeliveryOutcome::Delivered => Ok(()),
+        DeliveryOutcome::Delivered => {
+            for queued in batch {
+                if let Some(accounting) = &queued.accounting {
+                    accounting.persist();
+                }
+            }
+            Ok(())
+        }
         other => Err(other.safe_message().to_string()),
     }
 }
@@ -5219,11 +5366,39 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             "{PLUGIN_NAME}: clickhouse.password_ref must reference a FERRUM_* environment variable"
         ));
     }
+    // Pair completeness is a pure Option shape, so it belongs in cold
+    // admission rather than in client construction alone. Reading or parsing
+    // the PEM files stays in `build_clickhouse_http_client`, which keeps
+    // `validate` free of filesystem side effects while refusing a
+    // configuration that could only ever abort serving startup.
+    if config.clickhouse.tls.client_cert_file.is_some()
+        != config.clickhouse.tls.client_key_file.is_some()
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: clickhouse.tls.client_cert_file and client_key_file must be set together"
+        ));
+    }
     if config.pricing_version.trim().is_empty() {
         return Err(format!("{PLUGIN_NAME}: pricing_version must not be empty"));
     }
     if config.currency.trim().is_empty() {
         return Err(format!("{PLUGIN_NAME}: currency must not be empty"));
+    }
+    // Both labels are copied verbatim into every exported row and count
+    // against `MAX_CHARGE_EVENT_BYTES`. An unbounded label therefore admits a
+    // configuration in which every per-event charge is refused after the
+    // request already succeeded, silently disabling billing export. Reject the
+    // label instead of truncating it: a truncated currency or pricing
+    // generation would merge two distinct billing identities in ClickHouse.
+    if config.currency.len() > MAX_LABEL_LEN {
+        return Err(format!(
+            "{PLUGIN_NAME}: currency must be at most {MAX_LABEL_LEN} UTF-8 bytes"
+        ));
+    }
+    if config.pricing_version.len() > MAX_LABEL_LEN {
+        return Err(format!(
+            "{PLUGIN_NAME}: pricing_version must be at most {MAX_LABEL_LEN} UTF-8 bytes"
+        ));
     }
     Ok(())
 }
@@ -12608,7 +12783,11 @@ pub async fn probe_shared_spool_batch_clone_for_tests(
         let lease = budget
             .try_acquire(retained)
             .expect("shared spool clone probe must lease queued events");
-        queued.push(QueuedChargeEvent { event, lease });
+        queued.push(QueuedChargeEvent {
+            event,
+            lease,
+            accounting: None,
+        });
     }
     let shared = Arc::new(queued);
     // Retain a second handle for the whole probe so try_unwrap takes the Err path.
@@ -15296,8 +15475,34 @@ fn emit_periodic_snapshot(
     };
     // Bind the result first so the borrow of `events` ends before the failure
     // arm needs to move them back into bounded staging.
-    let write_result = spool.write_events(&events);
-    if let Err(error) = write_result {
+    let outcome = spool_snapshot_chunks(spool, &events);
+    let written = outcome.written;
+    // Snapshot mode requires the spool. It is the durable commit point before
+    // the accumulator baseline advances; the same event IDs are then enqueued as
+    // a low-latency delivery attempt. A reload racing this point can abort the
+    // queue worker without losing or double-charging the snapshot: replay is
+    // idempotent on event_id. The staged overflow was already taken above, so
+    // durable success simply keeps the durable prefix taken.
+    let durable = settle_snapshot_emission(
+        accumulator,
+        events,
+        written,
+        overflow_count,
+        overflow_retained_bytes,
+        &emitted_totals,
+    );
+    if written > 0 {
+        runtime
+            .metrics
+            .snapshot_emits_total
+            .fetch_add(written as u64, Ordering::Relaxed);
+        for event in durable {
+            // Already durable: the delivery attempt below must never be able
+            // to report billing loss for a spooled, replayable row.
+            enqueue_pre_spooled_charge_event(runtime, event);
+        }
+    }
+    if let Some(error) = outcome.error {
         runtime
             .metrics
             .spool_available
@@ -15309,29 +15514,16 @@ fn emit_periodic_snapshot(
         warn!(
             plugin = PLUGIN_NAME,
             generation = runtime.generation,
+            durable_rows = written,
             error = %error,
-            "Chargeback sink could not durably spool its periodic snapshot; no baseline was advanced"
+            "Chargeback sink could not durably spool its whole periodic snapshot; only the durable prefix advanced a baseline"
         );
-        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
+        invalidate_status_cache();
         return Err(error);
     }
-    // Snapshot mode requires the spool. It is the durable commit point before
-    // the accumulator baseline advances; the same event IDs are then enqueued as
-    // a low-latency delivery attempt. A reload racing this point can abort the
-    // queue worker without losing or double-charging the snapshot: replay is
-    // idempotent on event_id. The staged overflow was already taken above, so
-    // durable success simply keeps it taken.
-    accumulator.commit_taken_overflow(overflow_retained_bytes);
-    accumulator.commit_emitted_totals(&emitted_totals);
-    runtime
-        .metrics
-        .snapshot_emits_total
-        .fetch_add(event_count as u64, Ordering::Relaxed);
-    for event in events {
-        enqueue_charge_event(runtime, event);
-    }
+    debug_assert_eq!(written, event_count);
     invalidate_status_cache();
-    Ok(event_count)
+    Ok(written)
 }
 
 async fn wait_for_snapshot_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
@@ -15408,8 +15600,23 @@ fn emit_final_snapshot_to_spool(
     };
     // Bind the result first so the borrow of `events` ends before the failure
     // arm needs to move them back into bounded staging.
-    let write_result = spool.write_events(&events);
-    if let Err(error) = write_result {
+    let outcome = spool_snapshot_chunks(spool, &events);
+    let written = outcome.written;
+    drop(settle_snapshot_emission(
+        accumulator,
+        events,
+        written,
+        overflow_count,
+        overflow_retained_bytes,
+        &emitted_totals,
+    ));
+    if written > 0 {
+        runtime
+            .metrics
+            .snapshot_emits_total
+            .fetch_add(written as u64, Ordering::Relaxed);
+    }
+    if let Some(error) = outcome.error {
         runtime
             .metrics
             .spool_available
@@ -15421,18 +15628,13 @@ fn emit_final_snapshot_to_spool(
         warn!(
             plugin = PLUGIN_NAME,
             generation = runtime.generation,
+            durable_rows = written,
             error = %error,
-            "Chargeback sink could not durably spool its final snapshot; generation state retained"
+            "Chargeback sink could not durably spool its whole final snapshot; generation state retained"
         );
-        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
+        invalidate_status_cache();
         return false;
     }
-    accumulator.commit_taken_overflow(overflow_retained_bytes);
-    accumulator.commit_emitted_totals(&emitted_totals);
-    runtime
-        .metrics
-        .snapshot_emits_total
-        .fetch_add(events.len() as u64, Ordering::Relaxed);
     invalidate_status_cache();
     true
 }
@@ -15647,6 +15849,9 @@ fn event_from_snapshot(
 }
 
 fn infer_http_protocol(summary: &TransactionSummary) -> String {
+    if is_websocket_handshake(summary) {
+        return "ws".to_string();
+    }
     if let Some(protocol) = summary
         .metadata
         .get("request_protocol")
@@ -15654,11 +15859,7 @@ fn infer_http_protocol(summary: &TransactionSummary) -> String {
     {
         return bound_key_field(protocol, MAX_FIELD_LEN);
     }
-    if summary.response_status_code == 101 {
-        "ws".to_string()
-    } else {
-        "http".to_string()
-    }
+    "http".to_string()
 }
 
 fn metadata_value(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
@@ -15688,7 +15889,11 @@ fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEve
             let retained = charge_event_retained_bytes(&event);
             match runtime.byte_budget.try_acquire(retained) {
                 Some(lease) => {
-                    let queued = QueuedChargeEvent { event, lease };
+                    let queued = QueuedChargeEvent {
+                        event,
+                        lease,
+                        accounting: None,
+                    };
                     match delivery.try_enqueue_snapshot_overflow(
                         vec![queued],
                         Arc::clone(&lifecycle.accumulator),
@@ -15785,14 +15990,118 @@ fn reserve_delta_projection(
     Ok(reservation)
 }
 
+/// Outcome of a chunked snapshot spool handoff.
+struct ChunkedSpoolOutcome {
+    /// Rows durably written, counted from the front of the batch.
+    written: usize,
+    /// First chunk failure. `None` means every chunk landed.
+    error: Option<String>,
+}
+
+/// Write a snapshot batch as a sequence of bounded, independently replayable
+/// spool artifacts.
+///
+/// `snapshot.max_entries` admits up to `MAX_BUFFER_CAPACITY` identities while
+/// one artifact may hold at most `SPOOL_MAX_ROWS_PER_ARTIFACT` rows, so a
+/// single-artifact handoff makes every emission from a large accumulator fail
+/// permanently — periodic ticks, finalization, and compact recovery alike
+/// (issue #5264). Chunks are written in order and the caller advances exactly
+/// the baselines the durable prefix covers, so an interrupted emission retries
+/// only what never landed and keeps each row's `event_id`, which
+/// `ReplacingMergeTree` deduplicates. A full chunk cannot exceed the encoded
+/// artifact ceiling either: `SPOOL_MAX_ROWS_PER_ARTIFACT` rows conservatively
+/// bounded at `MAX_CHARGE_EVENT_BYTES` stay well inside
+/// `SPOOL_MAX_ARTIFACT_BYTES`.
+fn spool_snapshot_chunks(spool: &SpoolManager, events: &[ChargeEvent]) -> ChunkedSpoolOutcome {
+    let mut written = 0usize;
+    for chunk in events.chunks(SPOOL_MAX_ROWS_PER_ARTIFACT) {
+        if let Err(error) = spool.write_events(chunk) {
+            return ChunkedSpoolOutcome {
+                written,
+                error: Some(error),
+            };
+        }
+        written = written.saturating_add(chunk.len());
+    }
+    ChunkedSpoolOutcome {
+        written,
+        error: None,
+    }
+}
+
+/// Split the taken overflow reservation at the durable prefix.
+///
+/// `stage_overflow_event` reserves exactly `charge_event_retained_bytes` per
+/// event and `take_overflow_pending` moves that aggregate out under the same
+/// lock, so the take divides exactly. The whole-prefix and empty-prefix cases
+/// return the recorded aggregate verbatim rather than a recomputed sum, and the
+/// partial case is clamped: releasing more than was reserved would under-count
+/// the accumulator's retained bytes.
+fn split_overflow_reservation(
+    events: &[ChargeEvent],
+    overflow_written: usize,
+    overflow_count: usize,
+    overflow_retained_bytes: usize,
+) -> (usize, usize) {
+    if overflow_written >= overflow_count {
+        return (overflow_retained_bytes, 0);
+    }
+    if overflow_written == 0 {
+        return (0, overflow_retained_bytes);
+    }
+    let written_bytes = events[..overflow_written]
+        .iter()
+        .map(charge_event_retained_bytes)
+        .fold(0usize, usize::saturating_add)
+        .min(overflow_retained_bytes);
+    (written_bytes, overflow_retained_bytes - written_bytes)
+}
+
+/// Settle a snapshot emission that may only have been partially durable.
+///
+/// `events` is the taken overflow prefix followed by the prepared deltas, which
+/// are index-aligned with `emitted_totals`. Everything below `written` is
+/// durable: its share of the overflow reservation is released and its delta
+/// baselines advance. Everything above is restaged (overflow) or left to be
+/// recomputed from the unchanged accumulator baseline on the next tick
+/// (deltas). The durable prefix is returned so the caller can attempt
+/// low-latency delivery for exactly those rows.
+fn settle_snapshot_emission(
+    accumulator: &SnapshotAccumulator,
+    mut events: Vec<ChargeEvent>,
+    written: usize,
+    overflow_count: usize,
+    overflow_retained_bytes: usize,
+    emitted_totals: &[(SnapshotMetadata, u64, SnapshotTotals)],
+) -> Vec<ChargeEvent> {
+    let written = written.min(events.len());
+    let overflow_written = written.min(overflow_count);
+    let (commit_bytes, restage_bytes) = split_overflow_reservation(
+        &events,
+        overflow_written,
+        overflow_count,
+        overflow_retained_bytes,
+    );
+    let retryable = events.split_off(written);
+    restage_borrowed_overflow(
+        accumulator,
+        retryable,
+        overflow_count - overflow_written,
+        restage_bytes,
+    );
+    accumulator.commit_taken_overflow(commit_bytes);
+    accumulator.commit_emitted_totals(&emitted_totals[..written.saturating_sub(overflow_count)]);
+    events
+}
+
 /// Return the leading `overflow_count` events of a borrowed emission set to
 /// bounded overflow staging.
 ///
 /// The emission paths take staged overflow rather than cloning it. Every path
 /// that does not reach the durable commit point must give it back, or a pending
 /// billing delta would be silently lost. Prepared deltas beyond `overflow_count`
-/// are intentionally dropped: no baseline was advanced, so they are still held
-/// by the accumulator.
+/// are intentionally dropped: their baseline was not advanced, so they are
+/// still held by the accumulator and are recomputed on the next emission.
 fn restage_borrowed_overflow(
     accumulator: &SnapshotAccumulator,
     mut events: Vec<ChargeEvent>,
@@ -15860,11 +16169,37 @@ fn charge_event_retained_bytes(event: &ChargeEvent) -> usize {
 }
 
 fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
-    let retained = charge_event_retained_bytes(&event);
+    enqueue_charge_event_with_durability(runtime, event, false);
+}
+
+/// Enqueue a row whose durable spool copy already exists.
+///
+/// Used only by snapshot emission, which commits its artifact before the
+/// low-latency delivery attempt. Every refusal and every failed delivery below
+/// must leave the settled ledger reporting the row as persisted rather than
+/// dropped (issue #5266).
+fn enqueue_pre_spooled_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
+    enqueue_charge_event_with_durability(runtime, event, true);
+}
+
+fn enqueue_charge_event_with_durability(
+    runtime: &SinkRuntime,
+    event: ChargeEvent,
+    already_durable: bool,
+) {
+    let accounting = if already_durable {
+        PendingCharge::already_persisted(Arc::clone(&runtime.metrics))
+    } else {
+        PendingCharge::new(Arc::clone(&runtime.metrics))
+    };
+    // Charge the Arc allocation and lifetime bookkeeping to the existing budget.
+    let retained = charge_event_retained_bytes(&event).saturating_add(128);
     if retained > MAX_CHARGE_EVENT_BYTES {
-        runtime
-            .byte_budget
-            .record_drop("charge event exceeded max retained bytes");
+        let budget = runtime.byte_budget.as_ref();
+        budget.record_drop(
+            SinkLossReason::RecordTooLarge,
+            "charge event exceeded max retained bytes",
+        );
         invalidate_status_cache();
         return;
     }
@@ -15876,10 +16211,11 @@ fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
         invalidate_status_cache();
         return;
     };
-    match runtime
-        .logger
-        .try_send_outcome(QueuedChargeEvent { event, lease })
-    {
+    match runtime.logger.try_send_outcome(QueuedChargeEvent {
+        event,
+        lease,
+        accounting: Some(Arc::new(accounting)),
+    }) {
         TrySendOutcome::ChannelAccepted | TrySendOutcome::DiversionAccepted => {
             runtime
                 .metrics

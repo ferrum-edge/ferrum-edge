@@ -6,6 +6,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_ai_plugins
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use std::io::Write;
 use std::sync::Arc;
@@ -15,6 +17,180 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
+
+#[tokio::test]
+#[ignore]
+async fn functional_ai_semantic_cache_rewrites_once_across_h1_h2_h3() {
+    use crate::scaffolding::clients::{GetOptions, Http3Client};
+    use crate::scaffolding::ports::reserve_port;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use serde_json::{Value, json};
+    use std::convert::Infallible;
+    use std::io::Read;
+
+    let reservation = reserve_port().await.expect("reserve semantic cache origin");
+    let backend_port = reservation.port;
+    let listener = reservation.into_listener();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let origin_hits = Arc::clone(&hits);
+    let origin = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            let hits = Arc::clone(&origin_hits);
+            connections.spawn(async move {
+                let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        let is_post = request.method() == http::Method::POST;
+                        request.into_body().collect().await.expect("origin upload");
+                        let count = if is_post {
+                            hits.fetch_add(1, Ordering::SeqCst) + 1
+                        } else {
+                            0
+                        };
+                        let body = json!({
+                            "id": format!("origin-{count}"),
+                            "answer": "A garden contains flowers. ".repeat(30)
+                        })
+                        .to_string();
+                        Ok::<_, Infallible>(
+                            hyper::Response::builder()
+                                .header("content-type", "application/json")
+                                .header("content-length", body.len())
+                                .body(Full::new(Bytes::from(body)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "semantic-cache",
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "pool_enable_http2": false,
+            "plugins": [
+                {"plugin_config_id": "rewrite"},
+                {"plugin_config_id": "compress"},
+                {"plugin_config_id": "cache"}
+            ]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "rewrite", "plugin_name": "response_transformer",
+                "scope": "proxy", "proxy_id": "semantic-cache", "enabled": true,
+                "config": {"rules": [
+                    {"operation": "rename", "target": "body", "key": "id", "new_key": "origin_id"},
+                    {"operation": "add", "target": "body", "key": "id", "value": "client-id"}
+                ]}
+            },
+            {
+                "id": "compress", "plugin_name": "compression",
+                "scope": "proxy", "proxy_id": "semantic-cache", "enabled": true,
+                "config": {"algorithms": ["gzip"], "min_content_length": 10}
+            },
+            {
+                "id": "cache", "plugin_name": "ai_semantic_cache",
+                "scope": "proxy", "proxy_id": "semantic-cache", "enabled": true,
+                "config": {}
+            }
+        ]
+    });
+    let gateway = TestGateway::builder()
+        .mode_file(serde_yaml::to_string(&config).unwrap())
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start semantic cache gateway");
+    let h1 = reqwest::Client::builder()
+        .http1_only()
+        .no_gzip()
+        .build()
+        .unwrap();
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .no_gzip()
+        .build()
+        .unwrap();
+    let h3 = Http3Client::insecure().unwrap();
+    let https_port = gateway.env_port("FERRUM_PROXY_HTTPS_PORT").unwrap();
+    for protocol in 1..=3 {
+        let request = json!({"messages": [{"role": "user", "content": "Describe a garden"}]});
+        let route = format!("/replay-{protocol}");
+        let mut miss_body = None;
+        let before = hits.load(Ordering::SeqCst);
+        for expected in ["MISS", "HIT"] {
+            let (status, headers, body) = if protocol == 3 {
+                let options = GetOptions::default()
+                    .method(http::Method::POST)
+                    .header("content-type", "application/json")
+                    .header("accept-encoding", "gzip")
+                    .header("cookie", "fixture=semantic-cache")
+                    .body(Bytes::from(request.to_string()));
+                let response = h3
+                    .get_with_options(&format!("https://127.0.0.1:{https_port}{route}"), options)
+                    .await
+                    .expect("H3 semantic cache request");
+                assert_eq!(response.body_error, None);
+                (response.status, response.headers, response.body_bytes)
+            } else {
+                let client = if protocol == 1 { &h1 } else { &h2 };
+                let response = client
+                    .post(gateway.proxy_url(&route))
+                    .header("accept-encoding", "gzip")
+                    .header("cookie", "fixture=semantic-cache")
+                    .json(&request)
+                    .send()
+                    .await
+                    .expect("TCP semantic cache request");
+                let version = if protocol == 1 {
+                    http::Version::HTTP_11
+                } else {
+                    http::Version::HTTP_2
+                };
+                assert_eq!(response.version(), version);
+                let status = response.status();
+                let headers = response.headers().clone();
+                (status, headers, response.bytes().await.unwrap())
+            };
+            assert_eq!(status, http::StatusCode::OK);
+            assert_eq!(headers["x-ai-cache-status"], expected);
+            assert_eq!(headers["content-encoding"], "gzip");
+            let mut decoded = Vec::new();
+            flate2::read::GzDecoder::new(body.as_ref())
+                .read_to_end(&mut decoded)
+                .unwrap();
+            let parsed: Value = serde_json::from_slice(&decoded).unwrap();
+            assert_eq!(parsed["id"], "client-id");
+            assert_eq!(parsed["origin_id"], format!("origin-{}", before + 1));
+            if let Some(miss) = &miss_body {
+                assert_eq!(&parsed, miss);
+            } else {
+                miss_body = Some(parsed);
+            }
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), before + 1);
+    }
+    origin.abort();
+}
 
 // ============================================================================
 // Echo Server Helper
@@ -91,6 +267,7 @@ fn start_gateway(
     let binary_path = gateway_binary_path();
 
     let mut cmd = std::process::Command::new(binary_path);
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
@@ -128,11 +305,11 @@ async fn wait_for_owned_gateway(
 async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
@@ -164,7 +341,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 #[ignore]
 #[tokio::test]
 async fn test_ai_federation_terminal_dispatch_is_backend_accounting_neutral() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_task = tokio::spawn(start_counted_json_server_on(
@@ -175,7 +352,7 @@ async fn test_ai_federation_terminal_dispatch_is_backend_accounting_neutral() {
         Arc::clone(&backend_hits),
     ));
 
-    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let provider_port = provider_listener.local_addr().unwrap().port();
     let provider_hits = Arc::new(AtomicUsize::new(0));
     let provider_task = tokio::spawn(start_counted_json_server_on(
@@ -519,7 +696,7 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn test_ai_federation_streams_first_token_before_provider_completes() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_task = tokio::spawn(start_counted_json_server_on(
@@ -530,7 +707,7 @@ async fn test_ai_federation_streams_first_token_before_provider_completes() {
         Arc::clone(&backend_hits),
     ));
 
-    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let provider_port = provider_listener.local_addr().unwrap().port();
     let provider_hits = Arc::new(AtomicUsize::new(0));
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -642,7 +819,7 @@ async fn test_ai_federation_streams_first_token_before_provider_completes() {
 #[ignore]
 #[tokio::test]
 async fn test_ai_federation_truncated_provider_stream_fails_closed_without_splicing() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_task = tokio::spawn(start_counted_json_server_on(
@@ -653,7 +830,7 @@ async fn test_ai_federation_truncated_provider_stream_fails_closed_without_splic
         Arc::clone(&backend_hits),
     ));
 
-    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let provider_port = provider_listener.local_addr().unwrap().port();
     let provider_hits = Arc::new(AtomicUsize::new(0));
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -740,7 +917,7 @@ async fn test_ai_federation_truncated_provider_stream_fails_closed_without_splic
 #[ignore]
 #[tokio::test]
 async fn test_ai_federation_client_disconnect_cancels_without_wedging_the_route() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_task = tokio::spawn(start_counted_json_server_on(
@@ -751,7 +928,7 @@ async fn test_ai_federation_client_disconnect_cancels_without_wedging_the_route(
         Arc::clone(&backend_hits),
     ));
 
-    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let provider_port = provider_listener.local_addr().unwrap().port();
     let provider_hits = Arc::new(AtomicUsize::new(0));
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -881,7 +1058,7 @@ async fn test_ai_prompt_shield_rejects_pii() {
     let config_path = temp_dir.path().join("config.yaml");
 
     // Bind echo server — hold the listener to avoid port races
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
 
     let config_content = format!(
@@ -973,7 +1150,7 @@ async fn test_ai_prompt_shield_allows_clean_request() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
 
     let config_content = format!(
@@ -1058,7 +1235,7 @@ async fn test_ai_request_guard_rejects_disallowed_model() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
 
     let config_content = format!(
@@ -1146,7 +1323,7 @@ async fn test_ai_request_guard_rejects_excess_tokens() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
 
     let config_content = format!(
@@ -1239,7 +1416,7 @@ async fn test_ai_request_guard_allows_valid_request() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
 
     let config_content = format!(

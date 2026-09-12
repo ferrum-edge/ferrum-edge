@@ -433,6 +433,37 @@ impl<'a> PooledConnectionAdmission<'a> {
         })
     }
 
+    /// Resolve an admission lane while accounting for an absent cap as an
+    /// effectively unbounded one.
+    ///
+    /// The Sidecar mesh-mTLS pool uses this because its resident connection
+    /// vector survives configuration publication. Tracking connections opened
+    /// while uncapped ensures that a later `maxConnections` value observes
+    /// those physical connections instead of admitting another one from a
+    /// counter that incorrectly starts at zero.
+    pub(crate) fn resolve_tracking_uncapped(
+        limiter: Option<&'a BackendConnectionLimiter>,
+        proxy: &'a crate::config::types::Proxy,
+        dial_host: &'a str,
+        override_port: u16,
+    ) -> Option<Self> {
+        let limiter = limiter?;
+        let entry = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&override_port));
+        Some(Self {
+            limiter,
+            host: dial_host,
+            policy_port: entry
+                .and_then(|entry| entry.policy_port)
+                .unwrap_or(override_port),
+            cap: entry
+                .and_then(|entry| entry.max_connections)
+                .unwrap_or(u32::MAX),
+        })
+    }
+
     /// Reserve one physical-connection slot for this destination.
     pub fn acquire(&self) -> Result<SharedBackendConnectionGuard, BackendConnectionLimitExceeded> {
         self.limiter

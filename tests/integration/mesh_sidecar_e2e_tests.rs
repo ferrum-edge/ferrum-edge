@@ -629,6 +629,8 @@ fn sidecar_allow_any_leaves_the_capture_path_ungated() {
 // `grpc.health.v1` server — and assert the 200/503 mapping per probe type,
 // plus that `timeoutSeconds` actually bounds a hung application.
 mod app_probe_rewrite {
+    use crate::scaffolding::port_registry::TestSocket;
+
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -649,7 +651,9 @@ mod app_probe_rewrite {
     /// Minimal loopback HTTP application that answers every request with a
     /// fixed status line, like a real `httpGet`-probed container would.
     async fn start_http_app(status_line: &'static str) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind app");
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind app");
         let port = listener.local_addr().expect("app addr").port();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
@@ -673,7 +677,9 @@ mod app_probe_rewrite {
     /// but the HTTP exchange never completes, which is what `timeoutSeconds`
     /// exists to bound.
     async fn start_black_hole_app() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind hole");
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind hole");
         let port = listener.local_addr().expect("hole addr").port();
         tokio::spawn(async move {
             let mut held = Vec::new();
@@ -686,7 +692,9 @@ mod app_probe_rewrite {
 
     /// A bound-and-accepting TCP port, which is all a `tcpSocket` probe needs.
     async fn start_tcp_app() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp");
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind tcp");
         let port = listener.local_addr().expect("tcp addr").port();
         tokio::spawn(async move { while listener.accept().await.is_ok() {} });
         port
@@ -694,7 +702,9 @@ mod app_probe_rewrite {
 
     /// A closed port: nothing is listening, so connect fails immediately.
     async fn closed_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind closed");
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind closed");
         let port = listener.local_addr().expect("closed addr").port();
         drop(listener);
         port
@@ -720,7 +730,9 @@ mod app_probe_rewrite {
     }
 
     async fn start_grpc_health_app() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind grpc");
         let port = listener.local_addr().expect("grpc addr").port();
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
@@ -733,7 +745,9 @@ mod app_probe_rewrite {
 
     /// Start the real probe server on an ephemeral loopback port.
     async fn start_probe_server(targets: BTreeMap<String, AppProbeSpec>) -> std::net::SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind probe");
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind probe");
         let addr = listener.local_addr().expect("probe addr");
         let server = Arc::new(AppProbeServer::new(targets));
         let (shutdown_tx, rx) = tokio::sync::watch::channel(false);

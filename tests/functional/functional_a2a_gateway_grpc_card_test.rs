@@ -50,6 +50,8 @@
 //! Run with:
 //! `cargo test --test functional_tests functional_a2a_gateway_grpc_card -- --ignored --nocapture`
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::ports::{PortReservation, reserve_port, reserve_port_pair};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -505,6 +507,7 @@ fn start_gateway(
     let admin_port = admin.port;
     let (stdout, stderr) = logs.stdio()?;
     let mut command = std::process::Command::new(gateway_binary_path());
+    command.arg("run");
     command
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
@@ -1594,7 +1597,7 @@ fn child_diagnostics_are_bounded_and_redact_the_probe_token() {
 /// outliving the reload loop's behavioral deadline.
 #[tokio::test]
 async fn a_silent_peer_fails_within_the_per_call_budget() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind silent peer");
     let addr = listener.local_addr().expect("silent peer addr").to_string();

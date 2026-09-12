@@ -9,7 +9,7 @@ use super::plugin_utils::create_test_proxy;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     advance_response_caching_clock_for_test, clone_log_metadata,
-    is_gateway_generated_correlation_header_for_test,
+    is_gateway_generated_correlation_header_for_test, record_backend_dispatch_outcome_for_test,
     refine_stream_response_for_content_type_for_test, response_caching_cache_keys_for_test,
     response_caching_current_total_size_for_test, response_caching_instance_id_for_test,
     response_caching_shard_amount_for_test, response_caching_size_accounting_snapshot_for_test,
@@ -2580,9 +2580,55 @@ async fn test_if_none_match_parses_entity_tag_lists_without_partial_matches() {
             r#""alpha,beta""#,
             false,
         ),
+        // Issue #5145: a recipient must parse and ignore a reasonable number of
+        // empty list members (RFC 9110 §5.6.1.2), so a matching tag beside one
+        // still selects the stored representation.
         (
             "trailing comma",
             r#""alpha,beta", "#,
+            r#""alpha,beta""#,
+            true,
+        ),
+        (
+            "trailing comma without trailing space",
+            r#""alpha,beta","#,
+            r#""alpha,beta""#,
+            true,
+        ),
+        (
+            "leading empty member",
+            r#", "alpha,beta""#,
+            r#""alpha,beta""#,
+            true,
+        ),
+        (
+            "interior empty member",
+            r#""other",, "alpha,beta""#,
+            r#""alpha,beta""#,
+            true,
+        ),
+        (
+            "empty members around the only tag",
+            r#" , , "alpha,beta" , , "#,
+            r#""alpha,beta""#,
+            true,
+        ),
+        (
+            "empty members with a non-matching tag only",
+            r#", "other","#,
+            r#""alpha,beta""#,
+            false,
+        ),
+        ("separators only", " , , , ", r#""alpha,beta""#, false),
+        (
+            "unreasonable empty member run",
+            r#",,,,,,,,,,,,,,,,,"alpha,beta""#,
+            r#""alpha,beta""#,
+            false,
+        ),
+        (
+            "malformed member beside empty members",
+            r#", bogus, "alpha,beta""#,
             r#""alpha,beta""#,
             false,
         ),
@@ -8597,4 +8643,461 @@ async fn generated_correlation_omit_is_identical_on_h1_h2_h3() {
         let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
         assert_eq!(body, b"wire-body", "{transport:?} must HIT");
     }
+}
+
+// === Issue #5147: repeated `Age` field lines arrive comma-folded ===
+
+fn age_response_headers(age: &str) -> HashMap<String, String> {
+    let mut response_headers = HashMap::new();
+    response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    response_headers.insert("date".to_string(), http_date_seconds_ago(0));
+    response_headers.insert("age".to_string(), age.to_string());
+    response_headers
+}
+
+/// Drive one complete miss with the given origin headers, then report whether
+/// the next identical request was served from the cache.
+async fn store_and_report_hit(
+    plugin: &ResponseCaching,
+    path: &str,
+    response_headers: &HashMap<String, String>,
+) -> bool {
+    cache_response(plugin, "GET", path, 200, response_headers, b"origin-body").await;
+
+    let mut ctx = make_ctx("GET", path);
+    let mut headers = HashMap::new();
+    is_reject(&plugin.before_proxy(&mut ctx, &mut headers).await)
+}
+
+#[tokio::test]
+async fn test_repeated_age_field_lines_stay_stale_instead_of_resetting_to_zero() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    // `Age: 90` alone already exceeds `max-age=60`, so the response is stale on
+    // arrival and is never retained. An origin that emits the field twice is
+    // comma-folded into one value before any plugin sees it; the first member
+    // must still decide, or a stale response silently becomes a reusable entry.
+    let cases = [
+        ("single", "90"),
+        ("repeated", "90, 0"),
+        ("repeated-tight", "90,0"),
+        ("repeated-spaced", " 90 , 0 "),
+        ("repeated-equal", "90, 90"),
+        ("repeated-overflow", "99999999999999999999999, 0"),
+    ];
+    for (name, age) in cases {
+        let path = format!("/api/age-{name}");
+        let headers = age_response_headers(age);
+        assert!(
+            !store_and_report_hit(&plugin, &path, &headers).await,
+            "Age {age:?} is already past max-age=60 and must not be retained"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_repeated_age_first_member_decides_freshness() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    // A fresh first member still admits the response even though a later
+    // member on its own would have been stale.
+    let fresh = age_response_headers("1, 90");
+    assert!(
+        store_and_report_hit(&plugin, "/api/age-first-fresh", &fresh).await,
+        "a fresh first Age member must still admit the response"
+    );
+
+    // A first member that is not a plain delta-seconds is no more usable than a
+    // single malformed value, so the existing ignore-and-continue behavior of
+    // `test_malformed_age_does_not_panic_or_prevent_fresh_hit` is unchanged.
+    let invalid = age_response_headers("not-a-number, 90");
+    assert!(
+        store_and_report_hit(&plugin, "/api/age-first-invalid", &invalid).await,
+        "an unparsable first Age member is ignored exactly as a single one is"
+    );
+}
+
+// === Issue #5146: a slash-terminated mutated path is its own boundary ===
+
+#[tokio::test]
+async fn test_unsafe_method_invalidates_descendants_of_slash_terminated_path() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/tree/child",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"child",
+    )
+    .await;
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/tree/",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"parent",
+    )
+    .await;
+    // A sibling that merely shares the textual prefix is not a descendant.
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/treehouse",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"sibling",
+    )
+    .await;
+    // The same path under a different authority is a different partition.
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/tree/child",
+        Some("b.example.com"),
+        200,
+        &HashMap::new(),
+        b"other-auth",
+    )
+    .await;
+
+    unsafe_method_cycle(&plugin, "POST", "/tree/", Some("a.example.com"), 200).await;
+
+    assert_cache_miss_for_host(&plugin, "/tree/child", "a.example.com").await;
+    assert_cache_miss_for_host(&plugin, "/tree/", "a.example.com").await;
+    assert_cache_hit_for_host(&plugin, "/treehouse", "a.example.com", b"sibling").await;
+    assert_cache_hit_for_host(&plugin, "/tree/child", "b.example.com", b"other-auth").await;
+}
+
+#[tokio::test]
+async fn test_unsafe_method_at_root_invalidates_descendants() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/root-child",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"root-child",
+    )
+    .await;
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"root",
+    )
+    .await;
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/root-child",
+        Some("b.example.com"),
+        200,
+        &HashMap::new(),
+        b"other-auth",
+    )
+    .await;
+
+    unsafe_method_cycle(&plugin, "POST", "/", Some("a.example.com"), 200).await;
+
+    assert_cache_miss_for_host(&plugin, "/root-child", "a.example.com").await;
+    assert_cache_miss_for_host(&plugin, "/", "a.example.com").await;
+    assert_cache_hit_for_host(&plugin, "/root-child", "b.example.com", b"other-auth").await;
+}
+
+#[tokio::test]
+async fn test_slash_terminated_mutation_keeps_failed_and_safe_request_semantics() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/tree/child",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"child",
+    )
+    .await;
+
+    // A failed mutation evicts nothing.
+    unsafe_method_cycle(&plugin, "POST", "/tree/", Some("a.example.com"), 500).await;
+    assert_cache_hit_for_host(&plugin, "/tree/child", "a.example.com", b"child").await;
+
+    // A safe method outside `cacheable_methods` bypasses without invalidating.
+    unsafe_method_cycle(&plugin, "OPTIONS", "/tree/", Some("a.example.com"), 204).await;
+    assert_cache_hit_for_host(&plugin, "/tree/child", "a.example.com", b"child").await;
+
+    // The successful mutation still refreshes the descendant.
+    unsafe_method_cycle(&plugin, "POST", "/tree/", Some("a.example.com"), 200).await;
+    assert_cache_miss_for_host(&plugin, "/tree/child", "a.example.com").await;
+}
+
+// === Issue #5148: a gateway transport failure is not an origin response ===
+
+/// Drive one miss whose backend dispatch ended in the recorded provenance, then
+/// report whether the next identical request was served from the cache.
+async fn retains_dispatch_outcome(
+    plugin: &ResponseCaching,
+    path: &str,
+    transport: HttpWireTransport,
+    error_class: Option<ferrum_edge::retry::ErrorClass>,
+    request_on_wire: bool,
+) -> bool {
+    let mut resp = HashMap::new();
+    resp.insert("cache-control".to_string(), "max-age=60".to_string());
+
+    let mut ctx = make_ctx("GET", path);
+    set_request_wire_protocol_for_test(&mut ctx, transport, false);
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    record_backend_dispatch_outcome_for_test(&mut ctx, error_class, request_on_wire);
+    plugin.after_proxy(&mut ctx, 502, &mut resp).await;
+    plugin
+        .on_final_response_body(&mut ctx, 502, &resp, b"gateway-error")
+        .await;
+
+    let mut hit_ctx = make_ctx("GET", path);
+    set_request_wire_protocol_for_test(&mut hit_ctx, transport, false);
+    let mut hit_headers = HashMap::new();
+    is_reject(&plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await)
+}
+
+#[tokio::test]
+async fn test_configured_502_does_not_retain_gateway_transport_failures() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({"cacheable_status_codes": [200, 502, 504]}));
+    let refused = Some(ferrum_edge::retry::ErrorClass::ConnectionRefused);
+    let closed = Some(ferrum_edge::retry::ErrorClass::ConnectionClosed);
+
+    for transport in [
+        HttpWireTransport::Http1,
+        HttpWireTransport::Http2,
+        HttpWireTransport::Http3,
+    ] {
+        // Pre-wire refusal: nothing ever reached the origin.
+        let path = format!("/errorcache/prewire-{transport:?}");
+        let stored = retains_dispatch_outcome(&plugin, &path, transport, refused, false).await;
+        assert!(
+            !stored,
+            "{transport:?}: a pre-wire connect refusal is a gateway error, not an origin response"
+        );
+
+        // Ambiguous post-wire failure: the peer vanished before answering.
+        let path = format!("/errorcache/ambiguous-{transport:?}");
+        let stored = retains_dispatch_outcome(&plugin, &path, transport, closed, true).await;
+        assert!(
+            !stored,
+            "{transport:?}: a peer that vanished mid-exchange selected no representation"
+        );
+
+        // Control: an authoritative origin 502 under the same configuration is
+        // still an origin-selected representation and is retained.
+        let path = format!("/errorcache/origin-{transport:?}");
+        let stored = retains_dispatch_outcome(&plugin, &path, transport, None, true).await;
+        assert!(
+            stored,
+            "{transport:?}: explicitly configured caching of a real origin 502 is preserved"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_transport_failure_does_not_teach_the_uncacheable_predictor() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({"cacheable_status_codes": [200, 502]}));
+    let refused = Some(ferrum_edge::retry::ErrorClass::ConnectionRefused);
+    let wire = HttpWireTransport::Http1;
+    let path = "/errorcache/predictor";
+
+    let stored = retains_dispatch_outcome(&plugin, path, wire, refused, false).await;
+    assert!(!stored);
+
+    // A transport failure says nothing about the resource, so the recovered
+    // origin's response is stored on the very next request instead of being
+    // skipped by a predictor mark.
+    let mut origin = HashMap::new();
+    origin.insert("cache-control".to_string(), "max-age=60".to_string());
+    cache_response(&plugin, "GET", path, 200, &origin, b"recovered").await;
+
+    let mut ctx = make_ctx("GET", path);
+    let mut headers = HashMap::new();
+    let (status, body, _) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"recovered");
+}
+
+// === The downstream `Vary` contract is published on the miss itself ===
+
+fn vary_names(headers: &HashMap<String, String>) -> Vec<String> {
+    let Some(vary) = headers.get("vary") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = vary
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Drive one miss and the hit that follows it, returning the `Vary` dimensions
+/// each client-visible response actually carried.
+async fn miss_and_hit_vary(
+    plugin: &ResponseCaching,
+    path: &str,
+    transport: HttpWireTransport,
+    origin: &HashMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut ctx = make_ctx("GET", path);
+    set_request_wire_protocol_for_test(&mut ctx, transport, false);
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut resp = origin.clone();
+    plugin.after_proxy(&mut ctx, 200, &mut resp).await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &resp, b"origin-body")
+        .await;
+
+    let mut hit_ctx = make_ctx("GET", path);
+    set_request_wire_protocol_for_test(&mut hit_ctx, transport, false);
+    let mut hit_headers = HashMap::new();
+    let (_, _, hit) = expect_reject(plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    (vary_names(&resp), vary_names(&hit))
+}
+
+#[tokio::test]
+async fn test_miss_publishes_the_same_downstream_vary_contract_as_the_hit() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({"vary_by_headers": ["accept-language"]}));
+
+    let mut origin = HashMap::new();
+    origin.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    let expected = vec![
+        "accept-language".to_string(),
+        "authorization".to_string(),
+        "cookie".to_string(),
+        "proxy-authorization".to_string(),
+    ];
+
+    for transport in [
+        HttpWireTransport::Http1,
+        HttpWireTransport::Http2,
+        HttpWireTransport::Http3,
+    ] {
+        let path = format!("/configured-vary/{transport:?}");
+        let (miss, hit) = miss_and_hit_vary(&plugin, &path, transport, &origin).await;
+        assert_eq!(
+            miss, expected,
+            "{transport:?}: the first publicly cacheable response must already carry the \
+             configured and mandatory dimensions"
+        );
+        assert_eq!(
+            miss, hit,
+            "{transport:?}: MISS and HIT must publish an identical downstream Vary contract"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_default_config_miss_publishes_mandatory_vary_dimensions() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+    let wire = HttpWireTransport::Http1;
+
+    let mut origin = HashMap::new();
+    origin.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    let expected = vec![
+        "authorization".to_string(),
+        "cookie".to_string(),
+        "proxy-authorization".to_string(),
+    ];
+
+    let (miss, hit) = miss_and_hit_vary(&plugin, "/default-vary", wire, &origin).await;
+    assert_eq!(miss, expected);
+    assert_eq!(miss, hit);
+}
+
+#[tokio::test]
+async fn test_miss_vary_contract_preserves_origin_dimensions_and_wildcard() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+    let wire = HttpWireTransport::Http1;
+
+    // An origin dimension survives alongside the mandatory ones.
+    let mut origin = HashMap::new();
+    origin.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    origin.insert("vary".to_string(), "Accept-Encoding".to_string());
+    let expected = vec![
+        "accept-encoding".to_string(),
+        "authorization".to_string(),
+        "cookie".to_string(),
+        "proxy-authorization".to_string(),
+    ];
+
+    let (miss, hit) = miss_and_hit_vary(&plugin, "/origin-vary", wire, &origin).await;
+    assert_eq!(miss, expected);
+    assert_eq!(miss, hit);
+
+    // `Vary: *` is a stronger downstream refusal than any name list, and this
+    // cache refuses to store such a response at all, so it is left untouched.
+    let mut wildcard = HashMap::new();
+    wildcard.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    wildcard.insert("vary".to_string(), "*".to_string());
+    let mut ctx = make_ctx("GET", "/wildcard-vary");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    plugin.after_proxy(&mut ctx, 200, &mut wildcard).await;
+    assert_eq!(wildcard.get("vary").map(String::as_str), Some("*"));
+}
+
+#[tokio::test]
+async fn test_bypassed_response_is_not_rewritten_with_a_vary_contract() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    // A non-cacheable method establishes no partition, so the plugin publishes
+    // no selection requirement on its behalf.
+    let mut ctx = make_ctx("POST", "/bypassed");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_status(&plugin, &ctx, "BYPASS");
+
+    let mut resp = HashMap::new();
+    resp.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    plugin.after_proxy(&mut ctx, 200, &mut resp).await;
+    assert!(!resp.contains_key("vary"));
 }

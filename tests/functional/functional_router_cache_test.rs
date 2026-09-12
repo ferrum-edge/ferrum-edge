@@ -15,6 +15,8 @@
 //! Run with:
 //!   cargo test --test functional_tests -- --ignored functional_router_cache --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,6 +77,7 @@ fn start_gateway_with_cache_cap(
 ) -> std::process::Child {
     let binary_path = gateway_binary_path();
     let mut cmd = std::process::Command::new(binary_path);
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
@@ -90,10 +93,9 @@ fn start_gateway_with_cache_cap(
 
 /// Allocate an ephemeral port by binding to port 0 and returning the port.
 async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Wait until `child` owns `admin_port`. Unauthenticated `/health` and
@@ -222,7 +224,7 @@ async fn test_router_cache_500_proxies_normal_routing() {
 
     let temp_dir = TempDir::new().expect("tempdir");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo = tokio::spawn(start_echo_server_on(echo_listener));
     sleep(Duration::from_millis(200)).await;
@@ -304,7 +306,7 @@ async fn test_router_cache_scanner_traffic_preserves_valid_routes() {
 
     let temp_dir = TempDir::new().expect("tempdir");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo = tokio::spawn(start_echo_server_on(echo_listener));
     sleep(Duration::from_millis(200)).await;
@@ -463,7 +465,7 @@ async fn test_router_cache_hot_entry_survives_scanner_burst() {
 
     let temp_dir = TempDir::new().expect("tempdir");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo = tokio::spawn(start_echo_server_on(echo_listener));
     sleep(Duration::from_millis(200)).await;
@@ -603,7 +605,7 @@ async fn test_router_cache_negative_cache_no_degradation() {
 
     let temp_dir = TempDir::new().expect("tempdir");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo = tokio::spawn(start_echo_server_on(echo_listener));
     sleep(Duration::from_millis(200)).await;

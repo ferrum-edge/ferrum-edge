@@ -6,6 +6,8 @@
 //! `client_ip::resolve_client_ip` on backend-bound traffic. Every trigger below
 //! therefore sends a spoofed `X-Real-IP` that must appear in NO capture.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::ports::reserve_port;
@@ -42,7 +44,7 @@ struct ReplayBackend {
 
 impl ReplayBackend {
     async fn spawn() -> std::io::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind_test("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let (sender, receiver) = mpsc::channel(64);
         let handle = tokio::spawn(async move {

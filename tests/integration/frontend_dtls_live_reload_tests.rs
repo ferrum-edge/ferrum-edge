@@ -6,6 +6,10 @@
 //! established sessions kept, new handshakes observe the accepted identity /
 //! client-CA / CRL generation).
 
+use crate::scaffolding::ports::bind_dtls;
+
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -406,7 +410,7 @@ fn frontend_config(
 
 async fn spawn_echo_dtls_server(config: FrontendDtlsConfig) -> Arc<DtlsServer> {
     let server = Arc::new(
-        DtlsServer::bind("127.0.0.1:0".parse().expect("bind addr"), config)
+        bind_dtls("127.0.0.1:0".parse().expect("bind addr"), config)
             .await
             .expect("bind dtls server"),
     );
@@ -442,7 +446,7 @@ async fn connect_dtls_client(
     trust_ca: Option<&TestCa>,
     connect_timeout_ms: u64,
 ) -> Result<DtlsConnection, anyhow::Error> {
-    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let socket = UdpSocket::bind_test("127.0.0.1:0").await?;
     socket.connect(server_addr).await?;
     let certificate = load_dtls_certificate(
         path_str(&client_material.cert_path),
@@ -503,7 +507,7 @@ async fn assert_new_dtls_session_rejected(
 }
 
 async fn assert_udp_socket_still_owns(addr: SocketAddr) {
-    let conflict = UdpSocket::bind(addr).await;
+    let conflict = UdpSocket::bind_test(addr).await;
     assert!(
         conflict.is_err(),
         "live-swapped DtlsServer must retain the original UDP bind; rebinding {addr} unexpectedly succeeded"

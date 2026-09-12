@@ -7,6 +7,14 @@
 //! The server secret (`FERRUM_BASIC_AUTH_HMAC_SECRET`) MUST be set to a
 //! unique, random value of at least 32 bytes. The plugin rejects construction
 //! if that requirement is not met — there is no insecure default.
+//!
+//! RFC 7617 encodes the reusable username/password in reversible Base64, so the
+//! verified `Authorization: Basic` field is removed before backend forwarding by
+//! default — including when another mechanism wins a multi-auth chain and the
+//! losing Basic credential would otherwise still ride along. Only the `Basic`
+//! scheme is removed; a `Bearer` or other scheme another policy needs is left
+//! untouched. `hide_credentials: false` is the explicit legacy opt-out and
+//! mirrors `key_auth`'s convention.
 
 use crate::fips::approved::HmacSha256;
 use async_trait::async_trait;
@@ -35,6 +43,9 @@ pub(crate) fn bounded_verification_rounds(configured_limit: usize) -> usize {
     configured_limit.clamp(1, MAX_BASIC_AUTH_VERIFICATION_ROUNDS)
 }
 
+/// The only configuration key this plugin accepts.
+const BASIC_AUTH_CONFIG_KEYS: &[&str] = &["hide_credentials"];
+
 pub struct BasicAuth {
     /// Pre-computed HMAC key from FERRUM_BASIC_AUTH_HMAC_SECRET.
     hmac_secret: Vec<u8>,
@@ -42,6 +53,8 @@ pub struct BasicAuth {
     dummy_password_hash: String,
     /// Fixed verification work, independent of consumer rotation state.
     verification_rounds: usize,
+    /// Remove a `Basic` `Authorization` field before the backend request.
+    hide_credentials: bool,
 }
 
 impl BasicAuth {
@@ -56,18 +69,28 @@ impl BasicAuth {
         config: &Value,
         hmac_secret: Option<&str>,
     ) -> Result<Self, String> {
-        match config {
-            Value::Null => {}
-            Value::Object(obj) if obj.is_empty() => {}
-            Value::Object(_) => {
-                return Err("basic_auth: no configuration fields are supported".to_string());
+        let hide_credentials = match config {
+            Value::Null => true,
+            Value::Object(obj) => {
+                crate::util::unknown_keys::reject_unknown_keys(
+                    obj,
+                    "config",
+                    BASIC_AUTH_CONFIG_KEYS,
+                    "basic_auth: ",
+                )?;
+                match obj.get("hide_credentials") {
+                    Some(value) => value.as_bool().ok_or_else(|| {
+                        "basic_auth: 'hide_credentials' must be a boolean".to_string()
+                    })?,
+                    None => true,
+                }
             }
             other => {
                 return Err(format!(
                     "basic_auth: config must be an object, got: {other}"
                 ));
             }
-        }
+        };
 
         let hmac_secret = hmac_secret.ok_or_else(|| {
             "basic_auth: FERRUM_BASIC_AUTH_HMAC_SECRET must be set to a unique, random value of \
@@ -93,6 +116,7 @@ impl BasicAuth {
             verification_rounds: bounded_verification_rounds(
                 crate::config::types::max_credentials_per_type(),
             ),
+            hide_credentials,
         })
     }
 
@@ -176,6 +200,7 @@ impl BasicAuth {
             hmac_secret: vec![b'x'; 32],
             dummy_password_hash,
             verification_rounds,
+            hide_credentials: true,
         };
         let mut verification_count = 0;
         let outcome = plugin.verify_credential_with_round_observer(
@@ -202,9 +227,8 @@ impl AuthMechanism for BasicAuth {
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         // RFC 7617 `Authorization: Basic` credentials are base64 (visible ASCII).
-        // A present field line that `materialize_headers()` omitted is malformed,
-        // not absent — report invalid so operators are not pointed at a missing
-        // credential.
+        // A present field line that is not visible ASCII is malformed, not absent
+        // — report invalid so operators are not pointed at a missing credential.
         let auth_header = match lookup_configured_header(ctx, "authorization", None) {
             ConfiguredHeaderLookup::Absent => return ExtractedCredential::Missing,
             ConfiguredHeaderLookup::PresentNonMaterialized => {
@@ -215,11 +239,7 @@ impl AuthMechanism for BasicAuth {
             ConfiguredHeaderLookup::Value(header) => header,
         };
 
-        let scheme = auth_header
-            .split(|c: char| c.is_ascii_whitespace())
-            .next()
-            .unwrap_or_default();
-        if !scheme.eq_ignore_ascii_case("Basic") {
+        if !authorization_value_is_basic(&auth_header) {
             return ExtractedCredential::Missing;
         }
 
@@ -268,10 +288,64 @@ impl AuthMechanism for BasicAuth {
     }
 }
 
+/// Whether a materialized `Authorization` value presents the RFC 7617 `Basic`
+/// scheme.
+///
+/// Scheme comparison is ASCII case-insensitive (RFC 9110 §11.1) and only the
+/// FIRST token is inspected — that is the credential
+/// [`BasicAuth::extract`] parses, so it is exactly the one this plugin is
+/// responsible for keeping off the backend. Any other scheme belongs to another
+/// policy and is left in place.
+fn authorization_value_is_basic(value: &str) -> bool {
+    value
+        .split(|c: char| c.is_ascii_whitespace())
+        .next()
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("Basic")
+}
+
+/// Whether one backend-bound header entry is an `Authorization` field carrying
+/// the `Basic` scheme.
+///
+/// The materialized map is lowercase, but a plugin can insert a mixed-case key,
+/// so the name is matched ASCII case-insensitively. The decision is keyed on the
+/// VALUE as well: a `Bearer` (or any other) scheme is not this plugin's.
+fn is_basic_authorization_field(name: &str, value: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization") && authorization_value_is_basic(value)
+}
+
+/// Remove every `Authorization` field carrying the `Basic` scheme from a
+/// backend-bound header map.
+fn strip_basic_authorization(headers: &mut std::collections::HashMap<String, String>) {
+    headers.retain(|name, value| !is_basic_authorization_field(name, value));
+}
+
 auth_flow::impl_auth_plugin!(
     BasicAuth,
     "basic_auth",
     super::priority::BASIC_AUTH,
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
-    auth_flow::run_auth
+    auth_flow::run_auth;
+
+    fn modifies_request_headers(&self) -> bool {
+        self.hide_credentials
+    }
+
+    /// Remove the verified Basic credential from the backend request.
+    ///
+    /// `before_proxy` runs for EVERY configured plugin, not only the mechanism
+    /// that won the chain, so a Basic credential is stripped even when
+    /// `key_auth` (or any other mechanism) authenticated the request for a
+    /// different consumer. That mixed-chain case is the one that leaked a
+    /// consumer password to an upstream asserting a different principal.
+    async fn before_proxy(
+        &self,
+        _ctx: &mut crate::plugins::RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) -> crate::plugins::PluginResult {
+        if self.hide_credentials {
+            strip_basic_authorization(headers);
+        }
+        crate::plugins::PluginResult::Continue
+    }
 );

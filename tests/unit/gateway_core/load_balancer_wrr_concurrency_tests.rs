@@ -7,10 +7,10 @@
 //! 4-target fixture is a secondary Arc-hotspot / serial-ratio signal), not by
 //! wall-clock assertions in this ordinary unit suite.
 
-use dashmap::DashMap;
 use ferrum_edge::config::types::{
     LoadBalancerAlgorithm, SubsetDefinition, SubsetTrafficPolicy, UpstreamTarget,
 };
+use ferrum_edge::health_check::ActiveUnhealthyTargets;
 use ferrum_edge::load_balancer::{HealthContext, LoadBalancer, target_key};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use std::thread;
 
 const UPSTREAM: &str = "wrr-concurrency";
 
-fn active_health_ctx(active: &DashMap<String, u64>) -> HealthContext<'_> {
+fn active_health_ctx(active: &ActiveUnhealthyTargets) -> HealthContext<'_> {
     HealthContext {
         active_unhealthy: active,
         proxy_passive: None,
@@ -176,7 +176,7 @@ fn wrr_unhealthy_targets_excluded_and_recovered_targets_rejoin() {
         None,
     );
 
-    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     unhealthy.insert(target_key(UPSTREAM, &targets[0]), 1);
 
     for _ in 0..50 {

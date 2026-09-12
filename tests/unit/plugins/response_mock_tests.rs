@@ -63,6 +63,25 @@ fn test_creation_valid_config() {
 }
 
 #[test]
+fn test_creation_accepts_explicit_null_for_optional_fields() {
+    let plugin = ResponseMock::new(&json!({
+        "passthrough_on_no_match": null,
+        "rules": [{
+            "method": null,
+            "path": "/",
+            "status_code": null,
+            "headers": null,
+            "body": null,
+            "delay_ms": null
+        }]
+    }));
+    assert!(
+        plugin.is_ok(),
+        "explicit null optional fields must match omitted defaults"
+    );
+}
+
+#[test]
 fn test_creation_rejects_non_object_config() {
     let err = ResponseMock::new(&json!("bad")).err().unwrap();
     assert!(err.contains("config must be an object"));
@@ -1180,5 +1199,33 @@ async fn test_no_body_statuses_suppress_configured_body_on_wire() {
             }
             other => panic!("Expected finalized RejectBinary for {status}, got {other:?}"),
         }
+    }
+}
+
+#[tokio::test]
+async fn prefix_trailing_slash_preserves_rule_path_coordinates() {
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{"path": "/users", "body": "users"}, {"path": "/", "body": "root"}]
+    }))
+    .unwrap();
+    for (listen, path, expected) in [
+        ("/api/", "/api/users", "users"),
+        ("/api", "/api/users", "users"),
+        ("/api/", "/api/", "root"),
+        ("/", "/users", "users"),
+        ("~/users", "/users", "users"),
+        ("=/users", "/users", "users"),
+    ] {
+        let mut ctx = make_ctx("GET", path, listen);
+        let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+        let PluginResult::Reject {
+            status_code, body, ..
+        } = result
+        else {
+            panic!("mock must match {listen} at {path}");
+        };
+        assert_eq!(status_code, 200);
+        assert_eq!(body, expected);
+        assert_eq!(ctx.path, path);
     }
 }

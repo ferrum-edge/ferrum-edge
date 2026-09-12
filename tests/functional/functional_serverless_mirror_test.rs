@@ -8,6 +8,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_serverless_mirror
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
@@ -27,7 +29,7 @@ use tokio::time::sleep;
 
 /// Start a simple HTTP backend that returns a distinctive JSON body.
 async fn start_backend_server(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind backend server");
 
@@ -52,7 +54,7 @@ async fn start_backend_server(port: u16) {
 
 /// Start a mock serverless function endpoint that returns a custom response.
 async fn start_function_server(port: u16, invocations: Arc<AtomicUsize>) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind function server");
 
@@ -117,7 +119,7 @@ async fn start_function_server(port: u16, invocations: Arc<AtomicUsize>) {
 
 /// Start a mock mirror server that sets a flag when it receives a request.
 async fn start_mirror_server(port: u16, called: Arc<AtomicBool>) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind mirror server");
 
@@ -167,6 +169,7 @@ fn start_gateway(
     let binary_path = gateway_binary_path();
 
     let mut cmd = std::process::Command::new(binary_path);
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
@@ -198,10 +201,9 @@ async fn wait_for_owned_gateway(
 
 /// Allocate an ephemeral port by binding to port 0 and returning the assigned port.
 async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Start the gateway with retry logic for port allocation races.

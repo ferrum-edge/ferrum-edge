@@ -736,6 +736,35 @@ fn compile_string_match(
             "trigger: `{label}` must set exactly one of `exact`, `prefix`, or `regex`"
         ));
     }
+    // Request facts are already canonical. Refuse unreachable spellings at
+    // admission rather than publishing a policy that silently never executes.
+    if let Some(values) = value.exact.as_ref().or(value.prefix.as_ref())
+        && values.len() > MAX_TRIGGER_LIST_LEN
+    {
+        return Err(format!(
+            "trigger: `{label}` has {} entries, over the {MAX_TRIGGER_LIST_LEN} limit",
+            values.len()
+        ));
+    }
+    for entry in value.exact.iter().chain(value.prefix.iter()).flatten() {
+        check_value_len(entry, label)?;
+        if label == "path" {
+            if !entry.starts_with('/') {
+                return Err("trigger: `path` exact/prefix must start with `/`".to_string());
+            }
+            if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(entry) {
+                return Err(format!(
+                    "trigger: `path` exact/prefix must be canonical: {reason}"
+                ));
+            }
+        }
+        if label == "host"
+            && !value.case_insensitive
+            && entry.bytes().any(|byte| byte.is_ascii_uppercase())
+        {
+            return Err("trigger: `host` uppercase ASCII requires `case_insensitive`".to_string());
+        }
+    }
     if let Some(values) = &value.exact {
         let list = compile_token_list(values, label, |entry| {
             if value.case_insensitive {
@@ -776,6 +805,17 @@ fn compile_string_match(
             "trigger: `{label}` regex is {} bytes, over the {MAX_TRIGGER_REGEX_LEN}-byte limit",
             pattern.len()
         ));
+    }
+    if label == "path"
+        && let Some(reason) = crate::policy_path::non_canonical_policy_path_pattern_reason(pattern)
+    {
+        return Err(format!("trigger: `path` regex must be canonical: {reason}"));
+    }
+    if label == "host"
+        && !value.case_insensitive
+        && pattern.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err("trigger: `host` uppercase ASCII requires `case_insensitive`".to_string());
     }
     // Anchor so a trigger regex can never partially match a longer value, and
     // bound both the compiled program and the lazy-DFA cache so a hostile

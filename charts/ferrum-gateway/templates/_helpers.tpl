@@ -94,15 +94,25 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "ferrum-gateway.labels" -}}
-helm.sh/chart: {{ include "ferrum-gateway.chart" . }}
-{{ include "ferrum-gateway.selectorLabels" . }}
+{{- $ctx := . -}}
+{{- $component := "gateway" -}}
+{{- if kindIs "map" . -}}
+{{- if hasKey . "root" -}}
+{{- $ctx = .root -}}
+{{- end -}}
+{{- if hasKey . "component" -}}
+{{- $component = .component -}}
+{{- end -}}
+{{- end -}}
+helm.sh/chart: {{ include "ferrum-gateway.chart" $ctx }}
+{{ include "ferrum-gateway.selectorLabels" $ctx }}
 app.kubernetes.io/part-of: ferrum-edge
-app.kubernetes.io/component: gateway
-{{- if .Chart.AppVersion }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/component: {{ $component }}
+{{- if $ctx.Chart.AppVersion }}
+app.kubernetes.io/version: {{ $ctx.Chart.AppVersion | quote }}
 {{- end }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
-{{- with .Values.commonLabels }}
+app.kubernetes.io/managed-by: {{ $ctx.Release.Service }}
+{{- with $ctx.Values.commonLabels }}
 {{ toYaml . }}
 {{- end }}
 {{- end -}}

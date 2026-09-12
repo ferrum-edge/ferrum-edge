@@ -3,6 +3,8 @@
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext,
     ai_token_metrics::AiTokenMetrics,
+    prometheus_metrics::MetricsRegistry,
+    utils::ai_providers::{AiProvider, parse_ai_provider},
     utils::content_encoding::{DecodeLimits, decode_content_encoding},
     validate_plugin_config,
 };
@@ -11,7 +13,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
 
-use super::plugin_utils::create_test_context;
+use super::plugin_utils::{create_test_context, create_test_transaction_summary};
 
 // Marker set by the proxy on `ctx.metadata` while the response-body hooks run
 // over a synthetic 2xx plugin short-circuit body (mirrors
@@ -86,6 +88,243 @@ fn assert_continue(result: PluginResult) {
     );
 }
 
+fn assert_usage_and_metrics(
+    ctx: &RequestContext,
+    provider: &str,
+    prompt: Option<u64>,
+    completion: u64,
+    total: Option<u64>,
+    cost: &str,
+) {
+    assert_eq!(ctx.metadata["ai_provider"], provider);
+    let export = ctx.authoritative_ai_usage_export().unwrap();
+    assert_eq!(export.provider, provider);
+    assert_eq!(export.prompt_tokens, prompt);
+    assert_eq!(export.completion_tokens, Some(completion));
+    assert_eq!(export.total_tokens, total);
+
+    let mut summary = create_test_transaction_summary();
+    summary.ai_usage_export = Some(export);
+    let registry = MetricsRegistry::new();
+    registry.configure(0, 3600, 0, 10_000, "");
+    registry.record(&summary);
+    let output = registry.render_uncached();
+    // Configuring even an empty namespace emits its label on every AI series.
+    let labels = format!("proxy_id=\"test-proxy\",provider=\"{provider}\",namespace=\"\"");
+    for (metadata_key, metric, value) in [
+        ("ai_prompt_tokens", "ferrum_ai_prompt_tokens_total", prompt),
+        (
+            "ai_completion_tokens",
+            "ferrum_ai_completion_tokens_total",
+            Some(completion),
+        ),
+        ("ai_total_tokens", "ferrum_ai_tokens_total", total),
+    ] {
+        let series = format!("{metric}{{{labels}}}");
+        if let Some(value) = value {
+            assert_eq!(ctx.metadata[metadata_key], value.to_string());
+            assert!(
+                output.contains(&format!("{series} {value}\n")),
+                "missing {series} {value} in:\n{output}"
+            );
+        } else {
+            assert!(!ctx.metadata.contains_key(metadata_key));
+            assert!(!output.contains(&series));
+        }
+    }
+    assert_eq!(ctx.metadata["ai_estimated_cost"], cost);
+    assert!(output.contains(&format!(
+        "ferrum_ai_estimated_cost_currency_units_total{{{labels}}} {cost}\n"
+    )));
+}
+
+fn token_metrics_schema() -> serde_json::Value {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();
+    spec["components"]["schemas"]["AiTokenMetricsConfig"].clone()
+}
+
+#[test]
+fn optional_cost_rate_admission_matches_openapi() {
+    let schema = token_metrics_schema();
+    let validator = jsonschema::draft202012::options().build(&schema).unwrap();
+    assert!(validator.is_valid(&json!({})));
+    assert!(AiTokenMetrics::new(&json!({})).is_ok());
+    for field in ["cost_per_prompt_token", "cost_per_completion_token"] {
+        for (value, accepted) in [
+            (json!(null), true),
+            (json!(0), true),
+            (json!(18_446_744_073_709.55), true),
+            (json!(-1), false),
+            (json!(18_446_744_073_710.0), false),
+            (json!("free"), false),
+            (json!(true), false),
+            (json!([]), false),
+            (json!({}), false),
+        ] {
+            let config = json!({field: value});
+            assert_eq!(AiTokenMetrics::new(&config).is_ok(), accepted);
+            assert_eq!(validator.is_valid(&config), accepted, "{config}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn buffered_sse_event_framing_preserves_usage_and_prometheus_values() {
+    let plugin = AiTokenMetrics::new(&json!({
+        "buffer_streaming_responses": true,
+        "cost_per_prompt_token": 0.000001,
+        "cost_per_completion_token": 0.000002
+    }))
+    .unwrap();
+    let single = concat!(
+        "data: {\"object\":\"chat.completion\",\"model\":\"framing-model\",",
+        "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\n"
+    );
+    let multiline = concat!(
+        ": keepalive\n",
+        "event: message\n",
+        "id: usage-1\n",
+        "data: {\"object\":\"chat.completion\",\"model\":\"framing-model\",\n",
+        "data\n",
+        "data:\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\n"
+    );
+    for ending in ["\n", "\r\n", "\r"] {
+        for event in [single, multiline] {
+            // Repeated cumulative usage must replace, not add. An invalid
+            // event must not leak data into the next event's JSON document.
+            let body = format!("\u{feff}data: invalid\n\n{event}{event}data: [DONE]\n\n")
+                .replace('\n', ending);
+            let mut ctx = create_test_context();
+            let mut headers =
+                HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+            let original_headers = headers.clone();
+            assert_continue(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+                    .await,
+            );
+            assert_eq!(headers, original_headers);
+            assert_eq!(ctx.metadata["ai_model"], "framing-model");
+            assert_eq!(ctx.metadata["ai_streaming"], "true");
+            assert_usage_and_metrics(&ctx, "openai", Some(11), 7, Some(18), "0.000025");
+        }
+    }
+}
+
+#[tokio::test]
+async fn buffered_sse_does_not_parse_data_fields_as_independent_events() {
+    let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+    let usage = r#"{"usage":{"prompt_tokens":11,"completion_tokens":7}}"#;
+    for body in [
+        format!("data: {usage}\ndata: {usage}\n\n"),
+        format!("data: {usage}\n"),
+    ] {
+        let mut ctx = create_test_context();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+                .await,
+        );
+        assert!(ctx.authoritative_ai_usage_export().is_none());
+        assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+    }
+}
+
+#[tokio::test]
+async fn every_admitted_provider_exports_usage_to_prometheus() {
+    let schema = token_metrics_schema();
+    for value in schema["properties"]["provider"]["enum"].as_array().unwrap() {
+        let name = value.as_str().unwrap();
+        if name == "auto" {
+            continue;
+        }
+        let provider = parse_ai_provider(name).unwrap();
+        assert_eq!(provider.as_str(), name);
+        // Exhaustive match also makes an enum addition require an export
+        // fixture, even if its schema entry has not been added yet.
+        let body = match provider {
+            AiProvider::OpenAi | AiProvider::Mistral => {
+                json!({"usage": {"prompt_tokens": 11, "completion_tokens": 7}})
+            }
+            AiProvider::Anthropic => json!({"usage": {"input_tokens": 11, "output_tokens": 7}}),
+            AiProvider::Google => {
+                json!({"usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 7}})
+            }
+            AiProvider::Cohere => {
+                json!({"usage": {"tokens": {"input_tokens": 11, "output_tokens": 7}}})
+            }
+            AiProvider::Bedrock => json!({"usage": {"inputTokens": 11, "outputTokens": 7}}),
+            AiProvider::Tgi => {
+                json!({"details": {"generated_tokens": 7, "prefill": vec![json!({"id": 0}); 11]}})
+            }
+        };
+        let plugin = AiTokenMetrics::new(&json!({
+            "provider": name,
+            "cost_per_prompt_token": 0.000001,
+            "cost_per_completion_token": 0.000002
+        }))
+        .unwrap();
+        let mut ctx = create_test_context();
+        let mut headers = json_headers();
+        assert_continue(
+            plugin
+                .on_response_body(
+                    &mut ctx,
+                    200,
+                    &mut headers,
+                    &serde_json::to_vec(&body).unwrap(),
+                )
+                .await,
+        );
+        assert_usage_and_metrics(&ctx, name, Some(11), 7, Some(18), "0.000025");
+    }
+}
+
+#[tokio::test]
+async fn tgi_json_and_terminal_sse_keep_completion_only_usage_partial() {
+    for provider in ["auto", "tgi"] {
+        let plugin = AiTokenMetrics::new(&json!({
+            "provider": provider,
+            "buffer_streaming_responses": true,
+            "cost_per_prompt_token": 0.000001,
+            "cost_per_completion_token": 0.000002
+        }))
+        .unwrap();
+        for with_prompt in [false, true] {
+            let mut body = json!({"generated_text": "ok", "details": {"generated_tokens": 7}});
+            if with_prompt {
+                body["details"]["prefill"] = json!(vec![json!({"id": 0}); 11]);
+            }
+            for streaming in [false, true] {
+                let (content_type, body) = if streaming {
+                    ("text/event-stream", format!("data: {body}\n\n"))
+                } else {
+                    ("application/json", body.to_string())
+                };
+                let mut ctx = create_test_context();
+                let mut headers =
+                    HashMap::from([("content-type".to_string(), content_type.to_string())]);
+                assert_continue(
+                    plugin
+                        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+                        .await,
+                );
+                assert_usage_and_metrics(
+                    &ctx,
+                    "tgi",
+                    with_prompt.then_some(11),
+                    7,
+                    with_prompt.then_some(18),
+                    if with_prompt { "0.000025" } else { "0.000014" },
+                );
+            }
+        }
+    }
+}
+
 // ─── Plugin basics ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -157,10 +396,58 @@ fn test_streaming_response_buffering_requires_explicit_opt_in() {
     ));
 }
 
+#[test]
+fn retry_release_requires_origin_sse_and_no_buffering_opt_in() {
+    for opt_in in [false, true] {
+        let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": opt_in})).unwrap();
+        let ctx = ctx_with_content_type("POST", "application/json");
+        assert!(plugin.should_buffer_response_body(&ctx));
+        assert_eq!(
+            plugin.may_release_response_body_under_retries(&ctx),
+            !opt_in
+        );
+        for (content_type, is_sse) in [
+            ("text/event-stream", true),
+            ("Text/Event-Stream; charset=utf-8", true),
+            // This observer conservatively preserves streaming for variants,
+            // using the same classification with and without retries (#5333).
+            ("application/event-stream+json", true),
+            ("application/vnd.acme-event-stream", true),
+            ("application/json", false),
+            ("text/plain", false),
+        ] {
+            let headers = HashMap::from([("Content-Type".to_string(), content_type.to_string())]);
+            assert_eq!(
+                plugin.should_release_response_body_under_retries(&ctx, 200, &headers),
+                !opt_in && is_sse,
+                "{content_type}, opt_in={opt_in}"
+            );
+            if is_sse {
+                assert_eq!(
+                    plugin.should_buffer_response_body_for_content_type(
+                        &ctx,
+                        Some(content_type),
+                        200,
+                        &headers,
+                    ),
+                    opt_in,
+                    "{content_type}, opt_in={opt_in}"
+                );
+            }
+        }
+        assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &HashMap::new()));
+        assert!(plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            200,
+            &json_headers()
+        ));
+    }
+}
+
 // The pre-header `should_buffer_response_body` decision drives every backend
-// dispatch path — including the retry and HTTP/3-backend paths
-// that never consult the header-time content-type refinement. These tests pin
-// the request-shape gating that keeps those paths streaming (PR #1751 follow-up).
+// dispatch path. These tests pin the request-shape gating that avoids buffering
+// before origin headers and the retry-release refinement are available.
 
 #[test]
 fn test_pre_header_decision_streams_sse_accept_requests() {
@@ -172,7 +459,7 @@ fn test_pre_header_decision_streams_sse_accept_requests() {
         .insert("accept".to_string(), "text/event-stream".to_string());
 
     // A client asking for a stream must not be buffered by default, even on the
-    // retry / gRPC / H3-backend paths that skip the content-type refinement.
+    // retry / H3-backend paths before the content-type refinement.
     assert!(!default_plugin.should_buffer_response_body(&ctx));
     // Opt-in restores buffering for operators who want streamed token metrics.
     assert!(opt_in_plugin.should_buffer_response_body(&ctx));
@@ -385,6 +672,51 @@ async fn test_cohere_v2_streaming_format() {
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "64");
     assert_eq!(ctx.metadata.get("ai_prompt_tokens").unwrap(), "23");
     assert_eq!(ctx.metadata.get("ai_completion_tokens").unwrap(), "41");
+}
+
+#[tokio::test]
+async fn cohere_cost_uses_processed_tokens_and_ignores_billed_units_only() {
+    for provider in ["auto", "cohere"] {
+        let plugin = AiTokenMetrics::new(&json!({
+            "provider": provider,
+            "buffer_streaming_responses": true,
+            "cost_per_prompt_token": 0.000001,
+            "cost_per_completion_token": 0.000002
+        }))
+        .unwrap();
+        for location in ["usage", "delta", "meta"] {
+            for with_tokens in [false, true] {
+                let mut usage = json!({"billed_units": {"input_tokens": 9, "output_tokens": 5}});
+                if with_tokens {
+                    usage["tokens"] = json!({"input_tokens": 11, "output_tokens": 7});
+                }
+                let json = if location == "delta" {
+                    json!({"type": "message-end", "delta": {"usage": usage}})
+                } else {
+                    json!({location: usage})
+                };
+                let (content_type, body) = if location == "delta" {
+                    ("text/event-stream", format!("data: {json}\n\n"))
+                } else {
+                    ("application/json", json.to_string())
+                };
+                let mut ctx = create_test_context();
+                let mut headers =
+                    HashMap::from([("content-type".to_string(), content_type.to_string())]);
+                assert_continue(
+                    plugin
+                        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+                        .await,
+                );
+                if with_tokens {
+                    assert_usage_and_metrics(&ctx, "cohere", Some(11), 7, Some(18), "0.000025");
+                } else {
+                    assert!(ctx.authoritative_ai_usage_export().is_none());
+                    assert!(!ctx.metadata.contains_key("ai_estimated_cost"));
+                }
+            }
+        }
+    }
 }
 
 // ─── Bedrock format ─────────────────────────────────────────────────────

@@ -89,6 +89,10 @@ pub enum H3Step {
     ReadRequestData,
     /// Send a chunk of response body.
     RespondData(Bytes),
+    /// Keep sending DATA without FIN until the peer cancels this response with
+    /// H3_REQUEST_CANCELLED. Fail after a bounded wait or on any other error;
+    /// then allow AcceptStream to prove reuse of this same QUIC connection.
+    RespondDataUntilCancelled(Bytes),
     /// Send an H3 trailers (HEADERS) frame with the given `(name, value)`
     /// pairs after the response body (e.g. `grpc-status` / `grpc-message`),
     /// then FIN the stream. Pseudo-headers are rejected — trailers carry only
@@ -645,6 +649,34 @@ async fn run_h3_script(
                     .send_data(bytes)
                     .await
                     .map_err(|e| format!("send_data: {e}"))?;
+            }
+            H3Step::RespondDataUntilCancelled(bytes) => {
+                if bytes.is_empty() {
+                    return Err("RespondDataUntilCancelled requires nonempty DATA".into());
+                }
+                let stream = response_stream.as_mut().ok_or_else(|| {
+                    "RespondDataUntilCancelled without preceding RespondHeaders".to_string()
+                })?;
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        match stream.send_data(bytes.clone()).await {
+                            Ok(()) => tokio::task::yield_now().await,
+                            Err(h3::error::StreamError::RemoteTerminate { code, .. })
+                                if code == h3::error::Code::H3_REQUEST_CANCELLED =>
+                            {
+                                return Ok(());
+                            }
+                            Err(error) => return Err(format!("expected cancellation: {error}")),
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| "response was not cancelled within 15 seconds".to_string())??;
+                // The response is cancelled, but retain the request receive
+                // half like the other terminal steps until the script ends.
+                if let Some(stream) = response_stream.take() {
+                    finished_response_streams.push(stream);
+                }
             }
             H3Step::RespondTrailersWithoutFin(pairs) => {
                 let stream = response_stream.as_mut().ok_or_else(|| {

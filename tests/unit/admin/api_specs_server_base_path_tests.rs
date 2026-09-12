@@ -10,7 +10,7 @@ use ferrum_edge::admin::api_specs::{ExtractError, SpecFormat, extract};
 use ferrum_edge::plugins::{
     Plugin, PluginResult, RequestContext, openapi_validator::OpenapiValidator,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 fn proxy_block() -> &'static str {
@@ -73,6 +73,150 @@ async fn assert_rejects_unknown(plugin: &OpenapiValidator, method: &str, path: &
             assert_eq!(status_code, 400, "unknown operation rejects with 400");
         }
         other => panic!("{method} {path} must be rejected as unknown operation: {other:?}"),
+    }
+}
+
+#[test]
+fn listen_path_prefixes_generated_operations_for_all_spec_versions() {
+    for version in ["2.0", "3.0.3", "3.1.0", "3.2.0"] {
+        for listen_path in ["/p2/oas2", "/p2/oas2/"] {
+            for strip_listen_path in [true, false] {
+                let mut spec = json!({
+                    "info": {"title": "Mounted API", "version": "1.0.0"},
+                    "x-ferrum-validate": true,
+                    "x-ferrum-proxy": {
+                        "id": "mounted-api",
+                        "listen_path": listen_path,
+                        "strip_listen_path": strip_listen_path,
+                        "backend_host": "backend.internal",
+                        "backend_port": 8080
+                    },
+                    "paths": {
+                        "/": {"get": {"responses": {"200": {"description": "ok"}}}},
+                        "/items": {"post": {"responses": {"201": {"description": "ok"}}}},
+                        "/items/": {"get": {"responses": {"200": {"description": "ok"}}}},
+                        "/items/{id}": {"get": {"responses": {"200": {"description": "ok"}}}}
+                    }
+                });
+                let version_key = if version == "2.0" {
+                    "swagger"
+                } else {
+                    "openapi"
+                };
+                spec[version_key] = json!(version);
+                let config = extract_validator_config(&spec.to_string());
+                assert_eq!(config["fail_on_unknown_operation"], true);
+                assert_eq!(
+                    op_templates(&config),
+                    vec![
+                        (
+                            "GET".to_string(),
+                            "/p2/oas2".to_string(),
+                            "^/p2/oas2$".to_string()
+                        ),
+                        (
+                            "POST".to_string(),
+                            "/p2/oas2/items".to_string(),
+                            "^/p2/oas2/items$".to_string()
+                        ),
+                        (
+                            "GET".to_string(),
+                            "/p2/oas2/items/".to_string(),
+                            "^/p2/oas2/items/$".to_string()
+                        ),
+                        (
+                            "GET".to_string(),
+                            "/p2/oas2/items/{id}".to_string(),
+                            "^/p2/oas2/items/[^/]+$".to_string()
+                        ),
+                    ],
+                    "version={version}, listen_path={listen_path}, strip={strip_listen_path}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn root_host_only_exact_and_regex_routes_keep_spec_paths() {
+    for listen_path in [None, Some("/"), Some("=/items"), Some("~^/items$")] {
+        let spec = json!({
+            "openapi": "3.1.0",
+            "x-ferrum-validate": true,
+            "x-ferrum-proxy": {
+                "id": "unmounted-api",
+                "hosts": ["api.example.com"],
+                "listen_path": listen_path,
+                "backend_host": "backend.internal",
+                "backend_port": 8080
+            },
+            "paths": {
+                "/items": {"post": {"responses": {"201": {"description": "ok"}}}}
+            }
+        });
+        let config = extract_validator_config(&spec.to_string());
+        assert_eq!(
+            op_templates(&config),
+            vec![(
+                "POST".to_string(),
+                "/items".to_string(),
+                "^/items$".to_string()
+            )],
+            "listen_path={listen_path:?}"
+        );
+        let plugin = OpenapiValidator::new(&config).unwrap();
+        assert_matches(&plugin, "POST", "/items").await;
+        assert_rejects_unknown(&plugin, "POST", "/unknown").await;
+    }
+}
+
+#[tokio::test]
+async fn listen_prefix_composes_with_server_bases_and_is_regex_escaped() {
+    for version in ["2.0", "3.1.0"] {
+        let mut spec = json!({
+            "x-ferrum-validate": true,
+            "x-ferrum-proxy": {
+                "id": "server-mount-api",
+                "listen_path": "/p2/oas.v2/",
+                "backend_host": "backend.internal",
+                "backend_port": 8080
+            },
+            "paths": {
+                "/items/{id}": {"get": {"responses": {"200": {"description": "ok"}}}}
+            }
+        });
+        if version == "2.0" {
+            spec["swagger"] = json!(version);
+            spec["basePath"] = json!("/v1/");
+        } else {
+            spec["openapi"] = json!(version);
+            spec["servers"] = json!([{"url": "/ignored-root"}]);
+            spec["paths"]["/items/{id}"]["servers"] = json!([{"url": "/ignored-path"}]);
+            spec["paths"]["/items/{id}"]["get"]["servers"] = json!([
+                {"url": "https://api.example.com/v1/"},
+                {"url": "/v1"}
+            ]);
+        }
+        let config = extract_validator_config(&spec.to_string());
+        assert_eq!(
+            op_templates(&config),
+            vec![(
+                "GET".to_string(),
+                "/p2/oas.v2/v1/items/{id}".to_string(),
+                r"^/p2/oas\.v2/v1/items/[^/]+$".to_string()
+            )]
+        );
+        let plugin = OpenapiValidator::new(&config).unwrap();
+        assert_matches(&plugin, "GET", "/p2/oas.v2/v1/items/42").await;
+        for path in [
+            "/v1/items/42",
+            "/p2/oasXv2/v1/items/42",
+            "/p2/oas.v2/ignored-root/items/42",
+            "/p2/oas.v2/ignored-path/items/42",
+            "/p2/oas.v2/v1/items/42/extra",
+        ] {
+            assert_rejects_unknown(&plugin, "GET", path).await;
+        }
     }
 }
 

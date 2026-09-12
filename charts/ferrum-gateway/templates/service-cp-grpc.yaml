@@ -5,8 +5,7 @@ metadata:
   name: {{ include "ferrum-gateway.cpGrpcServiceName" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "ferrum-gateway.labels" . | nindent 4 }}
-    app.kubernetes.io/component: control-plane-grpc
+    {{- include "ferrum-gateway.labels" (dict "root" . "component" "control-plane-grpc") | nindent 4 }}
   {{- with .Values.cp.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}

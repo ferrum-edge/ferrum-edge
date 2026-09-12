@@ -47,7 +47,7 @@ permissions:
 # lane and run to completion.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('multicluster-federation-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('multicluster-federation-live-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('multicluster-federation-live-{0}', github.ref) || 'multicluster-federation-live-shared')) }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 env:
   FERRUM_IMAGE_REPOSITORY: ferrum-edge

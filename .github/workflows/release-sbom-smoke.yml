@@ -1,0 +1,62 @@
+name: Release SBOM Smoke
+
+# Read-only reproduction of #4856. No release inputs, registry login, OIDC,
+# signing, publication, image execution, or output consumed by a publisher.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/workflows/release-sbom-smoke.yml
+      - .github/scripts/release_sbom_smoke.py
+      - .github/scripts/test_release_sbom_smoke.py
+      - .github/fixtures/release-sbom/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+      - .github/workflows/release-sbom-smoke.yml
+      - .github/scripts/release_sbom_smoke.py
+      - .github/scripts/test_release_sbom_smoke.py
+      - .github/fixtures/release-sbom/**
+
+permissions:
+  contents: read
+
+jobs:
+  sbom:
+    name: SPDX ${{ matrix.family }} / ${{ matrix.registry }} / ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        family: [standard, ebpf, ebpftools]
+        # Run 34162011344 proved these immutable Docker Hub images public.
+        # All six anonymous GHCR entries failed token discovery with HTTP 401,
+        # before Syft. Authenticated per-registry release verification remains
+        # required; this anonymous diagnostic lane cannot supply that evidence.
+        registry: [docker]
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - name: Test production predicate and diagnostic failure handling
+        run: python3 .github/scripts/test_release_sbom_smoke.py
+      - name: Scan public immutable release image
+        if: ${{ !cancelled() }}
+        env:
+          SBOM_FAMILY: ${{ matrix.family }}
+          SBOM_REGISTRY: ${{ matrix.registry }}
+          SBOM_ARCH: ${{ matrix.arch }}
+        run: python3 .github/scripts/release_sbom_smoke.py
+      - name: Retain anonymous scan diagnostics and SPDX
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-sbom-${{ matrix.family }}-${{ matrix.registry }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/release-sbom-evidence/
+          if-no-files-found: warn
+          retention-days: 14

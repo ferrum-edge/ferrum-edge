@@ -7,6 +7,8 @@
 //! Run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_passthrough --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::process::Child;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -26,7 +28,7 @@ fn gateway_binary_path() -> &'static str {
 
 /// Plain TCP echo server — reads data, echoes it back, and closes.
 async fn start_tcp_echo_server(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind TCP echo");
 
@@ -73,7 +75,7 @@ async fn start_tls_echo_server(port: u16, cert_pem: &str, key_pem: &str) {
         .expect("bad tls config");
 
     let acceptor = TlsAcceptor::from(Arc::new(config));
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind TLS echo");
 
@@ -251,15 +253,15 @@ where
 {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let proxy_listen_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let http_port = http_listener.local_addr().unwrap().port();
         drop(http_listener);
 
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
@@ -278,6 +280,7 @@ where
         let observability_token = mint_observability_token();
 
         let mut cmd = std::process::Command::new(gateway_binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
             .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
@@ -324,7 +327,7 @@ where
 #[ignore]
 async fn test_tcp_passthrough_plain_echo() {
     // Backend: plain TCP echo (same-process, no port race)
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     tokio::spawn(start_tcp_echo_server(backend_port));
@@ -410,7 +413,7 @@ async fn try_passthrough_circuit_breaker_scenario(attempt: u32) -> Result<(), Po
     // real ECONNREFUSED so the breaker trips on a connection error. This
     // release/rebind window is inherent to the scenario; everything below
     // detects interference in it rather than misreporting it.
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
 
@@ -493,7 +496,7 @@ upstreams: []
     }
 
     // ── Step 3: install the backend listener now that the breaker is open ──
-    let backend_listener = match TcpListener::bind(format!("127.0.0.1:{backend_port}")).await {
+    let backend_listener = match TcpListener::bind_test(("127.0.0.1", backend_port)).await {
         Ok(listener) => listener,
         Err(e) => {
             return Err(PortRaced(format!(
@@ -598,7 +601,7 @@ async fn test_tcp_tls_passthrough_forwards_encrypted_data() {
     let (cert_pem, key_pem) = generate_self_signed_cert();
 
     // Backend: TLS echo server (same-process, no port race)
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
 
@@ -701,7 +704,7 @@ async fn test_tcp_passthrough_sni_peek_timeout_drops_silent_peer() {
 
     // Backend that just counts accepted connections and holds them open
     // (so the OS doesn't reset them, and the gateway doesn't see EOF early).
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let accepts = Arc::new(AtomicU32::new(0));
     let accepts_for_task = accepts.clone();
@@ -868,9 +871,9 @@ fn spawn_recording_backend(listener: TcpListener) -> RecordingBackend {
 #[tokio::test]
 #[ignore]
 async fn test_opaque_tcp_sni_fanout_routes_by_sni_and_preserves_bytes() {
-    let backend_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_a = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_a_port = backend_a.local_addr().unwrap().port();
-    let backend_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_b = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_b_port = backend_b.local_addr().unwrap().port();
     let mut backend_a = spawn_recording_backend(backend_a);
     let mut backend_b = spawn_recording_backend(backend_b);
@@ -954,9 +957,9 @@ upstreams: []
 #[tokio::test]
 #[ignore]
 async fn test_opaque_tls_sni_listener_fails_closed_on_indeterminate_and_non_tls() {
-    let named_backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let named_backend = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let named_port = named_backend.local_addr().unwrap().port();
-    let default_backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let default_backend = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let default_port = default_backend.local_addr().unwrap().port();
     let mut named = spawn_recording_backend(named_backend);
     let mut default_route = spawn_recording_backend(default_backend);
@@ -1049,9 +1052,9 @@ upstreams: []
 #[tokio::test]
 #[ignore]
 async fn test_opaque_tls_sni_listener_honors_authorized_plaintext_fallback() {
-    let named_backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let named_backend = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let named_port = named_backend.local_addr().unwrap().port();
-    let default_backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let default_backend = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let default_port = default_backend.local_addr().unwrap().port();
     let mut named = spawn_recording_backend(named_backend);
     let mut default_route = spawn_recording_backend(default_backend);
@@ -1157,10 +1160,9 @@ async fn test_tcp_passthrough_rotates_before_forwarding_client_hello() {
     for (retry_enabled, max_retries, succeeds) in
         [(true, 1, true), (false, 1, false), (true, 0, false)]
     {
-        let refused = tokio::net::TcpSocket::new_v4().unwrap();
-        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let refused = tokio::net::TcpSocket::bind_test("127.0.0.1:0").unwrap();
         let refused_port = refused.local_addr().unwrap().port();
-        let healthy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let healthy_port = healthy.local_addr().unwrap().port();
         let (gateway, proxy_port, _, _, dir) = start_gateway_with_retry(|stream_port, _| {
             format!(

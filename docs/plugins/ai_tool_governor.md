@@ -28,7 +28,9 @@ approval endpoint's answer.
   path-qualified errors and close-spelling suggestions. The free-form
   `tools` tool-name map and arbitrary per-tool `json_schema` document contents
   stay open. Unknown keys are rejected even when `enabled: false` so a typo
-  cannot hide until the plugin is turned on.
+  cannot hide until the plugin is turned on. Every accepted key, with its type,
+  default, and admitted range, is tabulated under
+  [Configuration reference](#configuration-reference).
 
 ## Inspection surfaces
 
@@ -38,7 +40,7 @@ Each is toggled independently under `inspect`; at least one must be enabled.
 | --- | --- | --- |
 | `request_tool_definitions` | `false` | Tool definitions the client exposes to the model, in every provider shape: OpenAI `tools[].function.name` and legacy `functions[].name`, Anthropic `tools[].name`, Google `tools[].functionDeclarations[].name`, Bedrock `toolConfig.tools[].toolSpec.name`. A provider built-in that carries a `type` but no name of its own (`{"type": "code_interpreter"}`) is governed under its `type`. A disallowed definition is rejected/dry-run; an entry no shape can name is ungovernable. |
 | `response_tool_calls` | `true` | Buffered response tool calls in every provider shape: OpenAI `choices[].message.tool_calls[]` and legacy `choices[].message.function_call`, OpenAI Responses `output[]` items of `type: "function_call"`, Anthropic `content[]` blocks of `type: "tool_use"`, Google `candidates[].content.parts[].functionCall`, Cohere v2 `message.tool_calls[]`, Bedrock Converse `output.message.content[].toolUse`. |
-| `streaming_response_tool_calls` | `false` | SSE tool-call deltas, reassembled across frames, in every provider shape: OpenAI `choices[].delta.tool_calls` and legacy `choices[].delta.function_call`, Anthropic `content_block_start` (`content_block.type: "tool_use"`) plus `content_block_delta` (`delta.type: "input_json_delta"`), Cohere v2 `tool-call-start` / `tool-call-delta`, Google `candidates[].content.parts[].functionCall`. Batch boundaries are OpenAI `finish_reason`, Google `finishReason`, Anthropic `message_delta` (`delta.stop_reason`) / `message_stop`, and Cohere `message-end`. |
+| `streaming_response_tool_calls` | `false` | SSE tool-call deltas, reassembled across frames, in **these four** provider shapes — a narrower set than the buffered row above: OpenAI `choices[].delta.tool_calls` and legacy `choices[].delta.function_call`, Anthropic `content_block_start` (`content_block.type: "tool_use"`) plus `content_block_delta` (`delta.type: "input_json_delta"`), Cohere v2 `tool-call-start` / `tool-call-delta`, Google `candidates[].content.parts[].functionCall`. OpenAI Responses events and Bedrock's binary event stream are **not** accumulated (see [Limitations](#limitations-mvp)). Batch boundaries are OpenAI `finish_reason`, Google `finishReason`, Anthropic `message_delta` (`delta.stop_reason`) / `message_stop`, and Cohere `message-end`. |
 | `mcp_tool_calls` | `false` | MCP JSON-RPC `tools/call` request bodies (`params.name` + `params.arguments`), including calls inside JSON-RPC **batch arrays**. Omitted `params.arguments` normalizes to `{}` before evaluation (MCP zero-argument calls); provider response `function.arguments` omissions are not normalized. |
 | `a2a_methods` | `false` | A2A JSON-RPC method names (governed against the `tools` map), including batch arrays. |
 
@@ -142,11 +144,24 @@ delivered buffered rather than streamed.
 | `mode` | Rejects? | What it does |
 | --- | --- | --- |
 | `enforce` (default) | yes | Blocks denied calls, cuts blocked streams, and **fails closed** on every body it cannot policy-check. |
-| `dry_run` | never | Evaluates, records `ai_tool_governor.decision=dry_run` and the observation labels below, and forwards. The safe rollout / observe posture. Never calls the approval webhook. |
+| `dry_run` | never | Evaluates policy, records the decision `enforce` **would** have reached plus the observation labels below, and forwards. The safe rollout / observe posture. Never calls the approval webhook. |
 
 `dry_run` still **counts and logs** everything `enforce` would have refused,
-including bodies it could not read — it just does not disrupt traffic, and it
-never records `decision=deny` for something it did not block.
+including bodies it could not read — it just does not disrupt traffic.
+
+**Global dry-run does not relabel the decision.** `ai_tool_governor.mode` is
+what records the posture; `ai_tool_governor.decision` keeps the would-be policy
+label. A tool that `enforce` would have blocked is logged as
+`mode=dry_run, decision=deny`; a `require_approval` policy is logged as
+`mode=dry_run, decision=require_approval` (the webhook is not called, so the
+terminal `approved` / `approval_denied` labels never appear in dry-run).
+`decision=dry_run` is reserved for two distinct cases: the per-tool
+`tools.<name>.action: dry_run` policy (which is observational even while the
+plugin is in `enforce` mode), and the dry-run duplicate-key ambiguity
+observation described under
+[Ambiguous JSON](#fail-closed-handling-of-uninspectable-bodies), which pairs it
+with `uninspectable_reason=ambiguous_json`. **Query rollout dashboards on
+`mode`, not on `decision`**, or ordinary global dry-run findings are missed.
 
 ## Unreadable tool-call shapes (`unknown_shape_action`)
 
@@ -303,6 +318,119 @@ pattern. Use it to measure what a stricter action *would* do before enforcing.
 (This differs from global `mode: dry_run`, which makes every action
 observational.)
 
+## Configuration reference
+
+Every accepted key, with its runtime type, default, and admitted range. This is
+the complete fixed-shape surface: a property name that is not listed here is
+rejected at admission with a path-qualified error and a close-spelling
+suggestion, at every layer (`config`, `config.inspect`, `config.tools.<name>`,
+`config.tools.<name>.blocked_arg_patterns[i]`, `config.approval`,
+`config.response`, `config.observability`). The two deliberately **open**
+surfaces are the `tools` tool-**name** map and the contents of each
+`tools.<name>.json_schema` document. Unless the instance is disabled (see
+[Disabled instances](#disabled-instances)), a present value of the wrong JSON
+type is rejected at admission — `null` included — so a mistyped value never
+silently resolves to the default in this table.
+
+### Root
+
+| Key | Type | Default | Admitted values and notes |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | `false` makes the instance inert (see [Disabled instances](#disabled-instances)). |
+| `mode` | string | `enforce` | `enforce` \| `dry_run`. See [Modes](#modes). |
+| `default_action` | string | `deny` | `allow` \| `deny` \| `require_approval`. Applies to any tool with no `tools` entry. `allow` additionally requires at least one `tools` entry — an allow-by-default instance with no policies would govern nothing and is rejected. |
+| `unknown_shape_action` | string | `deny` | `deny` \| `allow`. Posture for a payload carrying a tool-call marker no extractor could read. See [Unreadable tool-call shapes](#unreadable-tool-call-shapes-unknown_shape_action). |
+| `inspect` | object | `{}` | Inspection surfaces. At least one must be enabled after defaults are applied. |
+| `tools` | object | `{}` | Free-form map: exact tool name → policy object. An empty tool name is rejected. |
+| `approval` | object | absent | Approval webhook. Required when `mode: enforce` and a `require_approval` action is reachable from a concrete-call surface (`response_tool_calls`, `streaming_response_tool_calls`, `mcp_tool_calls`, or `a2a_methods`). Definition-only inspection blocks `require_approval` locally and needs no webhook. |
+| `response` | object | `{}` | Rejection / redaction output shape. |
+| `observability` | object | `{}` | Metadata and audit-logging controls. |
+
+### `inspect`
+
+All booleans; see [Inspection surfaces](#inspection-surfaces) for what each one
+reads.
+
+| Key | Default |
+| --- | --- |
+| `request_tool_definitions` | `false` |
+| `response_tool_calls` | `true` |
+| `streaming_response_tool_calls` | `false` |
+| `mcp_tool_calls` | `false` |
+| `a2a_methods` | `false` |
+
+Because `response_tool_calls` defaults to `true`, the only way to configure no
+surface at all — and be rejected — is to set it explicitly to `false` while
+every other surface is `false` or omitted.
+
+### `tools.<name>`
+
+| Key | Type | Default | Admitted values and notes |
+| --- | --- | --- | --- |
+| `action` | string | **required** | `allow` \| `deny` \| `redact_args` \| `require_approval` \| `dry_run`. `redact_args` additionally requires at least one `blocked_arg_patterns` entry. |
+| `risk` | string | `low` | `low` \| `medium` \| `high` \| `critical`. Surfaced as `ai_tool_governor.risk` (max across a batch) and sent in approval requests. Purely a label — it does not itself change the decision. |
+| `max_arg_bytes` | integer ≥ 0 | unset (no cap) | Deny when the raw arguments string exceeds this many bytes. |
+| `required_args` | array of strings | `[]` | Each entry must be a non-empty string. Deny when any listed key is absent from the parsed arguments object. |
+| `blocked_arg_patterns` | array of objects | `[]` | At most **32** entries; each entry is closed to the two keys below. |
+| `json_schema` | object | unset | An open JSON Schema document the parsed arguments must satisfy, else deny. Compiled at admission — an invalid schema is rejected. Arbitrary keywords inside the document are intentionally allowed. |
+
+### `tools.<name>.blocked_arg_patterns[]`
+
+| Key | Type | Default | Admitted values and notes |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Non-empty, at most **256 UTF-8 bytes**. Substituted into `response.redaction_placeholder`'s `{name}`. |
+| `regex` | string | **required** | Non-empty and must compile. A regex that matches the empty string is rejected at admission — zero-width redaction would amplify a bounded argument without limit. |
+
+### `approval`
+
+| Key | Type | Default | Admitted values and notes |
+| --- | --- | --- | --- |
+| `endpoint_url` | string | **required** | Must parse as a URL whose scheme is `http` or `https`. The scheme is **case-insensitive** (`HTTPS://…` is admitted; the URL parser normalizes it), and the host is screened against the backend egress policy at admission. |
+| `timeout_ms` | integer | `1500` | `1`–`30000`. Per-webhook-call timeout; `0` is rejected rather than meaning "no timeout". |
+| `cache_ttl_seconds` | integer ≥ 0 | `300` | `0`–`2592000` (30 days). **`0` disables caching.** The cache is bounded at 4096 entries; at capacity expired entries are purged and new decisions are simply not cached. |
+| `fail_on_error` | string | `reject` | `reject` \| `warn` \| `allow`. Behavior when the endpoint cannot be evaluated: `reject` fails closed, `warn` / `allow` fail open. |
+| `include_arguments` | boolean | `false` | Include the raw tool arguments in the approval request body. Off by default so secrets are not sent. |
+
+### `response`
+
+| Key | Type | Default | Admitted values and notes |
+| --- | --- | --- | --- |
+| `deny_status_code` | integer | `403` | `400`–`599`. Status for a deterministic policy denial in enforce mode. Uninspectable governed bodies keep their own fixed `502`. |
+| `redaction_placeholder` | string | `[REDACTED_TOOL_ARG:{name}]` | At most **256 UTF-8 bytes**. `{name}` is replaced with the matched pattern name. |
+| `streaming_deny_event` | boolean | `true` | Emit the terminal SSE `error` event when cutting a streamed tool call. Set `false` to cut the stream **silently** — the disallowed call is still never forwarded; the client simply sees the stream end with no in-band explanation. Buffered denials are unaffected. |
+
+### `observability`
+
+| Key | Type | Default | Admitted values and notes |
+| --- | --- | --- | --- |
+| `emit_metadata` | boolean | `true` | Emit the `ai_tool_governor.*` transaction metadata described under [Observability metadata](#observability-metadata). |
+| `hash_arguments` | boolean | `true` | Emit SHA-256 hashes of tool arguments as `ai_tool_governor.arguments_hashes`. Raw arguments are never placed in metadata. |
+| `max_argument_log_bytes` | integer ≥ 0 | `0` | When `> 0`, log up to this many bytes of a **blocked** call's raw arguments at `debug` for audit. `0` keeps raw arguments out of logs entirely. |
+
+### Admission diagnostics
+
+A key that is **present but wrong-typed** is reported as a type error naming the
+JSON kind that was supplied (`… 'action' must be a string (expected allow, deny,
+redact_args, require_approval, or dry_run), got a number`), never as a missing
+key — the same shape `risk` and `approval.fail_on_error` already use. A
+present-but-empty `approval.endpoint_url` is likewise reported as empty rather
+than as absent. Rejected values are never echoed back; only their kind is named.
+
+### Disabled instances
+
+`enabled: false` short-circuits the constructor: the plugin buffers nothing and
+inspects nothing, and the *values* of the remaining keys are never parsed. A
+disabled draft may therefore carry values this table would otherwise reject —
+`mode: 7`, `tools: null`, an out-of-range `deny_status_code` — and still be
+admitted.
+
+Property **names** are the exception. Unknown-key rejection runs *before* the
+short circuit, at every fixed-shape layer including nested ones, so
+`{"enabled": false, "inspect": {"typo": true}}` is rejected even though the
+instance is off. That is deliberate: a typo in a disabled draft must not stay
+hidden until the reload that flips `enabled: true` and silently drops an
+enforcement control.
+
 ## Examples
 
 ### Allowlist-only (deny everything not explicitly permitted)
@@ -421,6 +549,26 @@ when a payload carried an unreadable tool-call shape; never raw body bytes).
 `unrecognized_tool_call_shape` is recorded in **both** modes and under **both**
 `unknown_shape_action` settings, and never sets `decision`.
 
+**Bounded observation ledgers.** The comma-delimited cumulative fields —
+`tool_names`, `policy_ids`, `approval_id`, `arguments_hashes`, and
+`redacted_tools` — are aggregated across every governed surface of one request
+and every completed batch of one response stream, so each one is explicitly
+bounded: at most **64 distinct values** (matching the 64-call per-batch
+governable limit, so one well-formed batch is never truncated) and at most
+**8192 UTF-8 bytes** per field, with each individual value retained to at most
+**256 UTF-8 bytes** plus a trailing `…` when it was shortened. A stream that
+keeps emitting batches of distinct tool names therefore cannot grow this state
+without limit — the documented `0` (unlimited) response-byte policy leaves no
+wire-byte ceiling that could serve as the bound. Values are deduplicated, and
+order of first observation is preserved.
+
+When a ledger is full, further distinct values are counted in
+`ai_tool_governor.observations_omitted` (absent when nothing was dropped) so a
+capped field is never silently short. Truncation changes nothing about
+enforcement: every tool call is still governed, the highest-severity `decision`
+and the maximum `risk` are still recorded, and a higher-severity batch still
+replaces a weaker decision's ledger in full.
+
 Raw arguments are **never** placed in metadata and never logged unless
 `observability.max_argument_log_bytes > 0` (then a bounded excerpt of a blocked
 call's arguments is logged at `debug` for audit). Raw arguments are sent to the
@@ -440,7 +588,8 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
 > Thus a dry-run denied/approval-required call remains forwarded but appears in
 > transaction logs with `decision`, `tool_names`, and (when
 > `hash_arguments: true`) `arguments_hashes`. Streaming **enforce** decisions
-> still cut the stream and are also logged at `warn`.
+> still cut the stream and emit sampled warnings (one per source site per
+> 10 seconds with suppressed-event counts); every detail remains at `debug`.
 
 ## Composition
 
@@ -489,9 +638,13 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
 - A JSON-labelled **response** body that fails to parse is forwarded (only
   oversized responses fail closed) — rejecting every unparseable JSON response
   on a shared proxy would break unrelated routes.
-- **Provider scope is explicit, not universal.** Tool calls and definitions are
-  read in the OpenAI (Chat Completions and Responses), Anthropic Messages,
-  Google Gemini, Cohere v2, and Amazon Bedrock Converse shapes. A dialect
+- **Provider scope is explicit, not universal.** Buffered tool calls and
+  definitions are read in the OpenAI (Chat Completions and Responses),
+  Anthropic Messages, Google Gemini, Cohere v2, and Amazon Bedrock Converse
+  shapes. **Streaming SSE accumulation is narrower than the buffered set** — it
+  covers exactly the four dialects in the `streaming_response_tool_calls` row
+  of the inspection table (OpenAI Chat Completions, Anthropic, Cohere v2,
+  Google); see the two streaming bullets below. A dialect
   outside that set is not silently allowed: if the payload carries a tool-call
   marker the plugin cannot resolve into a call, `unknown_shape_action` (default
   `deny`) fails closed and the fixed `unrecognized_tool_call_shape` observation
@@ -502,7 +655,22 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
   `InvokeModelWithResponseStream` uses the binary
   `application/vnd.amazon.eventstream` framing rather than SSE text, so it is
   never parsed as a stream; a Bedrock Converse response delivered as a buffered
-  JSON body is governed normally.
+  JSON body is governed normally. Those bytes are neither SSE-shaped nor
+  JSON-shaped, so on a stream-marked governed request they take the opaque
+  path: held in full and cut at end-of-stream in enforce, released unchanged in
+  dry-run.
+- **OpenAI Responses streaming is buffered-only.** A buffered Responses body is
+  governed (`output[]` items of `type: "function_call"`), but the Responses
+  **event** stream (`response.output_item.added`,
+  `response.function_call_arguments.delta`, …) has no accumulator — the four
+  dialects in the `streaming_response_tool_calls` row above are the complete
+  streaming set. A Responses SSE frame carrying a tool-call marker is therefore
+  an **unreadable shape, not an allow**: `unknown_shape_action` (default `deny`)
+  cuts the stream in enforce, and the fixed `unrecognized_tool_call_shape`
+  observation is recorded under both settings. `ai_stream_router` does not close
+  this gap either — it normalizes Anthropic and Google Gemini streams to OpenAI
+  Chat Completions chunks and treats an `openai` provider's stream as already
+  normalized.
 - The unknown-shape posture is scoped to a positive tool-call marker. It does
   not attempt to decide whether an arbitrary body "is an AI response", so a
   provider dialect with no recognizable marker is out of scope in both

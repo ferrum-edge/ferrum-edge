@@ -13,6 +13,8 @@
 //!   BEFORE the destructive clear, so a bad payload cannot leave a partially
 //!   mutated trust generation behind.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use base64::Engine;
 use chrono::Utc;
@@ -133,7 +135,9 @@ fn admin_state(db: DatabaseStore) -> AdminState {
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr parses");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind_test(addr)
+        .await
+        .expect("bind");
     let actual = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(

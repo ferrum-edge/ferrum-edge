@@ -287,7 +287,8 @@ impl PoolManager for ReqwestPoolManager {
         // that `create_client` installs on the shared reqwest::Client. Request-
         // only timeouts stay out; `max_idle_per_host` stays global-only.
         self.global_config
-            .append_reqwest_client_behavior_pool_key(proxy, buf);
+            .for_proxy(proxy)
+            .append_reqwest_client_behavior_pool_key(buf);
     }
 
     async fn create(&self, _key: &str, proxy: &Proxy) -> Result<reqwest::Client> {

@@ -22,6 +22,8 @@
 //!   cargo build --bin ferrum-edge && \
 //!   cargo test --test functional_tests -- --ignored functional_tls_lifecycle --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
@@ -158,10 +160,11 @@ fn gw_bin() -> &'static str {
     }
 }
 
-/// Allocate an ephemeral port by binding to port 0 and returning the assigned port.
+/// Lease a gateway port until the test process exits.
 async fn alloc_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    l.local_addr().unwrap().port()
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Wait for the gateway admin HTTP health endpoint. Returns `true` if healthy
@@ -263,6 +266,7 @@ fn spawn_gateway_piped(
     envs: &[(&str, &str)],
 ) -> (TokioChild, OutputCapture) {
     let mut cmd = TokioCommand::new(gw_bin());
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", ports.proxy_http.to_string())
@@ -599,7 +603,7 @@ async fn test_crl_revoked_backend_cert_rejected() {
     let cfg_path = td.path().join("cfg.yaml");
 
     // Start HTTPS backend
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_https_echo_on(be_listener, &backend.cert_pem, &backend.key_pem).await;
 
@@ -700,7 +704,7 @@ async fn test_crl_unrelated_issuer_allows_request() {
     let crl_path = write_file(&td, "unrelated.crl", &crl_pem);
     let cfg_path = td.path().join("cfg.yaml");
 
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_https_echo_on(be_listener, &backend.cert_pem, &backend.key_pem).await;
 
@@ -1229,8 +1233,25 @@ struct TrustRetirementFixture {
     _backends: Vec<tokio::task::JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+enum GlobalCrlFixture {
+    #[default]
+    Baseline,
+    OutsideWithAki,
+    OutsideWithoutAki,
+    AnchoredWithoutAki,
+    UnarmedWithoutAki,
+}
+
 impl TrustRetirementFixture {
     async fn try_new_with(surfaces: FixtureSurfaces) -> Option<Self> {
+        Self::try_new_with_crl(surfaces, GlobalCrlFixture::Baseline).await
+    }
+
+    async fn try_new_with_crl(
+        surfaces: FixtureSurfaces,
+        crl_case: GlobalCrlFixture,
+    ) -> Option<Self> {
         let dir = TempDir::new().unwrap();
         let server_ca = generate_ca("Retirement-Server-CA");
         let server = generate_signed_cert(&server_ca, "localhost", &["localhost", "127.0.0.1"]);
@@ -1242,7 +1263,26 @@ impl TrustRetirementFixture {
         // A baseline CRL revoking an unrelated serial: the file exists and
         // parses, so the first accepted generation is a genuine one and a later
         // rewrite is a real semantic delta rather than "a CRL appeared".
-        let baseline_crl = generate_crl_pem(&client_ca, &[SerialNumber::from(1u64)]);
+        let outside_ca = generate_ca("Outside-Client-Trust-CA");
+        let crl_signer = match crl_case {
+            GlobalCrlFixture::Baseline | GlobalCrlFixture::AnchoredWithoutAki => &client_ca,
+            _ => &outside_ca,
+        };
+        let baseline_crl = generate_crl_pem(crl_signer, &[SerialNumber::from(1u64)]);
+        let baseline_crl = if matches!(
+            crl_case,
+            GlobalCrlFixture::OutsideWithoutAki
+                | GlobalCrlFixture::AnchoredWithoutAki
+                | GlobalCrlFixture::UnarmedWithoutAki
+        ) {
+            crate::common::crl_fixtures::without_authority_key_identifier(
+                &baseline_crl,
+                crl_signer.issuer.key(),
+                &crl_signer.cert_pem,
+            )
+        } else {
+            baseline_crl
+        };
 
         let cert_path = write_file(&dir, "server.crt", &server.cert_pem);
         let key_path = write_file(&dir, "server.key", &server.key_pem);
@@ -1265,7 +1305,7 @@ impl TrustRetirementFixture {
         let mut backends = Vec::new();
         let mut proxies = String::new();
 
-        let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let backend_port = be_listener.local_addr().unwrap().port();
         backends.push(start_plain_echo_on(be_listener));
         proxies.push_str(&format!(
@@ -1279,7 +1319,7 @@ impl TrustRetirementFixture {
         ));
 
         if surfaces.websocket {
-            let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let ws_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
             let ws_port = ws_listener.local_addr().unwrap().port();
             backends.push(start_ws_echo_on(ws_listener));
             // WebSocket is a runtime flavor, not a backend scheme: an ordinary
@@ -1296,7 +1336,7 @@ impl TrustRetirementFixture {
         }
 
         if surfaces.tcp_tls {
-            let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let tcp_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
             let tcp_port = tcp_listener.local_addr().unwrap().port();
             backends.push(start_tcp_echo_on(tcp_listener));
             let listen_port = ports.stream_tcp;
@@ -1341,6 +1381,9 @@ impl TrustRetirementFixture {
             ("FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS", "1"),
             ("FERRUM_POOL_WARMUP_ENABLED", "false"),
         ];
+        if matches!(crl_case, GlobalCrlFixture::UnarmedWithoutAki) {
+            envs.retain(|(name, _)| *name != "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH");
+        }
         if surfaces.http3 {
             envs.push(("FERRUM_ENABLE_HTTP3", "true"));
         }
@@ -1596,7 +1639,7 @@ fn start_tcp_echo_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
 /// Minimal UDP echo backend for the frontend DTLS relay. Binds first and
 /// reports its own port so there is no reserve-then-rebind race.
 async fn start_udp_echo() -> (u16, tokio::task::JoinHandle<()>) {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+    let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("bind udp echo backend");
     let port = socket.local_addr().expect("udp echo addr").port();
@@ -1947,7 +1990,7 @@ impl TrustRetirementFixture {
 
     /// A DTLS client presenting this fixture's client certificate.
     async fn connect_dtls(&self) -> Result<ferrum_edge::dtls::DtlsConnection, anyhow::Error> {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0").await?;
         socket
             .connect(format!("127.0.0.1:{}", self.ports.stream_udp))
             .await?;
@@ -2410,4 +2453,42 @@ async fn test_frontend_dtls_session_is_retired_and_reconnect_refused_after_crl_r
 
     session.close().await;
     fixture.shutdown().await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_global_crl_without_aki_allows_frontend_mtls_startup() {
+    for crl_case in [
+        GlobalCrlFixture::OutsideWithoutAki,
+        GlobalCrlFixture::OutsideWithAki,
+        GlobalCrlFixture::AnchoredWithoutAki,
+        GlobalCrlFixture::UnarmedWithoutAki,
+    ] {
+        let mut started = None;
+        for _ in 0..3 {
+            started =
+                TrustRetirementFixture::try_new_with_crl(FixtureSurfaces::default(), crl_case)
+                    .await;
+            if started.is_some() {
+                break;
+            }
+            // Only the classified bind-race return reaches this retry.
+            sleep(Duration::from_secs(1)).await;
+        }
+        let mut fixture = started.unwrap_or_else(|| panic!("CRL startup case {crl_case:?}"));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut transport = establish_h1(fixture.ports.proxy_https, fixture.h1_config())
+                .await
+                .unwrap_or_else(|error| panic!("CRL {crl_case:?} mTLS handshake: {error}"));
+            assert_eq!(
+                transport.request("localhost").await,
+                AttemptOutcome::Status(200),
+                "CRL startup case {crl_case:?} must serve"
+            );
+        })
+        .await
+        .expect("CRL startup case must complete a real frontend request");
+        fixture.assert_still_running("global CRL startup control");
+        fixture.shutdown().await;
+    }
 }

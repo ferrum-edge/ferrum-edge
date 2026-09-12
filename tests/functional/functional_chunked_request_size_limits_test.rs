@@ -3,6 +3,8 @@
 //! These cover `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when the inbound request
 //! has no `Content-Length` and must be limited while the body is read.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 
 use bytes::Bytes;
@@ -36,7 +38,7 @@ impl ChunkedRequestHarness {
     }
 
     async fn try_new(max_request_bytes: &str) -> Result<Self, String> {
-        let backend_listener = TcpListener::bind("127.0.0.1:0")
+        let backend_listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .map_err(|error| format!("bind backend: {error}"))?;
         let backend_port = backend_listener

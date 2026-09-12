@@ -42,6 +42,9 @@ from verify_cross_build_policy import (
     AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB,
     AMBIENT_REGISTRY_IMAGE_READ_JOB,
     AMBIENT_REGISTRY_IMAGE_WRITE_JOB,
+    NODE_DEFAULT_REGISTRY_READ_JOB,
+    NODE_DEFAULT_REGISTRY_WRITE_JOB,
+    NODE_WAYPOINT_IMAGE_GATE_JOB,
     extract_job_contract_block,
 )
 
@@ -62,6 +65,7 @@ CI_CD_DOC = REPO_ROOT / "docs" / "ci_cd.md"
 FIPS_DOC = REPO_ROOT / "docs" / "fips.md"
 COVERAGE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+PERFORMANCE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "performance-regression.yml"
 
 # Only the PR-editable direct sites; frozen composites/FIPS/fuzz/perf retain
 # their separately governed contracts. True means compiler-cache-only reuse.
@@ -74,6 +78,15 @@ DIRECT_CACHE_DIET_JOBS = (
     ("comparison-benchmark.yml", "comparison", True),
     ("connection-saturation-benchmark.yml", "saturation", True),
     ("gateways-protocol-benchmark.yml", "benchmark", True),
+)
+
+# These are the designated shared native-cache producers. The composite's
+# producer-only opt-in is insufficient: setup/fetch/compile can fail before a
+# complete dependency graph exists, even when main runs are never superseded.
+COMPLETED_CACHE_PRODUCER_JOBS = (
+    ("ci.yml", "test-unit"),
+    ("ci.yml", "lint"),
+    ("coverage.yml", "coverage-shard"),
 )
 
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -342,6 +355,8 @@ def production_dockerfile_probe_paths() -> list[str]:
             probes.append("custom_plugins/foo.rs")
         elif pattern == r"^ebpf/":
             probes.append("ebpf/src/lib.rs")
+        elif pattern == r"^\.github/actions/package-ferrum-runtime-image/":
+            probes.append(".github/actions/package-ferrum-runtime-image/action.yml")
         elif pattern == r"^\.github/scripts/stage_iproute2_runtime\.sh$":
             probes.append(".github/scripts/stage_iproute2_runtime.sh")
         elif pattern == r"^\.github/workflows/node-waypoint-ebpf-live\.yml$":
@@ -720,9 +735,12 @@ def check_node_waypoint_live_job(
             f"{source} production-only path {probe} must skip the NodeWaypoint live job",
             failures,
         )
+        # Ordinary compile inputs no longer schedule the image smoke on a pull
+        # request either: the ordinary CI lane proves they compile, and the
+        # smoke runs on every push to main.
         require(
-            prod_relevant,
-            f"{source} production-only path {probe} must still trigger production-image smoke",
+            not prod_relevant,
+            f"{source} ordinary compile path {probe} must skip production-image smoke on a PR",
             failures,
         )
     empty_relevant, _, _ = decide_relevance("node-waypoint-ebpf-live", [])
@@ -946,6 +964,14 @@ SAVE_IF_NON_FORK = re.compile(
     r"github\.event\.pull_request\.head\.repo\.fork\s*!=\s*true"
     r"(?:\s*\}\})?(?:['\"]?)\s*(?:#.*)?$"
 )
+# A save gated to a push on `refs/heads/main` can never fire on a fork PR
+# (or any PR), so it satisfies the fork guard with a stricter shape.
+SAVE_IF_MAIN_PUSH = re.compile(
+    r"(?m)^[ \t]*save-if:\s*(?:['\"]?)(?:\$\{\{\s*)?"
+    r"github\.event_name\s*==\s*'push'\s*&&\s*"
+    r"github\.ref\s*==\s*'refs/heads/main'"
+    r"(?:\s*\}\})?(?:['\"]?)\s*(?:#.*)?$"
+)
 SAVE_IF_FALSE = re.compile(
     r"(?m)^[ \t]*save-if:\s*(?:['\"]?)(?:\$\{\{\s*)?false"
     r"(?:\s*\}\})?(?:['\"]?)\s*(?:#.*)?$"
@@ -960,6 +986,7 @@ SAVE_IF_FALSE = re.compile(
 # same defense in depth.
 SAVE_IF_TRUSTED_MAIN = re.compile(
     r"(?m)^[ \t]*save-if:\s*(?:['\"]?)(?:\$\{\{\s*)?"
+    r"(?:inputs\.save\s*==\s*'true'\s*&&\s*)?"
     r"github\.event_name\s*!=\s*'pull_request'\s*&&\s*"
     r"github\.event_name\s*!=\s*'merge_group'\s*&&\s*"
     r"github\.ref\s*==\s*'refs/heads/main'\s*&&\s*"
@@ -3334,7 +3361,8 @@ def check_rust_cache_fork_save_if(
     )
     for index, block in enumerate(blocks, 1):
         require(
-            SAVE_IF_NON_FORK.search(block) is not None,
+            SAVE_IF_NON_FORK.search(block) is not None
+            or SAVE_IF_MAIN_PUSH.search(block) is not None,
             f"{source} rust-cache site {index} must set save-if so fork PRs "
             "restore only",
             failures,
@@ -3389,8 +3417,11 @@ def check_direct_rust_cache_diet(
         saves = re.findall(r"(?m)^\s*save-if:([^\n]*)$", block)
         require(
             [value.strip() for value in saves]
-            == ["${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"],
-            f"{source} must save only on pushes to main",
+            in (
+                ["${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"],
+                ['"false"'],
+            ),
+            f"{source} must save only on pushes to main, or never",
             failures,
         )
         if compiler_only:
@@ -4551,6 +4582,19 @@ def check_node_ebpf_registry_reader(job: str, failures: list[str]) -> None:
             "Node eBPF registry telemetry must not invent an Actions cache hit", failures)
 
 
+def check_node_default_registry_jobs(workflow: str, failures: list[str]) -> None:
+    # Exact recipes bind the write token to trusted main and preserve the
+    # same runtime checks on the mutually exclusive anonymous PR recipe.
+    for name, expected in (
+        ("production-dockerfile-smoke-default", NODE_DEFAULT_REGISTRY_READ_JOB),
+        ("production-dockerfile-smoke-default-write", NODE_DEFAULT_REGISTRY_WRITE_JOB),
+        ("production-dockerfile-smoke", NODE_WAYPOINT_IMAGE_GATE_JOB),
+    ):
+        actual, errors = extract_job_contract_block(workflow, "Node default registry", name, required=True)
+        failures.extend(errors)
+        require(actual == expected, f"Node default registry job {name} must preserve its complete contract", failures)
+
+
 def check_production_smoke(workflow: str, failures: list[str]) -> None:
     require(
         re.search(r"(?m)^    name: Production Dockerfile eBPF image smoke$", workflow)
@@ -4588,43 +4632,8 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         "eBPF production-image job must keep FEATURES=cloud-secrets,ebpf",
         failures,
     )
-    check_buildkit_cache_boundary(
-        default_job,
-        "production-dockerfile-smoke-default",
-        failures,
-    )
+    check_node_default_registry_jobs(workflow, failures)
     check_node_ebpf_registry_reader(ebpf_job, failures)
-    require(
-        "trusted-publish" in default_job
-        and "fork-restore-only" in default_job,
-        "production-image telemetry must name the trusted-publish and "
-        "fork-restore-only cache-to policies",
-        failures,
-    )
-    require(
-        "type=local" in default_job
-        and buildkit_cache_key("production-dockerfile-smoke-default") in default_job,
-        "default production-image job must restore a schema- and architecture-scoped "
-        "local BuildKit cache",
-        failures,
-    )
-    check_local_cache_actions(
-        default_job,
-        "production-dockerfile-smoke-default",
-        failures,
-        scope="production-dockerfile-smoke-default",
-    )
-    check_cache_save_preparation(
-        default_job,
-        "production-dockerfile-smoke-default",
-        failures,
-        scope="production-dockerfile-smoke-default",
-    )
-    check_cache_telemetry_evidence(
-        default_job,
-        "production-dockerfile-smoke-default",
-        failures,
-    )
     plan_job = extract_job(workflow, "production-dockerfile-plan")
     check_nul_delimited_plan(plan_job, "production-image planner", failures)
     require(
@@ -4692,14 +4701,46 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
     )
 
 
+# Only a lane's designated producer (`save: "true"`) may publish, and only
+# that producer may opt into publishing after a failed job (a completed
+# dependency compile is still deterministic and useful). Every other consumer
+# is restore-only regardless of outcome.
+COMPLETED_CACHE_ON_FAILURE = (
+    "${{ inputs.save == 'true' && inputs.cache-on-failure == 'true' }}"
+)
+
+
 def check_completed_rust_cache_save(action: str, failures: list[str]) -> None:
     blocks = rust_cache_with_blocks(action)
     require(len(blocks) == 1, "setup-rust-ci must have one Rust cache step", failures)
     for block in blocks:
         values = re.findall(r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$", block)
         require(
+            values == [COMPLETED_CACHE_ON_FAILURE],
+            "setup-rust-ci must publish Rust caches only from a lane producer, "
+            "and after a failed job only when that producer opts in",
+            failures,
+        )
+
+
+def check_completed_cache_producer(job: str, source: str, failures: list[str]) -> None:
+    steps = [
+        step
+        for step in job_steps(job)
+        if step_uses(step) == "./.github/actions/setup-rust-ci"
+    ]
+    require(
+        len(steps) == 1,
+        f"{source} must keep one shared Rust setup step",
+        failures,
+    )
+    for step in steps:
+        values = re.findall(
+            r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$", step_with(step)
+        )
+        require(
             values == ['"false"'],
-            "setup-rust-ci must publish Rust caches only after successful jobs",
+            f"{source} must save shared Rust caches only after job success",
             failures,
         )
 
@@ -4918,20 +4959,20 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "actions/cache/restore" in ci_cd
-        and "actions/cache/save" in ci_cd
-        and "restore-only" in ci_cd,
-        "docs/ci_cd.md must document pinned cache restore/save and fork restore-only",
+        "anonymous" in ci_cd and "packages: write" in ci_cd
+        and "refs/heads/main" in ci_cd,
+        "docs/ci_cd.md must document anonymous image readers and trusted-main registry writers",
         failures,
     )
     require(
-        "runner.arch" in ci_cd and BUILDKIT_CACHE_SCHEMA in ci_cd,
-        "docs/ci_cd.md must document schema- and architecture-scoped BuildKit cache keys",
+        "default-v1-linux-amd64-runtime" in ci_cd
+        and "ambient-v1-linux-amd64-runtime-ebpf" in ci_cd,
+        "docs/ci_cd.md must document separate versioned, architecture-scoped registry cache references",
         failures,
     )
     require(
-        "exact" in ci_cd.lower() and "partial" in ci_cd.lower(),
-        "docs/ci_cd.md must document exact-hit restore-only vs partial/miss publish",
+        "force_cold_cache" in ci_cd and "import and export" in ci_cd,
+        "docs/ci_cd.md must document the cold path omitting registry import and export",
         failures,
     )
     require(
@@ -4940,8 +4981,8 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "type=local" in ci_cd and "restored bytes" in ci_cd.lower(),
-        "docs/ci_cd.md must document local BuildKit cache restore-byte measurement",
+        "unknown registry hit/bytes" in ci_cd and "BuildKit logs" in ci_cd,
+        "docs/ci_cd.md must distinguish unknown registry telemetry from observed BuildKit reuse",
         failures,
     )
     require(
@@ -5113,17 +5154,48 @@ def check_dockerfile(failures: list[str]) -> None:
 
 def self_test() -> int:
     failures: list[str] = []
+    for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
+        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        producer = extract_job(workflow, job_name)
+        producer_errors: list[str] = []
+        check_completed_cache_producer(producer, job_name, producer_errors)
+        require(
+            not producer_errors,
+            f"self-test: {job_name} completed-cache producer must pass",
+            failures,
+        )
+        for replacement in (
+            'cache-on-failure: "true"',
+            'cache-on-failure: ${{ always() }}',
+            '',
+            '# cache-on-failure: "false"',
+            'cache-on-failure: "false"\n          cache-on-failure: "true"',
+        ):
+            mutated = producer.replace('cache-on-failure: "false"', replacement)
+            producer_errors = []
+            require(mutated != producer, "self-test: producer mutation must apply", failures)
+            check_completed_cache_producer(mutated, job_name, producer_errors)
+            require(
+                bool(producer_errors),
+                f"self-test: {job_name} incomplete-cache publication must fail",
+                failures,
+            )
+        producer_errors = []
+        check_completed_cache_producer("", job_name, producer_errors)
+        require(bool(producer_errors), "self-test: absent producer must fail", failures)
     completed_cache = SETUP_RUST.read_text(encoding="utf-8")
     cache_errors: list[str] = []
     check_completed_rust_cache_save(completed_cache, cache_errors)
     require(not cache_errors, "self-test: completed-cache action must pass", failures)
     for replacement in (
         'cache-on-failure: "true"',
-        '# cache-on-failure: "false"',
+        'cache-on-failure: "false"',
+        f"# cache-on-failure: {COMPLETED_CACHE_ON_FAILURE}",
         "cache-on-failure: ${{ always() }}",
-        'cache-on-failure: "false"\n        cache-on-failure: "true"',
+        "cache-on-failure: ${{ inputs.cache-on-failure == 'true' }}",
+        f'cache-on-failure: {COMPLETED_CACHE_ON_FAILURE}\n        cache-on-failure: "true"',
     ):
-        mutated = completed_cache.replace('cache-on-failure: "false"', replacement)
+        mutated = completed_cache.replace(f"cache-on-failure: {COMPLETED_CACHE_ON_FAILURE}", replacement)
         cache_errors = []
         require(mutated != completed_cache, "self-test: cache mutation must apply", failures)
         check_completed_rust_cache_save(mutated, cache_errors)
@@ -5149,6 +5221,35 @@ def self_test() -> int:
         reader_errors = []
         check_node_ebpf_registry_reader(mutated, reader_errors)
         require(bool(reader_errors), "self-test: Node reader regression must fail", failures)
+    default_registry = NODE_WORKFLOW.read_text(encoding="utf-8")
+    registry_errors: list[str] = []
+    check_node_default_registry_jobs(default_registry, registry_errors)
+    require(not registry_errors, "self-test: default registry recipes must pass", failures)
+    for before, after in (
+        ("github.ref == 'refs/heads/main'", "github.ref != 'refs/heads/main'"),
+        ("github.repository == 'ferrum-edge/ferrum-edge'", "true"),
+        ("      packages: write", "      packages: read"),
+        ("    name: Production Dockerfile default image (registry reader)",
+         "    permissions: write-all\n    name: Production Dockerfile default image (registry reader)"),
+        ("default-v1-linux-amd64-runtime", "untrusted-latest"),
+        ("target: runtime\n", "target: runtime-ebpf\n"),
+        ("CARGO_PROFILE=pr-build", "CARGO_PROFILE=release"),
+        ("provenance: false", "provenance: true"),
+        ("policy=anonymous-restore-only", "policy=trusted-main-publish"),
+        ("mode=max,image-manifest=true,oci-mediatypes=true", "mode=min"),
+        ("github.event.inputs.force_cold_cache != 'true'", "always()"),
+        ("github.event.inputs.force_cold_cache == 'true'", "false"),
+        ("ordinary runtime unexpectedly contains", "inventory omitted"),
+        ("needs.production-dockerfile-smoke-default-write.result != 'success'", "false"),
+        ("needs.production-dockerfile-smoke-default.result != 'skipped'", "false"),
+        ("needs.production-dockerfile-smoke-default-write.result != 'skipped'", "false"),
+        ("  production-dockerfile-smoke-default-write:", "  detached-writer:"),
+    ):
+        mutated = default_registry.replace(before, after)
+        require(mutated != default_registry, "self-test: default registry mutation must apply", failures)
+        registry_errors = []
+        check_node_default_registry_jobs(mutated, registry_errors)
+        require(bool(registry_errors), "self-test: default registry boundary regression must fail", failures)
     registry_fixture = (
         "jobs:\n" + AMBIENT_REGISTRY_IMAGE_READ_JOB + "\n"
         + AMBIENT_REGISTRY_IMAGE_WRITE_JOB + "\n"
@@ -8717,7 +8818,7 @@ def main(argv: list[str] | None = None) -> int:
     fips = FIPS_WORKFLOW.read_text(encoding="utf-8")
     node = NODE_WORKFLOW.read_text(encoding="utf-8")
     ambient = AMBIENT_WORKFLOW.read_text(encoding="utf-8")
-    ci = CI_WORKFLOW.read_text(encoding="utf-8")
+    ci = PERFORMANCE_WORKFLOW.read_text(encoding="utf-8")
     check_common_trust(fips, "fips-build.yml", failures)
     check_common_trust(node, "node-waypoint-ebpf-live.yml", failures)
     check_common_trust(ambient, "ambient-host-udp-live.yml", failures)
@@ -8725,7 +8826,12 @@ def main(argv: list[str] | None = None) -> int:
     check_production_smoke(node, failures)
     check_ambient_workflow_cache_budget(ambient, failures)
     check_shared_actions(failures)
-    check_performance_cache_wrapper_key(ci, "ci.yml", failures)
+    for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
+        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        check_completed_cache_producer(
+            extract_job(workflow, job_name), f"{filename}/{job_name}", failures
+        )
+    check_performance_cache_wrapper_key(ci, "performance-regression.yml", failures)
     for filename, job_name, compiler_only in DIRECT_CACHE_DIET_JOBS:
         workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
         check_direct_rust_cache_diet(

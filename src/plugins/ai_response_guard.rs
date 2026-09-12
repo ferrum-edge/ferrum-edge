@@ -20,6 +20,7 @@
 //! closed for enforcing actions. Methods that were never enrolled are never
 //! inspected opportunistically and never forced onto the buffered path.
 
+use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
@@ -34,13 +35,15 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use tracing::debug;
+
+use crate::plugins::utils::log_sampling::warn_sampled;
 
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
-    SseReassembler, SseTextKind, is_text_event_stream_media_type,
-    original_response_is_event_stream, parse_sse_data_frames, parse_sse_data_frames_checked,
+    AnthropicEvent, SseEventName, SseReassembler, SseTextKind, is_text_event_stream_media_type,
+    is_tgi_stream_frame, original_response_is_event_stream, parse_sse_data_frames_checked,
 };
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -551,7 +554,14 @@ impl AiResponseGuard {
     /// Anthropic text blocks / Gemini parts) are joined into one fragment, so
     /// detection and length enforcement see the logical completion the client
     /// renders rather than each part in isolation. Tool/function `arguments`
-    /// contribute both the raw string and its decoded JSON tokens.
+    /// contribute both the raw string and its decoded JSON tokens; a tool
+    /// document that arrives already decoded (an Anthropic `tool_use` block's
+    /// `input`, a Gemini `functionCall`'s `args`) contributes its decoded
+    /// tokens the same way.
+    ///
+    /// The last two arms cover the shapes that are not an OpenAI-style object:
+    /// Cohere v1's top-level `text` / echoed `chat_history[]`, and Hugging Face
+    /// TGI, whose completion document has no object root at all.
     fn extract_completion_texts<'a>(&self, json: &'a Value) -> Vec<Cow<'a, str>> {
         let mut texts = Vec::new();
 
@@ -588,6 +598,15 @@ impl AiResponseGuard {
             }
         }
 
+        // Amazon Bedrock Converse: output.message.content[].text. Here `output`
+        // is an object, not the Responses API array handled just above, so
+        // `Value::get` on a key cannot confuse the two shapes. Converse content
+        // blocks carry no `type` discriminator, which `content_part_text`
+        // already accepts.
+        if let Some(message) = json.get("output").and_then(|output| output.get("message")) {
+            collect_content_value(message.get("content"), &mut texts);
+        }
+
         // Anthropic: content[].text, joining adjacent text blocks.
         if let Some(content) = json.get("content").and_then(|c| c.as_array()) {
             push_joined_adjacent_texts(
@@ -600,6 +619,20 @@ impl AiResponseGuard {
                 }),
                 &mut texts,
             );
+            // Anthropic tool-use blocks: the invoked `name` and the `input`
+            // document the client executes. Both are model-authored and
+            // client-visible, and `input` is executable content — a leaked
+            // account number in a tool argument reaches the tool caller just as
+            // surely as one in prose. Read untyped, exactly as
+            // `ai_semantic_firewall`'s `$.content[*].name` / `$.content[*].input`
+            // are, so the `tool_use` / `server_tool_use` / `mcp_tool_use`
+            // spellings (and any added later) are all covered. One level: a
+            // block contributes its own two fields and nothing recurses back
+            // into the content array.
+            for block in content {
+                collect_string_value(block.get("name"), &mut texts);
+                collect_decoded_argument_value(block.get("input"), &mut texts);
+            }
         }
 
         // Google Gemini: candidates[].content.parts[].text, joined per candidate.
@@ -616,9 +649,36 @@ impl AiResponseGuard {
                             .map(|part| part.get("text").and_then(|t| t.as_str())),
                         &mut texts,
                     );
+                    // Gemini's spelling of a tool call: the invoked name plus
+                    // the `args` document, which arrives already decoded rather
+                    // than as the serialized string OpenAI and Anthropic use.
+                    // The streamed path has reassembled both since #4905; this
+                    // is the buffered `generateContent` counterpart.
+                    for part in parts {
+                        let Some(call) = part.get("functionCall") else {
+                            continue;
+                        };
+                        collect_string_value(call.get("name"), &mut texts);
+                        collect_decoded_argument_value(call.get("args"), &mut texts);
+                    }
                 }
             }
         }
+
+        // Amazon Bedrock Titan text generation: `results[].outputText`. One
+        // level — a result contributes its own completion string.
+        if let Some(results) = json.get("results").and_then(Value::as_array) {
+            for result in results {
+                collect_string_value(result.get("outputText"), &mut texts);
+            }
+        }
+
+        // Ollama `/api/generate`: the whole completion is the top-level
+        // `response` string.
+        collect_string_value(json.get("response"), &mut texts);
+
+        collect_cohere_completion_texts(json, &mut texts);
+        collect_tgi_generated_texts(json, &mut texts);
 
         texts
     }
@@ -712,16 +772,24 @@ impl AiResponseGuard {
     /// `ScanMode::All` SSE detection: the union of decoded parsed frames and a
     /// raw-body pass.
     ///
-    /// `parse_sse_data_frames` silently drops `data:` payloads that are not JSON
-    /// (a plain `data: user@example.com` frame, or malformed JSON), so scanning
-    /// only the parsed frames would let blocked content in unparseable SSE data
-    /// bypass scan-all policies. Running the `RegexSet` over the raw body too
-    /// restores the original whole-body coverage for those payloads, while the
-    /// decoded-frame pass adds `\uXXXX`-escaped detection (issue #1720).
-    /// `raw` is `None` only when the body is not valid UTF-8.
+    /// `parse_sse_data_frames_checked` silently drops `data:` payloads that are
+    /// not JSON (a plain `data: user@example.com` frame, or malformed JSON), so
+    /// scanning only the parsed frames would let blocked content in unparseable
+    /// SSE data bypass scan-all policies. Running the `RegexSet` over the raw
+    /// body too restores the original whole-body coverage for those payloads,
+    /// while the decoded-frame pass adds `\uXXXX`-escaped detection (issue
+    /// #1720). `raw` is `None` only when the body is not valid UTF-8.
+    ///
+    /// `events` carries the SSE `event:` name of each frame, in the same order,
+    /// so an Anthropic stream whose frames declare the discriminator only on
+    /// the event line still reassembles here. Without it the reassembled pass
+    /// would silently see nothing on such a stream while the caller's
+    /// fully-reassembled check reported success — a match split across
+    /// `text_delta` fragments would then be delivered (issue #4901).
     fn detect_matches_in_decoded_sse_frames(
         &self,
         frames: &[Value],
+        events: &[Option<SseEventName>],
         raw: Option<&str>,
     ) -> Vec<String> {
         if self.detection_pattern_count == 0 {
@@ -742,7 +810,7 @@ impl AiResponseGuard {
         // decoded frame. In particular, Responses API argument deltas are a
         // serialized JSON document that may span events; only reassembly can
         // expose JSON escapes such as `\u0040` to the detector.
-        let accumulated = self.extract_sse_completion_texts(frames);
+        let (accumulated, _) = self.extract_sse_completion_texts_checked(frames, events);
         for text in &accumulated {
             for idx in self.detection_set.matches(text).into_iter() {
                 hit[idx] = true;
@@ -868,6 +936,36 @@ impl AiResponseGuard {
             }
         }
         result
+    }
+
+    /// Verify a whole-body text replacement using only the scratch room left
+    /// by its retained allocation. Sequential placeholder removal may keep two
+    /// scratch buffers live, so their capacities share that remaining room.
+    fn text_has_residual(&self, redacted: &[u8], scratch_ceiling: usize) -> Option<bool> {
+        use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+
+        let mut current: Option<Vec<u8>> = None;
+        for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
+            let input = std::str::from_utf8(current.as_deref().unwrap_or(redacted)).ok()?;
+            if pattern.placeholder.is_empty() || !input.contains(pattern.placeholder.as_str()) {
+                continue;
+            }
+            let room = scratch_ceiling.checked_sub(current.as_ref().map_or(0, Vec::capacity))?;
+            let mut sink = BoundedResponseBodySink::with_ceiling(room);
+            let mut last = 0;
+            for (start, matched) in input.match_indices(pattern.placeholder.as_str()) {
+                if !sink.push(&input.as_bytes()[last..start]) {
+                    return None;
+                }
+                last = start + matched.len();
+            }
+            if !sink.push(&input.as_bytes()[last..]) {
+                return None;
+            }
+            current = Some(sink.finish()?);
+        }
+        let cleaned = std::str::from_utf8(current.as_deref().unwrap_or(redacted)).ok()?;
+        Some(self.detection_set.is_match(cleaned))
     }
 
     /// `ScanMode::All` redact mode: after applying the same redaction the
@@ -1006,9 +1104,9 @@ impl AiResponseGuard {
         if !parsed.fully_parsed {
             return true;
         }
-        let mut frames = parsed.frames;
+        let (mut frames, events) = (parsed.frames, parsed.events);
         if self.scan_mode == ScanMode::Content {
-            let accumulated = self.extract_sse_completion_texts(&frames);
+            let (accumulated, _) = self.extract_sse_completion_texts_checked(&frames, &events);
             return accumulated.iter().any(|text| {
                 self.detection_set
                     .is_match(&self.strip_known_placeholders(text))
@@ -1019,7 +1117,7 @@ impl AiResponseGuard {
         // present. Structural masking is only for the decoded-token and raw
         // residual passes; doing it first would hide Responses delta kinds and
         // let a match split across their argument events escape this re-scan.
-        let accumulated = self.extract_sse_completion_texts(&frames);
+        let (accumulated, _) = self.extract_sse_completion_texts_checked(&frames, &events);
 
         for frame in &mut frames {
             blank_top_level_structural_scalars(frame);
@@ -1210,7 +1308,20 @@ impl AiResponseGuard {
             }
         }
 
-        // Anthropic: content[].text
+        // Amazon Bedrock Converse: output.message.content[].text. Mirrors the
+        // extraction above so detection and redaction stay symmetric.
+        if let Some(content) = json
+            .get_mut("output")
+            .and_then(|output| output.get_mut("message"))
+            .and_then(|message| message.get_mut("content"))
+        {
+            self.redact_content_value(content);
+        }
+
+        // Anthropic: content[].text, plus a tool-use block's `name` and its
+        // decoded `input` document. Field-for-field mirror of the extraction
+        // above, so a match the detector found in a tool block is rewritable
+        // rather than a hard failure.
         if let Some(content) = json.get_mut("content").and_then(|c| c.as_array_mut()) {
             for block in content.iter_mut() {
                 if block.get("type").and_then(|t| t.as_str()) == Some("text")
@@ -1221,10 +1332,18 @@ impl AiResponseGuard {
                         block["text"] = Value::String(redacted);
                     }
                 }
+                if let Some(name) = block.get_mut("name") {
+                    self.redact_string_value(name);
+                }
+                if let Some(input) = block.get_mut("input") {
+                    self.redact_decoded_arguments_value(input);
+                }
             }
         }
 
-        // Google Gemini: candidates[].content.parts[].text
+        // Google Gemini: candidates[].content.parts[].text, plus a
+        // `functionCall` part's name and decoded `args` document — the same
+        // three fields `redact_sse_frame` rewrites on the streamed form.
         if let Some(candidates) = json.get_mut("candidates").and_then(Value::as_array_mut) {
             for candidate in candidates {
                 if let Some(parts) = candidate
@@ -1236,7 +1355,53 @@ impl AiResponseGuard {
                         if let Some(text) = part.get_mut("text") {
                             self.redact_string_value(text);
                         }
+                        let Some(call) = part.get_mut("functionCall") else {
+                            continue;
+                        };
+                        if let Some(name) = call.get_mut("name") {
+                            self.redact_string_value(name);
+                        }
+                        if let Some(args) = call.get_mut("args") {
+                            self.redact_decoded_arguments_value(args);
+                        }
                     }
+                }
+            }
+        }
+
+        // Amazon Bedrock Titan: results[].outputText.
+        if let Some(results) = json.get_mut("results").and_then(Value::as_array_mut) {
+            for result in results {
+                if let Some(text) = result.get_mut("outputText") {
+                    self.redact_string_value(text);
+                }
+            }
+        }
+
+        // Ollama `/api/generate`: the top-level `response` completion string.
+        if let Some(response) = json.get_mut("response") {
+            self.redact_string_value(response);
+        }
+
+        // Cohere v1: top-level `text` and the echoed `chat_history[].message`
+        // turns. Field-for-field mirror of `collect_cohere_completion_texts`.
+        if let Some(text) = json.get_mut("text") {
+            self.redact_string_value(text);
+        }
+        if let Some(history) = json.get_mut("chat_history").and_then(Value::as_array_mut) {
+            for turn in history {
+                if let Some(message) = turn.get_mut("message") {
+                    self.redact_string_value(message);
+                }
+            }
+        }
+
+        // Hugging Face TGI: a top-level ARRAY document, so this arm rewrites
+        // the document root. Mirror of `collect_tgi_generated_texts`.
+        if let Some(items) = json.as_array_mut() {
+            for item in items {
+                if let Some(generated) = item.get_mut("generated_text") {
+                    self.redact_string_value(generated);
                 }
             }
         }
@@ -1275,7 +1440,7 @@ impl AiResponseGuard {
                 }
             }
             GuardAction::Warn => {
-                warn!(
+                warn_sampled!(
                     "ai_response_guard: content detected (types: {:?}), passing through (warn mode)",
                     detected
                 );
@@ -1389,22 +1554,54 @@ impl AiResponseGuard {
     /// - OpenAI: `choices[].delta.content` keyed by choice `index`, plus
     ///   legacy `function_call` name/argument deltas and `delta.refusal`
     /// - OpenAI Responses: reassembler deltas plus `response.refusal.delta`
-    /// - Anthropic: `content_block_delta` events with `delta.text` keyed by block `index`
-    /// - Gemini: `candidates[].content.parts[].text` keyed by candidate position
+    /// - Anthropic: the Messages event protocol, reassembled per content-block
+    ///   `index` by the shared reassembler into `$.content[*].text` prose and
+    ///   `$.content[*].input` tool-use argument JSON
+    /// - Gemini: `streamGenerateContent?alt=sse` frames, reassembled per
+    ///   candidate `index` by the shared reassembler into
+    ///   `$.candidates[*].content.parts[*].text` prose plus the candidate's
+    ///   `functionCall` name and compactly serialized `args`
+    /// - Hugging Face TGI: `/generate_stream` frames, whose `token.text`
+    ///   fragments the shared reassembler concatenates into the buffered
+    ///   document's `$[*].generated_text`
     ///
     /// Returns one accumulated `String` per choice/block index, ordered by
     /// index (BTreeMap keeps output deterministic across runs). Accumulated
     /// tool/function argument strings additionally contribute their decoded
     /// JSON tokens so escapes cannot hide content from detection.
-    fn extract_sse_completion_texts(&self, frames: &[Value]) -> Vec<String> {
+    ///
+    /// Also reports whether the stream was FULLY reassembled. `false` means a
+    /// provider stream carried something the reassembler could not fold into
+    /// its document — an Anthropic event, `delta.type`, or content-block index,
+    /// or a malformed / unfoldable Gemini `candidates` frame — so the
+    /// accumulated texts do not necessarily cover every client-visible byte; an
+    /// enforcing caller must fail closed instead of clearing the response. A
+    /// TGI frame whose `token` / `generated_text` violate the shape, or which
+    /// carries alternative-token text outside the reconstructed completion,
+    /// reports the same way.
+    ///
+    /// `events` are the SSE `event:` names of `frames`, in the same order and
+    /// of the same length (exactly what `SseParse` produces). The parameter
+    /// is deliberately NOT optional: an Anthropic stream may declare the event
+    /// discriminator only on the `event:` line, and a caller that dropped the
+    /// names would reassemble nothing from it while still being told the stream
+    /// was fully reassembled (issue #4901).
+    fn extract_sse_completion_texts_checked(
+        &self,
+        frames: &[Value],
+        events: &[Option<SseEventName>],
+    ) -> (Vec<String>, bool) {
         let mut reassembler = SseReassembler::default();
         let mut provider_texts: std::collections::BTreeMap<(u8, usize), String> =
             std::collections::BTreeMap::new();
 
-        for frame in frames {
-            // Shared OpenAI chat/completions + Responses API reassembly covers
-            // prose, tool/function names and arguments, and Responses deltas.
-            reassembler.push_frame(frame);
+        for (frame_index, frame) in frames.iter().enumerate() {
+            // Shared OpenAI chat/completions + Responses API + Anthropic
+            // Messages + Gemini `streamGenerateContent` reassembly covers
+            // prose, tool/function names and arguments, Responses deltas,
+            // Anthropic content blocks, and Gemini candidate parts.
+            let event = events.get(frame_index).copied().flatten();
+            reassembler.push_event_frame(event, frame);
 
             // Legacy Chat Completions streamed `function_call` before the
             // indexed `tool_calls` shape. Keep name and arguments in separate
@@ -1465,42 +1662,17 @@ impl AiResponseGuard {
                     .or_default()
                     .push_str(delta);
             }
-
-            // Anthropic streaming: type=content_block_delta, delta.text
-            if frame.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
-                let index = frame.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                if let Some(text) = frame
-                    .get("delta")
-                    .and_then(|d| d.get("text"))
-                    .and_then(|t| t.as_str())
-                {
-                    provider_texts.entry((0, index)).or_default().push_str(text);
-                }
-            }
-
-            // Gemini: candidates[].content.parts[].text
-            if let Some(candidates) = frame.get("candidates").and_then(|c| c.as_array()) {
-                for (idx, candidate) in candidates.iter().enumerate() {
-                    if let Some(parts) = candidate
-                        .get("content")
-                        .and_then(|c| c.get("parts"))
-                        .and_then(|p| p.as_array())
-                    {
-                        for part in parts {
-                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                provider_texts.entry((1, idx)).or_default().push_str(text);
-                            }
-                        }
-                    }
-                }
-            }
         }
 
         let mut texts: Vec<String> = Vec::new();
+        let fully_reassembled = !reassembler.provider_stream_uninspectable();
         for sse_text in reassembler.into_texts() {
             if matches!(
                 sse_text.kind,
-                SseTextKind::ChatToolArguments | SseTextKind::ResponsesArguments
+                SseTextKind::ChatToolArguments
+                    | SseTextKind::ResponsesArguments
+                    | SseTextKind::AnthropicToolInput
+                    | SseTextKind::GeminiFunctionCallArgs
             ) {
                 append_decoded_argument_texts(&sse_text.text, &mut texts);
             }
@@ -1514,11 +1686,18 @@ impl AiResponseGuard {
             }
             texts.push(text);
         }
-        texts
+        (texts, fully_reassembled)
     }
 
     /// Redact content fields in a single parsed SSE frame.
-    fn redact_sse_frame(&self, frame: &mut Value) {
+    ///
+    /// `event` is the frame's SSE `event:` name when it carried one. Anthropic
+    /// Messages events are routed from the JSON `type` field when present and
+    /// from that name otherwise, mirroring how the reassembler that scanned
+    /// them resolved the discriminator — an intermediary that strips the
+    /// duplicated JSON `type` must not turn a redactable match into a hard
+    /// failure.
+    fn redact_sse_frame(&self, event: Option<SseEventName>, frame: &mut Value) {
         if let Some(choices) = frame.get_mut("choices").and_then(Value::as_array_mut) {
             for choice in choices {
                 if let Some(text) = choice.get_mut("text") {
@@ -1550,35 +1729,117 @@ impl AiResponseGuard {
             }
         }
 
-        // Anthropic streaming: content_block_delta
-        if frame.get("type").and_then(|t| t.as_str()) == Some("content_block_delta")
-            && let Some(text) = frame
-                .get("delta")
-                .and_then(|d| d.get("text"))
-                .and_then(|t| t.as_str())
-        {
-            let redacted = self.redact_text(text);
-            if redacted != text {
-                frame["delta"]["text"] = Value::String(redacted);
+        // Anthropic streaming. The reassembler scans `content_block_delta`
+        // prose, `input_json_delta` tool input, the `content_block_start` tool
+        // name, and an `error` event's message, so redact mode has to be able
+        // to rewrite all of them or a match confined to one would hard-fail
+        // instead of being redacted. The JSON `type` field decides when it is
+        // present (it describes the very payload being rewritten) and the SSE
+        // `event:` line stands in when an intermediary stripped it. A match
+        // that exists only ACROSS fragments is not rewritable in any single
+        // frame and still fails closed through the residual re-scan.
+        let anthropic_event = frame
+            .get("type")
+            .and_then(Value::as_str)
+            .map(SseEventName::from_name)
+            .or(event);
+        match anthropic_event {
+            Some(SseEventName::Anthropic(AnthropicEvent::ContentBlockDelta)) => {
+                if let Some(delta) = frame.get_mut("delta") {
+                    if let Some(text) = delta.get_mut("text") {
+                        self.redact_string_value(text);
+                    }
+                    // `partial_json` is one fragment of a serialized tool-input
+                    // document, so it gets the same treatment as OpenAI
+                    // tool-call `arguments`: value-safe redaction of the
+                    // decoded document when the fragment happens to be
+                    // self-contained JSON, plain string redaction otherwise.
+                    if let Some(partial) = delta.get_mut("partial_json") {
+                        self.redact_arguments_value(partial);
+                    }
+                }
             }
+            Some(SseEventName::Anthropic(AnthropicEvent::ContentBlockStart)) => {
+                if let Some(name) = frame
+                    .get_mut("content_block")
+                    .and_then(|block| block.get_mut("name"))
+                {
+                    self.redact_string_value(name);
+                }
+            }
+            // A mid-stream `error` event's `error.message` is client-visible
+            // free text the reassembler now scans.
+            Some(SseEventName::Anthropic(AnthropicEvent::Error)) => {
+                if let Some(message) = frame
+                    .get_mut("error")
+                    .and_then(|error| error.get_mut("message"))
+                {
+                    self.redact_string_value(message);
+                }
+            }
+            _ => {}
         }
 
-        // Gemini: candidates[].content.parts[].text
+        // Gemini `streamGenerateContent`. The reassembler scans a candidate's
+        // `text` parts, its `functionCall` name, and its `functionCall.args`
+        // document, so redact mode has to be able to rewrite all three or a
+        // match confined to one would hard-fail instead of being redacted. A
+        // match that exists only ACROSS frames is not rewritable in any single
+        // frame and still fails closed through the residual re-scan.
         if let Some(candidates) = frame.get_mut("candidates").and_then(Value::as_array_mut) {
             for candidate in candidates {
-                if let Some(parts) = candidate
+                let Some(parts) = candidate
                     .get_mut("content")
-                    .and_then(|c| c.get_mut("parts"))
-                    .and_then(|p| p.as_array_mut())
-                {
-                    for part in parts {
-                        if let Some(text) = part.get_mut("text") {
-                            self.redact_string_value(text);
-                        }
+                    .and_then(|content| content.get_mut("parts"))
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                for part in parts {
+                    if let Some(text) = part.get_mut("text") {
+                        self.redact_string_value(text);
+                    }
+                    let Some(call) = part.get_mut("functionCall") else {
+                        continue;
+                    };
+                    if let Some(name) = call.get_mut("name") {
+                        self.redact_string_value(name);
+                    }
+                    if let Some(args) = call.get_mut("args") {
+                        self.redact_decoded_arguments_value(args);
                     }
                 }
             }
         }
+
+        // Hugging Face TGI `/generate_stream`. The reassembler scans a frame's
+        // `token.text` fragment and the terminal `generated_text`, so redact
+        // mode has to be able to rewrite both or a match confined to one would
+        // hard-fail instead of being redacted. A match that exists only ACROSS
+        // frames is not rewritable in any single frame and still fails closed
+        // through the residual re-scan.
+        if is_tgi_stream_frame(frame) {
+            let token_text = frame.get_mut("token").and_then(|t| t.get_mut("text"));
+            if let Some(text) = token_text {
+                self.redact_string_value(text);
+            }
+            if let Some(generated) = frame.get_mut("generated_text") {
+                self.redact_string_value(generated);
+            }
+        }
+    }
+
+    /// Value-safe redaction of an ALREADY-decoded tool-argument document.
+    ///
+    /// Gemini's `functionCall.args` is a JSON object on the wire rather than
+    /// the serialized string OpenAI and Anthropic use, so it needs the decoded
+    /// branch of [`redact_arguments_value`](Self::redact_arguments_value)
+    /// without the parse step, under the same rule: object member names and
+    /// non-string scalars are left alone, so a match confined to one of those
+    /// is not rewritten into an invalid document and still fails closed through
+    /// the residual re-scan.
+    fn redact_decoded_arguments_value(&self, value: &mut Value) {
+        redact_json_strings(value, &self.pii_patterns, &self.blocked_phrases, false);
     }
 
     /// Rewrite one SSE event's JSON `data:` payload into `output`, or report
@@ -1588,11 +1849,12 @@ impl AiResponseGuard {
         output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
         lines: &[&str],
     ) -> Option<bool> {
+        let event = sse_event_name_of(lines);
         rewrite_sse_json_event_into(output, lines, |json| {
             if self.scan_mode == ScanMode::All {
                 self.redact_all_strings_with_argument_shield(json);
             } else {
-                self.redact_sse_frame(json);
+                self.redact_sse_frame(event, json);
             }
         })
     }
@@ -1614,14 +1876,14 @@ impl AiResponseGuard {
         // content) with a raw-body pass (so cross-token/contextual patterns and
         // unparseable `data:` payloads are not skipped here while the
         // reject/warn detection path would have flagged them).
+        let parsed = parse_sse_data_frames_checked(body);
+        let (frames, events) = (&parsed.frames, &parsed.events);
         let has_match = if self.scan_mode == ScanMode::All {
-            let frames = parse_sse_data_frames(body);
             !self
-                .detect_matches_in_decoded_sse_frames(&frames, Some(body_str))
+                .detect_matches_in_decoded_sse_frames(frames, events, Some(body_str))
                 .is_empty()
         } else {
-            let frames = parse_sse_data_frames(body);
-            let accumulated = self.extract_sse_completion_texts(&frames);
+            let (accumulated, _) = self.extract_sse_completion_texts_checked(frames, events);
             let refs: Vec<&str> = accumulated.iter().map(String::as_str).collect();
             !self.detect_matches(&refs).is_empty()
         };
@@ -3040,7 +3302,7 @@ fn load_grpc_inspection(
     let pool = match load_grpc_descriptor_pool_inner(&shape.descriptor_path) {
         Ok(pool) => pool,
         Err((true, _)) => {
-            warn!(
+            warn_sampled!(
                 plugin = "ai_response_guard",
                 "Protobuf descriptor dependency is unavailable; enrolled gRPC methods fail closed"
             );
@@ -3185,6 +3447,20 @@ impl Plugin for AiResponseGuard {
             return self.inspect_grpc_response(ctx, response_status, response_headers, body);
         }
 
+        // The shared representation gate owns origin decoding and its retained
+        // budget. It runs before transforms, after this early inspection hook.
+        // Defer only a response this instance claims there; the final hook must
+        // inspect the installed plaintext even when no redaction was needed.
+        if !body.is_empty()
+            && self.enforces_response_body_policy(
+                ctx,
+                response_headers.get("content-type").map(String::as_str),
+                body,
+            )
+        {
+            return PluginResult::Continue;
+        }
+
         // Enforce the aggregate scan/work bound before the successful-response
         // content gate. Buffered non-2xx error bodies still reach the transform
         // phase, so returning before this check would let a large raw body evade
@@ -3268,12 +3544,25 @@ impl Plugin for AiResponseGuard {
                     "SSE contains malformed, non-JSON, or non-UTF-8 data",
                 );
             }
-            let frames = parsed.frames;
+            let (frames, events) = (parsed.frames, parsed.events);
             if frames.is_empty() && self.scan_mode != ScanMode::All {
                 return PluginResult::Continue;
             }
 
-            let accumulated = self.extract_sse_completion_texts(&frames);
+            let (accumulated, fully_reassembled) =
+                self.extract_sse_completion_texts_checked(&frames, &events);
+            if !fully_reassembled {
+                // A provider stream carried something reassembly could not
+                // cover — an Anthropic event, delta type, or content-block
+                // index, or a malformed / unfoldable Gemini `candidates` frame
+                // — so the accumulated text is not proof the whole response is
+                // clean.
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "uninspectable_sse",
+                    "SSE contains an unsupported provider streaming event",
+                );
+            }
 
             // Check max completion length on accumulated text
             if self.max_completion_length > 0 {
@@ -3299,8 +3588,15 @@ impl Plugin for AiResponseGuard {
                 }
             }
 
+            if self.has_verified_redaction(ctx, body, Some(content_type)) {
+                return PluginResult::Continue;
+            }
             let detected = if self.scan_mode == ScanMode::All {
-                self.detect_matches_in_decoded_sse_frames(&frames, std::str::from_utf8(body).ok())
+                self.detect_matches_in_decoded_sse_frames(
+                    &frames,
+                    &events,
+                    std::str::from_utf8(body).ok(),
+                )
             } else {
                 let refs: Vec<&str> = accumulated.iter().map(|s| s.as_str()).collect();
                 self.detect_matches(&refs)
@@ -3376,6 +3672,9 @@ impl Plugin for AiResponseGuard {
                                 .insert("ai_response_guard_warning".to_string(), reason);
                         }
                     }
+                }
+                if self.has_verified_redaction(ctx, body, Some(content_type)) {
+                    return PluginResult::Continue;
                 }
                 let detected = self.detect_matches(&[text]);
                 return if detected.is_empty() {
@@ -3453,6 +3752,9 @@ impl Plugin for AiResponseGuard {
         }
 
         // Detect PII and blocked content
+        if self.has_verified_redaction(ctx, body, Some(content_type)) {
+            return PluginResult::Continue;
+        }
         let detected = if self.scan_mode == ScanMode::All {
             self.detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok())
         } else {
@@ -3559,7 +3861,28 @@ impl Plugin for AiResponseGuard {
         if ctx.is_native_grpc_request() || response_is_grpc_framed(ctx, content_type, body) {
             return None;
         }
-        let replacement = self.redacted_response_body(body, content_type, ceiling);
+        let mut detected = Vec::new();
+        let replacement = self.redacted_response_body(body, content_type, ceiling, &mut detected);
+        if let Some(redacted) = replacement.as_deref() {
+            self.record_verified_redaction(ctx, redacted, content_type);
+            if !detected.is_empty() {
+                ctx.metadata
+                    .insert("ai_response_guard_redacted".to_string(), detected.join(","));
+            }
+        } else if content_type.is_some_and(is_text_event_stream_media_type)
+            && body.len() <= self.max_scan_bytes
+            && ctx
+                .ai_response_guard_pending_redactions
+                .contains_key(&self.instance_id)
+            && !self.sse_body_has_residual(body)
+        {
+            // Structural-only SSE matches deliberately leave the exact event
+            // bytes untouched. A clean residual scan discharges that promise
+            // without pretending a replacement was installed.
+            self.record_verified_redaction(ctx, body, content_type);
+            ctx.ai_response_guard_pending_redactions
+                .remove(&self.instance_id);
+        }
         self.discharge_pending_redaction(ctx, replacement)
     }
 
@@ -3577,6 +3900,7 @@ impl Plugin for AiResponseGuard {
             body,
             content_type,
             crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
+            &mut Vec::new(),
         )
     }
 
@@ -3661,16 +3985,17 @@ impl Plugin for AiResponseGuard {
     ///    field — `pending_choices` → `choices` — after the guard's only pass, and
     ///    add/update/remove rules can equally introduce blocked text, drop a
     ///    required field, or expand a completion past its length bound
-    ///    (`GHSA-62jg-v563-4q23`). Re-running detection over the published bytes
-    ///    is what makes the metadata a statement about the delivered
-    ///    representation instead of the pre-transform one.
+    ///    (`GHSA-62jg-v563-4q23`). A private digest recognizes this instance's
+    ///    residual-verified HTTP output. Only that exact output may reuse the
+    ///    placeholder and structural-scalar exemptions; any changed bytes or
+    ///    media type need a fresh detection pass.
     ///
     /// The re-run is a RESIDUAL scan, not a second redaction round: no transform
     /// remains to install a replacement, so a fresh `redact` detection becomes
     /// the same rejection as an undischarged promise. `warn` keeps passing
     /// through, so a monitoring deployment is not silently converted into a
-    /// blocking one. Detection is local pattern matching, so nothing is charged
-    /// twice by running it again.
+    /// blocking one. Size, structure, and length rules still run on verified
+    /// output, so placeholder expansion cannot bypass a completion limit.
     ///
     /// The gateway's own capacity terminal is not affected: when the transform
     /// phase installs it, the response is already replaced and this phase is not
@@ -3682,11 +4007,26 @@ impl Plugin for AiResponseGuard {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        // A final call cannot defer again: the representation gate must have
+        // installed plaintext and retired the origin-encoding marker first.
+        if !body.is_empty()
+            && self.enforces_response_body_policy(
+                ctx,
+                response_headers.get("content-type").map(String::as_str),
+                body,
+            )
+        {
+            return self.respond_to_uninspectable(
+                ctx,
+                "encoded_response_not_decoded",
+                "response content encoding was not decoded before final inspection",
+            );
+        }
         if let Some(detected) = ctx
             .ai_response_guard_pending_redactions
             .remove(&self.instance_id)
         {
-            warn!(
+            warn_sampled!(
                 "ai_response_guard: detected content was not redacted before delivery (types: {}), rejecting response",
                 detected
             );
@@ -3712,7 +4052,7 @@ impl Plugin for AiResponseGuard {
         else {
             return PluginResult::Continue;
         };
-        warn!(
+        warn_sampled!(
             "ai_response_guard: detected content is still present in the final client-visible response (types: {}), rejecting response",
             detected
         );
@@ -3751,6 +4091,39 @@ impl Plugin for AiResponseGuard {
 }
 
 impl AiResponseGuard {
+    /// Bind residual verification to this instance's exact output and media
+    /// type. Keep the digest private to the request; public redaction metadata
+    /// cannot authorize placeholder or structural-value exemptions.
+    fn redaction_digest(body: &[u8], content_type: Option<&str>) -> [u8; 32] {
+        let content_type = content_type.unwrap_or("");
+        let mut digest = Sha256::new();
+        digest.update((content_type.len() as u64).to_be_bytes());
+        digest.update(content_type.as_bytes());
+        digest.update(body);
+        digest.finalize()
+    }
+
+    fn record_verified_redaction(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) {
+        ctx.ai_response_guard_verified_redactions
+            .insert(self.instance_id, Self::redaction_digest(body, content_type));
+    }
+
+    fn has_verified_redaction(
+        &self,
+        ctx: &RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> bool {
+        ctx.ai_response_guard_verified_redactions
+            .get(&self.instance_id)
+            .is_some_and(|digest| *digest == Self::redaction_digest(body, content_type))
+    }
+
     /// The shared terminal for detected content that is still in the bytes the
     /// client would receive — whether the promised redaction never ran or a later
     /// semantic transform reintroduced it.
@@ -3800,6 +4173,7 @@ impl AiResponseGuard {
         body: &[u8],
         content_type: Option<&str>,
         ceiling: usize,
+        detected: &mut Vec<String>,
     ) -> Option<Vec<u8>> {
         if !self.needs_body_transform {
             return None;
@@ -3829,8 +4203,12 @@ impl AiResponseGuard {
                     return None;
                 }
                 let text = std::str::from_utf8(body).ok()?;
+                *detected = self.detect_matches(&[text]);
                 let redacted = self.redact_text_bounded(text, ceiling)?;
                 if redacted == text.as_bytes() {
+                    return None;
+                }
+                if self.text_has_residual(&redacted, ceiling.checked_sub(redacted.capacity())?)? {
                     return None;
                 }
                 return Some(redacted);
@@ -3841,8 +4219,12 @@ impl AiResponseGuard {
             Ok(json) => json,
             Err(_) if self.scan_mode == ScanMode::All => {
                 let text = std::str::from_utf8(body).ok()?;
+                *detected = self.detect_matches(&[text]);
                 let redacted = self.redact_text_bounded(text, ceiling)?;
                 if redacted == text.as_bytes() {
+                    return None;
+                }
+                if self.text_has_residual(&redacted, ceiling.checked_sub(redacted.capacity())?)? {
                     return None;
                 }
                 return Some(redacted);
@@ -3851,10 +4233,8 @@ impl AiResponseGuard {
         };
 
         if self.scan_mode == ScanMode::All {
-            if self
-                .detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok())
-                .is_empty()
-            {
+            *detected = self.detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok());
+            if detected.is_empty() {
                 return None;
             }
             // `on_response_body` rejects this case in the normal pipeline.
@@ -3867,8 +4247,8 @@ impl AiResponseGuard {
             self.redact_all_strings_with_argument_shield(&mut json);
         } else {
             let texts = self.extract_completion_texts(&json);
-            let has_match = !self.detect_matches(&texts).is_empty();
-            if !has_match {
+            *detected = self.detect_matches(&texts);
+            if detected.is_empty() {
                 return None;
             }
             if self.content_redact_leaves_residual(&json) {
@@ -3916,6 +4296,23 @@ fn blank_top_level_structural_scalars(value: &mut Value) {
             }
         }
     }
+}
+
+/// The classified `event:` name of one complete SSE event's lines, if it
+/// carried one. Per the WHATWG spec the last `event:` field of an event wins,
+/// matching `parse_sse_data_frames_checked`.
+fn sse_event_name_of(lines: &[&str]) -> Option<SseEventName> {
+    let mut name = None;
+    for line in lines {
+        let content = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        if let Some(rest) = content.strip_prefix("event:") {
+            name = Some(SseEventName::from_name(rest.trim()));
+        }
+    }
+    name
 }
 
 /// Rewrite one SSE event's JSON `data:` payload straight into `output`.
@@ -4450,6 +4847,37 @@ fn collect_content_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, s
     }
 }
 
+/// Cohere v1 `/chat` and `/generate` completion text: the top-level `text`
+/// field, plus the `chat_history[]` turns the API echoes back to the client.
+///
+/// A turn's `role` is `USER` / `CHATBOT` / `SYSTEM` / `TOOL`, and Cohere spells
+/// it in either case. Unlike the request-side readers this mirrors, this plugin
+/// has no `exclude_roles` knob, so the role gates nothing here and there is no
+/// case-sensitive comparison to get wrong: every echoed turn is client-visible,
+/// so every turn's `message` is scanned whatever its role says. Bounded to one
+/// level — a turn contributes its own `message` string and nothing recurses.
+fn collect_cohere_completion_texts<'a>(json: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
+    collect_string_value(json.get("text"), texts);
+    let Some(history) = json.get("chat_history").and_then(Value::as_array) else {
+        return;
+    };
+    for turn in history {
+        collect_string_value(turn.get("message"), texts);
+    }
+}
+
+/// Hugging Face TGI text generation: the completion is a top-level JSON ARRAY
+/// of `{"generated_text": …}` objects rather than an object, so this arm reads
+/// the document root itself rather than a field of it. One level, no recursion.
+fn collect_tgi_generated_texts<'a>(json: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
+    let Some(items) = json.as_array() else {
+        return;
+    };
+    for item in items {
+        collect_string_value(item.get("generated_text"), texts);
+    }
+}
+
 /// Tool/function `arguments` are a JSON document serialized into a string, so
 /// scanning only the raw string lets JSON escapes (e.g. `\u0040` for `@`) hide
 /// content the tool client will decode. Push the raw string and, when it
@@ -4469,6 +4897,20 @@ fn collect_argument_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, 
                 .map(|token| Cow::Owned(token.into_owned())),
         );
     }
+}
+
+/// Decoded-document variant of [`collect_argument_value`] for the tool
+/// arguments providers deliver as JSON rather than as a serialized string — an
+/// Anthropic `tool_use` block's `input` and a Gemini `functionCall`'s `args`.
+///
+/// There is no string to parse and no raw form the client ever sees, so only
+/// the decoded tokens are collected. Strings stay borrowed from the response
+/// document; nothing is allocated for the common case.
+fn collect_decoded_argument_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, str>>) {
+    let Some(value) = value else {
+        return;
+    };
+    collect_decoded_json_strings(value, texts);
 }
 
 /// String-accumulator variant of [`collect_argument_value`] for the SSE path,

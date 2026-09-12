@@ -38,6 +38,7 @@ use crate::config::conf_file::resolve_ferrum_var;
 use crate::tls::source::CertSourceUri;
 
 const MODULE_PATH_ENV: &str = "FERRUM_PKCS11_MODULE_PATH";
+const MODULE_ALLOWED_PATHS_ENV: &str = "FERRUM_PKCS11_MODULE_ALLOWED_PATHS";
 const DEFAULT_KEY_TYPE: &str = "rsa";
 
 /// Largest RSA modulus (in bytes, leading zeros stripped) accepted when
@@ -174,34 +175,84 @@ where
     M: FnOnce() -> Option<String>,
     R: Fn(&str) -> Option<String>,
 {
-    if let Some(module) = uri
+    let allowed = var_resolver(MODULE_ALLOWED_PATHS_ENV);
+    let supplied = ["module", "module_path", "module_env"]
+        .iter()
+        .any(|option| uri.options.contains_key(*option));
+    if supplied && allowed.is_none() {
+        bail!(
+            "PKCS#11 module options require {}; omit them to use {}",
+            MODULE_ALLOWED_PATHS_ENV,
+            MODULE_PATH_ENV
+        );
+    }
+    let module = if let Some(module) = uri
         .options
         .get("module")
         .or_else(|| uri.options.get("module_path"))
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
     {
-        return Ok(module.to_string());
-    }
-
-    if let Some(module_env) = uri.options.get("module_env") {
+        module.clone()
+    } else if let Some(module_env) = uri.options.get("module_env") {
         validate_var_name(module_env, "module_env")?;
-        return var_resolver(module_env).ok_or_else(|| {
+        var_resolver(module_env).ok_or_else(|| {
             anyhow!(
-                "PKCS#11 TLS key source '{}' references module_env='{}' but it is not set",
-                uri.source_id(),
-                module_env
+                "PKCS#11 module_env is not set; check {}",
+                MODULE_ALLOWED_PATHS_ENV
             )
-        });
+        })?
+    } else {
+        module_fallback().ok_or_else(|| anyhow!("PKCS#11 requires {}", MODULE_PATH_ENV))?
+    };
+    let module = canonical_module_policy_path(&module)?;
+    if !module.is_file() {
+        bail!(
+            "PKCS#11 module must be a file; check {}",
+            MODULE_ALLOWED_PATHS_ENV
+        );
     }
+    if let Some(allowed) = allowed {
+        let mut admitted = false;
+        // Validate every entry, even after a match: malformed policy fails closed.
+        for entry in allowed.split(',') {
+            let entry = canonical_module_policy_path(entry)?;
+            admitted |= module == entry || (entry.is_dir() && module.starts_with(&entry));
+        }
+        if !admitted {
+            bail!("PKCS#11 module is outside {}", MODULE_ALLOWED_PATHS_ENV);
+        }
+    }
+    module
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow!("PKCS#11 module path must be UTF-8"))
+}
 
-    module_fallback().ok_or_else(|| {
+fn canonical_module_policy_path(value: &str) -> anyhow::Result<std::path::PathBuf> {
+    let path = std::path::Path::new(value.trim());
+    if !path.is_absolute() {
+        bail!(
+            "PKCS#11 module paths must be absolute; check {}",
+            MODULE_ALLOWED_PATHS_ENV
+        );
+    }
+    // Do not disclose configuration-supplied paths or environment values in errors.
+    path.canonicalize().map_err(|_| {
         anyhow!(
-            "PKCS#11 TLS key source '{}' must set ?module= or ?module_env=, or configure {}",
-            uri.source_id(),
-            MODULE_PATH_ENV
+            "PKCS#11 module paths must exist and resolve; check {}",
+            MODULE_ALLOWED_PATHS_ENV
         )
     })
+}
+
+/// Check node-local module policy at admission without opening a native library.
+/// Runtime key construction repeats this check immediately before loading it.
+pub fn validate_module_source_uri(uri: &CertSourceUri) -> anyhow::Result<()> {
+    resolve_module_path(
+        uri,
+        || resolve_ferrum_var(MODULE_PATH_ENV),
+        &resolve_ferrum_var,
+    )
+    .map(|_| ())
 }
 
 fn parse_slot(uri: &CertSourceUri) -> anyhow::Result<Option<u64>> {
@@ -885,13 +936,22 @@ mod tests {
     }
 
     fn parse_config(raw: &str) -> anyhow::Result<Pkcs11KeyConfig> {
-        let uri = pkcs11_uri(raw);
+        let directory = tempfile::tempdir().expect("module directory");
+        let module = directory.path().join("module.so");
+        std::fs::write(&module, []).expect("inert module fixture");
+        let module = module.canonicalize().expect("canonical fixture");
+        let module = module.to_str().expect("UTF-8 fixture");
+        let raw = raw
+            .replace("/usr/lib/softhsm/libsofthsm2.so", module)
+            .replace("/usr/lib/pkcs11.so", module);
+        let uri = pkcs11_uri(&raw);
         Pkcs11KeyConfig::parse_with_resolvers(
             &uri,
             || None,
             |name| match name {
                 "FERRUM_PKCS11_PIN" => Some("123456".to_string()),
-                "FERRUM_PKCS11_MODULE_FROM_ENV" => Some("/usr/lib/pkcs11.so".to_string()),
+                "FERRUM_PKCS11_MODULE_FROM_ENV" => Some(module.to_string()),
+                MODULE_ALLOWED_PATHS_ENV => Some(module.to_string()),
                 _ => None,
             },
         )
@@ -904,7 +964,7 @@ mod tests {
         )
         .expect("config parses");
         assert_eq!(config.label.as_deref(), Some("edge-rsa"));
-        assert_eq!(config.module_path, "/usr/lib/softhsm/libsofthsm2.so");
+        assert!(config.module_path.ends_with("module.so"));
         assert!(config.pin.is_some());
         let debug = format!("{config:?}");
         assert!(!debug.contains("123456"));
@@ -926,7 +986,7 @@ mod tests {
             "pkcs11://edge-rsa?module_env=FERRUM_PKCS11_MODULE_FROM_ENV&pin_env=FERRUM_PKCS11_PIN",
         )
         .expect("config parses");
-        assert_eq!(config.module_path, "/usr/lib/pkcs11.so");
+        assert!(config.module_path.ends_with("module.so"));
     }
 
     #[test]

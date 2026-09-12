@@ -15,6 +15,8 @@
 //! This test is marked with #[ignore] as it requires the binary to be built
 //! and should be run with: cargo test --test functional_tests functional_websocket -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use futures_util::{SinkExt, StreamExt};
 use http::StatusCode;
 use std::io::Write;
@@ -45,12 +47,11 @@ const WS_H3_FRAME_LIMIT_UNDER_TEST: usize = 64;
 const WS_H3_OVERSIZE_FRAME_BYTES: usize = WS_H3_FRAME_LIMIT_UNDER_TEST * 2;
 const WS_JWT_SECRET: &str = "ws-jwt-functional-secret-32-bytes-minimum";
 
-/// Allocate a free port by binding to port 0 and returning the assigned port.
+/// Lease a gateway port until the test process exits.
 async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    crate::scaffolding::ports::unbound_port()
         .await
-        .expect("Failed to bind to port 0");
-    listener.local_addr().unwrap().port()
+        .expect("lease test port")
 }
 
 /// Start a WebSocket echo server on the given port.
@@ -69,7 +70,7 @@ async fn start_ws_echo_server_with_subprotocol(
     port: u16,
     selected_subprotocol: Option<&'static str>,
 ) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind WS echo server");
 
@@ -134,7 +135,7 @@ async fn start_ws_echo_server_with_subprotocol(
 async fn start_ws_ping_responsive_server(port: u16) {
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind ping-responsive WS server");
 
@@ -171,7 +172,7 @@ async fn start_ws_ping_responsive_server(port: u16) {
 async fn start_ws_silent_ping_server(port: u16) {
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind silent-ping WS server");
 
@@ -216,7 +217,7 @@ async fn start_ws_backend_ping_server(
 ) {
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind backend-ping WS server");
 
@@ -272,7 +273,7 @@ async fn start_ws_frame_limit_probe_server(
     client_oversize_frames: Arc<AtomicUsize>,
     server_oversize_frames: Arc<AtomicUsize>,
 ) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind WS frame-limit probe server");
 
@@ -337,7 +338,7 @@ async fn start_ws_frame_limit_probe_server(
 /// Start a WebSocket probe backend that counts oversized client frames.
 #[allow(clippy::collapsible_match)]
 async fn start_ws_oversize_probe_server(port: u16, oversized_frames: Arc<AtomicUsize>) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind WS oversize probe server");
 
@@ -387,7 +388,7 @@ async fn start_ws_oversize_probe_server(port: u16, oversized_frames: Arc<AtomicU
 }
 
 async fn start_http_text_server(port: u16, body: &'static str) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind HTTP text server");
 
@@ -456,13 +457,14 @@ fn start_gateway_with_extra_env(
     // The admin HTTP port must be a real port, never the `0` sentinel: `0`
     // disables the plaintext admin listener, and this file's readiness barrier
     // proves child identity through that listener.
-    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
+    let admin_http_port = std::net::TcpListener::bind_test("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .map(|a| a.port())?;
     let stderr_path =
         std::path::Path::new(config_path).with_extension(format!("gateway-{http_port}.stderr.log"));
     let stderr_file = std::fs::File::create(&stderr_path)?;
     let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
@@ -2336,7 +2338,14 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
 
     // Held for the whole test: this listener keeps accepting, so a bare TCP
     // probe would report "ready" the entire time.
-    let squatter = TcpListener::bind("127.0.0.1:0")
+    //
+    // It binds the WILDCARD, which is the address the spawned gateway itself
+    // uses (`FERRUM_PROXY_BIND_ADDRESS` defaults to `0.0.0.0`). Contesting the
+    // exact same bind is what makes the gateway's bind fail on every host: with
+    // `SO_REUSEADDR`, a `127.0.0.1` listener and a `0.0.0.0` listener can hold
+    // one port simultaneously on Darwin, which would let the gateway start and
+    // dissolve the precondition (issue #4983).
+    let squatter = TcpListener::bind_test("0.0.0.0:0")
         .await
         .expect("bind foreign listener");
     let contested_port = squatter.local_addr().unwrap().port();
@@ -2606,7 +2615,7 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
 #[ignore]
 #[tokio::test]
 async fn test_h3_websocket_open_circuit_reject_strips_transport_policy_fields() {
-    let dead_backend_listener = TcpListener::bind("127.0.0.1:0")
+    let dead_backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind non-responsive backend listener");
     let dead_backend_port = dead_backend_listener.local_addr().unwrap().port();
@@ -2935,14 +2944,19 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
 }
 
 /// Test HTTP/3 WebSocket (RFC 9220 Extended CONNECT) proxying through the
-/// gateway, including unmasked compliant frames, binary frames, and strict
-/// RFC 9220 rejection of masked client frames.
+/// gateway with a standards-compliant masking client: masked text frames,
+/// masked binary frames, and the RFC 6455 §5.1 refusal of an unmasked client
+/// frame.
+///
+/// RFC 9220 §3 adopts RFC 8441's Extended CONNECT mechanism and RFC 8441 §5
+/// hands the stream to RFC 6455 unchanged, so there is no HTTP/3 masking
+/// exemption — this test previously asserted the inverse (issue #5011).
 ///
 /// `Http3Client::websocket` sends `:authority` from the URL and no Host
 /// header. Issue #4416's both-absent reject must not fire on that shape.
 #[ignore]
 #[tokio::test]
-async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
+async fn test_h3_websocket_rfc6455_masked_frames_and_unmasked_refusal() {
     let backend_port = free_port().await;
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
     sleep(Duration::from_millis(300)).await;
@@ -2974,8 +2988,20 @@ async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
         "backend negotiated no subprotocol, so H3 200 must not invent one"
     );
 
+    // Every client frame the H3 test client sends is masked per RFC 6455 §5.1,
+    // with a fresh masking key each time, so these echoes prove the gateway
+    // unmasks H3 client frames instead of refusing them.
     ws.send_text("hello h3").await.expect("send text");
     assert_eq!(ws.recv_text().await.expect("text echo"), "Echo: hello h3");
+
+    ws.send_text("second masked h3 frame")
+        .await
+        .expect("send second text");
+    assert_eq!(
+        ws.recv_text().await.expect("second text echo"),
+        "Echo: second masked h3 frame",
+        "a rotated masking key must unmask exactly like the first frame"
+    );
 
     ws.send_binary(&[1, 2, 3, 4, 5]).await.expect("send binary");
     assert_eq!(
@@ -2983,19 +3009,30 @@ async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
         "Echo binary: 5 bytes"
     );
 
-    ws.send_masked_text("masked but rejected")
+    // The inverse of the old assertion: an UNMASKED client frame is the RFC
+    // 6455 §5.1 violation, and H3 refuses it exactly as H1/H2 do.
+    let mut unmasked_ws = client
+        .websocket(&url, WebSocketOptions::default())
         .await
-        .expect("send masked text");
-    match ws.recv_frame().await.expect("protocol close") {
+        .expect("H3 WebSocket connect for unmasked-frame refusal");
+    assert_eq!(unmasked_ws.status, StatusCode::OK);
+    unmasked_ws
+        .send_unmasked_text("unmasked and rejected")
+        .await
+        .expect("send unmasked text");
+    match unmasked_ws.recv_frame().await.expect("protocol close") {
         H3WebSocketFrame::Close(payload) => {
             assert!(
                 payload.len() >= 2,
                 "protocol close payload must include a status code"
             );
             let code = u16::from_be_bytes([payload[0], payload[1]]);
-            assert_eq!(code, 1002, "masked H3 frames must close as protocol error");
+            assert_eq!(
+                code, 1002,
+                "unmasked H3 client frames must close as protocol error"
+            );
         }
-        other => panic!("expected protocol close after masked frame, got {other:?}"),
+        other => panic!("expected protocol close after unmasked frame, got {other:?}"),
     }
 
     let preserved_id = "h3-preserved-websocket-id";
@@ -4096,6 +4133,166 @@ async fn test_websocket_idle_timeout_sends_symmetric_1001_close() {
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
+}
+
+/// Backend that completes the upgrade, echoes the first text frame, then
+/// hard-resets the TCP connection (SO_LINGER=0 → RST, not FIN) so the gateway
+/// observes a transport failure (`connection_reset`) rather than a clean close.
+#[allow(clippy::collapsible_match)]
+async fn start_ws_reset_after_echo_server(port: u16) {
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind WS reset-after-echo server");
+
+    loop {
+        if let Ok((stream, _addr)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                while let Some(Ok(msg)) = ws.next().await {
+                    match msg {
+                        Message::Text(text) => {
+                            let echo = format!("Echo: {}", text);
+                            if ws.send(Message::Text(echo.into())).await.is_err() {
+                                return;
+                            }
+                            // Give the gateway/client a beat to read the echo before
+                            // the RST so the reset is cleanly separated from the
+                            // unread-echo data a RST could otherwise discard on loopback.
+                            sleep(Duration::from_millis(300)).await;
+                            let stream = ws.into_inner();
+                            // SO_LINGER=0 through socket2: tokio's own setter
+                            // is deprecated, and a zero linger never blocks.
+                            let _ =
+                                socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO));
+                            drop(stream);
+                            return;
+                        }
+                        Message::Close(_) => return,
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// A client that sets RSV1 (or any reserved bit) has violated RFC 6455 §5.2;
+/// the gateway must close the session with 1002, not Close(None)/1005
+/// (issue #4770).
+#[ignore]
+#[tokio::test]
+async fn test_websocket_client_protocol_violation_closes_with_1002() {
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+    use tokio_tungstenite::tungstenite::protocol::frame::{Frame, FrameHeader};
+
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    let rsv1_frame = Frame::from_payload(
+        FrameHeader {
+            is_final: true,
+            rsv1: true,
+            rsv2: false,
+            rsv3: false,
+            opcode: OpCode::Data(Data::Text),
+            mask: None,
+        },
+        bytes::Bytes::from_static(b"x"),
+    );
+    ws.send(Message::Frame(rsv1_frame))
+        .await
+        .expect("send RSV1 frame");
+
+    let close = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(Some(close)))) => break close,
+                Some(Ok(Message::Close(None))) => {
+                    panic!("client protocol violation closed with 1005/no status")
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(err)) => panic!("protocol violation reset client transport: {err}"),
+                None => panic!("protocol violation ended client stream without Close"),
+            }
+        }
+    })
+    .await
+    .expect("client 1002 Close timed out");
+    assert_eq!(close.code, CloseCode::Protocol);
+    assert_eq!(close.reason.as_str(), "protocol error");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// A backend that resets mid-relay must not leave the healthy client with a
+/// bare EOF (1006): the gateway publishes a defined policy Close (1011 outside
+/// drain) to the surviving peer (issue #4770).
+#[ignore]
+#[tokio::test]
+async fn test_websocket_backend_reset_closes_client_with_1011() {
+    let backend_port = free_port().await;
+    let reset_handle = tokio::spawn(start_ws_reset_after_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    ws.send(Message::Text("hello".into()))
+        .await
+        .expect("Failed to send text");
+    let reply = ws.next().await.expect("No reply").expect("Error reading");
+    assert_eq!(reply, Message::Text("Echo: hello".into()));
+
+    let close = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(Some(close)))) => break close,
+                Some(Ok(Message::Close(None))) => {
+                    panic!("backend reset closed client with 1005/no status")
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(err)) => panic!("backend reset left client with bare EOF/reset: {err}"),
+                None => panic!("backend reset ended client stream without a defined Close"),
+            }
+        }
+    })
+    .await
+    .expect("client 1011 Close timed out");
+    assert_eq!(close.code, CloseCode::Error);
+    assert_eq!(close.reason.as_str(), "relay error");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    reset_handle.abort();
 }
 
 /// Issue #2963: client→backend Ping must not produce a local gateway Pong when

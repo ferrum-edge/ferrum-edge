@@ -29,6 +29,7 @@ fn make_upstream(id: &str) -> Upstream {
             provider: SdProvider::Kubernetes,
             dns_sd: None,
             kubernetes: Some(KubernetesConfig {
+                address_type: None,
                 namespace: "default".to_string(),
                 service_name: "users-api".to_string(),
                 port_name: Some("http".to_string()),
@@ -66,6 +67,7 @@ fn make_upstream(id: &str) -> Upstream {
 fn endpointslice_items(endpoints: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "items": [{
+            "addressType": "IPv4",
             "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}],
             "endpoints": endpoints
         }]

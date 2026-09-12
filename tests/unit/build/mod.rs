@@ -1,1 +1,2 @@
+mod builtin_plugin_names_tests;
 mod protoc_preflight_tests;

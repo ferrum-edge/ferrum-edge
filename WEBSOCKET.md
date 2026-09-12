@@ -14,6 +14,8 @@ WebSocket requests are classified once by `detect_http_flavor()` and routed sepa
 
 The H3 frontend is gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default: `true`). When disabled, the H3 listener does not advertise Extended CONNECT support and returns `501` to WebSocket CONNECT requests. See [FEATURES.md](FEATURES.md) and [docs/http3.md](docs/http3.md).
 
+Client-to-server frame masking is RFC 6455 §5.1 on all three frontends. RFC 8441 §5 and RFC 9220 §3 bootstrap the session over a CONNECT stream and then hand it to RFC 6455 unchanged, so there is no HTTP/2 or HTTP/3 masking exemption: the gateway unmasks masked client frames before the frame plugins run, re-encodes them under the backend transport's own role, and closes a client that sends an unmasked frame with `1002`.
+
 Common path after classification:
 
 1. **Route matching** - Uses the same router cache as HTTP for O(1) lookups
@@ -46,13 +48,16 @@ This matches the same TLS configuration hierarchy used by HTTP/HTTPS backends in
 
 ## Header Forwarding
 
-Client request headers are forwarded to the backend WebSocket server during the upgrade handshake. The following hop-by-hop and WebSocket handshake headers are excluded:
+Client request headers are forwarded to the backend WebSocket server during the upgrade handshake. The following hop-by-hop, WebSocket handshake, and gateway-reserved headers are excluded:
 
 - `connection`, `upgrade`, `transfer-encoding`, `te`, `trailer`, `keep-alive`
 - `sec-websocket-key`, `sec-websocket-version`, `sec-websocket-accept`
+- `sec-websocket-extensions` — stripped so `permessage-deflate` cannot negotiate end to end; message bodies therefore stay uncompressed and inspectable by frame-level plugins such as `waf`
+- `x-consumer-*` (`x-consumer-username`, `x-consumer-custom-id`, and any other `x-consumer-` prefix) — stripped so a client cannot forge gateway-asserted consumer identity; the gateway re-injects authenticated values after the plugin pipeline when applicable
+- `x-geo-country` — stripped so a client cannot forge gateway-asserted geography; the gateway re-injects the lookup result from `geo_restriction` when configured
 - `host`, `proxy-authorization`, `proxy-connection`
 
-All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`, custom headers, etc.) are forwarded to the backend.
+All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`, custom headers, etc.) are forwarded to the backend. The same reserved-header strip set applies across HTTP, gRPC, and WebSocket backend boundaries; see [Plugin Execution Order — Backend Request Trailers](docs/plugin_execution_order.md#backend-request-trailers) for the full cross-protocol list.
 
 ## Timeouts and Limits
 
@@ -67,6 +72,8 @@ All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`
 Idle timeout and authorization lifetime are independent. Idle timeout answers “has either peer been quiet?” and can be refreshed by traffic. Authorization lifetime answers “is this upgraded session still allowed to exist?” and is absolute. The H1 Upgrade, H2 Extended CONNECT, and H3 Extended CONNECT paths share the same deadline/cancellation implementation. Expiry or graceful drain closes both relay directions with a fixed, non-secret close reason when frame-aware closure is possible; tunnel mode deterministically drops both transports at the same deadline.
 
 A policy close is not a relay failure. `on_ws_disconnect` reports no `error_class` for it, so `ferrum_websocket_sessions_total` records `result="success"` and the cause is carried by `termination_reason` (`credential_expired`, `max_lifetime`, or `drain`) — a stalled relay stays distinguishable from a session that simply reached its bound. Upgrades refused because the deadline elapsed before the handshake completed are logged as the `websocket_credential_expired` (`401`) or `websocket_max_lifetime` (`503`) rejection phase on all three frontends. Tunnel-mode sessions cancelled at the deadline cannot report their relayed byte totals (the raw copy owns its counters and only publishes them when it returns); use frame mode when byte accounting must survive a forced close.
+
+Transport- and protocol-level relay failures also publish a defined Close so peers never observe the reserved 1005/1006 statuses. The already-computed `error_class` maps to a wire code: **1002** (protocol violation), **1011** (transport failure), or **1001** (going away) while the gateway is draining. The Close is written to the surviving peer — for a backend reset the client receives the 1011/1001 rather than a bare EOF, and the surviving half no longer writes an empty Close into the dead backend sink. A client-side protocol violation (stray continuation, RSV1, reserved opcode, unmasked frame) closes the client with 1002 instead of `Close(None)`/1005. This applies to the shared frame-parsed relay used by H1, H2 Extended CONNECT, and H3 Extended CONNECT; tunnel mode has no frame layer and keeps its raw-copy teardown behavior.
 
 ## Tunnel Mode
 

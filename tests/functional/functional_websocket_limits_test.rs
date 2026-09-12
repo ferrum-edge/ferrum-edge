@@ -4,6 +4,8 @@
 //! exercise the global `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` runtime setting
 //! applied by the proxy's WebSocket frame parser.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use futures_util::{SinkExt, StreamExt};
 use std::io::Write;
 use std::time::Duration;
@@ -15,16 +17,13 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind port 0");
-    listener.local_addr().unwrap().port()
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
-async fn start_ws_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
-    let handle = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
-            .await
-            .expect("bind WS echo server");
-
+async fn start_ws_echo_server(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         loop {
             let Ok((stream, _addr)) = listener.accept().await else {
                 continue;
@@ -56,9 +55,7 @@ async fn start_ws_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
                 }
             });
         }
-    });
-    sleep(Duration::from_millis(200)).await;
-    handle
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -69,13 +66,10 @@ enum RawBackendFirstFrameShape {
 }
 
 async fn start_raw_ws_first_frame_backend(
-    port: u16,
+    listener: TcpListener,
     shape: RawBackendFirstFrameShape,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
-            .await
-            .expect("bind raw WS backend");
         let (mut stream, key) = loop {
             let Ok((mut stream, _addr)) = listener.accept().await else {
                 return;
@@ -266,6 +260,7 @@ async fn start_gateway_with_retry(
         let gateway_port = free_port().await;
         let admin_port = free_port().await;
         let mut cmd = std::process::Command::new(gateway_binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path)
             .env("FERRUM_PROXY_HTTP_PORT", gateway_port.to_string())
@@ -310,8 +305,9 @@ async fn start_gateway_with_retry(
 async fn test_websocket_global_frame_size_limit_rejects_oversized_frame() {
     crate::common::ensure_gateway_built().expect("build gateway");
 
-    let backend_port = free_port().await;
-    let echo_handle = start_ws_echo_server(backend_port).await;
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let echo_handle = start_ws_echo_server(listener).await;
 
     let temp_dir = TempDir::new().expect("create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -379,8 +375,9 @@ async fn test_websocket_tunnel_preserves_backend_frame_coalesced_with_101() {
         RawBackendFirstFrameShape::EmptyResidual,
         RawBackendFirstFrameShape::CoalescedPrefix,
     ] {
-        let backend_port = free_port().await;
-        let backend = start_raw_ws_first_frame_backend(backend_port, shape).await;
+        let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+        let backend_port = listener.local_addr().unwrap().port();
+        let backend = start_raw_ws_first_frame_backend(listener, shape).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
         let config_path = temp_dir.path().join("config.yaml");

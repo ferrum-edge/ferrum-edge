@@ -15,8 +15,8 @@ use ferrum_edge::proxy::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use super::plugin_cache_tests::{make_plugin_config, make_proxy};
 use super::plugin_utils::{create_test_consumer, create_test_context};
+use super::plugin_utils::{make_plugin_config, make_proxy};
 
 fn ai_federation_plugin_config(proxy_id: &str) -> PluginConfig {
     let mut plugin = make_plugin_config(

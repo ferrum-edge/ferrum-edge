@@ -9,6 +9,8 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_mesh_mode -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -407,13 +409,8 @@ pub(crate) struct MeshPorts {
     pub(crate) east_west: u16,
 }
 
-/// Ports already handed to mesh gateway subprocesses in this test process.
-///
-/// A reservation must be released before a subprocess can bind it. Without
-/// remembering released ports, the kernel can immediately return the same port
-/// to a later `reserve_mesh_ports()` call before either subprocess starts. The
-/// gateway's reusable listeners can then both bind that address and
-/// nondeterministically receive each other's fixture traffic.
+/// Mesh-port tags used by fixture assertions in this process. Allocation and
+/// cross-process exclusion belong to the shared port registry, not this set.
 static USED_MESH_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
 
 fn used_mesh_ports() -> &'static Mutex<HashSet<u16>> {
@@ -453,30 +450,14 @@ async fn reserve_unique_mesh_port() -> u16 {
 /// that connection claim its own promised listener port and fail startup with
 /// `EADDRINUSE`. The netns allocator below already enforces this invariant.
 async fn reserve_unique_mesh_port() -> u16 {
-    let (ephemeral_first, ephemeral_last) =
-        ephemeral_port_range().expect("read host ephemeral port range");
-    for port in 10_240..=u16::MAX {
-        if (ephemeral_first..=ephemeral_last).contains(&port) || mesh_port_is_reserved(port) {
-            continue;
-        }
-        let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
-            Err(error) => panic!("probe host mesh port {port}: {error}"),
-        };
-        let inserted = used_mesh_ports()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(port);
-        if inserted {
-            drop(listener);
-            return port;
-        }
-    }
-    panic!(
-        "no free host mesh port outside ephemeral range \
-         {ephemeral_first}-{ephemeral_last}"
-    );
+    let (first, last) = ephemeral_port_range().expect("read host ephemeral port range");
+    let port = crate::scaffolding::port_registry::unbound_port_outside(first..=last)
+        .expect("lease host mesh port");
+    used_mesh_ports()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(port);
+    port
 }
 
 /// Bind attempts [`bind_fixture_listener_where`] makes before giving up.
@@ -492,7 +473,7 @@ pub(crate) fn loopback_ephemeral() -> SocketAddr {
 /// / `::1` / `localhost` because those names reach the terminator netns, not the
 /// destination pod. Sidecar fixtures keep [`loopback_ephemeral`].
 fn fixture_non_loopback_local_v4() -> Ipv4Addr {
-    let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+    let probe = std::net::UdpSocket::bind_test((Ipv4Addr::UNSPECIFIED, 0))
         .expect("bind UDP probe for Ambient/waypoint fixture address");
     probe
         .connect((Ipv4Addr::new(1, 1, 1, 1), 80))
@@ -561,26 +542,9 @@ fn publish_ambient_dest_relay_enrollment(temp: &TempDir, ipv4: &str, spiffe_id: 
     .expect("publish ambient dest pod registry enrollment");
 }
 
-/// Bind an ephemeral listener for a fixture-owned server (a control plane, an
-/// echo backend, …) on a port no mesh gateway subprocess has been given.
-///
-/// ## Why this is not a plain `TcpListener::bind(":0")` (issue #2132)
-///
-/// [`reserve_unique_mesh_port`] must RELEASE its listener before handing the
-/// port to a subprocess that binds it itself, so between the release and the
-/// gateway's own bind the port is free and the kernel can hand it straight back
-/// to the next `:0` bind in this process. The cross-cluster fixtures reserve all
-/// fifteen gateway ports first and only then bind their three control planes, so
-/// a control plane could land on a port already promised to a gateway. The
-/// gateway then failed startup with `Address already in use`, exited — and
-/// `wait_for_tcp_port` still succeeded, because the control plane was listening
-/// on that very port. `USED_MESH_PORTS` alone did not cover this: it only stops
-/// one mesh reservation reusing another.
-///
-/// Re-rolling here closes that window from the fixture side; the child-bound
-/// readiness gate ([`wait_for_gateway_listener`]) covers the cross-PROCESS case
-/// (another test binding our released port), which no in-process bookkeeping
-/// can see.
+/// Bind a fixture listener through the cross-process registry. The local mesh
+/// tags remain an additional assertion aid; they are not the allocation authority.
+/// Child-bound readiness still protects against nonparticipating OS listeners.
 pub(crate) async fn bind_fixture_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     bind_fixture_listener_where(addr, |port| !mesh_port_is_reserved(port)).await
 }
@@ -590,11 +554,11 @@ pub(crate) async fn bind_fixture_listener(addr: SocketAddr) -> std::io::Result<T
 /// held so the kernel cannot re-offer the same port.
 async fn bind_fixture_udp_socket(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
     if addr.port() != 0 {
-        return tokio::net::UdpSocket::bind(addr).await;
+        return tokio::net::UdpSocket::bind_test(addr).await;
     }
     let mut rejected = Vec::new();
     for _ in 0..FIXTURE_BIND_ATTEMPTS {
-        let socket = tokio::net::UdpSocket::bind(addr).await?;
+        let socket = tokio::net::UdpSocket::bind_test(addr).await?;
         let port = socket.local_addr()?.port();
         if !mesh_port_is_reserved(port) {
             return Ok(socket);
@@ -622,11 +586,11 @@ async fn bind_fixture_listener_where(
     acceptable: impl Fn(u16) -> bool,
 ) -> std::io::Result<TcpListener> {
     if addr.port() != 0 {
-        return TcpListener::bind(addr).await;
+        return TcpListener::bind_test(addr).await;
     }
     let mut rejected = Vec::new();
     for _ in 0..FIXTURE_BIND_ATTEMPTS {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = TcpListener::bind_test(addr).await?;
         let port = listener.local_addr()?.port();
         if acceptable(port) {
             return Ok(listener);
@@ -701,34 +665,16 @@ fn ephemeral_port_range_in_netns(pid: u32) -> Result<(u16, u16), String> {
 /// during the handoff.
 #[cfg(target_os = "linux")]
 fn reserve_unique_mesh_port_in_netns(pid: u32) -> Result<u16, String> {
-    let (ephemeral_first, ephemeral_last) = ephemeral_port_range_in_netns(pid)?;
-    for port in 10_240..=u16::MAX {
-        if (ephemeral_first..=ephemeral_last).contains(&port) || mesh_port_is_reserved(port) {
-            continue;
-        }
-        let listener = run_in_live_netns(pid, move || {
-            match std::net::TcpListener::bind(("0.0.0.0", port)) {
-                Ok(listener) => Ok(Some(listener)),
-                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
-                Err(error) => Err(format!("probe netns mesh port {port}: {error}")),
-            }
-        })?;
-        let Some(listener) = listener else {
-            continue;
-        };
-        let inserted = used_mesh_ports()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(port);
-        if inserted {
-            drop(listener);
-            return Ok(port);
-        }
-    }
-    Err(format!(
-        "no free non-ephemeral mesh port in netns {pid} outside \
-         {ephemeral_first}-{ephemeral_last}"
-    ))
+    let (first, last) = ephemeral_port_range_in_netns(pid)?;
+    let port = run_in_live_netns(pid, move || {
+        crate::scaffolding::port_registry::unbound_port_outside(first..=last)
+            .map_err(|error| format!("lease netns mesh port: {error}"))
+    })?;
+    used_mesh_ports()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(port);
+    Ok(port)
 }
 
 #[cfg(target_os = "linux")]
@@ -1073,7 +1019,7 @@ const MESH_MODE_TEST_SOURCE: &str = include_str!(concat!(
 const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
     "drive_dr_live_visibility",
     "drive_egress_a_to_b",
-    "drive_grpc_egress_a_to_b",
+    "drive_grpc_egress_a_to_b_at_path",
     "drive_websocket_egress_a_to_b",
     "drive_cross_cluster_egress",
     "drive_ambient_cross_cluster_egress",
@@ -1089,7 +1035,7 @@ const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
 const DEAD_GATEWAY_VOIDING_DRIVERS: &[&str] = &[
     "drive_dr_live_visibility",
     "drive_egress_a_to_b",
-    "drive_grpc_egress_a_to_b",
+    "drive_grpc_egress_a_to_b_at_path",
     "drive_websocket_egress_a_to_b",
     "drive_cross_cluster_egress",
     "drive_ambient_cross_cluster_egress",
@@ -1456,13 +1402,19 @@ async fn functional_mesh_mode_starts_after_native_mesh_subscribe() {
                 config_protocol: "native",
                 topology: "sidecar",
                 waypoint_name: None,
-                env_overrides: Vec::new(),
+                env_overrides: vec![("FERRUM_POOL_SHARD_AMOUNT", "1".to_string())],
             },
         );
 
         let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
-        let inbound_listening = wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await;
-        let outbound_listening = wait_for_tcp_port(outbound_port, Duration::from_secs(5)).await;
+        let inbound_listening =
+            wait_for_gateway_listener(&mut child, inbound_port, STARTUP_TIMEOUT)
+                .await
+                .is_ready();
+        let outbound_listening =
+            wait_for_gateway_listener(&mut child, outbound_port, Duration::from_secs(5))
+                .await
+                .is_ready();
 
         kill_child(&mut child);
         let subscribe_count = cp.subscribe_count.load(Ordering::Relaxed);
@@ -4709,6 +4661,8 @@ async fn functional_mesh_sidecar_egress_rejects_untrusted_client_gateway() {
 #[derive(Debug, Default)]
 struct GrpcEgressResponse {
     status: u16,
+    initial_headers_end_stream: bool,
+    data_frames: usize,
     headers: HashMap<String, String>,
     body: Vec<u8>,
     trailers: HashMap<String, String>,
@@ -5131,9 +5085,12 @@ async fn grpc_mesh_retry_request(
     )
     .await
     .map_err(|_| "mesh retry client connect timed out")??;
+    let framing = Arc::new(crate::scaffolding::clients::grpc::InboundResponseFraming::default());
+    let observed =
+        crate::scaffolding::clients::grpc::FrameObservingIo::new(stream, Arc::clone(&framing));
     let (mut sender, connection) = tokio::time::timeout(
         Duration::from_secs(5),
-        http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
+        http2::handshake(TokioExecutor::new(), TokioIo::new(observed)),
     )
     .await
     .map_err(|_| "mesh retry client HTTP/2 handshake timed out")??;
@@ -5187,6 +5144,7 @@ async fn grpc_mesh_retry_request(
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
         .collect();
+    let mut data_frames = 0;
     let mut response_body = Vec::new();
     let mut response_trailers = HashMap::new();
     let mut incoming = response.into_body();
@@ -5198,6 +5156,7 @@ async fn grpc_mesh_retry_request(
             Err(_) => return Err("mesh retry response body timed out".into()),
         };
         if frame.is_data() {
+            data_frames += 1;
             if let Ok(data) = frame.into_data() {
                 response_body.extend_from_slice(&data);
             }
@@ -5215,6 +5174,8 @@ async fn grpc_mesh_retry_request(
     let _ = connection_task.await;
     Ok(GrpcEgressResponse {
         status,
+        initial_headers_end_stream: framing.initial_headers_end_stream(),
+        data_frames,
         headers,
         body: response_body,
         trailers: response_trailers,
@@ -5467,6 +5428,23 @@ async fn start_grpc_trailers_echo_backend_on(addr: SocketAddr) -> u16 {
                         .map(|c| c.to_bytes())
                         .unwrap_or_default();
 
+                    if path == "/echo.Mesh/TrailersOnly" {
+                        let body = http_body_util::Empty::<Bytes>::new()
+                            .map_err(|never| -> std::io::Error { match never {} })
+                            .boxed();
+                        return Ok::<_, hyper::Error>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .header("grpc-status", "7")
+                                .header("grpc-message", "denied")
+                                .header("grpc-status-details-bin", "CAc=")
+                                .header("x-mesh-trailers-only", "backend")
+                                .body(body)
+                                .expect("build terminal gRPC response"),
+                        );
+                    }
+
                     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
                     let _ = tx.send(Ok(Frame::data(body_bytes))).await;
                     let mut trailers = hyper::HeaderMap::new();
@@ -5482,7 +5460,7 @@ async fn start_grpc_trailers_echo_backend_on(addr: SocketAddr) -> u16 {
                         .status(200)
                         .header("content-type", "application/grpc")
                         .header("x-echo-path", &path)
-                        .body(StreamBody::new(ReceiverStream::new(rx)))
+                        .body(BodyExt::boxed(StreamBody::new(ReceiverStream::new(rx))))
                         .expect("build gRPC trailers echo response");
                     Ok::<_, hyper::Error>(response)
                 });
@@ -5529,7 +5507,10 @@ async fn grpc_egress_request_to(
         .await
         .map_err(|_| "connect timed out")??;
     let _ = stream.set_nodelay(true);
-    let io = TokioIo::new(stream);
+    let framing = Arc::new(crate::scaffolding::clients::grpc::InboundResponseFraming::default());
+    let observed =
+        crate::scaffolding::clients::grpc::FrameObservingIo::new(stream, Arc::clone(&framing));
+    let io = TokioIo::new(observed);
     let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await?;
     let conn_task = tokio::spawn(async move {
         let _ = conn.await;
@@ -5553,6 +5534,7 @@ async fn grpc_egress_request_to(
         }
     }
 
+    let mut data_frames = 0;
     let mut body_bytes = Vec::new();
     let mut trailers = HashMap::new();
     let mut body = response.into_body();
@@ -5564,6 +5546,7 @@ async fn grpc_egress_request_to(
             Err(_) => return Err("gRPC response body timed out".into()),
         };
         if frame.is_data() {
+            data_frames += 1;
             if let Ok(data) = frame.into_data() {
                 body_bytes.extend_from_slice(&data);
             }
@@ -5581,6 +5564,8 @@ async fn grpc_egress_request_to(
 
     Ok(GrpcEgressResponse {
         status,
+        initial_headers_end_stream: framing.initial_headers_end_stream(),
+        data_frames,
         headers,
         body: body_bytes,
         trailers,
@@ -5596,6 +5581,15 @@ async fn grpc_egress_request_to(
 async fn drive_grpc_egress_a_to_b(
     topology: &str,
     client_trusted: bool,
+    converged: fn(&GrpcEgressResponse) -> bool,
+) -> Result<(GrpcEgressResponse, String), String> {
+    drive_grpc_egress_a_to_b_at_path(topology, client_trusted, "/echo.Mesh/Call", converged).await
+}
+
+async fn drive_grpc_egress_a_to_b_at_path(
+    topology: &str,
+    client_trusted: bool,
+    path: &str,
     converged: fn(&GrpcEgressResponse) -> bool,
 ) -> Result<(GrpcEgressResponse, String), String> {
     ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
@@ -5754,7 +5748,7 @@ async fn drive_grpc_egress_a_to_b(
             let observed = grpc_egress_request(
                 a_outbound_port,
                 "svc-b.ferrum.svc.cluster.local",
-                "/echo.Mesh/Call",
+                path,
                 &framed,
             )
             .await
@@ -5934,6 +5928,44 @@ async fn functional_mesh_ambient_egress_grpc_routes_a_to_b_over_hbone_with_trail
             .any(|w| w == b"ferrum-mesh-grpc-payload"),
         "the echoed gRPC payload must ride the relayed DATA frames: {resp:?}\n{logs}"
     );
+}
+
+/// Both secured egress transports must preserve the backend's initial HEADERS
+/// END_STREAM, not merely forward grpc-status as non-terminal metadata.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_grpc_trailers_only_preserves_wire_end_stream() {
+    for topology in ["sidecar", "ambient"] {
+        let (resp, logs) = drive_grpc_egress_a_to_b_at_path(
+            topology,
+            true,
+            "/echo.Mesh/TrailersOnly",
+            // Stop on the first backend-authored response, even if malformed.
+            // A successful framing assertion must never be a convergence filter.
+            |resp| resp.headers.get("x-mesh-trailers-only").map(String::as_str) == Some("backend"),
+        )
+        .await
+        .expect("secured trailers-only drive");
+        assert_eq!(resp.status, 200, "{topology}: {resp:?}\n{logs}");
+        assert!(
+            resp.initial_headers_end_stream,
+            "{topology}: {resp:?}\n{logs}"
+        );
+        assert_eq!(resp.data_frames, 0, "{topology}: {resp:?}\n{logs}");
+        assert!(resp.body.is_empty(), "{topology}: {resp:?}\n{logs}");
+        assert!(resp.trailers.is_empty(), "{topology}: {resp:?}\n{logs}");
+        for (name, expected) in [
+            ("grpc-status", "7"),
+            ("grpc-message", "denied"),
+            ("grpc-status-details-bin", "CAc="),
+        ] {
+            assert_eq!(
+                resp.headers.get(name).map(String::as_str),
+                Some(expected),
+                "{topology}: {resp:?}\n{logs}"
+            );
+        }
+    }
 }
 
 /// gRPC fail-closed negative (Ambient, issue #3728): an UNTRUSTED gateway A —
@@ -9875,7 +9907,7 @@ fn udp_dest_slice(
 /// to its sender. Holds the socket for the task's lifetime.
 async fn start_udp_echo_backend() -> (Ipv4Addr, u16, tokio::task::JoinHandle<()>) {
     let ip = fixture_non_loopback_local_v4();
-    let socket = tokio::net::UdpSocket::bind((ip, 0))
+    let socket = tokio::net::UdpSocket::bind_test((ip, 0))
         .await
         .expect("bind udp echo backend");
     let port = socket.local_addr().expect("udp echo local addr").port();
@@ -10287,7 +10319,7 @@ async fn probe_udp_egress_local_ip(dest: SocketAddr) -> Result<IpAddr, String> {
     } else {
         SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
     };
-    let socket = tokio::net::UdpSocket::bind(bind)
+    let socket = tokio::net::UdpSocket::bind_test(bind)
         .await
         .map_err(|e| format!("probe bind {bind}: {e}"))?;
     socket
@@ -12870,7 +12902,7 @@ fn udp_round_trip_from_netns_with_source(
     timeout: Duration,
 ) -> Result<(Vec<u8>, SocketAddr), String> {
     run_in_live_netns(pid, move || {
-        let socket = std::net::UdpSocket::bind(SocketAddr::new(source_ip, 0))
+        let socket = std::net::UdpSocket::bind_test(SocketAddr::new(source_ip, 0))
             .map_err(|error| format!("bind pod UDP client: {error}"))?;
         socket
             .set_read_timeout(Some(timeout))
@@ -12929,7 +12961,7 @@ impl LiveNetnsUdpEcho {
                 }
             };
             runtime.block_on(async move {
-                let socket = match tokio::net::UdpSocket::bind((bind_ip, 0)).await {
+                let socket = match tokio::net::UdpSocket::bind_test((bind_ip, 0)).await {
                     Ok(socket) => socket,
                     Err(error) => {
                         let _ = ready_tx.send(Err(format!(
@@ -13007,7 +13039,7 @@ async fn start_counting_udp_echo(
         !bind_ip.is_loopback(),
         "Ambient host-UDP echo must not bind loopback; Sidecar alone has that namespace authority"
     );
-    let socket = tokio::net::UdpSocket::bind((bind_ip, 0))
+    let socket = tokio::net::UdpSocket::bind_test((bind_ip, 0))
         .await
         .expect("bind live source-capture UDP echo");
     let port = socket.local_addr().expect("UDP echo address").port();
@@ -13201,7 +13233,7 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         )
     });
     {
-        let probe = std::net::UdpSocket::bind("0.0.0.0:0")
+        let probe = std::net::UdpSocket::bind_test("0.0.0.0:0")
             .expect("bind host-netns probe to enrolled destination echo");
         probe
             .send_to(
@@ -14568,7 +14600,7 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
 async fn start_tcp_echo_all_interfaces() -> (u16, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let listener = TcpListener::bind("0.0.0.0:0")
+    let listener = TcpListener::bind_test("0.0.0.0:0")
         .await
         .expect("bind live TCP echo");
     let port = listener.local_addr().expect("TCP echo address").port();
@@ -14872,21 +14904,52 @@ const LIVE_XC_ID_B: &str = "spiffe://cluster-b.test/ns/ferrum/sa/destination";
 const LIVE_XC_SOURCE_POD_UID: &str = "11111111-2222-4333-8444-555555555555";
 
 #[cfg(target_os = "linux")]
-const LIVE_XC_HTTP_PORT: u16 = 18080;
+fn reserve_live_backend_port() -> u16 {
+    let (first, last) = ephemeral_port_range().expect("read live backend ephemeral range");
+    crate::scaffolding::port_registry::unbound_port_outside(first..=last)
+        .expect("lease live backend port")
+}
+
 #[cfg(target_os = "linux")]
-const LIVE_XC_GRPC_PORT: u16 = 18081;
+fn live_xc_http_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(reserve_live_backend_port)
+}
 #[cfg(target_os = "linux")]
-const LIVE_XC_SIDECAR_WS_PORT: u16 = 18082;
+fn live_xc_grpc_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(reserve_live_backend_port)
+}
 #[cfg(target_os = "linux")]
-const LIVE_XC_AMBIENT_WS_PORT: u16 = 18083;
+fn live_xc_sidecar_ws_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(reserve_live_backend_port)
+}
 #[cfg(target_os = "linux")]
-const LIVE_XC_MULTI_A_PORT: u16 = 18084;
+fn live_xc_ambient_ws_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(reserve_live_backend_port)
+}
 #[cfg(target_os = "linux")]
-const LIVE_XC_MULTI_B_PORT: u16 = 18085;
+fn live_xc_multi_a_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(reserve_live_backend_port)
+}
 #[cfg(target_os = "linux")]
-const LIVE_XC_TCP_PORT: u16 = 18086;
+fn live_xc_multi_b_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(reserve_live_backend_port)
+}
 #[cfg(target_os = "linux")]
-const LIVE_XC_UDP_PORT: u16 = 18087;
+fn live_xc_tcp_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(reserve_live_backend_port)
+}
+#[cfg(target_os = "linux")]
+fn live_xc_udp_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(reserve_live_backend_port)
+}
 
 #[cfg(target_os = "linux")]
 const LIVE_XC_TCP_VIP: &str = "192.0.2.86";
@@ -15056,16 +15119,33 @@ impl Drop for LiveTwoClusterSpire {
 }
 
 #[cfg(target_os = "linux")]
+fn live_xc_authority(port: u16) -> &'static str {
+    static HOSTS: OnceLock<HashMap<u16, String>> = OnceLock::new();
+    HOSTS
+        .get_or_init(|| {
+            live_xc_ports()
+                .into_iter()
+                .map(|p| {
+                    let authority = format!("live-matrix.ferrum.svc.cluster.local:{}", p.port);
+                    (p.port, authority)
+                })
+                .collect()
+        })
+        .get(&port)
+        .expect("registered live backend port")
+}
+
+#[cfg(target_os = "linux")]
 fn live_xc_ports() -> Vec<WorkloadPort> {
     [
-        (LIVE_XC_HTTP_PORT, AppProtocol::Http, "http"),
-        (LIVE_XC_GRPC_PORT, AppProtocol::Grpc, "grpc"),
-        (LIVE_XC_SIDECAR_WS_PORT, AppProtocol::Http, "sidecar-ws"),
-        (LIVE_XC_AMBIENT_WS_PORT, AppProtocol::Http, "ambient-ws"),
-        (LIVE_XC_MULTI_A_PORT, AppProtocol::Http, "multi-a"),
-        (LIVE_XC_MULTI_B_PORT, AppProtocol::Http, "multi-b"),
-        (LIVE_XC_TCP_PORT, AppProtocol::Tcp, "tcp"),
-        (LIVE_XC_UDP_PORT, AppProtocol::Udp, "udp"),
+        (live_xc_http_port(), AppProtocol::Http, "http"),
+        (live_xc_grpc_port(), AppProtocol::Grpc, "grpc"),
+        (live_xc_sidecar_ws_port(), AppProtocol::Http, "sidecar-ws"),
+        (live_xc_ambient_ws_port(), AppProtocol::Http, "ambient-ws"),
+        (live_xc_multi_a_port(), AppProtocol::Http, "multi-a"),
+        (live_xc_multi_b_port(), AppProtocol::Http, "multi-b"),
+        (live_xc_tcp_port(), AppProtocol::Tcp, "tcp"),
+        (live_xc_udp_port(), AppProtocol::Udp, "udp"),
     ]
     .into_iter()
     .map(|(port, protocol, name)| WorkloadPort {
@@ -15109,14 +15189,14 @@ fn live_xc_services(workload: &SpiffeId) -> Vec<MeshService> {
     vec![live_xc_service(
         "live-matrix",
         &[
-            (LIVE_XC_HTTP_PORT, AppProtocol::Http, "http"),
-            (LIVE_XC_GRPC_PORT, AppProtocol::Grpc, "grpc"),
-            (LIVE_XC_SIDECAR_WS_PORT, AppProtocol::Http, "sidecar-ws"),
-            (LIVE_XC_AMBIENT_WS_PORT, AppProtocol::Http, "ambient-ws"),
-            (LIVE_XC_MULTI_A_PORT, AppProtocol::Http, "multi-a"),
-            (LIVE_XC_MULTI_B_PORT, AppProtocol::Http, "multi-b"),
-            (LIVE_XC_TCP_PORT, AppProtocol::Tcp, "tcp"),
-            (LIVE_XC_UDP_PORT, AppProtocol::Udp, "udp"),
+            (live_xc_http_port(), AppProtocol::Http, "http"),
+            (live_xc_grpc_port(), AppProtocol::Grpc, "grpc"),
+            (live_xc_sidecar_ws_port(), AppProtocol::Http, "sidecar-ws"),
+            (live_xc_ambient_ws_port(), AppProtocol::Http, "ambient-ws"),
+            (live_xc_multi_a_port(), AppProtocol::Http, "multi-a"),
+            (live_xc_multi_b_port(), AppProtocol::Http, "multi-b"),
+            (live_xc_tcp_port(), AppProtocol::Tcp, "tcp"),
+            (live_xc_udp_port(), AppProtocol::Udp, "udp"),
         ],
         workload,
         vec![
@@ -15285,7 +15365,7 @@ struct LiveXcDnsServer {
 #[cfg(target_os = "linux")]
 impl LiveXcDnsServer {
     async fn start(advertised_ip: std::net::Ipv4Addr) -> Result<Self, String> {
-        let socket = tokio::net::UdpSocket::bind(SocketAddr::from((advertised_ip, 0)))
+        let socket = tokio::net::UdpSocket::bind_test(SocketAddr::from((advertised_ip, 0)))
             .await
             .map_err(|error| format!("bind live fixture DNS responder: {error}"))?;
         let port = socket
@@ -15493,19 +15573,19 @@ impl LiveXcBackends {
             };
             runtime.block_on(async move {
                 let bind_tcp = |port| async move {
-                    TcpListener::bind(("0.0.0.0", port))
+                    TcpListener::bind_test(("0.0.0.0", port))
                         .await
                         .map_err(|error| format!("bind destination TCP port {port}: {error}"))
                 };
                 let listeners = futures_util::future::try_join_all(
                     [
-                        LIVE_XC_HTTP_PORT,
-                        LIVE_XC_GRPC_PORT,
-                        LIVE_XC_SIDECAR_WS_PORT,
-                        LIVE_XC_AMBIENT_WS_PORT,
-                        LIVE_XC_MULTI_A_PORT,
-                        LIVE_XC_MULTI_B_PORT,
-                        LIVE_XC_TCP_PORT,
+                        live_xc_http_port(),
+                        live_xc_grpc_port(),
+                        live_xc_sidecar_ws_port(),
+                        live_xc_ambient_ws_port(),
+                        live_xc_multi_a_port(),
+                        live_xc_multi_b_port(),
+                        live_xc_tcp_port(),
                     ]
                     .into_iter()
                     .map(bind_tcp),
@@ -15518,11 +15598,13 @@ impl LiveXcBackends {
                         return;
                     }
                 };
-                let udp = match tokio::net::UdpSocket::bind(("0.0.0.0", LIVE_XC_UDP_PORT)).await {
+                let udp_port = live_xc_udp_port();
+                let udp = match tokio::net::UdpSocket::bind_test(("0.0.0.0", udp_port)).await {
                     Ok(socket) => socket,
                     Err(error) => {
                         let _ = ready_tx.send(Err(format!(
-                            "bind destination UDP port {LIVE_XC_UDP_PORT}: {error}"
+                            "bind destination UDP port {}: {error}",
+                            live_xc_udp_port()
                         )));
                         return;
                     }
@@ -15678,8 +15760,9 @@ impl LiveXcHostNetwork {
              iptables -w 5 -t filter -A {output_chain} -p tcp -d {dest_ip} \
                -m conntrack --ctstate NEW -j REJECT; \
              iptables -w 5 -t filter -A {output_chain} -p udp -d {dest_ip} \
-               --dport {LIVE_XC_UDP_PORT} -j REJECT; \
-             iptables -w 5 -t filter -A {output_chain} -j RETURN"
+               --dport {udp_port} -j REJECT; \
+             iptables -w 5 -t filter -A {output_chain} -j RETURN",
+            udp_port = live_xc_udp_port(),
         );
         let installed = Command::new("sh")
             .args(["-c", &script])
@@ -15722,8 +15805,9 @@ impl LiveXcHostNetwork {
         // listener still carries the service port used for multi-port routing.
         let rule = format!(
             "iptables -w 5 -t nat -I PREROUTING 1 -i {source_if} \
-             -p tcp -d {LIVE_XC_MULTI_VIP} --dport {LIVE_XC_AMBIENT_WS_PORT} \
-             -j REDIRECT --to-ports {ambient_outbound}"
+             -p tcp -d {LIVE_XC_MULTI_VIP} --dport {ws_port} \
+             -j REDIRECT --to-ports {ambient_outbound}",
+            ws_port = live_xc_ambient_ws_port(),
         );
         let installed = Command::new("sh")
             .args(["-c", &rule])
@@ -15746,8 +15830,9 @@ impl Drop for LiveXcHostNetwork {
                     "-c",
                     &format!(
                         "iptables -w 5 -t nat -D PREROUTING -i {source_if} \
-                         -p tcp -d {LIVE_XC_MULTI_VIP} --dport {LIVE_XC_AMBIENT_WS_PORT} \
-                         -j REDIRECT --to-ports {ambient_outbound} 2>/dev/null || true"
+                         -p tcp -d {LIVE_XC_MULTI_VIP} --dport {ws_port} \
+                         -j REDIRECT --to-ports {ambient_outbound} 2>/dev/null || true",
+                        ws_port = live_xc_ambient_ws_port(),
                     ),
                 ])
                 .status();
@@ -15788,19 +15873,19 @@ fn live_xc_install_destination_capture(
          iptables -w 5 -t nat -A FERRUM_XC_INBOUND -p tcp --dport {ambient_hbone} -j RETURN; "
     );
     for port in [
-        LIVE_XC_HTTP_PORT,
-        LIVE_XC_GRPC_PORT,
-        LIVE_XC_SIDECAR_WS_PORT,
-        LIVE_XC_MULTI_A_PORT,
-        LIVE_XC_MULTI_B_PORT,
-        LIVE_XC_TCP_PORT,
+        live_xc_http_port(),
+        live_xc_grpc_port(),
+        live_xc_sidecar_ws_port(),
+        live_xc_multi_a_port(),
+        live_xc_multi_b_port(),
+        live_xc_tcp_port(),
     ] {
         script.push_str(&format!(
             "iptables -w 5 -t nat -A FERRUM_XC_INBOUND -p tcp --dport {port} \
              -j REDIRECT --to-ports {sidecar_inbound}; "
         ));
     }
-    for port in [LIVE_XC_AMBIENT_WS_PORT, LIVE_XC_UDP_PORT] {
+    for port in [live_xc_ambient_ws_port(), live_xc_udp_port()] {
         script.push_str(&format!(
             "iptables -w 5 -t nat -A FERRUM_XC_INBOUND -p tcp --dport {port} \
              -j REDIRECT --to-ports {ambient_hbone}; "
@@ -16380,7 +16465,7 @@ impl LiveTwoClusterFixture {
         host: &'static str,
         payload: &'static str,
     ) -> Result<String, String> {
-        let address = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_AMBIENT_WS_PORT}")
+        let address = format!("{LIVE_XC_MULTI_VIP}:{}", live_xc_ambient_ws_port())
             .parse()
             .expect("Ambient WebSocket VIP");
         run_async_in_live_netns(self.source.pod.pid(), move || async move {
@@ -16390,13 +16475,13 @@ impl LiveTwoClusterFixture {
 
     async fn grpc(&self) -> Result<GrpcEgressResponse, String> {
         let framed = grpc_framed_payload(b"live-two-cluster-grpc");
-        let destination = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_GRPC_PORT}")
+        let destination = format!("{LIVE_XC_MULTI_VIP}:{}", live_xc_grpc_port())
             .parse()
             .expect("gRPC VIP");
         run_async_in_live_netns(self.source.pod.pid(), move || async move {
             grpc_egress_request_to(
                 destination,
-                "live-matrix.ferrum.svc.cluster.local:18081",
+                live_xc_authority(live_xc_grpc_port()),
                 "/echo.Mesh/Call",
                 &framed,
             )
@@ -16516,11 +16601,12 @@ fn live_xc_http_get_from_outbound_capture(
     // production Sidecar capture listener. Keep this rule request-scoped so it
     // cannot steer another row through the wrong negative gateway.
     let rule = format!(
-        "-p tcp -d {LIVE_XC_MULTI_VIP} --dport {LIVE_XC_HTTP_PORT} \
-         -j REDIRECT --to-ports {outbound}"
+        "-p tcp -d {LIVE_XC_MULTI_VIP} --dport {http_port} \
+         -j REDIRECT --to-ports {outbound}",
+        http_port = live_xc_http_port(),
     );
     netns_command(pid, &format!("iptables -w 5 -t nat -I OUTPUT 1 {rule}"))?;
-    let destination = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_HTTP_PORT}")
+    let destination = format!("{LIVE_XC_MULTI_VIP}:{}", live_xc_http_port())
         .parse()
         .expect("negative HTTP VIP");
     let observed = live_xc_http_get_from_vip(pid, destination, host);
@@ -16543,7 +16629,7 @@ fn live_xc_udp_round_trip(
     payload: &'static [u8],
 ) -> Result<(Vec<u8>, SocketAddr), String> {
     run_in_live_netns(pid, move || {
-        let socket = std::net::UdpSocket::bind(SocketAddr::from((source_ip, 0)))
+        let socket = std::net::UdpSocket::bind_test(SocketAddr::from((source_ip, 0)))
             .map_err(|error| format!("bind veth-backed UDP client: {error}"))?;
         socket
             .set_read_timeout(Some(Duration::from_secs(12)))
@@ -16561,7 +16647,7 @@ fn live_xc_udp_round_trip(
 
 #[cfg(target_os = "linux")]
 async fn live_xc_test_http(fixture: &LiveTwoClusterFixture) {
-    let destination = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_HTTP_PORT}")
+    let destination = format!("{LIVE_XC_MULTI_VIP}:{}", live_xc_http_port())
         .parse()
         .expect("HTTP VIP");
     // The fixture only proves listener binds, SVID issuance, and TCP
@@ -16573,7 +16659,7 @@ async fn live_xc_test_http(fixture: &LiveTwoClusterFixture) {
         let transient = match classify_cross_cluster_http(live_xc_http_get_from_vip(
             fixture.source.pod.pid(),
             destination,
-            "live-matrix.ferrum.svc.cluster.local:18080",
+            live_xc_authority(live_xc_http_port()),
         )) {
             Ok(response) => break response,
             Err(transient) => transient,
@@ -16656,7 +16742,7 @@ async fn live_xc_test_grpc(fixture: &LiveTwoClusterFixture) {
 
 #[cfg(target_os = "linux")]
 async fn live_xc_test_sidecar_websocket(fixture: &LiveTwoClusterFixture) {
-    let destination = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_SIDECAR_WS_PORT}")
+    let destination = format!("{LIVE_XC_MULTI_VIP}:{}", live_xc_sidecar_ws_port())
         .parse()
         .expect("sidecar WebSocket VIP");
     // Poll past the source-slice convergence window: a completed upgrade is the
@@ -16667,7 +16753,7 @@ async fn live_xc_test_sidecar_websocket(fixture: &LiveTwoClusterFixture) {
         let transient = match fixture
             .websocket(
                 destination,
-                "live-matrix.ferrum.svc.cluster.local:18082",
+                live_xc_authority(live_xc_sidecar_ws_port()),
                 "sidecar-live",
             )
             .await
@@ -16695,7 +16781,7 @@ async fn live_xc_test_ambient_websocket(fixture: &LiveTwoClusterFixture) {
     let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
     let reply = loop {
         let transient = match fixture
-            .ambient_websocket("live-matrix.ferrum.svc.cluster.local:18083", "ambient-live")
+            .ambient_websocket(live_xc_authority(live_xc_ambient_ws_port()), "ambient-live")
             .await
         {
             Ok(reply) => break reply,
@@ -16720,14 +16806,14 @@ fn live_xc_test_multi_port(fixture: &mut LiveTwoClusterFixture) {
         .expect("install source production TCP capture");
     for (port, expected, host) in [
         (
-            LIVE_XC_MULTI_A_PORT,
+            live_xc_multi_a_port(),
             "multi-a-ok",
-            "live-matrix.ferrum.svc.cluster.local:18084",
+            live_xc_authority(live_xc_multi_a_port()),
         ),
         (
-            LIVE_XC_MULTI_B_PORT,
+            live_xc_multi_b_port(),
             "multi-b-ok",
-            "live-matrix.ferrum.svc.cluster.local:18085",
+            live_xc_authority(live_xc_multi_b_port()),
         ),
     ] {
         let destination = format!("{LIVE_XC_MULTI_VIP}:{port}")
@@ -16764,7 +16850,7 @@ fn live_xc_test_raw_tcp(fixture: &mut LiveTwoClusterFixture) {
     fixture
         .install_tcp_capture()
         .expect("install source production TCP capture");
-    let destination = format!("{LIVE_XC_TCP_VIP}:{LIVE_XC_TCP_PORT}")
+    let destination = format!("{LIVE_XC_TCP_VIP}:{}", live_xc_tcp_port())
         .parse()
         .expect("raw TCP VIP");
     // Poll past the source-slice convergence window: a completed round trip is
@@ -16795,7 +16881,7 @@ fn live_xc_test_raw_tcp(fixture: &mut LiveTwoClusterFixture) {
 
 #[cfg(target_os = "linux")]
 async fn live_xc_test_udp(fixture: &mut LiveTwoClusterFixture) {
-    let destination = format!("{LIVE_XC_UDP_VIP}:{LIVE_XC_UDP_PORT}")
+    let destination = format!("{LIVE_XC_UDP_VIP}:{}", live_xc_udp_port())
         .parse()
         .expect("UDP VIP");
     // Poll past the source-slice convergence window: a framed reply is the
@@ -16848,7 +16934,7 @@ async fn live_xc_test_fail_closed_negatives(fixture: &LiveTwoClusterFixture) {
         let observed = live_xc_http_get_from_outbound_capture(
             fixture.source.pod.pid(),
             outbound,
-            "live-matrix.ferrum.svc.cluster.local:18080",
+            live_xc_authority(live_xc_http_port()),
         );
         assert!(
             !matches!(observed, Ok((200, ref body)) if body.contains("http-live-ok")),
@@ -16861,7 +16947,7 @@ async fn live_xc_test_fail_closed_negatives(fixture: &LiveTwoClusterFixture) {
     let observed = live_xc_http_get_from_outbound_capture(
         fixture.source.pod.pid(),
         fixture.missing_sni_outbound,
-        "live-matrix.ferrum.svc.cluster.local:18080",
+        live_xc_authority(live_xc_http_port()),
     );
     assert!(
         !matches!(observed, Ok((200, ref body)) if body.contains("http-live-ok")),
@@ -16874,7 +16960,10 @@ async fn live_xc_test_fail_closed_negatives(fixture: &LiveTwoClusterFixture) {
         .strip_prefix(&east_west_before)
         .unwrap_or(&east_west_after);
     assert!(
-        !request_scoped_output.contains("p18080.live-matrix.ferrum.svc.cluster.local"),
+        !request_scoped_output.contains(&format!(
+            "p{}.live-matrix.ferrum.svc.cluster.local",
+            live_xc_http_port()
+        )),
         "a missing SNI override must be refused before any east-west dial: \
          {request_scoped_output}"
     );
@@ -16912,7 +17001,7 @@ async fn functional_mesh_live_two_cluster_cross_cluster_protocol_matrix() {
     eprintln!("LIVE_XC_STAGE fixture:ready");
 
     let direct = run_in_live_netns(fixture.source.pod.pid(), {
-        let destination = SocketAddr::from((fixture.destination.pod_ip(), LIVE_XC_HTTP_PORT));
+        let destination = SocketAddr::from((fixture.destination.pod_ip(), live_xc_http_port()));
         move || {
             Ok(std::net::TcpStream::connect_timeout(&destination, Duration::from_secs(1)).is_ok())
         }
@@ -16922,7 +17011,7 @@ async fn functional_mesh_live_two_cluster_cross_cluster_protocol_matrix() {
         !direct,
         "source cluster A can reach the destination pod directly; fixture isolation is invalid"
     );
-    let destination = SocketAddr::from((fixture.destination.pod_ip(), LIVE_XC_HTTP_PORT));
+    let destination = SocketAddr::from((fixture.destination.pod_ip(), live_xc_http_port()));
     assert!(
         !std::net::TcpStream::connect_timeout(&destination, Duration::from_secs(1)).is_ok(),
         "the host-network Ambient gateway can reach the destination pod directly; fixture isolation is invalid"
@@ -20535,6 +20624,9 @@ async fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls() {
     let observed = peer.wait_for_http(Duration::from_secs(10)).await;
     assert_eq!(observed.method, "POST");
     assert!(observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE));
+    assert_eq!(observed.authority, H3_MESH_SERVICE_AUTHORITY);
+    assert_eq!(observed.path, H3_MESH_PLAIN_BACKEND_PATH);
+    assert_eq!(observed.body, payload);
     assert!(
         !socket_path.exists(),
         "H3 must never create/dial the Unix socket"
@@ -20677,6 +20769,11 @@ async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
     assert_eq!(first.status.as_u16(), 200);
     let observed_a = peer_a.wait_for_http(Duration::from_secs(10)).await;
     assert_eq!(observed_a.method, "POST");
+    assert!(observed_a.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE));
+    assert_eq!(observed_a.authority, H3_MESH_SERVICE_AUTHORITY);
+    assert_eq!(observed_a.path, H3_MESH_PLAIN_BACKEND_PATH);
+    assert_eq!(observed_a.body, b"h3-plain-reload");
+    assert_eq!(first.body_bytes.as_ref(), b"h3-plain-reload");
 
     let peer_b_tags = h3_mesh_mtls_tags(peer_b.port, H3_MESH_PEER_B_SPIFFE);
     h3_mesh_plain_reload(&gateway, config_for(&peer_b_tags, 1), &peer_b_tags).await;
@@ -20684,6 +20781,11 @@ async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
     assert_eq!(retargeted.status.as_u16(), 200);
     let observed_b = peer_b.wait_for_http(Duration::from_secs(10)).await;
     assert_eq!(observed_b.method, "POST");
+    assert!(observed_b.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE));
+    assert_eq!(observed_b.authority, H3_MESH_SERVICE_AUTHORITY);
+    assert_eq!(observed_b.path, H3_MESH_PLAIN_BACKEND_PATH);
+    assert_eq!(observed_b.body, b"h3-plain-reload");
+    assert_eq!(retargeted.body_bytes.as_ref(), b"h3-plain-reload");
 
     let peer_b_accepts = peer_b.accept_count();
     h3_mesh_plain_reload(&gateway, config_for(&[], 2), &[]).await;
@@ -20764,4 +20866,183 @@ async fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone() {
     );
 
     gateway.shutdown().await;
+}
+
+/// Exercise materialized aliases and numeric authority ports over real sidecar
+/// mTLS, with both positive and negative host matchers and a destination-port
+/// control. Every successful request must reach the labeled workload backend.
+async fn drive_inbound_authority_policy_matrix() -> Result<(), String> {
+    use ferrum_edge::modes::mesh::config::RequestMatch;
+
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+    let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-authority-policy-{attempt}");
+        let temp = TempDir::new().map_err(|e| format!("temp dir: {e}"))?;
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let backend_port = start_labeled_echo_backend("authority-workload-ok").await;
+        let mut slice =
+            inbound_authz_slice(&node_id, server_spiffe, client_spiffe, backend_port, true);
+        let canonical = format!("echo:{backend_port}");
+        let padded = format!("echo:0{backend_port}");
+        let mut rules = Vec::new();
+        for (path, hosts, not_hosts, ports) in [
+            ("/hosts", vec![canonical.clone()], vec![], vec![]),
+            ("/padded", vec![padded.clone()], vec![], vec![]),
+            ("/negative", vec![], vec![canonical.clone()], vec![]),
+            ("/wildcard", vec!["echo:*".to_string()], vec![], vec![]),
+            (
+                "/aliases",
+                vec!["echo.ferrum.svc.cluster.local".to_string()],
+                vec![],
+                vec![],
+            ),
+            ("/ports", vec![], vec![], vec![backend_port]),
+        ] {
+            rules.push(MeshRule {
+                action: PolicyAction::Deny,
+                to: vec![RequestMatch {
+                    paths: vec![path.to_string()],
+                    hosts,
+                    not_hosts,
+                    ports,
+                    ..RequestMatch::default()
+                }],
+                ..MeshRule::default()
+            });
+        }
+        slice.mesh_policies.push(MeshPolicy {
+            name: "authority-policy".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules,
+        });
+        let cp = start_static_mesh_cp(slice).await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+        let readiness = wait_for_gateway_listener(&mut child, inbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = readiness.describe("authority policy sidecar", inbound_port);
+            kill_child(&mut child);
+            cp.shutdown().await;
+            continue;
+        }
+        let mut cases = Vec::new();
+        for authority in [
+            canonical.clone(),
+            padded,
+            format!("echo:00{backend_port}"),
+            format!("ECHO:{backend_port}"),
+            format!("echo.:{backend_port}"),
+        ] {
+            for (path, expected) in [
+                ("/public", 200),
+                ("/hosts", 403),
+                ("/padded", 403),
+                ("/negative", 200),
+                ("/wildcard", 403),
+            ] {
+                cases.push((authority.clone(), path, expected));
+            }
+        }
+        for alias in [
+            "echo",
+            "echo.ferrum",
+            "echo.ferrum.svc",
+            "echo.ferrum.svc.cluster.local",
+        ] {
+            cases.push((alias.to_string(), "/public", 200));
+            cases.push((alias.to_string(), "/ports", 403));
+            let expected = if alias.ends_with("cluster.local") {
+                403
+            } else {
+                200
+            };
+            cases.push((alias.to_string(), "/aliases", expected));
+        }
+        cases.push((
+            "echo.ferrum.svc.cluster.local".to_string(),
+            "/negative",
+            403,
+        ));
+        for authority in [
+            format!("echo:+{backend_port}"),
+            "echo:99999".to_string(),
+            "echo:abc".to_string(),
+        ] {
+            cases.push((authority, "/public", 400));
+        }
+        let mut observations = Vec::new();
+        for (authority, path, expected) in cases {
+            let result = mesh_inbound_http_get(
+                inbound_port,
+                &peers.ca_pem,
+                server_spiffe,
+                Some((&peers.client_cert_pem, &peers.client_key_pem)),
+                &authority,
+                path,
+            )
+            .await;
+            observations.push((authority, path, expected, result));
+        }
+        if let Some(exited) =
+            exited_gateway_diagnostic(&mut [("authority policy sidecar", &mut child)])
+        {
+            last_failure = format!("attempt {attempt}: {exited}");
+            kill_child(&mut child);
+            cp.shutdown().await;
+            continue;
+        }
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+        for (authority, path, expected, result) in observations {
+            let (status, body) =
+                result.map_err(|e| format!("{authority} {path}: {e}\n{output}"))?;
+            assert_eq!(status, expected, "{authority} {path}: {body}\n{output}");
+            assert_eq!(
+                body.contains("authority-workload-ok"),
+                expected == 200,
+                "{authority} {path}"
+            );
+        }
+        return Ok(());
+    }
+    Err(format!("authority policy fixture failed: {last_failure}"))
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_authority_policy_ports_and_literal_aliases() {
+    drive_inbound_authority_policy_matrix().await.unwrap();
 }

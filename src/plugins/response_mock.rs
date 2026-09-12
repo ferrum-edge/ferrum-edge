@@ -8,7 +8,8 @@
 //!
 //! ## Path Matching
 //!
-//! Mock rule paths are **relative to a prefix `listen_path`**. The plugin
+//! Mock rule paths are **relative to a prefix `listen_path`**. Trailing
+//! slashes on the prefix are trimmed before stripping. The plugin
 //! strips that prefix from the incoming request path before matching rules.
 //! For example, if the proxy has `listen_path: /api/v1` and a request arrives
 //! at `/api/v1/users`, the mock rule path should be `/users`. A request to
@@ -426,7 +427,8 @@ impl Plugin for ResponseMock {
                     && !listen_path.starts_with('=')
                     && listen_path != "/" =>
             {
-                match ctx.path.strip_prefix(listen_path) {
+                let normalized_listen_path = listen_path.trim_end_matches('/');
+                match ctx.path.strip_prefix(normalized_listen_path) {
                     Some("") => "/",
                     Some(rest) => rest,
                     // Router gave us a mismatched path — fall back to the full

@@ -24,10 +24,58 @@ use super::update_validation::{
 use crate::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
-use crate::grpc::proto::{MeshConfigUpdate, MeshSliceStatusReport, MeshSubscribeRequest};
+use crate::grpc::proto::{
+    MeshConfigUpdate, MeshSliceRejectReason, MeshSliceStatusPhase, MeshSliceStatusReport,
+    MeshSubscribeRequest,
+};
 use crate::modes::mesh::revision::MeshRevisionRejection;
-use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall};
+use crate::modes::mesh::runtime::{
+    MeshRuntimeState, MeshSliceInstall, MeshSliceRuntimeOutcome, MeshSliceRuntimeRejectReason,
+};
 use crate::modes::mesh::slice::MeshSlice;
+
+/// Wire category for a proxy-runtime refusal (issue #4812).
+///
+/// The mapping is total and compile-time closed, so the control plane only ever
+/// records a fixed label — the data plane never sends free rejection text.
+const fn runtime_reject_reason_wire(reason: MeshSliceRuntimeRejectReason) -> MeshSliceRejectReason {
+    match reason {
+        MeshSliceRuntimeRejectReason::ConfigBuild => MeshSliceRejectReason::RuntimeConfigBuild,
+        MeshSliceRuntimeRejectReason::ProxyRefused => MeshSliceRejectReason::RuntimeProxyRefused,
+        MeshSliceRuntimeRejectReason::TrustUnusable => MeshSliceRejectReason::RuntimeTrustUnusable,
+        MeshSliceRuntimeRejectReason::TlsReload => MeshSliceRejectReason::RuntimeTlsReload,
+        MeshSliceRuntimeRejectReason::DtlsCandidate => MeshSliceRejectReason::RuntimeDtlsCandidate,
+    }
+}
+
+/// Build the `ReportMeshSliceStatus` payload for a proxy-runtime verdict.
+fn runtime_status_report(
+    version: &str,
+    session_token: &str,
+    outcome: MeshSliceRuntimeOutcome,
+) -> MeshSliceStatusReport {
+    let reject_reason = match outcome.reject_reason() {
+        Some(reason) => runtime_reject_reason_wire(reason),
+        None => MeshSliceRejectReason::Unspecified,
+    };
+    MeshSliceStatusReport {
+        version: version.to_string(),
+        session_token: session_token.to_string(),
+        phase: MeshSliceStatusPhase::Applied as i32,
+        reject_reason: reject_reason as i32,
+    }
+}
+
+/// What the native `MeshSubscribe` receive loop woke for.
+///
+/// The proxy-runtime verdict arrives on a side channel, not on the stream, so
+/// it must NOT reset the stream's first-frame / first-slice / silence clocks:
+/// a data plane whose control plane went quiet is not made live by its own
+/// apply task.
+enum NativeStreamEvent {
+    Update(MeshConfigUpdate),
+    RuntimeVerdict,
+}
 
 /// How many additional attempts a failed `ReportMeshSliceStatus` gets, each
 /// piggybacked on a later frame of the same subscription (issue #3265). Bounded
@@ -462,6 +510,17 @@ async fn connect_mesh_subscribe(
     // longer admissible, so retrying it can only add load.
     let mut pending_status_report: Option<(MeshSliceStatusReport, u8)> = None;
 
+    // ── issue #4812: report the RUNTIME verdict, not only the install ACK ──
+    // Installing a slice only makes it the RECEIVED slice; the proxy runtime is
+    // a second, independent gate. Subscribing here (after the stream is open)
+    // marks any pre-existing verdict seen, so this stream never reports a
+    // verdict for a slice a previous stream delivered. The report is bound to
+    // the exact (version, session_token) THIS stream installed: a verdict for
+    // any other generation is dropped rather than misattributed.
+    let mut runtime_verdicts = state.subscribe_runtime_verdict();
+    let mut runtime_verdicts_live = true;
+    let mut last_installed: Option<(String, String)> = None;
+
     // ── issue #3854: bounded liveness for an ESTABLISHED stream ──
     // Clocks are absolute from `attempt_started_at` (the RPC-open await). They
     // are polled before `stream.message()` so an already-expired bound cannot
@@ -482,7 +541,7 @@ async fn connect_mesh_subscribe(
     tokio::pin!(silence_deadline);
 
     loop {
-        let update = tokio::select! {
+        let event = tokio::select! {
             biased;
             _ = &mut first_frame_deadline, if awaiting_first_frame => {
                 return Ok(MeshStreamAttempt::FirstFrameTimeout);
@@ -502,15 +561,57 @@ async fn connect_mesh_subscribe(
                 );
                 return Ok(MeshStreamAttempt::HeartbeatSilenceTimeout);
             }
+            verdict = runtime_verdicts.changed(), if runtime_verdicts_live => {
+                if verdict.is_err() {
+                    // The publisher lives on the shared runtime state this
+                    // client holds, so this is unreachable in production. Latch
+                    // the arm off rather than spinning on a closed channel.
+                    runtime_verdicts_live = false;
+                }
+                NativeStreamEvent::RuntimeVerdict
+            }
             message = stream.message() => {
                 match message {
-                    Ok(Some(update)) => update,
+                    Ok(Some(update)) => NativeStreamEvent::Update(update),
                     // A remote clean EOF is an endpoint failure, not success:
                     // it rotates the CP and grows the bounded backoff.
                     Ok(None) => return Ok(MeshStreamAttempt::RemoteEof),
                     Err(status) => return Err(anyhow::Error::new(status)),
                 }
             }
+        };
+
+        let update = match event {
+            NativeStreamEvent::RuntimeVerdict => {
+                let verdict = runtime_verdicts.borrow_and_update().clone();
+                if let Some(verdict) = verdict
+                    && let Some((version, session_token)) = last_installed.as_ref()
+                    && verdict.version == *version
+                {
+                    let report = runtime_status_report(version, session_token, verdict.outcome);
+                    let retry_report = report.clone();
+                    let sent = tokio::time::timeout(
+                        config.timings.outbound,
+                        status_client.report_mesh_slice_status(report),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(status_report_deadline_exceeded()));
+                    if let Err(err) = sent {
+                        warn!(
+                            version = %version,
+                            code = ?err.code(),
+                            "Failed to report mesh slice runtime verdict to control plane"
+                        );
+                        pending_status_report = Some((retry_report, STATUS_REPORT_RETRIES));
+                    } else {
+                        pending_status_report = None;
+                    }
+                }
+                // A side-channel verdict is not stream activity: the liveness
+                // clocks below deliberately stay where the last frame left them.
+                continue;
+            }
+            NativeStreamEvent::Update(update) => update,
         };
         awaiting_first_frame = false;
         last_stream_activity = tokio::time::Instant::now();
@@ -572,10 +673,16 @@ async fn connect_mesh_subscribe(
                     version = %slice.version,
                     "Applied native MeshSubscribe update"
                 );
+                // Issue #4812: this is the INSTALL-time verdict only — the
+                // slice is the received slice, not yet the serving generation.
+                // Bind it to this stream's session so the runtime verdict that
+                // follows can be reported against the same (version, session).
+                last_installed = Some((slice.version.clone(), update.session_token.clone()));
                 let report = MeshSliceStatusReport {
                     version: slice.version.clone(),
-                    error_message: String::new(),
                     session_token: update.session_token.clone(),
+                    phase: MeshSliceStatusPhase::Accepted as i32,
+                    reject_reason: MeshSliceRejectReason::Unspecified as i32,
                 };
                 let retry_report = report.clone();
                 // Issue #3854 round two: this unary RPC used to be awaited
@@ -612,10 +719,14 @@ async fn connect_mesh_subscribe(
                 // DP is not converging. Reporting must not mask the stream
                 // disposition below.
                 if !update.heartbeat && !update.version.trim().is_empty() {
+                    // Install-stage refusal. The reason is a closed wire enum,
+                    // never the local diagnostic text: `reason_label()` still
+                    // drives this DP's own metric and log line.
                     let report = MeshSliceStatusReport {
                         version: update.version.clone(),
-                        error_message: rejection.reason_label().to_string(),
                         session_token: update.session_token.clone(),
+                        phase: MeshSliceStatusPhase::Accepted as i32,
+                        reject_reason: MeshSliceRejectReason::InstallRefused as i32,
                     };
                     let retry_report = report.clone();
                     let sent = tokio::time::timeout(

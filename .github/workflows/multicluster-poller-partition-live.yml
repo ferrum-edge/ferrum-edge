@@ -12,8 +12,10 @@ on:
       - main
 
 concurrency:
-  group: multicluster-poller-${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
+  group: multicluster-poller-${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.number || github.ref }}
+  # Pushes to main coalesce on the ref and are never cancelled; PR and
+  # merge-group lanes cancel superseded runs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 permissions:
   contents: read

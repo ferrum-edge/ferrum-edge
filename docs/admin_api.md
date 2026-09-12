@@ -28,6 +28,12 @@ Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `
 
 ### Per-namespace tenancy (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`)
 
+Only an absent `X-Ferrum-Namespace` header selects the default namespace
+(`ferrum`). A present invalid value, including non-ASCII bytes, returns `400`
+on namespace-scoped routes; it never silently selects the default. Invalid
+backup attempts retain the canonical audit bucket and fixed
+`namespace_status: invalid` metadata without storing the rejected value.
+
 On a single-namespace deployment, admin JWTs are **global** by default: the `X-Ferrum-Namespace` header is a routing selector, not an authorization boundary — any valid Operator/Admin token can address any namespace. Setting `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` makes namespace-scoped admin routes require the JWT to carry an `ns` claim authorizing the requested namespace.
 
 **Enforcement also engages automatically on a multi-namespace control plane.** When `FERRUM_CP_NAMESPACES` names more than one namespace (e.g. `"prod,staging"`) or is `*`, `cp` mode turns namespace-claim enforcement on for the admin plane regardless of `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` — the same rule the CP↔DP gRPC plane applies to `ConfigSync`, `MeshConfigSync`, and xDS streams. On such a CP, **admin tokens without an `ns` claim are refused with `403` on namespace-scoped routes**, including `GET /backup` (which serialises consumer credentials) and `POST /restore`. Mint admin tokens with an explicit `ns` claim before pointing them at a multi-namespace CP. `database`, `file`, `dp`, `mesh`, and `node_agent` modes have no CP scope and keep the flag's `false` default.
@@ -75,6 +81,8 @@ There is one transport-level exception that applies to **every** admin endpoint,
 
 ### `/health`, `/status` — readiness + diagnostics (tiered)
 
+A configured TCP/UDP/TLS/DTLS stream listener with a hard bind/backend-TLS failure or an exited task makes `/health` and `/status` return 503 with `status: "degraded"` and `ready: false`. Soft frontend TLS/DTLS deferrals and DTLS config-build failures report `status: "degraded"` with HTTP 200 and `ready: true` when otherwise healthy. A pending asynchronous bind alone does not degrade health or withdraw readiness during runtime reconciliation. A supervisor retries degraded listeners every 30 seconds using current configuration; readiness recovers when the hard failure clears or the listener is withdrawn. Healthy listeners continue serving, and `/live` is unaffected. Detailed failures remain on authenticated `/overload`; unauthenticated health contains only `status` and `ready`. Initial hard bind failure remains fatal in file/database mode and non-fatal in DP mode.
+
 ```bash
 # Unauthenticated (LB / readiness probe): status + ready only.
 curl http://localhost:9000/health
@@ -82,7 +90,8 @@ curl http://localhost:9000/health
 
 # Authenticated: full diagnostics.
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
-# Returns: {"status","timestamp","mode","database":{...},"admin_writes_enabled",
+# Returns: {"status","timestamp","mode","namespace":{...},"database":{...},
+#           "admin_writes_enabled",
 #           "ready","cached_config":{"proxy_count":...},"database_polling":{...},
 #           "config_rejected":true,"mesh":{"egress_scope":{...}},
 #           "listener_failures":{"failures_total":...},
@@ -99,7 +108,7 @@ Service-discovery task lifecycle and bounded staleness (issues #3717/#3721/#3722
 
 A terminating process reports `status: "draining"`, `ready: false`, and HTTP 503 (issue #4154). The verdict is published the moment SIGTERM/SIGINT is observed — ahead of the accept-loop close — so an orchestrator or load balancer can withdraw the replica from its endpoint set before a new connection is refused; `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` keeps every listener (proxy and admin) accepting for that window. `draining` is terminal and wins over every other status. `/live` is deliberately unaffected and keeps returning 200: a liveness probe pointed at a draining pod must not trigger a SIGKILL mid-drain. See [graceful_shutdown.md](graceful_shutdown.md).
 
-Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state. The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require an admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config. Both **database** and **cp** modes expose `database_polling.last_poll_completed_at` (updated on every normally completed poll outcome — empty success, rejection, or handled error — not on panic/abort/cancel) so operators can alert when the supervised poll task stops advancing. In **cp** mode, unexpected poll-task exit (panic/abort/unexpected completion — not ordinary shutdown) flips sticky `serving_degraded`, so `/health` returns 503 with `status: "unavailable"` and `ready: false`. In **database** mode the poll task is respawned after an unexpected exit while last-known-good config continues to serve. When the optional MongoDB change-stream watcher is enabled (`FERRUM_MONGO_CHANGE_STREAM_ENABLED`, replica sets only), `database_polling.change_stream` reports its bounded connected/degraded/reconnect state; it is a reload-latency signal only and never forces `status: "degraded"`, because periodic polling stays authoritative. See [mongodb.md](mongodb.md#change-stream-triggered-reloads).
+Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state. The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require an admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. In **data-plane mode**, authenticated detail additionally includes a fixed-cardinality `dp_config` object; `cp_disconnected_seconds` there measures how long the DP has been without usable applied configuration (`0` only after a snapshot is accepted and applied, not on bare transport connect). In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config. Both **database** and **cp** modes expose `database_polling.last_poll_completed_at` (updated on every normally completed poll outcome — empty success, rejection, or handled error — not on panic/abort/cancel) so operators can alert when the supervised poll task stops advancing. In **cp** mode, unexpected poll-task exit (panic/abort/unexpected completion — not ordinary shutdown) flips sticky `serving_degraded`, so `/health` returns 503 with `status: "unavailable"` and `ready: false`. In **database** mode the poll task is respawned after an unexpected exit while last-known-good config continues to serve. When the optional MongoDB change-stream watcher is enabled (`FERRUM_MONGO_CHANGE_STREAM_ENABLED`, replica sets only), `database_polling.change_stream` reports its bounded connected/degraded/reconnect state; it is a reload-latency signal only and never forces `status: "degraded"`, because periodic polling stays authoritative. See [mongodb.md](mongodb.md#change-stream-triggered-reloads).
 
 In mesh mode, authenticated health detail includes
 `mesh.egress_scope.sidecar_admitted_services` and
@@ -400,6 +409,77 @@ Sizing note: there is no listener-wide budget for concurrently buffered request 
 
 ## Namespaces
 
+### Admin is multi-namespace; one process's data plane serves one namespace
+
+The Admin API accepts any valid `X-Ferrum-Namespace`. A **proxy data plane does
+not**: it projects every configuration snapshot down to the process's single
+active namespace (`FERRUM_NAMESPACE`, default `ferrum`) before building the
+router, plugin, consumer, and load-balancer caches. Writing a resource under a
+namespace this process does not route therefore succeeds, stays visible to
+Admin reads, and is never matched by the local proxy — the data plane answers
+`404` (issue #5447).
+
+That asymmetry is deliberate, not a bug in the storage layer:
+
+| Mode | Admin writes | Data plane | Multi-namespace writes |
+|---|---|---|---|
+| `cp` | read/write | none | **Intended.** The CP stores every namespace in `FERRUM_CP_NAMESPACES` and each DP subscribes to its own. |
+| `database` | read/write | one namespace | **Unrouted here.** Accepted and durable, but only `FERRUM_NAMESPACE` is served by this process. |
+| `file`, `dp`, `mesh` | read-only | one namespace | Cannot arise — mutations are rejected with `403`. |
+| `node_agent` | read-only | none | Not applicable. |
+
+Two mechanisms make the mismatch visible instead of silent:
+
+**1. Discover the served namespace up front.** The authenticated `/health` and
+`/status` detail carries a `namespace` object:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:9000/status \
+  | jq '.namespace'
+# {
+#   "active": "ferrum",
+#   "serving_scope": "single-namespace-data-plane",
+#   "data_plane_single_namespace": true
+# }
+```
+
+- `active` — the one namespace this process's data plane routes. `null` when the
+  process has no data plane (`cp`, `node_agent`).
+- `serving_scope` — closed set: `single-namespace-data-plane` (`database`,
+  `file`, `dp`, `mesh`), `control-plane` (`cp`), `no-data-plane`
+  (`node_agent`).
+- `data_plane_single_namespace` — `true` when everything outside `active` is
+  unrouted by this process. This is the field to branch on.
+
+The block is authenticated-tier only (the namespace name is operator-supplied
+deployment topology); the unauthenticated probe still carries only `status` and
+`ready`.
+
+**2. Detect it per write.** An **accepted** mutation (`2xx` on
+`POST`/`PUT`/`PATCH`/`DELETE`) to a namespace-scoped route under a namespace this
+process does not route carries:
+
+```
+X-Ferrum-Namespace-Unserved: true
+```
+
+The header is absent when the requested namespace is the served one, on every
+non-`2xx` response (a rejected write never reached the store), on reads, on
+global admin surfaces that `X-Ferrum-Namespace` does not select, and in `cp`
+mode. A deferred `202` never carries it either: `?apply=async` is already a
+no-op for a namespace this process does not serve, so such a write returns its
+synchronous success status and no `X-Ferrum-Config-Cursor`.
+
+The gateway also logs one `WARN` per `(namespace, resource kind)` for these
+accepted-but-unrouted mutations, deduplicated so a provisioning client looping
+over one tenant logs once rather than once per resource, bounded to 256 distinct
+pairs, and rate limited to one line per five seconds past that bound.
+
+Nothing about routing, filtering, admission, or status codes changes: both
+mechanisms are observability. If you need several namespaces served at once, run
+`cp` mode with one `dp` per namespace rather than pointing a multi-namespace
+client at a single-process gateway.
+
 ### Resource identity is `(namespace, id)`
 
 Proxy, upstream, plugin-config, API-spec, and consumer ids are unique **within a
@@ -568,7 +648,12 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
     "strip_listen_path": true
   }' \
   http://localhost:9000/proxies
+```
 
+Plaintext backends need `backend_scheme: http`. Omitting `backend_scheme` on
+`POST /proxies` stores `https` (the HTTP-family default).
+
+```bash
 # Get a proxy
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
 
@@ -699,9 +784,8 @@ Query: `epoch`, `sequence` (both required u64s), optional `wait_ms`
   also returns `pending`; retry harmlessly with the same cursor.
 - `rejected` — a completed poll attempted a covering sequence and the runtime
   rejected the candidate. Fail-closed: durable but not live.
-- `unverifiable` — the cursor's topology was replaced
-  (failover/reconnect/restart) or was never issued by this process; observe
-  config directly instead.
+- `unverifiable` — the cursor was not issued by this process or its topology
+  was replaced (failover/reconnect/restart); observe config directly instead.
 
 With `wait_ms`, the probe registers as a live-apply waiter and inherits the
 immediate poll nudge. The bulk recipe: POST every chunk with `apply=async`,
@@ -792,9 +876,10 @@ default would otherwise silently change security state are handled explicitly:
   `200`. A `PUT` body that is a JSON object without an `enabled` key is
   rejected with `400` and nothing is mutated:
   `{"error":"PUT is a full replace: 'enabled' is required (openapi.yaml declares it required). Send the field explicitly."}`.
-  `openapi.yaml` already lists `enabled` in the `PluginConfig` `required` set;
-  this makes the implementation match it. `POST /plugins/config` still defaults
-  `enabled` to `true` when the key is absent.
+  `openapi.yaml` requires `enabled` on `PluginConfigReplace` (`PUT
+  /plugins/config/{id}`) and on the stored `PluginConfig` response. `POST
+  /plugins/config` uses `PluginConfigCreate`, which omits `enabled` from
+  `required` so the server can default it to `true`.
 - **An omitted `Proxy.plugins` preserves the stored associations.** Its default
   is the empty list, so an omitted key would detach every plugin association —
   including an authentication plugin — with a `200`. `PUT /proxies/{id}` is
@@ -847,6 +932,13 @@ A proxy-scoped plugin applies only when the target proxy lists it in `plugins`;
 The plugin-config row and the association commit in one transaction, and every
 touched proxy's `updated_at` advances so the next poll / control-plane
 broadcast republishes it. `GET /proxies/{id}` is therefore authoritative: a
+Plugin and proxy writes validate their complete prospective plugin composition
+before persistence. Invalid CORS/mesh-dispatch ordering, exclusive-instance
+conflicts, metric-tag plan budgets and global registry ownership return `400`;
+the rejected plugin row and association are not committed. File/DB/CP admission
+and runtime cache publication use the same checks. See
+[Composition admission](plugins.md#composition-admission).
+
 `201` from `POST /plugins/config` means *attached*, not merely created. A
 `proxy_id` that does not exist in the request's namespace is rejected with
 `400 {"error":"proxy_id '<P>' does not exist in namespace '<ns>'"}` and nothing
@@ -857,7 +949,9 @@ through `PUT /proxies/{id}` and stay valid for any proxy in the namespace. File
 mode is unchanged: the configuration file's association arrays are the only
 attachment surface there.
 
-Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes.
+Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes. The shared OpenAPI wrapper matches that admission: plugin-specific `config` schemas apply only while `enabled` is true (or omitted on `POST`, which defaults to true), and plugins whose constructors accept JSON `null` (`stdout_logging`, `prometheus_metrics`, `mtls_auth`, `compression`) document `config` as `[object, null]`.
+
+Global-scope requirements for `transaction_log_schema` and `prometheus_metrics` still apply while disabled.
 
 Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw.
 
@@ -1310,7 +1404,7 @@ Audit events may also carry `namespace_at_event` (the namespace in effect when t
 
 `GET /backup` security auditing is unconditional and does not consult `FERRUM_ADMIN_AUDIT_ENABLED`: before any unredacted configuration bytes leave the process, Ferrum admits a security record via a synchronous `audit_events` insert when a database backend is available, otherwise via the bounded local fallback under `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` (so a cached-config export during a primary outage is still recorded without depending on that same unavailable database). If neither sink admits the event, the export returns `503` and does not attach a backup body. Fallback-stored records are not served by `GET /audit` and are not replayed into `audit_events` once the primary recovers; the file keeps the newest 4096 events and logs a content-free `audit_local_fallback_evicted` warning whenever an append evicts an older record. Authenticated denied/failed backup attempts (role denial, `ns`-claim denial, validation failure — including an invalid `X-Ferrum-Namespace` recorded under the default audit namespace with fixed `namespace_status: invalid` — and unavailable) are audited best-effort with fixed failure categories only; audit records never contain raw backend, parser, authorization, or serialization error strings, and never credentials, tokens, cookies, JWTs, or backup payload fragments. An `ns`-claim denial is stored under that same canonical default bucket rather than the rejected header. The `resources` query is a closed allow-list (`proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`); unknown tokens and structurally malformed forms (key-only `resources`, duplicate/ambiguous occurrences) are rejected with `400` and a static client message that does not echo the rejected value, and audit records store only allow-listed names or the fixed `invalid` sentinel.
 
-`GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters. `limit` follows the shared bounds (default 100, maximum 1000), and malformed or out-of-range values are rejected with `400`. The audit store indexes offsets as a 32-bit value, so `offset` is capped at `2^32 - 1` here rather than the `2^63 - 1` other list endpoints allow — a larger offset returns `400`. The audit response keeps its own `{ "items", "limit", "offset", "next_offset", "total" }` envelope. `next_offset` is always strictly greater than `offset`; it is `null` when no further page exists or the next cursor would exceed the 32-bit ceiling.
+`GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters. `limit` follows the shared bounds (default 100, maximum 1000): an omitted `limit` or `0` applies the default, representable values above 1000 are capped, and malformed, negative, or unrepresentable values are rejected with `400`. The audit store indexes offsets as a 32-bit value, so `offset` is capped at `2^32 - 1` here rather than the `2^63 - 1` other list endpoints allow — a larger offset returns `400`. The audit response keeps its own `{ "items", "limit", "offset", "next_offset", "total" }` envelope. `next_offset` is always strictly greater than `offset`; it is `null` when no further page exists or the next cursor would exceed the 32-bit ceiling.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
@@ -1328,6 +1422,11 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/cluster
 ### CP Mode Response
 
 Returns all currently connected Data Plane nodes and Mesh nodes. Each registry is independent: a node that subscribes to both `ConfigSync.Subscribe` (DP) and `MeshConfigSync.MeshSubscribe` (mesh) appears in both arrays with separate `connected_at` timestamps.
+
+Both subscription services require the request's trimmed `node_id` to equal the
+authenticated bearer JWT's `sub`. A mismatched identity is rejected before
+registration and cannot replace another node's `GET /cluster` entry. Built-in
+DP token minting uses the node ID as `sub`; external issuers must do the same.
 
 ```json
 {
@@ -1939,13 +2038,13 @@ curl -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:9000/mesh/confi
 
 ## Mesh Slice Drift (CP mode)
 
-`GET /mesh/slice-drift` is JWT-authenticated and **control-plane only** (issue #3265). It reports per-authenticated mesh data plane desired / sent / acknowledged / rejected slice-version watermarks so operators can spot stuck, partitioned, or repeatedly rejecting DPs after a successful CP reconciliation.
+`GET /mesh/slice-drift` is JWT-authenticated and **control-plane only** (issue #3265). It reports per-authenticated mesh data plane desired / sent / acknowledged / applied / rejected slice-version watermarks so operators can spot stuck, partitioned, or repeatedly rejecting DPs after a successful CP reconciliation. `acknowledged` is the DP's install-time acceptance and `applied` is its proxy-runtime acceptance; only `applied` converges a row (issue #4812).
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/slice-drift
 ```
 
-Returns `404` outside CP mode. Returns `200` with an empty `data_planes` list when CP mode is active but no local `MeshSubscribe` DP has connected yet. Desired versions reflect actual per-DP projected content changes, not global reload timestamps; NACK diagnostics retain only the fixed `reported_rejection` label and discard caller text.
+Returns `404` outside CP mode. Returns `200` with an empty `data_planes` list when CP mode is active but no local `MeshSubscribe` DP has connected yet. Desired versions reflect actual per-DP projected content changes, not global reload timestamps; rejection diagnostics retain only a closed `rejected.stage` (`install` / `runtime`) and `rejected.reason` label mapped from the DP's wire enum, and no caller-supplied text is ever accepted or retained.
 
 This surface is **observability only and never gates mesh configuration delivery**: a DP the bounded registry declines to track (4096-identity cap, oversized retained selector) is still served its full mesh slice, it simply does not appear in `data_planes`. A missing DP therefore means "not tracked or not connected", not "not configured" — cross-check `GET /cluster` for the connected set. On fleets above 256 tracked identities the published watermarks may lag live state by up to one maintenance interval while high-frequency send/ACK updates coalesce.
 

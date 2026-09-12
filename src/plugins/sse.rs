@@ -38,6 +38,29 @@
 //!    responses into `data: ...\n\n` SSE event framing (buffered responses only),
 //!    preserving terminal line-break semantics for EventSource `MessageEvent.data`.
 //!
+//! ## Representations wrapping declines
+//!
+//! Wrapping rewrites the content AND its media type, so it is refused outright —
+//! relabel included — for a representation it cannot convert. The refusal is
+//! decided in `after_proxy`, before the `Content-Type` is touched, so the client
+//! receives the origin's own representation rather than reframed bytes under an
+//! event-stream label:
+//!
+//! * a `206`/`226` body, which is a fragment the unchanged status still describes;
+//! * a response carrying `Cache-Control: no-transform`, which RFC 9110 §7.7
+//!   forbids an intermediary from transforming (the origin directive is read
+//!   from the pristine pre-`after_proxy` snapshot, so a later header rule cannot
+//!   erase it);
+//! * a body under a non-identity `Content-Encoding`, whose octets are a
+//!   compressed bitstream rather than the UTF-8 text `data:` framing describes.
+//!   `strip_accept_encoding` exists to prevent this; a backend that ignores it
+//!   is passed through unchanged instead of being framed as lossy text.
+//!
+//! A framed event that cannot fit the retained-response ceiling is a different
+//! outcome: the bytes were claimed and could not be produced, so the shared
+//! gateway capacity terminal owns the response rather than the unconverted body
+//! being published under the event-stream label already selected.
+//!
 //! ## Config
 //!
 //! ```json
@@ -58,14 +81,16 @@
 //! implies a client-visible `text/event-stream` media type for responses that
 //! are wrapped.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::utils::policy_digest;
-use super::utils::sse::is_text_event_stream_media_type;
-use super::{PluginResult, RequestContext};
+use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
+use super::{BoundedResponseBodyConstruction, PluginResult, RequestContext};
 use crate::util::http_headers::headers_have_cache_control_directive;
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -234,24 +259,33 @@ impl SsePlugin {
     /// Wrap normalized text into one SSE event, preserving terminal newlines,
     /// inside a ceiling-bounded sink.
     ///
-    /// `None` means the framed event would not fit the retained-response ceiling
-    /// this response is being rewritten under; the refusal happens while the
-    /// event is being written, so the oversized buffer is never allocated
-    /// (GHSA-pwcm-6rh8-f2gh).
+    /// [`BoundedResponseBodyConstruction::CapacityRefused`] means the framed
+    /// event would not fit the retained-response ceiling this response is being
+    /// rewritten under; the refusal happens while the event is being written, so
+    /// the oversized buffer is never allocated (GHSA-pwcm-6rh8-f2gh). It is a
+    /// distinct outcome from an ordinary no-op because `after_proxy` has already
+    /// published the `text/event-stream` label this event was going to fill:
+    /// collapsing it onto `None` would serve the unconverted original body as a
+    /// successful event stream. The caller maps it onto the shared pending
+    /// capacity signal so the response-body loop installs the gateway terminal.
     ///
     /// Every byte is written THROUGH the sink: the lossy UTF-8 decode and the
     /// CR/CRLF normalization run incrementally over the input, so no complete
     /// `String` copy of the (attacker-chosen) body is ever materialised beside
     /// the bounded output. The observable framing is unchanged — see
     /// [`write_lossy_sse_data`] for the exact equivalence.
-    fn wrap_body_as_sse_event(&self, body: &[u8], ceiling: usize) -> Option<Vec<u8>> {
+    fn wrap_body_as_sse_event(
+        &self,
+        body: &[u8],
+        ceiling: usize,
+    ) -> BoundedResponseBodyConstruction {
         use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
         let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
 
         if let Some(retry_field) = &self.retry_field
             && !output.push(retry_field)
         {
-            return None;
+            return BoundedResponseBodyConstruction::CapacityRefused;
         }
 
         // Per the WHATWG EventSource algorithm, each `data:` field appends its
@@ -264,20 +298,90 @@ impl SsePlugin {
         // must emit no `data:` field at all, matching `str::lines()`.
         if !body.is_empty() {
             if !output.push(SSE_DATA_FIELD_PREFIX) {
-                return None;
+                return BoundedResponseBodyConstruction::CapacityRefused;
             }
             if !write_lossy_sse_data(&mut output, body) {
-                return None;
+                return BoundedResponseBodyConstruction::CapacityRefused;
             }
             if !output.push(b"\n") {
-                return None;
+                return BoundedResponseBodyConstruction::CapacityRefused;
             }
         }
         // Blank line terminates the event.
         if !output.push(b"\n") {
-            return None;
+            return BoundedResponseBodyConstruction::CapacityRefused;
         }
-        output.finish()
+        match output.finish() {
+            Some(event) => BoundedResponseBodyConstruction::Replaced(event),
+            None => BoundedResponseBodyConstruction::CapacityRefused,
+        }
+    }
+
+    /// Whether the ORIGINAL backend response declared a content coding.
+    ///
+    /// Read from the pristine pre-`after_proxy` snapshot whenever the proxy
+    /// stamped one, so a hook that removed or renamed `Content-Encoding` before
+    /// this plugin ran cannot make compressed octets look like text. A response
+    /// with no stamp is a synthetic/gateway-authored one, whose live header map
+    /// IS its own description.
+    fn origin_response_is_encoded(
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        let metadata = &ctx.metadata;
+        if metadata.contains_key(crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY) {
+            return metadata.contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
+        }
+        let Some(encoding) = response_headers.get("content-encoding") else {
+            return false;
+        };
+        super::response_representation::content_encoding_requires_decode_judgment(encoding)
+    }
+
+    /// Whether this response forbids intermediary content transformation
+    /// (RFC 9110 §7.7).
+    ///
+    /// The pristine marker is the authority: it is stamped from the backend's
+    /// own `Cache-Control` before any `after_proxy` hook runs, so a header rule
+    /// that strips the directive ahead of this plugin cannot unlock wrapping.
+    /// The live map is consulted too, which covers both a synthetic response
+    /// (never stamped) and a directive an EARLIER hook added.
+    fn response_forbids_transform(
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        let no_transform_key = crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY;
+        ctx.metadata.contains_key(no_transform_key)
+            || headers_have_cache_control_directive(response_headers, "no-transform")
+    }
+
+    /// Whether this response's REPRESENTATION rules wrapping out, whatever its
+    /// media type and status say. See the module header.
+    fn wrap_refused_for_representation(
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        Self::response_forbids_transform(ctx, response_headers)
+            || Self::origin_response_is_encoded(ctx, response_headers)
+    }
+
+    /// Whether this configured wrapper will decline THIS response, so nothing it
+    /// does needs the body collected.
+    ///
+    /// Genuine origin event streams are the load-bearing case: they are never
+    /// wrapped, and they are unbounded, so pinning them onto the buffered path
+    /// collects events until the response ceiling rejects the stream instead of
+    /// delivering them. The origin media type comes from the pristine stamp, so
+    /// this plugin's own relabel cannot answer the question for it.
+    fn wrap_declined_for_response(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        !super::response_body_rewrite_allowed(response_status)
+            || original_response_is_event_stream(ctx, response_headers)
+            || Self::wrap_refused_for_representation(ctx, response_headers)
     }
 }
 
@@ -415,7 +519,7 @@ fn optional_positive_u64_config(
 ) -> Result<Option<u64>, String> {
     match config.get(key) {
         None => Ok(None),
-        Some(Value::Number(number)) => match number.as_u64() {
+        Some(Value::Number(number)) => match unsigned_integer_value(number) {
             Some(value) if value > 0 => Ok(Some(value)),
             Some(_) => Err(format!("sse: '{key}' must be greater than zero")),
             None => Err(format!(
@@ -426,6 +530,33 @@ fn optional_positive_u64_config(
             "sse: '{key}' must be an unsigned integer, got: {}",
             value_kind(other)
         )),
+    }
+}
+
+/// The unsigned 64-bit value a JSON number denotes, or `None` when it denotes
+/// none.
+///
+/// Admission is over the VALUE, not the token, because the published schema
+/// (`SseConfig` in `openapi.yaml`) is what operators validate against and JSON
+/// Schema's `type: integer` is defined that way: draft 2020-12 admits `1.0`
+/// exactly as it admits `1`, and no keyword can express the lexical difference.
+/// Accepting an exact integer-valued number here is what makes schema-driven
+/// admission and `ferrum-edge validate` agree on the same document. The range is
+/// the schema's published `minimum`/`maximum` pair — anything with a fractional
+/// part, a negative value, or a magnitude outside unsigned 64-bit is rejected on
+/// both sides.
+fn unsigned_integer_value(number: &Number) -> Option<u64> {
+    if let Some(value) = number.as_u64() {
+        return Some(value);
+    }
+    let value = number.as_f64()?;
+    // `u64::MAX as f64` rounds UP to 2^64, so a strict `<` against it is the
+    // exact "representable as u64" test rather than an off-by-one at the
+    // ceiling. NaN and the infinities fail `fract() == 0.0` and the bounds.
+    if value.fract() == 0.0 && value >= 0.0 && value < (u64::MAX as f64) {
+        Some(value as u64)
+    } else {
+        None
     }
 }
 
@@ -501,23 +632,50 @@ impl super::Plugin for SsePlugin {
 
     fn should_buffer_response_body_for_content_type(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         content_type: Option<&str>,
         response_status: u16,
-        _response_headers: &HashMap<String, String>,
+        response_headers: &HashMap<String, String>,
     ) -> bool {
         self.wrap_non_sse_responses
             && super::response_body_rewrite_allowed(response_status)
             && !content_type.is_some_and(Self::is_sse_content_type)
+            && !Self::wrap_refused_for_representation(ctx, response_headers)
     }
 
+    /// A configured wrapper that will decline this response never needs its
+    /// body, so a later relabel cannot invalidate the answer either.
     fn should_release_response_body_before_content_type_rewrite(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         response_status: u16,
-        _response_headers: &HashMap<String, String>,
+        response_headers: &HashMap<String, String>,
     ) -> bool {
-        self.wrap_non_sse_responses && !super::response_body_rewrite_allowed(response_status)
+        self.wrap_non_sse_responses
+            && self.wrap_declined_for_response(ctx, response_status, response_headers)
+    }
+
+    /// Retries do not need THIS plugin's body: the only thing an SSE instance
+    /// does with a buffered body is frame it once, from the response the proxy
+    /// finally selected. Opting in is what lets the shared retry-time refinement
+    /// consider releasing at all — without it a `wrap_non_sse_responses` proxy
+    /// with retries configured collects a genuine backend event stream until
+    /// origin EOF, and the first event never reaches the client early.
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    /// Header-time confirmation: release exactly the responses this wrapper is
+    /// going to decline anyway. Anything it will still frame stays buffered, so
+    /// the retained body remains available to the transform.
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && self.wrap_declined_for_response(ctx, response_status, response_headers)
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {
@@ -543,7 +701,7 @@ impl super::Plugin for SsePlugin {
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // SSE is a read-only protocol — only GET is valid.
         if self.require_get_method && ctx.method != "GET" {
-            warn!(
+            warn_sampled!(
                 plugin = "sse",
                 method = %ctx.method,
                 "SSE request rejected: method must be GET"
@@ -563,7 +721,7 @@ impl super::Plugin for SsePlugin {
                 .is_some_and(|v| Self::accepts_event_stream(v));
 
             if !accepts_sse {
-                warn!(
+                warn_sampled!(
                     plugin = "sse",
                     accept = ?ctx.headers.get("accept"),
                     "SSE request rejected: Accept header must include text/event-stream"
@@ -582,7 +740,7 @@ impl super::Plugin for SsePlugin {
         // logs (see `redact_sse_log_metadata` + metadata redaction defaults).
         if let Some(last_id) = ctx.headers.get("last-event-id") {
             if last_id.len() > MAX_LAST_EVENT_ID_BYTES {
-                warn!(
+                warn_sampled!(
                     plugin = "sse",
                     last_event_id_len = last_id.len(),
                     max_bytes = MAX_LAST_EVENT_ID_BYTES,
@@ -665,11 +823,26 @@ impl super::Plugin for SsePlugin {
             .is_some_and(|value| value == "1");
         let origin_was_sse = is_sse && !was_relabelled_non_sse;
 
+        // RFC 9110 §7.7: a response `no-transform` directive forbids an
+        // intermediary from changing the content OR its `Content-Type`, so it
+        // rules out forcing as well as wrapping. Genuine origin event streams
+        // are unaffected — nothing below rewrites their representation.
+        if !origin_was_sse && Self::response_forbids_transform(ctx, response_headers) {
+            debug!(
+                plugin = "sse",
+                "origin response forbids transformation; leaving representation unchanged"
+            );
+            return PluginResult::Continue;
+        }
+
         // For a non-SSE backend response, wrapping/forcing depends on the
         // configured body wrapper running. Preserved 206/226 bytes cannot be
-        // wrapped, so do not relabel them as an SSE event stream.
-        let wrap_allowed =
-            self.wrap_non_sse_responses && super::response_body_rewrite_allowed(response_status);
+        // wrapped, and a content-coded body is a compressed bitstream rather
+        // than the text `data:` framing describes, so do not relabel either as
+        // an SSE event stream.
+        let wrap_allowed = self.wrap_non_sse_responses
+            && super::response_body_rewrite_allowed(response_status)
+            && !Self::origin_response_is_encoded(ctx, response_headers);
         if !origin_was_sse && self.wrap_non_sse_responses && !wrap_allowed {
             return PluginResult::Continue;
         }
@@ -740,7 +913,7 @@ impl super::Plugin for SsePlugin {
         ctx: &mut RequestContext,
         body: &[u8],
         content_type: Option<&str>,
-        _response_headers: &HashMap<String, String>,
+        response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         if !self.wrap_non_sse_responses || body.is_empty() {
             return None;
@@ -767,18 +940,33 @@ impl super::Plugin for SsePlugin {
             return None;
         }
 
+        // `after_proxy` already refused these representations before touching a
+        // header, so reaching here means it never ran for this response (a
+        // direct caller, or a path with no response-header phase). Re-check
+        // rather than trusting the arrival: framing content-coded octets as
+        // text, or overriding an origin `no-transform`, must not become
+        // reachable by skipping a hook.
+        if Self::wrap_refused_for_representation(ctx, response_headers) {
+            return None;
+        }
+
         // Built inside a sink sized to this response's retained ceiling, so an
         // event that would exceed it is refused during construction rather than
-        // allocated and rejected afterwards (GHSA-pwcm-6rh8-f2gh). A refusal
-        // leaves the original body in place.
-        let output = self.wrap_body_as_sse_event(body, ctx.retained_response_body_ceiling())?;
-        debug!(
-            plugin = "sse",
-            original_bytes = body.len(),
-            wrapped_bytes = output.len(),
-            "wrapped response into SSE event"
-        );
-        Some(output)
+        // allocated and rejected afterwards (GHSA-pwcm-6rh8-f2gh). The refusal
+        // is published as the shared pending capacity signal: `after_proxy` has
+        // already selected `text/event-stream` for this response, so leaving the
+        // unconverted body in place would serve plain bytes as a successful
+        // event stream.
+        let construction = self.wrap_body_as_sse_event(body, ctx.retained_response_body_ceiling());
+        if let BoundedResponseBodyConstruction::Replaced(output) = &construction {
+            debug!(
+                plugin = "sse",
+                original_bytes = body.len(),
+                wrapped_bytes = output.len(),
+                "wrapped response into SSE event"
+            );
+        }
+        construction.into_transform_option(ctx)
     }
 
     async fn transform_response_body(
@@ -787,7 +975,13 @@ impl super::Plugin for SsePlugin {
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        // Fallback when no request context is available (legacy callers).
+        // Fallback when no request context is available (legacy callers). The
+        // throwaway context carries no pending-signal channel back to a
+        // response-body loop, so a ceiling refusal collapses to `None` here.
+        // That stays self-consistent: a caller with no context also had no
+        // `after_proxy` pass, so no `text/event-stream` label was selected for
+        // the unconverted body to be published under. Every proxy path uses the
+        // context-aware hook above.
         let mut ctx =
             RequestContext::new("0.0.0.0".to_string(), "GET".to_string(), "/".to_string());
         self.transform_response_body_with_context(&mut ctx, body, content_type, response_headers)

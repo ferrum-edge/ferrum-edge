@@ -61,7 +61,7 @@ spec:
             - name: FERRUM_INJECTOR_LISTEN_ADDR
               value: "0.0.0.0:{{ .Values.injector.listenPort }}"
             - name: FERRUM_INJECTOR_SIDECAR_IMAGE
-              value: {{ include "ferrum-mesh.image" . | quote }}
+              value: {{ include "ferrum-mesh.injectorSidecarImage" . | quote }}
             - name: FERRUM_INJECTOR_REQUIRE_ANNOTATION
               value: {{ .Values.injector.requireAnnotation | quote }}
             - name: FERRUM_INJECTOR_TLS_CERT_PATH
@@ -69,8 +69,10 @@ spec:
             - name: FERRUM_INJECTOR_TLS_KEY_PATH
               value: {{ .Values.injector.tls.keyPath | quote }}
             {{- range $name, $value := .Values.injector.env }}
+            {{- if ne $name "FERRUM_INJECTOR_SIDECAR_IMAGE" }}
             - name: {{ $name }}
               value: {{ $value | quote }}
+            {{- end }}
             {{- end }}
           {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.injector.probes "startupHandler" $startupHandler "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
           {{- include "ferrum-mesh.preStopLifecycle" .Values.injector | nindent 10 }}

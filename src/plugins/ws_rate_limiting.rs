@@ -1,5 +1,7 @@
 //! WebSocket frame rate limiting with shared local/Redis/failover storage.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::fmt::Write as _;
@@ -8,7 +10,6 @@ use std::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tracing::warn;
 use uuid::Uuid;
 
 use super::utils::rate_limit::{
@@ -339,7 +340,7 @@ impl WsRateLimiting {
         };
         // One bounded, low-cardinality warning per closed connection: this is
         // the terminal decision, not a per-frame event.
-        warn!(
+        warn_sampled!(
             plugin = "ws_rate_limiting",
             proxy_id = %proxy_id,
             connection_id,

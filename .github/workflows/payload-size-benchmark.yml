@@ -149,27 +149,34 @@ jobs:
           echo "=========================================="
 
       - name: Build gateway binary
-        run: cargo build --profile ${{ inputs.build_profile }} --bin ferrum-edge
+        env:
+          BUILD_PROFILE: ${{ inputs.build_profile }}
+        run: cargo build --profile "$BUILD_PROFILE" --bin ferrum-edge
 
       - name: Build payload benchmark tools
-        run: cd tests/performance/payload_size && cargo build --profile ${{ inputs.build_profile }}
+        env:
+          BUILD_PROFILE: ${{ inputs.build_profile }}
+        run: cd tests/performance/payload_size && cargo build --profile "$BUILD_PROFILE"
 
       # The run_payload_test.sh expects binaries at target/release/.
       # When using a non-release profile, copy binaries so the scripts find them.
       # Note: Cargo's 'dev' profile outputs to target/debug/, not target/dev/.
       - name: Stage gateway binary
         if: inputs.build_profile != 'release'
+        env:
+          BUILD_PROFILE: ${{ inputs.build_profile }}
         run: |
-          PROFILE_DIR=${{ inputs.build_profile }}
+          PROFILE_DIR="$BUILD_PROFILE"
           if [ "$PROFILE_DIR" = "dev" ]; then PROFILE_DIR=debug; fi
           mkdir -p target/release
-          cp "target/${{ inputs.build_profile }}/ferrum-edge" target/release/ferrum-edge
           cp "target/${PROFILE_DIR}/ferrum-edge" target/release/ferrum-edge
 
       - name: Stage benchmark binaries
         if: inputs.build_profile != 'release'
+        env:
+          BUILD_PROFILE: ${{ inputs.build_profile }}
         run: |
-          PROFILE_DIR=${{ inputs.build_profile }}
+          PROFILE_DIR="$BUILD_PROFILE"
           if [ "$PROFILE_DIR" = "dev" ]; then PROFILE_DIR=debug; fi
           mkdir -p tests/performance/payload_size/target/release
           cp "tests/performance/payload_size/target/${PROFILE_DIR}/payload_backend" tests/performance/payload_size/target/release/payload_backend
@@ -177,8 +184,13 @@ jobs:
 
       - name: Run payload benchmark suite (${{ inputs.iterations }} iteration(s))
         timeout-minutes: 75
+        env:
+          CONTENT_TYPES: ${{ inputs.content_types }}
+          DURATION: ${{ inputs.duration }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          SIZES: ${{ inputs.sizes }}
+          ITERATIONS: ${{ inputs.iterations }}
         run: |
-          ITERATIONS=${{ inputs.iterations }}
           for run in $(seq 1 "$ITERATIONS"); do
             echo ""
             echo "============================================"
@@ -195,11 +207,11 @@ jobs:
 
             cd ${{ github.workspace }}/tests/performance/payload_size
             bash run_payload_test.sh \
-              "${{ inputs.content_types }}" \
+              "$CONTENT_TYPES" \
               --skip-build \
-              --duration "${{ inputs.duration }}" \
-              --concurrency "${{ inputs.concurrency }}" \
-              --sizes "${{ inputs.sizes }}" \
+              --duration "$DURATION" \
+              --concurrency "$CONCURRENCY" \
+              --sizes "$SIZES" \
               --json \
               --results-dir "/tmp/payload_results_run${run}" \
               2>&1 | tee /tmp/payload_bench_output_run${run}.txt
@@ -287,6 +299,11 @@ jobs:
       - name: Post benchmark summary
         if: always()
         env:
+          BUILD_PROFILE: ${{ inputs.build_profile }}
+          DURATION: ${{ inputs.duration }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          CONTENT_TYPES: ${{ inputs.content_types }}
+          SIZES: ${{ inputs.sizes }}
           NUM_ITERATIONS: ${{ inputs.iterations }}
         run: |
           python3 - benchmark-results/payload_results.json <<'PYEOF'
@@ -349,11 +366,11 @@ jobs:
           lines.append("## Payload Size Performance Benchmark Results\n")
           num_iterations = int(os.environ.get("NUM_ITERATIONS", "1"))
 
-          lines.append(f"**Profile:** `${{ inputs.build_profile }}` | "
-                       f"**Duration:** ${{ inputs.duration }}s | "
-                       f"**Concurrency:** ${{ inputs.concurrency }} | "
-                       f"**Content Types:** ${{ inputs.content_types }} | "
-                       f"**Sizes:** ${{ inputs.sizes }} | "
+          lines.append(f"**Profile:** `{os.environ['BUILD_PROFILE']}` | "
+                       f"**Duration:** {os.environ['DURATION']}s | "
+                       f"**Concurrency:** {os.environ['CONCURRENCY']} | "
+                       f"**Content Types:** {os.environ['CONTENT_TYPES']} | "
+                       f"**Sizes:** {os.environ['SIZES']} | "
                        f"**Iterations:** {num_iterations}\n")
 
           # ── Per-run detail tables ──

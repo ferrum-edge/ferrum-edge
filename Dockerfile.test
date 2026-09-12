@@ -61,7 +61,7 @@ ENV CARGO_PROFILE_TEST_DEBUG=line-tables-only
 # COPY into the build context. See `docs/upstream-*-patches/` for each
 # patch's lifecycle and retirement plan.
 COPY Cargo.toml Cargo.lock build.rs ./
-COPY build/protoc_preflight.rs ./build/
+COPY build/protoc_preflight.rs build/builtin_plugin_names.rs ./build/
 COPY proto ./proto
 COPY custom_plugins ./custom_plugins
 COPY vendor ./vendor

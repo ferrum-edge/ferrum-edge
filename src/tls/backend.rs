@@ -223,26 +223,24 @@ fn numeric_svid_generation_from_key(key: &str) -> Option<u64> {
 /// `format!` allocations during a rotation drain pass.
 #[derive(Debug, Clone)]
 pub struct SvidGenerationMatcher {
-    /// `"|svidg=<generation>"` — matches keys whose generation segment is the
-    /// final field of the pool key.
-    end_segment: String,
-    /// `"|svidg=<generation>#"` — matches keys whose generation segment is
-    /// followed by a shard separator (`#shard`) at the end.
-    mid_segment: String,
+    generation: String,
 }
 
 impl SvidGenerationMatcher {
     pub fn new(generation: u64) -> Self {
-        let end_segment = format!("|svidg={generation}");
-        let mid_segment = format!("{end_segment}#");
         Self {
-            end_segment,
-            mid_segment,
+            generation: generation.to_string(),
         }
     }
 
     pub fn matches(&self, key: &str) -> bool {
-        key.ends_with(&self.end_segment) || key.contains(&self.mid_segment)
+        // Reqwest appends |rcfg=... after the generation; H2/gRPC append
+        // #shard and H3 ends here. Compare the complete token, never a numeric
+        // prefix. As with numeric_svid_generation_from_key, the last generation
+        // field is authoritative if an earlier identity component resembles it.
+        key.rsplit_once("|svidg=").is_some_and(|(_, rest)| {
+            rest.split(['|', '#']).next() == Some(self.generation.as_str())
+        })
     }
 }
 
@@ -1426,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn svid_generation_matcher_anchors_segment_to_end_or_shard() {
+    fn svid_generation_matcher_uses_the_last_complete_generation_field() {
         let matcher = SvidGenerationMatcher::new(42);
 
         assert!(matcher.matches("backend|443|some|fields|svidg=42"));
@@ -1438,7 +1436,7 @@ mod tests {
         assert!(!matcher.matches("backend|443|some|fields|svidg=420"));
         assert!(!matcher.matches("backend|443|some|fields|svidg=static"));
 
-        // Embedded but not anchored at end-or-shard: no false positive.
+        // An earlier component must not override the final generation field.
         assert!(!matcher.matches("backend|443|svidg=42|some|fields|svidg=static"));
     }
 

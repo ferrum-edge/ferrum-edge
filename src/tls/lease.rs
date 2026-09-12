@@ -156,11 +156,29 @@ impl VersionedStoreFile for TlsLeaseStoreFile {
     }
 }
 
+/// Time source for persisted lease timestamps and liveness decisions.
+///
+/// Stores sharing a directory must use the same time basis. Production uses
+/// UTC wall time; tests can share a manually advanced clock across replicas.
+pub trait LeaseClock: std::fmt::Debug + Send + Sync {
+    fn now(&self) -> DateTime<Utc>;
+}
+
+#[derive(Debug)]
+struct SystemLeaseClock;
+
+impl LeaseClock for SystemLeaseClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
 /// Shared lease table for one managed-TLS store directory.
 #[derive(Debug)]
 pub struct TlsLeaseStore {
     holder: String,
     file: SharedStoreFile<TlsLeaseStoreFile>,
+    clock: Arc<dyn LeaseClock>,
 }
 
 impl TlsLeaseStore {
@@ -181,6 +199,16 @@ impl TlsLeaseStore {
         dir: impl Into<PathBuf>,
         holder: String,
     ) -> Result<Self, TlsLeaseError> {
+        Self::open_with_holder_and_clock(dir, holder, Arc::new(SystemLeaseClock))
+    }
+
+    /// Open with an explicit clock, allowing tests to control lease expiry
+    /// independently of thread scheduling. Store locking still uses real time.
+    pub fn open_with_holder_and_clock(
+        dir: impl Into<PathBuf>,
+        holder: String,
+        clock: Arc<dyn LeaseClock>,
+    ) -> Result<Self, TlsLeaseError> {
         let holder = validate_instance_id(&holder).map_err(TlsLeaseError::InvalidInstanceId)?;
         let dir = dir.into();
         if dir.as_os_str().is_empty() {
@@ -188,7 +216,7 @@ impl TlsLeaseStore {
                 "store directory must not be empty".to_string(),
             ));
         }
-        std::fs::create_dir_all(&dir).map_err(|error| {
+        crate::tls::store_dir::create_private_store_dir(&dir).map_err(|error| {
             TlsLeaseError::InvalidPath(format!(
                 "failed to create TLS lease store directory '{}': {error}",
                 dir.display()
@@ -198,7 +226,11 @@ impl TlsLeaseStore {
             dir.join(LEASE_STORE_FILE_NAME),
             TlsPersistentStoreKind::Leases,
         )?;
-        Ok(Self { holder, file })
+        Ok(Self {
+            holder,
+            file,
+            clock,
+        })
     }
 
     pub fn holder(&self) -> &str {
@@ -231,7 +263,7 @@ impl TlsLeaseStore {
         let holder = self.holder.clone();
         let name_owned = name.to_string();
         let fence = self.file.mutate_if::<_, TlsLeaseError>(move |document| {
-            let now = Utc::now();
+            let now = self.clock.now();
             if let Some(existing) = document.leases.get(&name_owned)
                 && existing.is_live_at(now)
             {
@@ -276,7 +308,7 @@ impl TlsLeaseStore {
     /// and extending the claim would be wrong.
     pub fn is_owner(&self, name: &str, fence: u64) -> Result<bool, TlsLeaseError> {
         let document = self.file.snapshot()?;
-        let now = Utc::now();
+        let now = self.clock.now();
         Ok(document.leases.get(name).is_some_and(|existing| {
             existing.holder == self.holder && existing.fence == fence && existing.is_live_at(now)
         }))
@@ -298,7 +330,7 @@ impl TlsLeaseStore {
         let holder = self.holder.clone();
         let name = name.to_string();
         let renewed = self.file.mutate_if::<_, TlsLeaseError>(move |document| {
-            let now = Utc::now();
+            let now = self.clock.now();
             let Some(existing) = document.leases.get_mut(&name) else {
                 return Ok((false, false));
             };
@@ -350,7 +382,7 @@ impl TlsLeaseStore {
         let holder = self.holder.clone();
         let name = name.to_string();
         self.file.mutate_if::<_, TlsLeaseError>(move |document| {
-            let now = Utc::now();
+            let now = self.clock.now();
             let owned = document.leases.get(&name).is_some_and(|existing| {
                 existing.holder == holder && existing.fence == fence && existing.is_live_at(now)
             });
@@ -375,7 +407,7 @@ impl TlsLeaseStore {
             }
             // Retain the record with an elapsed expiry rather than deleting it,
             // so the fence keeps advancing monotonically for this name.
-            existing.expires_at = Utc::now();
+            existing.expires_at = self.clock.now();
             Ok((true, true))
         })?;
         Ok(released)

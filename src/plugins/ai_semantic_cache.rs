@@ -78,6 +78,7 @@ use super::utils::auth_flow::constant_time_eq;
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::byte_budget::{ByteBudget, ByteLease};
 use super::utils::cache_headers::sanitize_cached_headers;
+use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::redis_rate_limiter::{
     BoundedRedisValue, REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
@@ -123,8 +124,9 @@ fn staging_metadata_key(instance_id: u64, suffix: &str) -> String {
 /// preimage of another. The `v2` suffixes mark the move from raw `:`/`|`/`\n`
 /// delimiter concatenation to canonical length framing: keys minted under the
 /// old encoding are unreachable, which is the intended fail-closed outcome.
-const AI_SEMANTIC_CACHE_EXACT_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-exact-v2";
-const AI_SEMANTIC_CACHE_SCOPE_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-scope-v2";
+/// v3 also binds provider context outside the modeled prompt/control fields.
+const AI_SEMANTIC_CACHE_EXACT_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-exact-v3";
+const AI_SEMANTIC_CACHE_SCOPE_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-scope-v3";
 const AI_SEMANTIC_CACHE_CALLER_DOMAIN: &str = "ferrum-ai-semantic-cache-caller-v1";
 /// Effective destination under the shared canonical contract
 /// (`replay_partition::append_destination_partition`), which binds the proxy
@@ -435,9 +437,8 @@ struct SemanticConfig {
     /// the endpoint uses a literal IP and requires no DNS lookup.
     warmup_hostname: Option<String>,
     model: Option<String>,
-    api_key: Option<String>,
-    auth_header: String,
-    auth_scheme: String,
+    auth_header: reqwest::header::HeaderName,
+    auth_value: Option<reqwest::header::HeaderValue>,
     input_type: Option<String>,
     output_dimension: Option<usize>,
     similarity_threshold: f32,
@@ -1291,6 +1292,9 @@ impl AiSemanticCache {
     }
 
     fn set_cache_status(&self, ctx: &mut RequestContext, status: &str) {
+        if status == "HIT" {
+            ctx.semantic_cache_response_replay = true;
+        }
         ctx.metadata
             .insert(self.meta_status.clone(), status.to_string());
     }
@@ -1592,13 +1596,8 @@ impl AiSemanticCache {
             .timeout(semantic.request_timeout)
             .json(&payload);
 
-        if let Some(api_key) = &semantic.api_key {
-            let header_value = if semantic.auth_scheme.is_empty() {
-                api_key.clone()
-            } else {
-                format!("{} {}", semantic.auth_scheme, api_key)
-            };
-            request = request.header(semantic.auth_header.as_str(), header_value);
+        if let Some(auth_value) = &semantic.auth_value {
+            request = request.header(semantic.auth_header.clone(), auth_value.clone());
         }
 
         let response = self
@@ -2565,6 +2564,15 @@ fn start_key_part(buffer: &str, has_part: &mut KeyParts) {
 fn classify_cache_request_family(body: &Value) -> Option<CacheRequestFamily> {
     let object = body.as_object()?;
 
+    // Provider-managed contexts can evolve independently of this request and
+    // may require provider-side effects. They remain outside replay admission.
+    if ["conversation", "cachedContent", "cached_content"]
+        .iter()
+        .any(|field| object.contains_key(*field))
+    {
+        return None;
+    }
+
     let has_messages = object.get("messages").is_some_and(|value| value.is_array());
     let has_gemini_markers = object.contains_key("contents")
         || object.contains_key("systemInstruction")
@@ -2688,9 +2696,10 @@ fn append_identity_key_parts(
     // outbound map and the query is `request_transformer`'s published outbound
     // query, so this is genuinely what the provider will see rather than the
     // pre-transform request. Credential values are digested inside the
-    // partition; no secret enters the assembled `String`.
+    // partition; no secret enters the assembled `String`. Body length and
+    // content coding are excluded because the normalized JSON is keyed below.
     let mut request = PartitionHasher::new(AI_SEMANTIC_CACHE_REQUEST_DOMAIN);
-    replay_partition::append_request_context_partition(&mut request, ctx, request_headers);
+    replay_partition::append_semantic_request_context_partition(&mut request, ctx, request_headers);
     start_key_part(key_input, has_part);
     key_input.push_str("req:");
     key_input.push_str(&request.hex());
@@ -2801,6 +2810,7 @@ fn append_family_shape_fields(
     key_input: &mut String,
     has_part: &mut KeyParts,
 ) {
+    append_family_extra_context(family, body, key_input, has_part);
     match family {
         CacheRequestFamily::Messages
         | CacheRequestFamily::Responses
@@ -2830,6 +2840,107 @@ fn append_family_shape_fields(
     if let Some(stream) = body.get("stream") {
         start_key_part(key_input, has_part);
         let _ = write!(key_input, "stream:{}", canonical_json_for_key(stream));
+    }
+}
+
+/// Conservatively bind unmodeled root context. Only fields already owned by
+/// prompt, instruction, model, or generation-control extraction are excluded;
+/// unknown extensions stay byte-preserving in both exact and semantic scopes.
+fn append_family_extra_context(
+    family: CacheRequestFamily,
+    body: &Value,
+    key_input: &mut String,
+    has_part: &mut KeyParts,
+) {
+    let Some(object) = body.as_object() else {
+        return;
+    };
+    let excluded: &[&str] = match family {
+        CacheRequestFamily::Messages => &[
+            "messages",
+            "system",
+            "preamble",
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "max_new_tokens",
+            "top_k",
+            "inferenceConfig",
+        ],
+        CacheRequestFamily::Responses => &[
+            "input",
+            "instructions",
+            "previous_response_id",
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "max_new_tokens",
+        ],
+        CacheRequestFamily::Gemini => &[
+            "contents",
+            "systemInstruction",
+            "system_instruction",
+            "generationConfig",
+        ],
+        CacheRequestFamily::Cohere => &[
+            "chat_history",
+            "message",
+            "preamble",
+            "temperature",
+            "top_p",
+            "p",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "max_new_tokens",
+            "k",
+            "stop_sequences",
+            "frequency_penalty",
+            "presence_penalty",
+            "raw_prompting",
+            "return_likelihoods",
+            "safety_mode",
+            "prompt_truncation",
+            "max_input_tokens",
+        ],
+        CacheRequestFamily::LegacyPrompt => &[
+            "prompt",
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "max_new_tokens",
+        ],
+        CacheRequestFamily::Tgi => &["inputs", "parameters"],
+        CacheRequestFamily::Titan => &["inputText", "textGenerationConfig"],
+    };
+    let shape_fields = match family {
+        CacheRequestFamily::Messages
+        | CacheRequestFamily::Responses
+        | CacheRequestFamily::LegacyPrompt => RESPONSE_SHAPE_FIELDS,
+        CacheRequestFamily::Gemini => GEMINI_SHAPE_FIELDS,
+        CacheRequestFamily::Cohere => COHERE_SHAPE_FIELDS,
+        CacheRequestFamily::Tgi | CacheRequestFamily::Titan => &[],
+    };
+    let mut fields: Vec<_> = object
+        .iter()
+        .filter(|(field, _)| {
+            !matches!(field.as_str(), "model" | "stream")
+                && !excluded.contains(&field.as_str())
+                && !shape_fields.contains(&field.as_str())
+        })
+        .collect();
+    fields.sort_unstable_by_key(|(field, _)| *field);
+    for (field, value) in fields {
+        start_key_part(key_input, has_part);
+        key_input.push_str("context:");
+        append_len_prefixed(key_input, field);
+        append_len_prefixed(key_input, &canonical_json_for_key(value));
     }
 }
 
@@ -2927,10 +3038,12 @@ fn append_object_state(
     key_input: &mut String,
 ) {
     key_input.push('{');
-    for (field, value) in object {
-        if excluded_fields.contains(&field.as_str()) {
-            continue;
-        }
+    let mut fields: Vec<_> = object
+        .iter()
+        .filter(|(field, _)| !excluded_fields.contains(&field.as_str()))
+        .collect();
+    fields.sort_unstable_by_key(|(field, _)| *field);
+    for (field, value) in fields {
         append_len_prefixed(key_input, field);
         key_input.push('=');
         key_input.push_str(&canonical_json_for_key(value));
@@ -3371,6 +3484,19 @@ fn append_family_instruction_scope(
             }
         }
         CacheRequestFamily::Cohere => {
+            if let Some(history) = body.get("chat_history").and_then(Value::as_array) {
+                for message in history {
+                    if message
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .is_some_and(|role| role.eq_ignore_ascii_case("system"))
+                    {
+                        start_key_part(key_input, has_part);
+                        key_input.push_str("history_instruction:");
+                        append_len_prefixed(key_input, &canonical_json_for_key(message));
+                    }
+                }
+            }
             if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
                 let normalized = normalize_text(preamble);
                 if !normalized.is_empty() {
@@ -4221,8 +4347,14 @@ fn build_openai_embedding_payload(semantic: &SemanticConfig, input: &str) -> Val
 
 fn build_embedding_request_payload(semantic: &SemanticConfig, input: &str) -> Value {
     match semantic.provider {
-        EmbeddingProvider::OpenAi | EmbeddingProvider::AzureOpenAi | EmbeddingProvider::Mistral => {
+        EmbeddingProvider::OpenAi | EmbeddingProvider::AzureOpenAi => {
             build_openai_embedding_payload(semantic, input)
+        }
+        EmbeddingProvider::Mistral => {
+            let mut payload = json!({ "input": input });
+            insert_optional_model(&mut payload, &semantic.model);
+            insert_optional_dimension(&mut payload, "output_dimension", semantic.output_dimension);
+            payload
         }
         EmbeddingProvider::Voyage => {
             let mut payload = json!({ "input": input });
@@ -5088,6 +5220,35 @@ impl Plugin for AiSemanticCache {
             );
             return PluginResult::Continue;
         }
+        // Final observers see the transport-encoded representation on both
+        // buffered HTTP and native H3. Retain plaintext so synthetic replay can
+        // pass through the live compression policy exactly once.
+        let mut encodings = response_headers.iter().filter_map(|(name, value)| {
+            name.eq_ignore_ascii_case("content-encoding")
+                .then_some(value.as_str())
+        });
+        let encoding = encodings.next();
+        if encodings.next().is_some() {
+            debug!("ai_semantic_cache: skipping ambiguous response content encoding");
+            return PluginResult::Continue;
+        }
+        let decoded = match decode_content_encoding(
+            encoding,
+            body,
+            DecodeLimits {
+                max_decoded_bytes: self.max_entry_size_bytes,
+                max_cumulative_bytes: self.max_entry_size_bytes.saturating_mul(2),
+                max_codings: 2,
+                max_amplification_ratio: 100,
+            },
+        ) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                debug!("ai_semantic_cache: response content decoding failed or exceeded limits");
+                return PluginResult::Continue;
+            }
+        };
+        let body = decoded.as_ref();
         if serde_json::from_slice::<Value>(body).is_err() {
             debug!("ai_semantic_cache: skipping syntactically invalid JSON response");
             return PluginResult::Continue;
@@ -5098,7 +5259,26 @@ impl Plugin for AiSemanticCache {
         // original response would otherwise be replayed verbatim to every
         // cache-hit consumer — leaking session state and misleading
         // downstream clients about their own rate-limit/trace context.
-        let safe_headers = sanitize_cached_headers(response_headers);
+        let mut safe_headers = sanitize_cached_headers(response_headers);
+        if encoding.is_some() {
+            // Validators and lengths describe the encoded representation, not
+            // the decoded body we retain. Never replay them with different bytes.
+            safe_headers.retain(|name, _| {
+                ![
+                    "content-encoding",
+                    "content-length",
+                    "etag",
+                    "content-md5",
+                    "digest",
+                    "content-digest",
+                    "repr-digest",
+                    "content-range",
+                    "accept-ranges",
+                ]
+                .iter()
+                .any(|header| name.eq_ignore_ascii_case(header))
+            });
+        }
         // Consume this instance's staging only after admission succeeds so
         // early skips leave siblings untouched and leave this instance's
         // markers intact if a later retry path re-enters the hook.
@@ -5387,10 +5567,30 @@ fn parse_semantic_config(
     let timeout_ms =
         optional_positive_u64(config, "semantic_embedding_timeout_ms")?.unwrap_or(5_000);
 
-    reqwest::header::HeaderName::from_bytes(auth_header.as_bytes()).map_err(|_| {
-        "ai_semantic_cache: 'semantic_embedding_auth_header' must be a valid HTTP header name"
+    let auth_header =
+        reqwest::header::HeaderName::from_bytes(auth_header.as_bytes()).map_err(|_| {
+            "ai_semantic_cache: 'semantic_embedding_auth_header' must be a valid HTTP header name"
+                .to_string()
+        })?;
+    reqwest::header::HeaderValue::from_str(&auth_scheme).map_err(|_| {
+        "ai_semantic_cache: 'semantic_embedding_auth_scheme' must be a valid HTTP header value"
             .to_string()
     })?;
+    let auth_value = api_key
+        .map(|api_key| {
+            let value = if auth_scheme.is_empty() {
+                api_key
+            } else {
+                format!("{auth_scheme} {api_key}")
+            };
+            let mut value = reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
+                "ai_semantic_cache: 'semantic_embedding_api_key' must form a valid HTTP header value"
+                    .to_string()
+            })?;
+            value.set_sensitive(true);
+            Ok::<_, String>(value)
+        })
+        .transpose()?;
 
     if !enabled {
         return Ok(None);
@@ -5408,9 +5608,8 @@ fn parse_semantic_config(
         redacted_endpoint: validated_endpoint.redacted,
         warmup_hostname: validated_endpoint.warmup_hostname,
         model,
-        api_key,
         auth_header,
-        auth_scheme,
+        auth_value,
         input_type,
         output_dimension,
         similarity_threshold,
@@ -5863,9 +6062,11 @@ mod tests {
             redacted_endpoint: "http://127.0.0.1:1/embeddings".to_string(),
             warmup_hostname: None,
             model: Some("test-embedding-model".to_string()),
-            api_key: Some("test-key".to_string()),
-            auth_header: provider.default_auth_header().to_string(),
-            auth_scheme: provider.default_auth_scheme().to_string(),
+            auth_header: reqwest::header::HeaderName::from_bytes(
+                provider.default_auth_header().as_bytes(),
+            )
+            .unwrap(),
+            auth_value: None,
             input_type: Some("SEMANTIC_SIMILARITY".to_string()),
             output_dimension: Some(256),
             similarity_threshold: 0.95,
@@ -6041,8 +6242,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn admit_redis_hit_reapplies_store_admission_and_sanitizes() {
+    #[tokio::test]
+    async fn admit_redis_hit_reapplies_store_admission_and_sanitizes() {
+        use std::io::Write;
+
+        // Exercise the store -> sealed wire envelope -> L2 admission path using
+        // an encoded origin response, independently of a live Redis service.
+        let cache = AiSemanticCache::new(
+            &json!({"redis_integrity_key": TEST_INTEGRITY_KEY}),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        ctx.metadata
+            .insert(cache.meta_cache_key.clone(), "encoded-response".to_string());
+        let plaintext = br#"{"answer":"Paris"}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plaintext).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-encoding".to_string(), "gzip".to_string()),
+        ]);
+        cache
+            .on_final_response_body(&mut ctx, 200, &headers, &encoded)
+            .await;
+        let local = cache.cache.get("encoded-response").unwrap();
+        let sealed = cache
+            .seal_redis_entry(TEST_REDIS_KEY, 200, &local.headers, &local.body)
+            .unwrap();
+        let wire = serde_json::to_vec(&sealed).unwrap();
+        let hit = cache
+            .admit_redis_hit(serde_json::from_slice(&wire).unwrap(), TEST_REDIS_KEY)
+            .unwrap();
+        assert_eq!(hit.body.as_ref(), plaintext);
+        assert!(!hit.headers.contains_key("content-encoding"));
+        assert!(
+            cache
+                .admit_redis_hit(serde_json::from_slice(&wire).unwrap(), "different-key")
+                .is_none()
+        );
+
         let split_headers = HashMap::from([
             ("a".to_string(), "1".to_string()),
             ("b".to_string(), "2".to_string()),

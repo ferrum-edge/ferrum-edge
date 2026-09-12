@@ -11,6 +11,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_otel_ldap
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::probe_gateway_identity;
 use hickory_resolver::proto::{
     op::Message,
@@ -61,7 +63,7 @@ struct RebindingDnsServer {
 
 impl RebindingDnsServer {
     async fn spawn(initial_answers: Vec<IpAddr>) -> Self {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
             .await
             .expect("bind functional DNS server");
         let addr = socket.local_addr().expect("functional DNS address");
@@ -166,6 +168,7 @@ fn start_gateway_with_dns(
     let binary_path = gateway_binary_path();
 
     let mut command = std::process::Command::new(binary_path);
+    command.arg("run");
     command
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
@@ -281,16 +284,20 @@ async fn start_otel_gateway_with_retry(
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         // Allocate fresh ports each attempt
-        let backend_listener = TcpListener::bind("127.0.0.1:0")
+        let backend_listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let backend_port = backend_listener.local_addr().unwrap().port();
 
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let proxy_listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind admin");
+        let admin_listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind admin");
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
@@ -552,21 +559,27 @@ async fn start_ldap_gateway_with_retry(
 ) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let backend_listener = TcpListener::bind("127.0.0.1:0")
+        let backend_listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let backend_port = backend_listener.local_addr().unwrap().port();
 
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let proxy_listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind admin");
+        let admin_listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind admin");
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
         // Use a port that we do NOT listen on — guaranteeing LDAP connection failure
-        let ldap_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ldap");
+        let ldap_listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind ldap");
         let ldap_port = ldap_listener.local_addr().unwrap().port();
         drop(ldap_listener);
 
@@ -649,15 +662,19 @@ async fn start_ldap_rebinding_gateway_with_retry(
 ) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let backend_listener = TcpListener::bind("127.0.0.1:0")
+        let backend_listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind rebind-test backend");
         let backend_port = backend_listener.local_addr().unwrap().port();
 
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let proxy_listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind admin");
+        let admin_listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind admin");
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
@@ -750,6 +767,7 @@ plugin_configs:
     config:
       ldap_url: "ldap://127.0.0.1:{ldap_port}"
       bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
+      canonical_identity_attribute: "uid"
 "#;
 
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
@@ -824,6 +842,7 @@ plugin_configs:
     config:
       ldap_url: "ldap://127.0.0.1:{ldap_port}"
       bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
+      canonical_identity_attribute: "uid"
 "#;
 
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
@@ -862,7 +881,7 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn test_ldap_auth_blocks_dial_time_dns_rebind() {
-    let ldap_listener = TcpListener::bind("127.0.0.1:0")
+    let ldap_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind LDAP rebind sentinel");
     let ldap_port = ldap_listener
@@ -893,6 +912,7 @@ plugin_configs:
     config:
       ldap_url: "ldap://directory.test:{ldap_port}"
       bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
+      canonical_identity_attribute: "uid"
       allow_plaintext: true
       connect_timeout_seconds: 1
 "#;

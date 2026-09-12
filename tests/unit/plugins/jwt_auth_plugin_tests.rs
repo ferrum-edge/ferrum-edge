@@ -875,3 +875,101 @@ async fn test_jwt_auth_malformed_repeated_line_cannot_hide_behind_materialized_v
     assert_reject_body(result, r#"{"error":"Invalid JWT token"}"#);
     assert!(ctx.identified_consumer.is_none());
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #5020 — `token_lookup` must name a location a request can satisfy
+// ────────────────────────────────────────────────────────────────────
+
+/// `jwt_auth` is fail-closed, so a credential location no request could ever
+/// carry publishes a route that answers every request `401` while `validate`,
+/// the admin API, and DP/CP admission all report the configuration as good.
+/// The contract mirrors `key_auth`'s `key_location` (closed by #2201).
+#[test]
+fn token_lookup_rejects_locations_no_request_can_satisfy() {
+    for token_lookup in [
+        "header:x bad",
+        "header:x\ty",
+        "header:x:y",
+        "header:x\u{7f}y",
+        "header:Authorization ",
+        " header:Authorization",
+        "header: Authorization",
+        "query:a b",
+        "query:   ",
+        "query:token ",
+    ] {
+        let error = JwtAuth::new(&json!({"token_lookup": token_lookup}))
+            .err()
+            .unwrap_or_else(|| panic!("token_lookup {token_lookup:?} must be refused"));
+        assert!(
+            error.contains("token_lookup"),
+            "unexpected error for {token_lookup:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn token_lookup_admits_valid_header_and_query_locations() {
+    for token_lookup in [
+        "header:Authorization",
+        "header:X-Token",
+        "header:X-Tenant_Key~V2",
+        "query:token",
+        "query:tenant-key.v2",
+    ] {
+        JwtAuth::new(&json!({"token_lookup": token_lookup}))
+            .unwrap_or_else(|_| panic!("token_lookup {token_lookup:?} must be admitted"));
+    }
+}
+
+/// The redaction list is built from the canonical (lowercased) header name, so
+/// a mixed-case configuration still redacts the field it reads.
+#[test]
+fn token_lookup_header_redaction_uses_the_canonical_name() {
+    let config = json!({"token_lookup": "header:X-Tenant_Key~V2"});
+    let plugin = JwtAuth::new(&config).expect("valid custom header location");
+    assert_eq!(plugin.request_headers_to_redact(), &["x-tenant_key~v2"]);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #5019 — HTTP/3 query decoding parity (sibling of #2200)
+// ────────────────────────────────────────────────────────────────────
+
+/// HTTP/3 materializes decoded query parameters only for plugins that declare
+/// they need them; H1/H2 always decode. Without the declaration the same URL
+/// authenticates over H1/H2 and returns `401` over H3 as soon as the parameter
+/// name or the token carries percent-encoding.
+#[test]
+fn query_token_lookup_requires_decoded_query_params() {
+    for (config, expected) in [
+        (json!({"token_lookup": "query:token"}), true),
+        (json!({"token_lookup": "header:Authorization"}), false),
+        (json!({"token_lookup": "header:X-Token"}), false),
+        (json!({}), false),
+    ] {
+        let plugin = JwtAuth::new(&config).expect("valid token_lookup");
+        assert_eq!(
+            plugin.requires_decoded_query_params(),
+            expected,
+            "unexpected H3 decoded-query capability for {config}"
+        );
+    }
+}
+
+/// The decoded view is what the plugin reads, so a percent-encoded parameter
+/// name and a percent-encoded token both authenticate once H3 materializes it.
+#[tokio::test]
+async fn percent_encoded_query_credentials_authenticate_from_the_decoded_view() {
+    let plugin = JwtAuth::new(&json!({"token_lookup": "query:token"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let token = create_jwt_token(&json!({"sub": "testuser"}), "test-jwt-secret");
+
+    let mut ctx = make_ctx();
+    // The decoded view HTTP/3 now materializes for this plugin: the client sent
+    // `?t%6fken=<jwt with %2E for its dots>`, which H1/H2 always decoded.
+    ctx.query_params.insert("token".to_string(), token);
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_some());
+}

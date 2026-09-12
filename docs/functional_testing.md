@@ -307,11 +307,28 @@ Then start CP/DP modes normally. The database connection will use TLS.
 
 ## Subprocess Harness Process Identity
 
-`tests/common/gateway_harness.rs` reserves the admin and proxy ports by
-binding `127.0.0.1:0` and dropping the listener, so between reservation
-and the child's own bind another gateway running in a parallel test can
-claim either port. Neither readiness nor a bare TCP accept can tell them
-apart — every gateway serves the same unauthenticated `/health` body.
+All functional and integration socket allocations share
+`tests/scaffolding/port_registry.rs`. An advisory allocation lock serializes
+binding and lease-table updates under `target/test-port-leases-v1` (or
+`CARGO_TARGET_DIR`). Separate advisory owner locks track process liveness;
+the next allocation reclaims a dead owner's ports, including after an abrupt
+nextest termination. TCP, UDP, IPv4, IPv6 and wildcard listeners share one
+port-number namespace, so a wildcard fixture cannot capture another test's
+promised gateway port. No test may bind a hard-coded, derived or self-probed port.
+
+Use `reserve_port` / `reserve_udp_port` / `reserve_colocated_tcp_udp` and keep
+the bound socket. Native socket fixtures use `TestSocket::bind_test` with port
+zero; DTLS fixtures use `ports::bind_dtls`. Drop releases unused reservations.
+Transferring a native socket with `into_listener` / `into_socket`, or releasing
+only the socket with `drop_and_take_port`, retains the lease until process exit.
+The bare-port helpers have the same retention contract. This spans a whole
+nextest test; libtest conservatively retains transferred ports across all tests
+in its process. Do not delete registry files during a test run.
+
+`tests/common/gateway_harness.rs` uses these leases for gateway handoffs and
+keeps its bounded startup retries for unrelated OS users that do not participate
+in the registry. Neither readiness nor a bare TCP accept establishes identity:
+every gateway serves the same unauthenticated `/health` body.
 
 `TestGatewayBuilder::spawn` therefore mints per-spawn-attempt credentials
 (admin JWT secret/issuer plus `FERRUM_METRICS_BEARER_TOKEN`) and treats
@@ -348,6 +365,56 @@ exported `probe_gateway_identity` in `wait_for_owned_gateway`, because a
 bare TCP accept let an unrelated H2 fixture that had claimed the released
 proxy port answer the RFC 8441 Extended CONNECT handshake and reset it
 with `PROTOCOL_ERROR` (issue #3435).
+
+## Spawned Gateway Teardown
+
+A `std::process::Child` does **not** kill its process when it is dropped. A
+bespoke spawner that only calls `shutdown_gateway(...)` on the happy path
+therefore leaks a live gateway on every early exit — an assertion panic, an
+early `return`, a `?` — and that orphan keeps its listen ports, reparented to
+init, contaminating every later run on a fixture with fixed ports (issue #4991).
+
+`tests/common/gateway_harness.rs` exports `GatewayChildGuard` for those
+spawners: wrap the child at the instant it is spawned, borrow it through
+`child_mut()` for `try_wait` readiness probes, and call `shutdown()` where the
+test wants a graceful teardown. `shutdown()` is idempotent and `Drop` runs it,
+so teardown is a property of scope rather than of reaching the last line.
+`TestGateway` already has the equivalent `Drop`. The contract is covered by
+`functional_tcp_proxy_test::test_gateway_guard_reaps_the_child_on_a_panicking_fixture`,
+which starts a real gateway, proves it relays, then panics inside
+`catch_unwind` and asserts both that the child is reaped and that its ports are
+bindable again.
+
+## Host-Dependent Socket Fixtures
+
+Three socket behaviours that Linux fixtures routinely assume are not portable
+to the macOS hosts developers build on (issue #4983). Fixtures must either
+avoid them or report the missing prerequisite explicitly — never fail as though
+the gateway were at fault:
+
+- **Secondary loopback addresses.** Linux assigns all of `127.0.0.0/8` to `lo`,
+  so `127.0.0.2` always binds. macOS assigns only `127.0.0.1` to `lo0`, and
+  binding an alias fails with `EADDRNOTAVAIL`. Where the fixture needs two
+  distinct *listen* identities, IPv6 loopback (`::1`) is the portable stand-in;
+  where it needs two IPv4 *source* addresses or two A records on one port
+  (`http2_pool_tests`, the per-source TCP cap, the UDP hook-concurrency gate),
+  probe for an alias and skip with a message naming the prerequisite. Note that
+  UDP sessions are keyed by the full client `SocketAddr`, so per-session
+  isolation only needs a second ephemeral **port**, not a second address.
+- **Refused connects.** A bound-but-unlistened TCP socket answers a SYN with
+  RST on Linux; Darwin drops it, so the connect hangs until the caller's own
+  timeout. `tests/scaffolding/ports.rs` states this as
+  `REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY`; the reservation's *ownership*
+  guarantee is unconditional, its observable failure category is not.
+- **Datagram ceilings.** macOS defaults `net.inet.udp.maxdgram` to 9216, so a
+  ~16 KiB datagram — including the record a max-size DTLS plaintext produces —
+  fails with `EMSGSIZE` before it leaves the socket. Size in-limit transport
+  probes under that ceiling and assert local size gates separately from
+  transport.
+
+Also beware `SO_REUSEADDR`: on Darwin a `127.0.0.1` listener and a `0.0.0.0`
+listener can hold one port at the same time. A fixture whose precondition is
+"the gateway cannot bind" must contest the *same* address the gateway uses.
 
 ## In-Process Test Harness
 

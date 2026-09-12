@@ -309,6 +309,39 @@ async fn reconcile_replaces_only_the_upstream_whose_discovery_config_changed() {
 }
 
 #[tokio::test]
+async fn reconcile_replaces_kubernetes_task_when_address_family_changes() {
+    let _guard = isolated().await;
+    let sd: ServiceDiscoveryConfig = serde_json::from_value(serde_json::json!({
+        "provider": "kubernetes",
+        "kubernetes": {"service_name": "api", "address_type": "IPv4"}
+    }))
+    .unwrap();
+    let config = config_with(vec![upstream_with_sd("family", Vec::new(), Some(sd))]);
+    let manager = manager(&config);
+    manager.start(&config, None);
+    let first = health::generation_for_test(&task_key("family")).expect("task registered");
+    manager.reconcile(&config, None);
+    assert_eq!(
+        health::generation_for_test(&task_key("family")),
+        Some(first)
+    );
+
+    let mut changed = config.clone();
+    changed.upstreams[0]
+        .service_discovery
+        .as_mut()
+        .unwrap()
+        .kubernetes
+        .as_mut()
+        .unwrap()
+        .address_type = Some(ferrum_edge::config::types::KubernetesAddressType::Ipv6);
+    manager.reconcile(&changed, None);
+    let replacement = health::generation_for_test(&task_key("family")).expect("replacement task");
+    assert_ne!(replacement, first);
+    manager.stop();
+}
+
+#[tokio::test]
 async fn reconcile_replaces_a_task_whose_static_targets_changed() {
     let _guard = isolated().await;
 
@@ -966,6 +999,12 @@ async fn a_replacement_generation_cannot_register_during_a_fenced_withdrawal() {
 #[tokio::test(start_paused = true)]
 async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elapses() {
     let _guard = isolated().await;
+    let poll_interval = 1;
+    let configured_max_stale = 3;
+    let resolved_max_stale =
+        health::resolve_staleness(configured_max_stale, SdStalePolicy::Withdraw, poll_interval)
+            .max_stale
+            .expect("a nonzero staleness bound must resolve to a finite duration");
 
     let statics = vec![target("static.local", 9000)];
     let config = config_with(vec![upstream_with_sd(
@@ -999,8 +1038,8 @@ async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elap
         DnsCache::new(Default::default()),
         statics,
         LoadBalancerAlgorithm::RoundRobin,
-        1,
-        3,
+        poll_interval,
+        configured_max_stale,
         SdStalePolicy::Withdraw,
         1,
     );
@@ -1024,23 +1063,24 @@ async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elap
     );
 
     // Park the poller inside discover() so the registry stops answering, then
-    // supersede it exactly as a reconcile would — before its 3s staleness bound
-    // elapses. A deadline armed before the replacement registered still reaches
-    // the expiry path, where the fence must refuse it.
+    // supersede it exactly as a reconcile would — before its resolved staleness
+    // bound elapses. A deadline armed before the replacement registered still
+    // reaches the expiry path, where the fence must refuse it.
     hang.store(true, Ordering::SeqCst);
-    // Next poll is 1s out; the 3s bound is still in the future. Advance only
-    // the poll interval so the hung discover() samples its deadline while
-    // generation 1 still owns the key.
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    // Advance only the poll interval so the hung discover() samples its deadline
+    // while generation 1 still owns the key.
+    let poll_advance = std::time::Duration::from_secs(poll_interval);
+    tokio::time::advance(poll_advance).await;
     assert!(
         wait_for_progress(|| calls.load(Ordering::SeqCst) >= 2).await,
         "the poller must park inside discover() with its pre-supersession deadline armed"
     );
     health::register_task_for_test(&task.key, 99, "scripted", scripted_staleness());
 
-    // Remaining window after the 1s poll advance. The fence must refuse the
-    // deadline that was armed while generation 1 still owned the key.
-    let withdrew = wait_for_deadline_action(std::time::Duration::from_secs(2), || {
+    // Cross the resolved deadline after accounting for the poll advance. The
+    // fence must refuse the deadline armed while generation 1 owned the key.
+    let remaining_stale_window = resolved_max_stale - poll_advance;
+    let withdrew = wait_for_deadline_action(remaining_stale_window, || {
         metrics.service_discovery_stale_withdrawals_total() > withdrawals_before
             || health::expiry_applied_for_test(&task.key) == Some(true)
             || !lb_has_host(
@@ -2594,4 +2634,358 @@ async fn service_discovery_target_churn_reclaims_circuit_breaker_entries() {
         0,
         "reclaimed entries mean the ceiling is never reached in this churn pattern"
     );
+}
+
+/// Own the listener and every accepted connection so a failed assertion cannot
+/// strand a gateway task in another lifecycle test.
+struct PassiveReloadGateway {
+    url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PassiveReloadGateway {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn passive_reload_gateway(state: ferrum_edge::proxy::ProxyState) -> PassiveReloadGateway {
+    let reservation = crate::scaffolding::ports::reserve_port().await.unwrap();
+    let url = format!("http://127.0.0.1:{}", reservation.port);
+    let listener = reservation.into_listener();
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, remote) = accepted.unwrap();
+                    let state = state.clone();
+                    connections.spawn(async move {
+                        let service = hyper::service::service_fn(move |request| {
+                            ferrum_edge::proxy::handle_proxy_request(
+                                request, state.clone(), remote, false, None, None,
+                            )
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+                _ = connections.join_next(), if !connections.is_empty() => {}
+            }
+        }
+    });
+    // The fixture owns the bound listener already; the first request is the
+    // barrier and cannot reach an unrelated process.
+    PassiveReloadGateway { url, task }
+}
+
+async fn apply_passive_reload(state: &ferrum_edge::proxy::ProxyState, incremental: bool) {
+    use ferrum_edge::config::db_loader::IncrementalResult;
+    use ferrum_edge::proxy::ConfigApplyOutcome;
+
+    let mut next = (*state.config.load_full()).clone();
+    let filler = next
+        .proxies
+        .iter_mut()
+        .find(|proxy| proxy.id == "filler")
+        .unwrap();
+    filler.updated_at += chrono::Duration::seconds(1);
+    filler.backend_path = Some(format!("/revision-{}", filler.updated_at.timestamp()));
+    let outcome = if incremental {
+        state
+            .apply_incremental(IncrementalResult {
+                added_or_modified_proxies: vec![filler.clone()],
+                removed_proxy_ids: vec![],
+                added_or_modified_consumers: vec![],
+                removed_consumer_ids: vec![],
+                added_or_modified_plugin_configs: vec![],
+                removed_plugin_config_ids: vec![],
+                added_or_modified_upstreams: vec![],
+                removed_upstream_ids: vec![],
+                sequence_cursor: 0,
+                poll_timestamp: chrono::Utc::now(),
+            })
+            .await
+    } else {
+        state.update_config(next)
+    };
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+}
+
+async fn passive_discovery_ejection_survives_reload(incremental: bool) {
+    use ferrum_edge::config::types::PassiveHealthCheck;
+    use ferrum_edge::proxy::ProxyState;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = isolated().await;
+    let good = MockServer::start().await;
+    let bad = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("healthy-backend"))
+        .mount(&good)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("failing-backend"))
+        .mount(&bad)
+        .await;
+    let good_target = target("127.0.0.1", good.address().port());
+    let bad_target = target("127.0.0.1", bad.address().port());
+    let bad_key = format!("127.0.0.1:{}", bad.address().port());
+    let good_key = format!("127.0.0.1:{}", good.address().port());
+    let passive: PassiveHealthCheck = serde_json::from_value(serde_json::json!({
+        "unhealthy_status_codes": [503], "unhealthy_threshold": 2,
+        "unhealthy_window_seconds": 600, "healthy_after_seconds": 600
+    }))
+    .unwrap();
+    let mut discovered_upstream = upstream_with_sd(
+        "reload-discovered",
+        vec![],
+        Some(
+            serde_json::from_value(serde_json::json!({
+                "provider": "consul", "consul": {
+                    "address": good.uri(), "service_name": "reload", "poll_interval_seconds": 3600
+                }
+            }))
+            .unwrap(),
+        ),
+    );
+    let mut static_upstream = upstream_with_sd(
+        "reload-static",
+        vec![bad_target.clone(), good_target.clone()],
+        None,
+    );
+    for upstream in [&mut discovered_upstream, &mut static_upstream] {
+        upstream.health_checks = Some(
+            serde_json::from_value(serde_json::json!({
+                "passive": passive
+            }))
+            .unwrap(),
+        );
+    }
+    let mut config = config_with(vec![discovered_upstream, static_upstream]);
+    for (id, upstream_id) in [
+        ("discovered", "reload-discovered"),
+        ("static", "reload-static"),
+        ("partial", "reload-discovered"),
+        ("filler", "reload-static"),
+    ] {
+        config.proxies.push(
+            serde_json::from_value(serde_json::json!({
+                "id": id, "listen_path": format!("/{id}"), "backend_scheme": "http",
+                "backend_host": "127.0.0.1", "backend_port": 1, "upstream_id": upstream_id
+            }))
+            .unwrap(),
+        );
+    }
+    config.normalize_fields();
+    let (state, handles) = ProxyState::new(
+        config,
+        DnsCache::new(Default::default()),
+        ferrum_edge::config::EnvConfig {
+            pool_warmup_enabled: false,
+            ..Default::default()
+        },
+        None,
+        None,
+    )
+    .unwrap();
+    // Drive the real discovery publication boundary with admitted snapshots.
+    // No background provider is started; only unrelated proxy edits are made.
+    let request_epoch = Some(Arc::clone(&state.request_epoch));
+    let mut discovery = ferrum_edge::_test_support::DiscoveryLoopStateForTest::new();
+    let (_cancel, cancel_rx) = tokio::sync::watch::channel(false);
+    let publish = |targets| DiscoverySnapshot::from_targets(targets);
+    let mut snapshots = vec![
+        vec![bad_target.clone(), good_target.clone()],
+        vec![good_target.clone()],
+        vec![],
+    ]
+    .into_iter();
+    let initial = snapshots.next().unwrap();
+    let control = ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
+        "ferrum",
+        "reload-discovered",
+        "scripted",
+        publish(initial),
+        &mut discovery,
+        &state.load_balancer_cache,
+        &request_epoch,
+        &[],
+        LoadBalancerAlgorithm::RoundRobin,
+        &None,
+        &cancel_rx,
+        &None,
+        &state.dns_cache,
+        &state.health_checker,
+        &state.circuit_breaker_cache,
+    )
+    .await;
+    assert_eq!(
+        control,
+        ferrum_edge::_test_support::DiscoveryApplyControlForTest::Continue
+    );
+    let gateway = passive_reload_gateway(state.clone()).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let ejected = |proxy: &str| {
+        state
+            .health_checker
+            .passive_health
+            .get(&format!("ferrum|{proxy}"))
+            .is_some_and(|health| health.unhealthy.contains_key(&bad_key))
+    };
+    // Real backend 503s cause the ejections, with a static upstream as control.
+    for proxy in ["discovered", "static"] {
+        for _ in 0..8 {
+            let response = client
+                .get(format!("{}/{proxy}/check", gateway.url))
+                .send()
+                .await
+                .unwrap();
+            assert!([200, 503].contains(&response.status().as_u16()));
+            let body = response.text().await.unwrap();
+            assert!(["healthy-backend", "failing-backend"].contains(&body.as_str()));
+            if ejected(proxy) {
+                break;
+            }
+        }
+        assert!(ejected(proxy), "fixture failed to eject {proxy}");
+    }
+    // A different proxy has not crossed its threshold: its partial history
+    // must survive too, not merely the already-unhealthy map.
+    state.health_checker.report_response(
+        "ferrum",
+        "partial",
+        "reload-discovered",
+        &bad_target,
+        503,
+        false,
+        Some(&passive),
+    );
+    assert_eq!(
+        state
+            .health_checker
+            .passive_recent_failure_len_for_test("ferrum", "partial", &bad_key),
+        1
+    );
+    let bad_hits = bad.received_requests().await.unwrap().len();
+    apply_passive_reload(&state, incremental).await;
+    for proxy in ["discovered", "static"] {
+        assert!(
+            ejected(proxy),
+            "reload re-admitted {proxy}'s ejected endpoint"
+        );
+        for _ in 0..8 {
+            let response = client
+                .get(format!("{}/{proxy}/check", gateway.url))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.text().await.unwrap(), "healthy-backend");
+        }
+    }
+    assert_eq!(bad.received_requests().await.unwrap().len(), bad_hits);
+    assert_eq!(
+        state
+            .health_checker
+            .passive_recent_failure_len_for_test("ferrum", "partial", &bad_key),
+        1
+    );
+
+    // Actual discovery retirement must remove both ejections and partial
+    // history. A subsequent unrelated reload must also reclaim late state for
+    // a retired endpoint, including when discovery's installed set is empty.
+    for remaining in snapshots {
+        let removed = if remaining.is_empty() {
+            &good_target
+        } else {
+            &bad_target
+        };
+        let removed_key = if remaining.is_empty() {
+            &good_key
+        } else {
+            &bad_key
+        };
+        let control = ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
+            "ferrum",
+            "reload-discovered",
+            "scripted",
+            publish(remaining),
+            &mut discovery,
+            &state.load_balancer_cache,
+            &request_epoch,
+            &[],
+            LoadBalancerAlgorithm::RoundRobin,
+            &None,
+            &cancel_rx,
+            &None,
+            &state.dns_cache,
+            &state.health_checker,
+            &state.circuit_breaker_cache,
+        )
+        .await;
+        assert_eq!(
+            control,
+            ferrum_edge::_test_support::DiscoveryApplyControlForTest::Continue
+        );
+        assert!(!ejected("discovered"));
+        assert_eq!(
+            state.health_checker.passive_recent_failure_len_for_test(
+                "ferrum",
+                "partial",
+                removed_key
+            ),
+            0
+        );
+        state.health_checker.report_response(
+            "ferrum",
+            "partial",
+            "reload-discovered",
+            removed,
+            503,
+            false,
+            Some(&passive),
+        );
+        assert_eq!(
+            state.health_checker.passive_recent_failure_len_for_test(
+                "ferrum",
+                "partial",
+                removed_key
+            ),
+            1
+        );
+        apply_passive_reload(&state, incremental).await;
+        assert_eq!(
+            state.health_checker.passive_recent_failure_len_for_test(
+                "ferrum",
+                "partial",
+                removed_key
+            ),
+            0
+        );
+        assert!(
+            ejected("static"),
+            "discovery retirement crossed upstream ownership"
+        );
+    }
+    drop(gateway);
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn full_reload_preserves_discovered_passive_ejection_and_failure_history() {
+    passive_discovery_ejection_survives_reload(false).await;
+}
+
+#[tokio::test]
+async fn incremental_reload_preserves_discovered_passive_ejection_and_failure_history() {
+    passive_discovery_ejection_survives_reload(true).await;
 }

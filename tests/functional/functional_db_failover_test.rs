@@ -16,6 +16,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_db_failover
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use chrono::Utc;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, default_namespace};
@@ -197,10 +199,14 @@ async fn test_db_failover_urls_startup() {
         let temp_dir = TempDir::new().expect("temp dir");
         let failover_db_path: PathBuf = temp_dir.path().join("failover.db");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
@@ -213,6 +219,7 @@ async fn test_db_failover_urls_startup() {
         let identity = mint_failover_identity("db-failover-urls");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
@@ -315,6 +322,194 @@ async fn test_db_failover_urls_startup() {
 // Test 2: Config backup path bootstrap
 // ============================================================================
 
+/// Exercise the public export producer and the real database startup fallback
+/// together, including authenticated traffic from the restored consumer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_db_config_backup_authenticated_export_roundtrip() {
+    use crate::common::TestGateway;
+
+    let temp_dir = TempDir::new().unwrap();
+    let backup_path = temp_dir.path().join("administrative-backup.json");
+    let backend = crate::scaffolding::ports::reserve_port().await.unwrap();
+    let backend_port = backend.port;
+    let backend_task = start_static_backend(backend.into_listener(), "export-roundtrip-ok");
+    let producer = TestGateway::builder()
+        .clear_env()
+        .namespace("tenant-a")
+        .spawn()
+        .await
+        .expect("healthy database producer");
+    let client = reqwest::Client::new();
+    let credentials = json!({
+        "keyauth": [{"key": "backup-roundtrip-test-key"}],
+        "jwt": [{"secret": "backup-roundtrip-test-secret-at-least-32-chars"}],
+        "custom": [{"schema": {"private_key": {"type": "string"}}}]
+    });
+    for (path, payload) in [
+        (
+            "/consumers",
+            json!({
+                "id": "roundtrip-consumer", "username": "roundtrip-user",
+                "credentials": credentials
+            }),
+        ),
+        (
+            "/plugins/config",
+            json!({
+                "id": "roundtrip-key-auth", "plugin_name": "key_auth",
+                "scope": "global", "enabled": true,
+                "config": {"key_location": "header:X-API-Key"}
+            }),
+        ),
+        (
+            "/proxies",
+            json!({
+                "id": "roundtrip-proxy", "listen_path": "/roundtrip",
+                "backend_scheme": "http", "backend_host": "127.0.0.1",
+                "backend_port": backend_port, "strip_listen_path": true
+            }),
+        ),
+    ] {
+        let response = client
+            .post(producer.admin_url(path))
+            .header("Authorization", producer.auth_header())
+            .header("X-Ferrum-Namespace", "tenant-a")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "seed {path}");
+    }
+    let response = client
+        .get(producer.admin_url("/backup"))
+        .header("Authorization", producer.auth_header())
+        .header("X-Ferrum-Namespace", "tenant-a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-data-source"], "database");
+    let bytes = response.bytes().await.unwrap();
+    let exported: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(exported["consumers"][0]["credentials"], credentials);
+    assert!(exported.get("api_specs").is_some());
+    assert!(exported.get("gateway_trust_bundles").is_some());
+    // No envelope stripping or reserialization between the API and the file.
+    std::fs::write(&backup_path, bytes).unwrap();
+    drop(producer);
+
+    let unavailable_url = format!(
+        "sqlite:{}/missing/database.db?mode=ro",
+        temp_dir.path().display()
+    );
+    let fallback = TestGateway::builder()
+        .clear_env()
+        .namespace("tenant-a")
+        .env("FERRUM_DB_URL", &unavailable_url)
+        .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "2")
+        .env(
+            "FERRUM_DB_CONFIG_BACKUP_PATH",
+            backup_path.to_string_lossy(),
+        )
+        .spawn()
+        .await
+        .expect("boot from the unmodified authenticated export");
+    let response = client
+        .get(fallback.proxy_url("/roundtrip/hello"))
+        .header("X-API-Key", "backup-roundtrip-test-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "export-roundtrip-ok");
+    let denied = client
+        .get(fallback.proxy_url("/roundtrip/hello"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+    let health: serde_json::Value = client
+        .get(fallback.admin_url("/health"))
+        .header("Authorization", fallback.auth_header())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["admin_writes_enabled"], false);
+    let trust: serde_json::Value = client
+        .get(fallback.admin_url("/gateway-trust/status"))
+        .header("Authorization", fallback.auth_header())
+        .header("X-Ferrum-Namespace", "tenant-a")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(trust["authority_unresolved"], true);
+    drop(fallback);
+
+    // A malformed runtime section must still reject before serving. The
+    // failure must come from backup admission, not unrelated startup settings.
+    let mut malformed = exported;
+    malformed["consumers"][0]["credentials"]["jwt"] = json!([{
+        "secret": "backup-roundtrip-test-secret-at-least-32-chars",
+        "private_key": "malformed-credential-canary"
+    }]);
+    std::fs::write(&backup_path, malformed.to_string()).unwrap();
+    let failure = TestGateway::builder()
+        .clear_env()
+        .namespace("tenant-a")
+        .env("FERRUM_DB_URL", unavailable_url)
+        .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "2")
+        .env(
+            "FERRUM_DB_CONFIG_BACKUP_PATH",
+            backup_path.to_string_lossy(),
+        )
+        .spawn_expect_failure(Duration::from_secs(30))
+        .await
+        .expect("invalid backup must refuse startup");
+    let output = failure.combined_output();
+    assert!(output.contains("failed consumer validation"));
+    assert!(!output.contains("malformed-credential-canary"));
+
+    let healthy = TestGateway::builder()
+        .clear_env()
+        .namespace("tenant-a")
+        .env(
+            "FERRUM_DB_CONFIG_BACKUP_PATH",
+            backup_path.to_string_lossy(),
+        )
+        .capture_output()
+        .spawn()
+        .await
+        .expect("invalid backup must not reject a healthy database start");
+    let output = healthy
+        .wait_for_captured_output(
+            |output| output.contains("Configured startup backup is unusable"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(output.contains("Configured startup backup is unusable"));
+    assert!(!output.contains("malformed-credential-canary"));
+    let response = client
+        .get(healthy.proxy_url("/roundtrip/hello"))
+        .header("X-API-Key", "backup-roundtrip-test-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        404,
+        "healthy DB config remains authoritative"
+    );
+    backend_task.abort();
+}
+
 /// When the DB is unreachable AND `FERRUM_DB_CONFIG_BACKUP_PATH` points at a
 /// valid JSON snapshot, the gateway starts with that snapshot. Proxy routing
 /// is served from the in-memory config built from the backup.
@@ -331,10 +526,14 @@ async fn test_db_config_backup_bootstrap() {
         let temp_dir = TempDir::new().expect("temp dir");
         let backup_path: PathBuf = temp_dir.path().join("backup.json");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
@@ -342,7 +541,9 @@ async fn test_db_config_backup_bootstrap() {
         // task — no drop-and-rebind, so the port is held atomically from
         // allocation through server startup. This eliminates the race where
         // another process could steal the numeric port between drop and rebind.
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let backend_port = backend_listener.local_addr().unwrap().port();
         let _backend = start_static_backend(backend_listener, "backup-bootstrap-ok");
 
@@ -372,6 +573,7 @@ async fn test_db_config_backup_bootstrap() {
         let identity = mint_failover_identity("db-failover-backup");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
@@ -512,6 +714,7 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
         let identity = mint_failover_identity("db-failover-backup-reject");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
@@ -645,15 +848,21 @@ async fn test_db_config_backup_bootstrap_filters_to_configured_namespace() {
         let backup_path: PathBuf = temp_dir.path().join("backup-multi-namespace.json");
         let log_path: PathBuf = temp_dir.path().join("gateway.stderr");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
         // Held atomically from allocation through server startup.
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let backend_port = backend_listener.local_addr().unwrap().port();
         let _backend = start_static_backend(backend_listener, "tenant-a-backend");
 
@@ -737,6 +946,7 @@ async fn test_db_config_backup_bootstrap_filters_to_configured_namespace() {
 
         let log_file = std::fs::File::create(&log_path).expect("create stderr log");
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
@@ -885,10 +1095,14 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
         let backup_path: PathBuf = temp_dir.path().join("backup.json");
         let failover_db_path: PathBuf = temp_dir.path().join("failover.db");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
@@ -913,6 +1127,7 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
         let identity = mint_failover_identity("db-failover-recovery");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
@@ -1077,10 +1292,14 @@ async fn test_db_read_replica_startup() {
         let temp_dir = TempDir::new().expect("temp dir");
         let db_path = temp_dir.path().join("gateway.db");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
@@ -1093,6 +1312,7 @@ async fn test_db_read_replica_startup() {
         let identity = mint_failover_identity("db-failover-replica");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &primary_url)
@@ -1206,14 +1426,20 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
         let primary_db_path: PathBuf = temp_dir.path().join("primary.db");
         let replica_db_path: PathBuf = temp_dir.path().join("replica-empty.db");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let backend_port = backend_listener.local_addr().unwrap().port();
         let _backend = start_static_backend(backend_listener, "primary-authoritative-ok");
 
@@ -1240,6 +1466,7 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
         let identity = mint_failover_identity("db-failover-authoritative");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &primary_url)

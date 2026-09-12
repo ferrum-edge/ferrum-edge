@@ -1,6 +1,8 @@
 //! Integration coverage for CP `GET /mesh/slice-drift` and
 //! `ReportMeshSliceStatus` (issue #3265).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,7 +23,9 @@ use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::grpc::mesh_slice_drift::{MeshSliceConvergenceState, MeshSliceDriftRegistry};
 use ferrum_edge::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::MeshConfigSyncServer;
-use ferrum_edge::grpc::proto::{MeshSliceStatusReport, MeshSubscribeRequest};
+use ferrum_edge::grpc::proto::{
+    MeshSliceRejectReason, MeshSliceStatusPhase, MeshSliceStatusReport, MeshSubscribeRequest,
+};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -115,7 +119,7 @@ fn cp_admin_state(drift: Arc<MeshSliceDriftRegistry>) -> AdminState {
 async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = TcpListener::bind(addr).await.unwrap();
+    let listener = TcpListener::bind_test(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(
@@ -159,7 +163,7 @@ async fn start_mesh_cp_with_drift(
         .expected_issuer(DEFAULT_CP_DP_JWT_ISSUER.to_string())
         .build();
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let incoming = TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {
@@ -241,24 +245,96 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
     client
         .report_mesh_slice_status(MeshSliceStatusReport {
             version: update.version.clone(),
-            error_message: "slice_json_invalid".to_string(),
             session_token: update.session_token.clone(),
+            phase: MeshSliceStatusPhase::Accepted as i32,
+            reject_reason: MeshSliceRejectReason::InstallRefused as i32,
         })
         .await
-        .expect("nack");
+        .expect("install nack");
     assert_eq!(
         drift.snapshot().data_planes[0].convergence,
         MeshSliceConvergenceState::Rejecting
     );
 
+    // Issue #4812: an install-time ACK alone leaves the row `accepted`, not
+    // `converged` — the proxy runtime has not yet reported the slice serving.
     client
         .report_mesh_slice_status(MeshSliceStatusReport {
             version: update.version.clone(),
-            error_message: String::new(),
             session_token: update.session_token.clone(),
+            phase: MeshSliceStatusPhase::Accepted as i32,
+            reject_reason: MeshSliceRejectReason::Unspecified as i32,
         })
         .await
-        .expect("ack");
+        .expect("install accept");
+    assert_eq!(
+        drift.snapshot().data_planes[0].convergence,
+        MeshSliceConvergenceState::Accepted
+    );
+
+    // A runtime refusal after that install accept is the false-negative case
+    // this surface used to miss.
+    client
+        .report_mesh_slice_status(MeshSliceStatusReport {
+            version: update.version.clone(),
+            session_token: update.session_token.clone(),
+            phase: MeshSliceStatusPhase::Applied as i32,
+            reject_reason: MeshSliceRejectReason::RuntimeProxyRefused as i32,
+        })
+        .await
+        .expect("runtime nack");
+    let rejected_body: Value = reqwest::Client::new()
+        .get(format!("{admin_base}/mesh/slice-drift"))
+        .bearer_auth(admin_token())
+        .send()
+        .await
+        .expect("admin get")
+        .error_for_status()
+        .expect("200")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        rejected_body["data_planes"][0]["convergence"], "rejecting",
+        "a runtime-refused slice must never read as converged"
+    );
+    assert_eq!(rejected_body["data_planes"][0]["node_id"], "mesh-dp-a");
+    assert_eq!(
+        rejected_body["data_planes"][0]["rejected"]["stage"],
+        "runtime"
+    );
+    assert_eq!(
+        rejected_body["data_planes"][0]["rejected"]["reason"],
+        "runtime_proxy_refused"
+    );
+    assert_eq!(
+        rejected_body["data_planes"][0]["drift"]["desired_vs_applied"],
+        true
+    );
+
+    // An unrecognised wire category is refused rather than recorded.
+    assert!(
+        client
+            .report_mesh_slice_status(MeshSliceStatusReport {
+                version: update.version.clone(),
+                session_token: update.session_token.clone(),
+                phase: MeshSliceStatusPhase::Applied as i32,
+                reject_reason: 9_999,
+            })
+            .await
+            .is_err(),
+        "an unknown rejection category must fail closed"
+    );
+
+    client
+        .report_mesh_slice_status(MeshSliceStatusReport {
+            version: update.version.clone(),
+            session_token: update.session_token.clone(),
+            phase: MeshSliceStatusPhase::Applied as i32,
+            reject_reason: MeshSliceRejectReason::Unspecified as i32,
+        })
+        .await
+        .expect("runtime applied");
 
     // A replacement stream can send the same version. The prior stream's
     // delayed ACK must still be refused by its opaque generation token.
@@ -274,8 +350,9 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         client
             .report_mesh_slice_status(MeshSliceStatusReport {
                 version: update.version.clone(),
-                error_message: String::new(),
                 session_token: update.session_token.clone(),
+                phase: MeshSliceStatusPhase::Applied as i32,
+                reject_reason: MeshSliceRejectReason::Unspecified as i32,
             })
             .await
             .is_err(),
@@ -284,8 +361,9 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
     client
         .report_mesh_slice_status(MeshSliceStatusReport {
             version: replacement_update.version.clone(),
-            error_message: String::new(),
             session_token: replacement_update.session_token.clone(),
+            phase: MeshSliceStatusPhase::Applied as i32,
+            reject_reason: MeshSliceRejectReason::Unspecified as i32,
         })
         .await
         .expect("replacement ack");
@@ -309,6 +387,12 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         body["data_planes"][0]["acknowledged"]["version"],
         update.version
     );
+    // Issue #4812: convergence is proven by the runtime-applied watermark.
+    assert_eq!(body["data_planes"][0]["applied"]["version"], update.version);
+    assert_eq!(body["data_planes"][0]["drift"]["desired_vs_applied"], false);
+    assert!(body["data_planes"][0]["rejected"].is_null());
+    assert_eq!(body["summary"]["accepted"], 0);
+    assert_eq!(body["summary"]["converged"], 1);
 }
 
 /// Drift tracking is observability. A registry that refuses to admit this DP

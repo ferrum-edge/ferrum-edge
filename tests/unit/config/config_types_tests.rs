@@ -6284,6 +6284,92 @@ fn api_chargeback_rejects_duplicate_effective_instances_on_one_proxy() {
     }));
 }
 
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn api_chargeback_sink_rejects_duplicate_effective_instances_on_one_proxy() {
+    let mut config = empty_config();
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.plugins = vec![
+        PluginAssociation {
+            plugin_config_id: "charge-a".into(),
+        },
+        PluginAssociation {
+            plugin_config_id: "charge-b".into(),
+        },
+    ];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![
+        PluginConfig {
+            id: "charge-a".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "api_chargeback_sink".into(),
+            config: serde_json::json!({
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+                "clickhouse": {"url": "http://localhost:8123"},
+                "spool": {"enabled": false}
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".into()),
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+        PluginConfig {
+            id: "charge-b".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "api_chargeback_sink".into(),
+            config: serde_json::json!({
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.02}],
+                "clickhouse": {"url": "http://localhost:8123"},
+                "spool": {"enabled": false}
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".into()),
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    ];
+
+    let errors = config
+        .validate_plugin_references()
+        .expect_err("duplicate effective api_chargeback_sink must be rejected");
+    assert!(errors.iter().any(|error| {
+        error.contains("at most one effective instance per proxy")
+            && error.contains("charge-a")
+            && error.contains("charge-b")
+    }));
+    assert!(
+        ferrum_edge::PluginCache::new(&config).is_err(),
+        "cache construction must enforce sink exclusivity too"
+    );
+    let duplicates = config.clone();
+    config.proxies[0].plugins.pop();
+    config.plugin_configs.pop();
+    config.validate_plugin_references().unwrap();
+    let cache = ferrum_edge::PluginCache::new(&config).expect("one sink must build with a runtime");
+    assert!(
+        cache.rebuild(&duplicates).is_err(),
+        "reload must refuse duplicate sinks"
+    );
+    // A scoped sink shadows a global sink rather than multiplying its output.
+    let mut global = config.plugin_configs[0].clone();
+    global.id = "global-sink".into();
+    global.scope = PluginScope::Global;
+    global.proxy_id = None;
+    config.plugin_configs.push(global);
+    config.validate_plugin_references().unwrap();
+    cache
+        .rebuild(&config)
+        .expect("scoped override must remain valid");
+}
+
 #[test]
 fn api_chargeback_rejects_conflicting_shared_tunables_in_plugin_references() {
     let mut config = empty_config();
@@ -6541,6 +6627,112 @@ fn an_internally_disabled_mcp_gateway_does_not_block_dedup() {
     );
 }
 
+fn mcp_gateway_at(id: &str, proxy_id: &str, path: &str) -> PluginConfig {
+    let mut plugin = mcp_gateway_plugin_config(id, PluginScope::Proxy, Some(proxy_id));
+    plugin.config["endpoint"]["path"] = serde_json::Value::String(path.to_string());
+    plugin
+}
+
+// An MCP endpoint reserves its whole slash-delimited subtree and answers 404
+// inside it, so a second gateway nested under the first can never be reached.
+// No single instance can see that, which is why it is decided over the merged
+// configuration.
+
+#[test]
+fn nesting_mcp_gateway_endpoint_scopes_on_one_proxy_are_rejected() {
+    for (first, second) in [
+        ("/mcp", "/mcp/v2"),
+        ("/mcp/v2", "/mcp"),
+        ("/mcp", "/mcp"),
+        ("/mcp/", "/mcp"),
+    ] {
+        let mut config = empty_config();
+        config.plugin_configs = vec![
+            mcp_gateway_at("mcp-a", "p1", first),
+            mcp_gateway_at("mcp-b", "p1", second),
+        ];
+        let mut proxy = make_proxy("p1", "/api");
+        associate(&mut proxy, &["mcp-a", "mcp-b"]);
+        config.proxies = vec![proxy];
+
+        let Err(errs) = config.validate_plugin_references() else {
+            panic!("{first} + {second} must be refused");
+        };
+        let joined = errs.join("; ");
+        assert!(joined.contains("nesting"), "{joined}");
+        // Operators need both offending ids and the proxy to act on the error.
+        assert!(
+            joined.contains("mcp-a") && joined.contains("mcp-b") && joined.contains("p1"),
+            "{joined}"
+        );
+    }
+}
+
+#[test]
+fn disjoint_mcp_gateway_endpoint_scopes_on_one_proxy_are_admitted() {
+    // `/mcpx` is a sibling, not a descendant, and nothing about `/tools`
+    // overlaps `/mcp`: both are reachable in every ordering.
+    for (first, second) in [("/mcp", "/tools"), ("/mcp", "/mcpx")] {
+        let mut config = empty_config();
+        config.plugin_configs = vec![
+            mcp_gateway_at("mcp-a", "p1", first),
+            mcp_gateway_at("mcp-b", "p1", second),
+        ];
+        let mut proxy = make_proxy("p1", "/api");
+        associate(&mut proxy, &["mcp-a", "mcp-b"]);
+        config.proxies = vec![proxy];
+
+        assert!(
+            config.validate_plugin_references().is_ok(),
+            "{first} + {second} reserve disjoint subtrees"
+        );
+    }
+}
+
+#[test]
+fn a_disabled_nested_mcp_gateway_does_not_conflict() {
+    // Both switches matter: an outer-disabled instance is never constructed,
+    // and an inner-disabled one returns Continue for every request, so
+    // neither can pre-empt the sibling that actually serves the endpoint.
+    for disable_outer in [true, false] {
+        let mut config = empty_config();
+        let mut nested = mcp_gateway_at("mcp-b", "p1", "/mcp/v2");
+        if disable_outer {
+            nested.enabled = false;
+        } else {
+            nested.config["enabled"] = serde_json::Value::Bool(false);
+        }
+        config.plugin_configs = vec![mcp_gateway_at("mcp-a", "p1", "/mcp"), nested];
+        let mut proxy = make_proxy("p1", "/api");
+        associate(&mut proxy, &["mcp-a", "mcp-b"]);
+        config.proxies = vec![proxy];
+
+        assert!(
+            config.validate_plugin_references().is_ok(),
+            "a disabled nested gateway reserves nothing (outer disabled: {disable_outer})"
+        );
+    }
+}
+
+#[test]
+fn nesting_mcp_gateway_endpoint_scopes_on_separate_proxies_are_admitted() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        mcp_gateway_at("mcp-a", "p1", "/mcp"),
+        mcp_gateway_at("mcp-b", "p2", "/mcp/v2"),
+    ];
+    let mut first = make_proxy("p1", "/api");
+    associate(&mut first, &["mcp-a"]);
+    let mut second = make_proxy("p2", "/other");
+    associate(&mut second, &["mcp-b"]);
+    config.proxies = vec![first, second];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "each proxy resolves its own endpoint scope"
+    );
+}
+
 #[test]
 fn dedup_and_mcp_gateway_on_separate_proxies_are_admitted() {
     // The documented remedy: keep both behaviors by splitting them across
@@ -6689,7 +6881,10 @@ fn dedup_and_request_derived_a2a_gateway_are_rejected() {
             "a2a1",
             PluginScope::Proxy,
             Some("p1"),
-            serde_json::json!({"trust_forwarded_headers": true}),
+            serde_json::json!({
+                "trust_forwarded_headers": true,
+                "allowed_public_origins": ["https://agents.example.com"]
+            }),
         ),
     ];
     let mut proxy = make_proxy("p1", "/api");
@@ -6729,7 +6924,10 @@ fn dedup_and_a_global_request_derived_a2a_gateway_are_rejected() {
             "a2a-global",
             PluginScope::Global,
             None,
-            serde_json::json!({"trust_forwarded_headers": true}),
+            serde_json::json!({
+                "trust_forwarded_headers": true,
+                "allowed_public_origins": ["https://agents.example.com"]
+            }),
         ),
     ];
     let mut proxy = make_proxy("p1", "/api");
@@ -6758,13 +6956,15 @@ fn dedup_and_a_configured_public_base_a2a_gateway_are_admitted() {
         serde_json::json!({
             "public_base_url": "https://agents.example.com",
             "trust_forwarded_headers": true,
+            "allowed_public_origins": ["https://agents.example.com"],
         }),
-        // Forwarded headers are not trusted, so no public base is derived at all.
-        serde_json::json!({}),
+        // Explicit passthrough needs no public base.
+        serde_json::json!({"rewrite_agent_card_urls": false}),
         // Nothing is rewritten.
         serde_json::json!({
             "rewrite_agent_card_urls": false,
             "trust_forwarded_headers": true,
+            "allowed_public_origins": ["https://agents.example.com"],
         }),
     ] {
         let mut config = empty_config();
@@ -6791,7 +6991,10 @@ fn a_disabled_request_derived_a2a_gateway_does_not_block_dedup() {
             "a2a1",
             PluginScope::Proxy,
             Some("p1"),
-            serde_json::json!({"trust_forwarded_headers": true}),
+            serde_json::json!({
+                "trust_forwarded_headers": true,
+                "allowed_public_origins": ["https://agents.example.com"]
+            }),
         );
         if disable == "outer" {
             a2a.enabled = false;
@@ -6824,7 +7027,10 @@ fn a_provable_local_a2a_gateway_shadows_a_request_derived_global_one() {
             "a2a-global",
             PluginScope::Global,
             None,
-            serde_json::json!({"trust_forwarded_headers": true}),
+            serde_json::json!({
+                "trust_forwarded_headers": true,
+                "allowed_public_origins": ["https://agents.example.com"]
+            }),
         ),
         a2a_gateway_plugin_config(
             "a2a-local",

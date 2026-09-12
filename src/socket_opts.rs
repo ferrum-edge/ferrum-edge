@@ -3358,19 +3358,8 @@ pub mod io_uring_splice {
                     ));
                 }
             }
-            // The write watermark is also checked in the outer loop / Phase 1
-            // WouldBlock so the c2b worker fires `backend_write_timeout_ms`
-            // when it has been stuck in the Reading phase past the deadline
-            // (e.g. the client went silent after a complete c2b exchange).
-            // This matches `bidirectional_copy`'s parent-watchdog semantics
-            // and the async libc-splice path's parent watchdog. Without it,
-            // io_uring would diverge: write timeouts would only fire during
-            // an active write phase, leaving "client silent" cases for the
-            // shared idle timeout alone — operators switching
-            // `FERRUM_IO_URING_SPLICE_ENABLED` would see different
-            // `DisconnectCause` distributions on identical traffic. The
-            // watermark is `u64::MAX` until the first successful read primes
-            // it, so this check stays inert until c2b actually carries data.
+            // Drained pipes disarm the write watermark. A quiet client
+            // therefore cannot be mistaken for queued backend write work.
             if write_wm_active && let Some(wm) = write_watermark {
                 let now = super::monotonic_now_ms();
                 let last = wm.load(std::sync::atomic::Ordering::Relaxed);
@@ -3443,11 +3432,7 @@ pub mod io_uring_splice {
                             ));
                         }
                     }
-                    // Mirror the outer-loop check: a Phase 1 WouldBlock means
-                    // src has nothing new, so if c2b's write watermark has
-                    // gone stale (queued bytes already drained AND the
-                    // deadline has now passed) the c2b worker should report
-                    // it here rather than wait for a future write attempt.
+                    // The queue-aware watermark is inert after Phase 2 drains.
                     if write_wm_active && let Some(wm) = write_watermark {
                         let now = super::monotonic_now_ms();
                         let last = wm.load(std::sync::atomic::Ordering::Relaxed);
@@ -3577,6 +3562,9 @@ pub mod io_uring_splice {
                 if write_wm_active && let Some(wm) = write_watermark {
                     wm.store(post_write_now, std::sync::atomic::Ordering::Relaxed);
                 }
+            }
+            if let Some(wm) = write_watermark {
+                wm.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }

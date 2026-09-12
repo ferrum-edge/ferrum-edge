@@ -48,12 +48,38 @@ CP and DP communicate via the `ConfigSync` gRPC service defined in `proto/ferrum
 - **`Subscribe(SubscribeRequest) -> stream ConfigUpdate`** — Server-streaming RPC. The DP subscribes and receives an initial full config snapshot followed by streaming updates whenever the CP detects config changes.
 - **`GetFullConfig(FullConfigRequest) -> FullConfigResponse`** — Unary RPC for on-demand full config retrieval.
 
+### Configuration message size
+
+ConfigSync uses the same **16 MiB (16,777,216 byte)** message limit as the mesh
+configuration consumers. The limit covers the complete encoded protobuf body,
+including configuration JSON, trust bundles, and version metadata; it is not a
+per-resource or JSON-only allowance. DPs accept snapshots and deltas above
+4 MiB up to this bound on both initial connection and subsequent updates.
+
+The CP checks each namespace's snapshot, delta, unary response, and stream
+recovery before transmission. An oversized message is refused with a warning
+containing `namespace`, `encoded_bytes`, and `max_bytes`, without configuration
+contents. Initial subscription and unary retrieval return `RESOURCE_EXHAUSTED`;
+an oversized recovery or live broadcast terminates each affected stream.
+Rejected broadcasts do not advance the DP registry's last-update timestamp.
+DPs retain their last-known-good
+configuration under the existing staleness policy. Reduce the affected
+namespace's configuration below the bound to restore delivery. CP liveness alone
+does not certify that every namespace's configuration is deliverable.
+
 ### Authentication
 
 All gRPC calls are authenticated with JWT HS256 tokens:
 - The CP validates the `authorization` header (Bearer token) on every RPC
 - The DP sends its auth token in the gRPC metadata on every request
 - Both CP and DP use the same shared secret for JWT signing/verification
+
+For `ConfigSync.Subscribe`, the bearer token's `sub` must equal the request's
+`node_id` after trimming surrounding whitespace from `node_id`, as for native
+`MeshSubscribe`. Built-in DP token minting already sets `sub` to the DP node ID.
+Externally issued tokens must use that same identity. A mismatch returns
+`PERMISSION_DENIED` and emits a failed tenant-subscription audit record before
+allocating a stream or registering the node for `GET /cluster`.
 
 ### Transport Security (TLS/mTLS)
 
@@ -987,7 +1013,7 @@ A DP that has accepted one snapshot keeps serving it while every control plane i
 
 **Startup and restarts.** The DP holds no persisted or on-disk configuration cache — it starts with an empty `GatewayConfig` and fetches everything from a CP — so a restart always begins with no applied snapshot. In that state readiness is already `false` (`startup_ready` waits for the first applied snapshot and backend-capability classification), and the same bound applies with the age measured from process start: a DP that never reaches a CP is stale after `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`, reported as `awaiting_first_snapshot` until then. Restart behavior is therefore identical with or without a prior outage.
 
-**Diagnostics.** Authenticated `/health` includes a fixed-cardinality `dp_config` object (`stale`, `reason`, `stale_action`, `new_traffic_blocked`, `cp_connected`, `cp_authority`, `cp_disconnected_seconds`, `max_stale_seconds`, `applied_snapshot`, `snapshot_age_seconds`, and the `applied`/`rejected`/`apply_failed`/`stale_transitions` counters). `reason` is a closed set that distinguishes `cp_disconnected`, `snapshot_stale`, `snapshot_rejected`, and `snapshot_apply_failed` (plus `ok` and `awaiting_first_snapshot`). The same state is exported as fixed-cardinality Prometheus series: `ferrum_dp_config_snapshot_age_seconds`, `ferrum_dp_config_max_stale_seconds`, `ferrum_dp_config_stale`, `ferrum_dp_config_new_traffic_blocked`, `ferrum_dp_config_cp_connected`, `ferrum_dp_config_stale_transitions_total`, `ferrum_dp_config_snapshots_applied_total`, `ferrum_dp_config_snapshots_rejected_total`, and `ferrum_dp_config_snapshot_apply_failures_total`. `namespace` is the only standard metric label; CP endpoint, credential, node id, and configuration content are not exposed.
+**Diagnostics.** Authenticated `/health` includes a fixed-cardinality `dp_config` object (`stale`, `reason`, `stale_action`, `new_traffic_blocked`, `cp_connected`, `cp_authority`, `cp_disconnected_seconds`, `max_stale_seconds`, `applied_snapshot`, `snapshot_age_seconds`, and the `applied`/`rejected`/`apply_failed`/`stale_transitions` counters). `cp_disconnected_seconds` measures how long the DP has been without usable applied configuration — it is `0` only after a snapshot has been accepted and applied, not on bare transport connect, so a CP that is reachable but never delivers config reports a monotonically increasing outage instead of saw-toothing on each reconnect-backoff cycle. `reason` is a closed set that distinguishes `cp_disconnected`, `snapshot_stale`, `snapshot_rejected`, and `snapshot_apply_failed` (plus `ok` and `awaiting_first_snapshot`). The same state is exported as fixed-cardinality Prometheus series: `ferrum_dp_config_snapshot_age_seconds`, `ferrum_dp_config_max_stale_seconds`, `ferrum_dp_config_stale`, `ferrum_dp_config_new_traffic_blocked`, `ferrum_dp_config_cp_connected`, `ferrum_dp_config_stale_transitions_total`, `ferrum_dp_config_snapshots_applied_total`, `ferrum_dp_config_snapshots_rejected_total`, and `ferrum_dp_config_snapshot_apply_failures_total`. `namespace` is the only standard metric label; CP endpoint, credential, node id, and configuration content are not exposed.
 
 
 ## DP Multi-CP Failover

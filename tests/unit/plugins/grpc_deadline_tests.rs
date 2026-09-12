@@ -3423,10 +3423,82 @@ async fn test_invalid_timeout_treated_as_missing() {
     assert_continue(result);
 
     // Should fall back to default
+    assert_eq!(headers.get("grpc-timeout").unwrap(), "5000m");
     assert_eq!(
         ctx.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
         "5000"
     );
+    assert_eq!(ctx.metadata.get("grpc_timeout_invalid").unwrap(), "true");
+}
+
+#[tokio::test]
+async fn test_malformed_timeout_rewritten_to_enforced_fallback() {
+    let config = json!({ "default_deadline_ms": 1500 });
+    let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
+
+    for timeout in [
+        "0S",
+        "999999999S",
+        "-5S",
+        "5 S",
+        "12345678901234567890H",
+        "invalid",
+    ] {
+        let mut ctx = create_grpc_context_with_timeout(Some(timeout));
+        let mut headers = HashMap::from([("grpc-timeout".to_string(), timeout.to_string())]);
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_continue(result);
+        assert_eq!(
+            headers.get("grpc-timeout").map(String::as_str),
+            Some("1500m"),
+            "malformed timeout {timeout:?} must be rewritten to the enforced fallback"
+        );
+        assert_eq!(
+            ctx.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
+            "1500"
+        );
+        assert_eq!(ctx.metadata.get("grpc_timeout_invalid").unwrap(), "true");
+        assert!(!ctx.metadata.contains_key("grpc_original_deadline_ms"));
+    }
+}
+
+#[tokio::test]
+async fn test_valid_timeout_header_unchanged_by_invalid_rewrite() {
+    let config = json!({
+        "default_deadline_ms": 5000,
+        "max_deadline_ms": 999999999
+    });
+    let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
+
+    let mut ctx = create_grpc_context_with_timeout(Some("5000m"));
+    let mut headers = HashMap::from([("grpc-timeout".to_string(), "5000m".to_string())]);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    assert_eq!(headers.get("grpc-timeout").unwrap(), "5000m");
+    assert_eq!(
+        ctx.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
+        "5000"
+    );
+    assert_eq!(
+        ctx.metadata.get("grpc_original_deadline_ms").unwrap(),
+        "5000"
+    );
+    assert!(!ctx.metadata.contains_key("grpc_timeout_invalid"));
+}
+
+#[tokio::test]
+async fn test_missing_timeout_header_without_default_stays_absent() {
+    let config = json!({ "max_deadline_ms": 30_000 });
+    let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    assert!(!headers.contains_key("grpc-timeout"));
+    assert!(!ctx.metadata.contains_key("grpc_timeout_invalid"));
 }
 
 // ── Rejection body format ──
@@ -3487,10 +3559,12 @@ async fn test_empty_string_timeout_treated_as_missing() {
     assert_continue(result);
 
     // Empty string can't be parsed, falls back to default
+    assert_eq!(headers.get("grpc-timeout").unwrap(), "3000m");
     assert_eq!(
         ctx.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
         "3000"
     );
+    assert_eq!(ctx.metadata.get("grpc_timeout_invalid").unwrap(), "true");
 }
 
 // ── Very large timeout values (overflow protection) ──
@@ -3508,7 +3582,8 @@ async fn test_more_than_eight_timeout_digits_is_ignored_without_default() {
 
     assert!(!ctx.metadata.contains_key("grpc_original_deadline_ms"));
     assert!(!ctx.metadata.contains_key("grpc_adjusted_deadline_ms"));
-    assert_eq!(headers.get("grpc-timeout").unwrap(), "999999999H");
+    assert_eq!(ctx.metadata.get("grpc_timeout_invalid").unwrap(), "true");
+    assert!(!headers.contains_key("grpc-timeout"));
 }
 
 // ── subtract_gateway_processing + max_deadline_ms combined ──
@@ -3555,10 +3630,12 @@ async fn test_multi_char_unit_rejected() {
 
     // "5000ms" fails to parse (last char 's', digits "5000m" fails u64 parse)
     // Falls back to default
+    assert_eq!(headers.get("grpc-timeout").unwrap(), "1000m");
     assert_eq!(
         ctx.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
         "1000"
     );
+    assert_eq!(ctx.metadata.get("grpc_timeout_invalid").unwrap(), "true");
 }
 
 // ── Robustness against malformed inputs ──
@@ -3578,10 +3655,12 @@ async fn test_non_ascii_timeout_does_not_panic() {
     assert_continue(result);
 
     // Malformed value falls back to default
+    assert_eq!(headers.get("grpc-timeout").unwrap(), "1000m");
     assert_eq!(
         ctx.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
         "1000"
     );
+    assert_eq!(ctx.metadata.get("grpc_timeout_invalid").unwrap(), "true");
 }
 
 #[tokio::test]
@@ -3595,10 +3674,12 @@ async fn test_non_digit_value_treated_as_missing() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
+    assert_eq!(headers.get("grpc-timeout").unwrap(), "2000m");
     assert_eq!(
         ctx.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
         "2000"
     );
+    assert_eq!(ctx.metadata.get("grpc_timeout_invalid").unwrap(), "true");
 }
 
 // ── Metadata tracking ──
@@ -4270,26 +4351,31 @@ async fn deadline_rebuild_keeps_an_owned_set_cookie_update_matching_a_backend_li
 
 /// Same owned-replacement boundary as
 /// [`deadline_rebuild_keeps_an_owned_set_cookie_update_matching_a_backend_line`],
-/// reached through a fired `rename` whose destination is `set-cookie`.
+/// reached through an operator-configured update plus source removal. Renaming
+/// into `set-cookie` is forbidden because the source is backend-controlled.
 /// Mutation tracking observes only the source removal, so ownership is the sole
 /// signal that the destination is gateway-authored.
 #[tokio::test]
-async fn deadline_rebuild_keeps_an_owned_set_cookie_rename_destination() {
+async fn deadline_rebuild_keeps_an_owned_set_cookie_update_with_source_removal() {
     use ferrum_edge::_test_support::{
         run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
         set_grpc_deadline_budget_for_test,
     };
 
-    const SHARED: &str = "sid=renamed; Path=/";
+    const SHARED: &str = "sid=operator-owned; Path=/";
 
     let transformer = create_plugin(
         "response_transformer",
         &json!({
             "rules": [{
-                "operation": "rename",
+                "operation": "update",
+                "target": "header",
+                "key": "set-cookie",
+                "value": SHARED,
+            }, {
+                "operation": "remove",
                 "target": "header",
                 "key": "x-session-source",
-                "new_key": "set-cookie",
             }]
         }),
     )
@@ -4301,9 +4387,9 @@ async fn deadline_rebuild_keeps_an_owned_set_cookie_rename_destination() {
     let mut ctx = create_grpc_context_with_timeout(None);
     set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
 
-    // The backend supplies BOTH the rename source and a `set-cookie` that is
-    // byte-identical to what the rename will produce, so the post-rename value
-    // has zero surplus over the backend baseline.
+    // The backend spoofs BOTH the removed source and the operator's cookie.
+    // The trusted update has zero surplus over this backend baseline, so only
+    // explicit ownership can preserve it through the later deadline rebuild.
     let mut headers = HashMap::from([
         ("content-type".to_string(), "application/grpc".to_string()),
         ("x-session-source".to_string(), SHARED.to_string()),
@@ -4315,7 +4401,7 @@ async fn deadline_rebuild_keeps_an_owned_set_cookie_rename_destination() {
     );
     assert!(
         !headers.contains_key("x-session-source"),
-        "precondition: the rename consumed the source header"
+        "precondition: the remove rule consumed the backend source header"
     );
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
@@ -4336,11 +4422,11 @@ async fn deadline_rebuild_keeps_an_owned_set_cookie_rename_destination() {
     assert_eq!(
         headers.get("set-cookie").map(String::as_str),
         Some(SHARED),
-        "the fired rename destination is gateway-authored and must survive"
+        "the operator-written cookie is gateway-authored and must survive"
     );
     assert!(
         !headers.contains_key("x-session-source"),
-        "the renamed-away backend source header must not reappear"
+        "the removed backend source header must not reappear"
     );
 }
 

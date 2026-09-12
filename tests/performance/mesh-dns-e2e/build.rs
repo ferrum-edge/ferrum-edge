@@ -61,10 +61,26 @@ message MeshConfigUpdate {
   string session_token = 8;
 }
 
+enum MeshSliceStatusPhase {
+  MESH_SLICE_STATUS_PHASE_ACCEPTED = 0;
+  MESH_SLICE_STATUS_PHASE_APPLIED = 1;
+}
+
+enum MeshSliceRejectReason {
+  MESH_SLICE_REJECT_REASON_UNSPECIFIED = 0;
+  MESH_SLICE_REJECT_REASON_INSTALL_REFUSED = 1;
+  MESH_SLICE_REJECT_REASON_RUNTIME_CONFIG_BUILD = 2;
+  MESH_SLICE_REJECT_REASON_RUNTIME_PROXY_REFUSED = 3;
+  MESH_SLICE_REJECT_REASON_RUNTIME_TRUST_UNUSABLE = 4;
+  MESH_SLICE_REJECT_REASON_RUNTIME_TLS_RELOAD = 5;
+  MESH_SLICE_REJECT_REASON_RUNTIME_DTLS_CANDIDATE = 6;
+}
+
 message MeshSliceStatusReport {
   string version = 1;
-  string error_message = 2;
   string session_token = 3;
+  MeshSliceStatusPhase phase = 4;
+  MeshSliceRejectReason reject_reason = 5;
 }
 
 message MeshSliceStatusResponse {}

@@ -395,7 +395,7 @@ FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=up \
   FERRUM_DB_TYPE=sqlite \
   FERRUM_DB_URL=sqlite://ferrum.db \
-  ferrum-edge
+  ferrum-edge run
 ```
 
 `status` is strictly read-only. If the core or plugin tracking table does not
@@ -411,7 +411,7 @@ FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=status \
   FERRUM_DB_TYPE=sqlite \
   FERRUM_DB_URL=sqlite://ferrum.db \
-  ferrum-edge
+  ferrum-edge run
 ```
 
 Example output:
@@ -437,7 +437,7 @@ Pending plugin migrations: (none — all plugins up to date)
 FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=config \
   FERRUM_FILE_CONFIG_PATH=./config.yaml \
-  ferrum-edge
+  ferrum-edge run
 ```
 
 ### Dry Run
@@ -450,7 +450,7 @@ FERRUM_MODE=migrate \
   FERRUM_MIGRATE_DRY_RUN=true \
   FERRUM_DB_TYPE=sqlite \
   FERRUM_DB_URL=sqlite://ferrum.db \
-  ferrum-edge
+  ferrum-edge run
 ```
 
 Database dry-run uses the same read-only status path: it does not create core
@@ -653,7 +653,7 @@ FERRUM_MODE=migrate \
   FERRUM_DB_TYPE=mongodb \
   FERRUM_DB_URL="mongodb://localhost:27017" \
   FERRUM_MONGO_DATABASE=ferrum \
-  ferrum-edge
+  ferrum-edge run
 ```
 
 Preview the canonical plan without connecting:
@@ -663,7 +663,7 @@ FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=up \
   FERRUM_MIGRATE_DRY_RUN=true \
   FERRUM_DB_TYPE=mongodb \
-  ferrum-edge
+  ferrum-edge run
 ```
 
 Compare live indexes to the plan (connects; does not mutate):
@@ -674,7 +674,7 @@ FERRUM_MODE=migrate \
   FERRUM_DB_TYPE=mongodb \
   FERRUM_DB_URL="mongodb://localhost:27017" \
   FERRUM_MONGO_DATABASE=ferrum \
-  ferrum-edge
+  ferrum-edge run
 ```
 
 ### Schema Differences from SQL

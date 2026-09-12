@@ -13,7 +13,7 @@
 # reason the production stage does: a point-release pin would break without
 # bounding anything the digest does not already bound.
 ARG BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
-ARG TOOLS_BASE=debian:13-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+ARG TOOLS_BASE=debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 ARG IPROUTE2_VERSION=6.15.0-1
 
 FROM ${BASE_IMAGE} AS ferrum-runtime

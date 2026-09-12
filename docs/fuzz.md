@@ -143,3 +143,55 @@ traffic into `corpus/`.
 
 Production `rust-toolchain.toml` remains `stable`; fuzz dependencies stay isolated
 in the `fuzz/` crate per `docs/dependency-policy.md`.
+
+## Compile-time resource observations (#4694)
+
+The existing main/manual sanitizer smoke step emits `Fuzz build resources:`
+JSON records during compilation and its unchanged seven-target run. Samples
+are spaced 30 seconds apart, capped at 240 records and two hours, and written
+directly to the hosted log. Hard runner loss can prevent that log from being
+published: the first observer trial lost communication and left no retrievable
+Fuzz log or resource samples. Outer job status can also lag the actual failed
+step; compare step timestamps before inferring ongoing compilation.
+The observer stops with the owning shell and preserves its original exit code.
+
+A second, best-effort channel emits at most nine notice annotations: the initial
+sample, first available-memory crossings of 75/50/25/10/5 percent, first free-swap
+crossings of 25/5 percent when swap exists, and the first increase in exposed root
+cgroup OOM counters. Simultaneous reasons share one annotation. Notices carry
+only selected numeric counters, are queued as runner timeline issues,
+and do not grant API credentials to the observer or compiler. Results-only live
+step updates can omit annotations; queuing does not establish that the Checks
+API exposes them before step/job completion. They can also be
+lost if the runner stops before forwarding them; missing records do not prove
+absence of memory pressure. Validate retrieval on a hosted run before relying
+on this channel. Thresholds select diagnostic samples and do not stop the build.
+The [notice command](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-a-notice-message)
+and [runner issue handling](https://github.com/actions/runner/blob/0b0ac2fdabf53d69add6175026945b8afc8549a5/src/Runner.Worker/ExecutionContext.cs#L795)
+describe the annotation path and the ten-notice limit; these are not a delivery
+guarantee after runner loss.
+
+Records contain host available memory/swap, swap page counters, root cgroup
+memory limits/events when exposed, and an RSS summary of at most 1,024 visible
+processes. No process arguments, environment, request bytes or corpus data are
+read or logged. Missing kernel counters are reported as null. RSS sums double
+count shared pages, sampled maxima are not exact peaks, and root cgroup counters
+may include other runner processes; none alone proves that rustc exhausted
+memory. Compare the final samples and cgroup OOM counters with the runner's
+termination annotation before attributing a shutdown to resource pressure.
+
+The second trial recovered 44 samples and six notices after a runner shutdown
+(exit 143). The largest visible process reached about 14.3 GiB RSS, available
+host memory fell below 250 MiB and the 3 GiB swap area had less than 45 MiB free.
+Root cgroup OOM counters were unavailable, so this establishes severe sampled
+pressure without proving a kernel OOM kill or the exact shutdown cause. Notices
+were not observed through the Checks API during the run; both channels became
+available afterward, so this is not proof of recovery after hard runner loss.
+
+Main/manual jobs now add a bounded 12 GiB swap file under `/mnt`, following the
+existing unit/PKCS11 provisioning. Existing swap remains enabled; provisioning
+fails visibly if allocation or activation fails. The observer records whether
+this adds useful headroom, and a fresh full run must validate it. Paging may
+increase wall time; this is not a measured latency improvement. Compiler/profile/
+cache settings, AddressSanitizer, all seven targets and every libFuzzer bound
+remain unchanged. The scheduled longer discovery workflow is unchanged.

@@ -40,6 +40,11 @@ pub const MAX_CUSTOM_ID_LENGTH: usize = 255;
 pub const MAX_HOST_LENGTH: usize = 253;
 /// Maximum number of host entries per proxy.
 pub const MAX_HOSTS_PER_PROXY: usize = 100;
+/// Operator-facing guidance for the CORS-style `allowed_ws_origins: ["*"]`
+/// footgun (issue #5454). Empty list is the only allow-all; entries are
+/// literal origins; `*` is not a wildcard.
+pub const ALLOWED_WS_ORIGINS_STAR_GUIDANCE: &str =
+    "empty list = allow all origins; entries are literal origins; `*` is not a wildcard";
 /// Maximum number of targets per upstream.
 pub const MAX_TARGETS_PER_UPSTREAM: usize = 1000;
 /// Maximum number of tags per upstream target.
@@ -1066,7 +1071,21 @@ pub(crate) fn dispatch_port_overrides_for_selected_subset(
             let mut resolved =
                 ResolvedPortOverride::from_upstream_override(override_config).unwrap_or_default();
             if let Some(outlier) = override_config.outlier_detection_overlay.as_ref() {
-                let mut passive = inherited_passive.cloned().unwrap_or_default();
+                // Preserve native per-port controls which DestinationRule cannot
+                // express, while rebasing the fields it can express onto the
+                // selected subset (or upstream) before applying the port mask.
+                let inherited = inherited_passive.cloned().unwrap_or_default();
+                let mut passive = resolved
+                    .passive_health_check
+                    .take()
+                    .unwrap_or_else(|| inherited.clone());
+                passive.unhealthy_threshold = inherited.unhealthy_threshold;
+                passive.unhealthy_window_seconds = inherited.unhealthy_window_seconds;
+                passive.healthy_after_seconds = inherited.healthy_after_seconds;
+                passive.max_ejection_percent = inherited.max_ejection_percent;
+                passive.consecutive_error_mode = inherited.consecutive_error_mode;
+                passive.consecutive_5xx_ejection_disabled =
+                    inherited.consecutive_5xx_ejection_disabled;
                 crate::modes::mesh::apply_outlier_detection_to_passive(&mut passive, outlier);
                 resolved.passive_health_check = Some(passive);
             }
@@ -1960,9 +1979,22 @@ pub struct DnsSdConfig {
     pub poll_interval_seconds: u64,
 }
 
+/// IP family selected from Kubernetes EndpointSlices.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KubernetesAddressType {
+    #[serde(rename = "IPv4")]
+    Ipv4,
+    #[serde(rename = "IPv6")]
+    Ipv6,
+}
+
 /// Kubernetes service discovery configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KubernetesConfig {
+    /// Select one address family. When omitted, prefer IPv4 if eligible IPv4
+    /// targets exist in the snapshot, otherwise use IPv6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_type: Option<KubernetesAddressType>,
     /// Kubernetes namespace. Default: "default".
     #[serde(default = "default_k8s_namespace")]
     pub namespace: String,
@@ -2172,7 +2204,13 @@ pub struct CircuitBreakerConfig {
     pub failure_threshold: u32,
     #[serde(default = "default_success_threshold")]
     pub success_threshold: u32,
-    #[serde(default = "default_circuit_timeout")]
+    /// Seconds the circuit stays open before transitioning to half-open.
+    ///
+    /// `cooldown_seconds` is accepted as a serde input alias (Admin API, file
+    /// config, database rows, and batch/restore payloads). Serialization always
+    /// emits `timeout_seconds`. Supplying both spellings in one object is a
+    /// duplicate-field error.
+    #[serde(default = "default_circuit_timeout", alias = "cooldown_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_failure_status_codes")]
     pub failure_status_codes: Vec<u16>,
@@ -2937,7 +2975,9 @@ pub struct Proxy {
     /// Optional list of allowed WebSocket Origin values (e.g., ["https://example.com"]).
     /// When non-empty, WebSocket upgrade requests must include an Origin header
     /// matching one of these values (case-insensitive). Empty list (default) means
-    /// no origin check — all origins are permitted. Protects against Cross-Site
+    /// no origin check — all origins are permitted. Entries are literal
+    /// `scheme://host[:port]` origins; `*` is not a wildcard and is rejected at
+    /// Admin API / `ferrum-edge validate` admission. Protects against Cross-Site
     /// WebSocket Hijacking (CSWSH) per RFC 6455 §10.2.
     #[serde(default)]
     pub allowed_ws_origins: Vec<String>,
@@ -4975,6 +5015,10 @@ impl GatewayConfig {
             errors.extend(soap_errors);
         }
 
+        if let Err(mcp_errors) = crate::plugins::mcp_gateway::validate_composition(self) {
+            errors.extend(mcp_errors);
+        }
+
         for plugin in &self.plugin_configs {
             // `transaction_log_schema` is process-global by design (it
             // registers named schemas into a single registry); reject
@@ -5905,6 +5949,15 @@ pub(crate) fn validate_tls_material_source_field(
     if source.is_system_trust_roots() {
         return validate_system_trust_roots_source_field(field_name, value, kind);
     }
+    if let crate::tls::source::CertSource::Uri(uri) = &source
+        && uri.scheme == crate::tls::source::SourceScheme::Pkcs11
+    {
+        #[cfg(feature = "pkcs11")]
+        crate::tls::pkcs11::validate_module_source_uri(uri)
+            .map_err(|error| format!("{field_name}: {error}"))?;
+        #[cfg(not(feature = "pkcs11"))]
+        validate_pkcs11_key_source(field_name, uri)?;
+    }
     match source {
         crate::tls::source::CertSource::InlinePem(_) => {
             validate_string_field(field_name, value, MAX_TLS_INLINE_PEM_LENGTH)
@@ -5955,6 +6008,25 @@ pub(crate) fn validate_system_trust_roots_verify_pairing(
         return Some(format!(
             "{verify_field} cannot be false when {ca_field} is '{}' — the system trust-roots source requires server certificate verification",
             crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
+        ));
+    }
+    None
+}
+
+/// Reject pairing a client-CA bundle with the admin listener no-verify opt-out.
+/// Configuring a client CA means the admin HTTPS listener requires client
+/// certificates; disabling verification contradicts that and would otherwise
+/// silently accept anonymous TLS connections while logs claim mTLS is available.
+pub(crate) fn validate_admin_tls_no_verify_client_ca_pairing(
+    client_ca_field: &str,
+    no_verify_field: &str,
+    client_ca_bundle_path: Option<&str>,
+    no_verify: bool,
+) -> Option<String> {
+    if client_ca_bundle_path.is_some() && no_verify {
+        return Some(format!(
+            "{no_verify_field} cannot be true when {client_ca_field} is set — a configured \
+             client CA bundle requires client certificate verification on the admin listener"
         ));
     }
     None
@@ -7583,12 +7655,97 @@ impl Proxy {
         }
     }
 
+    /// Whether `raw` is a literal WebSocket Origin `scheme://host[:port]` that
+    /// the runtime matcher can normalize (`http`/`https`/`ws`/`wss`, no
+    /// userinfo, path, query, or fragment). Used at admission so configured
+    /// allow-list entries match what `websocket_origin_allowed` compares.
+    pub fn is_literal_websocket_origin(raw: &str) -> bool {
+        // RFC 6454 opaque origin: browsers send `Origin: null` for sandboxed
+        // frames and `data:`/`file:` documents; the runtime matcher compares it
+        // literally, so it stays admissible.
+        if raw.trim().eq_ignore_ascii_case("null") {
+            return true;
+        }
+        let Ok(parsed) = url::Url::parse(raw) else {
+            return false;
+        };
+        if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+            return false;
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return false;
+        }
+        match parsed.scheme() {
+            "http" | "https" | "ws" | "wss" => parsed.host_str().is_some(),
+            _ => false,
+        }
+    }
+
+    /// Admission-only errors for `allowed_ws_origins` beyond empty-string
+    /// checks: CORS-style `"*"` and entries that are not a literal origin.
+    ///
+    /// Load paths (file/database/CP/DP `validate_all_fields`) must not treat
+    /// these as rejecting errors — existing rows keep loading with a warning
+    /// from [`Self::warn_legacy_allowed_ws_origins`].
+    pub fn allowed_ws_origins_admission_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
+            if origin.trim().is_empty() {
+                continue;
+            }
+            if origin.trim() == "*" {
+                errors.push(format!(
+                    "allowed_ws_origins[{}] is '*': {}",
+                    i, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+                ));
+            } else if !Self::is_literal_websocket_origin(origin) {
+                errors.push(format!(
+                    "allowed_ws_origins[{}] must be a literal origin \
+                     (scheme://host[:port]); {}",
+                    i, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+                ));
+            }
+        }
+        errors
+    }
+
+    /// Warn once when a loaded proxy still carries the CORS-style `"*"`
+    /// footgun or a non-origin `allowed_ws_origins` entry. Never fails the load.
+    pub fn warn_legacy_allowed_ws_origins(&self) {
+        let has_legacy_entry = self.allowed_ws_origins.iter().any(|origin| {
+            let trimmed = origin.trim();
+            !trimmed.is_empty() && (trimmed == "*" || !Self::is_literal_websocket_origin(origin))
+        });
+        if !has_legacy_entry {
+            return;
+        }
+        tracing::warn!(
+            proxy = %self.id,
+            namespace = %self.namespace,
+            "Proxy '{}' allowed_ws_origins contains '*' or a non-origin entry; {}; \
+             existing config is still loaded. Admin API writes and `ferrum-edge validate` \
+             reject this value.",
+            self.id,
+            ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+        );
+    }
+
     /// Validate all fields of a proxy for correctness and safe lengths.
     ///
     /// This validates field values only — uniqueness checks (listen_path conflicts,
     /// name uniqueness, upstream_id existence) are done separately in the admin handlers.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
-        self.validate_fields_inner(None, crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS)
+        let mut errors =
+            match self.validate_fields_inner(None, crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS) {
+                Ok(()) => Vec::new(),
+                Err(errors) => errors,
+            };
+        errors.extend(self.allowed_ws_origins_admission_errors());
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     /// Validate fields with a shared cache of already-validated TLS file paths.
@@ -8175,7 +8332,11 @@ impl Proxy {
             }
         }
 
-        // Allowed WebSocket origins validation
+        // Allowed WebSocket origins validation. Empty strings are a hard
+        // error on every path. CORS-style `"*"` and non-origin entries are
+        // admission-only (`validate_fields` / Admin / `ferrum-edge validate`);
+        // load snapshots warn via `warn_legacy_allowed_ws_origins` instead of
+        // failing startup.
         for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
             if origin.trim().is_empty() {
                 errors.push(format!("allowed_ws_origins[{}] must not be empty", i));
@@ -8310,6 +8471,19 @@ impl Consumer {
         }
         if let Err(e) = validate_string_field("username", &self.username, MAX_USERNAME_LENGTH) {
             errors.push(e);
+        }
+        // RFC 7617 §2 splits the decoded `user-id ":" password` at the FIRST
+        // colon, so a colon-bearing user-id has no representation on the wire.
+        // Such a consumer starts fine and then fails every Basic login, which
+        // reads as a credential problem rather than an unusable configuration —
+        // reject the combination at admission instead. Colons inside a password
+        // remain valid, and a consumer without Basic credentials is unaffected.
+        if self.username.contains(':') && self.has_credential("basicauth") {
+            errors.push(
+                "username must not contain ':' when the consumer has basicauth credentials \
+                 — RFC 7617 Basic authentication cannot represent a colon in the user-id"
+                    .to_string(),
+            );
         }
 
         // Custom ID
@@ -10146,6 +10320,19 @@ impl ServiceDiscoveryConfig {
 }
 
 impl GatewayConfig {
+    /// Admission-only `allowed_ws_origins` errors across every proxy (`*` and
+    /// non-origin entries). Load snapshots must not use this as a rejecting
+    /// gate; they warn via [`Proxy::warn_legacy_allowed_ws_origins`] instead.
+    pub fn allowed_ws_origins_admission_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for proxy in &self.proxies {
+            for e in proxy.allowed_ws_origins_admission_errors() {
+                errors.push(format!("Proxy '{}': {}", proxy.id, e));
+            }
+        }
+        errors
+    }
+
     /// Validate all field-level constraints across every resource in the config.
     ///
     /// This validates individual field values (lengths, ranges, formats) — not
@@ -10168,6 +10355,22 @@ impl GatewayConfig {
         backend_allow_ips: &crate::config::BackendEgressPolicy,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+
+        // Distributed frontend keys must pass this node's module policy even
+        // before a listener or material loader is constructed.
+        for key in self.frontend_tls_key_path.iter().chain(
+            self.frontend_tls_certificate_sources
+                .iter()
+                .map(|source| &source.key_path),
+        ) {
+            if let Err(error) = validate_tls_material_source_field(
+                "frontend_tls_key_path",
+                key,
+                crate::tls::source::MaterialKind::Key,
+            ) {
+                errors.push(error);
+            }
+        }
 
         let mut frontend_tls_sources_by_namespace = std::collections::HashMap::new();
         for source in &self.frontend_tls_certificate_sources {
@@ -10194,6 +10397,10 @@ impl GatewayConfig {
                     errors.push(format!("Proxy '{}': {}", proxy.id, e));
                 }
             }
+            // Grandfather existing `"*"` / non-origin rows: never fail a
+            // file/database/CP/DP load for this (issue #5454). Admission
+            // rejects the same values through `validate_fields`.
+            proxy.warn_legacy_allowed_ws_origins();
         }
         for consumer in &self.consumers {
             if let Err(errs) = consumer.validate_fields() {

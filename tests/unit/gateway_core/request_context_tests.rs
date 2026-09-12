@@ -46,6 +46,102 @@ fn materialize_headers_is_idempotent() {
     assert_eq!(ctx.headers.get("extra").unwrap(), "val");
 }
 
+// ── Issue #5010: obs-text field values must survive materialization ─────────
+//
+// RFC 9110 §5.5 permits obs-text (0x80-0xFF) in a field value, and
+// `HeaderValue::from_str` accepts those bytes — only `HeaderValue::to_str`
+// refuses them. Decoding with `to_str` therefore deleted every obs-text field
+// value from the backend request, because the materialized map is the
+// authoritative removal set for the outbound merges.
+
+#[test]
+fn materialize_headers_keeps_non_ascii_utf8_values_byte_exact() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    let mut raw = HeaderMap::new();
+    raw.insert(
+        "x-api-key",
+        http::HeaderValue::from_bytes("ユニコード-api-key-value-32chars-min".as_bytes())
+            .expect("obs-text is a valid header value"),
+    );
+    ctx.set_raw_headers(raw);
+
+    ctx.materialize_headers();
+
+    assert_eq!(
+        ctx.headers.get("x-api-key").map(String::as_str),
+        Some("ユニコード-api-key-value-32chars-min")
+    );
+    // Non-vacuity: the exact bytes round-trip back onto the wire.
+    assert_eq!(
+        http::HeaderValue::from_str(ctx.headers.get("x-api-key").unwrap())
+            .expect("materialized value must be representable on the wire")
+            .as_bytes(),
+        "ユニコード-api-key-value-32chars-min".as_bytes()
+    );
+}
+
+#[test]
+fn materialize_headers_folds_repeated_non_ascii_utf8_field_lines() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    let mut raw = HeaderMap::new();
+    raw.append(
+        "x-note",
+        http::HeaderValue::from_bytes("café".as_bytes()).unwrap(),
+    );
+    raw.append(
+        "x-note",
+        http::HeaderValue::from_bytes("naïve".as_bytes()).unwrap(),
+    );
+    ctx.set_raw_headers(raw);
+
+    ctx.materialize_headers();
+
+    assert_eq!(
+        ctx.headers.get("x-note").map(String::as_str),
+        Some("café, naïve")
+    );
+}
+
+#[test]
+fn materialize_headers_still_omits_values_that_are_not_valid_utf8() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    let mut raw = HeaderMap::new();
+    raw.insert(
+        "x-binary",
+        http::HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap(),
+    );
+    raw.insert("x-plain", "ok".parse().unwrap());
+    ctx.set_raw_headers(raw);
+
+    ctx.materialize_headers();
+
+    assert!(!ctx.headers.contains_key("x-binary"));
+    assert_eq!(ctx.headers.get("x-plain").map(String::as_str), Some("ok"));
+    // The raw map still carries the exact bytes for plugins that inspect them.
+    assert_eq!(
+        ctx.raw_header_value_bytes("x-binary").next(),
+        Some(&[0xFF, 0xFE][..])
+    );
+}
+
+#[test]
+fn materialize_headers_still_drops_reserved_gateway_assertions_with_obs_text() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    let mut raw = HeaderMap::new();
+    raw.insert(
+        "x-consumer-username",
+        http::HeaderValue::from_bytes("スプーフ".as_bytes()).unwrap(),
+    );
+    ctx.set_raw_headers(raw);
+
+    ctx.materialize_headers();
+
+    assert!(
+        !ctx.headers.contains_key("x-consumer-username"),
+        "a client-supplied gateway assertion must never be materialized"
+    );
+}
+
 #[test]
 fn raw_header_get_reads_before_materialization() {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());

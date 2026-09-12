@@ -207,6 +207,48 @@ message MeshConfigUpdate {
   string session_token = 8;
 }
 
+// Which stage of the data plane's slice lifecycle a status report describes
+// (issue #4812).
+//
+// A data plane reports TWICE for a version it fully converges on: once when the
+// receive/install gates admit it (ACCEPTED — the slice is the received slice but
+// is NOT yet serving), and once when the proxy runtime makes it the serving
+// generation (APPLIED). Collapsing the two is what let the control plane call a
+// data plane converged while its runtime had refused the slice.
+enum MeshSliceStatusPhase {
+  // Install-time verdict: subscription binding, envelope consistency, and
+  // config-revision freshness. Zero-valued so an unset field keeps the
+  // install-time meaning.
+  MESH_SLICE_STATUS_PHASE_ACCEPTED = 0;
+  // Proxy-runtime verdict: the slice became (or failed to become) the serving
+  // generation.
+  MESH_SLICE_STATUS_PHASE_APPLIED = 1;
+}
+
+// Closed, control-plane-validated refusal category (issue #4812).
+//
+// The data plane never supplies free rejection text: this enum is the ENTIRE
+// diagnostic the control plane retains, so a refusal reason can never carry
+// credentials, request data, or unbounded caller bytes. An unrecognized value
+// is refused rather than recorded.
+enum MeshSliceRejectReason {
+  // No refusal: the report is a success at its `phase`.
+  MESH_SLICE_REJECT_REASON_UNSPECIFIED = 0;
+  // Refused by the receive/install gates before the slice was installed.
+  MESH_SLICE_REJECT_REASON_INSTALL_REFUSED = 1;
+  // The slice could not be converted into a serving gateway configuration.
+  MESH_SLICE_REJECT_REASON_RUNTIME_CONFIG_BUILD = 2;
+  // The proxy runtime refused the converted configuration.
+  MESH_SLICE_REJECT_REASON_RUNTIME_PROXY_REFUSED = 3;
+  // Effective gateway trust material for this slice was unusable.
+  MESH_SLICE_REJECT_REASON_RUNTIME_TRUST_UNUSABLE = 4;
+  // Inbound mTLS live-reload preparation failed, or the slice made an
+  // overridden inbound app port newly selectable while live reload is off.
+  MESH_SLICE_REJECT_REASON_RUNTIME_TLS_RELOAD = 5;
+  // Owner-scoped NodeWaypoint DTLS candidate build failed.
+  MESH_SLICE_REJECT_REASON_RUNTIME_DTLS_CANDIDATE = 6;
+}
+
 // DP → CP apply/reject report for a MeshSubscribe-delivered slice version.
 //
 // CONSUMER CONTRACT (enforced fail-closed by the control plane):
@@ -216,18 +258,21 @@ message MeshConfigUpdate {
 //     characters, and have no leading/trailing whitespace.
 //   * `session_token` MUST match the currently connected local MeshSubscribe
 //     session and `version` MUST equal that session's current sent version.
-//   * Empty `error_message` is an ACK. Non-empty `error_message` is a NACK;
-//     the CP discards the caller text and retains only a fixed, control-safe,
-//     low-cardinality rejection label.
+//   * `phase` names the lifecycle stage this verdict came from and
+//     `reject_reason` is the verdict itself: UNSPECIFIED is success at that
+//     phase, anything else is a refusal. Both are closed enums; an
+//     unrecognized value is refused, never recorded.
 //   * The reporter MUST present the ordinary local mesh subscribe audience
 //     (`ferrum-mesh-subscribe:local`). Remote-discovery tokens are refused.
 message MeshSliceStatusReport {
-  // Slice version being acknowledged or rejected.
+  // Slice version being reported on.
   string version = 1;
-  // Empty = ACK. Non-empty = NACK diagnostic (CP-sanitised, never echoed raw).
-  string error_message = 2;
   // Opaque token from the MeshConfigUpdate carrying `version`.
   string session_token = 3;
+  // Lifecycle stage this verdict came from.
+  MeshSliceStatusPhase phase = 4;
+  // UNSPECIFIED = success at `phase`; any other value is a refusal category.
+  MeshSliceRejectReason reject_reason = 5;
 }
 
 // Empty success acknowledgement for ReportMeshSliceStatus.

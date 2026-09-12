@@ -20,6 +20,8 @@
 
 #![allow(clippy::bool_assert_comparison)]
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::backends::{
     H2Step, H3Step, H3TlsConfig, MatchHeaders, ScriptedH2Backend, ScriptedH3Backend,
     ScriptedTlsBackend, TcpStep, TlsConfig, tls_backend_without_quic_with_ok_response,
@@ -43,9 +45,9 @@ use tokio::net::{TcpListener, UdpSocket};
 async fn reserve_colocated_tcp_udp()
 -> Result<(TcpListener, UdpSocket, u16), Box<dyn std::error::Error + Send + Sync>> {
     for attempt in 0..10 {
-        let tcp = TcpListener::bind("127.0.0.1:0").await?;
+        let tcp = TcpListener::bind_test("127.0.0.1:0").await?;
         let port = tcp.local_addr()?.port();
-        match StdUdpSocket::bind(("127.0.0.1", port)) {
+        match StdUdpSocket::bind_test(("127.0.0.1", port)) {
             Ok(std_udp) => {
                 std_udp.set_nonblocking(true)?;
                 let udp = UdpSocket::from_std(std_udp)?;
@@ -137,8 +139,7 @@ async fn spawn_h3_gateway(
                 continue;
             }
         };
-        let https_port = reservation.port;
-        drop(reservation);
+        let https_port = reservation.drop_and_take_port();
 
         let scratch = tempfile::tempdir().expect("scratch");
         let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "phase8-gw-ca");
@@ -731,7 +732,7 @@ async fn mark_h3_unsupported_persists_until_periodic_refresh_succeeds() {
     let mut bind_err: Option<std::io::Error> = None;
     let mut recovered_udp: Option<UdpSocket> = None;
     for attempt in 0..10 {
-        match UdpSocket::bind(("127.0.0.1", backend_port)).await {
+        match UdpSocket::bind_test(("127.0.0.1", backend_port)).await {
             Ok(s) => {
                 recovered_udp = Some(s);
                 break;

@@ -12,9 +12,12 @@ Companion documents:
 - [Support policy](support_policy.md) — what a version number promises today.
 - [SECURITY.md](../SECURITY.md) — vulnerability reporting and the supply-chain gate.
 
-> **Build-out status.** Ferrum Edge is pre-1.0 (`0.9.0`) and no `v*` release has
-> been tagged. Read [support_policy.md](support_policy.md) before treating any
-> item here as a stability commitment.
+> **Build-out status.** Ferrum Edge is pre-1.0 and publishes semver releases on
+> the `v0.9.x` channel (see the [Releases
+> page](https://github.com/ferrum-edge/ferrum-edge/releases) for the current
+> tag; latest at time of writing: **v0.9.4**). Read
+> [support_policy.md](support_policy.md) before treating any item here as a
+> stability commitment.
 
 ## 1. Admin plane
 
@@ -227,7 +230,7 @@ are accepted and silently weaken the deployment.
 |---|---|
 | `FERRUM_TLS_NO_VERIFY=true` | Disables outbound TLS verification for **all** connections and bypasses backend SAN allow-list enforcement. Any on-path attacker becomes a valid backend. Refused when `FERRUM_MESH_PRODUCTION_MODE=true`. |
 | `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` | Not supported: **rejected at startup**. To reach a CP presenting a self-signed certificate, pin its CA with `FERRUM_DP_GRPC_TLS_CA_CERT_PATH`. |
-| `FERRUM_ADMIN_TLS_NO_VERIFY=true` | Skips Admin API TLS certificate verification. Refused when `FERRUM_MESH_PRODUCTION_MODE=true`. |
+| `FERRUM_ADMIN_TLS_NO_VERIFY=true` | The admin HTTPS listener neither requires nor verifies client certificates, so any TLS client reaches the admin API. Refused when `FERRUM_MESH_PRODUCTION_MODE=true`, and refused together with `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` because a configured client CA demands verification. |
 | `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` with a non-loopback plaintext admin bind | Downgrades the `database`/`cp` startup refusal to a warning and serves the management plane — and every operator bearer token that reaches it — in cleartext on a network-reachable interface. |
 | `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false` | Removes the cloud-metadata / link-local / multicast / unspecified baseline. With `FERRUM_BACKEND_ALLOW_IPS=both` and no deny list this makes the gateway an unrestricted SSRF bridge; the gateway logs a startup warning to that effect. |
 | `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` | Skips the in-flight connection drain, so a rolling deploy severs live requests instead of finishing them. |

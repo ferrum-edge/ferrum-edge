@@ -28,10 +28,11 @@
 //! Evaluation order: deny (consumer + group) → allow (consumer + group).
 //! If no rules match, the request is allowed (open by default).
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use tracing::warn;
 
 use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 
@@ -142,7 +143,7 @@ impl AccessControl {
                     // `allow_authenticated_identity`, so `has_allow_rules` is always
                     // false on this path.
                     if identity.chars().count() > MAX_EXTERNAL_IDENTITY_LENGTH {
-                        warn!(
+                        warn_sampled!(
                             client_ip = %client_ip,
                             plugin = "access_control",
                             reason = "external_identity_too_long",
@@ -155,7 +156,7 @@ impl AccessControl {
                         };
                     }
                     if self.disallowed_consumers.contains(identity) {
-                        warn!(
+                        warn_sampled!(
                             client_ip = %client_ip,
                             plugin = "access_control",
                             reason = "external_identity_disallowed",
@@ -170,14 +171,24 @@ impl AccessControl {
                     return PluginResult::Continue;
                 }
                 if authenticated_identity.is_some() {
-                    warn!(client_ip = %client_ip, plugin = "access_control", reason = "external_identity_not_authorized", "Authenticated external identity rejected by access control");
+                    warn_sampled!(
+                        client_ip = %client_ip,
+                        plugin = "access_control",
+                        reason = "external_identity_not_authorized",
+                        "Authenticated external identity rejected by access control"
+                    );
                     return PluginResult::Reject {
                         status_code: 403,
                         body: r#"{"error":"Authenticated identity is not authorized"}"#.into(),
                         headers: HashMap::new(),
                     };
                 }
-                warn!(client_ip = %client_ip, plugin = "access_control", reason = "no_consumer", "No consumer identified for access control");
+                warn_sampled!(
+                    client_ip = %client_ip,
+                    plugin = "access_control",
+                    reason = "no_consumer",
+                    "No consumer identified for access control"
+                );
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"No consumer identified"}"#.into(),
@@ -192,7 +203,13 @@ impl AccessControl {
 
         // Consumer username deny
         if self.disallowed_consumers.contains(username) {
-            warn!(consumer = %username, client_ip = %client_ip, plugin = "access_control", reason = "consumer_disallowed", "Consumer rejected by access control");
+            warn_sampled!(
+                consumer = %username,
+                client_ip = %client_ip,
+                plugin = "access_control",
+                reason = "consumer_disallowed",
+                "Consumer rejected by access control"
+            );
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"Consumer is not allowed"}"#.into(),
@@ -204,7 +221,14 @@ impl AccessControl {
         if !self.disallowed_groups.is_empty() {
             for group in &consumer.acl_groups {
                 if self.disallowed_groups.contains(group) {
-                    warn!(consumer = %username, group = %group, client_ip = %client_ip, plugin = "access_control", reason = "group_disallowed", "Consumer rejected by access control (group)");
+                    warn_sampled!(
+                        consumer = %username,
+                        group = %group,
+                        client_ip = %client_ip,
+                        plugin = "access_control",
+                        reason = "group_disallowed",
+                        "Consumer rejected by access control (group)"
+                    );
                     return PluginResult::Reject {
                         status_code: 403,
                         body: r#"{"error":"Consumer is not allowed"}"#.into(),
@@ -232,7 +256,13 @@ impl AccessControl {
             }
 
             // Neither username nor any group matched the allow lists
-            warn!(consumer = %username, client_ip = %client_ip, plugin = "access_control", reason = "consumer_not_allowed", "Consumer not in allow list");
+            warn_sampled!(
+                consumer = %username,
+                client_ip = %client_ip,
+                plugin = "access_control",
+                reason = "consumer_not_allowed",
+                "Consumer not in allow list"
+            );
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"Consumer is not allowed"}"#.into(),

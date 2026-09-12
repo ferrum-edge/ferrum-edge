@@ -21,6 +21,8 @@
 
 #![allow(dead_code)]
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config::{EnvConfig, OperatingMode};
@@ -358,7 +360,7 @@ pub(super) struct HoldingHttp1Backend {
 
 impl HoldingHttp1Backend {
     pub async fn spawn(behavior: HoldBehavior) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind holding backend");
         let port = listener.local_addr().expect("backend addr").port();
@@ -483,7 +485,7 @@ pub(super) struct StatusScriptHttp1Backend {
 
 impl StatusScriptHttp1Backend {
     pub async fn spawn(statuses: &[u16]) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind status backend");
         let port = listener.local_addr().expect("backend addr").port();

@@ -29,7 +29,7 @@ Fixes # (issue number)
 
 <!-- Describe the testing you have performed -->
 
-- [ ] Unit tests pass (`cargo test --test unit_tests`)
+- [ ] Unit tests pass (`cargo test --test unit_tests`, `--test unit_plugins_a_tests`, `--test unit_plugins_b_tests`, `--test unit_gateway_core_tests` as touched)
 - [ ] Integration tests pass (`cargo test --test integration_tests`)
 - [ ] E2E tests pass (`cargo test --test functional_tests -- --ignored`)
 - [ ] Clippy passes with zero warnings (`cargo clippy --all-targets -- -D warnings`)

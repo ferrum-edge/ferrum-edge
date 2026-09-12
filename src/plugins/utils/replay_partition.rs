@@ -715,6 +715,20 @@ pub fn append_request_context_partition(
     append_filtered_request_context_partition(hasher, ctx, request_headers, |_, _| false);
 }
 
+/// Append the finalized JSON request context used by `ai_semantic_cache`.
+/// Body framing and coding do not select a semantic neighborhood: the cache
+/// separately binds the parsed, normalized body. Keep every other origin input
+/// and the independent caller/destination partitions intact.
+pub fn append_semantic_request_context_partition(
+    hasher: &mut PartitionHasher,
+    ctx: &RequestContext,
+    request_headers: &HashMap<String, String>,
+) {
+    append_filtered_request_context_partition(hasher, ctx, request_headers, |name, _| {
+        name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("content-encoding")
+    });
+}
+
 /// Append the request context used by `response_caching`.
 ///
 /// Unlike an RFC cache's optional `Vary` optimization, this fail-closed

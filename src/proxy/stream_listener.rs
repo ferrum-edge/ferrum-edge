@@ -1109,11 +1109,16 @@ enum StreamBackendMetricEntry {
 /// Manages the set of active TCP/UDP stream listeners.
 ///
 /// All state is behind a tokio `Mutex` to serialize reconciliation calls.
-/// Reconciliation happens only on config reload — not on the hot request path.
+/// Reconciliation happens on config reload and bounded recovery ticks.
 pub struct StreamListenerManager {
     /// Serializes whole reconcile transactions without making the listener-map
     /// guard span asynchronous preparation, socket probes, or task shutdown.
     reconcile_serial: tokio::sync::Mutex<()>,
+    supervisor_manager: std::sync::OnceLock<std::sync::Weak<Self>>,
+    supervisor_started: AtomicBool,
+    reconciled: AtomicBool,
+    stopped: AtomicBool,
+    serving_tasks: arc_swap::ArcSwap<Vec<tokio::task::AbortHandle>>,
     listeners: Arc<tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>>,
     dtls_metrics: arc_swap::ArcSwap<Vec<DtlsDemuxMetricEntry>>,
     stream_backend_metrics: arc_swap::ArcSwap<Vec<StreamBackendMetricEntry>>,
@@ -1558,6 +1563,11 @@ impl StreamListenerManager {
     ) -> Self {
         Self {
             reconcile_serial: tokio::sync::Mutex::new(()),
+            supervisor_manager: std::sync::OnceLock::new(),
+            supervisor_started: AtomicBool::new(false),
+            reconciled: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            serving_tasks: arc_swap::ArcSwap::from_pointee(Vec::new()),
             listeners: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             dtls_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             stream_backend_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
@@ -2293,6 +2303,86 @@ impl StreamListenerManager {
         });
     }
 
+    /// Register one recovery supervisor. Launch is deferred until the mode's
+    /// first reconcile, so synchronous construction needs no Tokio runtime.
+    /// The task owns only a weak manager reference between ticks.
+    pub fn start_supervisor(self: &Arc<Self>) {
+        let _ = self.supervisor_manager.set(Arc::downgrade(self));
+        if self.reconciled.load(Ordering::Acquire) {
+            self.spawn_supervisor();
+        }
+    }
+
+    fn spawn_supervisor(&self) {
+        let Some(manager) = self.supervisor_manager.get().cloned() else {
+            return;
+        };
+        if self.supervisor_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        tokio::spawn(async move {
+            let period = Duration::from_secs(30);
+            let mut retry = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                retry.tick().await;
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                if manager.is_stopping() {
+                    break;
+                }
+                if manager.reconciled.load(Ordering::Acquire)
+                    && (!manager.is_ready() || manager.has_degraded_listeners())
+                {
+                    manager.reconcile().await;
+                }
+            }
+        });
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+            || self.overload.draining.load(Ordering::Acquire)
+            || self
+                .global_shutdown_rx
+                .load()
+                .as_ref()
+                .as_ref()
+                .is_some_and(|rx| *rx.borrow())
+    }
+
+    /// Recoverable readiness without locks or I/O. Soft TLS/DTLS deferrals and
+    /// pending binds do not withdraw a replica whose other listeners can serve.
+    /// Task completion fails readiness regardless of whether it ever started,
+    /// including panics that cannot publish a normal failure diagnostic.
+    pub fn is_ready(&self) -> bool {
+        !self.stopped.load(Ordering::Acquire)
+            && !self.overload.draining.load(Ordering::Acquire)
+            && !self
+                .bind_failures
+                .load()
+                .iter()
+                .any(|failure| failure.kind.is_hard_bind_failure())
+            && self
+                .serving_tasks
+                .load()
+                .iter()
+                .all(|task| !task.is_finished())
+    }
+
+    /// Any recorded degradation or exited task, including non-fatal frontend
+    /// TLS/DTLS deferrals. Pending binds alone are not degraded. Used for the
+    /// admin health status and recovery retries independently of readiness.
+    pub fn has_degraded_listeners(&self) -> bool {
+        !self.bind_failures.load().is_empty()
+            || self
+                .serving_tasks
+                .load()
+                .iter()
+                .any(|task| task.is_finished())
+    }
+
     /// Reconcile active listeners against the current config.
     ///
     /// - Starts listeners for new stream proxies (TCP and UDP)
@@ -2304,6 +2394,9 @@ impl StreamListenerManager {
     /// listeners started successfully.
     pub async fn reconcile(&self) -> Vec<(String, u16, String)> {
         let _reconcile_guard = self.reconcile_serial.lock().await;
+        if self.is_stopping() {
+            return Vec::new();
+        }
         // Every configured stream listener that is not serving after this
         // reconcile — hard bind failures AND deferred/degraded skips — is
         // accumulated here and published to the `/overload` snapshot. The
@@ -2930,6 +3023,22 @@ impl StreamListenerManager {
         // away, so an old rule cannot outlive its listener. New destinations
         // are not added here — they wait until bind succeeds below.
         let exclude: std::collections::HashSet<String> = to_remove.iter().cloned().collect();
+        if !exclude.is_empty() {
+            // Planned retirement is part of pending-bind grace. Stop tracking
+            // live handles BEFORE signalling them, so their expected exit
+            // cannot flap readiness while reconcile awaits shutdown/rebind.
+            // Already-exited tasks remain failures until replacement is
+            // published at the end of reconcile.
+            self.serving_tasks.store(Arc::new(
+                listeners
+                    .iter()
+                    .filter(|(key, handle)| {
+                        !exclude.contains(*key) || handle.join_handle.is_finished()
+                    })
+                    .map(|(_, handle)| handle.join_handle.abort_handle())
+                    .collect(),
+            ));
+        }
         drop(listeners);
         self.publish_serving_node_waypoint_udp_steering(&exclude)
             .await;
@@ -3737,6 +3846,12 @@ impl StreamListenerManager {
             .collect();
         self.stream_backend_metrics
             .store(Arc::new(stream_backend_entries));
+        self.serving_tasks.store(Arc::new(
+            listeners
+                .values()
+                .map(|handle| handle.join_handle.abort_handle())
+                .collect(),
+        ));
         drop(listeners);
 
         // Derive the hard bind-failure list returned to callers from the
@@ -3764,6 +3879,8 @@ impl StreamListenerManager {
             append_bind_failure(&self.bind_failures, failure);
         }
 
+        self.reconciled.store(true, Ordering::Release);
+        self.spawn_supervisor();
         bind_failures
     }
 
@@ -4092,6 +4209,8 @@ impl StreamListenerManager {
     /// ensures the `JoinHandle` set is cleared even when the global channel
     /// is not injected (e.g. unit tests that build a manager standalone).
     pub async fn shutdown_all(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let _reconcile_guard = self.reconcile_serial.lock().await;
         let mut listeners = self.listeners.lock().await;
         // Fence watchers under the same ownership boundary as publication:
         // they cannot re-enter once `steering_open` is false and every

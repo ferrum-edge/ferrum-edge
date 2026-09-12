@@ -52,6 +52,36 @@ pub mod stock_proto {
     tonic::include_proto!("ferrum.stockxds.v3");
 }
 
+/// Maximum number of characters of a peer-supplied string retained in an xDS
+/// log field. Peer-supplied strings (NACK `error_detail.message`, resource
+/// names) have no closed value space, so they are length-bounded rather than
+/// relabelled (issue #4813).
+pub const MAX_XDS_LOG_VALUE_CHARS: usize = 256;
+
+/// Bound a peer-supplied string for an xDS log field: control characters are
+/// replaced (no log-line forgery) and the value is truncated to
+/// [`MAX_XDS_LOG_VALUE_CHARS`] with an explicit marker. Recognized short values
+/// pass through unchanged so operators keep a usable diagnostic prefix, while
+/// an arbitrary-length input always produces a bounded field.
+pub fn bounded_xds_log_value(value: &str) -> String {
+    if value.len() <= MAX_XDS_LOG_VALUE_CHARS && !value.chars().any(|c| c.is_control()) {
+        return value.to_string();
+    }
+    let mut rendered = String::with_capacity(MAX_XDS_LOG_VALUE_CHARS + 12);
+    let mut truncated = false;
+    for (index, ch) in value.chars().enumerate() {
+        if index >= MAX_XDS_LOG_VALUE_CHARS {
+            truncated = true;
+            break;
+        }
+        rendered.push(if ch.is_control() { '.' } else { ch });
+    }
+    if truncated {
+        rendered.push_str("(truncated)");
+    }
+    rendered
+}
+
 // Public re-exports are used by library consumers/tests even when the binary
 // target only reaches xDS through narrower module paths.
 #[allow(unused_imports)]
@@ -94,5 +124,34 @@ pub use stock::{
 pub use translator::{
     CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL, LDS_TYPE_URL,
     RDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS, translate_destination_rule_carriers,
-    translate_mesh_slice_to_snapshot, translate_rtds_layer,
+    translate_mesh_slice_to_snapshot, translate_rtds_layer, xds_type_url_log_label,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_XDS_LOG_VALUE_CHARS, bounded_xds_log_value};
+
+    #[test]
+    fn hostile_megabyte_value_is_truncated_to_a_bounded_field() {
+        let hostile = "x".repeat(1024 * 1024);
+        let bounded = bounded_xds_log_value(&hostile);
+
+        assert!(
+            bounded.len() <= MAX_XDS_LOG_VALUE_CHARS + "(truncated)".len(),
+            "a 1 MiB peer value must collapse to a bounded log field, got {} bytes",
+            bounded.len()
+        );
+        assert!(bounded.ends_with("(truncated)"));
+    }
+
+    #[test]
+    fn short_clean_value_passes_through_unchanged() {
+        let value = "secret/spiffe-bundle/cluster.local";
+        assert_eq!(bounded_xds_log_value(value), value);
+    }
+
+    #[test]
+    fn control_characters_are_replaced_period() {
+        assert_eq!(bounded_xds_log_value("a\nb\rc"), "a.b.c");
+    }
+}

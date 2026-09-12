@@ -1529,15 +1529,18 @@ pub async fn wait_optional_tls_reload(
 /// (issue #4531).
 ///
 /// `connect_and_subscribe_*` returns `anyhow::Error`, so the underlying
-/// `tonic::Status` survives only as a downcast target. `RESOURCE_EXHAUSTED` is
-/// the code the CP's admission controller returns for every saturated stream
-/// budget (`CpGrpcAdmissionRejection::into_native_status`), and the status
-/// message names the exact `FERRUM_XDS_MAX_*` variable. Every other status code
-/// and every non-status error stays an ordinary connection error.
+/// `tonic::Status` survives only as a downcast target. The CP's admission
+/// controller returns `RESOURCE_EXHAUSTED` and names the saturated
+/// `FERRUM_XDS_MAX_*` budget. The code alone is insufficient: ConfigSync also
+/// uses `RESOURCE_EXHAUSTED` when a configuration cannot be delivered, which
+/// must remain an ordinary authority-loss error so the stale fence can latch.
 pub fn subscribe_admission_refusal(error: &anyhow::Error) -> Option<&tonic::Status> {
-    error
-        .downcast_ref::<tonic::Status>()
-        .filter(|status| status.code() == tonic::Code::ResourceExhausted)
+    error.downcast_ref::<tonic::Status>().filter(|status| {
+        status.code() == tonic::Code::ResourceExhausted
+            && status.message().starts_with("CP gRPC ")
+            && status.message().contains("(FERRUM_XDS_MAX_")
+            && status.message().ends_with(')')
+    })
 }
 
 /// Helper: mark connection state as disconnected with the last attempted CP target.
@@ -1555,10 +1558,11 @@ pub fn subscribe_admission_refusal(error: &anyhow::Error) -> Option<&tonic::Stat
 /// deliberately no grace period on top of that maximum.
 ///
 /// One more disconnect is classified as authority-retained (issue #4531): a
-/// Subscribe answered with `RESOURCE_EXHAUSTED`. That status is proof the CP is
-/// alive and answering — it is its stream admission controller refusing this
-/// subscriber for capacity/tenancy reasons — so latching a data-plane outage on
-/// it would fail closed on a control plane that is working. See
+/// Subscribe answered with the admission controller's identified
+/// `RESOURCE_EXHAUSTED` status. That status is proof the CP is alive and
+/// answering — it is refusing this subscriber for capacity/tenancy reasons —
+/// so latching a data-plane outage on it would fail closed on a control plane
+/// that is working. See
 /// [`subscribe_admission_refusal`].
 fn update_state_disconnected(
     connection_state: &Option<Arc<ArcSwap<DpCpConnectionState>>>,
@@ -1887,6 +1891,7 @@ fn stage_frontend_tls_snapshot(
                         .as_deref(),
                     tls_policy,
                     proxy_state.env_config.tls_cert_expiry_warning_days,
+                    proxy_state.env_config.tls_crl_expiry_warning_days,
                     proxy_state.crls.as_ref().as_slice(),
                     handshake_scope,
                 )
@@ -2255,7 +2260,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         ConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
             req.metadata_mut().insert("authorization", token.clone());
             Ok(req)
-        });
+        })
+        .max_decoding_message_size(
+            crate::modes::mesh::config_consumer::common::MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE,
+        );
 
     info!(
         "Connected to CP, subscribing for config updates (DP v{})",

@@ -3,6 +3,8 @@
 //! These tests verify that the DP client connects to the CP server,
 //! receives initial config snapshots, and processes streaming config updates.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -450,7 +452,9 @@ async fn start_test_cp_server(
         MeshGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
 
     // Bind to port 0 to get a random available port
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
@@ -532,7 +536,9 @@ async fn start_severable_test_cp_server(config: GatewayConfig) -> SeverableTestC
     // registered with one reactor cannot be polled from another.
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
     runtime.spawn(async move {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         if addr_tx.send(addr).is_err() {
@@ -565,7 +571,9 @@ async fn start_test_cp_server_with_real_ip_header(
     let (server, _update_tx) = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
         .real_ip_header(Some(real_ip_header.to_string()))
         .build();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {
@@ -1230,7 +1238,9 @@ async fn test_xds_ads_stream_returns_lds_snapshot() {
         32,
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let _server_handle = tokio::spawn(async move {
@@ -1303,7 +1313,9 @@ async fn test_xds_ads_per_node_stream_cap_rejects_excess_streams() {
     )
     .with_max_streams_per_node(1);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let _server_handle = tokio::spawn(async move {
@@ -1973,7 +1985,9 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
         CUSTOM_ISSUER.to_string(),
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let bound_addr = listener.local_addr().unwrap();
     let server_handle = tokio::spawn(async move {
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -2419,7 +2433,9 @@ async fn start_test_cp_server_with_tls(
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
     let (server, update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
 
     let mut tls_config =
@@ -3245,7 +3261,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
     let (server, _update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let bound_addr = listener.local_addr().unwrap();
 
     let server_handle = tokio::spawn(async move {
@@ -3312,7 +3328,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
 
     // Verify that a matching version succeeds
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
-        node_id: "test-dp-good".to_string(),
+        node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
@@ -3335,7 +3351,7 @@ async fn test_cp_rejects_dp_with_empty_version() {
     let (server, _update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let bound_addr = listener.local_addr().unwrap();
 
     let server_handle = tokio::spawn(async move {
@@ -3370,7 +3386,7 @@ async fn test_cp_rejects_dp_with_empty_version() {
 
     // Empty version simulates a pre-v0.9.0 DP that doesn't set the field
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
-        node_id: "old-dp".to_string(),
+        node_id: "test-dp".to_string(),
         ferrum_version: String::new(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
@@ -3964,7 +3980,9 @@ async fn start_test_cp_server_with_capacity(
         channel_capacity,
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
@@ -4113,7 +4131,9 @@ async fn start_test_cp_server_with_namespace(
             cp_namespace.to_string(),
         );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
@@ -4424,7 +4444,7 @@ async fn test_cp_accepts_dp_with_matching_namespace() {
         );
 
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
-        node_id: "test-dp-good".to_string(),
+        node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "production".to_string(),
         real_ip_header: Some(String::new()),
@@ -4703,7 +4723,9 @@ async fn spawn_blackhole_relay(
     use tokio::net::TcpStream;
 
     let blackhole = Arc::new(AtomicBool::new(false));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let flag = blackhole.clone();
     let handle = tokio::spawn(async move {
@@ -5777,7 +5799,9 @@ async fn start_native_admission_harness(
         .registry(mesh_registry.clone())
         .max_stream_lifetime(max_stream_lifetime)
         .build();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {
@@ -6323,7 +6347,9 @@ async fn start_severable_native_admission_server() -> SeverableNativeAdmissionSe
         .unwrap();
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
     runtime.spawn(async move {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         if addr_tx.send(addr).is_err() {
             return;
@@ -6423,7 +6449,7 @@ async fn native_configsync_rejects_unsafe_node_id_before_allocation() {
         ))
         .await
         .expect_err("unsafe node_id must fail closed before a stream exists");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
     assert!(
         !status.message().contains("injected"),
         "a rejection must never echo the client-supplied node_id: {status}"
@@ -6466,7 +6492,9 @@ async fn start_test_xds_server_with_limits(
     .with_admission_limits(limits);
     let admission = xds_server.admission();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {
@@ -7230,4 +7258,481 @@ async fn test_cp_refuses_unconstructible_plugin_config_and_dp_reports_rejection(
     );
 
     client_handle.abort();
+}
+
+mod configsync_identity_binding {
+    use super::*;
+    use ferrum_edge::grpc::admission::{CpGrpcAdmissionController, CpGrpcAdmissionLimits};
+    use ferrum_edge::grpc::cp_server::DpNodeRegistry;
+    use ferrum_edge::grpc::proto::SubscribeRequest;
+    use ferrum_edge::grpc::proto::config_sync_server::ConfigSync;
+    use std::io::{self, Write};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn request(subject: &str, node_id: &str) -> tonic::Request<SubscribeRequest> {
+        let mut request = tonic::Request::new(SubscribeRequest {
+            node_id: node_id.to_string(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            namespace: "ferrum".to_string(),
+            real_ip_header: Some(String::new()),
+            supports_heartbeat: false,
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", bearer_for(subject));
+        request
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configsync_rejects_and_audits_forged_node_without_replacing_live_registration() {
+        let registry = Arc::new(DpNodeRegistry::new());
+        let admission = CpGrpcAdmissionController::new(CpGrpcAdmissionLimits::default());
+        let (server, tx) = CpGrpcServer::builder(
+            Arc::new(ArcSwap::from_pointee(create_test_config(1))),
+            TEST_JWT_SECRET.to_string(),
+        )
+        .registry(registry.clone())
+        .admission(admission.clone())
+        .build();
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // The matching identity is admitted and owns the cluster registry row.
+        let stream = server
+            .subscribe(request("victim-dp", "victim-dp"))
+            .await
+            .unwrap();
+        let connected_at = registry.snapshot()[0].connected_at;
+        assert_eq!(registry.snapshot()[0].node_id, "victim-dp");
+        assert_eq!(tx.receiver_count(), 1);
+
+        let status = match server.subscribe(request("other-dp", "victim-dp")).await {
+            Ok(_) => panic!("a different subject must not claim the live node"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(admission.active_streams(), 1);
+        assert_eq!(admission.active_nodes(), 1);
+        assert_eq!(tx.receiver_count(), 1);
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.snapshot()[0].connected_at, connected_at);
+
+        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let failure = captured
+            .lines()
+            .find(|line| line.contains("result=\"failure\""))
+            .expect("identity mismatch must produce a failure audit record");
+        assert!(failure.contains("audit.event=\"tenant_subscription\""));
+        assert!(failure.contains("surface=\"ConfigSync.Subscribe\""));
+        assert!(failure.contains("node_id=\"other-dp\""));
+        assert!(failure.contains("namespace=\"ferrum\""));
+        assert!(failure.contains("node_id does not match authenticated subject"));
+        assert!(!failure.contains("victim-dp"));
+
+        drop(stream);
+        assert!(registry.is_empty());
+        assert_eq!(admission.active_streams(), 0);
+        assert_eq!(tx.receiver_count(), 0);
+    }
+}
+
+mod configsync_size_bounds {
+    use super::*;
+    use ferrum_edge::grpc::cp_server::{CpScope, DpNodeInfo, DpNodeRegistry};
+    use ferrum_edge::grpc::proto::config_sync_server::ConfigSync;
+    use ferrum_edge::grpc::proto::{ConfigUpdate, FullConfigRequest, SubscribeRequest};
+    use ferrum_edge::modes::mesh::config_consumer::common::MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE;
+    use prost::Message;
+    use std::io::{self, Write};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio_stream::StreamExt;
+
+    const LIMIT: usize = MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            let writer = self.clone();
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish()
+        }
+    }
+
+    fn authenticated<T>(body: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(body);
+        let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "size-bound-dp").unwrap();
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        request
+    }
+
+    fn subscribe_request() -> tonic::Request<SubscribeRequest> {
+        authenticated(SubscribeRequest {
+            node_id: "size-bound-dp".to_string(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            namespace: "ferrum".to_string(),
+            real_ip_header: Some(String::new()),
+            supports_heartbeat: false,
+        })
+    }
+
+    fn delta(proxies: Vec<Proxy>) -> IncrementalResult {
+        IncrementalResult {
+            added_or_modified_proxies: proxies,
+            removed_proxy_ids: vec![],
+            added_or_modified_consumers: vec![],
+            removed_consumer_ids: vec![],
+            added_or_modified_plugin_configs: vec![],
+            removed_plugin_config_ids: vec![],
+            added_or_modified_upstreams: vec![],
+            removed_upstream_ids: vec![],
+            sequence_cursor: 0,
+            poll_timestamp: Utc::now(),
+        }
+    }
+
+    fn oversized_config() -> GatewayConfig {
+        let mut config = create_test_config(1);
+        config.proxies[0].name = Some("configuration-canary".repeat(LIMIT / 19 + 1));
+        assert!(serde_json::to_vec(&config).unwrap().len() > LIMIT);
+        config
+    }
+
+    #[test]
+    fn configsync_rejected_broadcasts_disconnect_subscribers_without_reporting_delivery() {
+        let config = oversized_config();
+        let (server, tx) = CpGrpcServer::new(
+            Arc::new(ArcSwap::from_pointee(create_test_config(1))),
+            TEST_JWT_SECRET.to_string(),
+        );
+        let broadcasts = server.broadcasts();
+        let mut rx = tx.subscribe();
+        let registry = DpNodeRegistry::new();
+        let before = Utc::now() - chrono::Duration::seconds(60);
+        registry.insert(DpNodeInfo {
+            node_id: "size-bound-dp".to_string(),
+            version: ferrum_edge::FERRUM_VERSION.to_string(),
+            namespace: "ferrum".to_string(),
+            connected_at: before,
+            last_update_at: before,
+        });
+        let logs = CapturedLogs::default();
+        tracing::subscriber::with_default(logs.subscriber(), || {
+            CpGrpcServer::broadcast_namespace_update(
+                &broadcasts,
+                "ferrum",
+                &config,
+                &registry,
+                &CpScope::Single("ferrum".to_string()),
+            );
+            let oversized_delta = delta(config.proxies.clone());
+            CpGrpcServer::broadcast_namespace_delta(
+                &broadcasts,
+                "ferrum",
+                &oversized_delta,
+                &oversized_delta.poll_timestamp.to_rfc3339(),
+                &registry,
+                GatewayTrustPublication::Unchanged,
+                &CpScope::Single("ferrum".to_string()),
+            );
+        });
+        // The stream-level size guard turns these publications into terminal
+        // RESOURCE_EXHAUSTED errors. They must enter the channel first so an
+        // established subscriber cannot remain healthy on heartbeats alone.
+        assert!(rx.try_recv().unwrap().encoded_len() > LIMIT);
+        assert!(rx.try_recv().unwrap().encoded_len() > LIMIT);
+        assert_eq!(registry.snapshot()[0].last_update_at, before);
+        let logs = logs.contents();
+        assert_eq!(
+            logs.matches("Refusing oversized ConfigSync message")
+                .count(),
+            2
+        );
+        assert!(logs.contains("namespace=\"ferrum\""));
+        assert!(logs.contains("encoded_bytes="));
+        assert!(logs.contains(&format!("max_bytes={LIMIT}")));
+        assert!(!logs.contains("configuration-canary"));
+
+        // A subsequent accepted publication remains deliverable to a receiver
+        // that has not modeled tonic's terminal stream behavior.
+        CpGrpcServer::broadcast_namespace_update(
+            &broadcasts,
+            "ferrum",
+            &create_test_config(1),
+            &registry,
+            &CpScope::Single("ferrum".to_string()),
+        );
+        assert_eq!(rx.try_recv().unwrap().update_type, 0);
+        assert!(registry.snapshot()[0].last_update_at > before);
+    }
+
+    #[tokio::test]
+    async fn configsync_oversized_initial_unary_and_lag_recovery_are_refused() {
+        let config = Arc::new(ArcSwap::from_pointee(oversized_config()));
+        let registry = Arc::new(DpNodeRegistry::new());
+        let (server, tx) = CpGrpcServer::with_channel_capacity_and_registry(
+            config.clone(),
+            TEST_JWT_SECRET.to_string(),
+            2,
+            registry.clone(),
+        );
+        let logs = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(logs.subscriber());
+        let status = server.subscribe(subscribe_request()).await.err().unwrap();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(registry.is_empty());
+        let status = server
+            .get_full_config(authenticated(FullConfigRequest {
+                node_id: "size-bound-dp".to_string(),
+                ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                namespace: "ferrum".to_string(),
+                real_ip_header: Some(String::new()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+
+        let oversized = config.load_full();
+        config.store(Arc::new(create_test_config(1)));
+        let mut stream = server
+            .subscribe(subscribe_request())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.next().await.unwrap().is_ok());
+        assert_eq!(registry.len(), 1);
+        config.store(oversized);
+        // The receiver is deliberately not polled until its capacity is
+        // exceeded, forcing the actual full-snapshot recovery branch.
+        for _ in 0..3 {
+            assert_eq!(tx.send(ConfigUpdate::default()).unwrap(), 1);
+        }
+        let status = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        drop(stream);
+        assert!(registry.is_empty());
+        let logs = logs.contents();
+        assert_eq!(
+            logs.matches("Refusing oversized ConfigSync message")
+                .count(),
+            3
+        );
+        assert!(logs.contains("namespace=\"ferrum\""));
+        assert!(!logs.contains("configuration-canary"));
+    }
+
+    #[tokio::test]
+    async fn configsync_exact_protobuf_bound_includes_trust_and_metadata() {
+        let (server, tx) = CpGrpcServer::new(
+            Arc::new(ArcSwap::from_pointee(create_test_config(1))),
+            TEST_JWT_SECRET.to_string(),
+        );
+        let mut stream = server
+            .subscribe(subscribe_request())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.next().await.unwrap().is_ok());
+        // Individually both fields fit. Their sum and the protobuf length
+        // prefixes/metadata must be accounted for, even for raw sender callers.
+        let mut update = ConfigUpdate {
+            config_json: "x".repeat(LIMIT / 2),
+            trust_bundles_json: "y".repeat(LIMIT / 2),
+            version: "size-bound-version".to_string(),
+            ..Default::default()
+        };
+        let overhead = update.encoded_len() - LIMIT;
+        update.trust_bundles_json.truncate(LIMIT / 2 - overhead);
+        assert_eq!(update.encoded_len(), LIMIT);
+        assert_eq!(tx.send(update.clone()).unwrap(), 1);
+        assert_eq!(stream.next().await.unwrap().unwrap().encoded_len(), LIMIT);
+        update.trust_bundles_json.push('y');
+        assert_eq!(update.encoded_len(), LIMIT + 1);
+        assert_eq!(tx.send(update).unwrap(), 1);
+        assert_eq!(
+            stream.next().await.unwrap().unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configsync_large_cold_start_and_growth_reach_ready_and_serve() {
+        use bytes::Bytes;
+        use http_body_util::Full;
+        use hyper::service::service_fn;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let backend = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let backend_task = tokio::spawn(async move {
+            loop {
+                let (socket, _) = backend.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let service = service_fn(|_request| async {
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                            Bytes::from_static(b"configsync-size-proof"),
+                        )))
+                    });
+                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(socket), service)
+                        .await;
+                });
+            }
+        });
+        // Size an ordinary many-proxy namespace to roughly 6 MiB. No gigantic
+        // label, disabled plugin, or unknown JSON field stands in for config.
+        let per_proxy = serde_json::to_vec(&create_test_proxy("proxy-0", "/api-0"))
+            .unwrap()
+            .len();
+        let count = 6 * 1024 * 1024 / per_proxy;
+        let make_config = |count| {
+            let mut config = create_test_config(count);
+            for proxy in &mut config.proxies {
+                proxy.backend_host = "127.0.0.1".to_string();
+                proxy.backend_port = backend_addr.port();
+            }
+            config
+        };
+        let initial = make_config(count);
+        let bytes = serde_json::to_vec(&initial).unwrap().len();
+        assert!(bytes > 4 * 1024 * 1024 && bytes < LIMIT);
+        let (cp_addr, tx, cp_task) = start_test_cp_server(initial).await;
+        let state = create_test_proxy_state();
+        let ready = Arc::new(AtomicBool::new(false));
+        let connection = Arc::new(ArcSwap::from_pointee(
+            DpCpConnectionState::new_disconnected(&format!("http://{cp_addr}")),
+        ));
+        let dp_state = state.clone();
+        let dp_ready = ready.clone();
+        let dp_connection = connection.clone();
+        let dp_task = tokio::spawn(async move {
+            dp_client::connect_and_subscribe_with_startup_ready(
+                &format!("http://{cp_addr}"),
+                &test_secret(),
+                "size-bound-dp",
+                &dp_state,
+                None,
+                Some(dp_ready),
+                "ferrum",
+                Some(&dp_connection),
+                true,
+                None,
+            )
+            .await
+        });
+        timeout(Duration::from_secs(30), async {
+            while !ready.load(Ordering::Acquire) {
+                assert!(
+                    !dp_task.is_finished(),
+                    "DP terminated before accepting the large snapshot"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("large initial snapshot must reach DP readiness");
+        assert_eq!(state.config.load().proxies.len(), count);
+        assert!(connection.load().last_config_received_at.is_some());
+
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let proxy_task = tokio::spawn(
+            ferrum_edge::proxy::start_proxy_listener_with_bound_listener(
+                listener,
+                state.clone(),
+                shutdown_rx,
+                None,
+            ),
+        );
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let assert_serves = |index| {
+            let client = &client;
+            async move {
+                let response = client
+                    .get(format!("http://{proxy_addr}/api-{index}/"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                assert_eq!(response.text().await.unwrap(), "configsync-size-proof");
+            }
+        };
+        assert_serves(count - 1).await;
+
+        assert!(CpGrpcServer::broadcast_update(&tx, &make_config(1)));
+        assert!(wait_for_proxy_count(&state, 1, Duration::from_secs(30)).await);
+        assert_serves(0).await;
+        let grown = make_config(count + 1);
+        assert!(CpGrpcServer::broadcast_update(&tx, &grown));
+        assert!(wait_for_proxy_count(&state, count + 1, Duration::from_secs(30)).await);
+        assert_serves(count).await;
+        let growth_delta = delta(make_config(count + 2).proxies);
+        assert!(serde_json::to_vec(&growth_delta).unwrap().len() > 4 * 1024 * 1024);
+        assert!(CpGrpcServer::broadcast_delta_with_trust_bundles(
+            &tx,
+            &growth_delta,
+            &growth_delta.poll_timestamp.to_rfc3339(),
+            GatewayTrustPublication::Unchanged,
+        ));
+        assert!(wait_for_proxy_count(&state, count + 2, Duration::from_secs(30)).await);
+        assert_serves(count + 1).await;
+        assert!(!connection.load().config_diverged);
+        assert!(!dp_task.is_finished());
+        shutdown_tx.send(true).unwrap();
+        dp_task.abort();
+        proxy_task.abort();
+        cp_task.abort();
+        backend_task.abort();
+    }
 }

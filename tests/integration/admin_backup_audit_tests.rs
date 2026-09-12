@@ -1,5 +1,7 @@
 //! Integration coverage for GET /backup security audit (#2422).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::admin::audit::{self, list_local_fallback_events};
@@ -321,7 +323,7 @@ fn cached_only_state(config: GatewayConfig) -> AdminState {
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(
@@ -413,6 +415,37 @@ fn assert_no_secret_canaries(value: &Value) {
     assert!(!rendered.contains("Bearer "));
     assert!(!rendered.contains("Cookie:"));
     assert!(!rendered.contains("eyJhbGciOi"));
+}
+
+#[tokio::test]
+async fn restore_consumer_admission_rejects_conflicts_without_replacing_resources() {
+    let tmp = TempDir::new().unwrap();
+    let db = make_store(&tmp).await;
+    db.create_proxy(&create_test_proxy("retained", "/retained"))
+        .await
+        .unwrap();
+    let (base, _shutdown) = start_admin(admin_state(db)).await;
+    let admin = token("restore-admin", Some("admin"));
+    let response = reqwest::Client::new()
+        .post(format!("{base}/restore?confirm=true"))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "version": "1", "proxies": [], "upstreams": [], "plugin_configs": [],
+            "consumers": [
+                {"id": "a", "username": "shared"},
+                {"id": "b", "username": "shared"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert!(body.to_string().contains("consumer username"));
+    let (status, backup, _) = get_backup(&base, "/backup", &admin, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(backup["proxies"][0]["id"], "retained");
+    assert_eq!(backup["consumers"], json!([]));
 }
 
 #[tokio::test]
@@ -648,6 +681,104 @@ async fn backup_invalid_namespace_is_audited_in_default_namespace_without_echoin
 
     let captured = logs.contents();
     assert_logs_omit_hostile_canaries(&captured, &[hostile_ns, &admin]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn backup_non_ascii_namespace_is_rejected_and_audited_without_echoing() {
+    let (logs, _guard) = capture_backup_audit_logs();
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("backup-admin", Some("admin"));
+    let client = reqwest::Client::new();
+
+    // Cover valid UTF-8 that is not ASCII as well as invalid UTF-8. Both are
+    // legal HTTP field bytes, but neither is a valid namespace identifier.
+    for raw in [b"tenant-\xc3\xa9".as_slice(), b"tenant-\xff".as_slice()] {
+        let response = client
+            .get(format!("{base}/backup"))
+            .bearer_auth(&admin)
+            .header(
+                "X-Ferrum-Namespace",
+                reqwest::header::HeaderValue::from_bytes(raw).unwrap(),
+            )
+            .send()
+            .await
+            .expect("send non-ASCII namespace over HTTP");
+        assert_eq!(response.status().as_u16(), 400);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["error"],
+            "Invalid X-Ferrum-Namespace: header must contain only visible ASCII characters"
+        );
+        assert!(body.get("proxies").is_none());
+    }
+
+    let (audit_status, audit_body) = get_audit(&base, &admin).await;
+    assert_eq!(audit_status, 200);
+    assert_eq!(audit_body["total"], 2);
+    for event in audit_body["items"].as_array().unwrap() {
+        assert_eq!(event["namespace"], "ferrum");
+        assert_eq!(event["resource_id"], "ferrum");
+        assert_eq!(event["outcome"], "validation_failed");
+        assert_eq!(event["diff"]["namespace_status"], "invalid");
+    }
+    assert!(!audit_body.to_string().contains("tenant-"));
+    assert_no_secret_canaries(&audit_body);
+    assert_logs_omit_hostile_canaries(&logs.contents(), &["tenant-", &admin]);
+}
+
+#[tokio::test]
+async fn non_ascii_namespace_cannot_write_the_default_namespace() {
+    let tmp = TempDir::new().unwrap();
+    let db = make_store(&tmp).await;
+    db.create_proxy(&create_test_proxy("default-control", "/default-control"))
+        .await
+        .unwrap();
+    let (base, _shutdown) = start_admin(admin_state(db)).await;
+    let admin = token("namespace-admin", Some("admin"));
+    let client = reqwest::Client::new();
+    let candidate = create_test_proxy("tenant-control", "/tenant-control");
+    let response = client
+        .post(format!("{base}/proxies"))
+        .bearer_auth(&admin)
+        .header(
+            "X-Ferrum-Namespace",
+            reqwest::header::HeaderValue::from_bytes(b"tenant-\xc3\xa9").unwrap(),
+        )
+        .json(&candidate)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
+
+    // The same candidate is valid with an explicit ASCII tenant selector.
+    let response = client
+        .post(format!("{base}/proxies"))
+        .bearer_auth(&admin)
+        .header("X-Ferrum-Namespace", "tenant-a")
+        .json(&candidate)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 201);
+
+    for (namespace, expected_id) in [
+        (None, "default-control"),
+        (Some("tenant-a"), "tenant-control"),
+    ] {
+        let mut request = client.get(format!("{base}/proxies")).bearer_auth(&admin);
+        if let Some(namespace) = namespace {
+            request = request.header("X-Ferrum-Namespace", namespace);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let body: Value = response.json().await.unwrap();
+        let proxies = body["data"].as_array().unwrap();
+        assert_eq!(proxies.len(), 1, "unexpected namespace contents: {body}");
+        assert_eq!(proxies[0]["id"], expected_id);
+        assert_eq!(proxies[0]["namespace"], namespace.unwrap_or("ferrum"));
+    }
 }
 
 /// A namespace-claim denial must audit the real `GET /backup` attempt, and must

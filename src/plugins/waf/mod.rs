@@ -24,13 +24,14 @@ mod scan;
 mod stream;
 mod websocket;
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tracing::warn;
 
 use self::defaults::default_rules;
 use self::exemptions::CompiledExemptions;
@@ -48,8 +49,9 @@ use super::utils::synthetic_response::{
 };
 use super::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
-    ResponseTrailerPolicy, StreamBytesKind, StreamConnectionContext, UdpDatagramContext,
-    UdpDatagramDirection, UdpDatagramVerdict, WebSocketFrameDirection,
+    ResponseTrailerPolicy, StreamBytesKind, StreamConnectionContext, StreamFrontendTransport,
+    UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict, WafScorePhase,
+    WebSocketFrameDirection,
 };
 use crate::config::types::BackendScheme;
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -634,8 +636,23 @@ impl Waf {
         outcome
     }
 
-    fn finish_scan(&self, ctx: &mut RequestContext, outcome: ScanOutcome) -> PluginResult {
+    /// Turn one scan outcome into this instance's decision for `phase`.
+    ///
+    /// `phase` is what decides whether the anomaly contribution accumulates or
+    /// supersedes an earlier contribution from the same phase — see
+    /// [`WafScorePhase`]. It changes nothing else about the decision.
+    fn finish_scan(
+        &self,
+        ctx: &mut RequestContext,
+        outcome: ScanOutcome,
+        phase: WafScorePhase,
+    ) -> PluginResult {
         if outcome.hits.is_empty() {
+            // A replaceable phase that re-ran CLEAN retires its own previous
+            // contribution: that evidence is not in the representation the
+            // client receives, so it must stop counting toward this instance's
+            // threshold.
+            self.retire_replaceable_phase_score(ctx, phase);
             if outcome.truncated && self.config.log_to_metadata {
                 ctx.set_waf_metadata("waf.scan_truncated", "true");
             }
@@ -648,7 +665,7 @@ impl Waf {
             return PluginResult::Continue;
         }
 
-        let should_block = self.record_hits(ctx, &outcome, true);
+        let should_block = self.record_hits(ctx, &outcome, true, phase);
         if should_block {
             // An over-budget cheap/body scan still ran to completion and
             // produced real matches, so a confirmed enforcing hit (or score
@@ -750,7 +767,7 @@ impl Waf {
         }
         let globally_enforcing = self.config.mode == GlobalMode::Enforce;
         for hit in hits {
-            warn!(
+            warn_sampled!(
                 target: "waf",
                 proxy = %proxy_id,
                 rule = %hit.id,
@@ -814,7 +831,7 @@ impl Waf {
                 ctx.set_waf_metadata_if_absent("waf.block_reason", "body_too_large");
             }
             if self.config.log_to_stdout {
-                warn!(
+                warn_sampled!(
                     target: "waf",
                     proxy = %proxy_id(ctx),
                     client_ip = %ctx.client_ip,
@@ -838,6 +855,7 @@ impl Waf {
         ctx: &mut RequestContext,
         outcome: &ScanOutcome,
         enforce_actions: bool,
+        phase: WafScorePhase,
     ) -> bool {
         let mut first_blocking_rule = None;
         let mut highest = Severity::Info;
@@ -869,12 +887,10 @@ impl Waf {
         // request-private per-instance state) so weak signals in the query,
         // body, and response add up to a single instance score that can cross
         // that instance's block threshold. Sibling WAF instances never share
-        // this accumulator.
-        let total_score = self.config.scoring.as_ref().and_then(|scoring| {
-            ctx.ensure_waf_metadata_initialized();
-            ctx.accumulate_waf_instance_score(self.instance_id, &self.identity, phase_score)
-                .map(|total| (total, scoring.block_threshold))
-        });
+        // this accumulator. A phase the response pipeline may re-run over a
+        // revised representation supersedes its own previous contribution
+        // instead (`WafScorePhase`), so one response is never scored twice.
+        let total_score = self.score_phase(ctx, phase, phase_score);
         let score_block = enforce_actions
             && self.config.mode == GlobalMode::Enforce
             && total_score.is_some_and(|(total, threshold)| total >= threshold);
@@ -913,6 +929,40 @@ impl Waf {
         first_blocking_rule.is_some() || score_block
     }
 
+    /// Record `phase_score` for `phase` and report `(total, block_threshold)`
+    /// when this instance participates in anomaly scoring at all.
+    fn score_phase(
+        &self,
+        ctx: &mut RequestContext,
+        phase: WafScorePhase,
+        phase_score: u32,
+    ) -> Option<(u32, u32)> {
+        let scoring = self.config.scoring.as_ref()?;
+        ctx.ensure_waf_metadata_initialized();
+        let total = ctx.accumulate_waf_instance_score(
+            self.instance_id,
+            &self.identity,
+            phase,
+            phase_score,
+        )?;
+        Some((total, scoring.block_threshold))
+    }
+
+    /// Retire a replaceable phase's previous contribution because this run of
+    /// it found nothing. A never-scoring instance stays absent; an instance that
+    /// scored elsewhere keeps those independent contributions.
+    fn retire_replaceable_phase_score(&self, ctx: &mut RequestContext, phase: WafScorePhase) {
+        if !phase.is_replaceable() {
+            return;
+        }
+        let Some((total, _)) = self.score_phase(ctx, phase, 0) else {
+            return;
+        };
+        if self.config.log_to_metadata {
+            self.publish_instance_score_metadata(ctx, total);
+        }
+    }
+
     /// Publish this instance's score and a deterministic multi-instance aggregate.
     ///
     /// - Always writes `waf.instances.<identity>.score` for the updating instance.
@@ -930,7 +980,7 @@ impl Waf {
         let mut parts: Vec<(&str, u32)> = ctx
             .waf_instance_scores
             .values()
-            .map(|state| (state.identity.as_ref(), state.score))
+            .map(|state| (state.identity.as_ref(), state.total()))
             .collect();
         parts.sort_unstable_by(|left, right| left.0.cmp(right.0));
         let mut aggregate = String::new();
@@ -959,7 +1009,7 @@ impl Waf {
             }
         }
         if !matches!(self.config.on_scan_timeout, TimeoutAction::Allow) {
-            warn!(
+            warn_sampled!(
                 target: "waf",
                 proxy = %proxy_id(ctx),
                 client_ip = %ctx.client_ip,
@@ -981,7 +1031,7 @@ impl Waf {
         }
         let rule = &self.compiled.rules[hit.rule_index];
         let globally_enforcing = self.config.mode == GlobalMode::Enforce;
-        warn!(
+        warn_sampled!(
             target: "waf",
             proxy = %proxy_id(ctx),
             rule = %rule.id,
@@ -1097,7 +1147,24 @@ impl Waf {
         content_type: Option<&str>,
     ) -> bool {
         self.response_body_policy_applies(ctx, content_type)
-            && self.has_enforcing_response_body_policy(ctx)
+            && self.response_body_disposition_can_refuse(ctx)
+    }
+
+    /// Whether ANY response-body disposition of this instance can refuse the
+    /// response — the request side's `(enforcing rule || strict size cap)`
+    /// term, mirrored.
+    ///
+    /// `on_body_too_large: block` rejects every oversize governed body while
+    /// globally enforcing, independent of per-rule `action`, so a posture whose
+    /// only blocking disposition is the strict size cap must still claim the
+    /// decoded representation: otherwise `clamp_body` measures the ENCODED
+    /// origin bytes and a compressed body slips under a cap its plaintext
+    /// exceeds. Decided from configuration and request state alone, so the
+    /// pre-content-type over-approximation can reuse it verbatim.
+    fn response_body_disposition_can_refuse(&self, ctx: &RequestContext) -> bool {
+        self.has_enforcing_response_body_policy(ctx)
+            || (self.config.mode == GlobalMode::Enforce
+                && self.config.on_body_too_large == TooLargeAction::Block)
     }
 
     /// Whether response-header policy is configured and applies to this request.
@@ -1245,7 +1312,7 @@ impl Plugin for Waf {
                     "tcp_require_tls",
                 );
                 if self.config.log_to_stdout {
-                    warn!(
+                    warn_sampled!(
                         target: "waf",
                         proxy = %ctx.proxy_id,
                         client_ip = %ctx.client_ip,
@@ -1261,14 +1328,23 @@ impl Plugin for Waf {
             }
         }
 
-        // L7 signature scan over plaintext / decrypted opening bytes only.
-        // If an inspectable stream produced no bytes before the bounded capture
-        // deadline (idle client / EOF / read timeout), fail closed in enforce
-        // mode. Otherwise a client could wait out the peek/read window and send
-        // malicious first bytes after the backend relay starts. Encrypted
-        // passthrough remains fail-open for signatures because the gateway never
-        // has L7 plaintext to scan there.
-        if stream.inspect_tcp && !stream.signatures.is_empty() {
+        // L7 signature scan over the opening bytes of a TCP stream. This is a
+        // TCP-only surface: `inspect_tcp` governs the FIRST-BYTES capture, which
+        // only a TCP frontend performs. A UDP/DTLS session reaches this hook to
+        // be admitted and carries no first bytes at all, so evaluating the
+        // branch there would fail every clean datagram session closed before its
+        // own per-datagram policy (`on_udp_datagram`) ever ran (issue #5117).
+        //
+        // If an inspectable TCP stream produced no bytes before the bounded
+        // capture deadline (idle client / EOF / read timeout), fail closed in
+        // enforce mode. Otherwise a client could wait out the peek/read window
+        // and send malicious first bytes after the backend relay starts.
+        // Encrypted passthrough remains fail-open for signatures because the
+        // gateway never has L7 plaintext to scan there.
+        if ctx.frontend_transport == StreamFrontendTransport::Tcp
+            && stream.inspect_tcp
+            && !stream.signatures.is_empty()
+        {
             let kind = ctx
                 .first_bytes_kind
                 .unwrap_or(StreamBytesKind::PlaintextWire);
@@ -1296,7 +1372,7 @@ impl Plugin for Waf {
                         "first_bytes_unavailable",
                     );
                     if self.config.log_to_stdout {
-                        warn!(
+                        warn_sampled!(
                             target: "waf",
                             proxy = %ctx.proxy_id,
                             client_ip = %ctx.client_ip,
@@ -1446,7 +1522,7 @@ impl Plugin for Waf {
         if is_control || !self.requires_ws_frame_hooks() {
             return None;
         }
-        warn!(
+        warn_sampled!(
             target: "waf",
             plugin = "waf",
             proxy = %proxy_id,
@@ -1471,7 +1547,7 @@ impl Plugin for Waf {
             return PluginResult::Continue;
         }
         let outcome = self.run_cheap_with_budget(|| self.run_cheap_scan(ctx));
-        self.finish_scan(ctx, outcome)
+        self.finish_scan(ctx, outcome, WafScorePhase::Accumulating)
     }
 
     fn requires_request_body_buffering(&self) -> bool {
@@ -1561,7 +1637,7 @@ impl Plugin for Waf {
             .run_body_scan_with_budget(|| self.run_request_body_scan(ctx, body, content_type))
             .await;
         outcome.truncated = truncated;
-        self.finish_scan(ctx, outcome)
+        self.finish_scan(ctx, outcome, WafScorePhase::Accumulating)
     }
 
     async fn after_proxy(
@@ -1587,7 +1663,7 @@ impl Plugin for Waf {
             // untouched header set is neither rescanned nor rescored
             // (`GHSA-62jg-v563-4q23`).
             let digest = response_header_map_digest(response_headers);
-            let result = self.finish_scan(ctx, outcome);
+            let result = self.finish_scan(ctx, outcome, WafScorePhase::Accumulating);
             // A rejection can be rebuilt into the same header map and must be
             // scanned again by the bounded fail-closed recheck. Only successful
             // decisions are safe to memoize.
@@ -1711,9 +1787,12 @@ impl Plugin for Waf {
     /// free: it converts an uninspectable representation into a `502`.
     ///
     /// * the configured response-body rules must actually scan this media type
-    ///   on this request, AND their verdict must be able to refuse it. A
-    ///   `monitor`-mode instance never blocks, so an undecodable origin coding
-    ///   there costs an observation, not the response;
+    ///   on this request, AND some disposition must be able to refuse it —
+    ///   an enforcing rule, or a globally enforcing `on_body_too_large: block`
+    ///   whose cap must be measured against plaintext rather than the encoded
+    ///   origin bytes. A `monitor`-mode instance never blocks, so an
+    ///   undecodable origin coding there costs an observation, not the
+    ///   response;
     /// * the ORIGIN must have declared a content coding
     ///   ([`crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY`], the pristine
     ///   pre-`after_proxy` stamp). An identity-coded response is already the
@@ -1744,7 +1823,7 @@ impl Plugin for Waf {
     /// — including the enforcing-disposition term, which is itself decided from
     /// configuration and the request alone.
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
-        self.should_buffer_response_body(ctx) && self.has_enforcing_response_body_policy(ctx)
+        self.should_buffer_response_body(ctx) && self.response_body_disposition_can_refuse(ctx)
     }
 
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
@@ -1791,7 +1870,7 @@ impl Plugin for Waf {
         }
         let outcome =
             self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
-        let result = self.finish_scan(ctx, outcome);
+        let result = self.finish_scan(ctx, outcome, WafScorePhase::FinalResponseHeaders);
         // Do not memoize refused maps: the final response pipeline deliberately
         // rechecks a rebuilt rejection, which can be byte-for-byte identical.
         if matches!(&result, PluginResult::Continue) {
@@ -1824,9 +1903,8 @@ impl Plugin for Waf {
         {
             return PluginResult::Continue;
         }
-        if !self.response_body_eligible_for_scan(
-            response_headers.get("content-type").map(String::as_str),
-        ) {
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        if !self.response_body_eligible_for_scan(content_type) {
             return PluginResult::Continue;
         }
         let (body, truncated) = match self.clamp_body(ctx, BodyDirection::Response, body) {
@@ -1834,10 +1912,10 @@ impl Plugin for Waf {
             Err(result) => return result,
         };
         let mut outcome = self
-            .run_body_scan_with_budget(|| self.run_response_body_scan(ctx, body))
+            .run_body_scan_with_budget(|| self.run_response_body_scan(ctx, body, content_type))
             .await;
         outcome.truncated = truncated;
-        self.finish_scan(ctx, outcome)
+        self.finish_scan(ctx, outcome, WafScorePhase::FinalResponseBody)
     }
 
     /// Preserve the established final-body hook contract for direct callers.
@@ -1995,11 +2073,7 @@ fn validate_enforce_mode_has_enforcing_rules(
     }) {
         return Ok(());
     }
-    if stream.is_some_and(|cfg| {
-        cfg.tcp_require_tls
-            || (cfg.signatures.has_enforce_action()
-                && (cfg.inspect_tcp || cfg.inspect_udp || cfg.inspect_response))
-    }) {
+    if stream.is_some_and(|cfg| cfg.tcp_require_tls || cfg.enforcing_signature_is_reachable()) {
         return Ok(());
     }
     if oversize_body_block_is_reachable(on_body_too_large, compiled, surfaces) {
@@ -2272,7 +2346,7 @@ mod tests {
         });
 
         assert!(outcome.timed_out);
-        let result = plugin.finish_scan(&mut ctx, outcome);
+        let result = plugin.finish_scan(&mut ctx, outcome, WafScorePhase::Accumulating);
 
         assert!(matches!(result, PluginResult::Reject { .. }));
         assert_eq!(
@@ -2315,7 +2389,7 @@ mod tests {
                 ScanOutcome::default()
             })
             .await;
-        let result = plugin.finish_scan(&mut ctx, outcome);
+        let result = plugin.finish_scan(&mut ctx, outcome, WafScorePhase::Accumulating);
 
         assert!(matches!(
             result,

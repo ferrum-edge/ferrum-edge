@@ -20,6 +20,12 @@ normalizes to UNKNOWN (`2`), while malformed input retains the existing
 `u32::MAX` invalid-status sentinel. It can be omitted, renamed, or placed in
 `order` like any other HTTP native field.
 
+They also include `grpc_request_messages` and `grpc_response_messages`, the
+complete length-prefixed gRPC message counts observed for the transaction.
+Like native serialization, each is emitted only when nonzero — zero means the
+transaction was not gRPC — so attaching a schema never removes message-count
+observability, and both names are valid in `omit`, `rename`, and `order`.
+
 ## Quick Start
 
 ```yaml
@@ -254,11 +260,18 @@ schema raises.)
     `overwrite` (metadata entry replaces — implemented as a duplicate
     key, which most JSON parsers resolve as "last wins").
 
+`prefix` and `on_collision` only take effect under `flatten`, but they are
+type- and value-checked in **every** mode. A `nested` or `omit` schema
+carrying `prefix: 3` or `on_collision: "bad"` is rejected at construction
+rather than accepted and discarded, so switching a working schema to
+`mode: flatten` can never turn a stored config into a load failure.
+
 Sensitive keys (`authorization`, `cookie`, credential tokens, API keys, etc.)
 are **always** redacted, on every path — `nested`, `flatten`, even when the
 operator renames the outer `metadata` field via `rename:`. There is no
 way to bypass redaction through the schema. Request-private lifecycle keys
-under the `_dedup_` prefix are **omitted entirely** (not redacted) from every
+under the `_dedup_` prefix, and the gRPC-Web request-trailer staging container
+`grpc_web.request_trailers`, are **omitted entirely** (not redacted) from every
 summary projection.
 
 ### Sensitive substrings
@@ -335,6 +348,17 @@ producer still writes the legacy names (`_dedup_key`, `_dedup_fingerprint`,
 `_dedup_local_inflight_token`, `_dedup_redis_lock_token`). Schema
 `static_fields` / rename targets that match this namespace are rejected at
 compile time.
+
+The gRPC-Web request-trailer staging container `grpc_web.request_trailers` is
+internal-only under the same contract. It holds the client's complete validated
+end-of-stream metadata block as a base64 JSON array — transport state the gRPC
+dispatch paths consume, not observability metadata — and the trailer names live
+*inside* the encoded value, so outer-key sensitive matching cannot reach them
+and base64 is an encoding rather than confidentiality. `clone_log_metadata`
+strips it, every native / schema serializer omits it, and `static_fields` /
+rename targets naming it are rejected at compile time. The response-side
+counterpart `grpc_web_shadowed_trailers` remains in the sensitive-substring
+list and serializes as `[REDACTED]`.
 
 ## Per-Plugin Notes
 
@@ -460,7 +484,9 @@ suggestion where applicable):
 10. `static_fields` values containing nested keys with sensitive substrings.
 11. `static_fields` string values that begin with an HTTP auth scheme token (`Bearer xxx`, `Basic xxx`, `Digest`, `Negotiate`, `NTLM`, `HOBA`, `Mutual`, `SCRAM-SHA-1`, `SCRAM-SHA-256`, `vapid`, `AWS4-HMAC-SHA256`). Defense-in-depth against literal credential copy-paste.
 12. `static_fields` values that are `null`.
-13. `metadata.prefix` containing control characters.
+13. `metadata.prefix` containing control characters, and any non-string
+    `metadata.prefix` or `metadata.on_collision` outside the `skip` /
+    `overwrite` enum — checked in every `metadata.mode`, not just `flatten`.
 14. Unknown derived `kind`.
 15. Unknown top-level schema keys (typo guard).
 16. `schema:` and `schema_ref:` both present on the same plugin.
@@ -486,6 +512,18 @@ For named schemas:
   `serde_json::Value` is built; no per-request `HashMap` is allocated.
   Default-configured plugins (no schema) go through the identical
   pre-existing serde path with zero added cost.
+- `metadata: { mode: flatten }` needs a set of already-claimed output keys to
+  detect collisions. The invariant part of that set — every `static_fields`
+  key, plus every native output key — is compiled once into
+  `SummarySchema::flatten_reserved` and borrowed per record instead of being
+  rebuilt, so a flattened record no longer clones one owned `String` per
+  native field and allocates a hash table before it emits anything. Only the
+  genuinely record-dependent claims are collected per record, as borrowed
+  `&str`: a derived field claims its key only when the value was actually
+  emitted (`backend_host` yields nothing when the target carries no host), and
+  under a `ws_logging` capability schema a native field claims its key only for
+  the entry kind that owns it. A record with neither — the common case — makes
+  no allocation at all. `nested` and `omit` never build or consult the set.
 - The named-schemas registry is read-only on the hot path; `schema_ref`
   resolution is a one-shot `Arc::clone` at plugin construction.
 - `transaction_log_schema` instances are config-only: cache construction
@@ -502,22 +540,50 @@ For named schemas:
 
 ### Splunk-style "Common Information Model" output
 
+CIM wants one `time` key, but an HTTP summary and a stream summary carry
+different timestamp fields (`timestamp_received` and `timestamp_connected`).
+Under one `summary_type: both` schema both renames would target `time` and the
+compiler rejects the duplicate output key, so declare one named schema per
+summary type and point each logger at the one it needs. `duration` likewise
+comes from `latency_total_ms` on HTTP and `duration_ms` on a stream.
+
 ```yaml
-schema:
-  summary_type: both
-  rename:
-    timestamp_received: time
-    timestamp_connected: time
-    proxy_id: route
-    response_status_code: status
-    client_ip: src
-    backend_target: dest
-    latency_total_ms: duration
-  derived_fields:
-    - { name: status_class, kind: status_class }
-    - { name: outcome,      kind: outcome      }
-  metadata: { mode: flatten, prefix: "fields." }
-  timestamp_format: epoch_ms
+plugin_name: transaction_log_schema
+scope: global
+config:
+  schemas:
+    splunk_cim_http:
+      summary_type: http
+      rename:
+        timestamp_received: time
+        proxy_id: route
+        response_status_code: status
+        client_ip: src
+        backend_target: dest
+        latency_total_ms: duration
+      derived_fields:
+        - { name: status_class, kind: status_class }
+        - { name: outcome,      kind: outcome      }
+      metadata: { mode: flatten, prefix: "fields." }
+      timestamp_format: epoch_ms
+    splunk_cim_stream:
+      summary_type: stream
+      rename:
+        timestamp_connected: time
+        proxy_id: route
+        client_ip: src
+        backend_target: dest
+        duration_ms: duration
+      derived_fields:
+        - { name: outcome, kind: outcome }
+      metadata: { mode: flatten, prefix: "fields." }
+      timestamp_format: epoch_ms
+```
+
+```yaml
+plugin_name: stdout_logging
+config:
+  schema_ref: splunk_cim_http
 ```
 
 ### Datadog logs
@@ -565,6 +631,12 @@ schema:
 
 ### statsd tag rename for a Datadog migration
 
+Renaming a field and omitting it are alternatives, not a pair: naming the same
+field in both `rename` and `omit` is rejected at construction (`schema field
+'proxy_id' is both omitted and renamed`). Pick one.
+
+Rename the proxy tag:
+
 ```yaml
 schema:
   summary_type: http
@@ -572,11 +644,23 @@ schema:
     http_method: verb
     proxy_id: route_id
     response_status_code: code
-  omit:
-    - proxy_id   # also valid if you want to drop the proxy tag entirely
 ```
 
 Output line: `ferrum.request.count:1|c|#verb:GET,code:200,status_class:2xx,route_id:things-api`.
+
+Or drop the proxy tag entirely:
+
+```yaml
+schema:
+  summary_type: http
+  rename:
+    http_method: verb
+    response_status_code: code
+  omit:
+    - proxy_id
+```
+
+Output line: `ferrum.request.count:1|c|#verb:GET,code:200,status_class:2xx`.
 
 ## Extending in Custom Plugins
 

@@ -3,7 +3,7 @@ use ferrum_edge::overload::{
     RED_PROBABILITY_SCALE, RequestGuard,
 };
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // ── OverloadState basics ──────────────────────────────────────────────
@@ -653,12 +653,38 @@ fn snapshot_includes_node_waypoint_drop_counters() {
     assert_eq!(snap.node_waypoint_drops.hash_mismatch, 0);
 }
 
-#[test]
-fn overload_fd_sample_runs_on_blocking_pool() {
+/// FD sampling must never run on the thread driving the runtime. The monitor
+/// now takes its sample through the bounded `sample_open_fd_count` helper
+/// (issue #4786) instead of calling `spawn_blocking(count_open_fds)` inline, so
+/// this asserts the behaviour — the closure observes a different thread — plus
+/// the fact that the monitor still feeds `count_open_fds` into that helper.
+#[tokio::test]
+async fn overload_fd_sample_runs_on_blocking_pool() {
+    // `#[tokio::test]` builds a current-thread runtime, so the async body runs
+    // on this very thread: a matching thread id would mean the count blocked
+    // the runtime worker rather than the blocking pool.
+    let worker = std::thread::current().id();
+    let (sampled_on_tx, sampled_on_rx) = std::sync::mpsc::channel();
+    let mut in_flight = None;
+    let sample = sample_open_fd_count(&mut in_flight, Duration::from_secs(5), 7, move || {
+        let _ = sampled_on_tx.send(std::thread::current().id());
+        42
+    })
+    .await;
+    assert_eq!(sample.current, 42);
+    assert!(!sample.timed_out);
+    let sampled_on = sampled_on_rx
+        .recv()
+        .expect("the counting closure must run and report its thread");
+    assert_ne!(
+        sampled_on, worker,
+        "FD sampling must leave the tokio worker via spawn_blocking"
+    );
+
     let src = include_str!("../../../src/overload.rs");
     assert!(
-        src.contains("tokio::task::spawn_blocking(count_open_fds)"),
-        "FD sampling must leave the tokio worker via spawn_blocking"
+        src.contains("&mut fd_count_in_flight"),
+        "the monitor must take its FD sample through the bounded blocking-pool helper"
     );
     assert!(
         src.contains("linux_fd_count_from_stat"),
@@ -721,4 +747,246 @@ async fn overload_monitor_publishes_fd_current() {
         .await
         .expect("overload monitor did not stop")
         .expect("overload monitor task panicked");
+}
+
+// ── FD limit classification (issue #4787) ─────────────────────────────
+
+use ferrum_edge::overload::FD_LIMIT_MAX_ENFORCEABLE;
+use ferrum_edge::overload::FdLimitVerdict;
+use ferrum_edge::overload::ShutdownSignalAction;
+use ferrum_edge::overload::begin_drain;
+use ferrum_edge::overload::classify_fd_limit_with_ceiling;
+use ferrum_edge::overload::classify_shutdown_signal;
+use ferrum_edge::overload::fd_count_timeout_warn_should_fire;
+use ferrum_edge::overload::sample_open_fd_count;
+use ferrum_edge::overload::wait_for_drain_with_escalation;
+use tokio_util::sync::CancellationToken;
+
+#[test]
+fn finite_fd_limit_is_enforced_directly() {
+    let verdict = classify_fd_limit_with_ceiling(65_536, None);
+    assert_eq!(verdict, FdLimitVerdict::Enforced(65_536));
+    assert_eq!(verdict.fd_max(), 65_536);
+    assert!(verdict.is_enforced());
+}
+
+#[test]
+fn zero_fd_limit_is_not_enforceable() {
+    // `getrlimit` failed, or a platform with no RLIMIT_NOFILE.
+    let verdict = classify_fd_limit_with_ceiling(0, Some(1_048_576));
+    assert_eq!(verdict, FdLimitVerdict::NotEnforceable);
+    assert_eq!(verdict.fd_max(), 0);
+    assert!(!verdict.is_enforced());
+}
+
+#[test]
+fn unlimited_fd_hard_cap_without_a_platform_ceiling_disables_the_tier() {
+    // RLIM_INFINITY: `raise_fd_limit()` raises the soft cap to it, which used
+    // to publish `fd_max = i64::MAX` and a ratio that could never reach the
+    // 0.80 pressure or 0.95 critical threshold.
+    for limit in [u64::MAX, i64::MAX as u64, FD_LIMIT_MAX_ENFORCEABLE] {
+        let verdict = classify_fd_limit_with_ceiling(limit, None);
+        assert_eq!(
+            verdict,
+            FdLimitVerdict::NotEnforceable,
+            "limit {limit} should not be enforceable"
+        );
+        assert_eq!(verdict.fd_max(), 0);
+    }
+}
+
+#[test]
+fn unlimited_fd_hard_cap_clamps_to_a_published_platform_ceiling() {
+    let verdict = classify_fd_limit_with_ceiling(u64::MAX, Some(1_048_576));
+    assert_eq!(verdict, FdLimitVerdict::ClampedToPlatformCeiling(1_048_576));
+    assert_eq!(verdict.fd_max(), 1_048_576);
+    assert!(verdict.is_enforced());
+}
+
+#[test]
+fn implausible_platform_ceiling_does_not_rescue_an_unlimited_cap() {
+    for ceiling in [Some(0u64), Some(u64::MAX)] {
+        let verdict = classify_fd_limit_with_ceiling(u64::MAX, ceiling);
+        assert_eq!(verdict, FdLimitVerdict::NotEnforceable);
+    }
+}
+
+#[test]
+fn disabled_fd_tier_reports_enforced_false_in_the_snapshot() {
+    let state = OverloadState::new();
+    state.fd_current.store(45, Ordering::Relaxed);
+    // `fd_max = 0` is how the monitor publishes "not enforceable".
+    state.fd_max.store(0, Ordering::Relaxed);
+    let snapshot = state.snapshot();
+    assert!(!snapshot.pressure.file_descriptors.enforced);
+    assert_eq!(snapshot.pressure.file_descriptors.max, 0);
+    assert_eq!(snapshot.pressure.file_descriptors.ratio, 0.0);
+
+    state.fd_max.store(65_536, Ordering::Relaxed);
+    let snapshot = state.snapshot();
+    assert!(snapshot.pressure.file_descriptors.enforced);
+    assert!(snapshot.pressure.file_descriptors.ratio > 0.0);
+}
+
+// ── Monitor FD-count timeout (issue #4786) ────────────────────────────
+
+#[tokio::test]
+async fn fd_count_sample_returns_the_measured_count_when_it_completes() {
+    let mut in_flight = None;
+    let sample = sample_open_fd_count(&mut in_flight, Duration::from_secs(5), 7, || 42);
+    let sample = sample.await;
+    assert_eq!(sample.current, 42);
+    assert!(!sample.timed_out);
+}
+
+#[tokio::test]
+async fn fd_count_sample_keeps_the_previous_count_when_the_blocking_pool_is_saturated() {
+    // Failing closed to u64::MAX here would drive fd_ratio to 1.0 and latch
+    // the gateway into permanent rejection — the outage the timeout prevents.
+    let stalled = || {
+        std::thread::sleep(Duration::from_secs(3));
+        99
+    };
+    let mut in_flight = None;
+    let sample = sample_open_fd_count(&mut in_flight, Duration::from_millis(20), 1234, stalled);
+    let sample = sample.await;
+    assert_eq!(sample.current, 1234);
+    assert!(sample.timed_out);
+}
+
+#[tokio::test]
+async fn fd_count_sample_is_single_flight_after_timeout() {
+    let submissions = Arc::new(AtomicU64::new(0));
+    let first_submissions = Arc::clone(&submissions);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut in_flight = None;
+
+    let first = sample_open_fd_count(&mut in_flight, Duration::from_millis(10), 7, move || {
+        first_submissions.fetch_add(1, Ordering::Relaxed);
+        release_rx
+            .recv()
+            .expect("the test must release the retained blocking task");
+        42
+    })
+    .await;
+    assert!(first.timed_out);
+
+    let duplicate_submissions = Arc::clone(&submissions);
+    let second = sample_open_fd_count(
+        &mut in_flight,
+        Duration::from_millis(10),
+        first.current,
+        move || {
+            duplicate_submissions.fetch_add(1, Ordering::Relaxed);
+            99
+        },
+    )
+    .await;
+    assert!(second.timed_out);
+    assert_eq!(submissions.load(Ordering::Relaxed), 1);
+
+    release_tx
+        .send(())
+        .expect("the retained blocking task must still be running");
+    let completed = sample_open_fd_count(&mut in_flight, Duration::from_secs(1), 7, || 99).await;
+    assert_eq!(completed.current, 42);
+    assert!(!completed.timed_out);
+}
+
+#[test]
+fn fd_count_timeout_warning_is_rate_limited() {
+    assert!(fd_count_timeout_warn_should_fire(10, None));
+    assert!(!fd_count_timeout_warn_should_fire(11, Some(10)));
+    assert!(!fd_count_timeout_warn_should_fire(69, Some(10)));
+    assert!(fd_count_timeout_warn_should_fire(70, Some(10)));
+}
+
+// ── Repeated shutdown signal escalation (issue #4829) ─────────────────
+
+#[test]
+fn repeated_shutdown_signals_escalate_then_acknowledge() {
+    assert_eq!(
+        classify_shutdown_signal(1),
+        ShutdownSignalAction::InitiateDrain
+    );
+    assert_eq!(classify_shutdown_signal(2), ShutdownSignalAction::Escalate);
+    assert_eq!(
+        classify_shutdown_signal(3),
+        ShutdownSignalAction::AlreadyEscalated
+    );
+    assert_eq!(
+        classify_shutdown_signal(9),
+        ShutdownSignalAction::AlreadyEscalated
+    );
+    // Defensive: the counter is incremented before classification, so 0 is
+    // unreachable, but it must not panic on the shutdown path.
+    assert_eq!(
+        classify_shutdown_signal(0),
+        ShutdownSignalAction::InitiateDrain
+    );
+}
+
+#[tokio::test]
+async fn escalation_cuts_the_drain_wait_short() {
+    let state = Arc::new(OverloadState::new());
+    let conn = ConnectionGuard::new(&state);
+    begin_drain(&state);
+
+    // A local token, not the process-global latch: escalating that one would
+    // make every later drain in this test binary observe a cut-short wait.
+    let escalation = CancellationToken::new();
+    let escalation_signal = escalation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        escalation_signal.cancel();
+    });
+
+    let started = std::time::Instant::now();
+    let wait = wait_for_drain_with_escalation(&state, Duration::from_secs(30), escalation);
+    let drained = wait.await;
+    assert!(!drained, "an escalated drain did not complete");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "escalation should skip the remaining 30s drain budget"
+    );
+    // The connection is still tracked: escalation force-closes, it does not
+    // pretend the drain finished.
+    assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+    drop(conn);
+}
+
+#[tokio::test]
+async fn an_already_escalated_shutdown_does_not_wait_at_all() {
+    let state = Arc::new(OverloadState::new());
+    let conn = ConnectionGuard::new(&state);
+    begin_drain(&state);
+
+    let escalation = CancellationToken::new();
+    escalation.cancel();
+
+    let started = std::time::Instant::now();
+    let wait = wait_for_drain_with_escalation(&state, Duration::from_secs(30), escalation);
+    let drained = wait.await;
+    assert!(!drained);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    drop(conn);
+}
+
+#[tokio::test]
+async fn a_single_signal_still_performs_the_full_drain() {
+    let state = Arc::new(OverloadState::new());
+    let conn = ConnectionGuard::new(&state);
+    begin_drain(&state);
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(conn);
+    });
+
+    // No escalation: the wait runs to completion, not to its timeout.
+    let escalation = CancellationToken::new();
+    let wait = wait_for_drain_with_escalation(&state, Duration::from_secs(10), escalation);
+    let drained = wait.await;
+    assert!(drained, "an unescalated drain should complete normally");
+    assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
 }

@@ -104,13 +104,14 @@ fn jwks_uri_redaction_removes_credentials_query_and_path() {
 #[test]
 fn jwk_key_ops_must_authorize_signature_verification() {
     let jwks = |key_use: Option<&str>, key_ops: Option<serde_json::Value>| {
-        let mut key = json!({
-            "kty": "RSA",
-            "kid": "k1",
-            "alg": "RS256",
-            "n": "AQAB",
-            "e": "AQAB"
-        });
+        // Start from the 2048-bit fixture so the modulus floor is not what
+        // decides these cases; `use` is re-applied per case below.
+        let mut fixture = rsa_jwks_with_kid(
+            include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+            "k1",
+        );
+        let mut key = fixture["keys"][0].take();
+        key.as_object_mut().expect("JWK object").remove("use");
         if let Some(key_use) = key_use {
             key["use"] = json!(key_use);
         }
@@ -192,20 +193,14 @@ fn jwks_requires_unique_non_empty_key_identifiers() {
 
 /// A minimal but well-formed RSA JWKS with one signing key.
 ///
-/// `DecodingKey::from_rsa_raw_components` stores the components without
-/// validating the modulus, so any valid base64url `n`/`e` yields a cached key —
-/// sufficient to populate the store for cache-retention assertions.
+/// A JWKS carrying the 2048-bit fixture key under `kid` `k1`: the store now
+/// applies the RSA modulus floor at load time, so a placeholder modulus would
+/// be discarded as unusable instead of populating the cache.
 fn populated_rsa_jwks() -> serde_json::Value {
-    json!({
-        "keys": [{
-            "kty": "RSA",
-            "kid": "k1",
-            "use": "sig",
-            "alg": "RS256",
-            "n": "AQAB",
-            "e": "AQAB"
-        }]
-    })
+    rsa_jwks_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+        "k1",
+    )
 }
 
 /// An empty 200 retains diagnostic/recovery keys only inside the configured
@@ -284,16 +279,10 @@ async fn empty_fetch_expires_bounded_trust_and_valid_recovery_restores_it() {
     );
 
     server.reset().await;
-    let recovered = json!({
-        "keys": [{
-            "kty": "RSA",
-            "kid": "k2",
-            "use": "sig",
-            "alg": "RS256",
-            "n": "AQAB",
-            "e": "AQAB"
-        }]
-    });
+    let recovered = rsa_jwks_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem"),
+        "k2",
+    );
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/jwks"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(recovered))
@@ -607,4 +596,102 @@ async fn an_on_demand_fetch_does_not_shorten_the_periodic_schedule() {
         "the periodic deadline must survive an out-of-band fetch unchanged"
     );
     refresh.abort();
+}
+
+// ─── JWK `alg` is honoured per RFC 7517 §4.4 ────────────────────────────────
+
+/// Before this, every unrecognized `alg` fell back to `Algorithm::RS256`, so a
+/// key an issuer published for RSA-OAEP / RSA1_5 encryption — or for RSASSA-PSS
+/// — became a PKCS#1 v1.5 signature-verification key. `use`/`key_ops` did not
+/// catch it: a JWK may omit both.
+#[test]
+fn rsa_jwk_alg_must_name_a_supported_signature_algorithm() {
+    let jwks = |alg: Option<&str>| {
+        let mut fixture = rsa_jwks_with_kid(
+            include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+            "k1",
+        );
+        let mut key = fixture["keys"][0].take();
+        key.as_object_mut().expect("JWK object").remove("alg");
+        if let Some(alg) = alg {
+            key["alg"] = json!(alg);
+        }
+        json!({"keys": [key]}).to_string()
+    };
+
+    for accepted in [
+        jwks(None),
+        jwks(Some("RS256")),
+        jwks(Some("RS384")),
+        jwks(Some("RS512")),
+    ] {
+        let store = JwksKeyStore::from_inline_jwks(&accepted)
+            .expect("absent or RSA signature alg should be accepted");
+        assert!(has_trusted_key(&store, "k1"));
+    }
+
+    for rejected in [
+        "RSA-OAEP",
+        "RSA-OAEP-256",
+        "RSA1_5",
+        "PS256",
+        "PS384",
+        "PS512",
+        "ES256",
+        "HS256",
+        "none",
+        "not-an-algorithm",
+    ] {
+        assert!(
+            JwksKeyStore::from_inline_jwks(&jwks(Some(rejected))).is_err(),
+            "JWK alg {rejected} must not become an RS256 verification key"
+        );
+    }
+}
+
+/// The EC path ignored an `alg` it did not recognize and kept the curve-derived
+/// algorithm, so a key published for key agreement (`ECDH-ES`) or one whose
+/// `alg` contradicted its `crv` was still admitted for signature verification.
+#[test]
+fn ec_jwk_alg_must_agree_with_the_curve_and_name_a_signature_algorithm() {
+    let jwks = |crv: &str, alg: Option<&str>, coordinate_len: usize| {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let coordinate = URL_SAFE_NO_PAD.encode(vec![7u8; coordinate_len]);
+        let mut key = json!({
+            "kty": "EC",
+            "kid": "k1",
+            "crv": crv,
+            "x": coordinate,
+            "y": coordinate
+        });
+        if let Some(alg) = alg {
+            key["alg"] = json!(alg);
+        }
+        json!({"keys": [key]}).to_string()
+    };
+
+    for (crv, alg, len) in [
+        ("P-256", None, 32),
+        ("P-256", Some("ES256"), 32),
+        ("P-384", None, 48),
+        ("P-384", Some("ES384"), 48),
+    ] {
+        let store = JwksKeyStore::from_inline_jwks(&jwks(crv, alg, len))
+            .expect("an alg that agrees with the curve should be accepted");
+        assert!(has_trusted_key(&store, "k1"));
+    }
+
+    for (crv, alg, len) in [
+        ("P-256", Some("ES384"), 32),
+        ("P-384", Some("ES256"), 48),
+        ("P-256", Some("ECDH-ES"), 32),
+        ("P-256", Some("RS256"), 32),
+        ("P-256", Some("ES512"), 32),
+    ] {
+        assert!(
+            JwksKeyStore::from_inline_jwks(&jwks(crv, alg, len)).is_err(),
+            "EC JWK alg {alg:?} on {crv} must not become a verification key"
+        );
+    }
 }

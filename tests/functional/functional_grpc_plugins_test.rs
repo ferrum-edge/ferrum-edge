@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::time::sleep;
 
 // ============================================================================
@@ -33,10 +32,9 @@ use tokio::time::sleep;
 // ============================================================================
 
 async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    crate::scaffolding::ports::unbound_port()
         .await
-        .expect("Failed to bind to port 0");
-    listener.local_addr().unwrap().port()
+        .expect("lease test port")
 }
 
 /// Per-path request witnesses for the mock gRPC echo backend.
@@ -181,6 +179,7 @@ fn start_gateway(
     observability_token: &str,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let child = std::process::Command::new(gateway_binary_path())
+        .arg("run")
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())

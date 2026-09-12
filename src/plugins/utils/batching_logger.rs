@@ -1,3 +1,5 @@
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -10,6 +12,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
 use crate::observability_delivery::DeliveryWorkerControl;
+use crate::plugins::utils::sink_loss::{SinkLossReason, SinkLossSlot};
 
 const DROP_WARN_EVERY: u64 = 100;
 /// Hard ceiling for an admitted batch size across shared logging sinks.
@@ -130,6 +133,9 @@ pub struct BatchingLogger<T: Send + Sync + 'static> {
     sender: Option<mpsc::Sender<T>>,
     worker: Arc<DeliveryWorkerControl>,
     plugin_name: &'static str,
+    /// Pre-resolved process-counter slot so the accepted-record increment on
+    /// the proxy path stays a single relaxed atomic add.
+    sink_slot: SinkLossSlot,
     dropped_count: Arc<AtomicU64>,
     queue_depth: Arc<AtomicUsize>,
     outstanding_count: Arc<AtomicUsize>,
@@ -148,6 +154,7 @@ pub struct BatchingLoggerHandle<T: Send + Sync + 'static> {
     sender: mpsc::Sender<T>,
     worker: Arc<DeliveryWorkerControl>,
     plugin_name: &'static str,
+    sink_slot: SinkLossSlot,
     dropped_count: Arc<AtomicU64>,
     queue_depth: Arc<AtomicUsize>,
     outstanding_count: Arc<AtomicUsize>,
@@ -160,6 +167,7 @@ pub struct BatchingLoggerHandle<T: Send + Sync + 'static> {
 /// logger's depth accounting.
 pub struct BatchingLoggerPermit<T: Send + Sync + 'static> {
     permit: Option<mpsc::OwnedPermit<T>>,
+    sink_slot: SinkLossSlot,
     queue_depth: Arc<AtomicUsize>,
     outstanding_count: Arc<AtomicUsize>,
 }
@@ -168,6 +176,9 @@ impl<T: Send + Sync + 'static> BatchingLoggerPermit<T> {
     pub fn send(mut self, item: T) {
         if let Some(permit) = self.permit.take() {
             permit.send(item);
+            // A reserved slot only becomes an admitted record here; an unused
+            // permit releases its accounting in `Drop` without counting.
+            self.sink_slot.record_accepted(1);
         }
     }
 }
@@ -182,8 +193,9 @@ impl<T: Send + Sync + 'static> Drop for BatchingLoggerPermit<T> {
 }
 
 /// Terminal failure handoff. Receives the same immutable shared batch every
-/// flush attempt used — never a deep-cloned `Vec<T>` of owned records.
-type FailedBatchHook<T> = Arc<dyn Fn(Arc<Vec<T>>, String) + Send + Sync>;
+/// flush attempt used — never a deep-cloned `Vec<T>` of owned records. Returns
+/// `true` only when durable fallback ownership was accepted.
+type FailedBatchHook<T> = Arc<dyn Fn(Arc<Vec<T>>, String) -> bool + Send + Sync>;
 /// Overflow handoff. Returns `true` only when the hook actually accepted
 /// ownership of the item (durable diversion, intentional shed, or equivalent).
 /// Returning `false` means the item was not accepted; callers must not treat
@@ -273,8 +285,9 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
     ///
     /// If `flush` returns `Err`, the retry policy is applied. After the final
     /// attempt fails, the shared batch is handed to `on_failed_batch` when
-    /// present; otherwise it is dropped and a warning is logged. A successful
-    /// flush drops the shared batch immediately (no post-success retention).
+    /// present. If the hook is absent or declines durable ownership, the batch
+    /// is counted as discarded and a warning is logged. A successful flush
+    /// drops the shared batch immediately (no post-success retention).
     pub fn spawn<F, Fut>(cfg: BatchConfig, flush: F) -> Self
     where
         F: Fn(Arc<Vec<T>>) -> Fut + Send + Sync + 'static,
@@ -326,6 +339,7 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
             ..cfg
         };
         let plugin_name = cfg.plugin_name;
+        let sink_slot = SinkLossSlot::for_plugin(plugin_name);
         let buffer_capacity = cfg.buffer_capacity;
         let (sender, receiver) = mpsc::channel(cfg.buffer_capacity);
         let queue_depth = Arc::new(AtomicUsize::new(0));
@@ -377,6 +391,7 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
             sender: Some(sender),
             worker: worker_control,
             plugin_name,
+            sink_slot,
             dropped_count: Arc::new(AtomicU64::new(0)),
             queue_depth,
             outstanding_count,
@@ -412,6 +427,7 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
             sender: sender.clone(),
             worker: Arc::clone(&self.worker),
             plugin_name: self.plugin_name,
+            sink_slot: self.sink_slot,
             dropped_count: Arc::clone(&self.dropped_count),
             queue_depth: Arc::clone(&self.queue_depth),
             outstanding_count: Arc::clone(&self.outstanding_count),
@@ -462,6 +478,8 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
             record_drop(
                 &self.dropped_count,
                 self.plugin_name,
+                self.sink_slot,
+                SinkLossReason::Shutdown,
                 "worker unavailable during shutdown",
             );
             return TrySendOutcome::WorkerUnavailable;
@@ -472,6 +490,8 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
             record_drop(
                 &self.dropped_count,
                 self.plugin_name,
+                self.sink_slot,
+                SinkLossReason::Shutdown,
                 "worker unavailable during shutdown",
             );
             return TrySendOutcome::WorkerUnavailable;
@@ -500,7 +520,10 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
 
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
         match sender.try_send(item) {
-            Ok(()) => TrySendOutcome::ChannelAccepted,
+            Ok(()) => {
+                self.sink_slot.record_accepted(1);
+                TrySendOutcome::ChannelAccepted
+            }
             Err(mpsc::error::TrySendError::Full(item)) => {
                 decrement_queue_depth(&self.queue_depth);
                 decrement_queue_depth(&self.outstanding_count);
@@ -508,11 +531,23 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
                     return if on_overflow(item, "buffer full") {
                         TrySendOutcome::DiversionAccepted
                     } else {
-                        record_drop(&self.dropped_count, self.plugin_name, "buffer full");
+                        record_drop(
+                            &self.dropped_count,
+                            self.plugin_name,
+                            self.sink_slot,
+                            SinkLossReason::QueueFull,
+                            "buffer full",
+                        );
                         TrySendOutcome::BufferFull
                     };
                 }
-                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
+                record_drop(
+                    &self.dropped_count,
+                    self.plugin_name,
+                    self.sink_slot,
+                    SinkLossReason::QueueFull,
+                    "buffer full",
+                );
                 TrySendOutcome::BufferFull
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -521,6 +556,8 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
+                    self.sink_slot,
+                    SinkLossReason::Shutdown,
                     "worker unavailable during shutdown",
                 );
                 TrySendOutcome::WorkerUnavailable
@@ -537,6 +574,8 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
             record_drop(
                 &self.dropped_count,
                 self.plugin_name,
+                self.sink_slot,
+                SinkLossReason::Shutdown,
                 "worker unavailable while reserving a commit slot",
             );
             return None;
@@ -545,6 +584,8 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
             record_drop(
                 &self.dropped_count,
                 self.plugin_name,
+                self.sink_slot,
+                SinkLossReason::Shutdown,
                 "worker unavailable while reserving a commit slot",
             );
             return None;
@@ -554,6 +595,7 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
         match sender.clone().try_reserve_owned() {
             Ok(permit) => Some(BatchingLoggerPermit {
                 permit: Some(permit),
+                sink_slot: self.sink_slot,
                 queue_depth: Arc::clone(&self.queue_depth),
                 outstanding_count: Arc::clone(&self.outstanding_count),
             }),
@@ -563,6 +605,8 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
+                    self.sink_slot,
+                    SinkLossReason::QueueFull,
                     "buffer full while reserving a commit slot",
                 );
                 None
@@ -573,11 +617,18 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
+                    self.sink_slot,
+                    SinkLossReason::Shutdown,
                     "worker unavailable while reserving a commit slot",
                 );
                 None
             }
         }
+    }
+
+    /// Accepted records still queued, pending in a batch, or being flushed.
+    pub fn outstanding_count(&self) -> usize {
+        self.outstanding_count.load(Ordering::Relaxed)
     }
 
     pub fn queue_depth(&self) -> usize {
@@ -615,6 +666,9 @@ impl<T: Send + Sync + 'static> Drop for BatchingLogger<T> {
 /// with no flush side effects.
 pub struct DeferredBatchingLogger<T: Send + Sync + 'static> {
     logger: OnceLock<BatchingLogger<T>>,
+    /// Loss attribution for records offered before staging runs, when there is
+    /// no `BatchingLogger` yet to count them.
+    sink_slot: SinkLossSlot,
     start_lock: Mutex<()>,
 }
 
@@ -625,9 +679,21 @@ impl<T: Send + Sync + 'static> Default for DeferredBatchingLogger<T> {
 }
 
 impl<T: Send + Sync + 'static> DeferredBatchingLogger<T> {
+    /// Unattributed constructor. Pre-staging losses land in the `other` sink
+    /// bucket; production plugins use [`Self::for_plugin`].
     pub fn new() -> Self {
         Self {
             logger: OnceLock::new(),
+            sink_slot: SinkLossSlot::default(),
+            start_lock: Mutex::new(()),
+        }
+    }
+
+    /// Constructor that attributes pre-staging losses to `plugin_name`.
+    pub fn for_plugin(plugin_name: &'static str) -> Self {
+        Self {
+            logger: OnceLock::new(),
+            sink_slot: SinkLossSlot::for_plugin(plugin_name),
             start_lock: Mutex::new(()),
         }
     }
@@ -721,14 +787,25 @@ impl<T: Send + Sync + 'static> DeferredBatchingLogger<T> {
     pub fn try_send_outcome(&self, item: T) -> TrySendOutcome {
         match self.logger.get() {
             Some(logger) => logger.try_send_outcome(item),
-            None => TrySendOutcome::WorkerUnavailable,
+            None => {
+                // No staged logger exists to count this, so account the loss
+                // here; otherwise a pre-publication record vanishes silently.
+                self.sink_slot.record_dropped(SinkLossReason::Shutdown, 1);
+                TrySendOutcome::WorkerUnavailable
+            }
         }
     }
 
     /// Reserve a queue slot when the worker is staged. Returns `None` when
     /// background staging has not run or the buffer is full/closed.
     pub fn try_reserve(&self) -> Option<BatchingLoggerPermit<T>> {
-        self.logger.get().and_then(BatchingLogger::try_reserve)
+        match self.logger.get() {
+            Some(logger) => logger.try_reserve(),
+            None => {
+                self.sink_slot.record_dropped(SinkLossReason::Shutdown, 1);
+                None
+            }
+        }
     }
 }
 
@@ -746,6 +823,8 @@ impl<T: Send + Sync + 'static> BatchingLoggerHandle<T> {
             record_drop(
                 &self.dropped_count,
                 self.plugin_name,
+                self.sink_slot,
+                SinkLossReason::Shutdown,
                 "worker unavailable during shutdown",
             );
             return TrySendOutcome::WorkerUnavailable;
@@ -772,7 +851,10 @@ impl<T: Send + Sync + 'static> BatchingLoggerHandle<T> {
 
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
         match self.sender.try_send(item) {
-            Ok(()) => TrySendOutcome::ChannelAccepted,
+            Ok(()) => {
+                self.sink_slot.record_accepted(1);
+                TrySendOutcome::ChannelAccepted
+            }
             Err(mpsc::error::TrySendError::Full(item)) => {
                 decrement_queue_depth(&self.queue_depth);
                 decrement_queue_depth(&self.outstanding_count);
@@ -780,11 +862,23 @@ impl<T: Send + Sync + 'static> BatchingLoggerHandle<T> {
                     return if on_overflow(item, "buffer full") {
                         TrySendOutcome::DiversionAccepted
                     } else {
-                        record_drop(&self.dropped_count, self.plugin_name, "buffer full");
+                        record_drop(
+                            &self.dropped_count,
+                            self.plugin_name,
+                            self.sink_slot,
+                            SinkLossReason::QueueFull,
+                            "buffer full",
+                        );
                         TrySendOutcome::BufferFull
                     };
                 }
-                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
+                record_drop(
+                    &self.dropped_count,
+                    self.plugin_name,
+                    self.sink_slot,
+                    SinkLossReason::QueueFull,
+                    "buffer full",
+                );
                 TrySendOutcome::BufferFull
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -793,6 +887,8 @@ impl<T: Send + Sync + 'static> BatchingLoggerHandle<T> {
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
+                    self.sink_slot,
+                    SinkLossReason::Shutdown,
                     "worker unavailable during shutdown",
                 );
                 TrySendOutcome::WorkerUnavailable
@@ -807,6 +903,8 @@ impl<T: Send + Sync + 'static> BatchingLoggerHandle<T> {
             record_drop(
                 &self.dropped_count,
                 self.plugin_name,
+                self.sink_slot,
+                SinkLossReason::Shutdown,
                 "worker unavailable while reserving a commit slot",
             );
             return None;
@@ -816,6 +914,7 @@ impl<T: Send + Sync + 'static> BatchingLoggerHandle<T> {
         match self.sender.clone().try_reserve_owned() {
             Ok(permit) => Some(BatchingLoggerPermit {
                 permit: Some(permit),
+                sink_slot: self.sink_slot,
                 queue_depth: Arc::clone(&self.queue_depth),
                 outstanding_count: Arc::clone(&self.outstanding_count),
             }),
@@ -825,6 +924,8 @@ impl<T: Send + Sync + 'static> BatchingLoggerHandle<T> {
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
+                    self.sink_slot,
+                    SinkLossReason::QueueFull,
                     "buffer full while reserving a commit slot",
                 );
                 None
@@ -835,6 +936,8 @@ impl<T: Send + Sync + 'static> BatchingLoggerHandle<T> {
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
+                    self.sink_slot,
+                    SinkLossReason::Shutdown,
                     "worker unavailable while reserving a commit slot",
                 );
                 None
@@ -852,7 +955,14 @@ fn is_high_water(depth: usize, buffer_capacity: usize, high_watermark_percent: u
         >= buffer_capacity.saturating_mul(high_watermark_percent.max(1) as usize)
 }
 
-fn record_drop(dropped_count: &AtomicU64, plugin_name: &'static str, reason: &str) {
+fn record_drop(
+    dropped_count: &AtomicU64,
+    plugin_name: &'static str,
+    sink_slot: SinkLossSlot,
+    loss_reason: SinkLossReason,
+    reason: &str,
+) {
+    sink_slot.record_dropped(loss_reason, 1);
     let dropped = dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
     if dropped == 1 || dropped.is_multiple_of(DROP_WARN_EVERY) {
         warn!(
@@ -1019,7 +1129,7 @@ async fn flush_with_retry<T, F, Fut>(
                 return;
             }
             Err(error) if attempt < attempts => {
-                warn!(
+                warn_sampled!(
                     plugin = cfg.plugin_name,
                     "{}: batch flush failed (attempt {}/{}): {}",
                     cfg.plugin_name,
@@ -1033,8 +1143,8 @@ async fn flush_with_retry<T, F, Fut>(
                 tokio::time::sleep(cfg.retry.backoff_delay(attempt)).await;
             }
             Err(error) => {
-                if let Some(on_failed_batch) = on_failed_batch {
-                    warn!(
+                let fallback_accepted = if let Some(on_failed_batch) = on_failed_batch {
+                    warn_sampled!(
                         plugin = cfg.plugin_name,
                         "{}: handing failed batch to fallback after {} attempts ({} entries): {}",
                         cfg.plugin_name,
@@ -1042,9 +1152,22 @@ async fn flush_with_retry<T, F, Fut>(
                         entry_count,
                         error,
                     );
-                    on_failed_batch(batch, error);
+                    on_failed_batch(batch, error.clone())
                 } else {
-                    warn!(
+                    false
+                };
+                if !fallback_accepted {
+                    // Terminal loss: no durable fallback owns these records.
+                    // Count every lost RECORD, not the discard event, so the
+                    // published loss matches the entries the warning names.
+                    // These were already counted as accepted at admission;
+                    // `batch_discard` is a post-admission loss.
+                    crate::plugins::utils::sink_loss::record_dropped(
+                        cfg.plugin_name,
+                        SinkLossReason::BatchDiscard,
+                        entry_count as u64,
+                    );
+                    warn_sampled!(
                         plugin = cfg.plugin_name,
                         "{}: batch discarded after {} attempts ({} entries lost): {}",
                         cfg.plugin_name,

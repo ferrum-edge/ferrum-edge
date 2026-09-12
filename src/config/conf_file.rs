@@ -147,6 +147,37 @@ impl ConfFile {
                 ));
             }
 
+            // Exact inventory names win before suffix interpretation: several
+            // ordinary path settings legitimately end in _FILE.
+            if !crate::config::public_env_inventory::is_recognized_ferrum_setting(&key) {
+                let display_key: String = key
+                    .chars()
+                    .map(|c| match c {
+                        'A'..='Z' | 'a'..='z' | '0'..='9' | '_' => c,
+                        _ => '?',
+                    })
+                    .collect();
+                let secret_suffix = crate::secrets::EXTERNAL_SECRET_SUFFIXES
+                    .iter()
+                    .any(|suffix| {
+                        key.strip_suffix(*suffix).is_some_and(
+                            crate::config::public_env_inventory::is_recognized_ferrum_setting,
+                        )
+                    });
+                return Err(if secret_suffix {
+                    format!(
+                        "Invalid ferrum.conf key '{display_key}' at line {}: external secret \
+                         suffixes are environment-only; set this key in the environment",
+                        line_num + 1
+                    )
+                } else {
+                    format!(
+                        "Unknown ferrum.conf key '{display_key}' at line {}",
+                        line_num + 1
+                    )
+                });
+            }
+
             let value = trimmed[eq_pos + 1..].trim();
             let value = if let Some(quote @ ('"' | '\'')) = value.chars().next() {
                 // Both delimiters are ASCII; find the first matching quote without escapes.

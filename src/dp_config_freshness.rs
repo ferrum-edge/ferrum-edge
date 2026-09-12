@@ -262,7 +262,8 @@ pub struct DpConfigFreshnessSnapshot {
     /// Closed-set CP authority state (`connected` / `reconnecting` / `lost`).
     /// Only `lost` can latch the bound.
     pub cp_authority: &'static str,
-    /// How long every CP has been unreachable, in seconds. `0` while connected.
+    /// How long the DP has been without usable applied configuration, in
+    /// seconds. `0` once a snapshot has been accepted and applied.
     pub cp_disconnected_seconds: u64,
     /// Configured bound in seconds. `0` means the bound is disabled.
     pub max_stale_seconds: u64,
@@ -305,11 +306,12 @@ pub struct DpConfigFreshness {
     /// generation bump, so an evaluator that observed the older generation and
     /// then reads this cannot commit (its CAS fails).
     last_applied_ms: AtomicU64,
-    /// Offset at which the current CP outage began, stored as `offset_ms + 1`
-    /// so `0` can mean "a CP is connected". Diagnostic only — the staleness
-    /// predicate does not read it, because the bound is the applied-snapshot
-    /// age and nothing else. Set once per outage: repeated failover attempts
-    /// against successive CP URLs must not restart it.
+    /// Offset at which the current configuration-outage began, stored as
+    /// `offset_ms + 1` so `0` can mean "usable config is serving". Diagnostic
+    /// only — the staleness predicate does not read it, because the bound is
+    /// the applied-snapshot age and nothing else. Set once per outage: repeated
+    /// failover attempts against successive CP URLs must not restart it.
+    /// Cleared by [`Self::record_snapshot_applied_at`], not by transport connect.
     disconnected_since_ms: AtomicU64,
     /// [`CpAuthority`], encoded.
     authority: AtomicU8,
@@ -396,14 +398,14 @@ impl DpConfigFreshness {
 
     /// A ConfigSync stream to some CP is established. Transport success alone
     /// is **not** freshness: this records authority for the staleness predicate
-    /// and never touches the age or clears the sticky stale flag.
+    /// and never touches the age, the outage diagnostic, or the sticky stale
+    /// flag.
     pub fn record_cp_connected(&self) {
         self.record_cp_connected_at(Instant::now());
     }
 
     /// [`Self::record_cp_connected`] with an explicit instant (tests).
     pub fn record_cp_connected_at(&self, now: Instant) {
-        self.disconnected_since_ms.store(0, Ordering::Relaxed);
         self.authority
             .store(CpAuthority::Connected.encode(), Ordering::Relaxed);
         self.wake();
@@ -448,7 +450,8 @@ impl DpConfigFreshness {
     /// attempt while cycling through `FERRUM_DP_CP_GRPC_URLS`. Because the
     /// predicate is the applied-snapshot age — not an outage duration —
     /// repeated failed cycles cannot postpone the boundary; only the
-    /// `cp_disconnected_seconds` diagnostic depends on the first stamp.
+    /// `cp_disconnected_seconds` diagnostic depends on the first stamp, and
+    /// that stamp clears only when a snapshot is accepted and applied.
     pub fn record_cp_authority_lost_at(&self, now: Instant) {
         self.authority
             .store(CpAuthority::Lost.encode(), Ordering::Relaxed);
@@ -486,8 +489,9 @@ impl DpConfigFreshness {
     }
 
     /// A snapshot or delta was validated and successfully applied. This is the
-    /// only event that resets the age, and the only one that clears the sticky
-    /// stale flag — a reconnect on its own must not restore admission.
+    /// only event that resets the age, clears the configuration-outage
+    /// diagnostic, and clears the sticky stale flag — a reconnect on its own must
+    /// not restore admission.
     pub fn record_snapshot_applied(&self) {
         self.record_snapshot_applied_at(Instant::now());
     }
@@ -500,6 +504,7 @@ impl DpConfigFreshness {
     /// the superseded snapshot can never re-block this one.
     pub fn record_snapshot_applied_at(&self, now: Instant) {
         let stamp = self.stamp(now);
+        self.disconnected_since_ms.store(0, Ordering::Relaxed);
         self.last_applied_ms.store(stamp, Ordering::Release);
         self.applied_total.fetch_add(1, Ordering::Relaxed);
         self.last_outcome.store(OUTCOME_APPLIED, Ordering::Relaxed);
@@ -558,8 +563,8 @@ impl DpConfigFreshness {
         }
     }
 
-    /// How long every CP has been unreachable. `Duration::ZERO` while a CP
-    /// stream is established.
+    /// How long the DP has been without usable applied configuration.
+    /// `Duration::ZERO` once a snapshot has been accepted and applied.
     pub fn cp_outage_at(&self, now: Instant) -> Duration {
         match self.disconnected_since_ms.load(Ordering::Relaxed) {
             0 => Duration::ZERO,

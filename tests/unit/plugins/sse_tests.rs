@@ -1,3 +1,11 @@
+use super::plugin_utils::create_test_proxy;
+use bytes::Bytes;
+use ferrum_edge::_test_support::{
+    install_pending_buffered_response_capacity_refusal_for_test,
+    refine_stream_response_for_content_type_for_test, retry_response_decision_context_for_test,
+    stamp_original_response_metadata_for_test,
+    take_buffered_response_capacity_refusal_pending_for_test,
+};
 use ferrum_edge::plugins::sse::{
     LAST_EVENT_ID_METADATA_KEY, MAX_LAST_EVENT_ID_BYTES, SsePlugin, redact_sse_log_metadata,
 };
@@ -11,6 +19,7 @@ use ferrum_edge::proxy::headers::{
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 fn make_plugin(config: serde_json::Value) -> SsePlugin {
     SsePlugin::new(&config).unwrap()
@@ -1432,7 +1441,364 @@ async fn test_wrap_is_refused_while_it_is_written_when_it_exceeds_the_ceiling() 
         .await;
     assert!(
         wrapped.is_none(),
-        "an over-ceiling framed event must be refused, leaving the original \
-         body in place"
+        "an over-ceiling framed event must be refused rather than allocated"
+    );
+    assert!(
+        take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "the refusal is a CLAIMED rewrite that failed, so it must mark the shared \
+         pending capacity signal instead of publishing the unconverted body"
+    );
+}
+
+// ── #5103 — SseConfig.retry_ms schema/runtime admission parity ────────────────
+
+/// `SseConfig.retry_ms` is published as JSON Schema `type: integer`, which
+/// draft 2020-12 defines over the VALUE: `1.0` is an integer there exactly as
+/// `1` is, and no keyword can express the lexical difference. Admission here
+/// therefore accepts an exact integer-valued number, so a document that
+/// validates against the published schema also passes `ferrum-edge validate`.
+#[test]
+fn test_retry_ms_accepts_exact_integer_valued_numbers() {
+    for config in [
+        json!({"retry_ms": 1.0}),
+        json!({"retry_ms": 2500.0}),
+        json!({"retry_ms": 1}),
+        json!({"retry_ms": u64::MAX}),
+    ] {
+        let admitted = SsePlugin::new(&config);
+        assert!(admitted.is_ok(), "must admit {config}");
+    }
+}
+
+#[tokio::test]
+async fn test_integer_valued_retry_ms_frames_the_same_retry_field() {
+    let config = json!({"wrap_non_sse_responses": true, "retry_ms": 2500.0});
+    let wrapped = wrap_body_once(config, b"hi").await.expect("wrapped");
+    let framed = String::from_utf8(wrapped).expect("framed event is UTF-8");
+    assert_eq!(framed, "retry: 2500\ndata: hi\n\n");
+}
+
+/// The other half of the parity: everything the schema's `type` / `minimum` /
+/// `maximum` triple rejects is rejected here too. `18446744073709551616` is the
+/// case the missing `maximum` used to let the schema admit while the
+/// constructor refused it.
+#[test]
+fn test_retry_ms_rejects_values_outside_the_published_schema_range() {
+    for (config, expected) in [
+        (json!({"retry_ms": 1.5}), "must be an unsigned integer"),
+        (json!({"retry_ms": -1}), "must be an unsigned integer"),
+        (json!({"retry_ms": -1.0}), "must be an unsigned integer"),
+        (json!({"retry_ms": 0.0}), "must be greater than zero"),
+    ] {
+        let err = SsePlugin::new(&config).err().unwrap_or_default();
+        assert!(err.contains(expected), "for {config}: {err}");
+    }
+
+    let over_u64_text = r#"{"retry_ms": 18446744073709551616}"#;
+    let over_u64: serde_json::Value =
+        serde_json::from_str(over_u64_text).expect("over-u64 literals parse");
+    let err = SsePlugin::new(&over_u64).err().unwrap_or_default();
+    assert!(err.contains("must be an unsigned integer"), "{err}");
+}
+
+// ── #5100 / #5101 / #5102 — representations wrapping declines ─────────────────
+
+/// A backend response header map plus the pristine stamp every dispatch path
+/// records before running `after_proxy`.
+fn stamped_origin(content_type: &str) -> (RequestContext, HashMap<String, String>) {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), content_type.to_string());
+    let mut ctx = make_sse_ctx();
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+    (ctx, headers)
+}
+
+/// Same, with one extra origin header recorded in the stamp.
+fn stamped_origin_with(
+    content_type: &str,
+    name: &str,
+    value: &str,
+) -> (RequestContext, HashMap<String, String>) {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), content_type.to_string());
+    headers.insert(name.to_string(), value.to_string());
+    let mut ctx = make_sse_ctx();
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+    (ctx, headers)
+}
+
+fn content_type_of(headers: &HashMap<String, String>) -> Option<&str> {
+    headers.get("content-type").map(String::as_str)
+}
+
+/// Drive the wrapping transform exactly as the buffered response-body phase
+/// does, over the response headers the client would see.
+async fn wrap_now(
+    plugin: &SsePlugin,
+    ctx: &mut RequestContext,
+    body: &[u8],
+    content_type: &str,
+    headers: &HashMap<String, String>,
+) -> Option<Vec<u8>> {
+    let content_type = Some(content_type);
+    plugin
+        .transform_response_body_with_context(ctx, body, content_type, headers)
+        .await
+}
+
+/// RFC 9110 §7.7: an origin `Cache-Control: no-transform` forbids an
+/// intermediary from converting the content. Wrapping used to reframe the body
+/// and relabel the media type while faithfully preserving the very directive
+/// that forbade both.
+#[tokio::test]
+async fn test_origin_no_transform_blocks_wrapping_and_relabeling() {
+    let config = json!({"wrap_non_sse_responses": true, "retry_ms": 2500});
+    let plugin = make_plugin(config);
+    for directive in ["no-transform", "NO-TRANSFORM", "private, no-transform"] {
+        let stamped = stamped_origin_with("text/plain", "cache-control", directive);
+        let (mut ctx, mut headers) = stamped;
+
+        let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+        assert_continue(&result);
+        let label = content_type_of(&headers);
+        assert_eq!(label, Some("text/plain"), "kept for {directive}");
+        let cache_control = headers.get("cache-control").map(String::as_str);
+        assert_eq!(cache_control, Some(directive), "verbatim {directive}");
+
+        let wrapped = wrap_now(&plugin, &mut ctx, b"hello", "text/plain", &headers).await;
+        assert!(wrapped.is_none(), "must not reframe: {directive}");
+    }
+}
+
+/// `force_sse_content_type` is blocked by the same directive: RFC 9110 §7.7
+/// names `Content-Type` among the fields a no-transform response forbids
+/// changing.
+#[tokio::test]
+async fn test_origin_no_transform_also_blocks_content_type_forcing() {
+    let plugin = make_plugin(json!({"force_sse_content_type": true}));
+    let stamped = stamped_origin_with("application/json", "cache-control", "no-transform");
+    let (mut ctx, mut headers) = stamped;
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert_continue(&result);
+    assert_eq!(content_type_of(&headers), Some("application/json"));
+}
+
+/// A later header rule cannot unlock wrapping by deleting the directive: the
+/// decision reads the pristine pre-`after_proxy` snapshot.
+#[tokio::test]
+async fn test_erasing_the_origin_no_transform_directive_does_not_unlock_wrapping() {
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true}));
+    let stamped = stamped_origin_with("text/plain", "cache-control", "no-transform");
+    let (mut ctx, mut headers) = stamped;
+    headers.remove("cache-control");
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert_continue(&result);
+    assert_eq!(content_type_of(&headers), Some("text/plain"));
+
+    let wrapped = wrap_now(&plugin, &mut ctx, b"hello", "text/plain", &headers).await;
+    assert!(wrapped.is_none(), "the pristine directive still forbids it");
+}
+
+/// `no-transform` inside a quoted extension value is not the directive. The
+/// shared Cache-Control parser skips quoted-string interiors, so an ordinary
+/// response carrying one is still wrapped.
+#[tokio::test]
+async fn test_quoted_no_transform_extension_is_not_the_directive() {
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true}));
+    let quoted = r#"ext="no-transform""#;
+    let stamped = stamped_origin_with("text/plain", "cache-control", quoted);
+    let (mut ctx, mut headers) = stamped;
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert_continue(&result);
+    assert_eq!(content_type_of(&headers), Some("text/event-stream"));
+
+    let sse = "text/event-stream";
+    let wrapped = wrap_now(&plugin, &mut ctx, b"hello", sse, &headers).await;
+    let framed = wrapped.expect("an ordinary response is still wrapped");
+    assert_eq!(String::from_utf8(framed).unwrap(), "data: hello\n\n");
+}
+
+/// A content-coded origin body is a compressed bitstream, not the UTF-8 text
+/// `data:` framing describes. Wrapping it produced a body that was neither
+/// valid gzip nor the intended event, still labelled `Content-Encoding: gzip`.
+#[tokio::test]
+async fn test_content_coded_origin_body_is_not_framed_as_text() {
+    let config = json!({
+        "wrap_non_sse_responses": true,
+        "force_sse_content_type": true
+    });
+    let plugin = make_plugin(config);
+    // Deliberately not UTF-8: framing these would emit lossy replacement
+    // characters in place of the compressed octets.
+    let coded: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe, 0x00, 0x03];
+    for coding in ["gzip", "br", "gzip, br"] {
+        let stamped = stamped_origin_with("text/plain", "content-encoding", coding);
+        let (mut ctx, mut headers) = stamped;
+
+        let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+        assert_continue(&result);
+        let label = content_type_of(&headers);
+        assert_eq!(label, Some("text/plain"), "not relabelled: {coding}");
+
+        let wrapped = wrap_now(&plugin, &mut ctx, coded, "text/plain", &headers).await;
+        assert!(wrapped.is_none(), "coded octets are not text: {coding}");
+    }
+}
+
+/// `identity` is not a transforming coding, so it changes nothing.
+#[tokio::test]
+async fn test_identity_content_encoding_still_wraps() {
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true}));
+    let stamped = stamped_origin_with("text/plain", "content-encoding", "identity");
+    let (mut ctx, mut headers) = stamped;
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert_continue(&result);
+    assert_eq!(content_type_of(&headers), Some("text/event-stream"));
+
+    let sse = "text/event-stream";
+    let wrapped = wrap_now(&plugin, &mut ctx, b"hello", sse, &headers).await;
+    let framed = wrapped.expect("identity bytes are what the wrapper frames");
+    assert_eq!(String::from_utf8(framed).unwrap(), "data: hello\n\n");
+}
+
+/// A refused representation is also released from the buffered path: nothing
+/// this instance does with the body can run, so pinning it there only costs the
+/// retained-response budget.
+#[test]
+fn test_refused_representations_are_released_from_the_buffered_path() {
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true}));
+    let no_transform = stamped_origin_with("text/plain", "cache-control", "no-transform");
+    let coded = stamped_origin_with("text/plain", "content-encoding", "gzip");
+    for (ctx, headers) in [no_transform, coded] {
+        let plain = Some("text/plain");
+        let buffers =
+            plugin.should_buffer_response_body_for_content_type(&ctx, plain, 200, &headers);
+        assert!(!buffers, "a refused representation must not be buffered");
+        let released =
+            plugin.should_release_response_body_before_content_type_rewrite(&ctx, 200, &headers);
+        assert!(released, "it must release before the relabel guard");
+    }
+}
+
+/// A framed event that cannot fit this response's retained ceiling is a CLAIMED
+/// rewrite that failed, not a no-op: `after_proxy` already published
+/// `text/event-stream`, so publishing the unconverted body would serve plain
+/// text as a successful event stream. The shared pending capacity signal is
+/// what hands the response to the gateway terminal instead.
+#[tokio::test]
+async fn test_over_ceiling_framing_selects_the_shared_capacity_terminal() {
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true}));
+    let mut ctx = make_sse_ctx();
+    ctx.max_response_body_size_bytes = 8;
+    let mut headers = json_response_headers();
+    // The original body fits the ceiling; only its framing does not. That is
+    // the real-wire case an "original already over the limit" fixture misses.
+    let original: &[u8] = b"abcd";
+    plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert_eq!(content_type_of(&headers), Some("text/event-stream"));
+
+    let sse = "text/event-stream";
+    let wrapped = wrap_now(&plugin, &mut ctx, original, sse, &headers).await;
+    assert!(wrapped.is_none(), "an over-ceiling event is refused");
+
+    let mut status = 200u16;
+    let mut body = Bytes::from_static(b"abcd");
+    let installed = install_pending_buffered_response_capacity_refusal_for_test(
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    );
+    assert!(installed, "the refusal must mark the pending signal");
+    assert_ne!(status, 200, "the refused response is not successful");
+    assert_ne!(&body[..], original, "raw bytes are not published");
+    assert_ne!(content_type_of(&headers), Some("text/event-stream"));
+}
+
+// ── #5097 / #5098 — streaming decisions for wrapped and genuine event streams ─
+
+fn refinement_streams(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+    with_retries: bool,
+) -> bool {
+    let proxy = create_test_proxy();
+    let decision_ctx = if with_retries {
+        retry_response_decision_context_for_test(ctx)
+    } else {
+        ctx.clone()
+    };
+    refine_stream_response_for_content_type_for_test(&proxy, plugins, &decision_ctx, 200, headers)
+}
+
+/// A configured wrapper never frames a genuine backend event stream, so it must
+/// open the retry-time release gate and then release that representation.
+/// Without the opt-in, `wrap_non_sse_responses` plus `retry` collected an
+/// unbounded origin stream to EOF before the client saw its first event.
+#[test]
+fn test_genuine_event_streams_release_under_retries() {
+    let config = json!({"wrap_non_sse_responses": true});
+    let plugin: Arc<SsePlugin> = Arc::new(make_plugin(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+
+    let (sse_ctx, sse_headers) = stamped_origin("text/event-stream");
+    assert!(plugin.may_release_response_body_under_retries(&sse_ctx));
+    let released = plugin.should_release_response_body_under_retries(&sse_ctx, 200, &sse_headers);
+    assert!(released, "a genuine event stream is never framed");
+    assert!(
+        refinement_streams(&plugins, &sse_ctx, &sse_headers, true),
+        "a genuine event stream must stream even with retries configured"
+    );
+
+    let (json_ctx, json_headers) = stamped_origin("application/json");
+    let held = plugin.should_release_response_body_under_retries(&json_ctx, 200, &json_headers);
+    assert!(!held, "a response this wrapper frames keeps its body");
+    assert!(
+        !refinement_streams(&plugins, &json_ctx, &json_headers, true),
+        "a response this wrapper will frame stays buffered under retries"
+    );
+}
+
+/// A plugin that is not wrapping has no body need at all, so it neither opens
+/// the retry gate nor votes.
+#[test]
+fn test_a_non_wrapping_instance_does_not_open_the_retry_gate() {
+    let plugin = make_plugin(json!({}));
+    let (ctx, headers) = stamped_origin("text/event-stream");
+    assert!(!plugin.may_release_response_body_under_retries(&ctx));
+    let released = plugin.should_release_response_body_under_retries(&ctx, 200, &headers);
+    assert!(!released);
+}
+
+/// The ordering invariant every dispatch path has to honor: the buffer/stream
+/// refinement is only correct over the PRISTINE backend headers. Asked about
+/// the map `after_proxy` has already relabelled, this same chain answers
+/// "stream" — nothing left to wrap in a response that is already
+/// `text/event-stream` — and the body goes out unframed under the very label
+/// the wrap was supposed to fill. That was the H3 bridge's ordering bug.
+#[tokio::test]
+async fn test_the_refinement_answer_depends_on_pristine_backend_headers() {
+    let config = json!({"wrap_non_sse_responses": true});
+    let plugin: Arc<SsePlugin> = Arc::new(make_plugin(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let (mut ctx, mut headers) = stamped_origin("text/plain");
+    let pristine = headers.clone();
+
+    assert!(
+        !refinement_streams(&plugins, &ctx, &pristine, false),
+        "over the backend's own headers the wrapper must keep the body"
+    );
+
+    plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert_eq!(content_type_of(&headers), Some("text/event-stream"));
+    assert!(
+        refinement_streams(&plugins, &ctx, &headers, false),
+        "the relabelled map releases the body — which is exactly why every \
+         dispatch path must refine before `after_proxy` runs"
     );
 }

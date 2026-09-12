@@ -77,7 +77,9 @@ use crate::modes::mesh::config_consumer::stock_xds_transport::StockXdsTransportP
 use crate::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
 use crate::modes::mesh::dns_proxy::MeshDnsProxy;
-use crate::modes::mesh::runtime::MeshRuntimeState;
+use crate::modes::mesh::runtime::{
+    MeshRuntimeState, MeshSliceRuntimeOutcome, MeshSliceRuntimeRejectReason,
+};
 use crate::modes::mesh::slice::{
     MeshSlice, MeshSliceRequest, ServiceEntryHostOwner, destination_host_owner,
     index_service_entry_host_owners, mesh_service_identities,
@@ -3579,7 +3581,7 @@ fn materialize_fault_runtime_overlay(
 /// The counterpart to [`materialize_fault_runtime_overlay`] for
 /// `request_transformer` / `response_transformer` (GHSA-83rc-23c9-3g9x). Before
 /// this, the two gates lived in process-global stores that
-/// `record_applied_slice` swapped AFTER `ProxyState::update_config` had already
+/// `record_applied_slice_with_token` swapped AFTER `ProxyState::update_config` had already
 /// published the new `RequestEpoch`. That made gate and rules two separately
 /// published values with two distinct straddle windows: a plugin built from the
 /// new slice read the OLD gate for the length of the publication gap, and an
@@ -4165,7 +4167,14 @@ async fn wait_for_initial_mesh_config(
     runtime: &MeshRuntimeConfig,
     activation: FederationActivation,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<(GatewayConfig, Arc<MeshSlice>), anyhow::Error> {
+) -> Result<
+    (
+        GatewayConfig,
+        Arc<MeshSlice>,
+        revision::MeshRevisionApplyToken,
+    ),
+    anyhow::Error,
+> {
     let mut updates = mesh_state.subscribe();
     loop {
         let snapshot = mesh_state.snapshot();
@@ -4173,20 +4182,27 @@ async fn wait_for_initial_mesh_config(
             let evaluation = mesh_state.evaluate_received_slice(&snapshot);
             let federation_snapshot = mesh_state.federation_store().snapshot();
             let remote_snapshot = mesh_state.remote_endpoint_store().snapshot();
-            match gateway_config_from_mesh_slice_with_federation(
-                slice,
-                runtime,
-                Some(&federation_snapshot),
-                Some(&remote_snapshot),
-                activation,
-            ) {
-                Ok(config) => {
+            let revision_apply_token = mesh_state.begin_revision_apply(slice);
+            let candidate_config = revision_apply_token
+                .ok_or_else(|| anyhow::anyhow!("initial mesh slice lost revision apply permission"))
+                .and_then(|token| {
+                    gateway_config_from_mesh_slice_with_federation(
+                        slice,
+                        runtime,
+                        Some(&federation_snapshot),
+                        Some(&remote_snapshot),
+                        activation,
+                    )
+                    .map(|config| (config, token))
+                });
+            match candidate_config {
+                Ok((config, token)) => {
                     // Not "applied" yet — `serve_mesh_runtime` commits the
                     // watermark once this generation is actually live. Passing
                     // only hands the candidate to that stage with its
                     // provisional admission intact.
                     evaluation.pass();
-                    return Ok((config, Arc::new(slice.clone())));
+                    return Ok((config, Arc::new(slice.clone()), token));
                 }
                 Err(e) => {
                     // Roll the provisional admission back to the last applied
@@ -4195,6 +4211,16 @@ async fn wait_for_initial_mesh_config(
                     // and a lower-sequence recovery — is eligible instead of
                     // quarantined behind a slice that never served a request.
                     let revision_rolled_back = evaluation.reject();
+                    // Issue #4812: the FIRST slice is gated here rather than in
+                    // the apply task, so this is the runtime refusal the control
+                    // plane must see — otherwise a data plane that never started
+                    // serving still reads as converged.
+                    mesh_state.publish_runtime_verdict(
+                        &slice.version,
+                        MeshSliceRuntimeOutcome::Rejected(
+                            MeshSliceRuntimeRejectReason::ConfigBuild,
+                        ),
+                    );
                     warn!(
                         mesh_slice_version = %slice.version,
                         revision_rolled_back,
@@ -12241,32 +12267,6 @@ fn build_http_egress_for_entry(
             None => (port_spec.port, port_spec.name.clone()),
         };
     for host in proxy_hosts {
-        // A wildcard host with no declared endpoint set has no dialable target:
-        // `build_egress_upstream_targets` would emit the literal `*.example.com`
-        // as the upstream host, which no resolver can answer, while the proxy's
-        // wildcard host tier still MATCHES `foo.example.com` — so every request
-        // would route and then 502 with no apply-time signal. Refuse the host
-        // and do NOT record it in `materialized_http_hosts`, so a later
-        // exact-host ServiceEntry for the same family is not shadowed by it.
-        if crate::modes::mesh::config::egress_host_is_unresolvable_wildcard(
-            host,
-            entry.resolution,
-            entry.endpoints.len(),
-        ) {
-            warn!(
-                service_entry = %entry.name,
-                namespace = %entry.namespace,
-                field = "hosts[]",
-                host = %host,
-                port = port_spec.port,
-                "Skipping wildcard HTTP-family egress ServiceEntry host: without \
-                 resolution: STATIC and a non-empty endpoints[], the wildcard host itself \
-                 becomes the upstream dial target and cannot be resolved. Declare concrete \
-                 endpoints[] or split the family into exact hosts."
-            );
-            continue;
-        }
-
         let targets = build_egress_upstream_targets(
             entry,
             host,
@@ -12508,9 +12508,9 @@ fn egress_health_checks() -> Option<HealthCheckConfig> {
     })
 }
 
-/// Build upstream targets from a `ServiceEntry`. When the entry uses static
-/// resolution with explicit endpoints, those addresses become targets. When
-/// endpoints are empty (DNS or None resolution), each host becomes a target.
+/// Build upstream targets from a `ServiceEntry`. Static resolution uses only
+/// operator-declared endpoints and therefore yields no targets when none are
+/// usable. DNS and None resolution use each host as a target.
 fn build_egress_upstream_targets(
     entry: &ServiceEntry,
     host: &str,
@@ -12518,7 +12518,7 @@ fn build_egress_upstream_targets(
     backend_port: u16,
     port_name: &Option<String>,
 ) -> Vec<UpstreamTarget> {
-    if entry.resolution == Resolution::Static && !entry.endpoints.is_empty() {
+    if entry.resolution == Resolution::Static {
         entry
             .endpoints
             .iter()
@@ -13172,10 +13172,14 @@ fn inject_mesh_global_plugins(
         "node_id": runtime.node_id.clone(),
         "topology": runtime.topology.as_str(),
         "namespace": mesh_slice.namespace.clone(),
-        "workload_spiffe_id": mesh_slice.workload_spiffe_id.clone(),
         "labels": mesh_slice.labels.clone(),
         "trust_domain_aliases": trust_domain_aliases,
     });
+    // Optional identity hints must be omitted: explicit null is a type error
+    // under workload_metrics admission, including for mesh-managed instances.
+    if let Some(workload_spiffe_id) = &mesh_slice.workload_spiffe_id {
+        workload_metrics_config["workload_spiffe_id"] = serde_json::json!(workload_spiffe_id);
+    }
     // Mirror EVERY enabled global mesh_authz baggage gate PluginCache will
     // execute (issue #4274). Capture-on force-injects reserved `__mesh_authz`
     // beside an operator global; multiple enabled operator globals are also
@@ -14037,23 +14041,24 @@ pub async fn run(
             );
         }
     }
-    let (bootstrap_config, initial_applied_mesh_slice) = match wait_for_initial_mesh_config(
-        &mesh_state,
-        &runtime,
-        federation_activation,
-        shutdown_tx.subscribe(),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            // Config-consumer / gRPC TLS watcher tasks are already running.
-            // Drain them before surfacing the wait failure (issue #2372).
-            let err =
-                err.context("mesh runtime stopped before receiving a valid initial mesh slice");
-            return Err(fail_mesh_pre_owner(&shutdown_tx, background_handles, err).await);
-        }
-    };
+    let (bootstrap_config, initial_applied_mesh_slice, initial_revision_apply_token) =
+        match wait_for_initial_mesh_config(
+            &mesh_state,
+            &runtime,
+            federation_activation,
+            shutdown_tx.subscribe(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                // Config-consumer / gRPC TLS watcher tasks are already running.
+                // Drain them before surfacing the wait failure (issue #2372).
+                let err =
+                    err.context("mesh runtime stopped before receiving a valid initial mesh slice");
+                return Err(fail_mesh_pre_owner(&shutdown_tx, background_handles, err).await);
+            }
+        };
     info!(
         mesh_global_plugins = bootstrap_config.plugin_configs.len(),
         mesh_slice_version = %initial_applied_mesh_slice.version,
@@ -14071,7 +14076,7 @@ pub async fn run(
         bootstrap_config,
         shutdown_tx,
         mesh_state,
-        Some(initial_applied_mesh_slice),
+        Some((initial_applied_mesh_slice, initial_revision_apply_token)),
         MeshRuntimeBackgroundOwnership {
             handles: background_handles,
             finalize_global_plugins_on_shutdown: true,
@@ -14153,7 +14158,7 @@ async fn serve_mesh_runtime(
     config: GatewayConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     mesh_state: MeshRuntimeState,
-    initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
+    initial_apply: Option<(Arc<MeshSlice>, revision::MeshRevisionApplyToken)>,
     background_ownership: MeshRuntimeBackgroundOwnership,
 ) -> Result<(), anyhow::Error> {
     let MeshRuntimeBackgroundOwnership {
@@ -14170,7 +14175,7 @@ async fn serve_mesh_runtime(
         &runtime,
         config,
         &shutdown_tx,
-        initial_applied_mesh_slice.as_ref(),
+        initial_apply.as_ref().map(|(slice, _)| slice),
     );
     let (
         dns_cache,
@@ -14205,7 +14210,7 @@ async fn serve_mesh_runtime(
         &dns_cache,
         hostnames,
         initial_dns_slice,
-        initial_applied_mesh_slice,
+        initial_apply,
         mesh_state,
         tls_policy,
         crls,
@@ -14468,13 +14473,17 @@ async fn arm_mesh_runtime_startup(
     dns_cache: &DnsCache,
     mut hostnames: Vec<(String, Option<String>, Option<u64>)>,
     initial_dns_slice: Option<MeshSlice>,
-    initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
+    initial_apply: Option<(Arc<MeshSlice>, revision::MeshRevisionApplyToken)>,
     mesh_state: MeshRuntimeState,
     tls_policy: TlsPolicy,
     crls: tls::CrlList,
     bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
     local_source_recovery: Option<Arc<config_consumer::file_source::MeshLocalSourceRecovery>>,
 ) -> Result<(), anyhow::Error> {
+    let (initial_applied_mesh_slice, initial_revision_apply_token) = match initial_apply {
+        Some((slice, token)) => (Some(slice), Some(token)),
+        None => (None, None),
+    };
     let shutdown_tx = owner.shutdown_tx.clone();
     let proxy_state = owner.proxy_state.clone();
     let mut serving_udp_steering = None;
@@ -14504,10 +14513,10 @@ async fn arm_mesh_runtime_startup(
         ) {
             owner.push_mesh_background(handle);
         }
-        // Spawn the SOCK_OPS ringbuf consumer. When the kernel program
-        // is not pinned (no node-agent on this host, kernel < 5.7, or
-        // build without the ebpf feature), the spawned task logs once
-        // and exits — the plugin still emits zero counters.
+        // Spawn the SOCK_OPS ringbuf consumer. Linux `ebpf` builds retry
+        // with capped backoff until the node-agent pins appear (or
+        // shutdown); other targets skip the task. The plugin still emits
+        // zero counters until the consumer attaches.
         if let Some(state) = bpf_metrics_state.as_ref()
             && let Some(handle) = spawn_sock_ops_consumer_task(state.clone(), &shutdown_tx)
         {
@@ -15062,7 +15071,7 @@ async fn arm_mesh_runtime_startup(
     }
 
     if let Some(ref slice) = initial_applied_mesh_slice {
-        mesh_state.record_applied_slice(slice);
+        mesh_state.record_applied_slice_with_token(slice, initial_revision_apply_token);
     }
     let startup_ready = Arc::new(AtomicBool::new(false));
     let serving_degraded = Arc::new(AtomicBool::new(false));
@@ -19253,6 +19262,7 @@ async fn apply_mesh_slice_generation(
     proxy_state: &ProxyState,
     runtime: &MeshRuntimeConfig,
     base_slice: &MeshSlice,
+    revision_apply_token: Option<revision::MeshRevisionApplyToken>,
     federation_snapshot: &federation::FederationSnapshot,
     remote_snapshot: &multicluster::RemoteEndpointSnapshot,
     live_reload_enabled: bool,
@@ -19260,11 +19270,14 @@ async fn apply_mesh_slice_generation(
     has_termination_listener: bool,
     last_applied_slice: &mut Option<Arc<MeshSlice>>,
     dns_proxy: &Option<Arc<MeshDnsProxy>>,
-) -> bool {
-    // Capture before any asynchronous preparation. An operator reset that
-    // lands while this generation is being built invalidates the token, so a
-    // late successful apply cannot resurrect the cleared freshness watermark.
-    let revision_apply_token = mesh_state.begin_revision_apply(base_slice);
+) -> MeshSliceRuntimeOutcome {
+    // The caller captures before any asynchronous preparation. An operator
+    // reset during preparation invalidates the token, so a late successful
+    // apply cannot resurrect the cleared freshness watermark.
+    let Some(revision_apply_token) = revision_apply_token else {
+        warn!("Mesh slice lost revision apply permission before proxy preparation");
+        return MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::ConfigBuild);
+    };
     if has_termination_listener && !live_reload_enabled {
         let fixed_policy = proxy_state.mesh_inbound_tls_policy.load();
         if let Some((port, mode)) = newly_selectable_inbound_peer_auth_port_requires_reload(
@@ -19280,7 +19293,7 @@ async fn apply_mesh_slice_generation(
                 required_mode = ?mode,
                 "Rejecting mesh slice because it makes an overridden inbound app port newly selectable while PeerAuthentication TLS live reload is disabled; restart with the new port present or enable FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED"
             );
-            return false;
+            return MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::TlsReload);
         }
     }
 
@@ -19298,7 +19311,7 @@ async fn apply_mesh_slice_generation(
                 "Rejected mesh slice before proxy config apply because effective gateway trust \
                  was unusable"
             );
-            return false;
+            return MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::TrustUnusable);
         }
     };
     let live_reload = if live_reload_enabled {
@@ -19327,7 +19340,7 @@ async fn apply_mesh_slice_generation(
             mesh_slice_version = %base_slice.version,
             "Rejected mesh slice before proxy config apply because inbound mTLS live reload preparation failed"
         );
-        return false;
+        return MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::TlsReload);
     }
     let staged_inbound_spiffe = if live_reload_enabled {
         None
@@ -19397,7 +19410,9 @@ async fn apply_mesh_slice_generation(
                          last good routing and DTLS serving generation in their entirety; \
                          ordinary operator DTLS listeners are untouched"
                     );
-                    return false;
+                    return MeshSliceRuntimeOutcome::Rejected(
+                        MeshSliceRuntimeRejectReason::DtlsCandidate,
+                    );
                 }
             };
             let publish_node_waypoint_dtls = runtime.topology == MeshTopology::NodeWaypoint;
@@ -19465,7 +19480,7 @@ async fn apply_mesh_slice_generation(
                 last_applied_slice,
                 base_slice,
                 accepted,
-                revision_apply_token,
+                Some(revision_apply_token),
             );
             if accepted {
                 // Sidecar ingress routes remain live-reloadable even when
@@ -19551,7 +19566,11 @@ async fn apply_mesh_slice_generation(
                     "Rejected mesh slice proxy config; leaving last applied slice and DNS table unchanged"
                 );
             }
-            accepted
+            if accepted {
+                MeshSliceRuntimeOutcome::Applied
+            } else {
+                MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::ProxyRefused)
+            }
         }
         Err(e) => {
             warn!(
@@ -19559,7 +19578,7 @@ async fn apply_mesh_slice_generation(
                 error = %e,
                 "Ignoring invalid mesh slice update"
             );
-            false
+            MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::ConfigBuild)
         }
     }
 }
@@ -19610,25 +19629,39 @@ fn start_mesh_slice_apply_task(
                 // unresolved rolls the provisional admission back rather than
                 // leaving a candidate that never served holding the watermark.
                 let evaluation = mesh_state.evaluate_received_slice(&snapshot);
+                let revision_apply_token = mesh_state.begin_revision_apply(slice);
                 let slice_unchanged =
                     mesh_slice_matches_last_applied(last_applied_slice.as_deref(), slice);
                 if slice_unchanged && !federation_changed && !remote_changed {
-                    let revision_apply_token = mesh_state.begin_revision_apply(slice);
-                    record_mesh_slice_apply_result(
-                        &mesh_state,
-                        &mut last_applied_slice,
-                        slice,
-                        true,
-                        revision_apply_token,
-                    );
-                    evaluation.pass();
-                    if let Some(recovery) = local_source_recovery.as_ref() {
-                        recovery.note_proxy_apply_success(slice);
+                    if revision_apply_token.is_none() {
+                        evaluation.reject();
+                        if let Some(recovery) = local_source_recovery.as_ref() {
+                            recovery.note_proxy_apply_rejection(slice);
+                        }
+                        mesh_state.publish_runtime_verdict(
+                            &slice.version,
+                            MeshSliceRuntimeOutcome::Rejected(
+                                MeshSliceRuntimeRejectReason::ConfigBuild,
+                            ),
+                        );
+                        warn!("Mesh no-op slice lost revision apply permission before evaluation");
+                    } else {
+                        record_mesh_slice_apply_result(
+                            &mesh_state,
+                            &mut last_applied_slice,
+                            slice,
+                            true,
+                            revision_apply_token,
+                        );
+                        evaluation.pass();
+                        if let Some(recovery) = local_source_recovery.as_ref() {
+                            recovery.note_proxy_apply_success(slice);
+                        }
+                        debug!(
+                            mesh_slice_version = %slice.version,
+                            "Skipping no-op mesh slice update"
+                        );
                     }
-                    debug!(
-                        mesh_slice_version = %slice.version,
-                        "Skipping no-op mesh slice update"
-                    );
                 } else {
                     let live_reload_enabled =
                         proxy_state.env_config.mesh_peer_auth_live_reload_enabled;
@@ -19639,11 +19672,12 @@ fn start_mesh_slice_apply_task(
                     // can fall back to re-applying the overlay against the slice
                     // the proxy is actually serving (codex F7.2 round-4).
                     let last_accepted_base = last_applied_slice.clone();
-                    let received_accepted = apply_mesh_slice_generation(
+                    let received_outcome = apply_mesh_slice_generation(
                         &mesh_state,
                         &proxy_state,
                         &runtime,
                         slice,
+                        revision_apply_token,
                         &federation_snapshot,
                         &remote_snapshot,
                         live_reload_enabled,
@@ -19653,6 +19687,21 @@ fn start_mesh_slice_apply_task(
                         &dns_proxy,
                     )
                     .await;
+                    let received_accepted = received_outcome.accepted();
+                    // Issue #4812: publish the REFUSAL so the configuration
+                    // consumer can report it to the control plane. Acceptance
+                    // is published by `record_applied_slice_with_token`, the
+                    // single commit point every accepting path funnels through.
+                    if !received_accepted {
+                        if let Some(reason) = received_outcome.reject_reason() {
+                            warn!(
+                                mesh_slice_version = %slice.version,
+                                reason = reason.as_metric_label(),
+                                "Reporting mesh slice proxy-runtime refusal to the control plane"
+                            );
+                        }
+                        mesh_state.publish_runtime_verdict(&slice.version, received_outcome);
+                    }
                     // Issue #2473 lifecycle: the freshness gate advanced its
                     // accepted watermark when this slice entered the received
                     // slot, but the proxy runtime is a second, independent
@@ -19706,6 +19755,7 @@ fn start_mesh_slice_apply_task(
                             &proxy_state,
                             &runtime,
                             base.as_ref(),
+                            mesh_state.begin_revision_apply(base.as_ref()),
                             &federation_snapshot,
                             &remote_snapshot,
                             live_reload_enabled,
@@ -19714,7 +19764,8 @@ fn start_mesh_slice_apply_task(
                             &mut last_applied_slice,
                             &dns_proxy,
                         )
-                        .await;
+                        .await
+                        .accepted();
                         // Overlay re-apply of last-accepted must NOT clear a
                         // sticky local-source failure unless that base is the
                         // exact pending recovery identity.
@@ -19770,8 +19821,7 @@ fn record_mesh_slice_apply_result(
     applied: bool,
     revision_apply_token: Option<revision::MeshRevisionApplyToken>,
 ) {
-    if applied {
-        mesh_state.record_applied_slice_with_token(slice, revision_apply_token);
+    if applied && mesh_state.record_applied_slice_with_token(slice, revision_apply_token) {
         *last_applied_slice = Some(Arc::new(slice.clone()));
     }
 }
@@ -20427,7 +20477,7 @@ pub mod initial_config_wait_test_seams {
         };
         wait_for_initial_mesh_config(&mesh_state, &runtime, activation, shutdown_rx)
             .await
-            .map(|(_, slice)| slice.version.clone())
+            .map(|(_, slice, _)| slice.version.clone())
             .map_err(|error| error.to_string())
     }
 }
@@ -26399,6 +26449,45 @@ mod tests {
             resolve_inbound_mtls_modes_by_port(Some(&slice), &runtime),
             std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]),
             "the exact runtime identity and local-cluster context used to materialize the route must also retain its portLevelMtls posture"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_reject_remote_provenance_spoofing_local_cluster() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut remote = workload("reviews", "reviews");
+        remote.cluster = Some("cluster-a".to_string());
+        remote.remote_provenance = true;
+        remote.ports = vec![WorkloadPort {
+            port: 9999,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![remote],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            multi_cluster: Some(MultiClusterConfig {
+                local_cluster: Some("cluster-a".to_string()),
+                ..MultiClusterConfig::default()
+            }),
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            config
+                .proxies
+                .iter()
+                .all(|proxy| !proxy.id.starts_with("__mesh-inbound-")),
+            "remote ingestion provenance must override a spoofed local cluster name"
         );
     }
 
@@ -33325,7 +33414,15 @@ mod tests {
             }
         ));
 
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, true, None);
+        assert!(mesh_state.install_slice(rejected.clone()).installed());
+        let token = mesh_state.begin_revision_apply(&rejected);
+        record_mesh_slice_apply_result(
+            &mesh_state,
+            &mut last_applied_slice,
+            &rejected,
+            true,
+            token,
+        );
         assert!(mesh_state.applied_snapshot().as_ref().is_some());
         assert!(mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),
@@ -33352,12 +33449,16 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v1, true, None);
+        assert!(mesh_state.install_slice(v1.clone()).installed());
+        let token = mesh_state.begin_revision_apply(&v1);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v1, true, token);
         assert!(mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),
             &v2
         ));
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v2, true, None);
+        assert!(mesh_state.install_slice(v2.clone()).installed());
+        let token = mesh_state.begin_revision_apply(&v2);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v2, true, token);
 
         let applied = mesh_state.applied_snapshot();
         assert_eq!(
@@ -34202,7 +34303,7 @@ mod tests {
             ..MeshSlice::default()
         });
 
-        let (config, slice) = wait
+        let (config, slice, _) = wait
             .await
             .expect("wait task joins")
             .expect("valid slice is accepted");
@@ -38286,13 +38387,10 @@ mod tests {
         );
     }
 
-    /// The same wildcard host WITHOUT declared endpoints has no dialable target:
-    /// materializing it would emit the literal `*.api.external.com` as the
-    /// upstream host while the proxy's wildcard host tier still matched
-    /// `foo.api.external.com`, so every request would route and then 502. It must
-    /// be refused outright (issue #4535).
+    /// A DNS/NONE wildcard HTTP target is concretized from the matching request
+    /// authority before the dial path resolves it.
     #[test]
-    fn egress_refuses_wildcard_host_without_declared_endpoints() {
+    fn egress_materializes_http_wildcard_host_without_declared_endpoints() {
         let service_entries = vec![test_external_service_entry(
             "wildcard-api",
             vec!["*.api.external.com".to_string()],
@@ -38308,12 +38406,10 @@ mod tests {
             false,
         );
 
-        assert!(
-            proxies.is_empty(),
-            "an unresolvable wildcard host must not materialize a proxy: {:?}",
-            proxies.iter().map(|p| p.id.clone()).collect::<Vec<_>>()
-        );
-        assert!(upstreams.is_empty(), "and no upstream either");
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].hosts, vec!["*.api.external.com"]);
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].targets[0].host, "*.api.external.com");
     }
 
     #[test]

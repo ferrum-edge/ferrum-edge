@@ -43,6 +43,26 @@ pub const XDS_TYPE_URLS: [&str; 7] = [
     RTDS_TYPE_URL,
 ];
 
+/// Closed-set log label for a top-level xDS `type_url`.
+///
+/// Recognized profile types map to a short operator label; any other
+/// peer-supplied value collapses to a single `unknown` label. This keeps every
+/// `type_url` that reaches a log field bounded regardless of input length, so a
+/// hostile or misconfigured peer cannot inject arbitrary bytes into a log line
+/// or amplify log volume (issue #4813).
+pub fn xds_type_url_log_label(type_url: &str) -> &'static str {
+    match type_url {
+        CDS_TYPE_URL => "cds",
+        EDS_TYPE_URL => "eds",
+        LDS_TYPE_URL => "lds",
+        RDS_TYPE_URL => "rds",
+        SDS_TYPE_URL => "sds",
+        ECDS_TYPE_URL => "ecds",
+        RTDS_TYPE_URL => "rtds",
+        _ => "unknown",
+    }
+}
+
 pub fn translate_mesh_slice_to_snapshot(slice: &MeshSlice) -> XdsSnapshot {
     let mut resources = Vec::new();
     resources.extend(translate_lds(slice));
@@ -510,4 +530,37 @@ fn fractional_percent_from_struct(structure: &runtime_proto::Struct) -> Option<R
         numerator,
         denominator,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::MAX_XDS_LOG_VALUE_CHARS;
+    use super::{
+        CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, RTDS_TYPE_URL,
+        SDS_TYPE_URL, xds_type_url_log_label,
+    };
+
+    #[test]
+    fn recognized_type_urls_map_to_short_labels() {
+        for (type_url, label) in [
+            (CDS_TYPE_URL, "cds"),
+            (EDS_TYPE_URL, "eds"),
+            (LDS_TYPE_URL, "lds"),
+            (RDS_TYPE_URL, "rds"),
+            (SDS_TYPE_URL, "sds"),
+            (ECDS_TYPE_URL, "ecds"),
+            (RTDS_TYPE_URL, "rtds"),
+        ] {
+            assert_eq!(xds_type_url_log_label(type_url), label);
+        }
+    }
+
+    #[test]
+    fn hostile_megabyte_type_url_collapses_to_unknown() {
+        let hostile = format!("type.googleapis.com/{}", "x".repeat(1024 * 1024));
+        let label = xds_type_url_log_label(&hostile);
+
+        assert_eq!(label, "unknown");
+        assert!(label.len() < MAX_XDS_LOG_VALUE_CHARS);
+    }
 }

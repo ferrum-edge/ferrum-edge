@@ -1231,6 +1231,164 @@ async fn strict_route_response_limit_rejects_unknown_length_json_despite_sse_acc
     backend.assert_no_step_errors().await;
 }
 
+// ai_token_metrics releases origin SSE under retries unless buffering is opted in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn ai_token_metrics_retry_sse_release_honors_origin_headers_and_opt_in() {
+    const EVENT_ONE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n";
+    const EVENT_TWO: &str = concat!(
+        "data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    const MID_STREAM_PAUSE: Duration = Duration::from_secs(5);
+    const FIRST_EVENT_DEADLINE: Duration = Duration::from_millis(2500);
+
+    for retry_first in [false, true] {
+        for accept_sse in [false, true] {
+            for opt_in in [false, true] {
+                let reservation = reserve_port().await.expect("reserve backend port");
+                let backend_port = reservation.port;
+                let mut scripts = Vec::new();
+                if retry_first {
+                    scripts.push(vec![
+                        HttpStep::ExpectRequest(RequestMatcher::method_path("POST", "/chat")),
+                        HttpStep::RespondStatus {
+                            status: 503,
+                            reason: "Service Unavailable".into(),
+                        },
+                        HttpStep::RespondHeader {
+                            name: "Content-Type".into(),
+                            value: "text/event-stream".into(),
+                        },
+                        HttpStep::RespondHeader {
+                            name: "Connection".into(),
+                            value: "close".into(),
+                        },
+                        HttpStep::RespondBodyChunk(b"data: discarded attempt\n\n".to_vec()),
+                        HttpStep::RespondBodyEnd,
+                    ]);
+                }
+                scripts.push(vec![
+                    HttpStep::ExpectRequest(RequestMatcher::method_path("POST", "/chat")),
+                    HttpStep::RespondStatus {
+                        status: 200,
+                        reason: "OK".into(),
+                    },
+                    HttpStep::RespondHeader {
+                        name: "Content-Type".into(),
+                        value: "text/event-stream".into(),
+                    },
+                    HttpStep::RespondHeader {
+                        name: "Connection".into(),
+                        value: "close".into(),
+                    },
+                    HttpStep::RespondBodyChunk(EVENT_ONE.as_bytes().to_vec()),
+                    HttpStep::Sleep(MID_STREAM_PAUSE),
+                    HttpStep::RespondBodyChunk(EVENT_TWO.as_bytes().to_vec()),
+                    HttpStep::RespondBodyEnd,
+                ]);
+                let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+                    .connection_scripts(scripts)
+                    .spawn()
+                    .expect("spawn backend");
+                let config = json!({
+                    "version": "1",
+                    "proxies": [{
+                        "id": "token-retry",
+                        "listen_path": "/chat",
+                        "backend_scheme": "http",
+                        "backend_host": "127.0.0.1",
+                        "backend_port": backend_port,
+                        "strip_listen_path": false,
+                        "backend_read_timeout_ms": 0,
+                        "retry": {
+                            "max_retries": 2,
+                            "retryable_status_codes": [503],
+                            "retryable_methods": ["POST"],
+                            "retry_on_connect_failure": false,
+                        },
+                        "plugins": [{"plugin_config_id": "tokens"}],
+                    }],
+                    "consumers": [],
+                    "upstreams": [],
+                    "plugin_configs": [{
+                        "id": "tokens",
+                        "proxy_id": "token-retry",
+                        "plugin_name": "ai_token_metrics",
+                        "scope": "proxy",
+                        "enabled": true,
+                        "config": {"buffer_streaming_responses": opt_in},
+                    }],
+                });
+                // In-process startup keeps capability probes from consuming
+                // a scripted attempt; only the test's POST reaches the fixture.
+                let harness = GatewayHarness::builder()
+                    .mode_in_process()
+                    .file_config(to_file_mode_yaml(&config))
+                    .pool_warmup_enabled(false)
+                    .spawn()
+                    .await
+                    .expect("spawn gateway");
+                let request_body = json!({
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hello"}]
+                })
+                .to_string();
+                let client = harness.http_client().expect("client");
+                let mut request = client
+                    .request(reqwest::Method::POST, &harness.proxy_url("/chat"))
+                    .header("content-type", "application/json")
+                    .body(request_body.clone());
+                if accept_sse {
+                    request = request.header("accept", "text/event-stream");
+                }
+                let started = Instant::now();
+                let deadline = if opt_in {
+                    MID_STREAM_PAUSE + Duration::from_secs(5)
+                } else {
+                    FIRST_EVENT_DEADLINE
+                };
+                let (mut response, mut body) = tokio::time::timeout(deadline, async {
+                    let mut response = request.send().await.expect("response headers");
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let mut body = Vec::new();
+                    while body.len() < EVENT_ONE.len() {
+                        let chunk = response.chunk().await.expect("read event").expect("event");
+                        body.extend_from_slice(&chunk);
+                    }
+                    (response, body)
+                })
+                .await
+                .expect("first event arrives within the configured delivery deadline");
+                if opt_in {
+                    assert!(started.elapsed() >= MID_STREAM_PAUSE);
+                } else {
+                    assert_eq!(body, EVENT_ONE.as_bytes());
+                }
+                tokio::time::timeout(MID_STREAM_PAUSE + Duration::from_secs(5), async {
+                    while let Some(chunk) = response.chunk().await.expect("drain SSE") {
+                        body.extend_from_slice(&chunk);
+                    }
+                })
+                .await
+                .expect("stream finishes");
+                assert_eq!(body, format!("{EVENT_ONE}{EVENT_TWO}").as_bytes());
+                let requests = backend.received_requests().await;
+                assert_eq!(requests.len(), if retry_first { 2 } else { 1 });
+                for forwarded in requests {
+                    assert_eq!(forwarded.complete_body(), Some(request_body.as_bytes()));
+                    assert_eq!(
+                        forwarded.header("accept") == Some("text/event-stream"),
+                        accept_sse
+                    );
+                }
+                backend.assert_no_matcher_mismatches().await;
+                backend.assert_no_step_errors().await;
+            }
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // a2a_gateway + retries — unexpected SSE must stream incrementally (#2169).
 // ────────────────────────────────────────────────────────────────────────────
@@ -1266,7 +1424,10 @@ async fn strict_route_response_limit_rejects_unknown_length_json_despite_sse_acc
 // sibling SSE streaming tests above — and assert a single backend connection so
 // a reintroduced stray dial fails loudly instead of corrupting the script.
 
-fn a2a_retry_file_config(backend_port: u16, plugin_config: serde_json::Value) -> String {
+fn a2a_retry_file_config(backend_port: u16, mut plugin_config: serde_json::Value) -> String {
+    if plugin_config.get("discovery").is_none() {
+        plugin_config["discovery"] = json!({"rewrite_agent_card_urls": false});
+    }
     let config = json!({
         "version": "1",
         "proxies": [{
@@ -2040,4 +2201,216 @@ async fn h1_progressing_sse_survives_idle_read_timeout() {
         text.contains("data: a") && text.contains("data: c"),
         "progressing SSE body truncated: {text:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn a2a_policy_covers_request_shapes_before_any_upstream_connection() {
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "application/json".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"{\"id\":\"task-1\"}".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn recording backend");
+    let yaml = a2a_retry_file_config(
+        backend.port,
+        json!({
+            "policy": {"default_action": "deny", "methods": {"tasks/get": {"action": "allow"}}}
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = harness.http_client().expect("client");
+    for (method, path, content_type, body) in [
+        (
+            "POST",
+            "/a2a/",
+            "application/json",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"message/send\"}",
+        ),
+        ("POST", "/a2a/message:send/", "application/json", "{}"),
+        ("POST", "/a2a//message:send", "application/json", "{}"),
+        (
+            "POST",
+            "/a2a/tasks/t1/pushNotificationConfigs/",
+            "application/json",
+            "{}",
+        ),
+        (
+            "POST",
+            "/a2a/tasks/t1//pushNotificationConfigs",
+            "application/json",
+            "{}",
+        ),
+        ("GET", "/a2a/tasks/", "application/json", ""),
+        ("POST", "/a2a", "application/json", "not-json"),
+        ("POST", "/a2a", "application/json", "{}"),
+        (
+            "POST",
+            "/a2a",
+            "text/plain",
+            "{\"method\":\"message/send\"}",
+        ),
+    ] {
+        let response = client
+            .request(method.parse().expect("method"), &harness.proxy_url(path))
+            .header("content-type", content_type)
+            .body(body)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("policy response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+    assert_eq!(
+        backend.accepted_connections(),
+        0,
+        "denials must not dial upstream"
+    );
+    assert!(backend.received_requests().await.is_empty());
+
+    // Positive controls prove the route, recorder, body decoding, and request
+    // credential forwarding work with the same policy instance.
+    for (method, path, body) in [
+        ("GET", "/a2a/tasks/task-1", ""),
+        (
+            "POST",
+            "/a2a",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tasks/get\"}",
+        ),
+    ] {
+        let response = client
+            .request(method.parse().expect("method"), &harness.proxy_url(path))
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer fixture-only-caller")
+            .body(body)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("allowed response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: serde_json::Value = response.json().await.expect("decode backend JSON");
+        assert_eq!(decoded["id"], "task-1");
+    }
+    let requests = backend.received_requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(backend.accepted_connections(), 2);
+    for request in &requests {
+        assert!(!request.body_truncated);
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == "Bearer fixture-only-caller"
+        }));
+    }
+    let decoded: serde_json::Value =
+        serde_json::from_slice(&requests[1].body).expect("decode recorded body");
+    assert_eq!(decoded["method"], "tasks/get");
+    backend.assert_no_step_errors().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn a2a_card_public_origin_admission_and_signed_jsonrpc_batch_on_the_wire() {
+    let card = json!({
+        "name": "fixture", "protocolVersion": "0.3.0",
+        "url": "http://agent.internal/a2a", "signatures": [{"signature": "fixture"}]
+    });
+    let upstream = json!([
+        {"jsonrpc": "2.0", "id": 1, "result": {"id": "task-1"}},
+        {"jsonrpc": "2.0", "id": 2, "result": card}
+    ])
+    .to_string();
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "POST", "/a2a",
+        )))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "application/json".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(upstream.into_bytes()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn card backend");
+    let yaml = a2a_retry_file_config(
+        backend.port,
+        json!({"discovery": {
+            "trust_forwarded_headers": true,
+            "allowed_public_origins": ["https://agents.example.com"]
+        }}),
+    );
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = harness.http_client().expect("client");
+    let request = json!([
+        {"jsonrpc": "2.0", "id": 1, "method": "tasks/get"},
+        {"jsonrpc": "2.0", "id": 2, "method": "agent/getCard"}
+    ]);
+    for host in [None, Some("unapproved.example.com")] {
+        let mut call = client
+            .request(reqwest::Method::POST, &harness.proxy_url("/a2a"))
+            .header("x-forwarded-proto", "https")
+            .json(&request);
+        if let Some(host) = host {
+            call = call.header("x-forwarded-host", host);
+        }
+        let response = call
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("origin refusal");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            !response
+                .text()
+                .await
+                .expect("error body")
+                .contains("agent.internal")
+        );
+    }
+    assert_eq!(backend.accepted_connections(), 0);
+    let response = client
+        .request(reqwest::Method::POST, &harness.proxy_url("/a2a"))
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-host", "agents.example.com")
+        .header("authorization", "Bearer fixture-only-caller")
+        .json(&request)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .expect("rewritten response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let decoded: serde_json::Value = response.json().await.expect("decode rewritten card batch");
+    assert_eq!(decoded[0]["result"]["id"], "task-1");
+    assert_eq!(
+        decoded[1]["result"]["url"],
+        "https://agents.example.com/a2a"
+    );
+    assert!(decoded[1]["result"].get("signatures").is_none());
+    assert_eq!(backend.received_requests().await.len(), 1);
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
 }

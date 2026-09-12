@@ -143,6 +143,14 @@ fn status_planning_avoids_per_object_retranslate_and_post_cap() {
         "post-plan truncate must not remain as the only CPU bound"
     );
     assert!(
+        STATUS_SRC.contains("for status in &translation.listenerset_statuses"),
+        "rejected ListenerSets must be indexed in one pass over translation statuses"
+    );
+    assert!(
+        !STATUS_SRC.contains("translation.listenerset_statuses.iter().any"),
+        "status indexing must not scan all ListenerSet statuses for every ListenerSet"
+    );
+    assert!(
         TRANSLATE_SRC.contains("Vec<&K8sObject>"),
         "translator must borrow included objects instead of deep-cloning"
     );

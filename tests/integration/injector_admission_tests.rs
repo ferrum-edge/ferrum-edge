@@ -21,7 +21,7 @@ fn injector_config(capture_mode: CaptureMode) -> InjectorConfig {
     InjectorConfig {
         listen_addr: "127.0.0.1:9443".parse().expect("listen addr"),
         namespace: "default".to_string(),
-        sidecar_image: "ferrum-edge:test".to_string(),
+        sidecar_image: "ferrum-edge:test-ebpf-tools".to_string(),
         sidecar_env: vec![(
             "FERRUM_DP_CP_GRPC_URLS".to_string(),
             "http://cp:50051".to_string(),
@@ -500,4 +500,74 @@ fn admission_rejects_unresolved_named_probe_port() {
         message.contains("names port 'metrics'"),
         "denial must name the unresolved probe port: {message}"
     );
+}
+
+#[test]
+fn iptables_injection_requires_a_tools_image_before_emitting_any_patch() {
+    let review = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "request": {
+            "uid": "tools-image-contract",
+            "namespace": "payments",
+            "kind": {"group": "", "version": "v1", "kind": "Pod"},
+            "resource": {"group": "", "version": "v1", "resource": "pods"},
+            "object": pod_object()
+        }
+    });
+    let body = review.to_string();
+    let digest = format!("sha256:{}", "a".repeat(64));
+    for image in [
+        "ferrumedge/ferrum-edge:0.9.3".to_string(),
+        "ferrumedge/ferrum-edge:0.9.3-ebpf".to_string(),
+        "registry:5000/team/ferrum-edge:custom".to_string(),
+        "registry:5000/team/ferrum-edge-ebpf-tools".to_string(),
+        format!("ferrumedge/ferrum-edge@{digest}"),
+        format!("ferrumedge/ferrum-edge:0.9.3@{digest}"),
+    ] {
+        let mut config = injector_config(CaptureMode::Iptables);
+        config.sidecar_image = image.clone();
+        let response = admission_response(body.as_bytes(), &config).unwrap();
+        assert_eq!(response["response"]["allowed"], false, "{image}");
+        assert_eq!(response["response"]["uid"], "tools-image-contract");
+        assert_eq!(response["response"]["status"]["code"], 400);
+        assert!(
+            response["response"]["status"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("-ebpf-tools")
+        );
+        assert!(response["response"].get("patch").is_none());
+        assert!(response["response"].get("patchType").is_none());
+
+        // A non-shell capture mode still accepts the same image reference.
+        for mode in [CaptureMode::Explicit, CaptureMode::Ebpf] {
+            config.capture_mode = mode;
+            let response = admission_response(body.as_bytes(), &config).unwrap();
+            assert_eq!(response["response"]["allowed"], true, "{mode:?}: {image}");
+            assert!(response["response"].get("patch").is_some());
+        }
+    }
+
+    for image in [
+        "ferrumedge/ferrum-edge:0.9.3-ebpf-tools".to_string(),
+        format!("registry:5000/team/ferrum-edge:custom-ebpf-tools@{digest}"),
+    ] {
+        let mut config = injector_config(CaptureMode::Iptables);
+        config.sidecar_image = image.clone();
+        let response = admission_response(body.as_bytes(), &config).unwrap();
+        assert_eq!(response["response"]["allowed"], true);
+        let patch = base64::engine::general_purpose::STANDARD
+            .decode(response["response"]["patch"].as_str().unwrap())
+            .unwrap();
+        let patches: Vec<Value> = serde_json::from_slice(&patch).unwrap();
+        for path in ["/spec/initContainers/0", "/spec/initContainers/1"] {
+            let operation = patches.iter().find(|patch| patch["path"] == path).unwrap();
+            let container = &operation["value"];
+            assert_eq!(container["image"], image);
+            if path == "/spec/initContainers/1" {
+                assert_eq!(container["command"], json!(["/bin/sh", "-c"]));
+            }
+        }
+    }
 }

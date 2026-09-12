@@ -10,7 +10,7 @@
 
 use crossbeam_utils::CachePadded;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -24,23 +24,43 @@ use tracing::{debug, info, warn};
 /// `getrlimit` syscall per minute) without taking the hit on every tick.
 const FD_LIMIT_REFRESH_INTERVAL_TICKS: u64 = 60;
 
-/// One-shot warning latch for the `fd_limit == 0` (FD pressure disabled) case.
+/// One-shot warning latch for the "FD pressure not enforceable" case.
 ///
-/// `get_fd_limit()` returns 0 on Windows and other non-Unix platforms (and on
-/// the rare `getrlimit` failure on Unix). When that happens the FD ratio is
-/// permanently 0.0 — FD-based load shedding is silently inert. We emit a
-/// single `warn!` so operators can distinguish "FD pressure disabled by
-/// platform" from "FD pressure at 0%". The latch ensures the periodic refresh
-/// loop never spams the warn if it continues to see 0.
+/// Two distinct conditions land here (issue #4787):
+///
+/// * `get_fd_limit()` returns 0 — Windows and other non-Unix platforms, and the
+///   rare `getrlimit` failure on Unix.
+/// * The soft cap is `RLIM_INFINITY` (or otherwise at/above
+///   [`FD_LIMIT_MAX_ENFORCEABLE`]) and no platform ceiling is published, so the
+///   ratio would be computed against a number the kernel never honors.
+///
+/// In both cases the FD ratio is permanently 0.0 — FD-based load shedding is
+/// silently inert. We emit a single `warn!`, naming which condition applied, so
+/// operators can distinguish "this tier is off" from "FD pressure at 0%". The
+/// latch ensures the periodic refresh loop never spams the warn.
 static FD_PRESSURE_DISABLED_WARN: Once = Once::new();
 
-fn warn_fd_pressure_disabled_once() {
+fn warn_fd_pressure_disabled_once(reason: &'static str) {
     FD_PRESSURE_DISABLED_WARN.call_once(|| {
         warn!(
-            "FD-based pressure shedding disabled on this platform — fd_limit could not be queried. \
-             Connection-based and request-based shedding remain active."
+            reason,
+            "FD-based pressure shedding disabled ({}) — the /overload snapshot reports \
+             pressure.file_descriptors.enforced=false. Connection-based and request-based \
+             shedding remain active.",
+            reason
         );
     });
+}
+
+/// Reason string for the one-shot warning, or `None` when the tier is enforcing.
+fn fd_pressure_disabled_reason(limit: u64, verdict: FdLimitVerdict) -> Option<&'static str> {
+    match verdict {
+        FdLimitVerdict::Enforced(_) | FdLimitVerdict::ClampedToPlatformCeiling(_) => None,
+        FdLimitVerdict::NotEnforceable if limit == 0 => Some("fd_limit could not be queried"),
+        FdLimitVerdict::NotEnforceable => {
+            Some("the FD hard cap is unlimited and no platform ceiling is published")
+        }
+    }
 }
 
 fn pressure_ratio(current: u64, max: u64) -> f64 {
@@ -367,6 +387,12 @@ impl OverloadState {
                     current: fd_current,
                     max: fd_max,
                     ratio: pressure_ratio(fd_current, fd_max),
+                    // `fd_max == 0` is the single representation of "this tier
+                    // is off", whether because the platform has no rlimit,
+                    // `getrlimit` failed, or the hard cap is unlimited with no
+                    // published platform ceiling (issue #4787). Derived rather
+                    // than stored so the flag and the ratio can never disagree.
+                    enforced: fd_max > 0,
                 },
                 connections: ConnPressure {
                     current: conn_current,
@@ -516,6 +542,10 @@ pub struct FdPressure {
     pub current: u64,
     pub max: u64,
     pub ratio: f64,
+    /// False when FD-based load shedding is disabled because no enforceable
+    /// ceiling could be determined. `max` is then 0 and `ratio` is always 0.0,
+    /// so an operator can tell "the tier is off" from "FD pressure at 0%".
+    pub enforced: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -698,6 +728,106 @@ unsafe extern "C" {
 /// signal in their log pipeline rather than discovering it at the EMFILE.
 pub const FD_HARD_LIMIT_PRODUCTION_FLOOR: u64 = 65_536;
 
+/// Largest soft `RLIMIT_NOFILE` value that is treated as a real, enforceable
+/// per-process ceiling (issue #4787).
+///
+/// `RLIM_INFINITY` is `u64::MAX`, and [`raise_fd_limit`] deliberately raises
+/// the soft cap to the hard cap — so on a host whose hard cap is unlimited the
+/// FD tier would compute `current / u64::MAX`, a ratio that can never reach the
+/// 0.80 pressure or 0.95 critical threshold no matter how close the process is
+/// to the ceiling the kernel actually enforces. Linux caps `fs.nr_open` at
+/// `INT_MAX`, so no genuine per-process FD ceiling can reach `1 << 31`; a value
+/// at or above it is either `RLIM_INFINITY` or a number no host can honor.
+pub const FD_LIMIT_MAX_ENFORCEABLE: u64 = 1 << 31;
+
+/// What the FD load-shedding tier should do with an observed soft FD cap.
+///
+/// Produced by [`classify_fd_limit`] and consumed by the overload monitor and
+/// by startup logging. The point of the enum (rather than a bare `u64`) is that
+/// "the tier is off" and "the tier is enforcing a small limit" must never be
+/// indistinguishable to an operator reading `/overload`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdLimitVerdict {
+    /// The observed cap is finite and plausible; the tier uses it directly.
+    Enforced(u64),
+    /// The observed cap was `RLIM_INFINITY` (or implausibly large) but the
+    /// platform publishes the ceiling it really enforces, so the tier uses
+    /// that instead and the ratio stays honest. Linux only, via
+    /// `/proc/sys/fs/nr_open`.
+    ClampedToPlatformCeiling(u64),
+    /// No enforceable ceiling could be determined. `fd_max` stays 0 so
+    /// [`pressure_ratio`] returns 0.0 and the tier is *explicitly* disabled
+    /// rather than falsely quiet.
+    NotEnforceable,
+}
+
+impl FdLimitVerdict {
+    /// The value to publish as `OverloadState::fd_max`. 0 disables the tier.
+    pub fn fd_max(self) -> u64 {
+        match self {
+            Self::Enforced(limit) | Self::ClampedToPlatformCeiling(limit) => limit,
+            Self::NotEnforceable => 0,
+        }
+    }
+
+    /// True when FD pressure is actually being enforced.
+    pub fn is_enforced(self) -> bool {
+        !matches!(self, Self::NotEnforceable)
+    }
+}
+
+/// Pure classification of a soft FD cap against an optional platform ceiling.
+///
+/// Split from [`classify_fd_limit`] so the decision table is testable without
+/// reading `/proc`.
+pub fn classify_fd_limit_with_ceiling(limit: u64, platform_ceiling: Option<u64>) -> FdLimitVerdict {
+    if limit == 0 {
+        // `getrlimit` failed, or this is a non-Unix platform.
+        return FdLimitVerdict::NotEnforceable;
+    }
+    if limit < FD_LIMIT_MAX_ENFORCEABLE {
+        return FdLimitVerdict::Enforced(limit);
+    }
+    match platform_ceiling {
+        Some(ceiling) if ceiling > 0 && ceiling < FD_LIMIT_MAX_ENFORCEABLE => {
+            FdLimitVerdict::ClampedToPlatformCeiling(ceiling)
+        }
+        _ => FdLimitVerdict::NotEnforceable,
+    }
+}
+
+/// Read the per-process FD ceiling the platform enforces regardless of
+/// `RLIMIT_NOFILE`, when it publishes one.
+///
+/// Linux exposes `fs.nr_open`, the upper bound `setrlimit(RLIMIT_NOFILE)`
+/// itself is checked against, so it is the real ceiling behind an unlimited
+/// hard cap. One small `read` of a `procfs` file; the caller does it at startup
+/// and once per `FD_LIMIT_REFRESH_INTERVAL_TICKS` monitor ticks, never on a
+/// request path. Every other platform returns `None`, which classifies an
+/// unlimited cap as [`FdLimitVerdict::NotEnforceable`].
+fn platform_fd_ceiling() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/fs/nr_open")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Classify an observed soft FD cap, consulting the platform ceiling when the
+/// cap itself is not enforceable.
+pub fn classify_fd_limit(limit: u64) -> FdLimitVerdict {
+    if limit != 0 && limit < FD_LIMIT_MAX_ENFORCEABLE {
+        // Fast path: no `/proc` read for the overwhelmingly common case.
+        return FdLimitVerdict::Enforced(limit);
+    }
+    classify_fd_limit_with_ceiling(limit, platform_fd_ceiling())
+}
+
 /// Outcome of the startup attempt to raise the soft FD cap to the hard cap.
 /// Reported by [`raise_fd_limit`] for logging and tests.
 #[derive(Debug, Clone, Copy)]
@@ -878,6 +1008,94 @@ async fn measure_event_loop_latency() -> Duration {
     max_latency
 }
 
+/// Monitor ticks between repeats of the FD-count timeout warning.
+///
+/// One per minute at the default 1 s check interval — enough for an operator
+/// to see that the condition persists, few enough that a permanently saturated
+/// blocking pool cannot flood the log pipeline.
+pub const FD_COUNT_TIMEOUT_WARN_INTERVAL_TICKS: u64 = 60;
+
+/// Whether the FD-count timeout warning should be emitted on this tick.
+///
+/// Fires on the first timeout and then at most once every
+/// [`FD_COUNT_TIMEOUT_WARN_INTERVAL_TICKS`] ticks. `tick` wraps, so the
+/// comparison uses `wrapping_sub`: after a wrap the elapsed distance is still
+/// correct, and the worst case is one extra warning per `u64` wrap.
+pub fn fd_count_timeout_warn_should_fire(tick: u64, last_warn_tick: Option<u64>) -> bool {
+    match last_warn_tick {
+        None => true,
+        Some(last) => tick.wrapping_sub(last) >= FD_COUNT_TIMEOUT_WARN_INTERVAL_TICKS,
+    }
+}
+
+/// One open-FD sample taken by the overload monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FdCountSample {
+    /// The count to publish. On timeout this is the caller-supplied previous
+    /// value, deliberately NOT `u64::MAX`.
+    pub current: u64,
+    /// True when the blocking-pool task did not finish within the budget.
+    pub timed_out: bool,
+}
+
+/// Count open file descriptors on the blocking pool under a bounded budget.
+///
+/// Three outcomes, and the difference between them is the whole point of this
+/// function (issue #4786):
+///
+/// * completed — the measured count.
+/// * `JoinError` — a genuine panic or abort of the counting task. Fail closed
+///   to `u64::MAX` exactly as before; that is a bug signal, not a load signal.
+/// * budget expired — the blocking pool is saturated. Keep the PREVIOUS count
+///   and let the loop continue. Failing closed here would drive `fd_ratio` to
+///   1.0 and latch the gateway into permanent rejection — the very outage this
+///   timeout exists to prevent.
+///
+/// The in-flight handle is retained after a timeout. Subsequent calls poll that
+/// same task instead of adding more work to Tokio's unbounded blocking queue.
+pub async fn sample_open_fd_count<F>(
+    in_flight: &mut Option<tokio::task::JoinHandle<u64>>,
+    budget: Duration,
+    previous: u64,
+    count: F,
+) -> FdCountSample
+where
+    F: FnOnce() -> u64 + Send + 'static,
+{
+    if in_flight.is_none() {
+        *in_flight = Some(tokio::task::spawn_blocking(count));
+    }
+
+    let outcome = match in_flight.as_mut() {
+        Some(task) => tokio::time::timeout(budget, task).await,
+        None => {
+            return FdCountSample {
+                current: previous,
+                timed_out: true,
+            };
+        }
+    };
+
+    let sample = match outcome {
+        Ok(Ok(current)) => FdCountSample {
+            current,
+            timed_out: false,
+        },
+        Ok(Err(_join_error)) => FdCountSample {
+            current: u64::MAX,
+            timed_out: false,
+        },
+        Err(_elapsed) => FdCountSample {
+            current: previous,
+            timed_out: true,
+        },
+    };
+    if !sample.timed_out {
+        *in_flight = None;
+    }
+    sample
+}
+
 // ── Background monitor task ─────────────────────────────────────────────
 
 /// Start the overload monitor background task.
@@ -896,8 +1114,20 @@ pub fn start_monitor(
         // `fd_limit` is mutable so the monitor can pick up runtime changes to
         // the soft `RLIMIT_NOFILE` (e.g. operator `setrlimit(2)`, systemd unit
         // reload). Refreshed every `FD_LIMIT_REFRESH_INTERVAL_TICKS` iterations.
-        let mut fd_limit = get_fd_limit();
+        let mut fd_raw_limit = get_fd_limit();
+        let mut fd_verdict = classify_fd_limit(fd_raw_limit);
+        // `fd_limit` is the value the tier actually sheds against: the observed
+        // soft cap, the platform ceiling behind an unlimited cap, or 0 when
+        // neither is enforceable (issue #4787).
+        let mut fd_limit = fd_verdict.fd_max();
         let mut tick: u64 = 0;
+        // Monitor tick of the most recent FD-count timeout warning, so a
+        // persistently saturated blocking pool logs at a bounded rate instead
+        // of once per tick (issue #4786).
+        let mut fd_count_timeout_warn_tick: Option<u64> = None;
+        // Retain a timed-out blocking task so each tick polls the same sample
+        // rather than submitting unbounded duplicate work to the blocking pool.
+        let mut fd_count_in_flight = None;
 
         // Store limits (max_connections / max_requests don't change during
         // runtime; fd_max is updated each refresh below).
@@ -907,11 +1137,19 @@ pub fn start_monitor(
             .store(max_connections as u64, Ordering::Relaxed);
         state.req_max.store(max_requests as u64, Ordering::Relaxed);
 
-        // One-shot warn at startup when FD pressure is unavailable on this
-        // platform (Windows, or `getrlimit` failed). Connection- and
-        // request-based shedding still work; only FD-based shedding is inert.
-        if fd_limit == 0 {
-            warn_fd_pressure_disabled_once();
+        // One-shot warn at startup when FD pressure is not enforceable —
+        // either unavailable on this platform (Windows, or `getrlimit`
+        // failed) or an unlimited hard cap with no published platform
+        // ceiling. Connection- and request-based shedding still work; only
+        // FD-based shedding is inert, and `/overload` says so explicitly.
+        if let Some(reason) = fd_pressure_disabled_reason(fd_raw_limit, fd_verdict) {
+            warn_fd_pressure_disabled_once(reason);
+        }
+        if let FdLimitVerdict::ClampedToPlatformCeiling(ceiling) = fd_verdict {
+            info!(
+                platform_ceiling = ceiling,
+                "FD hard cap is unlimited; FD pressure is measured against the platform ceiling"
+            );
         }
 
         info!(
@@ -935,28 +1173,56 @@ pub fn start_monitor(
             // tracks the live limit. On platforms where the syscall returns
             // 0, the warn latch fires only once.
             if tick.is_multiple_of(FD_LIMIT_REFRESH_INTERVAL_TICKS) {
-                let new_limit = get_fd_limit();
-                if new_limit != fd_limit {
-                    info!(
-                        old_fd_limit = fd_limit,
-                        new_fd_limit = new_limit,
-                        "Overload monitor: fd_limit changed (RLIMIT_NOFILE updated)"
-                    );
-                    fd_limit = new_limit;
-                    state.fd_max.store(fd_limit, Ordering::Relaxed);
+                let new_raw_limit = get_fd_limit();
+                if new_raw_limit != fd_raw_limit {
+                    fd_raw_limit = new_raw_limit;
+                    fd_verdict = classify_fd_limit(fd_raw_limit);
+                    let new_limit = fd_verdict.fd_max();
+                    if new_limit != fd_limit {
+                        info!(
+                            old_fd_limit = fd_limit,
+                            new_fd_limit = new_limit,
+                            enforced = fd_verdict.is_enforced(),
+                            "Overload monitor: fd_limit changed (RLIMIT_NOFILE updated)"
+                        );
+                        fd_limit = new_limit;
+                        state.fd_max.store(fd_limit, Ordering::Relaxed);
+                    }
                 }
-                if fd_limit == 0 {
-                    warn_fd_pressure_disabled_once();
+                if let Some(reason) = fd_pressure_disabled_reason(fd_raw_limit, fd_verdict) {
+                    warn_fd_pressure_disabled_once(reason);
                 }
             }
 
             // ── FD pressure ──
             // count_open_fds() may stat or walk /proc. Run it on the blocking
             // pool so a large fdtable cannot stall a tokio worker — worst
-            // exactly when FDs are the problem. Join failure is fail-closed.
-            let fd_current = tokio::task::spawn_blocking(count_open_fds)
-                .await
-                .unwrap_or(u64::MAX);
+            // exactly when FDs are the problem. Bounded by one check interval
+            // so a saturated blocking pool (issue #4786: io_uring splice
+            // relays hold two blocking threads each for a connection's whole
+            // lifetime) cannot park the monitor and freeze every shedding
+            // flag at its last computed value.
+            let previous_fd_current = state.fd_current.load(Ordering::Relaxed);
+            let fd_sample = sample_open_fd_count(
+                &mut fd_count_in_flight,
+                interval,
+                previous_fd_current,
+                count_open_fds,
+            )
+            .await;
+            if fd_sample.timed_out
+                && fd_count_timeout_warn_should_fire(tick, fd_count_timeout_warn_tick)
+            {
+                fd_count_timeout_warn_tick = Some(tick);
+                warn!(
+                    budget_ms = interval.as_millis() as u64,
+                    fd_current = fd_sample.current,
+                    "Overload monitor: open-FD count did not complete within one check interval \
+                     (blocking pool saturated?); reusing the previous count and continuing so the \
+                     shedding flags keep updating"
+                );
+            }
+            let fd_current = fd_sample.current;
             state.fd_current.store(fd_current, Ordering::Relaxed);
 
             let fd_ratio = pressure_ratio(fd_current, fd_limit);
@@ -1186,6 +1452,90 @@ pub fn shutdown_drain_announced() -> bool {
     SHUTDOWN_DRAIN_ANNOUNCED.load(Ordering::Acquire)
 }
 
+/// Documented maximum for `FERRUM_SHUTDOWN_DRAIN_SECONDS` (issue #4829).
+///
+/// 24 hours, the same ceiling the other lifetime knobs use. Anything larger is
+/// a typo rather than an intent: an orchestrator grace period is measured in
+/// seconds to minutes, and a drain budget beyond a day leaves a process that
+/// only `SIGKILL` can stop. Refused by `validate()` — at startup and from the
+/// non-serving `ferrum-edge validate` command — rather than clamped, so the
+/// mistake is visible before an incident. A repeated shutdown signal cuts the
+/// remaining wait short regardless; see [`escalate_shutdown`].
+pub const MAX_SHUTDOWN_DRAIN_SECONDS: u64 = 86_400;
+
+/// Documented maximum for `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (issue #4829).
+///
+/// One hour. The pre-drain window exists only to bridge a load balancer's or
+/// kubelet's endpoint-withdrawal latency, which is at most a few health-check
+/// intervals — and unlike the drain wait, this window keeps every listener
+/// ACCEPTING NEW CONNECTIONS while readiness already reports not-ready, so an
+/// oversized value is actively harmful rather than merely slow.
+pub const MAX_SHUTDOWN_PREDRAIN_SECONDS: u64 = 3_600;
+
+/// Process-wide escalation latch for a repeated shutdown signal (issue #4829).
+///
+/// Cancelled when a second `SIGTERM`/`SIGINT` is observed. Two waiters honor
+/// it: the pre-drain window and [`wait_for_drain`]. The fixed post-drain
+/// cleanup phases still run — the escalation means "stop waiting for peers",
+/// not "abandon cleanup", which is what `SIGKILL` already does.
+///
+/// A [`CancellationToken`] rather than an `AtomicBool` so a waiter that
+/// registers after the escalation is ready immediately and one that registers
+/// before is woken, with no check-then-wait race.
+static SHUTDOWN_ESCALATION: OnceLock<CancellationToken> = OnceLock::new();
+
+/// The process-wide shutdown escalation token.
+pub fn shutdown_escalation_token() -> &'static CancellationToken {
+    SHUTDOWN_ESCALATION.get_or_init(CancellationToken::new)
+}
+
+/// Read the escalation latch without waiting.
+pub fn shutdown_escalated() -> bool {
+    shutdown_escalation_token().is_cancelled()
+}
+
+/// Publish the escalation. Idempotent and one-way; returns `true` when this
+/// call is the one that escalated.
+///
+/// Called from the single signal-observer task, so the check-then-cancel pair
+/// has no concurrent caller to race; the return value is only used to pick the
+/// log line.
+pub fn escalate_shutdown() -> bool {
+    let token = shutdown_escalation_token();
+    if token.is_cancelled() {
+        return false;
+    }
+    token.cancel();
+    true
+}
+
+/// What an observed shutdown signal should do, given how many have now been
+/// seen by this process (including the one being classified).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownSignalAction {
+    /// First signal: announce draining and begin the ordinary shutdown.
+    InitiateDrain,
+    /// Second signal: acknowledge it and skip the remaining drain.
+    Escalate,
+    /// Third and later: acknowledge only. There is nothing further to
+    /// escalate to short of `SIGKILL`, which the operator can still send.
+    AlreadyEscalated,
+}
+
+/// Classify a shutdown signal by its 1-based observation count.
+///
+/// Pure, so the escalation ladder is testable without signalling a process.
+/// A `0` count cannot happen (the counter is incremented before classifying)
+/// but is treated as the first signal rather than panicking on the shutdown
+/// path.
+pub fn classify_shutdown_signal(observed_count: u32) -> ShutdownSignalAction {
+    match observed_count {
+        0 | 1 => ShutdownSignalAction::InitiateDrain,
+        2 => ShutdownSignalAction::Escalate,
+        _ => ShutdownSignalAction::AlreadyEscalated,
+    }
+}
+
 /// Mark the overload state as draining and refuse new request admission.
 ///
 /// Sets both `draining` and `reject_new_requests` together so they are observed
@@ -1248,6 +1598,19 @@ pub fn begin_shutdown_drain(state: &Arc<OverloadState>) {
 /// fires even when the operator has set `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` to
 /// disable the wait loop.
 pub async fn wait_for_drain(state: &Arc<OverloadState>, timeout: Duration) -> bool {
+    wait_for_drain_with_escalation(state, timeout, shutdown_escalation_token().clone()).await
+}
+
+/// [`wait_for_drain`] with an injectable escalation token.
+///
+/// Split out so tests can exercise the repeated-signal path without cancelling
+/// the process-global latch, which would make every later drain in the same
+/// test binary observe an escalated shutdown.
+pub async fn wait_for_drain_with_escalation(
+    state: &Arc<OverloadState>,
+    timeout: Duration,
+    escalation: CancellationToken,
+) -> bool {
     let active_conns = state.active_connections.load(Ordering::Relaxed);
     let active_reqs = state.active_requests.load(Ordering::Relaxed);
     if active_conns == 0 && active_reqs == 0 {
@@ -1266,7 +1629,7 @@ pub async fn wait_for_drain(state: &Arc<OverloadState>, timeout: Duration) -> bo
         "Draining active connections and requests",
     );
 
-    match tokio::time::timeout(timeout, async {
+    let drained = async {
         loop {
             if state.active_connections.load(Ordering::Relaxed) == 0
                 && state.active_requests.load(Ordering::Relaxed) == 0
@@ -1275,16 +1638,36 @@ pub async fn wait_for_drain(state: &Arc<OverloadState>, timeout: Duration) -> bo
             }
             state.drain_complete.notified().await;
         }
+    };
+    // A repeated shutdown signal cuts the wait short (issue #4829). Reported
+    // as "not drained" — the caller's contract is "did everything finish?",
+    // and it did not — so the force-close and the fixed cleanup phases after
+    // this call run exactly as they do on a timeout.
+    match tokio::time::timeout(timeout, async {
+        tokio::select! {
+            _ = drained => true,
+            _ = escalation.cancelled() => false,
+        }
     })
     .await
     {
-        Ok(()) => {
+        Ok(true) => {
             info!(
                 phase = "drain",
                 result = "complete",
                 "All connections and requests drained successfully"
             );
             true
+        }
+        Ok(false) => {
+            warn!(
+                phase = "drain",
+                result = "escalated",
+                remaining_connections = state.active_connections.load(Ordering::Relaxed),
+                remaining_requests = state.active_requests.load(Ordering::Relaxed),
+                "Repeated shutdown signal — skipping the remaining drain and force closing",
+            );
+            false
         }
         Err(_) => {
             let remaining_conns = state.active_connections.load(Ordering::Relaxed);

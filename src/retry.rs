@@ -83,11 +83,12 @@ pub enum ErrorClass {
     /// spec-legal teardown signal (RFC 9114 §8.1), not a transport-level
     /// capability failure. See [`crate::http3::client::is_h3_graceful_close`].
     GracefulRemoteClose,
-    /// Gateway dispatch policy rejected the request before any backend dial.
+    /// Terminal gateway policy refused dispatch or response-transform output.
     ///
     /// Used for terminal gateway decisions where replaying would produce the
     /// same policy response (for example a backend TLS SNI override on a path
-    /// that cannot honor per-request SNI, or a final request-body hook reject).
+    /// that cannot honor per-request SNI, a final request-body hook reject, or
+    /// a response transform exceeding the gateway's output ceiling).
     /// Classified as non-connection-error so `retry_on_connect_failure` does
     /// not fire, and `should_retry` rejects it before status-code retry checks.
     DispatchPolicyRejected,
@@ -661,11 +662,12 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
                 // variant is excluded from `retry_on_connect_failure` regardless
                 // of the class.
                 GrpcBackendUnavailableKind::BackendRequest => ErrorClass::ConnectionReset,
-                // Pooled sender canceled before dispatch (hyper `is_canceled`)
-                // with a buffered/replayable body. Pre-wire pool/stale-sender
-                // failure — `request_reached_wire` is false so connect-failure
-                // retry can redial.
-                GrpcBackendUnavailableKind::DispatchCanceled => ErrorClass::ConnectionPoolError,
+                // A buffered/replayable request was never dispatched (hyper
+                // `is_canceled`) or explicitly rejected without application
+                // processing (typed RFC 9113 NACK). Both are pre-wire pool
+                // failures, so configured connect-failure retries can redial.
+                GrpcBackendUnavailableKind::DispatchCanceled
+                | GrpcBackendUnavailableKind::ProtocolNack => ErrorClass::ConnectionPoolError,
                 // A trust-generation fence refused the transport before the
                 // request reached the destination. Pre-wire, so retry may
                 // acquire a fresh transport under the newly published authority
@@ -1123,6 +1125,69 @@ pub fn error_is_tls_close_without_notify(error: &(dyn StdError + 'static)) -> bo
     false
 }
 
+/// Operator-facing reason when a TLS handshake failed because the backend
+/// spoke plaintext HTTP while `backend_scheme` is `https` (the HTTP-family
+/// default when omitted). Issue #5460.
+///
+/// Not a new [`ErrorClass`]: the failure stays [`ErrorClass::TlsError`] so
+/// retry, circuit-breaker, and the client-facing
+/// `X-Gateway-Error: connection_failure` contract are unchanged. Logs attach
+/// this token as `error_reason`.
+pub const ERROR_REASON_HTTPS_TO_PLAINTEXT: &str = "https_to_plaintext_backend";
+
+/// Characteristic TLS-handshake wording when a plaintext HTTP/1.x peer
+/// answers an `https` dial (OpenSSL `wrong version number`, rustls
+/// `InvalidContentType` / `UnknownProtocolVersion`, an HTTP/1.x status line
+/// arriving as a TLS record).
+pub fn https_to_plaintext_from_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("wrong version number")
+        || lower.contains("invalid tls record")
+        || lower.contains("invalid content type")
+        || message.contains("InvalidContentType")
+        || message.contains("UnknownProtocolVersion")
+        || lower.contains("http/1.0 ")
+        || lower.contains("http/1.1 ")
+}
+
+/// Typed rustls variants that characteristically mean the peer sent
+/// plaintext (or otherwise non-TLS) bytes during the handshake.
+fn rustls_error_looks_like_https_to_plaintext(err: &rustls::Error) -> bool {
+    matches!(
+        err,
+        rustls::Error::InvalidMessage(
+            rustls::InvalidMessage::InvalidContentType
+                | rustls::InvalidMessage::UnknownProtocolVersion
+                | rustls::InvalidMessage::InvalidCcs,
+        ),
+    )
+}
+
+/// True when a backend dial/handshake error is the HTTPS-to-plaintext
+/// mismatch (issue #5460). Prefers a typed `rustls::Error` in the chain,
+/// then falls back to Display wording for OpenSSL / stringly wrappers.
+pub fn error_looks_like_https_to_plaintext(error: &(dyn StdError + 'static)) -> bool {
+    if let Some(rustls_err) = rustls_error_from_chain(error)
+        && rustls_error_looks_like_https_to_plaintext(rustls_err)
+    {
+        return true;
+    }
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if https_to_plaintext_from_message(&err.to_string()) {
+            return true;
+        }
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+            && let Some(inner) = io_err.get_ref()
+        {
+            current = Some(inner as &(dyn StdError + 'static));
+            continue;
+        }
+        current = err.source();
+    }
+    false
+}
+
 /// Tightened substring fallback for boxed/reqwest errors when the typed
 /// walk is exhausted.
 ///
@@ -1342,7 +1407,15 @@ fn classify_boxed_with_phase(
 ///
 /// Error path only.
 pub fn reqwest_error_is_protocol_nack(e: &reqwest::Error) -> bool {
-    let mut source = StdError::source(e);
+    error_chain_is_protocol_nack(e)
+}
+
+/// Share reqwest's typed RFC 9113 rejection proof with buffered native gRPC.
+/// h2 surfaces a remote GOAWAY on a response future only when its stream ID
+/// exceeds last_stream_id. Never infer this guarantee from an error message,
+/// and never use it after response headers or with an unreplayable upload.
+pub(crate) fn error_chain_is_protocol_nack(e: &(dyn StdError + 'static)) -> bool {
+    let mut source = Some(e);
     while let Some(err) = source {
         if let Some(h2_err) = err.downcast_ref::<h2::Error>()
             && h2_err.is_remote()

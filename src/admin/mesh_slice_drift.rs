@@ -1,8 +1,10 @@
 //! Response builder for `GET /mesh/slice-drift` (issue #3265).
 //!
 //! CP-mode admin surface that exposes per-authenticated-DP desired / sent /
-//! acknowledged / rejected mesh slice versions so operators can diff the
-//! control plane's publish view against what each data plane has ACKed.
+//! acknowledged (accepted) / applied / rejected mesh slice versions so
+//! operators can diff the control plane's publish view against what each data
+//! plane accepted at install time AND what its proxy runtime is actually
+//! serving (issue #4812).
 
 use serde::Serialize;
 

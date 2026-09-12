@@ -12,6 +12,8 @@
 //! 3. Existing in-flight TLS sessions are NOT torn down by a swap (rustls
 //!    consults the `ServerConfig` only during the handshake).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -807,7 +809,7 @@ async fn start_admin_https_listener(
         let reservation = reserve_port().await.expect("reserve admin port");
         let port = reservation.drop_and_take_port();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        let listener = match tokio::net::TcpListener::bind(addr).await {
+        let listener = match tokio::net::TcpListener::bind_test(addr).await {
             Ok(listener) => listener,
             Err(error) => {
                 errors.push(format!("attempt {attempt}: bind failed: {error}"));
@@ -959,6 +961,41 @@ async fn admin_https_registers_a_client_certificate_authenticated_connection() {
         trust_snapshot(ferrum_edge::tls::ClientTrustScope::AdminHttps).tracked_sessions,
         0,
         "the registration guard must deregister when the admin connection ends"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;
+}
+
+/// With a client-CA bundle configured (and without `FERRUM_ADMIN_TLS_NO_VERIFY`),
+/// anonymous TLS clients must be refused at handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_https_with_client_ca_refuses_anonymous_tls_client() {
+    let _registry = isolated_client_trust_registry().await;
+    let pki = admin_mtls_pki();
+
+    let slot: ferrum_edge::tls::SharedFrontendTls =
+        Arc::new(ArcSwap::new(Arc::new(Some(admin_mtls_server_config(&pki)))));
+    let (addr, shutdown_tx, listener) = start_admin_https_listener(slot, 10).await;
+
+    // TLS 1.3 lets the client finish its side of the handshake before the
+    // server's `certificate_required` alert arrives, so a refused anonymous
+    // client surfaces either at connect or on its first request — never as a
+    // served response.
+    let outcome = match establish_admin_connection(
+        addr,
+        admin_client_config(&pki, false, &[b"http/1.1"]),
+        false,
+    )
+    .await
+    {
+        Err(_) => AdminAttempt::TransportFailed,
+        Ok((mut transport, _driver)) => transport.live_probe().await,
+    };
+    assert_eq!(
+        outcome,
+        AdminAttempt::TransportFailed,
+        "anonymous TLS client must be refused when admin client CA is configured"
     );
 
     let _ = shutdown_tx.send(true);

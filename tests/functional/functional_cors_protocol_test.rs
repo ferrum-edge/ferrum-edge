@@ -1,5 +1,7 @@
 //! CORS request/response parity across H1, H2, and H3 frontends.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::ports::reserve_port;
@@ -42,7 +44,7 @@ struct PermissiveCorsBackend {
 
 impl PermissiveCorsBackend {
     async fn spawn() -> std::io::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind_test("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let handle = tokio::spawn(async move {
             loop {
@@ -156,7 +158,8 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
     ] {
         assert_eq!(response.status, StatusCode::FORBIDDEN);
         assert!(
-            String::from_utf8_lossy(&response.body).contains("CORS method not allowed: DELETE"),
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+                == serde_json::json!({"error": "CORS method not allowed"}),
             "later CORS policy must reject the conflicting preflight method: {response:?}"
         );
     }
@@ -209,8 +212,8 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
     ] {
         assert_eq!(response.status, StatusCode::FORBIDDEN);
         assert!(
-            String::from_utf8_lossy(&response.body)
-                .contains("CORS header not allowed: Authorization"),
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+                == serde_json::json!({"error": "CORS header not allowed"}),
             "later CORS policy must reject the conflicting header: {response:?}"
         );
     }
@@ -266,7 +269,8 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
     ] {
         assert_eq!(response.status, StatusCode::FORBIDDEN);
         assert!(
-            String::from_utf8_lossy(&response.body).contains("CORS method not allowed: GET"),
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+                == serde_json::json!({"error": "CORS method not allowed"}),
             "the empty Istio preflight list must narrow the native approval: {response:?}"
         );
     }

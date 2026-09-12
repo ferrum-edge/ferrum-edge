@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::plugin_utils::{
     assert_continue, assert_reject, create_test_consumer, create_test_proxy,
+    read_http11_request_body,
 };
 
 const POLICY_PATH: &str = "ferrum/authz/allow";
@@ -1255,5 +1257,193 @@ fn reject_header_maps_refuse_protocol_managed_destinations() {
             .insert(field.to_string(), Value::Object(headers));
         Opa::new(&config, default_client())
             .unwrap_or_else(|error| panic!("ordinary {field} names must stay allowed: {error}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External-I/O accounting through the decision body — issue #5059
+// ---------------------------------------------------------------------------
+
+/// Serve one HTTP/1.1 decision whose HEADERS are written immediately and whose
+/// BODY is written `body_delay` later.
+///
+/// A policy service that behaves this way used to contribute almost nothing to
+/// `latency_plugin_external_io_ms` and never crossed the slow-call threshold,
+/// even though the authorization decision waits for the whole document.
+async fn spawn_delayed_body_opa(body_delay: Duration) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+
+        const BODY: &[u8] = br#"{"result":true}"#;
+
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        if read_http11_request_body(&mut socket).await.is_none() {
+            return;
+        }
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            BODY.len()
+        );
+        if socket.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+        let _ = socket.flush().await;
+        tokio::time::sleep(body_delay).await;
+        let _ = socket.write_all(BODY).await;
+        let _ = socket.flush().await;
+    });
+    addr
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn opa_external_io_and_slow_call_telemetry_cover_the_decision_body_wait() {
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let body_delay = Duration::from_millis(200);
+    let addr = spawn_delayed_body_opa(body_delay).await;
+    let config = json!({
+        "opa_host": format!("http://{addr}"),
+        "policy_path": POLICY_PATH,
+        "timeout_ms": 5000,
+    });
+    let client = PluginHttpClient::from_pool_config_with_threshold(&PoolConfig::default(), 50);
+    let plugin = Opa::new(&config, client).expect("valid opa config");
+
+    let mut ctx = make_ctx();
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let charged = Duration::from_nanos(ctx.plugin_http_call_ns.load(Ordering::Relaxed));
+    drop(guard);
+
+    // Headers arrive in well under a millisecond on loopback, so anything near
+    // the body delay can only have come from the decision-body wait.
+    assert!(
+        charged >= body_delay.mul_f64(0.75),
+        "the decision body wait must be charged to external I/O, got {charged:?}"
+    );
+    let logs = writer.contents();
+    assert!(
+        logs.contains("Slow plugin HTTP call"),
+        "a body-delayed decision must cross the slow-call threshold: {logs}"
+    );
+}
+
+/// Control for the case above: a header-delayed decision was always measured,
+/// and must still be charged exactly once now that the body read is inside the
+/// same span.
+#[tokio::test(flavor = "current_thread")]
+async fn opa_external_io_charges_a_header_delayed_decision_exactly_once() {
+    let header_delay = Duration::from_millis(200);
+    let server = MockServer::start().await;
+    mount_opa_with_delay(&server, header_delay).await;
+    let plugin = plugin(&server, json!({"timeout_ms": 5000}));
+
+    let mut ctx = make_ctx();
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let charged = Duration::from_nanos(ctx.plugin_http_call_ns.load(Ordering::Relaxed));
+    assert!(
+        charged >= header_delay.mul_f64(0.75),
+        "the header wait must be charged, got {charged:?}"
+    );
+    assert!(
+        charged < header_delay.mul_f64(1.8),
+        "the header wait must be charged exactly once, got {charged:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Decision-endpoint redaction — advisory GHSA-4ghp-v85j-5hvq
+// ---------------------------------------------------------------------------
+
+/// `opa_host` rejects userinfo, query, and fragment but accepts a base PATH,
+/// and a deployment may put a reusable credential there. The shared client's
+/// diagnostics must record the origin only.
+#[tokio::test(flavor = "current_thread")]
+async fn opa_slow_call_diagnostics_never_print_the_configured_base_path() {
+    const BASE_PATH_CANARY: &str = "opa-base-path-canary";
+
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let server = MockServer::start().await;
+    let decision_path = format!("/{BASE_PATH_CANARY}{DECISION_PATH}");
+    Mock::given(method("POST"))
+        .and(path(decision_path))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": true})))
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let config = json!({
+        "opa_host": format!("{base}/{BASE_PATH_CANARY}"),
+        "policy_path": POLICY_PATH,
+    });
+    // Threshold 0 makes every call "slow", so the diagnostic always fires.
+    let client = PluginHttpClient::from_pool_config_with_threshold(&PoolConfig::default(), 0);
+    let plugin = Opa::new(&config, client).expect("valid opa config");
+
+    let mut ctx = make_ctx();
+    assert_continue(plugin.authorize(&mut ctx).await);
+    drop(guard);
+
+    let logs = writer.contents();
+    assert!(
+        logs.contains("Slow plugin HTTP call"),
+        "the slow-call diagnostic must have been emitted: {logs}"
+    );
+    assert!(
+        !logs.contains(BASE_PATH_CANARY),
+        "OPA diagnostics leaked the configured base path: {logs}"
+    );
+}
+
+#[test]
+fn opa_rejects_a_fail_posture_configured_twice_even_when_the_values_agree() {
+    let config = json!({
+        "opa_host": "http://127.0.0.1:8181",
+        "policy_path": POLICY_PATH,
+        "fail_open": false,
+        "fail_closed": true,
+    });
+    let Err(error) = Opa::new(&config, default_client()) else {
+        panic!("configuring both fail-posture flags must be rejected");
+    };
+    assert!(
+        error.contains("configure only one of 'fail_open' or 'fail_closed'"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn opa_accepts_null_byte_limits_as_the_documented_defaults() {
+    for field in ["max_response_bytes", "max_body_bytes"] {
+        let mut config = json!({
+            "opa_host": "http://127.0.0.1:8181",
+            "policy_path": POLICY_PATH,
+        });
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert(field.to_string(), Value::Null);
+        Opa::new(&config, default_client())
+            .unwrap_or_else(|error| panic!("null {field} must select the default: {error}"));
     }
 }

@@ -140,3 +140,110 @@ fn dtls_demux_rejects_non_client_hello_handshake_records() {
         "ChangeCipherSpec must not open a session for an unknown peer"
     );
 }
+
+/// A ClientHello spray from ONE source must not be able to occupy the whole
+/// frontend DTLS pre-handshake demux table (GHSA-cc8p-2cqj-7fgg).
+///
+/// Demux entries are allocated on the first ClientHello — before
+/// authentication, and before the session-level per-source bound that already
+/// covers plain UDP — so the gateway-wide per-source-IP budget has to be taken
+/// on the ClientHello admission path as well. The listener-wide cap is set far
+/// above the spray here, so nothing but the per-source gate can bound it.
+#[tokio::test]
+async fn dtls_pre_handshake_demux_is_bounded_per_source_ip() {
+    let max_per_source = 4u64;
+    let attempts = 32u16;
+    let (sprayed, second_source, refusals) =
+        ferrum_edge::_test_support::dtls_pre_handshake_per_source_ip_admission_for_test(
+            max_per_source,
+            attempts,
+        )
+        .await
+        .expect("per-source pre-handshake admission harness");
+
+    let admitted = u64::try_from(sprayed).expect("demux entry count fits in u64");
+    assert_eq!(
+        admitted, max_per_source,
+        "one source must hold at most its per-source budget of pre-handshake demux entries"
+    );
+    assert_eq!(
+        second_source, 1,
+        "a saturated neighbour must not deny a second source its handshake"
+    );
+    assert_eq!(
+        refusals,
+        u64::from(attempts) - max_per_source,
+        "every refused ClientHello must be counted"
+    );
+}
+
+/// A disabled per-source dimension must stay byte-for-byte the old behavior:
+/// every ClientHello is admitted and nothing is counted.
+#[tokio::test]
+async fn dtls_pre_handshake_demux_is_unbounded_when_the_dimension_is_disabled() {
+    let max_per_source = 0u64;
+    let attempts = 16u16;
+    let (sprayed, second_source, refusals) =
+        ferrum_edge::_test_support::dtls_pre_handshake_per_source_ip_admission_for_test(
+            max_per_source,
+            attempts,
+        )
+        .await
+        .expect("per-source pre-handshake admission harness");
+
+    assert_eq!(
+        sprayed,
+        usize::from(attempts),
+        "max == 0 is the unlimited dimension and must refuse nothing"
+    );
+    assert_eq!(second_source, 1, "the second source is unaffected");
+    assert_eq!(refusals, 0, "an unlimited dimension records no refusal");
+}
+
+/// An abandoned DTLS handshake is an unauthenticated, attacker-reachable event,
+/// so one `warn!` per peer turns a ClientHello spray into a log flood with
+/// unbounded cardinality on the peer field (GHSA-6j9w-xjqj-85x8). Every timeout
+/// must still be counted, and the record that follows a closed window must
+/// report what was withheld.
+#[test]
+fn dtls_handshake_timeouts_are_counted_and_rate_limited() {
+    let timeouts_in_window = 64u64;
+    let (counted, records, suppressed) =
+        ferrum_edge::_test_support::dtls_handshake_timeout_warning_accounting_for_test(
+            timeouts_in_window,
+        )
+        .expect("handshake timeout accounting harness");
+
+    assert_eq!(
+        counted,
+        timeouts_in_window + 1,
+        "every abandoned handshake must be counted, emitted or not"
+    );
+    assert_eq!(
+        records, 2,
+        "one record for the first timeout, one after the window elapsed"
+    );
+    assert_eq!(
+        suppressed,
+        timeouts_in_window - 1,
+        "the second record must report the timeouts the limiter withheld"
+    );
+}
+
+/// Control for the bound above: an isolated handshake timeout must still
+/// produce its diagnostic rather than being swallowed by the limiter.
+#[test]
+fn an_isolated_dtls_handshake_timeout_still_logs() {
+    let timeouts_in_window = 1u64;
+    let (counted, records, _) =
+        ferrum_edge::_test_support::dtls_handshake_timeout_warning_accounting_for_test(
+            timeouts_in_window,
+        )
+        .expect("handshake timeout accounting harness");
+
+    assert_eq!(counted, 2, "both timeouts are counted");
+    assert_eq!(
+        records, 2,
+        "a single timeout in a window is emitted immediately, not suppressed"
+    );
+}

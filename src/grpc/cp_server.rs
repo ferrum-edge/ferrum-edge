@@ -38,6 +38,7 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::stream;
+use prost::Message;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
@@ -71,6 +72,7 @@ use crate::modes::mesh::config::{
     PolicyScope, SidecarHostPattern, Workload, WorkloadSelector,
     service_entry_exported_to_namespace,
 };
+use crate::modes::mesh::config_consumer::common::MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE;
 use crate::modes::mesh::slice::{
     MeshSliceRequest, node_waypoint_assertors_from_workloads,
     node_waypoint_capture_destinations_from_workloads,
@@ -763,6 +765,7 @@ impl CpGrpcServer {
 
     pub fn into_service(self) -> ConfigSyncServer<Self> {
         ConfigSyncServer::new(self)
+            .max_encoding_message_size(MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE)
     }
 
     /// Access the per-namespace broadcast map. Used by the CP polling loop
@@ -1680,8 +1683,9 @@ impl CpGrpcServer {
                 return;
             }
         };
-        Self::broadcast_update_with_trust_json(&tx, &filtered, trust_json);
-        registry.touch_namespace(namespace);
+        if Self::broadcast_update_with_trust_json(&tx, &filtered, trust_json, namespace) {
+            registry.touch_namespace(namespace);
+        }
     }
 
     /// Broadcast an incremental delta to all DPs in `namespace`. The caller
@@ -1723,8 +1727,9 @@ impl CpGrpcServer {
         } else {
             trust
         };
-        Self::broadcast_delta_with_trust_bundles(&tx, result, version, trust);
-        registry.touch_namespace(namespace);
+        if Self::broadcast_scoped_delta_with_trust_bundles(&tx, result, version, trust, namespace) {
+            registry.touch_namespace(namespace);
+        }
     }
 
     /// Broadcast a full config snapshot to all connected DPs.
@@ -1738,8 +1743,9 @@ impl CpGrpcServer {
         config: &GatewayConfig,
         registry: &DpNodeRegistry,
     ) {
-        Self::broadcast_update(tx, config);
-        registry.touch_all();
+        if Self::broadcast_update(tx, config) {
+            registry.touch_all();
+        }
     }
 
     /// Build a keepalive frame. Only ever emitted on a subscription whose DP
@@ -1759,7 +1765,8 @@ impl CpGrpcServer {
     }
 
     /// Broadcast a full config snapshot to all connected DPs.
-    pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) {
+    /// Returns whether a bounded message was sent to at least one subscriber.
+    pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) -> bool {
         let trust_bundles_json = match Self::trust_bundles_json(config.trust_bundles.as_deref()) {
             Ok(json) => json,
             Err(e) => {
@@ -1767,10 +1774,10 @@ impl CpGrpcServer {
                     "Failed to serialize gateway trust bundles for broadcast; skipping update: {}",
                     e
                 );
-                return;
+                return false;
             }
         };
-        Self::broadcast_update_with_trust_json(tx, config, trust_bundles_json);
+        Self::broadcast_update_with_trust_json(tx, config, trust_bundles_json, "unpartitioned")
     }
 
     /// Broadcast a full config snapshot with an already-resolved trust side
@@ -1781,16 +1788,17 @@ impl CpGrpcServer {
     /// the ambiguous-authority refusal: an empty string means "say nothing, keep
     /// the trust you already applied", which is distinct from the `"null"` an
     /// absent slot would otherwise produce (issue #3727).
-    pub(crate) fn broadcast_update_with_trust_json(
+    fn broadcast_update_with_trust_json(
         tx: &broadcast::Sender<ConfigUpdate>,
         config: &GatewayConfig,
         trust_bundles_json: String,
-    ) {
+        namespace: &str,
+    ) -> bool {
         let config_json = match Self::config_json_for_dp(config) {
             Ok(json) => json,
             Err(e) => {
                 error!("Refusing to publish configuration to data planes: {}", e);
-                return;
+                return false;
             }
         };
         let update = ConfigUpdate {
@@ -1803,7 +1811,7 @@ impl CpGrpcServer {
             heartbeat: false,
             heartbeat_negotiated: false,
         };
-        let _ = tx.send(update);
+        Self::send_bounded_update(tx, update, namespace)
     }
 
     /// Broadcast an incremental delta to all connected DPs (with registry update).
@@ -1815,8 +1823,9 @@ impl CpGrpcServer {
         registry: &DpNodeRegistry,
         trust: GatewayTrustPublication<'_>,
     ) {
-        Self::broadcast_delta_with_trust_bundles(tx, result, version, trust);
-        registry.touch_all();
+        if Self::broadcast_delta_with_trust_bundles(tx, result, version, trust) {
+            registry.touch_all();
+        }
     }
 
     /// Broadcast an incremental delta to all connected DPs.
@@ -1829,7 +1838,13 @@ impl CpGrpcServer {
         result: &crate::config::db_loader::IncrementalResult,
         version: &str,
     ) {
-        Self::broadcast_delta_with_trust_bundles_json(tx, result, version, String::new());
+        Self::broadcast_delta_with_trust_bundles_json(
+            tx,
+            result,
+            version,
+            String::new(),
+            "unpartitioned",
+        );
     }
 
     /// Broadcast an incremental delta with an explicit gateway trust
@@ -1846,7 +1861,17 @@ impl CpGrpcServer {
         result: &crate::config::db_loader::IncrementalResult,
         version: &str,
         trust: GatewayTrustPublication<'_>,
-    ) {
+    ) -> bool {
+        Self::broadcast_scoped_delta_with_trust_bundles(tx, result, version, trust, "unpartitioned")
+    }
+
+    fn broadcast_scoped_delta_with_trust_bundles(
+        tx: &broadcast::Sender<ConfigUpdate>,
+        result: &crate::config::db_loader::IncrementalResult,
+        version: &str,
+        trust: GatewayTrustPublication<'_>,
+        namespace: &str,
+    ) -> bool {
         let trust_bundles_json = match Self::trust_publication_json(&trust) {
             Ok(json) => json,
             Err(e) => {
@@ -1854,10 +1879,16 @@ impl CpGrpcServer {
                     "Failed to serialize gateway trust bundles for delta broadcast; skipping update: {}",
                     e
                 );
-                return;
+                return false;
             }
         };
-        Self::broadcast_delta_with_trust_bundles_json(tx, result, version, trust_bundles_json);
+        Self::broadcast_delta_with_trust_bundles_json(
+            tx,
+            result,
+            version,
+            trust_bundles_json,
+            namespace,
+        )
     }
 
     fn broadcast_delta_with_trust_bundles_json(
@@ -1865,12 +1896,13 @@ impl CpGrpcServer {
         result: &crate::config::db_loader::IncrementalResult,
         version: &str,
         trust_bundles_json: String,
-    ) {
+        namespace: &str,
+    ) -> bool {
         let config_json = match serde_json::to_string(result) {
             Ok(json) => json,
             Err(e) => {
                 error!("Failed to serialize delta for broadcast: {}", e);
-                return;
+                return false;
             }
         };
         let update = ConfigUpdate {
@@ -1883,7 +1915,41 @@ impl CpGrpcServer {
             heartbeat: false,
             heartbeat_negotiated: false,
         };
-        let _ = tx.send(update);
+        Self::send_bounded_update(tx, update, namespace)
+    }
+
+    /// Check the complete protobuf body, including trust and metadata. The
+    /// five-byte gRPC framing header is not part of tonic's message-size limit.
+    #[allow(clippy::result_large_err)]
+    fn check_message_size(message: &impl Message, namespace: &str) -> Result<(), Status> {
+        let encoded_bytes = message.encoded_len();
+        if encoded_bytes > MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE {
+            warn!(
+                namespace,
+                encoded_bytes,
+                max_bytes = MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE,
+                "Refusing oversized ConfigSync message"
+            );
+            return Err(Status::resource_exhausted(
+                "Configuration exceeds the ConfigSync message size limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn send_bounded_update(
+        tx: &broadcast::Sender<ConfigUpdate>,
+        update: ConfigUpdate,
+        namespace: &str,
+    ) -> bool {
+        let within_limit = Self::check_message_size(&update, namespace).is_ok();
+        // Existing subscribers must observe an oversized publication. Their
+        // outgoing stream guard converts it to RESOURCE_EXHAUSTED and closes
+        // the stream instead of letting heartbeats mask stale configuration.
+        // Still report the publication as rejected so registry freshness is
+        // not advanced.
+        let delivered = tx.send(update).is_ok();
+        within_limit && delivered
     }
 
     /// Encode a [`GatewayTrustPublication`] for the side channel.
@@ -2096,6 +2162,20 @@ impl ConfigSync for CpGrpcServer {
         let allowed = &identity.allowed_namespaces;
 
         let inner = request.into_inner();
+        // Match MeshSubscribe: only the authenticated subject may claim this
+        // registry key. Reject before allocating any subscription state.
+        if inner.node_id.trim() != identity.subject {
+            Self::audit_tenant_subscription(
+                "ConfigSync.Subscribe",
+                &identity.subject,
+                &inner.namespace,
+                "failure",
+                "node_id does not match authenticated subject",
+            );
+            return Err(Status::permission_denied(
+                "Subscribe node_id must match the authenticated JWT subject",
+            ));
+        }
         let node_id = inner.node_id;
         let dp_version = inner.ferrum_version;
         let dp_namespace = inner.namespace;
@@ -2194,6 +2274,8 @@ impl ConfigSync for CpGrpcServer {
             // field leaves it false and the DP never arms the watchdog.
             heartbeat_negotiated: heartbeats_negotiated,
         };
+
+        Self::check_message_size(&initial, &dp_namespace)?;
 
         // Only a subscriber for which the complete initial config+trust
         // generation was prepared is registered or audited as successful.
@@ -2299,7 +2381,18 @@ impl ConfigSync for CpGrpcServer {
                 current.loaded_at.to_rfc3339(),
             )))
         });
-        let combined = initial_stream.chain(stream::select(stream, heartbeat_stream));
+        // Guard every outgoing frame, including lag recovery and callers that
+        // hold a raw broadcast sender. Initial admission was checked above so
+        // an oversized snapshot never becomes a successful registry entry.
+        #[allow(clippy::result_large_err)]
+        let combined = initial_stream
+            .chain(stream::select(stream, heartbeat_stream))
+            .map(move |result| {
+                result.and_then(|update| {
+                    Self::check_message_size(&update, &dp_namespace)?;
+                    Ok(update)
+                })
+            });
         let tracked = TrackedStream {
             inner: Box::pin(combined),
             _admission_permit: admission_permit,
@@ -2383,6 +2476,13 @@ impl ConfigSync for CpGrpcServer {
             );
             Status::internal("Failed to serialize configuration")
         })?;
+        let response = FullConfigResponse {
+            config_json,
+            version: config.loaded_at.to_rfc3339(),
+            ferrum_version: FERRUM_VERSION.to_string(),
+            trust_bundles_json,
+        };
+        Self::check_message_size(&response, &req.namespace)?;
         Self::audit_tenant_subscription(
             "ConfigSync.GetFullConfig",
             &req.node_id,
@@ -2395,12 +2495,7 @@ impl ConfigSync for CpGrpcServer {
             req.node_id, dp_version, req.namespace
         );
 
-        Ok(Response::new(FullConfigResponse {
-            config_json,
-            version: config.loaded_at.to_rfc3339(),
-            ferrum_version: FERRUM_VERSION.to_string(),
-            trust_bundles_json,
-        }))
+        Ok(Response::new(response))
     }
 }
 

@@ -1,5 +1,7 @@
 //! Issue #2445: response_mock HEAD / no-body status wire parity across H1/H2/H3.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 
@@ -79,7 +81,7 @@ async fn spawn_mock_gateway(backend_port: u16) -> (TestGateway, u16) {
     let mut last_error = String::new();
 
     for _ in 0..MAX_ATTEMPTS {
-        let reservation = match TcpListener::bind("127.0.0.1:0").await {
+        let reservation = match TcpListener::bind_test("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) => {
                 last_error = error.to_string();
@@ -173,7 +175,7 @@ async fn assert_h1_h2_no_body_path(
 #[ignore]
 #[tokio::test]
 async fn functional_response_mock_head_and_no_body_statuses_across_h1_h2_h3() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind idle backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();

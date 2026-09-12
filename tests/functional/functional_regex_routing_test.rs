@@ -15,6 +15,8 @@
 //!   cargo build --bin ferrum-edge
 //!   cargo test --test functional_tests -- --ignored functional_regex_routing --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -51,7 +53,7 @@ async fn start_identified_echo_server(listener: TcpListener, identifier: String)
 /// Bind an ephemeral-port listener and spawn an identified echo server on it.
 /// Returns the bound port and the server task handle.
 async fn spawn_backend(identifier: &str) -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let id = identifier.to_string();
     let handle = tokio::spawn(async move {
@@ -83,6 +85,7 @@ fn start_gateway_in_file_mode(
     let binary_path = gateway_binary_path();
 
     let mut cmd = std::process::Command::new(binary_path);
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
@@ -138,10 +141,9 @@ async fn wait_for_gateway(
 }
 
 async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Start the gateway with retry to handle ephemeral port races.

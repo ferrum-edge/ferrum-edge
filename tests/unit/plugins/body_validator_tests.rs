@@ -5926,3 +5926,522 @@ async fn test_xml_depth_screen_does_not_end_a_tag_at_a_quoted_angle_bracket() {
         reject_body_of(&result)
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Issue #5124 — impossible required XML element names
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Required names are matched against `roxmltree`'s parsed LOCAL name, so a
+// spelling outside the XML `NCName` grammar can never match. Such an entry used
+// to pass admission and then reject every governed request (400) and every
+// governed response (502) forever.
+
+#[test]
+fn impossible_required_xml_local_names_are_rejected_at_construction() {
+    for entry in [
+        "two words",
+        "2item",
+        "-item",
+        ".item",
+        "ns:item",
+        "<item>",
+        "it&m",
+        "item\ttab",
+        "{urn:x}two words",
+        "{urn:x}ns:item",
+        "{}2item",
+    ] {
+        for config in [
+            json!({"required_xml_elements": [entry]}),
+            json!({"response_required_xml_elements": [entry]}),
+        ] {
+            let error = BodyValidator::new(&config)
+                .err()
+                .expect("an impossible local element name must be rejected");
+            assert!(
+                error.contains("has an invalid local element name"),
+                "entry {entry:?} must be refused: {error}"
+            );
+            assert!(
+                !error.contains(entry),
+                "the rejection must never echo the configured name: {error}"
+            );
+            BodyValidator::validate_config(&config)
+                .expect_err("shape-only admission must refuse the same entry too");
+        }
+    }
+}
+
+#[test]
+fn valid_required_xml_local_names_are_still_accepted() {
+    for entry in [
+        "item",
+        "_item",
+        "item-2",
+        "item.name",
+        "süd",
+        "名前",
+        "{http://example.com/ns}item",
+        "{}item",
+        "{urn:x}süd",
+    ] {
+        for config in [
+            json!({"required_xml_elements": [entry]}),
+            json!({"response_required_xml_elements": [entry]}),
+        ] {
+            BodyValidator::new(&config)
+                .unwrap_or_else(|error| panic!("{entry:?} must be accepted: {error}"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_unicode_required_xml_element_still_matches_a_parsed_name() {
+    let plugin = xml_plugin_with_required(vec!["süd"]);
+
+    let mut ctx = make_xml_ctx("<root><süd/></root>");
+    let mut headers = make_xml_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mut ctx = make_xml_ctx("<root><nord/></root>");
+    let mut headers = make_xml_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Issue #5139 — `protobuf_method_messages` selectors must be method paths
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Selection is an exact map lookup against the gRPC method path, so a key
+// spelled any other way satisfies the rule-presence test while never being
+// selectable — an enabled policy whose intended rule is silently inert.
+
+fn method_selector_config(selector: &str) -> serde_json::Value {
+    let entry = json!({"request": "test.HelloRequest"});
+    let mut methods = serde_json::Map::new();
+    methods.insert(selector.to_string(), entry);
+    json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_method_messages": methods
+    })
+}
+
+#[test]
+fn non_path_protobuf_method_selectors_are_rejected_at_construction() {
+    for selector in [
+        "",
+        "test.Greeter/SayHello",
+        "/SayHello",
+        "/test.Greeter/",
+        "//SayHello",
+        "/test.Greeter/Say/Hello",
+        "/test.Greeter/Say Hello",
+        "/test.Greeter/SayHello?x=1",
+        "/test.Greeter/SayHello#frag",
+        "SayHello",
+    ] {
+        let config = method_selector_config(selector);
+        let error = BodyValidator::new(&config)
+            .err()
+            .expect("a non-path method selector must be rejected at admission");
+        assert!(
+            error.contains("must be gRPC method paths"),
+            "selector {selector:?} must be refused: {error}"
+        );
+        assert!(
+            !error.contains("Greeter"),
+            "the rejection must never echo the configured selector: {error}"
+        );
+        BodyValidator::validate_config(&config)
+            .expect_err("shape-only admission must refuse the same selector");
+    }
+}
+
+#[test]
+fn conventional_protobuf_method_selectors_are_still_accepted() {
+    for selector in ["/test.Greeter/SayHello", "/Greeter/SayHello"] {
+        let config = method_selector_config(selector);
+        BodyValidator::new(&config)
+            .unwrap_or_else(|error| panic!("{selector:?} must be accepted: {error}"));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Issue #5123 — a declared Content-Encoding defers to the final hook
+// ═══════════════════════════════════════════════════════════════════════
+//
+// `before_proxy` has no decoder. Judging the compressed octets there turned
+// every legitimate gzip JSON/XML upload into a fixed 400 while the
+// authoritative, decoding check (`GHSA-3973-47g5-4mcx`) was still ahead of it.
+
+fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).expect("gzip write");
+    encoder.finish().expect("gzip finish")
+}
+
+/// Stage the plaintext exactly as the shared representation gate stages it.
+fn stage_plaintext(ctx: &mut RequestContext, plaintext: &[u8]) {
+    ferrum_edge::_test_support::stage_final_request_body_plaintext(ctx, plaintext.to_vec());
+}
+
+fn encoded_ctx(content_type: &str, encoding: &str, wire: &[u8]) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), content_type.to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), encoding.to_string());
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(wire));
+    ctx
+}
+
+fn encoded_headers(content_type: &str, encoding: &str) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), content_type.to_string());
+    headers.insert("content-encoding".to_string(), encoding.to_string());
+    headers
+}
+
+#[tokio::test]
+async fn a_gzip_json_request_is_deferred_by_the_early_hook_not_rejected() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let document = br#"{"name":"Ada"}"#;
+    let wire = gzip_bytes(document);
+    let mut ctx = encoded_ctx("application/json", "gzip", &wire);
+    let mut headers = encoded_headers("application/json", "gzip");
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // Deferral is sound only because the shared gate claims exactly this
+    // request, decodes it, and the final hook then validates the plaintext.
+    assert!(
+        plugin.enforces_final_request_body_policy(&ctx, &headers, &wire),
+        "an encoded governed request must be claimed by the representation gate"
+    );
+    stage_plaintext(&mut ctx, document);
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &wire)
+        .await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn a_gzip_xml_request_is_deferred_by_the_early_hook_not_rejected() {
+    let plugin = xml_plugin_with_required(vec!["item"]);
+    let document = b"<root><item/></root>";
+    let wire = gzip_bytes(document);
+    let mut ctx = encoded_ctx("application/xml", "gzip", &wire);
+    let mut headers = encoded_headers("application/xml", "gzip");
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    stage_plaintext(&mut ctx, document);
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &wire)
+        .await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn a_decoded_gzip_request_that_violates_the_rule_is_still_rejected() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let document = br#"{"nome":"Ada"}"#;
+    let wire = gzip_bytes(document);
+    let mut ctx = encoded_ctx("application/json", "gzip", &wire);
+    let mut headers = encoded_headers("application/json", "gzip");
+
+    // Deferred early…
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // …and rejected on the decoded document, before backend egress.
+    stage_plaintext(&mut ctx, document);
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &wire)
+        .await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn an_unsupported_or_malformed_coding_is_deferred_to_the_gate() {
+    // Anything not provably `identity` — an unsupported coding, a stacked
+    // list, an empty token — must reach the gate's fail-closed rejection
+    // rather than be scanned as though it were plaintext.
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let wire = gzip_bytes(br#"{"name":"Ada"}"#);
+    for encoding in ["gzip, br", "identity, ", "GZIP", "deflate"] {
+        let mut ctx = encoded_ctx("application/json", encoding, &wire);
+        let mut headers = encoded_headers("application/json", encoding);
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            plugin.enforces_final_request_body_policy(&ctx, &headers, &wire),
+            "coding {encoding:?} must still be claimed so the gate can refuse it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_identity_coding_is_still_validated_by_the_early_hook() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let body = br#"{"nome":"Ada"}"#;
+    for encoding in ["identity", "identity, identity"] {
+        let mut ctx = encoded_ctx("application/json", encoding, body);
+        let mut headers = encoded_headers("application/json", encoding);
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn an_unencoded_non_utf8_request_is_still_rejected_early() {
+    // The deferral must not become a general escape hatch: with no declared
+    // coding an uninspectable body is still a fail-closed 400
+    // (`GHSA-2vmr-ww8r-mww3`).
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(&[0xff, 0xfe, 0xfd]));
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GHSA-cqmm-vj3c-g8w8 — strict unknown fields at every nesting level
+// ═══════════════════════════════════════════════════════════════════════
+//
+// `DynamicMessage::unknown_fields()` is message-LOCAL, so checking only the
+// decoded outer message left unknown fields inside nested, repeated, map-value,
+// and oneof message values unexamined while `protobuf_reject_unknown_fields`
+// was documented as a strict-schema policy.
+
+/// A `t2.Command` carrying its required field plus unknown field number 99.
+fn command_with_unknown_field() -> Vec<u8> {
+    let mut payload = pb_str_field(1, "go");
+    // tag = (99 << 3) | 0 = 792, varint 0x98 0x06; value 42.
+    payload.extend_from_slice(&[0x98, 0x06, 42]);
+    payload
+}
+
+fn proto2_strict_plugin(dir: &tempfile::TempDir, message: &str) -> BodyValidator {
+    let config = json!({
+        "protobuf_descriptor_path": proto2_path(dir),
+        "protobuf_request_type": message,
+        "protobuf_response_type": message,
+        "protobuf_reject_unknown_fields": true
+    });
+    BodyValidator::new(&config).expect("strict proto2 plugin config")
+}
+
+fn proto2_permissive_plugin(dir: &tempfile::TempDir, message: &str) -> BodyValidator {
+    let config = json!({
+        "protobuf_descriptor_path": proto2_path(dir),
+        "protobuf_request_type": message,
+        "protobuf_response_type": message
+    });
+    BodyValidator::new(&config).expect("permissive proto2 plugin config")
+}
+
+/// Every present message-valued container the walk must descend into, each
+/// carrying an unknown field only in its NESTED `t2.Command`.
+fn nested_unknown_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let command = command_with_unknown_field();
+    let mut entry = pb_str_field(1, "k");
+    entry.extend(pb_len_field(2, &command));
+    let mut batch = pb_len_field(1, &command);
+    batch.extend(pb_len_field(1, &command));
+    vec![
+        // Wrapper { optional Command inner = 1; }
+        ("t2.Wrapper", pb_len_field(1, &command)),
+        // Batch { repeated Command items = 1; }
+        ("t2.Batch", batch),
+        // MapHolder { map<string, Command> entries = 1; }
+        ("t2.MapHolder", pb_len_field(1, &entry)),
+        // Choice { oneof pick { Command cmd = 1; ... } }
+        ("t2.Choice", pb_len_field(1, &command)),
+    ]
+}
+
+/// The same containers with a fully known nested `t2.Command`.
+fn known_nested_cases() -> Vec<(&'static str, Vec<u8>)> {
+    let command = pb_str_field(1, "go");
+    let mut entry = pb_str_field(1, "k");
+    entry.extend(pb_len_field(2, &command));
+    vec![
+        ("t2.Wrapper", pb_len_field(1, &command)),
+        ("t2.Batch", pb_len_field(1, &command)),
+        ("t2.MapHolder", pb_len_field(1, &entry)),
+        ("t2.Choice", pb_len_field(1, &command)),
+    ]
+}
+
+#[tokio::test]
+async fn nested_unknown_protobuf_fields_are_rejected_when_configured() {
+    let dir = proto2_descriptor_dir();
+    for (message, payload) in nested_unknown_cases() {
+        let plugin = proto2_strict_plugin(&dir, message);
+        let frame = grpc_frame(&payload);
+        let headers = grpc_request_headers();
+        let result = plugin.on_final_request_body(&headers, &frame).await;
+        assert_reject(result, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn nested_unknown_protobuf_fields_are_rejected_on_the_response_side() {
+    let dir = proto2_descriptor_dir();
+    for (message, payload) in nested_unknown_cases() {
+        let plugin = proto2_strict_plugin(&dir, message);
+        let frame = grpc_frame(&payload);
+        let mut ctx = grpc_ctx();
+        let headers = grpc_response_headers();
+        let result = plugin
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, &frame)
+            .await;
+        assert_reject(result, Some(502));
+    }
+}
+
+#[tokio::test]
+async fn nested_unknown_protobuf_fields_remain_permitted_by_default() {
+    let dir = proto2_descriptor_dir();
+    for (message, payload) in nested_unknown_cases() {
+        let plugin = proto2_permissive_plugin(&dir, message);
+        let frame = grpc_frame(&payload);
+        let headers = grpc_request_headers();
+        let result = plugin.on_final_request_body(&headers, &frame).await;
+        assert_continue(result);
+    }
+}
+
+#[tokio::test]
+async fn strict_protobuf_mode_still_accepts_known_nested_messages() {
+    let dir = proto2_descriptor_dir();
+    for (message, payload) in known_nested_cases() {
+        let plugin = proto2_strict_plugin(&dir, message);
+        let frame = grpc_frame(&payload);
+        let headers = grpc_request_headers();
+        let result = plugin.on_final_request_body(&headers, &frame).await;
+        assert_continue(result);
+    }
+}
+
+#[tokio::test]
+async fn a_top_level_unknown_protobuf_field_is_still_rejected() {
+    let dir = proto2_descriptor_dir();
+    let plugin = proto2_strict_plugin(&dir, "t2.Command");
+    let frame = grpc_frame(&command_with_unknown_field());
+    let headers = grpc_request_headers();
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn a_nested_unknown_protobuf_rejection_describes_no_payload() {
+    let dir = proto2_descriptor_dir();
+    let plugin = proto2_strict_plugin(&dir, "t2.Wrapper");
+    let payload = pb_len_field(1, &command_with_unknown_field());
+    let frame = grpc_frame(&payload);
+    let headers = grpc_request_headers();
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    let body = reject_body_of(&result);
+    assert!(body.contains("unknown field"), "{body}");
+    for forbidden in ["99", "792", "inner", "action", "go"] {
+        assert!(
+            !body.contains(forbidden),
+            "the diagnostic must not describe the payload: {body}"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GHSA-j965-6vq5-v44f — the entity policy uses the parser's name grammar
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn non_ascii_named_entity_chains_are_rejected() {
+    let plugin = xml_plugin();
+    for body in [
+        // Declared and referenced under a non-ASCII name.
+        r#"<!DOCTYPE r [<!ENTITY é "lol"><!ENTITY b "&é;&é;">]><r>&b;</r>"#,
+        // The DECLARATION name is non-ASCII; its value chains to another.
+        r#"<!DOCTYPE r [<!ENTITY a "lol"><!ENTITY 名前 "&a;&a;">]><r>ok</r>"#,
+        // Numeric character references still normalize before the scan.
+        r#"<!DOCTYPE r [<!ENTITY é "lol"><!ENTITY b "&#38;é;">]><r>&b;</r>"#,
+        // A parameter entity under a non-ASCII name generating declarations.
+        r#"<!DOCTYPE r [<!ENTITY % é "<!ENTITY a 'x'><!ENTITY b 'y'>">%é;]><r/>"#,
+    ] {
+        let mut ctx = make_xml_ctx(body);
+        let mut headers = make_xml_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn non_ascii_parameter_entities_are_charged_when_nesting_is_allowed() {
+    // With the nested-entity rejection off, the reference scanner must still
+    // recognize the non-ASCII name so its generated declarations are charged
+    // against `xml_max_entities`.
+    let plugin = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "xml_reject_nested_entities": false,
+        "xml_max_entities": 1
+    }))
+    .unwrap();
+    let body = r#"<!DOCTYPE r [<!ENTITY % é "<!ENTITY a 'x'><!ENTITY b 'y'">%é;]><r/>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn an_unevaluable_entity_declaration_fails_closed() {
+    let plugin = xml_plugin();
+    for body in [
+        // No replacement text at all.
+        "<!DOCTYPE r [<!ENTITY a>]><r/>",
+        // Unterminated replacement text.
+        r#"<!DOCTYPE r [<!ENTITY a "unterminated]><r/>"#,
+        // A name outside the XML `Name` grammar.
+        r#"<!DOCTYPE r [<!ENTITY 1bad "x">]><r/>"#,
+    ] {
+        let mut ctx = make_xml_ctx(body);
+        let mut headers = make_xml_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn an_unevaluable_entity_declaration_reports_the_policy_diagnostic() {
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx("<!DOCTYPE r [<!ENTITY a>]><r/>");
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let body = reject_body_of(&result);
+    assert!(
+        body.contains("could not be evaluated against the nested-entity policy"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_entity_declarations_still_pass_under_the_new_grammar() {
+    let plugin = xml_plugin();
+    for body in [
+        r#"<!DOCTYPE r [<!ENTITY safe "hello">]><r>&safe;</r>"#,
+        r#"<!DOCTYPE r [<!ENTITY é "hello">]><r>ok</r>"#,
+        r#"<!DOCTYPE r [<!ENTITY % ünüsed "plain text">]><r>ok</r>"#,
+        r#"<!DOCTYPE r [<!ENTITY a "x"><!ENTITY b "y">]><r>ok</r>"#,
+    ] {
+        let mut ctx = make_xml_ctx(body);
+        let mut headers = make_xml_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}

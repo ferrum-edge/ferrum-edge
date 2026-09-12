@@ -8,10 +8,10 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::cp_server::CpScope;
 use ferrum_edge::grpc::mesh_slice_drift::{
     MESH_SLICE_DRIFT_MAX_ENTRIES, MESH_SLICE_DRIFT_MAX_NODE_ID_BYTES,
-    MESH_SLICE_DRIFT_MAX_REASON_BYTES, MESH_SLICE_DRIFT_REJECTION_REASON,
-    MeshSliceConvergenceState, MeshSliceDriftAdmitError, MeshSliceDriftRegistry,
-    MeshSliceDriftSummary, render_mesh_slice_drift_summary_metrics, sanitize_reason,
-    slice_content_digest, validate_version,
+    MESH_SLICE_DRIFT_MAX_REASON_BYTES, MESH_SLICE_DRIFT_STAGE_INSTALL,
+    MESH_SLICE_DRIFT_STAGE_RUNTIME, MeshSliceConvergenceState, MeshSliceDriftAdmitError,
+    MeshSliceDriftRegistry, MeshSliceDriftSummary, MeshSliceReportRejection, MeshSliceReportStatus,
+    render_mesh_slice_drift_summary_metrics, slice_content_digest, validate_version,
 };
 use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
@@ -39,10 +39,29 @@ fn desired_sent_ack_converges_and_drift_flags_clear() {
             "dp-a",
             &token,
             "v1",
-            None,
+            MeshSliceReportStatus::Accepted,
             connected_at + Duration::seconds(1),
         )
-        .expect("ack");
+        .expect("install-time accept");
+    // Issue #4812: the install ACK alone must NOT converge the row.
+    let accepted_only = registry.snapshot();
+    assert_eq!(accepted_only.summary.accepted, 1);
+    assert_eq!(accepted_only.summary.converged, 0);
+    assert_eq!(
+        accepted_only.data_planes[0].convergence,
+        MeshSliceConvergenceState::Accepted
+    );
+    assert!(accepted_only.data_planes[0].applied.is_none());
+    assert!(accepted_only.data_planes[0].drift.desired_vs_applied);
+    registry
+        .record_status(
+            "dp-a",
+            &token,
+            "v1",
+            MeshSliceReportStatus::Applied,
+            connected_at + Duration::seconds(2),
+        )
+        .expect("runtime applied");
 
     let snap = registry.snapshot();
     assert_eq!(snap.summary.tracked, 1);
@@ -52,6 +71,8 @@ fn desired_sent_ack_converges_and_drift_flags_clear() {
     assert!(!entry.drift.desired_vs_sent);
     assert!(!entry.drift.desired_vs_acknowledged);
     assert!(!entry.drift.sent_vs_acknowledged);
+    assert!(!entry.drift.desired_vs_applied);
+    assert_eq!(entry.applied.as_ref().expect("applied").version, "v1");
 }
 
 #[test]
@@ -73,13 +94,25 @@ fn reports_require_connected_current_session_and_current_sent_version() {
     assert_ne!(first_token, second_token);
     assert_eq!(
         registry
-            .record_status("dp-a", &first_token, "v1", None, second)
+            .record_status(
+                "dp-a",
+                &first_token,
+                "v1",
+                MeshSliceReportStatus::Applied,
+                second,
+            )
             .expect_err("stale replacement report"),
         MeshSliceDriftAdmitError::SessionMismatch
     );
     assert_eq!(
         registry
-            .record_status("dp-a", &second_token, "v0", None, second)
+            .record_status(
+                "dp-a",
+                &second_token,
+                "v0",
+                MeshSliceReportStatus::Applied,
+                second,
+            )
             .expect_err("not current sent version"),
         MeshSliceDriftAdmitError::VersionMismatch
     );
@@ -88,38 +121,156 @@ fn reports_require_connected_current_session_and_current_sent_version() {
     registry.mark_disconnected("dp-a", &second_token, second);
     assert_eq!(
         registry
-            .record_status("dp-a", &second_token, "v1", None, second)
+            .record_status(
+                "dp-a",
+                &second_token,
+                "v1",
+                MeshSliceReportStatus::Applied,
+                second,
+            )
             .expect_err("disconnected report"),
         MeshSliceDriftAdmitError::DisconnectedNode
     );
 }
 
 #[test]
-fn nack_reason_discards_caller_text_and_is_strictly_bounded() {
+fn rejection_reason_is_a_closed_bounded_label_with_its_refusing_stage() {
     let registry = MeshSliceDriftRegistry::new();
     let connected_at = at(0);
     let token = open(&registry, "dp-a", connected_at);
     registry
         .record_sent("dp-a", &token, "v1", connected_at)
         .unwrap();
-    let secret_bearing = "Bearer secret-token\npassword=hunter2\u{0000}";
     registry
-        .record_status("dp-a", &token, "v1", Some(secret_bearing), connected_at)
+        .record_status(
+            "dp-a",
+            &token,
+            "v1",
+            MeshSliceReportStatus::Rejected(MeshSliceReportRejection::RuntimeProxyRefused),
+            connected_at,
+        )
         .unwrap();
 
     let rejected = registry.snapshot().data_planes[0]
         .rejected
         .clone()
         .expect("rejected");
-    assert_eq!(rejected.reason, MESH_SLICE_DRIFT_REJECTION_REASON);
-    assert!(rejected.reason.len() <= MESH_SLICE_DRIFT_MAX_REASON_BYTES);
-    assert!(!rejected.reason.contains("secret"));
-    assert_eq!(
-        sanitize_reason("\u{0000}"),
-        MESH_SLICE_DRIFT_REJECTION_REASON
-    );
-    assert_eq!(sanitize_reason("   "), MESH_SLICE_DRIFT_REJECTION_REASON);
-    assert_eq!(sanitize_reason(""), "unspecified");
+    assert_eq!(rejected.reason, "runtime_proxy_refused");
+    assert_eq!(rejected.stage, MESH_SLICE_DRIFT_STAGE_RUNTIME);
+
+    // Every retained label is closed and strictly bounded, and the stage is
+    // derived from the category rather than supplied alongside it.
+    for rejection in MeshSliceReportRejection::ALL {
+        assert!(rejection.as_label().len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+        assert!(rejection.as_label().is_ascii());
+        let expected_stage = if rejection == MeshSliceReportRejection::InstallRefused {
+            MESH_SLICE_DRIFT_STAGE_INSTALL
+        } else {
+            MESH_SLICE_DRIFT_STAGE_RUNTIME
+        };
+        assert_eq!(rejection.stage(), expected_stage);
+    }
+}
+
+/// Issue #4812: the false-negative case the slice-drift surface could not see.
+/// The data plane installs the slice (install-time ACK) and its proxy runtime
+/// then refuses it. The row must report drift with the DP identity and the
+/// refusal reason, never `converged`.
+#[test]
+fn a_runtime_refusal_after_an_install_accept_is_drift_not_convergence() {
+    let registry = MeshSliceDriftRegistry::new();
+    let token = open(&registry, "dp-a", at(0));
+    registry.record_sent("dp-a", &token, "v1", at(0)).unwrap();
+    registry
+        .record_status("dp-a", &token, "v1", MeshSliceReportStatus::Accepted, at(1))
+        .expect("install accept");
+    registry
+        .record_status(
+            "dp-a",
+            &token,
+            "v1",
+            MeshSliceReportStatus::Rejected(MeshSliceReportRejection::RuntimeConfigBuild),
+            at(2),
+        )
+        .expect("runtime refusal");
+
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot.summary.converged, 0);
+    assert_eq!(snapshot.summary.rejecting, 1);
+    let entry = &snapshot.data_planes[0];
+    assert_eq!(entry.node_id, "dp-a");
+    assert_eq!(entry.convergence, MeshSliceConvergenceState::Rejecting);
+    // The install-time acceptance stands: the slice WAS accepted, it simply
+    // never started serving.
+    assert_eq!(entry.acknowledged.as_ref().expect("accepted").version, "v1");
+    assert!(entry.applied.is_none());
+    assert!(entry.drift.desired_vs_applied);
+    let rejected = entry.rejected.as_ref().expect("rejected");
+    assert_eq!(rejected.version, "v1");
+    assert_eq!(rejected.stage, MESH_SLICE_DRIFT_STAGE_RUNTIME);
+    assert_eq!(rejected.reason, "runtime_config_build");
+}
+
+/// Control: an applied report converges the row and clears a prior refusal.
+#[test]
+fn an_applied_report_converges_and_stamps_the_acceptance_watermark() {
+    let registry = MeshSliceDriftRegistry::new();
+    let token = open(&registry, "dp-a", at(0));
+    registry.record_sent("dp-a", &token, "v1", at(0)).unwrap();
+    registry
+        .record_status(
+            "dp-a",
+            &token,
+            "v1",
+            MeshSliceReportStatus::Rejected(MeshSliceReportRejection::RuntimeTlsReload),
+            at(1),
+        )
+        .unwrap();
+    // A serving report with no preceding install ACK must still converge:
+    // a slice cannot serve without having been installed.
+    registry
+        .record_status("dp-a", &token, "v1", MeshSliceReportStatus::Applied, at(2))
+        .unwrap();
+
+    let entry = &registry.snapshot().data_planes[0];
+    assert_eq!(entry.convergence, MeshSliceConvergenceState::Converged);
+    assert!(entry.rejected.is_none());
+    assert_eq!(entry.acknowledged.as_ref().expect("accepted").version, "v1");
+    assert_eq!(entry.applied.as_ref().expect("applied").version, "v1");
+    assert!(!entry.drift.desired_vs_applied);
+}
+
+/// Control: a slice the data plane never received is still `drifted`, not
+/// silently promoted by the new applied watermark.
+#[test]
+fn a_never_received_slice_stays_drifted() {
+    let registry = MeshSliceDriftRegistry::new();
+    let token = open(&registry, "dp-a", at(0));
+    registry.record_sent("dp-a", &token, "v1", at(0)).unwrap();
+
+    let entry = &registry.snapshot().data_planes[0];
+    assert_eq!(entry.convergence, MeshSliceConvergenceState::Drifted);
+    assert!(entry.acknowledged.is_none());
+    assert!(entry.applied.is_none());
+}
+
+/// An applied watermark left on an older generation is drift, not convergence:
+/// a data plane serving a stale slice is exactly what this surface must show.
+#[test]
+fn a_stale_applied_generation_reports_accepted_not_converged() {
+    let registry = MeshSliceDriftRegistry::new();
+    let token = registry
+        .open_session("dp-a", "ferrum", at(0), Some("v2"))
+        .expect("open");
+    registry.record_sent("dp-a", &token, "v2", at(0)).unwrap();
+    registry
+        .record_status("dp-a", &token, "v2", MeshSliceReportStatus::Accepted, at(1))
+        .unwrap();
+
+    let entry = &registry.snapshot().data_planes[0];
+    assert_eq!(entry.convergence, MeshSliceConvergenceState::Accepted);
+    assert!(entry.drift.desired_vs_applied);
+    assert!(!entry.drift.desired_vs_acknowledged);
 }
 
 #[test]
@@ -158,7 +309,13 @@ fn maintenance_republishes_advancing_ages_without_removal() {
         .record_sent("dp-a", &token, "v1", connected_at)
         .unwrap();
     registry
-        .record_status("dp-a", &token, "v1", None, connected_at)
+        .record_status(
+            "dp-a",
+            &token,
+            "v1",
+            MeshSliceReportStatus::Applied,
+            connected_at,
+        )
         .unwrap();
 
     let maintenance_at = connected_at + Duration::seconds(42);
@@ -219,7 +376,7 @@ fn hard_cardinality_cap_is_serialized_under_concurrent_admission() {
                     .record_sent(&node_id, token, "v1", at(0))
                     .expect("admitted send");
                 registry
-                    .record_status(&node_id, token, "v1", None, at(0))
+                    .record_status(&node_id, token, "v1", MeshSliceReportStatus::Applied, at(0))
                     .expect("admitted ack");
             }
             admitted
@@ -462,7 +619,13 @@ fn subscribe_publication_race_repairs_desired_from_the_published_config() {
         .record_projected_sent("dp-a", &token, &published_slice, at(2))
         .unwrap();
     registry
-        .record_status("dp-a", &token, &published_slice.version, None, at(2))
+        .record_status(
+            "dp-a",
+            &token,
+            &published_slice.version,
+            MeshSliceReportStatus::Applied,
+            at(2),
+        )
         .unwrap();
     let entry = &registry.snapshot().data_planes[0];
     assert_eq!(entry.convergence, MeshSliceConvergenceState::Converged);
@@ -493,7 +656,13 @@ fn identity_length_is_bounded_independently_of_the_transport() {
     );
     assert_eq!(
         registry
-            .record_status(&oversized, &token, "v1", None, at(0))
+            .record_status(
+                &oversized,
+                &token,
+                "v1",
+                MeshSliceReportStatus::Applied,
+                at(0),
+            )
             .unwrap_err(),
         MeshSliceDriftAdmitError::NodeIdTooLong
     );
@@ -528,7 +697,7 @@ fn assert_rendered_summary_is_coherent(output: &str, summary: &MeshSliceDriftSum
         }
     }
     let tracked = tracked.expect("tracked summary metric");
-    assert_eq!(states.len(), 5);
+    assert_eq!(states.len(), 6);
     assert_eq!(tracked, states.into_iter().sum::<usize>());
 }
 
@@ -537,6 +706,7 @@ fn assert_published_summary_is_coherent(registry: &MeshSliceDriftRegistry) {
     assert_eq!(
         summary.tracked,
         summary.converged
+            + summary.accepted
             + summary.drifted
             + summary.rejecting
             + summary.pending
@@ -559,7 +729,13 @@ fn prometheus_summary_publication_is_coherent_during_registry_mutations() {
         .unwrap();
     assert_published_summary_is_coherent(&registry);
     registry
-        .record_status("dp-converged", &converged_token, "v1", None, at(1))
+        .record_status(
+            "dp-converged",
+            &converged_token,
+            "v1",
+            MeshSliceReportStatus::Applied,
+            at(1),
+        )
         .unwrap();
     assert_published_summary_is_coherent(&registry);
 
@@ -581,7 +757,7 @@ fn prometheus_summary_publication_is_coherent_during_registry_mutations() {
             "dp-rejecting",
             &rejecting_token,
             "v1",
-            Some("caller detail"),
+            MeshSliceReportStatus::Rejected(MeshSliceReportRejection::InstallRefused),
             at(0),
         )
         .unwrap();
@@ -671,7 +847,13 @@ fn desired_tracks_projected_content_for_connected_and_retained_disconnected_rows
         .record_projected_sent("dp-a", &token, &initial_slice, at(0))
         .unwrap();
     registry
-        .record_status("dp-a", &token, &initial_slice.version, None, at(0))
+        .record_status(
+            "dp-a",
+            &token,
+            &initial_slice.version,
+            MeshSliceReportStatus::Applied,
+            at(0),
+        )
         .unwrap();
 
     let related = projected_config(1, vec![service("api-v2", "ferrum")]);

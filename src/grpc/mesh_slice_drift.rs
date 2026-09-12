@@ -3,9 +3,17 @@
 //!
 //! Complements the DP-local `GET /mesh/config-drift` surface: this registry
 //! records what the control plane **desired**, last **sent**, last
-//! **acknowledged**, and last **rejected** for each authenticated mesh
-//! subscriber so operators can spot stuck, partitioned, or repeatedly
-//! rejecting data planes after a successful CP reconciliation.
+//! **accepted** (`acknowledged`: the data plane's install-time verdict), last
+//! **applied** (its proxy-runtime verdict), and last **rejected** for each
+//! authenticated mesh subscriber so operators can spot stuck, partitioned, or
+//! repeatedly rejecting data planes after a successful CP reconciliation.
+//!
+//! Accepted and applied are deliberately distinct (issue #4812). A data plane
+//! ACKs at install time, when the slice has merely become its RECEIVED slice;
+//! its proxy runtime is a second, independent gate that can still refuse the
+//! slice. Only an **applied** report converges a row — otherwise this surface,
+//! which exists to find stuck data planes, would report `converged` for a data
+//! plane whose runtime refused the slice.
 //!
 //! # Identity
 //!
@@ -22,8 +30,9 @@
 //!   [`super::mesh_registry::MeshNodeRegistry`]).
 //! - **Send**: advances `sent` for the matching generation only.
 //! - **Desired**: advanced only when that DP's projected slice content changes.
-//! - **ACK / NACK**: recorded only for an existing identity; malformed reports
-//!   fail closed with field-specific diagnostics.
+//! - **Status**: accepted / applied / rejected reports are recorded only for an
+//!   existing identity; malformed reports fail closed with field-specific
+//!   diagnostics.
 //! - **Disconnect**: marks the entry disconnected but retains it until the
 //!   retention TTL so partition/reconnect drift remains visible.
 //! - **Retention expiry / cardinality**: expired disconnected entries are
@@ -72,19 +81,100 @@ pub const MESH_SLICE_DRIFT_MAX_VERSION_BYTES: usize = 256;
 /// registry bounds it independently of the transport.
 pub const MESH_SLICE_DRIFT_MAX_NODE_ID_BYTES: usize = 256;
 
-/// Max retained rejection-reason UTF-8 byte length. Production currently
-/// retains only the fixed label below, never caller-supplied text.
+/// Max retained rejection-reason UTF-8 byte length. Production retains only the
+/// closed labels of [`MeshSliceReportRejection`], never caller-supplied text.
 pub const MESH_SLICE_DRIFT_MAX_REASON_BYTES: usize = 64;
 
-/// Closed diagnostic retained for every NACK. The authenticated caller's raw
-/// error text may contain credentials and is deliberately discarded.
-pub const MESH_SLICE_DRIFT_REJECTION_REASON: &str = "reported_rejection";
+/// Which of a data plane's two independent gates refused a slice (issue #4812).
+pub const MESH_SLICE_DRIFT_STAGE_INSTALL: &str = "install";
+pub const MESH_SLICE_DRIFT_STAGE_RUNTIME: &str = "runtime";
 
-// Both retained rejection labels are compile-time bounded. Keeping this as a
-// real use of the public limit also prevents the binary's private module graph
-// from treating the integration-test contract constant as dead code.
-const _: () = assert!(MESH_SLICE_DRIFT_REJECTION_REASON.len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
-const _: () = assert!("unspecified".len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+/// Closed, compile-time refusal categories retained for a rejected slice.
+///
+/// The data plane sends a wire enum, never free text, so this is the ENTIRE
+/// diagnostic the control plane can record: a rejection reason can never carry
+/// credentials, request data, or unbounded caller bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MeshSliceReportRejection {
+    /// Refused by the DP's receive/install gates (subscription binding,
+    /// envelope consistency, or config-revision freshness).
+    InstallRefused,
+    /// The slice could not be converted into a serving gateway configuration.
+    RuntimeConfigBuild,
+    /// The DP's proxy runtime refused the converted configuration.
+    RuntimeProxyRefused,
+    /// Effective gateway trust material for the slice was unusable.
+    RuntimeTrustUnusable,
+    /// Inbound mTLS live-reload preparation failed on the DP.
+    RuntimeTlsReload,
+    /// Owner-scoped NodeWaypoint DTLS candidate build failed on the DP.
+    RuntimeDtlsCandidate,
+}
+
+impl MeshSliceReportRejection {
+    /// Fixed, length-bounded label published on the admin surface.
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::InstallRefused => "install_refused",
+            Self::RuntimeConfigBuild => "runtime_config_build",
+            Self::RuntimeProxyRefused => "runtime_proxy_refused",
+            Self::RuntimeTrustUnusable => "runtime_trust_unusable",
+            Self::RuntimeTlsReload => "runtime_tls_reload",
+            Self::RuntimeDtlsCandidate => "runtime_dtls_candidate",
+        }
+    }
+
+    /// The DP gate that produced the refusal.
+    pub const fn stage(self) -> &'static str {
+        match self {
+            Self::InstallRefused => MESH_SLICE_DRIFT_STAGE_INSTALL,
+            Self::RuntimeConfigBuild
+            | Self::RuntimeProxyRefused
+            | Self::RuntimeTrustUnusable
+            | Self::RuntimeTlsReload
+            | Self::RuntimeDtlsCandidate => MESH_SLICE_DRIFT_STAGE_RUNTIME,
+        }
+    }
+
+    /// Every retained label, for exhaustive contract coverage.
+    pub const ALL: [Self; 6] = [
+        Self::InstallRefused,
+        Self::RuntimeConfigBuild,
+        Self::RuntimeProxyRefused,
+        Self::RuntimeTrustUnusable,
+        Self::RuntimeTlsReload,
+        Self::RuntimeDtlsCandidate,
+    ];
+}
+
+/// A data plane's verdict on one delivered slice version (issue #4812).
+///
+/// `Accepted` and `Applied` are two different gates, not two names for one: a
+/// slice that is accepted has merely become the DP's received slice, while an
+/// applied slice is the generation the DP is actually serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshSliceReportStatus {
+    Accepted,
+    Applied,
+    Rejected(MeshSliceReportRejection),
+}
+
+// Every retained rejection label is compile-time bounded, so the registry can
+// never store an oversized reason. Keeping these as real uses of the public
+// limit and of `ALL` also prevents the binary's private module graph from
+// treating the integration-test contract surface as dead code.
+const _: () = assert!(MeshSliceReportRejection::ALL.len() == 6);
+const _: () = {
+    use MeshSliceReportRejection::*;
+    assert!(InstallRefused.as_label().len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+    assert!(RuntimeConfigBuild.as_label().len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+    assert!(RuntimeProxyRefused.as_label().len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+    assert!(RuntimeTrustUnusable.as_label().len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+    assert!(RuntimeTlsReload.as_label().len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+    assert!(RuntimeDtlsCandidate.as_label().len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+};
+const _: () = assert!(MESH_SLICE_DRIFT_STAGE_INSTALL.len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
+const _: () = assert!(MESH_SLICE_DRIFT_STAGE_RUNTIME.len() < MESH_SLICE_DRIFT_MAX_REASON_BYTES);
 
 /// Bound the retained subscription selector used for publication-time projection.
 const MESH_SLICE_DRIFT_MAX_PROJECTION_LABELS: usize = 256;
@@ -109,8 +199,13 @@ const SNAPSHOT_COALESCE_WINDOW_MS: i64 = 500;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MeshSliceConvergenceState {
-    /// Desired, sent, and acknowledged versions all agree and are present.
+    /// Desired, sent, acknowledged, and applied versions all agree and are
+    /// present: this data plane is SERVING the desired generation.
     Converged,
+    /// The data plane accepted the desired version at install time but has not
+    /// reported it as the serving generation. Distinct from `Converged`
+    /// (issue #4812): an install ACK is not proof the runtime took the slice.
+    Accepted,
     /// Desired differs from sent and/or acknowledged (or ACK is missing while
     /// a desired version exists).
     Drifted,
@@ -127,6 +222,7 @@ impl MeshSliceConvergenceState {
     pub const fn as_metric_label(self) -> &'static str {
         match self {
             Self::Converged => "converged",
+            Self::Accepted => "accepted",
             Self::Drifted => "drifted",
             Self::Rejecting => "rejecting",
             Self::Pending => "pending",
@@ -168,8 +264,13 @@ pub struct MeshSliceDriftEntry {
     pub desired: Option<MeshSliceVersionStamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sent: Option<MeshSliceVersionStamp>,
+    /// The data plane's INSTALL-time acceptance watermark.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acknowledged: Option<MeshSliceVersionStamp>,
+    /// The data plane's PROXY-RUNTIME acceptance watermark: the generation it
+    /// reported as actually serving (issue #4812).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<MeshSliceVersionStamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rejected: Option<MeshSliceRejectedStamp>,
     pub convergence: MeshSliceConvergenceState,
@@ -181,6 +282,9 @@ pub struct MeshSliceRejectedStamp {
     pub version: String,
     pub at: DateTime<Utc>,
     pub age_seconds: u64,
+    /// Which of the data plane's two gates refused the slice: `install` (the
+    /// receive/revision gates) or `runtime` (the proxy runtime).
+    pub stage: &'static str,
     /// Closed, length-bounded reason label. Never caller-supplied text.
     pub reason: String,
 }
@@ -190,6 +294,9 @@ pub struct MeshSliceDriftFlags {
     pub desired_vs_sent: bool,
     pub desired_vs_acknowledged: bool,
     pub sent_vs_acknowledged: bool,
+    /// The desired generation is not the one the data plane's proxy runtime
+    /// reported as serving (issue #4812).
+    pub desired_vs_applied: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -197,6 +304,7 @@ pub struct MeshSliceDriftSummary {
     pub tracked: usize,
     pub connected: usize,
     pub converged: usize,
+    pub accepted: usize,
     pub drifted: usize,
     pub rejecting: usize,
     pub pending: usize,
@@ -224,8 +332,11 @@ struct LiveEntry {
     sent_at: Option<DateTime<Utc>>,
     acknowledged_version: Option<String>,
     acknowledged_at: Option<DateTime<Utc>>,
+    applied_version: Option<String>,
+    applied_at: Option<DateTime<Utc>>,
     rejected_version: Option<String>,
     rejected_at: Option<DateTime<Utc>>,
+    rejected_stage: Option<&'static str>,
     rejected_reason: Option<String>,
     /// Opaque, per-stream generation. Never published or logged.
     session_token: String,
@@ -261,6 +372,10 @@ pub enum MeshSliceDriftAdmitError {
     CardinalityExceeded,
     ProjectionContextTooLarge,
     ProjectionFailed,
+    /// The report named a lifecycle phase this control plane does not define.
+    UnknownStatusPhase,
+    /// The report named a refusal category this control plane does not define.
+    UnknownRejectReason,
 }
 
 impl MeshSliceDriftAdmitError {
@@ -294,6 +409,12 @@ impl MeshSliceDriftAdmitError {
                 "mesh subscription projection context exceeds the retained-state bound"
             }
             Self::ProjectionFailed => "mesh slice projection could not be represented",
+            Self::UnknownStatusPhase => {
+                "mesh slice status phase is not a recognised lifecycle stage"
+            }
+            Self::UnknownRejectReason => {
+                "mesh slice status rejection reason is not a recognised category"
+            }
         }
     }
 
@@ -313,6 +434,8 @@ impl MeshSliceDriftAdmitError {
             Self::CardinalityExceeded => "cardinality",
             Self::ProjectionContextTooLarge => "subscription",
             Self::ProjectionFailed => "projection",
+            Self::UnknownStatusPhase => "phase",
+            Self::UnknownRejectReason => "reject_reason",
         }
     }
 }
@@ -469,8 +592,11 @@ impl MeshSliceDriftRegistry {
                 sent_at: None,
                 acknowledged_version: None,
                 acknowledged_at: None,
+                applied_version: None,
+                applied_at: None,
                 rejected_version: None,
                 rejected_at: None,
+                rejected_stage: None,
                 rejected_reason: None,
                 session_token: session_token.clone(),
                 projection,
@@ -528,6 +654,7 @@ impl MeshSliceDriftRegistry {
         if entry.rejected_version.as_deref() == Some(version) {
             entry.rejected_version = None;
             entry.rejected_at = None;
+            entry.rejected_stage = None;
             entry.rejected_reason = None;
         }
         self.publish_fanout_locked(&mut state, Utc::now());
@@ -611,13 +738,20 @@ impl MeshSliceDriftRegistry {
         changed
     }
 
-    /// Record an ACK (`error_message` empty) or NACK (non-empty, sanitised).
+    /// Record a data plane's verdict on one delivered slice version.
+    ///
+    /// Issue #4812: an `Accepted` report is the DP's INSTALL-time verdict and
+    /// deliberately does NOT converge the row — only `Applied`, the DP's
+    /// proxy-runtime verdict, does. An `Applied` report also stamps the
+    /// acceptance watermark: a slice cannot serve without having been
+    /// installed, so a lost install ACK must not strand an applied row in
+    /// `drifted`.
     pub fn record_status(
         &self,
         node_id: &str,
         session_token: &str,
         version: &str,
-        error_message: Option<&str>,
+        status: MeshSliceReportStatus,
         at: DateTime<Utc>,
     ) -> Result<(), MeshSliceDriftAdmitError> {
         let node_id = validate_identity(node_id)?;
@@ -631,18 +765,29 @@ impl MeshSliceDriftRegistry {
         if entry.sent_version.as_deref() != Some(version) {
             return Err(MeshSliceDriftAdmitError::VersionMismatch);
         }
-        match error_message {
-            None | Some("") => {
+        match status {
+            MeshSliceReportStatus::Accepted => {
                 entry.acknowledged_version = Some(version.to_string());
                 entry.acknowledged_at = Some(at);
-                entry.rejected_version = None;
-                entry.rejected_at = None;
-                entry.rejected_reason = None;
+                clear_rejection(entry);
             }
-            Some(raw) => {
+            MeshSliceReportStatus::Applied => {
+                entry.acknowledged_version = Some(version.to_string());
+                entry.acknowledged_at = Some(at);
+                entry.applied_version = Some(version.to_string());
+                entry.applied_at = Some(at);
+                clear_rejection(entry);
+            }
+            MeshSliceReportStatus::Rejected(rejection) => {
+                // A runtime refusal leaves the install-time acceptance standing:
+                // the slice WAS accepted, it simply never started serving. That
+                // pairing (acknowledged == desired, applied behind, rejected
+                // present) is exactly the stuck data plane this surface exists
+                // to show.
                 entry.rejected_version = Some(version.to_string());
                 entry.rejected_at = Some(at);
-                entry.rejected_reason = Some(sanitize_reason(raw));
+                entry.rejected_stage = Some(rejection.stage());
+                entry.rejected_reason = Some(rejection.as_label().to_string());
             }
         }
         self.publish_fanout_locked(&mut state, Utc::now());
@@ -804,6 +949,7 @@ impl MeshSliceDriftRegistry {
             }
             match entry.convergence {
                 MeshSliceConvergenceState::Converged => summary.converged += 1,
+                MeshSliceConvergenceState::Accepted => summary.accepted += 1,
                 MeshSliceConvergenceState::Drifted => summary.drifted += 1,
                 MeshSliceConvergenceState::Rejecting => summary.rejecting += 1,
                 MeshSliceConvergenceState::Pending => summary.pending += 1,
@@ -868,6 +1014,13 @@ fn evict_oldest_disconnected(entries: &mut HashMap<String, LiveEntry>) -> bool {
     }
 }
 
+fn clear_rejection(entry: &mut LiveEntry) {
+    entry.rejected_version = None;
+    entry.rejected_at = None;
+    entry.rejected_stage = None;
+    entry.rejected_reason = None;
+}
+
 fn publish_entry(entry: &LiveEntry, now: DateTime<Utc>) -> MeshSliceDriftEntry {
     let desired = entry
         .desired_version
@@ -884,12 +1037,20 @@ fn publish_entry(entry: &LiveEntry, now: DateTime<Utc>) -> MeshSliceDriftEntry {
         .as_ref()
         .zip(entry.acknowledged_at)
         .map(|(v, at)| MeshSliceVersionStamp::from_parts(v.clone(), at, now));
+    let applied = entry
+        .applied_version
+        .as_ref()
+        .zip(entry.applied_at)
+        .map(|(v, at)| MeshSliceVersionStamp::from_parts(v.clone(), at, now));
     let rejected = entry.rejected_version.as_ref().map(|version| {
         let at = entry.rejected_at.unwrap_or(now);
         MeshSliceRejectedStamp {
             version: version.clone(),
             at,
             age_seconds: age_seconds(now, at),
+            stage: entry
+                .rejected_stage
+                .unwrap_or(MESH_SLICE_DRIFT_STAGE_INSTALL),
             reason: entry
                 .rejected_reason
                 .clone()
@@ -910,6 +1071,10 @@ fn publish_entry(entry: &LiveEntry, now: DateTime<Utc>) -> MeshSliceDriftEntry {
             sent.as_ref().map(|s| s.version.as_str()),
             acknowledged.as_ref().map(|s| s.version.as_str()),
         ),
+        desired_vs_applied: versions_differ(
+            desired.as_ref().map(|s| s.version.as_str()),
+            applied.as_ref().map(|s| s.version.as_str()),
+        ),
     };
 
     let convergence = classify(
@@ -917,6 +1082,7 @@ fn publish_entry(entry: &LiveEntry, now: DateTime<Utc>) -> MeshSliceDriftEntry {
         &desired,
         &sent,
         &acknowledged,
+        &applied,
         &rejected,
         drift,
     );
@@ -930,6 +1096,7 @@ fn publish_entry(entry: &LiveEntry, now: DateTime<Utc>) -> MeshSliceDriftEntry {
         desired,
         sent,
         acknowledged,
+        applied,
         rejected,
         convergence,
         drift,
@@ -941,6 +1108,7 @@ fn classify(
     desired: &Option<MeshSliceVersionStamp>,
     sent: &Option<MeshSliceVersionStamp>,
     acknowledged: &Option<MeshSliceVersionStamp>,
+    applied: &Option<MeshSliceVersionStamp>,
     rejected: &Option<MeshSliceRejectedStamp>,
     drift: MeshSliceDriftFlags,
 ) -> MeshSliceConvergenceState {
@@ -960,6 +1128,13 @@ fn classify(
         || acknowledged.is_none()
     {
         return MeshSliceConvergenceState::Drifted;
+    }
+    // Issue #4812: the install-time ACK is not proof the proxy runtime took the
+    // slice. Convergence requires the DP to have reported the desired
+    // generation as the one it is SERVING; anything short of that is
+    // `accepted`, never `converged`.
+    if drift.desired_vs_applied || applied.is_none() {
+        return MeshSliceConvergenceState::Accepted;
     }
     MeshSliceConvergenceState::Converged
 }
@@ -1129,17 +1304,6 @@ fn canonical_json_value(value: Value) -> Value {
     }
 }
 
-/// Conservative NACK diagnostic for admin surfaces. Raw authenticated-caller
-/// text is never retained: it may contain bearer tokens, credentials, or other
-/// secrets. The result is a fixed, control-safe, low-cardinality label whose
-/// total UTF-8 length is strictly below [`MESH_SLICE_DRIFT_MAX_REASON_BYTES`].
-pub fn sanitize_reason(raw: &str) -> String {
-    if raw.is_empty() {
-        return "unspecified".to_string();
-    }
-    MESH_SLICE_DRIFT_REJECTION_REASON.to_string()
-}
-
 fn append_mesh_slice_drift_summary_metrics(
     output: &mut String,
     summary: &MeshSliceDriftSummary,
@@ -1158,6 +1322,7 @@ fn append_mesh_slice_drift_summary_metrics(
     output.push_str("# TYPE ferrum_mesh_slice_drift_data_planes gauge\n");
     for (state, value) in [
         (MeshSliceConvergenceState::Converged, summary.converged),
+        (MeshSliceConvergenceState::Accepted, summary.accepted),
         (MeshSliceConvergenceState::Drifted, summary.drifted),
         (MeshSliceConvergenceState::Rejecting, summary.rejecting),
         (MeshSliceConvergenceState::Pending, summary.pending),
@@ -1208,7 +1373,7 @@ pub fn render_mesh_slice_drift_summary_metrics(
 }
 
 /// Render closed-set CP mesh slice convergence gauges into a Prometheus text
-/// exposition buffer. Label cardinality is fixed (`state` ∈ five values).
+/// exposition buffer. Label cardinality is fixed (`state` ∈ six values).
 pub fn render_mesh_slice_drift_metrics(output: &mut String, gateway_ns_label: &str) {
     let summary = DRIFT_SUMMARY.load_full();
     append_mesh_slice_drift_summary_metrics(output, &summary, gateway_ns_label);

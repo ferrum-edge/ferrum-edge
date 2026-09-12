@@ -2,8 +2,11 @@
 //! before proxying.
 //!
 //! Header/query rules execute in `before_proxy` before the backend request is
-//! built. Body rules execute in `transform_request_body` which forces the
-//! request body to be buffered.
+//! built. Body rules execute in `transform_request_body`, which needs the
+//! request body buffered — but only for the representations it can actually
+//! rewrite: `RequestTransformer::should_buffer_request_body` releases a
+//! DECLARED non-JSON upload to the streaming path, while an absent
+//! `Content-Type` (which the transform still parses as JSON) stays buffered.
 //!
 //! Rules are validated and partitioned at construction time:
 //!
@@ -14,6 +17,9 @@
 //! - Every configured header `value` must parse as an HTTP `HeaderValue`
 //!   (same complete syntax accepted at H1/H2/H3 emission). CR/LF keep a
 //!   dedicated diagnostic; other forbidden control bytes fail the same gate.
+//! - Gateway-owned header destinations (primary egress strip inventory,
+//!   generated forwarding headers, and Host) reject add/update and rename.
+//!   Removal and rename sources remain allowed.
 //! - Query `value` / `new_key` / `key` strings must not contain CR or LF
 //!   (injection into the request-target). Names and values are otherwise
 //!   percent-encoded when authored onto the outbound query.
@@ -414,6 +420,24 @@ impl RequestTransformer {
                     if let Some(ref v) = value {
                         validate_configured_header_value(v, idx)?;
                     }
+                    // Match the primary egress ownership inventory. Removal and
+                    // rename sources stay available, as in response_transformer.
+                    let destination = match hop {
+                        HeaderOp::Add | HeaderOp::Update => Some(key.as_str()),
+                        HeaderOp::Rename => new_key.as_deref(),
+                        HeaderOp::Remove => None,
+                    };
+                    if let Some(dest) = destination
+                        && (crate::proxy::headers::is_backend_request_strip_header(dest)
+                            || crate::proxy::headers::is_proxy_generated_forwarding_header(dest)
+                            || dest == "host")
+                    {
+                        return Err(format!(
+                            "request_transformer: rule[{idx}]: header destination '{dest}' is \
+                             gateway-owned and cannot be configured; use preserve_host_header \
+                             for Host or trusted-proxy configuration for forwarding identity"
+                        ));
+                    }
                     header_rules.push(HeaderRule {
                         operation: hop,
                         key,
@@ -559,6 +583,34 @@ impl Plugin for RequestTransformer {
         // Otherwise the kill-switch would still retain every request body even
         // though no phase can consume or transform it.
         self.rules_enabled && !self.body_rules.is_empty()
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        // `modifies_request_body` is only the config-time upper bound. Refine it
+        // per request so an ordinary binary or form upload is not collected in
+        // full for a JSON-only body rule that `transform_request_body` will
+        // decline anyway — which otherwise added the whole upload duration to
+        // upstream time-to-first-byte and retained a needless full-body buffer.
+        //
+        // The condition is the EXACT negation of what `transform_request_body`
+        // declines on media type: a DECLARED non-JSON type is released; an
+        // ABSENT `Content-Type` keeps the buffered path because the transform
+        // still attempts a JSON parse for it. Framed gRPC `+json` satisfies
+        // `is_json_content_type` and so also stays buffered, matching the
+        // transform, which declines it only after a failed document parse.
+        //
+        // Safe against a header rewrite that changes eligibility: proxy core
+        // (and the H3 path) re-evaluates `final_request_body_requirements`
+        // against the effective outbound headers after `before_proxy`, so a
+        // `text/plain` -> `application/json` rewrite still selects buffering
+        // before the body is read. Route-level request transforms are
+        // header-only and never reach the body.
+        if !self.rules_enabled || self.body_rules.is_empty() {
+            return false;
+        }
+        ctx.headers
+            .get("content-type")
+            .is_none_or(|ct| body_transform::is_json_content_type(ct))
     }
 
     async fn before_proxy(

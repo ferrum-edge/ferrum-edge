@@ -1,0 +1,94 @@
+name: CI Latency Report
+
+# Issue #4672 asks for a read-only latency report before any cancellation,
+# batching or cadence policy is changed. This lane is that report and nothing
+# else: it never dispatches, re-runs, cancels or mutates a run, it holds no
+# write permission, and it is not a required check. Its verdict is data for
+# maintainers, not a gate.
+#
+# Pull requests run the offline self-test only. Collection costs Actions API
+# calls and is worth paying on an explicit dispatch or the weekly schedule.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Runs to collect (1-1000)
+        required: false
+        default: '400'
+      workflow:
+        description: Workflow file to collect, or 'all' for every workflow
+        required: false
+        default: 'all'
+      max_job_fetches:
+        description: Runs whose per-job inventory is fetched
+        required: false
+        default: '120'
+  schedule:
+    # Monday 07:00 UTC, after a full week of activity has landed.
+    - cron: '0 7 * * 1'
+  pull_request:
+    paths:
+      - .github/workflows/ci-latency-report.yml
+      - .github/scripts/ci_latency_report.py
+      - .github/required-publication-checks.json
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ci-latency-report.yml
+      - .github/scripts/ci_latency_report.py
+      - .github/required-publication-checks.json
+
+permissions:
+  contents: read
+
+jobs:
+  latency-report:
+    name: Latency report
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Report contract self-test
+        run: python3 -I .github/scripts/ci_latency_report.py --self-test
+
+      # Proves the frozen publication-gate inventory this report joins on is
+      # still parseable and still declares required contexts. Read-only.
+      - name: Required-context inventory parses
+        run: python3 -I .github/scripts/ci_latency_report.py --check-inventory
+
+      - name: Collect and report
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPORT_REPOSITORY: ${{ github.repository }}
+          REPORT_RUNS: ${{ inputs.runs || '400' }}
+          REPORT_WORKFLOW: ${{ inputs.workflow || 'all' }}
+          REPORT_MAX_JOB_FETCHES: ${{ inputs.max_job_fetches || '120' }}
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/ci_latency_report.py \
+            --repository "$REPORT_REPOSITORY" \
+            --workflow "$REPORT_WORKFLOW" \
+            --runs "$REPORT_RUNS" \
+            --max-job-fetches "$REPORT_MAX_JOB_FETCHES" \
+            --output-dir ci-latency-report
+
+      - name: Upload the latency report
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-latency-report
+          path: ci-latency-report/
+          retention-days: 30
+          if-no-files-found: error

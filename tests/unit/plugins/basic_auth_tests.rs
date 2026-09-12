@@ -146,7 +146,9 @@ fn test_basic_auth_plugin_contract() {
     assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
     assert!(plugin.is_auth_plugin());
     assert_eq!(plugin.authentication_challenge(), Some(BASIC_CHALLENGE));
-    assert!(!plugin.modifies_request_headers());
+    // Default `hide_credentials: true` removes the reusable Basic credential
+    // before the backend request, so the plugin does mutate request headers.
+    assert!(plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
     assert!(!plugin.requires_request_body_before_before_proxy());
     assert!(!plugin.requires_request_body_before_authenticate());
@@ -162,8 +164,12 @@ fn test_basic_auth_rejects_invalid_config() {
     let invalid_configs = [
         json!(""),
         json!(true),
+        json!([]),
         json!({"unexpected": true}),
         json!({"realm": "private"}),
+        json!({"hide_credentials": "yes"}),
+        json!({"hide_credentials": null}),
+        json!({"hide_credentials": true, "realm": "private"}),
     ];
 
     for config in invalid_configs {
@@ -173,7 +179,17 @@ fn test_basic_auth_rejects_invalid_config() {
         );
     }
 
-    assert!(BasicAuth::new(&json!(null)).is_ok());
+    for config in [
+        json!(null),
+        json!({}),
+        json!({"hide_credentials": true}),
+        json!({"hide_credentials": false}),
+    ] {
+        assert!(
+            BasicAuth::new(&config).is_ok(),
+            "config should be accepted: {config}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -658,4 +674,134 @@ async fn test_basic_auth_non_ascii_authorization_returns_invalid_not_missing() {
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject_body(result, r#"{"error":"Invalid Authorization header"}"#);
     assert!(ctx.identified_consumer.is_none());
+}
+
+// ── Basic credentials must not reach the upstream by default ────────────────
+//
+// RFC 7617 encodes a REUSABLE username/password in reversible Base64. Every
+// upstream that received the forwarded field could recover the password and
+// replay it on any other gateway route that consumer can reach — including
+// when a different mechanism won the chain and the backend was told a
+// different principal. Removal is default-on and mirrors `key_auth`'s
+// `hide_credentials` convention.
+
+#[tokio::test]
+async fn test_basic_auth_removes_the_verified_credential_before_proxy() {
+    set_test_hmac_secret();
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("testuser", "password"),
+    );
+    ctx.identified_consumer = None;
+
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert!(ctx.identified_consumer.is_some());
+
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+
+    assert!(
+        backend_headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("authorization")),
+        "a verified Basic password must never reach the upstream by default"
+    );
+}
+
+#[tokio::test]
+async fn test_basic_auth_removes_a_losing_credential_in_a_mixed_chain() {
+    // `before_proxy` runs for every configured plugin, not only the mechanism
+    // that won. A request that authenticated as `bob` through another plugin
+    // must not still carry Alice's Basic password upstream.
+    set_test_hmac_secret();
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "some-other-password"),
+    );
+    // Another mechanism already committed a different principal; basic_auth
+    // never authenticated on this request.
+    ctx.identified_consumer = Some(std::sync::Arc::new(create_basic_auth_consumer_with_hash(
+        "bob",
+        hmac_sha256_password_hash("bob-password"),
+    )));
+
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+
+    assert!(
+        backend_headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("authorization")),
+        "a losing Basic credential must not ride along to the upstream"
+    );
+}
+
+#[tokio::test]
+async fn test_basic_auth_can_explicitly_preserve_the_credential() {
+    set_test_hmac_secret();
+    let plugin = BasicAuth::new(&json!({"hide_credentials": false})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
+
+    let mut ctx = make_ctx();
+    let header = basic_header("testuser", "password");
+    ctx.headers
+        .insert("authorization".to_string(), header.clone());
+    ctx.identified_consumer = None;
+
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+
+    assert!(!plugin.modifies_request_headers());
+    assert_eq!(
+        backend_headers.get("authorization").map(String::as_str),
+        Some(header.as_str())
+    );
+}
+
+#[tokio::test]
+async fn test_basic_auth_leaves_other_authorization_schemes_in_place() {
+    // Removal is keyed on the scheme: a Bearer token another policy needs must
+    // survive, and so must an unrelated scheme.
+    set_test_hmac_secret();
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+
+    for value in ["Bearer opaque-token", "Negotiate abcdef", "DPoP proof"] {
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), value.to_string());
+        let mut backend_headers = ctx.headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+        assert_eq!(
+            backend_headers.get("authorization").map(String::as_str),
+            Some(value),
+            "only the Basic scheme may be removed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_basic_auth_removal_is_scheme_and_name_case_insensitive() {
+    set_test_hmac_secret();
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+
+    let mut ctx = make_ctx();
+    let mut backend_headers = std::collections::HashMap::new();
+    backend_headers.insert(
+        "Authorization".to_string(),
+        "bAsIc dXNlcjpwYXNz".to_string(),
+    );
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+
+    assert!(
+        backend_headers.is_empty(),
+        "mixed-case name and scheme must still be removed: {backend_headers:?}"
+    );
 }

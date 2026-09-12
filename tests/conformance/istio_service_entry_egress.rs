@@ -1328,19 +1328,16 @@ fn wildcard_se(
     )
 }
 
-/// A `resolution: DNS` wildcard HTTP-family ServiceEntry materializes NOTHING.
-///
-/// Without declared endpoints the upstream target host would be the literal
-/// string `*.api.external.com`, which no resolver can answer — while Ferrum's
-/// wildcard host tier still MATCHES `foo.api.external.com`, so every request
-/// routed and then 502'd with no apply-time signal.
+/// A `resolution: DNS` wildcard HTTP-family ServiceEntry remains routable.
+/// Dispatch concretizes its wildcard target from each matching request authority
+/// before DNS, SNI, and connection-pool selection.
 #[test]
-fn se_http_egress_refuses_unresolvable_wildcard_host() {
+fn se_http_egress_materializes_dns_wildcard_host() {
     register_feature!(
         category = CATEGORY,
-        feature = "Wildcard-host HTTP-family egress ServiceEntry refused without endpoints (#4535)",
+        feature = "DNS wildcard-host HTTP-family egress ServiceEntry (#4535)",
         status = Status::Supported,
-        notes = "#4535: a DNS/NONE wildcard host would become the literal upstream dial target; refused with a hosts[]-named warning instead of silently 502ing.",
+        notes = "The configured wildcard target is replaced with the matching concrete request authority before dialing.",
     );
     let translation = translate_k8s_objects(
         &[wildcard_se(
@@ -1357,19 +1354,53 @@ fn se_http_egress_refuses_unresolvable_wildcard_host() {
     let prepared =
         prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
 
+    let proxy = prepared
+        .proxies
+        .iter()
+        .find(|p| p.id.starts_with("mesh-egress"))
+        .expect("wildcard route must materialize");
+    assert_eq!(proxy.hosts, vec!["*.api.external.com"]);
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id.starts_with("mesh-egress-up"))
+        .expect("wildcard upstream must materialize");
+    assert_eq!(upstream.targets[0].host, "*.api.external.com");
+}
+
+/// A STATIC HTTP-family ServiceEntry without declared endpoints has no dial
+/// set. In particular, a wildcard route must not become a client-selected DNS
+/// target through request-authority concretization.
+#[test]
+fn se_http_egress_static_without_endpoints_fails_closed() {
+    let translation = translate_k8s_objects(
+        &[wildcard_se(
+            "static-wildcard-api",
+            "*.api.external.com",
+            443,
+            "TLS",
+            "STATIC",
+            Vec::new(),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+
     assert!(
-        !prepared
+        prepared
             .proxies
             .iter()
-            .any(|p| p.id.starts_with("mesh-egress")),
-        "no egress proxy may be materialized for an unresolvable wildcard host"
+            .all(|p| !p.id.starts_with("mesh-egress")),
+        "STATIC wildcard without endpoints must not materialize a route"
     );
     assert!(
-        !prepared
+        prepared
             .upstreams
             .iter()
-            .any(|u| u.id.starts_with("mesh-egress-up")),
-        "and no egress upstream either"
+            .all(|u| !u.id.starts_with("mesh-egress-up")),
+        "STATIC wildcard without endpoints must not materialize a dial target"
     );
 }
 

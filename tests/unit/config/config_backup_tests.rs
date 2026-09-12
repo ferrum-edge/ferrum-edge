@@ -1,6 +1,195 @@
 use ferrum_edge::config::config_backup::load_config_backup;
 use ferrum_edge::config::types::CURRENT_CONFIG_VERSION;
+use serde_json::json;
 use std::io::Write;
+
+fn administrative_backup() -> serde_json::Value {
+    json!({
+        "version": CURRENT_CONFIG_VERSION,
+        "ferrum_version": "test",
+        "exported_at": "2026-09-08T00:00:00Z",
+        "source": "database",
+        "counts": {},
+        "proxies": [],
+        "consumers": [],
+        "plugin_configs": [],
+        "upstreams": [],
+        "api_specs": {"section_version": "2", "items": []},
+        "gateway_trust_bundles": []
+    })
+}
+
+#[test]
+fn backup_envelope_is_not_a_runtime_trust_or_spec_authority() {
+    let mut value = administrative_backup();
+    // Bootstrap neither interprets nor applies these admin-only sections.
+    value["gateway_trust_bundles"] = json!([{"namespace": "tenant-a", "bundle": "stale"}]);
+    value["api_specs"] = json!({"unrelated_schema": {"private_key": "test-only"}});
+    let (_tmp, path) = write_tmp_file(&value.to_string());
+    let loaded = load_config_backup(&path, "tenant-a").unwrap().unwrap();
+    assert!(loaded.gateway_trust_bundles.is_empty());
+    assert!(loaded.trust_bundles.is_none());
+    assert_eq!(loaded.known_namespaces, ["tenant-a"]);
+}
+
+#[test]
+fn backup_envelope_keeps_version_and_runtime_schema_checks() {
+    for (field, invalid) in [
+        ("version", json!("999999")),
+        ("unexpected_runtime_field", json!(true)),
+        ("proxies", json!("not-an-array")),
+    ] {
+        let mut value = administrative_backup();
+        value[field] = invalid;
+        let (_tmp, path) = write_tmp_file(&value.to_string());
+        assert!(load_config_backup(&path, "ferrum").is_err(), "{field}");
+    }
+}
+
+#[test]
+fn backup_consumer_admission_matches_sorted_database_quarantine_after_projection() {
+    let mut value = administrative_backup();
+    value["consumers"] = json!([
+        {"id": "z", "username": "shared", "namespace": "tenant-a"},
+        {"id": "a", "username": "shared", "namespace": "tenant-a"},
+        {"id": "b", "username": "independent", "custom_id": "b", "namespace": "tenant-a"},
+        {"id": "a", "username": "shared", "namespace": "tenant-b"}
+    ]);
+    let (_tmp, path) = write_tmp_file(&value.to_string());
+    let loaded = load_config_backup(&path, "tenant-a").unwrap().unwrap();
+    assert_eq!(
+        loaded
+            .consumers
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert!(loaded.validate_unique_consumer_identities().is_ok());
+    let foreign = load_config_backup(&path, "tenant-b").unwrap().unwrap();
+    assert_eq!(foreign.consumers.len(), 1);
+    assert_eq!(foreign.consumers[0].namespace, "tenant-b");
+}
+
+#[test]
+fn backup_rejects_duplicate_resource_ids_before_quarantine() {
+    let mut value = administrative_backup();
+    value["consumers"] = json!([
+        {"id": "same", "username": "first"},
+        {"id": "same", "username": "second"}
+    ]);
+    let (_tmp, path) = write_tmp_file(&value.to_string());
+    assert!(
+        load_config_backup(&path, "ferrum")
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate resource ID")
+    );
+}
+
+#[test]
+fn backup_rejects_malformed_consumer_credentials_without_echoing_values() {
+    for credentials in [
+        json!({"keyauth": {"key": "credential-canary"}}),
+        json!({"keyauth": ["credential-canary"]}),
+        json!({"jwt": [{"secret": "short-credential-canary"}]}),
+        json!({"jwt": [{
+            "secret": "a-valid-test-secret-with-at-least-32-chars",
+            "private_key": "credential-canary"
+        }]}),
+        json!({"keyauth": [{"key": "[REDACTED]"}]}),
+    ] {
+        let mut value = administrative_backup();
+        value["consumers"] = json!([{"id": "c", "username": "user", "credentials": credentials}]);
+        let (_tmp, path) = write_tmp_file(&value.to_string());
+        let error = load_config_backup(&path, "ferrum").unwrap_err().to_string();
+        assert!(error.contains("consumer validation"));
+        assert!(!error.contains("credential-canary"));
+        assert!(!error.contains("private_key"));
+    }
+}
+
+#[test]
+fn backup_preserves_canonical_secrets_and_custom_schema_fields() {
+    let credentials = json!({
+        "jwt": [{"secret": "a-valid-test-secret-with-at-least-32-chars"}],
+        "keyauth": [{"key": "first-key"}, {"key": "rotation-key"}],
+        "custom": [{"schema": {"private_key": {"type": "string"}}}]
+    });
+    let mut value = administrative_backup();
+    value["consumers"] = json!([{"id": "c", "username": "user", "credentials": credentials}]);
+    let (_tmp, path) = write_tmp_file(&value.to_string());
+    let loaded = load_config_backup(&path, "ferrum").unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.consumers[0].credentials).unwrap(),
+        credentials
+    );
+}
+
+#[test]
+fn backup_quarantines_identity_conflicts_while_file_admission_still_rejects() {
+    use ferrum_edge::config::BackendEgressPolicy;
+    use ferrum_edge::config::file_loader::load_config_from_file;
+    use ferrum_edge::config::types::GatewayConfig;
+
+    for (first_field, second_field) in [
+        ("username", "username"),
+        ("id", "username"),
+        ("username", "custom_id"),
+        ("custom_id", "custom_id"),
+    ] {
+        let mut first = json!({"id": "a", "username": "alice"});
+        let mut second = json!({"id": "z", "username": "zoe"});
+        for consumer in [&mut first, &mut second] {
+            consumer["created_at"] = json!("2026-09-08T00:00:00Z");
+            consumer["updated_at"] = json!("2026-09-08T00:00:00Z");
+        }
+        first[first_field] = json!("a");
+        second[second_field] = json!("a");
+        let value = json!({
+            "version": CURRENT_CONFIG_VERSION, "proxies": [],
+            "plugin_configs": [], "upstreams": [], "consumers": [first, second]
+        });
+        let mut database_candidate: GatewayConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            database_candidate
+                .quarantine_colliding_consumer_identities()
+                .len(),
+            1
+        );
+        let (_tmp, path) = write_tmp_file(&value.to_string());
+        let loaded = load_config_backup(&path, "ferrum").unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded.consumers).unwrap(),
+            serde_json::to_value(&database_candidate.consumers).unwrap()
+        );
+        let error =
+            load_config_from_file(&path, 30, &BackendEgressPolicy::unrestricted(), "ferrum")
+                .unwrap_err();
+        assert!(error.to_string().contains("consumer identity"));
+    }
+}
+
+#[test]
+fn backup_rejects_oversized_files_before_reading_them() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    tmp.as_file().set_len(64 * 1024 * 1024 + 1).unwrap();
+    let error = load_config_backup(tmp.path().to_str().unwrap(), "ferrum").unwrap_err();
+    assert!(error.to_string().contains("maximum supported size"));
+}
+
+#[test]
+fn backup_rejects_duplicate_credentials_inside_the_served_namespace() {
+    let mut value = administrative_backup();
+    value["consumers"] = json!([
+        {"id": "a", "username": "alice", "credentials": {"keyauth": [{"key": "same-test-key"}]}},
+        {"id": "b", "username": "bob", "credentials": {"keyauth": [{"key": "same-test-key"}]}}
+    ]);
+    let (_tmp, path) = write_tmp_file(&value.to_string());
+    let error = load_config_backup(&path, "ferrum").unwrap_err().to_string();
+    assert!(error.contains("duplicate credential"));
+    assert!(!error.contains("same-test-key"));
+}
 
 fn write_tmp_file(content: &str) -> (tempfile::NamedTempFile, String) {
     let mut tmp = tempfile::NamedTempFile::new().unwrap();
@@ -439,13 +628,13 @@ const TWO_NAMESPACE_BACKUP: &str = r#"{
             "id": "consumer-a",
             "username": "alice",
             "namespace": "tenant-a",
-            "credentials": {"keyauth": {"key": "key-alpha"}}
+            "credentials": {"keyauth": [{"key": "key-alpha"}]}
         },
         {
             "id": "consumer-b",
             "username": "bob",
             "namespace": "tenant-b",
-            "credentials": {"keyauth": {"key": "key-bravo"}}
+            "credentials": {"keyauth": [{"key": "key-bravo"}]}
         }
     ],
     "plugin_configs": [
@@ -650,7 +839,7 @@ fn backup_rejection_text_never_carries_the_payload_or_foreign_names() {
                 "id": "consumer-b",
                 "username": "bob",
                 "namespace": "tenant-b",
-                "credentials": {"keyauth": {"key": "key-bravo"}}
+                "credentials": {"keyauth": [{"key": "key-bravo"}]}
             }
         ],
         "plugin_configs": [],

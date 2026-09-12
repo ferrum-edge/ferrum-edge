@@ -454,7 +454,7 @@ fn optional_client_ca_mtls_loads_and_fails_closed() {
     };
     let policy = load_tls_policy(&ok_env).unwrap();
     let crls = load_crls_from_env(&ok_env).unwrap();
-    load_admin_https_tls_fail_closed(
+    let candidate = load_admin_https_tls_fail_closed(
         &ok_env,
         &policy,
         &crls,
@@ -462,6 +462,10 @@ fn optional_client_ca_mtls_loads_and_fails_closed() {
     )
     .expect("optional client CA must load through the shared admin TLS stack")
     .expect("HTTPS with mTLS must produce a ServerConfig");
+    assert!(
+        candidate.client_trust.verifier.is_some(),
+        "client CA must install a client-certificate verifier on the admin listener"
+    );
 
     let bad_env = EnvConfig {
         admin_https_port: 19443,

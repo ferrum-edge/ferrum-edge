@@ -661,13 +661,12 @@ fn dockerfile_publishes_a_tools_capable_runtime_without_weakening_ebpf() {
 fn ambient_udp_lifecycle_selects_the_tools_capable_published_runtime() {
     let chart = read("charts/ferrum-mesh/templates/ambient-daemonset.yaml");
     assert!(
-        chart.contains(
-            "{{- $ambientImageTag = printf \"%s-ebpf-tools\" \
-             (trimSuffix \"-ebpf\" $ambientImageTag) -}}"
-        ),
-        "the Ambient UDP lifecycle must select the tools-capable runtime variant, \
-         promoting an explicit `-ebpf` tag rather than double-suffixing it"
+        chart.contains("include \"ferrum-mesh.toolsImageTag\" $ambientImageTag"),
+        "the Ambient UDP lifecycle must use the shared tools image selector"
     );
+    let helpers = read("charts/ferrum-mesh/templates/_helpers.tpl");
+    assert!(helpers.contains("trimSuffix \"-ebpf\" ."));
+    assert!(helpers.contains("hasSuffix \"-ebpf-tools\" ."));
     assert!(
         chart.contains("{{- if or $ambientUdpLifecycle $nodeWaypointUdpListeners -}}"),
         "the tools variant must be selected by the Ambient UDP lifecycle AND \

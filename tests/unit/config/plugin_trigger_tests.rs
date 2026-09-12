@@ -288,7 +288,7 @@ fn regex_source_length_and_program_size_are_bounded() {
     // Well under the source-length limit but far over the compiled-program
     // ceiling — the size guard, not the length guard, must catch this.
     let error = compile_error(serde_json::json!({
-        "when": {"match": {"path": {"regex": "(?:[a-z0-9._~%-]{100}){200}"}}}
+        "when": {"match": {"path": {"regex": "(?:[a-z0-9._~-]{100}){200}"}}}
     }));
     assert!(error.contains("invalid or too large"), "{error}");
 
@@ -608,6 +608,75 @@ fn path_regex_is_anchored_so_it_cannot_partially_match() {
         !trigger.evaluate(&facts),
         "anchored regex must not match a prefix-extended path"
     );
+}
+
+#[test]
+fn path_matchers_require_canonical_spellings_at_admission() {
+    for matcher in ["exact", "prefix"] {
+        for path in [
+            "/%61dmin",
+            "/api%2Fadmin",
+            "/api/../admin",
+            "/api\\admin",
+            "admin",
+            "*",
+        ] {
+            let error = compile_error(serde_json::json!({
+                "when": {"match": {"path": {matcher: [path]}}}
+            }));
+            assert!(error.contains("`path`"), "{matcher}: {error}");
+        }
+        for path in ["/admin", "/v1.0/x"] {
+            let trigger = compile(serde_json::json!({
+                "when": {"match": {"path": {matcher: [path]}}}
+            }));
+            let mut facts = Facts::http();
+            facts.path = Some(path.to_string());
+            assert!(trigger.evaluate(&facts));
+        }
+    }
+    let error = compile_error(serde_json::json!({
+        "when": {"match": {"path": {"regex": "^/%61dmin/.*"}}}
+    }));
+    assert!(error.contains("canonical"), "{error}");
+    let trigger = compile(serde_json::json!({
+        "when": {"match": {"path": {"regex": r"^/v1\.0/.*"}}}
+    }));
+    let mut facts = Facts::http();
+    facts.path = Some("/v1.0/x".to_string());
+    assert!(trigger.evaluate(&facts));
+}
+
+#[test]
+fn host_uppercase_requires_explicit_case_insensitivity() {
+    for matcher in ["exact", "prefix", "regex"] {
+        for insensitive in [false, true] {
+            let value = if matcher == "regex" {
+                serde_json::json!("API.EXAMPLE.COM")
+            } else {
+                serde_json::json!(["API.EXAMPLE.COM"])
+            };
+            let config = serde_json::json!({
+                "when": {"match": {"host": {
+                    matcher: value, "case_insensitive": insensitive
+                }}}
+            });
+            if insensitive {
+                let trigger = compile(config);
+                let mut facts = Facts::http();
+                facts.host = Some("api.example.com".to_string());
+                assert!(trigger.evaluate(&facts));
+            } else {
+                assert!(compile_error(config).contains("case_insensitive"));
+            }
+        }
+    }
+    let trigger = compile(serde_json::json!({
+        "when": {"match": {"host": {"exact": ["api.example.com"]}}}
+    }));
+    let mut facts = Facts::http();
+    facts.host = Some("api.example.com".to_string());
+    assert!(trigger.evaluate(&facts));
 }
 
 #[test]

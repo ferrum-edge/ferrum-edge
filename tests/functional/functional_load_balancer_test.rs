@@ -8,6 +8,9 @@
 //!
 //! Run with: cargo test --test functional_load_balancer_test -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+use crate::scaffolding::ports::{reserve_port, unbound_port};
+
 use std::collections::HashMap;
 use std::io::Write;
 use std::time::Duration;
@@ -20,25 +23,14 @@ use tokio::time::sleep;
 // Identifying Echo Server — each backend returns its own identity
 // ============================================================================
 
-/// Start an HTTP server that responds with a JSON body identifying itself.
-/// Optionally serves a health endpoint at /health with a configurable status.
-async fn start_identifying_server(port: u16, name: &'static str) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "Failed to bind identifying server {} on port {}",
-                name, port
-            )
-        });
-
-    serve_identifying_listener(listener, name).await;
+/// Reserve a backend port and keep its listener bound until server handoff.
+async fn reserve_backend() -> (u16, TcpListener) {
+    let reservation = reserve_port().await.expect("reserve backend listener");
+    (reservation.port, reservation.into_listener())
 }
 
 /// Serve an identifying backend from a listener reserved by the caller.
-/// Tests that need collision-free ephemeral ports use this entry point so the
-/// socket stays owned continuously from allocation through the first request.
-async fn serve_identifying_listener(listener: TcpListener, name: &'static str) {
+async fn start_identifying_server(listener: TcpListener, name: &'static str) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
             let server_name = name;
@@ -80,11 +72,7 @@ async fn serve_identifying_listener(listener: TcpListener, name: &'static str) {
 }
 
 /// Start an HTTP server that always responds with a specific status code (for health check testing).
-async fn start_status_server(port: u16, name: &'static str, status_code: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap_or_else(|_| panic!("Failed to bind status server {} on port {}", name, port));
-
+async fn start_status_server(listener: TcpListener, name: &'static str, status_code: u16) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
             let server_name = name;
@@ -154,11 +142,7 @@ async fn start_retry_accounting_server_on(
 
 /// Start a server that initially returns errors then switches to healthy.
 /// Uses a shared atomic counter to track call count.
-async fn start_flapping_server(port: u16, name: &'static str, fail_count: u32) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap_or_else(|_| panic!("Failed to bind flapping server {} on port {}", name, port));
-
+async fn start_flapping_server(listener: TcpListener, name: &'static str, fail_count: u32) {
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     loop {
@@ -219,6 +203,7 @@ fn start_gateway_in_file_mode(
     };
 
     let mut cmd = std::process::Command::new(binary_path);
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
@@ -277,13 +262,8 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         // Allocate fresh ephemeral ports each attempt
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
+        let proxy_port = unbound_port().await.expect("lease gateway proxy port");
+        let admin_port = unbound_port().await.expect("lease gateway admin port");
 
         let identity = crate::common::SpawnedGatewayIdentity::mint("load-balancer");
         match start_gateway_in_file_mode(config_path, proxy_port, admin_port, &identity) {
@@ -314,16 +294,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 
 /// Start an HTTP server that identifies itself but delays its response.
 /// This keeps connections alive long enough for least-connections to see non-zero counts.
-async fn start_slow_identifying_server(port: u16, name: &'static str, delay_ms: u64) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "Failed to bind slow identifying server {} on port {}",
-                name, port
-            )
-        });
-
+async fn start_slow_identifying_server(listener: TcpListener, name: &'static str, delay_ms: u64) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
             let server_name = name;
@@ -372,14 +343,19 @@ async fn test_round_robin_load_balancing() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let config = r#"
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+    let (port3, listener3) = reserve_backend().await;
+
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-proxy"
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30001
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-rr"
 
@@ -389,18 +365,19 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30001
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30002
+        port: {port2}
         weight: 1
       - host: "127.0.0.1"
-        port: 30003
+        port: {port3}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -408,9 +385,9 @@ plugin_configs: []
         .unwrap();
 
     // Start 3 backend servers
-    let s1 = tokio::spawn(start_identifying_server(30001, "server1"));
-    let s2 = tokio::spawn(start_identifying_server(30002, "server2"));
-    let s3 = tokio::spawn(start_identifying_server(30003, "server3"));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "server1"));
+    let s2 = tokio::spawn(start_identifying_server(listener2, "server2"));
+    let s3 = tokio::spawn(start_identifying_server(listener3, "server3"));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -490,15 +467,19 @@ async fn test_weighted_round_robin_load_balancing() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+
     // Weight 5 for heavy, weight 1 for light — heavy should get ~5x traffic
-    let config = r#"
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-wrr-proxy"
     listen_path: "/wrr"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30011
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-wrr"
 
@@ -508,23 +489,24 @@ upstreams:
     algorithm: weighted_round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30011
+        port: {port1}
         weight: 5
       - host: "127.0.0.1"
-        port: 30012
+        port: {port2}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
         .write_all(config.as_bytes())
         .unwrap();
 
-    let s1 = tokio::spawn(start_identifying_server(30011, "heavy"));
-    let s2 = tokio::spawn(start_identifying_server(30012, "light"));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "heavy"));
+    let s2 = tokio::spawn(start_identifying_server(listener2, "light"));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -600,14 +582,19 @@ async fn test_consistent_hashing_load_balancing() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let config = r#"
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+    let (port3, listener3) = reserve_backend().await;
+
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-hash-proxy"
     listen_path: "/hash"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30021
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-hash"
 
@@ -617,27 +604,28 @@ upstreams:
     algorithm: consistent_hashing
     targets:
       - host: "127.0.0.1"
-        port: 30021
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30022
+        port: {port2}
         weight: 1
       - host: "127.0.0.1"
-        port: 30023
+        port: {port3}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
         .write_all(config.as_bytes())
         .unwrap();
 
-    let s1 = tokio::spawn(start_identifying_server(30021, "hash-server1"));
-    let s2 = tokio::spawn(start_identifying_server(30022, "hash-server2"));
-    let s3 = tokio::spawn(start_identifying_server(30023, "hash-server3"));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "hash-server1"));
+    let s2 = tokio::spawn(start_identifying_server(listener2, "hash-server2"));
+    let s3 = tokio::spawn(start_identifying_server(listener3, "hash-server3"));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -688,16 +676,20 @@ async fn test_active_health_check_excludes_unhealthy() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    // Server on port 30031 is healthy, server on port 30032 returns 500s,
-    // active health checks should mark 30032 as unhealthy after threshold
-    let config = r#"
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+
+    // The first server is healthy; the second returns 500s.
+    // Active health checks should mark the second unhealthy after threshold.
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-health-proxy"
     listen_path: "/health-test"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30031
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-health"
 
@@ -707,10 +699,10 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30031
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30032
+        port: {port2}
         weight: 1
     health_checks:
       active:
@@ -723,7 +715,8 @@ upstreams:
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -731,8 +724,8 @@ plugin_configs: []
         .unwrap();
 
     // Server 1 is healthy, server 2 returns 500
-    let s1 = tokio::spawn(start_identifying_server(30031, "healthy-server"));
-    let s2 = tokio::spawn(start_status_server(30032, "unhealthy-server", 500));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "healthy-server"));
+    let s2 = tokio::spawn(start_status_server(listener2, "unhealthy-server", 500));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -795,15 +788,19 @@ async fn test_passive_health_check_marks_unhealthy() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+
     // One server always returns 500, passive health check should eventually mark it unhealthy
-    let config = r#"
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-passive-proxy"
     listen_path: "/passive"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30041
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-passive"
 
@@ -813,10 +810,10 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30041
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30042
+        port: {port2}
         weight: 1
     health_checks:
       passive:
@@ -826,7 +823,8 @@ upstreams:
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -834,8 +832,8 @@ plugin_configs: []
         .unwrap();
 
     // Server 1 is healthy, server 2 always returns 500
-    let s1 = tokio::spawn(start_identifying_server(30041, "good-server"));
-    let s2 = tokio::spawn(start_status_server(30042, "bad-server", 500));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "good-server"));
+    let s2 = tokio::spawn(start_status_server(listener2, "bad-server", 500));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -906,17 +904,21 @@ async fn test_active_health_check_recovery() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    // Server on port 30051 is always healthy.
-    // Server on port 30052 starts failing then recovers (flapping server).
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+
+    // The first server is always healthy.
+    // The second starts failing then recovers (flapping server).
     // Active health check should eventually re-include server 2.
-    let config = r#"
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-recovery-proxy"
     listen_path: "/recovery"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30051
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-recovery"
 
@@ -926,10 +928,10 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30051
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30052
+        port: {port2}
         weight: 1
     health_checks:
       active:
@@ -942,7 +944,8 @@ upstreams:
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -950,8 +953,8 @@ plugin_configs: []
         .unwrap();
 
     // Server 1 is always healthy. Server 2 starts by failing 4 health checks then recovers.
-    let s1 = tokio::spawn(start_identifying_server(30051, "always-healthy"));
-    let s2 = tokio::spawn(start_flapping_server(30052, "recovering", 4));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "always-healthy"));
+    let s2 = tokio::spawn(start_flapping_server(listener2, "recovering", 4));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -1018,15 +1021,20 @@ async fn test_config_reload_updates_upstream_targets() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+    let (port3, listener3) = reserve_backend().await;
+
     // Initial config with 2 targets
-    let initial_config = r#"
+    let initial_config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-reload-proxy"
     listen_path: "/reload"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30061
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-reload"
 
@@ -1036,24 +1044,25 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30061
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30062
+        port: {port2}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
         .write_all(initial_config.as_bytes())
         .unwrap();
 
-    let s1 = tokio::spawn(start_identifying_server(30061, "target-a"));
-    let s2 = tokio::spawn(start_identifying_server(30062, "target-b"));
-    let s3 = tokio::spawn(start_identifying_server(30063, "target-c"));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "target-a"));
+    let s2 = tokio::spawn(start_identifying_server(listener2, "target-b"));
+    let s3 = tokio::spawn(start_identifying_server(listener3, "target-c"));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -1092,14 +1101,15 @@ plugin_configs: []
     );
 
     // Update config: add target-c, remove target-b
-    let updated_config = r#"
+    let updated_config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-reload-proxy"
     listen_path: "/reload"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30061
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-reload"
 
@@ -1109,15 +1119,16 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30061
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30063
+        port: {port3}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -1184,15 +1195,19 @@ async fn test_retry_selects_different_target() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+
     // One server always returns 502, retry should go to the other server
-    let config = r#"
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-retry-proxy"
     listen_path: "/retry"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30171
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-retry"
     retry:
@@ -1209,15 +1224,16 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30171
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30172
+        port: {port2}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -1225,8 +1241,8 @@ plugin_configs: []
         .unwrap();
 
     // Server 1 always returns 502, server 2 is healthy
-    let s1 = tokio::spawn(start_status_server(30171, "failing-server", 502));
-    let s2 = tokio::spawn(start_identifying_server(30172, "fallback-server"));
+    let s1 = tokio::spawn(start_status_server(listener1, "failing-server", 502));
+    let s2 = tokio::spawn(start_identifying_server(listener2, "fallback-server"));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -1274,9 +1290,9 @@ async fn test_retry_final_status_marks_rotated_target_passively_unhealthy() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let initial_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let initial_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let initial_port = initial_listener.local_addr().unwrap().port();
-    let retry_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let retry_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let retry_port = retry_listener.local_addr().unwrap().port();
 
     let config = format!(
@@ -1388,17 +1404,21 @@ async fn test_all_unhealthy_fallback() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+
     // Both servers return 500 on /health but 200 on other paths.
     // Active health checks will mark both as unhealthy,
     // but requests should still be served (fallback to all targets).
-    let config = r#"
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-fallback-proxy"
     listen_path: "/fallback"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30081
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-fallback"
 
@@ -1408,10 +1428,10 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30081
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30082
+        port: {port2}
         weight: 1
     health_checks:
       active:
@@ -1424,7 +1444,8 @@ upstreams:
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -1433,8 +1454,8 @@ plugin_configs: []
 
     // Both servers return 500 on /health (so active checks mark them unhealthy)
     // but they respond normally to other requests
-    let s1 = tokio::spawn(start_status_server(30081, "server-x", 500));
-    let s2 = tokio::spawn(start_status_server(30082, "server-y", 500));
+    let s1 = tokio::spawn(start_status_server(listener1, "server-x", 500));
+    let s2 = tokio::spawn(start_status_server(listener2, "server-y", 500));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -1488,14 +1509,20 @@ async fn test_multiple_upstreams() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let config = r#"
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+    let (port3, listener3) = reserve_backend().await;
+    let (port4, listener4) = reserve_backend().await;
+
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "api-proxy"
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30091
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-api"
 
@@ -1503,7 +1530,7 @@ proxies:
     listen_path: "/static"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30093
+    backend_port: {port3}
     strip_listen_path: true
     upstream_id: "upstream-static"
 
@@ -1513,10 +1540,10 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30091
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30092
+        port: {port2}
         weight: 1
 
   - id: "upstream-static"
@@ -1524,25 +1551,26 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30093
+        port: {port3}
         weight: 1
       - host: "127.0.0.1"
-        port: 30094
+        port: {port4}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
         .write_all(config.as_bytes())
         .unwrap();
 
-    let s1 = tokio::spawn(start_identifying_server(30091, "api-1"));
-    let s2 = tokio::spawn(start_identifying_server(30092, "api-2"));
-    let s3 = tokio::spawn(start_identifying_server(30093, "static-1"));
-    let s4 = tokio::spawn(start_identifying_server(30094, "static-2"));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "api-1"));
+    let s2 = tokio::spawn(start_identifying_server(listener2, "api-2"));
+    let s3 = tokio::spawn(start_identifying_server(listener3, "static-1"));
+    let s4 = tokio::spawn(start_identifying_server(listener4, "static-2"));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -1630,14 +1658,19 @@ async fn test_weighted_round_robin_three_targets() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let config = r#"
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+    let (port3, listener3) = reserve_backend().await;
+
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-wrr3-proxy"
     listen_path: "/wrr3"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30101
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-wrr3"
 
@@ -1647,27 +1680,28 @@ upstreams:
     algorithm: weighted_round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30101
+        port: {port1}
         weight: 3
       - host: "127.0.0.1"
-        port: 30102
+        port: {port2}
         weight: 2
       - host: "127.0.0.1"
-        port: 30103
+        port: {port3}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
         .write_all(config.as_bytes())
         .unwrap();
 
-    let s1 = tokio::spawn(start_identifying_server(30101, "weight-3"));
-    let s2 = tokio::spawn(start_identifying_server(30102, "weight-2"));
-    let s3 = tokio::spawn(start_identifying_server(30103, "weight-1"));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "weight-3"));
+    let s2 = tokio::spawn(start_identifying_server(listener2, "weight-2"));
+    let s3 = tokio::spawn(start_identifying_server(listener3, "weight-1"));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -1750,14 +1784,19 @@ async fn test_combined_active_and_passive_health_checks() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let config = r#"
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+    let (port3, listener3) = reserve_backend().await;
+
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-combined-proxy"
     listen_path: "/combined"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30111
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-combined"
 
@@ -1767,13 +1806,13 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30111
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30112
+        port: {port2}
         weight: 1
       - host: "127.0.0.1"
-        port: 30113
+        port: {port3}
         weight: 1
     health_checks:
       active:
@@ -1790,7 +1829,8 @@ upstreams:
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -1798,9 +1838,9 @@ plugin_configs: []
         .unwrap();
 
     // Server 1 healthy, server 2 returns 500 (caught by active), server 3 healthy
-    let s1 = tokio::spawn(start_identifying_server(30111, "combined-ok-1"));
-    let s2 = tokio::spawn(start_status_server(30112, "combined-bad", 500));
-    let s3 = tokio::spawn(start_identifying_server(30113, "combined-ok-2"));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "combined-ok-1"));
+    let s2 = tokio::spawn(start_status_server(listener2, "combined-bad", 500));
+    let s3 = tokio::spawn(start_identifying_server(listener3, "combined-ok-2"));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -1866,15 +1906,21 @@ async fn test_unreachable_target_with_retry() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
+    let (port1, listener1) = reserve_backend().await;
+    let unavailable_port = unbound_port()
+        .await
+        .expect("lease unavailable backend port");
+
     // One target is on a port where nothing is listening (connection refused)
-    let config = r#"
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-unreachable-proxy"
     listen_path: "/unreachable"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30121
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-unreachable"
     retry:
@@ -1891,23 +1937,24 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30121
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 39999
+        port: {unavailable_port}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
         .write_all(config.as_bytes())
         .unwrap();
 
-    // Only start server on port 30121, port 39999 has nothing listening
-    let s1 = tokio::spawn(start_identifying_server(30121, "reachable-server"));
+    // Only the reachable backend has a listener; the other port stays leased.
+    let s1 = tokio::spawn(start_identifying_server(listener1, "reachable-server"));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -1962,22 +2009,27 @@ async fn test_single_backend_and_load_balanced_coexist() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+    let (port3, listener3) = reserve_backend().await;
+
     // Two proxies: one uses upstream_id (load balanced), one uses direct backend
-    let config = r#"
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "direct-proxy"
     listen_path: "/direct"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30131
+    backend_port: {port1}
     strip_listen_path: true
 
   - id: "lb-proxy"
     listen_path: "/balanced"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30131
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-coexist"
 
@@ -1987,15 +2039,16 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30132
+        port: {port2}
         weight: 1
       - host: "127.0.0.1"
-        port: 30133
+        port: {port3}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -2003,10 +2056,10 @@ plugin_configs: []
         .unwrap();
 
     // direct-backend is the single-target server
-    let s1 = tokio::spawn(start_identifying_server(30131, "direct-backend"));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "direct-backend"));
     // lb targets
-    let s2 = tokio::spawn(start_identifying_server(30132, "lb-target-1"));
-    let s3 = tokio::spawn(start_identifying_server(30133, "lb-target-2"));
+    let s2 = tokio::spawn(start_identifying_server(listener2, "lb-target-1"));
+    let s3 = tokio::spawn(start_identifying_server(listener3, "lb-target-2"));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -2124,14 +2177,19 @@ async fn test_least_connections_load_balancing() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let config = r#"
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+    let (port3, listener3) = reserve_backend().await;
+
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-lc-proxy"
     listen_path: "/lc"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30201
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-lc"
 
@@ -2141,18 +2199,19 @@ upstreams:
     algorithm: least_connections
     targets:
       - host: "127.0.0.1"
-        port: 30201
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30202
+        port: {port2}
         weight: 1
       - host: "127.0.0.1"
-        port: 30203
+        port: {port3}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -2161,9 +2220,9 @@ plugin_configs: []
 
     // Use slow servers (200ms delay) so concurrent connections stay open
     // long enough for LC to see non-zero active connection counts.
-    let s1 = tokio::spawn(start_slow_identifying_server(30201, "lc-server1", 200));
-    let s2 = tokio::spawn(start_slow_identifying_server(30202, "lc-server2", 200));
-    let s3 = tokio::spawn(start_slow_identifying_server(30203, "lc-server3", 200));
+    let s1 = tokio::spawn(start_slow_identifying_server(listener1, "lc-server1", 200));
+    let s2 = tokio::spawn(start_slow_identifying_server(listener2, "lc-server2", 200));
+    let s3 = tokio::spawn(start_slow_identifying_server(listener3, "lc-server3", 200));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -2248,14 +2307,19 @@ async fn test_random_load_balancing() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let config = r#"
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+    let (port3, listener3) = reserve_backend().await;
+
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-rand-proxy"
     listen_path: "/rand"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30211
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-rand"
 
@@ -2265,27 +2329,28 @@ upstreams:
     algorithm: random
     targets:
       - host: "127.0.0.1"
-        port: 30211
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30212
+        port: {port2}
         weight: 1
       - host: "127.0.0.1"
-        port: 30213
+        port: {port3}
         weight: 1
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
         .write_all(config.as_bytes())
         .unwrap();
 
-    let s1 = tokio::spawn(start_identifying_server(30211, "rand-server1"));
-    let s2 = tokio::spawn(start_identifying_server(30212, "rand-server2"));
-    let s3 = tokio::spawn(start_identifying_server(30213, "rand-server3"));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "rand-server1"));
+    let s2 = tokio::spawn(start_identifying_server(listener2, "rand-server2"));
+    let s3 = tokio::spawn(start_identifying_server(listener3, "rand-server3"));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -2360,11 +2425,11 @@ async fn test_active_health_check_tcp_probe() {
     // second distinct ephemeral port through gateway startup so the harness
     // cannot allocate it for another listener. Releasing that reservation
     // below gives the TCP probe a deterministic refused target.
-    let healthy_listener = TcpListener::bind("127.0.0.1:0")
+    let healthy_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("reserve healthy TCP-probe backend");
     let healthy_port = healthy_listener.local_addr().unwrap().port();
-    let unavailable_reservation = TcpListener::bind("127.0.0.1:0")
+    let unavailable_reservation = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("reserve unavailable TCP-probe target");
     let unavailable_port = unavailable_reservation.local_addr().unwrap().port();
@@ -2410,7 +2475,7 @@ plugin_configs: []
         .write_all(config.as_bytes())
         .unwrap();
 
-    let s1 = tokio::spawn(serve_identifying_listener(healthy_listener, "tcp-healthy"));
+    let s1 = tokio::spawn(start_identifying_server(healthy_listener, "tcp-healthy"));
 
     let (mut gateway, proxy_port, _admin_port) =
         start_gateway_with_retry(config_path.to_str().unwrap()).await;
@@ -2494,17 +2559,21 @@ async fn test_passive_health_check_recovery_timer() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+
     // Configure passive health check with a short recovery timer.
     // One server returns 500s initially then recovers, the other is always healthy.
     // After the recovery timer fires, the flapping server should be restored.
-    let config = r#"
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-recovery-timer-proxy"
     listen_path: "/recovery-timer"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30231
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-recovery-timer"
 
@@ -2514,10 +2583,10 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30231
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30232
+        port: {port2}
         weight: 1
     health_checks:
       passive:
@@ -2528,7 +2597,8 @@ upstreams:
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -2536,8 +2606,8 @@ plugin_configs: []
         .unwrap();
 
     // Server 1 is always healthy. Server 2 fails first 10 requests then recovers.
-    let s1 = tokio::spawn(start_identifying_server(30231, "stable-server"));
-    let s2 = tokio::spawn(start_flapping_server(30232, "flapping-server", 10));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "stable-server"));
+    let s2 = tokio::spawn(start_flapping_server(listener2, "flapping-server", 10));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =
@@ -2637,17 +2707,21 @@ async fn test_active_health_check_custom_status_codes() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
+    let (port1, listener1) = reserve_backend().await;
+    let (port2, listener2) = reserve_backend().await;
+
     // Configure active health checks that accept 200 AND 503 as "healthy".
-    // Server on 30241 returns 200 (healthy), server on 30242 returns 503.
+    // The first server returns 200 (healthy); the second returns 503.
     // Because 503 is in healthy_status_codes, BOTH servers should stay healthy.
-    let config = r#"
+    let config = format!(
+        r#"
 version: "1"
 proxies:
   - id: "lb-custom-codes-proxy"
     listen_path: "/custom-codes"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 30241
+    backend_port: {port1}
     strip_listen_path: true
     upstream_id: "upstream-custom-codes"
 
@@ -2657,10 +2731,10 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: 30241
+        port: {port1}
         weight: 1
       - host: "127.0.0.1"
-        port: 30242
+        port: {port2}
         weight: 1
     health_checks:
       active:
@@ -2673,7 +2747,8 @@ upstreams:
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     std::fs::File::create(&config_path)
         .unwrap()
@@ -2681,8 +2756,8 @@ plugin_configs: []
         .unwrap();
 
     // Server 1 returns 200, server 2 returns 503 — but 503 is in healthy_status_codes
-    let s1 = tokio::spawn(start_identifying_server(30241, "ok-server"));
-    let s2 = tokio::spawn(start_status_server(30242, "maint-server", 503));
+    let s1 = tokio::spawn(start_identifying_server(listener1, "ok-server"));
+    let s2 = tokio::spawn(start_status_server(listener2, "maint-server", 503));
     sleep(Duration::from_millis(500)).await;
 
     let (mut gateway, proxy_port, _admin_port) =

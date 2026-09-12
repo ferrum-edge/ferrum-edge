@@ -2,7 +2,19 @@
 
 `api_chargeback_sink` exports durable charge events to ClickHouse. It is a sibling
 to `api_chargeback`: use either plugin independently, or run both when you want
-the existing in-memory `/charges` view plus a durable event stream.
+the existing in-memory `/charges` view plus a durable event stream. Each proxy
+admits at most one effective `api_chargeback_sink` after scope merging. Multiple
+sinks on disjoint proxies are allowed; fan-out from one transaction is not.
+Independent sinks mint different `event_id` values, so ClickHouse cannot deduplicate
+their rows. A scoped sink replaces the global sink on that proxy.
+
+An explicitly configured `price_per_call: 0` meters matching calls with
+`call_count: 1` and zero call charge, even without bandwidth pricing. An unmatched
+status has no row unless bandwidth pricing applies. Successful WebSocket
+handshakes use the `101` pricing tier and `protocol: ws` for H1 Upgrade and H2/H3
+Extended CONNECT alike. The latter retain `http_status_code: 200` (or their actual
+2xx wire status); rejected handshakes keep their error-status pricing. gRPC
+terminal-status pricing is unchanged.
 
 ## Durability Contract
 
@@ -22,6 +34,51 @@ When `wait_for_async_insert` is omitted from `insert_query_params`, the sink
 pins `wait_for_async_insert=1` on every durable request instead of inheriting a
 potentially lossy ClickHouse user/profile default (including profiles that
 enable `async_insert` while disabling the persistence wait).
+
+### Memory acceptance, shutdown, and abrupt termination
+
+Per-event admission is **not persistence**. A row can reside in the bounded
+channel, the pending batch, an HTTP attempt/retry, or the asynchronous spool
+handoff before any durable copy exists. `queue.depth` covers only the channel;
+`queue.outstanding` also includes pending batches and active exports for the
+current generation. `chargeback_sink_per_event_pending` and `totals.per_event.pending`
+cover newly emitted rows awaiting acknowledgement or spooling across **all**
+generations, including retired workers and spool handoffs. Snapshot accumulator
+exposure remains separately reported by snapshot gauges and pending finalizations.
+
+The per-event ledger counts `received_total` at bounded admission, including
+refusals, then settles each row exactly once as `persisted_total` after a successful
+ClickHouse acknowledgement or spool write, or `dropped_total` when its last memory
+owner disappears without either. In snapshot mode the durable spool artifact is
+written *before* the same rows are enqueued for low-latency delivery, so those
+rows enter the ledger already settled as persisted: a failed or diverted
+delivery attempt for a row the spool already owns never reports billing loss. At a settled observation:
+`received_total = persisted_total + dropped_total + pending`. Replays of an already
+spooled row do not increment this ledger; they retain the original `event_id`.
+These are row counts, not `call_count` sums or snapshot delta counts. The existing
+`events_enqueued_total` is narrower: it excludes refused admissions. A spool row
+subsequently evicted or dead-lettered is reported by the separate spool counters.
+The lossy async-insert opt-in still weakens the acknowledgement's persistence
+meaning. Independent metric samples are not an atomic transaction snapshot; allow
+for concurrent updates and the status endpoint's one-second cache when reconciling.
+
+Graceful retirement closes admission and drains pending batches through the
+normal delivery path. Graceful process shutdown attempts that drain within its
+configured deadline. Cancellation and failed delivery with no successful spool
+handoff count unresolved rows as dropped when Rust destructors run. Successful
+blocking spool writes retain ownership through completion even when the async
+waiter is cancelled.
+
+**SIGKILL, process crashes, power loss, and forced exit cannot flush memory or
+increment final loss counters.** Rows that had not reached ClickHouse or a
+successful spool write are unrecoverable; the last scrape is only an observation
+of the exposure. `batch.flush_interval_ms` bounds the scheduled batching delay,
+not end-to-end persistence latency: active HTTP timeouts, bounded retry attempts
+and delays, delivery backlog, and filesystem latency add to it. Channel capacity,
+`batch.buffer_max_bytes`, spool delivery capacity, and the process retained-byte
+ceiling bound memory; filesystem stalls do not have a wall-clock durability bound.
+Snapshot mode likewise has a pre-spool accumulator window until its next successful
+snapshot write. No in-memory metric survives a process restart.
 
 ### Credentials and `insert_query_params`
 
@@ -71,10 +128,10 @@ exported categorical field on the resulting `ChargeEvent`:
 
 - `namespace`
 - `consumer_id`
-- `consumer_name` (empty segment when absent)
+- `consumer_name` (custom metadata only; no built-in producer; empty when absent)
 - `proxy_id`
 - `proxy_name`
-- `route_id` (empty segment when absent)
+- `route_id` (custom metadata only; no built-in producer; empty when absent)
 - billable `status_code`
 - raw `http_status_code` (empty when absent, e.g. stream/WebSocket)
 - final `grpc_status` (empty when absent; non-standard codes collapse to a
@@ -121,6 +178,22 @@ lands; a full/closed delivery queue or a failed write re-stages the exact event
 within the retained-byte budget. If both durable handoff and bounded staging are
 exhausted, the sink records an explicit cardinality rejection counter instead of
 growing memory without bound.
+
+### Snapshot emission is chunked into bounded artifacts
+
+One spool artifact holds at most 10,000 rows, while `snapshot.max_entries`
+admits up to 1,000,000 identities. Every emission — the periodic tick, final
+emission at shutdown, and compact recovery of a retired generation — therefore
+writes its batch as a sequence of at-most-10,000-row artifacts rather than one
+oversized file, so a large accumulator is never permanently unable to reach the
+spool.
+
+Durability is settled per chunk, in order. Baselines advance, and staged
+overflow is released, only for the rows an artifact actually accepted; the
+remainder is re-staged (overflow) or simply recomputed from the unchanged
+baseline on the next tick (deltas). An emission that fails partway therefore
+retries only what never landed, keeps every row's `event_id`, and neither loses
+a charge nor bills one twice.
 
 ### Snapshot concurrency contract
 
@@ -267,18 +340,56 @@ zero delta.
 
 ## Admission Layers
 
+Admission runs in three distinct phases. Only the first two are reachable from
+`ferrum-edge validate`, so an environment approved by `validate` can still fail
+when serving starts.
+
+### 1. Schema admission (Admin, file mode, CP-DP)
+
 Admin, file-mode, and CP-DP admission share the OpenAPI
-`ApiChargebackSinkConfig` contract plus the plugin constructor
-(`ApiChargebackSink::new` / `validate_plugin_config`). OpenAPI requires
-`config`, `clickhouse.url`, at least one valid pricing dimension, snapshot
-mode with `spool.enabled=true`, and compatible `password_ref`/TLS settings.
-Constructor validation additionally enforces relationships OpenAPI 3.1 cannot
-express safely (notably `retry.max_delay_ms >= retry.initial_delay_ms` and the
-600000 ms worst-case cumulative inter-attempt delay budget),
-spool directory privacy, ClickHouse egress screening, that a nonempty
-`password_ref` names a set `FERRUM_*` environment variable, and that
-`wait_for_async_insert` falsy values require
+`ApiChargebackSinkConfig` contract. It requires `config`, `clickhouse.url`, at
+least one valid pricing dimension, `spool.enabled` not disabled under snapshot
+mode, compatible `password_ref`/TLS settings, `clickhouse.tls.client_cert_file`
+and `client_key_file` set together, and every numeric/length bound the
+constructor also enforces.
+
+### 2. Cold constructor validation (`validate`, and every admission path)
+
+`ApiChargebackSink::new` / `validate_plugin_config` is deliberately
+**runtime-free**: it reads no file, resolves no secret, builds no TLS client,
+creates no directory, and spawns no worker. It enforces the relationships
+OpenAPI 3.1 cannot express safely — notably
+`retry.max_delay_ms >= retry.initial_delay_ms`, the 600000 ms worst-case
+cumulative inter-attempt delay budget, and
+`snapshot.stale_entry_ttl_secs >= snapshot.interval_secs` — plus shape checks
+that need no I/O: ClickHouse egress screening of a literal-IP `clickhouse.url`,
+that a nonempty `password_ref` *is spelled* `FERRUM_*`, that `spool.dir` is a
+nonempty NUL-free path when spooling is enabled, that
+`clickhouse.tls.client_cert_file` and `client_key_file` are either both set or
+both absent, that `currency` and `pricing_version` are non-blank and at most
+512 UTF-8 bytes, and that `wait_for_async_insert` falsy values require
 `clickhouse.allow_lossy_async_insert=true`.
+
+`currency` and `pricing_version` are copied verbatim into every exported row
+and count against the bounded charge-event budget, so a longer label is
+rejected here rather than silently truncated — truncation would merge two
+distinct pricing or currency identities into one ClickHouse row.
+
+### 3. Activation (serving startup only)
+
+These checks require local files, the process environment, or the filesystem
+and therefore **do not run under `validate`**:
+
+- resolving `clickhouse.password_ref` to a set environment variable,
+- reading and parsing `clickhouse.tls.ca_file` and the client certificate/key
+  pair into a dedicated TLS client,
+- creating the spool directory tree and enforcing its private permissions
+  (`ensure_private_dir`), the ownership lock, and `spool.meta.json` identity.
+
+A configuration that passes `validate` on a workstation can still abort
+`ferrum-edge run` on a node where the referenced secret or file is missing, or
+where the spool path is not privately writable. Validate the shape in CI;
+verify secrets and storage on the node.
 
 ## ClickHouse Setup
 
@@ -352,6 +463,25 @@ failure the static contract test is there to catch. Operators who rename or
 omit keys must keep the destination table in sync; Ferrum cannot inspect the
 remote schema.
 
+The OpenAPI `schema` property uses `ApiChargebackSinkLogSchema`, a refinement
+of the shared logging schema for this row family. It accepts `omit`, `rename`,
+`order`, `static_fields`, and `derived_fields`. Omit/rename source names must
+come from the native JSON keys above. Derived kinds are `status_class` (from
+billable `status_code`), `summary_kind` (always `charge_event`), and `outcome`
+(`error` for `status_code >= 500` or a nonzero `grpc_status`, otherwise `ok`).
+`backend_host` is rejected. The keys `summary_type`, `timestamp_format`, and
+`metadata` are forbidden even with null/default values; `received_at` remains
+an epoch-nanosecond integer.
+
+`schema` and `schema_ref` are mutually exclusive by key presence, including
+null values. `schema_ref` must be a nonempty registered name; the constructor
+resolves and recompiles its definition with the same sink restrictions. Named
+definitions must first compile against the transaction-summary inventory, so
+use inline `schema` for charge-event-only fields. JSON Schema cannot resolve
+the named registry or compare the final projected keys: reference existence,
+output-key collisions, sensitive-data restrictions, omit/rename conflicts,
+and complete `order` coverage remain constructor checks.
+
 For HTTP-family events, `status_code` is the billable status used for pricing
 and rollups. `http_status_code` preserves the transport status, and
 `grpc_status` preserves the normalized final application code when the request
@@ -359,6 +489,29 @@ was native gRPC or translated gRPC-Web. Stream and WebSocket-disconnect events
 leave both raw-status columns null. This keeps transport and application
 outcomes auditable even when several gRPC codes share one effective billing
 bucket.
+
+## Correlation ID Export
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `include_request_id` | Boolean | `true` | Export the transaction's canonical request/correlation ID as `request_id` |
+| `include_trace_id` | Boolean | `true` | Export the transaction's trace correlation value as `trace_id` |
+
+Both apply to **per-event** rows only. Snapshot deltas aggregate many
+transactions into one row, so `request_id` and `trace_id` are always omitted
+from snapshot events regardless of these switches.
+
+Setting a switch to `false` omits the JSON key entirely — the column is left to
+its ClickHouse default rather than written empty. The key is likewise omitted
+when the flag is `true` but the transaction carries no such metadata, so an
+absent column never distinguishes "disabled" from "unavailable".
+
+`request_id` reads the canonical `request_id` metadata first and falls back to
+the older `x-request-id` / `correlation_id` spellings only for custom plugins
+that predate the canonical contract. `trace_id` reads `trace_id` metadata first
+and falls back to the transaction's `traceparent` metadata. Disable either
+switch when the destination table has no such column, or when per-request
+identifiers must not be retained in the billing warehouse.
 
 ## Example Config
 
@@ -403,10 +556,16 @@ bucket.
       "emit_zero_deltas": false
     },
     "pricing_version": "2026-01-rev3",
-    "currency": "USD"
+    "currency": "USD",
+    "include_request_id": true,
+    "include_trace_id": true
   }
 }
 ```
+
+`currency` and `pricing_version` are operator labels copied verbatim into every
+exported row. Each is required, must not be blank after trimming, and is
+admitted only up to 512 UTF-8 bytes.
 
 Fire-and-forget (lossy) async inserts require an explicit opt-in that cannot be
 confused with durable mode:
@@ -502,6 +661,10 @@ handoff actually accepts the job; a saturated or closed delivery queue is
 counted by `chargeback_sink_spool_jobs_lost_total` /
 `chargeback_sink_spool_events_lost_total` instead (with rate-limited warnings)
 and must not be reported as a successful diversion or enqueue.
+Async spool-write failures and exhausted exports with spooling disabled use the
+shared warning sampler: one warning per source site per 10 seconds across
+instances, with `suppressed_events` counts. Every failure remains at debug level;
+delivery and loss counters retain their existing accounting.
 `events_enqueued_total` / `chargeback_sink_events_enqueued_total` counts channel
 admission or an overflow handoff that actually succeeded. Request and body
 terminal hooks only enqueue to that worker; compression, directory scans,
@@ -692,8 +855,9 @@ an unproven pathname merely because its filename contains an `owner_tag`.
 
 Queued export and spool-delivery events retain the same byte leases under
 `batch.buffer_max_bytes`; transferring an event to the spool worker does not
-escape or double-count that budget. The minimum admitted budget is 9312 bytes,
-the conservative maximum retained size of one field-bounded charge event.
+escape or double-count that budget. The minimum admitted budget is 9440 bytes,
+the conservative maximum retained size of one field-bounded charge event,
+including 128 bytes reserved for shared lifetime accounting.
 
 ### Delivery outcomes
 
@@ -990,7 +1154,16 @@ operators must inspect and reconcile the previous node subtree explicitly.
 
 ## Reconciliation Queries
 
-Raw event count:
+`received_at` is the charge event's emission time, not HTTP request arrival time
+(`timestamp_received`). WebSocket bandwidth and TCP/UDP/DTLS session charges emit
+at disconnect, so all session bandwidth belongs to the closing period, including
+`charges_monthly` and `PARTITION BY toYYYYMM(received_at)`. WebSocket handshake
+call charges emit separately at handshake completion. Snapshot deltas use their
+emission time. No request-arrival column is added to the baseline schema.
+`consumer_name` and `route_id` are optional custom-plugin metadata dimensions;
+built-in paths do not populate them and their exported values are absent/null.
+
+Raw events emitted during the last hour (including sessions that started earlier):
 
 ```sql
 SELECT count(), sum(charge_total)
@@ -1047,26 +1220,42 @@ Response contract:
 - `totals` aggregates queue depth/capacity/high-water hits/high-water
   diversions/full-buffer drops, spool files/bytes/
   drops/prepare failures/replay attempts/durably dead-lettered rows, and export
-  counters across every current accepted instance.
+  counters. Gauges describe current accepted instances; cumulative counters retain
+  process history across reload, removal, and late completion of retired workers.
+  `totals.per_event` reports the process ledger described above.
   `totals.spool.available` is `true` only when every spool-enabled live instance
   is currently writable.
 - `instances` lists the current accepted generation for each sink in ascending
   `plugin_config_id` order. Each entry includes its generation plus
-  mode, pricing version, sanitized ClickHouse endpoint metadata, batch/retry
+  mode, pricing version, redacted ClickHouse endpoint metadata, batch/retry
   settings, per-instance queue/spool/export counters, and timestamps.
+  `clickhouse.endpoint` is the structural `scheme://host:port/redacted` form
+  every HTTP-backed sink renders in diagnostics: userinfo, path, query, and
+  fragment never appear, so this surface cannot disclose a credential the
+  admin plugin-config read path already withholds from non-admin roles. The
+  durable spool owner keeps binding the full sanitized endpoint (including its
+  path), so existing artifacts stay attributable to the sink that wrote them.
 
 Cardinality is bounded by the number of accepted plugin-config IDs. A newly
 accepted generation replaces the prior status entry for the same stable ID;
 dropping an older in-flight runtime removes nothing unless it is still the
 published generation.
 
-`/metrics` preserves the existing metric names as process-wide aggregates
-across the current accepted sink generation for every stable plugin-config ID:
+`/metrics` keeps cumulative counters and export-latency histogram observations
+for the process lifetime, even after all sinks are removed. It uses fixed-size
+process storage, with no retained policy IDs or retired runtime registry. Current
+instance status counters remain generation-local diagnostics; top-level totals and
+Prometheus counters are cumulative. Existing metric names are preserved:
 
 - `chargeback_sink_events_enqueued_total`
 - `chargeback_sink_events_exported_total`
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
+- `chargeback_sink_queue_outstanding`
+- `chargeback_sink_per_event_received_total`
+- `chargeback_sink_per_event_persisted_total`
+- `chargeback_sink_per_event_dropped_total`
+- `chargeback_sink_per_event_pending`
 - `chargeback_sink_queue_high_water_hits_total`
 - `chargeback_sink_queue_high_water_diversions_total`
 - `chargeback_sink_queue_full_drops_total`
@@ -1096,7 +1285,16 @@ requires an `https://` `clickhouse.url` and rejects configs that disable TLS
 certificate or hostname verification, so Basic Auth credentials are never sent
 over cleartext. Configure mTLS with `clickhouse.tls.client_cert_file`
 and `clickhouse.tls.client_key_file` when ClickHouse requires client
-authentication. Keep `password_ref` pointed at an environment variable resolved
-by Ferrum's existing secret materialization; do not place credentials directly
-in plugin config. The admin status response strips user-info and never returns
-passwords or bearer material.
+authentication. Both files must be configured together; an incomplete pair is
+refused at admission rather than at serving startup. Keep `password_ref`
+pointed at an environment variable resolved by Ferrum's existing secret
+materialization; do not place credentials directly in plugin config.
+
+The admin status response never returns passwords or bearer material, and its
+`clickhouse.endpoint` is structurally redacted to `scheme://host:port/redacted`.
+Path, query, and fragment are dropped along with user-info, so a token embedded
+anywhere in `clickhouse.url` cannot be read back from status by a role that
+cannot read the raw plugin config — the plugin-config read path applies the same
+projection. Prefer `username` + `password_ref` over any credential embedded in
+the URL: Ferrum sends those as an HTTP Basic header rather than appending them
+to the INSERT URL.

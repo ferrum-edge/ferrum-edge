@@ -21,6 +21,8 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_scale_perf -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::Full;
@@ -176,15 +178,15 @@ impl ScalePerfHarness {
         let jwt_issuer = identity.jwt_issuer.clone();
         let observability_token = identity.observability_token.clone();
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         let admin_port = admin_listener.local_addr()?.port();
         drop(admin_listener);
 
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         let proxy_port = proxy_listener.local_addr()?.port();
         drop(proxy_listener);
 
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         let backend_port = backend_listener.local_addr()?.port();
         drop(backend_listener);
 
@@ -213,6 +215,7 @@ impl ScalePerfHarness {
         // Run migrations first for postgres
         if db_type == "postgres" {
             let migrate_status = Command::new(binary_path)
+                .arg("run")
                 .env("FERRUM_MODE", "migrate")
                 .env("FERRUM_DB_TYPE", db_type)
                 .env("FERRUM_DB_URL", db_url)
@@ -224,6 +227,7 @@ impl ScalePerfHarness {
         }
 
         let mut command = Command::new(binary_path);
+        command.arg("run");
         command
             .env("FERRUM_MODE", "database")
             .env(
@@ -351,7 +355,7 @@ impl Drop for ScalePerfHarness {
 async fn start_echo_backend(
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
     let handle = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(async move {

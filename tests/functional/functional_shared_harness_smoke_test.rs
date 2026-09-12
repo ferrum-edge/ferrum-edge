@@ -15,6 +15,8 @@
 //!
 //! [`TestGateway`]: crate::common::TestGateway
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{
     ConsumerBuilder, GatewayConfigBuilder, PluginConfigBuilder, ProxyBuilder, TestGateway,
     probe_gateway_identity, scrub_gateway_capture_for_diagnostics, spawn_http_echo,
@@ -222,7 +224,7 @@ enum FakeHealthTier {
 /// a real gateway so the test pins the *probe's* decision rule, independently
 /// of how much of a gateway happens to have started.
 async fn spawn_fake_health_listener(tier: FakeHealthTier) -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind fake health listener");
     let port = listener.local_addr().expect("fake listener addr").port();
@@ -334,7 +336,7 @@ async fn test_harness_identity_accepts_only_matching_credential() {
 #[tokio::test]
 #[ignore]
 async fn test_harness_identity_rejects_bare_tcp_listener() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let accept_task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
@@ -466,6 +468,16 @@ fn harness_capture_diagnostics_scrub_secrets_and_bound_output() {
         scrubbed_sensitive.contains("redis://***@127.0.0.1:6379/0"),
         "credential-bearing Redis URL should retain a redacted host form: {scrubbed_sensitive}"
     );
+
+    for delimiter_secret in ["/", ":", "@"] {
+        let scrubbed_delimiter =
+            scrub_gateway_capture_for_diagnostics(&sensitive, &[delimiter_secret]);
+        assert!(
+            !scrubbed_delimiter.contains("user:s3cret@"),
+            "URL userinfo must be redacted before replacing delimiter secret {delimiter_secret:?}: \
+             {scrubbed_delimiter}"
+        );
+    }
 
     let oversized = format!("{}{}", "x".repeat(20_000), sensitive);
     let scrubbed_oversized =

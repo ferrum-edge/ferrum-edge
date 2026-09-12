@@ -6,13 +6,34 @@ use std::collections::HashMap;
 
 use super::plugin_utils::{create_test_context, normalize_compressed_request_for_plugin_test};
 
-/// Mutex to serialize tests that touch process-global env vars.
+/// RAII guard over the single process-wide environment lock.
 ///
 /// This is the single process-wide lock, not a file-private one. These tests
 /// write `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_DEFAULT_REGION`, which
 /// the AWS secret-backend tests in `unit::secrets::aws_tests` read through the
 /// SDK's credential chain, so the two suites must serialize against each other.
-use crate::unit::env_lock::ENV_LOCK as ENV_MUTEX;
+/// The guard also restores every variable it saved, so a fixture value — or a
+/// panicking assertion — cannot leak into a later test in the binary.
+use crate::unit::env_lock::EnvGuard;
+
+/// Reader/writer discipline for this file's process-global provider credentials.
+///
+/// `ServerlessFunction::new` resolves an absent credential from the process
+/// environment (`AWS_*`, `AZURE_FUNCTIONS_KEY`,
+/// `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`), so almost every construction below is
+/// an environment READ. A test that publishes a fixture value therefore has to
+/// exclude every other test in this file, not merely the other writers: owning
+/// the environment lock orders writers against each other while an unlocked
+/// reader still races them. `#[serial(serverless_env)]` marks a writer,
+/// `#[parallel(serverless_env)]` marks a reader, and readers keep running
+/// concurrently with one another.
+///
+/// The gate stops at this file, so no fixture value may be one that makes
+/// admission FAIL: sibling files in the same binary (`plugin_cache_tests`,
+/// `request_deduplication_tests`, `plugin_utils::minimal_plugin_config`)
+/// construct credential-less serverless plugins too, and nothing here can
+/// exclude them. See `test_environment_resolved_credentials_are_validated_too`.
+use serial_test::{parallel, serial};
 
 /// Test shim for the finalized-request-egress phase.
 ///
@@ -69,11 +90,39 @@ fn expect_err(result: Result<ServerlessFunction, String>) -> String {
     }
 }
 
+/// Every process-global variable `ServerlessFunction::new` can resolve a
+/// provider credential or endpoint from.
+const PROVIDER_ENV_VARS: [&str; 9] = [
+    "AWS_DEFAULT_REGION",
+    "AWS_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "AWS_LAMBDA_ENDPOINT_URL",
+    "AZURE_FUNCTIONS_KEY",
+    "GCP_CLOUD_FUNCTIONS_BEARER_TOKEN",
+];
+
+/// Own the process-wide environment lock with every provider variable saved for
+/// restoration on drop, starting from a cleared environment.
+///
+/// Callers must also be `#[serial(serverless_env)]`: the guard excludes other
+/// lock holders, the attribute excludes this file's readers.
+fn cleared_provider_env() -> EnvGuard {
+    let env = EnvGuard::new(&PROVIDER_ENV_VARS);
+    for key in PROVIDER_ENV_VARS {
+        env.unset(key);
+    }
+    env
+}
+
 // ---------------------------------------------------------------------------
 // Plugin basics
 // ---------------------------------------------------------------------------
 
 #[test]
+#[parallel(serverless_env)]
 fn test_plugin_name_and_priority() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -89,6 +138,7 @@ fn test_plugin_name_and_priority() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_supported_protocols() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -109,6 +159,7 @@ fn test_supported_protocols() {
 /// still fire, and so runtime construction agrees with the pure candidate view
 /// in `plugin_cache::ServerlessSecurityCompositionPlugin`.
 #[test]
+#[parallel(serverless_env)]
 fn pre_proxy_mode_still_reports_backend_visible_header_mutation() {
     let pre_proxy = ServerlessFunction::new(
         &json!({
@@ -139,6 +190,7 @@ fn pre_proxy_mode_still_reports_backend_visible_header_mutation() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_warmup_hostnames() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -154,6 +206,7 @@ fn test_warmup_hostnames() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_warmup_hostnames_unbrackets_ipv6_function_url() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -168,6 +221,7 @@ fn test_warmup_hostnames_unbrackets_ipv6_function_url() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_warmup_hostnames_aws() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -189,6 +243,7 @@ fn test_warmup_hostnames_aws() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_warmup_hostnames_aws_endpoint_ipv6_override() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -211,6 +266,7 @@ fn test_warmup_hostnames_aws_endpoint_ipv6_override() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[parallel(serverless_env)]
 fn test_non_object_config_rejects() {
     for config in [Value::Null, json!("bad"), json!([]), json!(42)] {
         let err = expect_err(ServerlessFunction::new(&config, default_client()));
@@ -219,6 +275,7 @@ fn test_non_object_config_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_unknown_fields_are_rejected_deterministically() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -233,6 +290,7 @@ fn test_unknown_fields_are_rejected_deterministically() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_explicit_null_diagnostics_distinguish_required_and_optional_fields() {
     for field in [
         "provider",
@@ -289,6 +347,7 @@ fn test_explicit_null_diagnostics_distinguish_required_and_optional_fields() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_function_urls_reject_userinfo_without_echoing_credentials() {
     let secret = "url-password-do-not-echo";
     let err = expect_err(ServerlessFunction::new(
@@ -306,6 +365,7 @@ fn test_function_urls_reject_userinfo_without_echoing_credentials() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_function_urls_reject_fragments_that_clients_do_not_send() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -325,6 +385,7 @@ fn test_function_urls_reject_fragments_that_clients_do_not_send() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_function_url_diagnostic_form_redacts_path_and_query_credentials() {
     let raw = "https://functions.example/private/signed-secret?code=query-secret";
     let diagnostic = redact_serverless_url(raw);
@@ -337,6 +398,7 @@ fn test_function_url_diagnostic_form_redacts_path_and_query_credentials() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_endpoint_override_rejects_non_origin_components() {
     for (endpoint, expected_error) in [
         ("https://example.com/lambda", "must be an HTTP(S) origin"),
@@ -365,12 +427,14 @@ fn test_aws_endpoint_override_rejects_non_origin_components() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_final_error_status_boundaries_are_accepted() {
     for status in [400, 599] {
         ServerlessFunction::new(
             &json!({
                 "provider": "azure_functions",
                 "function_url": "https://example.com/func",
+                "azure_function_key": "boundary-fixture-key",
                 "error_status_code": status
             }),
             default_client(),
@@ -380,12 +444,14 @@ fn test_final_error_status_boundaries_are_accepted() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_missing_provider_rejects() {
     let err = expect_err(ServerlessFunction::new(&json!({}), default_client()));
     assert!(err.contains("provider"));
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_unknown_provider_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -398,6 +464,7 @@ fn test_unknown_provider_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_azure_missing_url_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({ "provider": "azure_functions" }),
@@ -407,6 +474,7 @@ fn test_azure_missing_url_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_gcp_missing_url_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({ "provider": "gcp_cloud_functions" }),
@@ -416,6 +484,7 @@ fn test_gcp_missing_url_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_rejects_invalid_ignored_function_url() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -432,14 +501,9 @@ fn test_aws_rejects_invalid_ignored_function_url() {
 }
 
 #[test]
+#[serial(serverless_env)]
 fn test_aws_missing_region_rejects() {
-    let _lock = ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // SAFETY: serialized by ENV_MUTEX — no concurrent env var access
-    unsafe {
-        remove_all_aws_env_vars();
-    }
+    let _env = cleared_provider_env();
     let err = expect_err(ServerlessFunction::new(
         &json!({
             "provider": "aws_lambda",
@@ -453,13 +517,9 @@ fn test_aws_missing_region_rejects() {
 }
 
 #[test]
+#[serial(serverless_env)]
 fn test_aws_missing_access_key_rejects() {
-    let _lock = ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    unsafe {
-        remove_all_aws_env_vars();
-    }
+    let _env = cleared_provider_env();
     let err = expect_err(ServerlessFunction::new(
         &json!({
             "provider": "aws_lambda",
@@ -473,13 +533,9 @@ fn test_aws_missing_access_key_rejects() {
 }
 
 #[test]
+#[serial(serverless_env)]
 fn test_aws_missing_secret_key_rejects() {
-    let _lock = ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    unsafe {
-        remove_all_aws_env_vars();
-    }
+    let _env = cleared_provider_env();
     let err = expect_err(ServerlessFunction::new(
         &json!({
             "provider": "aws_lambda",
@@ -493,13 +549,9 @@ fn test_aws_missing_secret_key_rejects() {
 }
 
 #[test]
+#[serial(serverless_env)]
 fn test_aws_missing_function_name_rejects() {
-    let _lock = ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    unsafe {
-        remove_all_aws_env_vars();
-    }
+    let _env = cleared_provider_env();
     let err = expect_err(ServerlessFunction::new(
         &json!({
             "provider": "aws_lambda",
@@ -513,6 +565,7 @@ fn test_aws_missing_function_name_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_invalid_url_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -525,6 +578,7 @@ fn test_invalid_url_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_non_http_url_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -537,6 +591,7 @@ fn test_non_http_url_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_function_url_empty_authority_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -556,6 +611,7 @@ fn test_function_url_empty_authority_rejects() {
 // as an opaque reqwest invoke error instead of a deterministic config
 // rejection.
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_endpoint_url_missing_scheme_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -575,6 +631,7 @@ fn test_aws_endpoint_url_missing_scheme_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_endpoint_url_non_http_scheme_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -592,6 +649,7 @@ fn test_aws_endpoint_url_non_http_scheme_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_endpoint_url_empty_authority_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -609,6 +667,7 @@ fn test_aws_endpoint_url_empty_authority_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_endpoint_url_valid_accepts() {
     // Happy path — the override must work as the test harness relies on it.
     ServerlessFunction::new(
@@ -626,6 +685,7 @@ fn test_aws_endpoint_url_valid_accepts() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_zero_timeout_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -639,6 +699,7 @@ fn test_zero_timeout_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_unknown_mode_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -652,6 +713,7 @@ fn test_unknown_mode_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_unknown_on_error_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -665,6 +727,7 @@ fn test_unknown_on_error_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_zero_max_response_body_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -678,6 +741,7 @@ fn test_zero_max_response_body_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_error_status_code_below_400_rejects() {
     for status in [100, 199, 399] {
         let err = expect_err(ServerlessFunction::new(
@@ -696,6 +760,7 @@ fn test_error_status_code_below_400_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_error_status_code_above_599_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -709,6 +774,7 @@ fn test_error_status_code_above_599_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_non_string_mode_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -722,6 +788,7 @@ fn test_non_string_mode_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_non_bool_forward_body_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -739,6 +806,7 @@ fn test_non_bool_forward_body_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_non_bool_forward_query_params_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -756,6 +824,7 @@ fn test_non_bool_forward_query_params_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_invalid_forward_headers_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -769,6 +838,7 @@ fn test_invalid_forward_headers_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_non_array_forward_headers_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -786,6 +856,7 @@ fn test_non_array_forward_headers_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_non_integer_timeout_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -803,6 +874,7 @@ fn test_non_integer_timeout_rejects() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_non_string_on_error_rejects() {
     let err = expect_err(ServerlessFunction::new(
         &json!({
@@ -820,6 +892,7 @@ fn test_non_string_on_error_rejects() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_lambda_with_qualifier() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -843,6 +916,7 @@ fn test_aws_lambda_with_qualifier() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_azure_with_function_key() {
     let result = ServerlessFunction::new(
         &json!({
@@ -856,6 +930,7 @@ fn test_azure_with_function_key() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_gcp_with_bearer_token() {
     let result = ServerlessFunction::new(
         &json!({
@@ -869,6 +944,7 @@ fn test_gcp_with_bearer_token() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_terminate_mode() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -885,6 +961,7 @@ fn test_terminate_mode() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_pre_proxy_mode_uses_finalized_header_overlay() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -908,6 +985,7 @@ fn test_pre_proxy_mode_uses_finalized_header_overlay() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[parallel(serverless_env)]
 fn test_body_buffering_disabled_by_default() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -925,6 +1003,7 @@ fn test_body_buffering_disabled_by_default() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_body_buffering_enabled_with_forward_body() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -962,6 +1041,7 @@ fn test_body_buffering_enabled_with_forward_body() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[parallel(serverless_env)]
 fn test_default_mode_is_pre_proxy() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -981,6 +1061,7 @@ fn test_default_mode_is_pre_proxy() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_default_on_error_is_reject() {
     let result = ServerlessFunction::new(
         &json!({
@@ -997,6 +1078,7 @@ fn test_default_on_error_is_reject() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_before_proxy_error_reject_mode() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -1023,6 +1105,7 @@ async fn test_before_proxy_error_reject_mode() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_before_proxy_error_continue_mode() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -1057,6 +1140,7 @@ async fn test_before_proxy_error_continue_mode() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_mode_rejects_grpc_web_requests() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -1097,6 +1181,7 @@ async fn test_terminate_mode_rejects_grpc_web_requests() {
 /// exactly like native gRPC. Header inspection alone would frame a native unary
 /// response for a client that can only read gRPC-Web body-framed trailers.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_mode_rejects_translated_grpc_web_requests() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -1135,6 +1220,7 @@ async fn test_terminate_mode_rejects_translated_grpc_web_requests() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_mode_frames_native_grpc_unary_response() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1232,6 +1318,7 @@ async fn test_terminate_mode_frames_native_grpc_unary_response() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_mode_native_grpc_malformed_contract_fails_closed() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1274,6 +1361,7 @@ async fn test_terminate_mode_native_grpc_malformed_contract_fails_closed() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_native_grpc_terminate_contract_rejects_streaming_and_reserved_trailers() {
     let streaming_err =
         ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test(
@@ -1317,6 +1405,7 @@ fn frame_terminate_message(message: &[u8]) -> Bytes {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_normalize_reject_preserves_framed_unary_grpc_body() {
     use ferrum_edge::_test_support::{
         framed_unary_reject_trailers, normalize_reject_response_with_context,
@@ -1378,6 +1467,7 @@ fn test_normalize_reject_preserves_framed_unary_grpc_body() {
 /// full-body copy. A 256 KiB message makes a regression an unmistakable pointer
 /// change rather than an allocator coincidence.
 #[test]
+#[parallel(serverless_env)]
 fn test_framed_unary_reject_shares_the_authored_frame_allocation() {
     use ferrum_edge::_test_support::{
         normalize_reject_response_bytes_with_context, set_serverless_grpc_terminate_frame_for_test,
@@ -1425,6 +1515,7 @@ fn test_framed_unary_reject_shares_the_authored_frame_allocation() {
 /// reintroduce a per-reject copy at the QUIC boundary while every shared helper
 /// stays clean.
 #[test]
+#[parallel(serverless_env)]
 fn test_h3_framed_unary_writer_moves_the_shared_frame_to_quic() {
     let server = include_str!("../../../src/http3/server.rs");
     let start = server
@@ -1455,6 +1546,7 @@ fn test_h3_framed_unary_writer_moves_the_shared_frame_to_quic() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_h3_framed_unary_reject_emits_each_cookie_as_a_separate_header() {
     let mut headers = framed_grpc_terminate_reject_headers();
     headers.insert(
@@ -1479,6 +1571,7 @@ fn test_h3_framed_unary_reject_emits_each_cookie_as_a_separate_header() {
 /// `grpc-status`; it must still normalize to trailers-only so an untrusted body
 /// is never reflected onto the wire.
 #[test]
+#[parallel(serverless_env)]
 fn test_normalize_reject_without_provenance_stays_trailers_only() {
     use ferrum_edge::_test_support::{
         framed_unary_reject_trailers, normalize_reject_response_with_context,
@@ -1508,6 +1601,7 @@ fn test_normalize_reject_without_provenance_stays_trailers_only() {
 /// `serverless_function` stamped its frame — and any later unrelated rejection
 /// on the same request — falls back to trailers-only.
 #[test]
+#[parallel(serverless_env)]
 fn test_normalize_reject_provenance_is_byte_exact() {
     use ferrum_edge::_test_support::{
         normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
@@ -1557,6 +1651,7 @@ fn test_normalize_reject_provenance_is_byte_exact() {
 /// INTERNAL — the client has to see the rejection's real gRPC error even though
 /// the stale contract `grpc-status: 0` is still sitting in the header map.
 #[test]
+#[parallel(serverless_env)]
 fn test_normalize_reject_invalidated_by_body_policy_keeps_rejection_status() {
     use ferrum_edge::_test_support::{
         normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
@@ -1596,6 +1691,7 @@ fn test_normalize_reject_invalidated_by_body_policy_keeps_rejection_status() {
 /// authorization is bound to the status the contract authored as well as to the
 /// frame — so the original successful trailers can never ride out on it.
 #[test]
+#[parallel(serverless_env)]
 fn test_normalize_reject_stale_provenance_is_not_inherited() {
     use ferrum_edge::_test_support::{
         framed_unary_reject_trailers, normalize_reject_response_with_context,
@@ -1677,6 +1773,7 @@ fn status_only_grpc_terminate_trailers() -> HashMap<String, String> {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_authorized_grpc_terminate_frame_runs_response_body_lifecycle() {
     use ferrum_edge::_test_support::synthetic_response_body_hooks_apply_for_test;
 
@@ -1692,6 +1789,7 @@ fn test_authorized_grpc_terminate_frame_runs_response_body_lifecycle() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_ordinary_grpc_reject_still_skips_response_body_lifecycle() {
     use ferrum_edge::_test_support::synthetic_response_body_hooks_apply_for_test;
 
@@ -1726,6 +1824,7 @@ fn test_ordinary_grpc_reject_still_skips_response_body_lifecycle() {
 /// The authorization is native-gRPC only. A non-gRPC request keeps the ordinary
 /// HTTP representation rather than being reinterpreted as a framed unary reply.
 #[test]
+#[parallel(serverless_env)]
 fn test_normalize_reject_provenance_does_not_apply_to_non_grpc() {
     use ferrum_edge::_test_support::{
         normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
@@ -1754,6 +1853,7 @@ fn test_normalize_reject_provenance_does_not_apply_to_non_grpc() {
 /// client sees comes from the validated contract, not from the reject header map
 /// (which here still carries an unrelated `grpc-status: 0`).
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_mode_status_only_grpc_response_is_trailers_only() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1827,6 +1927,7 @@ async fn test_terminate_mode_status_only_grpc_response_is_trailers_only() {
 /// representation, and the contract's own `grpc-status` must not ride out with
 /// it as an empty Trailers-Only success either.
 #[test]
+#[parallel(serverless_env)]
 fn test_normalize_reject_status_only_with_unauthored_body_fails_closed() {
     use ferrum_edge::_test_support::{
         framed_unary_reject_trailers, normalize_reject_response_with_context,
@@ -1869,6 +1970,7 @@ fn test_normalize_reject_status_only_with_unauthored_body_fails_closed() {
 /// status; failing closed must surface that status rather than the contract's
 /// residual `grpc-status: 0`.
 #[test]
+#[parallel(serverless_env)]
 fn test_normalize_reject_status_only_invalidated_by_status_change_fails_closed() {
     use ferrum_edge::_test_support::{
         normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
@@ -1899,6 +2001,7 @@ fn test_normalize_reject_status_only_invalidated_by_status_change_fails_closed()
 /// cannot authorize anything: it is an invalidation like any other, not a
 /// fallback to the mutable reject header map.
 #[test]
+#[parallel(serverless_env)]
 fn test_normalize_reject_status_only_unparsable_status_fails_closed() {
     use ferrum_edge::_test_support::{
         normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
@@ -1932,6 +2035,7 @@ fn test_normalize_reject_status_only_unparsable_status_fails_closed() {
 /// lifecycle only through the explicit zero-byte inspection gate, and neither a
 /// body the contract never authored nor a status it never authored opens it.
 #[test]
+#[parallel(serverless_env)]
 fn test_status_only_terminate_response_body_lifecycle_gate() {
     use ferrum_edge::_test_support::synthetic_response_body_hooks_apply_for_test;
 
@@ -1980,6 +2084,7 @@ fn test_status_only_terminate_response_body_lifecycle_gate() {
 /// letting both through would emit whichever the map iterated last — losing an
 /// authored value nondeterministically.
 #[test]
+#[parallel(serverless_env)]
 fn test_native_grpc_terminate_rejects_case_equivalent_trailer_names() {
     use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
 
@@ -2014,6 +2119,7 @@ fn test_native_grpc_terminate_rejects_case_equivalent_trailer_names() {
 /// the RAW bytes with the shared bounded `json_dup_keys` scanner, before
 /// `serde_json` ever sees them.
 #[test]
+#[parallel(serverless_env)]
 fn test_native_grpc_terminate_rejects_duplicate_json_members() {
     use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_error_code_test as build_code;
     use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
@@ -2095,6 +2201,7 @@ fn test_native_grpc_terminate_rejects_duplicate_json_members() {
 /// echo while keeping field-specific refusals under the fixed client-visible
 /// class.
 #[test]
+#[parallel(serverless_env)]
 fn test_native_grpc_terminate_bounds_hostile_operator_diagnostics() {
     use ferrum_edge::plugins::serverless_function::test_helpers::{
         MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS_TEST as MAX_NAME,
@@ -2271,6 +2378,7 @@ fn test_native_grpc_terminate_bounds_hostile_operator_diagnostics() {
 /// protocol's narrower name/value grammar and binary-metadata encoding before
 /// the response is authorized to reach a native gRPC stream.
 #[test]
+#[parallel(serverless_env)]
 fn test_native_grpc_terminate_validates_custom_grpc_metadata() {
     use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
 
@@ -2311,6 +2419,7 @@ fn test_native_grpc_terminate_validates_custom_grpc_metadata() {
 /// a bare `%` (which clients decode as an escape introducer) and raw non-ASCII
 /// bytes into a field whose grammar forbids both.
 #[test]
+#[parallel(serverless_env)]
 fn test_native_grpc_terminate_percent_encodes_grpc_message() {
     use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
 
@@ -2342,6 +2451,7 @@ fn test_native_grpc_terminate_percent_encodes_grpc_message() {
 /// Percent-encoding expands a byte threefold, so bounding the pre-encoding
 /// string would have admitted roughly 24 KiB onto the wire.
 #[test]
+#[parallel(serverless_env)]
 fn test_native_grpc_terminate_bounds_encoded_grpc_message() {
     use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
     use ferrum_edge::plugins::serverless_function::test_helpers::percent_encode_grpc_message_test as encode;
@@ -2428,6 +2538,7 @@ fn aggregate_terminate_trailers(count: usize, charge: usize) -> HashMap<String, 
 /// until emission. The complete block is therefore charged the way the peer
 /// charges it — names + values + 32 bytes per field.
 #[test]
+#[parallel(serverless_env)]
 fn test_native_grpc_terminate_bounds_aggregate_terminal_block() {
     use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_error_code_test as build_code;
     use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
@@ -2479,6 +2590,7 @@ fn test_native_grpc_terminate_bounds_aggregate_terminal_block() {
 /// fitting once the contract also authors `grpc-message` and
 /// `grpc-status-details-bin`.
 #[test]
+#[parallel(serverless_env)]
 fn test_native_grpc_terminate_aggregate_budget_counts_protocol_owned_metadata() {
     use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
 
@@ -2525,6 +2637,7 @@ fn test_native_grpc_terminate_aggregate_budget_counts_protocol_owned_metadata() 
 /// is stamped, so nothing authorizes DATA + plugin-authored trailers on the gRPC
 /// stream, and the client sees the fixed rejection class instead.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_mode_over_budget_trailers_never_receive_framed_provenance() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2604,6 +2717,7 @@ fn status_only_full_terminate_trailers() -> HashMap<String, String> {
 /// error string, and neither must a nonzero contract that deliberately omitted
 /// one. Omission is also not represented by an empty `grpc-message` field.
 #[test]
+#[parallel(serverless_env)]
 fn test_status_only_terminate_preserves_omitted_grpc_message() {
     use ferrum_edge::_test_support::{
         h3_reject_log_signal_for_test, normalize_reject_response_with_context,
@@ -2666,6 +2780,7 @@ fn test_status_only_terminate_preserves_omitted_grpc_message() {
 /// in the initial response headers, but a decorator can neither alter, drop,
 /// nor inject contract terminal metadata.
 #[test]
+#[parallel(serverless_env)]
 fn test_status_only_terminate_restores_complete_authored_metadata() {
     use ferrum_edge::_test_support::{
         normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
@@ -2748,6 +2863,7 @@ fn test_status_only_terminate_restores_complete_authored_metadata() {
 /// is not receiving, and the contract's custom trailers would misattribute the
 /// replacement error.
 #[test]
+#[parallel(serverless_env)]
 fn test_invalidated_status_only_terminate_drops_all_authored_metadata() {
     use ferrum_edge::_test_support::{
         h3_reject_log_signal_for_test, normalize_reject_response_with_context,
@@ -2812,6 +2928,7 @@ fn test_invalidated_status_only_terminate_drops_all_authored_metadata() {
 /// framed terminate response, and must do so through the shared borrowed
 /// predicate rather than a full-body copy of the authorized frame.
 #[test]
+#[parallel(serverless_env)]
 fn test_h3_reject_log_framed_terminate_matches_wire_signal() {
     use ferrum_edge::_test_support::{
         h3_reject_log_signal_for_test, normalize_reject_response_with_context,
@@ -2858,6 +2975,7 @@ fn test_h3_reject_log_framed_terminate_matches_wire_signal() {
 /// that point the reject header map still holds the contract's terminal
 /// metadata, so a plain fallback would leak it beside the replacement error.
 #[test]
+#[parallel(serverless_env)]
 fn test_invalidated_framed_terminate_drops_all_authored_metadata() {
     use ferrum_edge::_test_support::{
         normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
@@ -2908,6 +3026,7 @@ fn test_invalidated_framed_terminate_drops_all_authored_metadata() {
 /// and the H3 writers all still treat it as ordinary HTTP — so authoring a
 /// framed unary response here would put a gRPC frame on an HTTP response.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_mode_ignores_rewritten_content_type_on_plain_request() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2969,6 +3088,7 @@ async fn test_terminate_mode_ignores_rewritten_content_type_on_plain_request() {
 /// so a prior hook that removed or rewrote the live `content-type` cannot take a
 /// genuine gRPC request off the terminate contract.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_mode_uses_stamped_grpc_flavor_despite_header_rewrite() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3025,6 +3145,7 @@ async fn test_terminate_mode_uses_stamped_grpc_flavor_despite_header_rewrite() {
 /// Every dedicated terminal value is bound by the advertised 8 KiB **wire**
 /// ceiling, measured after sanitization and after base64 re-encoding.
 #[test]
+#[parallel(serverless_env)]
 fn test_native_grpc_terminate_bounds_dedicated_terminal_values() {
     use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
 
@@ -3109,6 +3230,7 @@ fn test_native_grpc_terminate_bounds_dedicated_terminal_values() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_mode_returns_function_response_as_reject_binary() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3161,6 +3283,7 @@ async fn test_terminate_mode_returns_function_response_as_reject_binary() {
 /// `strip_authorization_on_success` — must not have the client's original value
 /// resurrected out of the pristine ingress map and handed to the function.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_forward_headers_never_resurrect_stripped_client_values() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3225,6 +3348,7 @@ async fn test_forward_headers_never_resurrect_stripped_client_values() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_rejects_out_of_range_function_status() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3266,6 +3390,7 @@ async fn test_terminate_rejects_out_of_range_function_status() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_pre_proxy_redirect_is_not_approval_and_is_not_followed() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3319,6 +3444,7 @@ async fn test_pre_proxy_redirect_is_not_approval_and_is_not_followed() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_pre_proxy_redirect_continue_records_only_scoped_diagnostics() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3358,6 +3484,7 @@ async fn test_pre_proxy_redirect_continue_records_only_scoped_diagnostics() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_pre_proxy_4xx_and_5xx_use_configured_final_error_status() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3402,6 +3529,7 @@ async fn test_pre_proxy_4xx_and_5xx_use_configured_final_error_status() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_forwards_safe_headers_and_preserves_repeated_cookies() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3470,6 +3598,7 @@ async fn test_terminate_forwards_safe_headers_and_preserves_repeated_cookies() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_strips_redirects_that_expose_signed_function_destination() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3867,6 +3996,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_strips_unsafe_url_headers_for_root_function_destination() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3995,6 +4125,7 @@ async fn test_terminate_strips_unsafe_url_headers_for_root_function_destination(
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4222,6 +4353,7 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_rejects_repeated_singleton_url_headers() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4264,6 +4396,7 @@ async fn test_terminate_rejects_repeated_singleton_url_headers() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_revalidates_combined_link_headers() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4327,6 +4460,7 @@ async fn test_terminate_revalidates_combined_link_headers() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_preserves_head_no_body_semantics() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4375,6 +4509,7 @@ async fn test_terminate_preserves_head_no_body_semantics() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_strips_body_from_no_content_statuses() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4422,6 +4557,7 @@ async fn test_terminate_strips_body_from_no_content_statuses() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_forward_body_is_binary_safe_for_non_post_methods() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4461,6 +4597,7 @@ async fn test_forward_body_is_binary_safe_for_non_post_methods() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_forward_body_preserves_exact_bytes_and_active_content_type() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4527,6 +4664,7 @@ async fn test_forward_body_preserves_exact_bytes_and_active_content_type() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn configured_decompression_exposes_plaintext_before_serverless_dispatch() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4573,6 +4711,7 @@ async fn configured_decompression_exposes_plaintext_before_serverless_dispatch()
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_encoded_or_unavailable_body_fails_before_external_egress() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4622,6 +4761,7 @@ async fn test_encoded_or_unavailable_body_fails_before_external_egress() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_original_content_encoding_marker_fails_before_external_egress() {
     // Mirror of `ORIGIN_ENCODED_REQUEST_METADATA_KEY` (pub(crate) in proxy). A
     // header-only request_transformer that removed/renamed Content-Encoding
@@ -4667,6 +4807,7 @@ async fn test_original_content_encoding_marker_fails_before_external_egress() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_query_transform_is_forwarded_in_function_payload() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4725,6 +4866,7 @@ async fn test_query_transform_is_forwarded_in_function_payload() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_ambiguous_query_fails_before_external_egress() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4784,6 +4926,7 @@ async fn test_ambiguous_query_fails_before_external_egress() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_unambiguous_query_is_decoded_once_for_function_payload() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4816,6 +4959,7 @@ async fn test_unambiguous_query_is_decoded_once_for_function_payload() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_query_forwarding_omits_only_credentials_marked_for_backend_stripping() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4908,6 +5052,7 @@ async fn test_query_forwarding_omits_only_credentials_marked_for_backend_strippi
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_secret_bearing_url_never_reaches_client_or_metadata() {
     let secret = "reusable-trigger-secret";
     let plugin = ServerlessFunction::new(
@@ -4937,6 +5082,7 @@ async fn test_secret_bearing_url_never_reaches_client_or_metadata() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_pre_proxy_mode_allows_grpc_requests() {
     // pre_proxy mode should NOT reject gRPC — only terminate does
     let plugin = ServerlessFunction::new(
@@ -4971,6 +5117,7 @@ async fn test_pre_proxy_mode_allows_grpc_requests() {
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_aws_lambda_function_error_does_not_leak_response_body_in_reject_details() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5025,6 +5172,7 @@ async fn test_aws_lambda_function_error_does_not_leak_response_body_in_reject_de
 // ---------------------------------------------------------------------------
 
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_sigv4_includes_security_token_when_present() {
     let aws_config = json!({
         "region": "us-east-1",
@@ -5061,6 +5209,7 @@ fn test_aws_sigv4_includes_security_token_when_present() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_sigv4_omits_security_token_when_absent() {
     let aws_config = create_test_aws_config();
     let url = "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations";
@@ -5086,6 +5235,7 @@ fn test_aws_sigv4_omits_security_token_when_absent() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_sigv4_rejects_invalid_url() {
     let aws_config = create_test_aws_config();
     let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
@@ -5107,6 +5257,7 @@ fn test_aws_sigv4_rejects_invalid_url() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[parallel(serverless_env)]
 fn test_forward_headers_lowercase() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -5172,6 +5323,7 @@ async fn claimed_ai_stream_router_context() -> ferrum_edge::plugins::RequestCont
 }
 
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_skips_ai_stream_router_claimed_provider_requests() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -5208,42 +5360,22 @@ async fn test_skips_ai_stream_router_claimed_provider_requests() {
 // ---------------------------------------------------------------------------
 // Environment variable fallback
 //
-// All env-var-touching tests are serialized via ENV_MUTEX to prevent races.
-// SAFETY: std::env::set_var / remove_var are unsafe in Rust 2024 because
-// concurrent threads may read env vars while we mutate them. The mutex
-// ensures only one test mutates env vars at a time.
+// Every test below writes the process environment through `EnvGuard`, which
+// owns the process-wide lock and restores what it saved on drop, and is
+// `#[serial(serverless_env)]` so this file's readers cannot observe a fixture
+// value mid-construction.
 // ---------------------------------------------------------------------------
 
-/// Clear all AWS env vars that could affect plugin construction.
-/// Caller must hold ENV_MUTEX.
-unsafe fn remove_all_aws_env_vars() {
-    unsafe {
-        std::env::remove_var("AWS_DEFAULT_REGION");
-        std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_ACCESS_KEY_ID");
-        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-        std::env::remove_var("AWS_LAMBDA_FUNCTION_NAME");
-    }
-}
-
 #[test]
+#[serial(serverless_env)]
 fn test_aws_falls_back_to_env_vars() {
-    let _lock = ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    unsafe {
-        remove_all_aws_env_vars();
-        std::env::set_var("AWS_DEFAULT_REGION", "ap-southeast-1");
-        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAENVTEST123456789");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-secret-key-value");
-        std::env::set_var("AWS_LAMBDA_FUNCTION_NAME", "env-function");
-    }
+    let env = cleared_provider_env();
+    env.set("AWS_DEFAULT_REGION", "ap-southeast-1");
+    env.set("AWS_ACCESS_KEY_ID", "AKIAENVTEST123456789");
+    env.set("AWS_SECRET_ACCESS_KEY", "env-secret-key-value");
+    env.set("AWS_LAMBDA_FUNCTION_NAME", "env-function");
 
     let result = ServerlessFunction::new(&json!({ "provider": "aws_lambda" }), default_client());
-
-    unsafe {
-        remove_all_aws_env_vars();
-    }
 
     let plugin = result.unwrap();
     let hostnames = plugin.warmup_hostnames();
@@ -5254,17 +5386,13 @@ fn test_aws_falls_back_to_env_vars() {
 }
 
 #[test]
+#[serial(serverless_env)]
 fn test_aws_config_overrides_env_vars() {
-    let _lock = ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    unsafe {
-        remove_all_aws_env_vars();
-        std::env::set_var("AWS_DEFAULT_REGION", "eu-west-1");
-        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAENVOVERRIDE");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-secret");
-        std::env::set_var("AWS_LAMBDA_FUNCTION_NAME", "env-func");
-    }
+    let env = cleared_provider_env();
+    env.set("AWS_DEFAULT_REGION", "eu-west-1");
+    env.set("AWS_ACCESS_KEY_ID", "AKIAENVOVERRIDE");
+    env.set("AWS_SECRET_ACCESS_KEY", "env-secret");
+    env.set("AWS_LAMBDA_FUNCTION_NAME", "env-func");
 
     let result = ServerlessFunction::new(
         &json!({
@@ -5277,10 +5405,6 @@ fn test_aws_config_overrides_env_vars() {
         default_client(),
     );
 
-    unsafe {
-        remove_all_aws_env_vars();
-    }
-
     let plugin = result.unwrap();
     let hostnames = plugin.warmup_hostnames();
     assert_eq!(
@@ -5290,23 +5414,15 @@ fn test_aws_config_overrides_env_vars() {
 }
 
 #[test]
+#[serial(serverless_env)]
 fn test_aws_region_falls_back_to_aws_region_env() {
-    let _lock = ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    unsafe {
-        remove_all_aws_env_vars();
-        std::env::set_var("AWS_REGION", "ca-central-1");
-        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAENVTEST123456789");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-secret-key-value");
-        std::env::set_var("AWS_LAMBDA_FUNCTION_NAME", "env-function");
-    }
+    let env = cleared_provider_env();
+    env.set("AWS_REGION", "ca-central-1");
+    env.set("AWS_ACCESS_KEY_ID", "AKIAENVTEST123456789");
+    env.set("AWS_SECRET_ACCESS_KEY", "env-secret-key-value");
+    env.set("AWS_LAMBDA_FUNCTION_NAME", "env-function");
 
     let result = ServerlessFunction::new(&json!({ "provider": "aws_lambda" }), default_client());
-
-    unsafe {
-        remove_all_aws_env_vars();
-    }
 
     let plugin = result.unwrap();
     let hostnames = plugin.warmup_hostnames();
@@ -5317,13 +5433,10 @@ fn test_aws_region_falls_back_to_aws_region_env() {
 }
 
 #[test]
+#[serial(serverless_env)]
 fn test_azure_function_key_falls_back_to_env() {
-    let _lock = ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    unsafe {
-        std::env::set_var("AZURE_FUNCTIONS_KEY", "env-azure-key");
-    }
+    let env = cleared_provider_env();
+    env.set("AZURE_FUNCTIONS_KEY", "env-azure-key");
 
     let result = ServerlessFunction::new(
         &json!({
@@ -5333,21 +5446,16 @@ fn test_azure_function_key_falls_back_to_env() {
         default_client(),
     );
 
-    unsafe {
-        std::env::remove_var("AZURE_FUNCTIONS_KEY");
-    }
+    env.unset("AZURE_FUNCTIONS_KEY");
 
     assert!(result.is_ok());
 }
 
 #[test]
+#[serial(serverless_env)]
 fn test_gcp_bearer_token_falls_back_to_env() {
-    let _lock = ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    unsafe {
-        std::env::set_var("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN", "ya29.env-token");
-    }
+    let env = cleared_provider_env();
+    env.set("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN", "ya29.env-token");
 
     let result = ServerlessFunction::new(
         &json!({
@@ -5357,9 +5465,7 @@ fn test_gcp_bearer_token_falls_back_to_env() {
         default_client(),
     );
 
-    unsafe {
-        std::env::remove_var("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN");
-    }
+    env.unset("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN");
 
     assert!(result.is_ok());
 }
@@ -5369,6 +5475,7 @@ fn test_gcp_bearer_token_falls_back_to_env() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_sigv4_produces_valid_authorization_header() {
     let aws_config = create_test_aws_config();
     let payload = b"{}";
@@ -5408,6 +5515,7 @@ fn test_aws_sigv4_produces_valid_authorization_header() {
 }
 
 #[test]
+#[parallel(serverless_env)]
 fn test_aws_sigv4_different_payloads_produce_different_signatures() {
     let aws_config = create_test_aws_config();
     let url = "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations";
@@ -5456,6 +5564,7 @@ fn test_aws_sigv4_different_payloads_produce_different_signatures() {
 /// In `terminate` mode, an over-limit response yields a Reject with the
 /// configured error status code.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_terminate_mode_rejects_oversized_response_body() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5502,6 +5611,7 @@ async fn test_terminate_mode_rejects_oversized_response_body() {
 /// the plugin must record the error in metadata and continue, without ever
 /// having buffered the full 2 KiB body.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_pre_proxy_continue_on_oversized_response_body() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5544,6 +5654,7 @@ async fn test_pre_proxy_continue_on_oversized_response_body() {
 
 /// Backend returns a body within the limit — call succeeds.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_pre_proxy_succeeds_when_response_body_within_limit() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5586,6 +5697,7 @@ async fn test_pre_proxy_succeeds_when_response_body_within_limit() {
 /// A 2xx `pre_proxy` body that is not a JSON object must fail closed under
 /// `on_error: reject` rather than silently continuing without injection.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_pre_proxy_rejects_non_object_2xx_response_bodies() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5640,6 +5752,7 @@ async fn test_pre_proxy_rejects_non_object_2xx_response_bodies() {
 /// Under `on_error: continue`, a non-object 2xx body still records the error
 /// class and continues without injecting headers.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_pre_proxy_continue_on_non_object_2xx_response_body() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5682,6 +5795,7 @@ async fn test_pre_proxy_continue_on_non_object_2xx_response_body() {
 
 /// An empty JSON object is a valid pre_proxy approval that injects nothing.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_pre_proxy_empty_object_body_is_valid() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5742,6 +5856,7 @@ fn create_test_aws_config() -> serde_json::Value {
 /// admission keys on: a plugin that still egresses from `before_proxy` cannot
 /// share a chain with a transformer or a final request-policy validator.
 #[test]
+#[parallel(serverless_env)]
 fn test_serverless_declares_finalized_egress_phase_not_pre_finalization_egress() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -5762,6 +5877,7 @@ fn test_serverless_declares_finalized_egress_phase_not_pre_finalization_egress()
 /// the proxy stages it; consuming it instead of the finalized parameter is the
 /// disclosure this advisory describes.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_finalized_egress_forwards_transformed_body_not_pretransform_metadata() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5827,6 +5943,7 @@ async fn test_finalized_egress_forwards_transformed_body_not_pretransform_metada
 /// header overlay. The finalized snapshot the function consumed — the exact
 /// representation policy accepted and the backend receives — stays untouched.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_pre_proxy_header_injection_uses_backend_overlay_not_the_snapshot() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5868,6 +5985,7 @@ async fn test_pre_proxy_header_injection_uses_backend_overlay_not_the_snapshot()
 /// request that may carry one: the function must not be invoked on a silently
 /// truncated payload.
 #[tokio::test]
+#[parallel(serverless_env)]
 async fn test_forward_body_fails_closed_when_no_body_was_collected() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5912,5 +6030,730 @@ async fn test_forward_body_fails_closed_when_no_body_was_collected() {
             .expect("recorded requests")
             .is_empty(),
         "no function may be contacted when the governed representation is unavailable"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5173 — the SigV4 canonical Host is the authority sent on the wire
+// ---------------------------------------------------------------------------
+
+fn sigv4_authorization_for(url: &str) -> String {
+    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
+        .expect("fixed timestamp parses")
+        .with_timezone(&chrono::Utc);
+    ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
+        &create_test_aws_config(),
+        url,
+        b"{}",
+        &now,
+    )
+    .expect("SigV4 signing should succeed")
+    .into_iter()
+    .find(|(name, _)| name == "authorization")
+    .map(|(_, value)| value)
+    .expect("authorization header should be present")
+}
+
+/// A custom `aws_endpoint_url` with a nondefault port sends `host:port` in the
+/// `Host` field, so that is what a verifying endpoint recomputes the signature
+/// over. The canonical request is rebuilt here independently — from the Host
+/// field the request actually carries — and only the crypto primitives are
+/// shared with the signer.
+#[test]
+#[parallel(serverless_env)]
+fn test_aws_sigv4_canonical_host_includes_a_nondefault_port() {
+    use ferrum_edge::plugins::utils::aws_sigv4;
+
+    let authorization = sigv4_authorization_for(
+        "http://127.0.0.1:59816/2015-03-31/functions/strict/invocations?Qualifier=%24LATEST",
+    );
+
+    let payload_hash = aws_sigv4::sha256_hex(b"{}");
+    let canonical_headers = format!(
+        "content-type:application/json\nhost:127.0.0.1:59816\nx-amz-content-sha256:{payload_hash}\nx-amz-date:20240115T120000Z\n"
+    );
+    let canonical_request = format!(
+        "POST\n/2015-03-31/functions/strict/invocations\nQualifier=%24LATEST\n{canonical_headers}\ncontent-type;host;x-amz-content-sha256;x-amz-date\n{payload_hash}"
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n20240115T120000Z\n20240115/us-east-1/lambda/aws4_request\n{}",
+        aws_sigv4::sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = aws_sigv4::derive_signing_key(
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "20240115",
+        "us-east-1",
+        "lambda",
+    )
+    .expect("signing key derives");
+    let expected: String = aws_sigv4::hmac_sha256(&signing_key, string_to_sign.as_bytes())
+        .expect("signature computes")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    assert!(
+        authorization.ends_with(&format!("Signature={expected}")),
+        "canonical Host must carry the nondefault port; got {authorization}"
+    );
+}
+
+/// A scheme's default port never appears in the authority that goes on the
+/// wire, so it must not change the signature either. A nondefault port must.
+#[test]
+#[parallel(serverless_env)]
+fn test_aws_sigv4_canonical_host_omits_scheme_default_ports() {
+    let https_implicit = sigv4_authorization_for("https://lambda.example/invocations");
+    let https_explicit = sigv4_authorization_for("https://lambda.example:443/invocations");
+    assert_eq!(https_implicit, https_explicit);
+
+    let http_implicit = sigv4_authorization_for("http://127.0.0.1/invocations");
+    let http_explicit = sigv4_authorization_for("http://127.0.0.1:80/invocations");
+    assert_eq!(http_implicit, http_explicit);
+
+    let http_custom = sigv4_authorization_for("http://127.0.0.1:4566/invocations");
+    assert_ne!(http_implicit, http_custom);
+
+    let https_custom = sigv4_authorization_for("https://lambda.example:8443/invocations");
+    assert_ne!(https_implicit, https_custom);
+}
+
+/// IPv6 endpoints keep their brackets in the signed Host, matching the wire.
+#[test]
+#[parallel(serverless_env)]
+fn test_aws_sigv4_canonical_host_brackets_ipv6_literals() {
+    use ferrum_edge::plugins::utils::aws_sigv4;
+
+    let authorization =
+        sigv4_authorization_for("http://[2001:db8::30]:4566/2015-03-31/f/invocations");
+    let payload_hash = aws_sigv4::sha256_hex(b"{}");
+    let canonical_headers = format!(
+        "content-type:application/json\nhost:[2001:db8::30]:4566\nx-amz-content-sha256:{payload_hash}\nx-amz-date:20240115T120000Z\n"
+    );
+    let canonical_request = format!(
+        "POST\n/2015-03-31/f/invocations\n\n{canonical_headers}\ncontent-type;host;x-amz-content-sha256;x-amz-date\n{payload_hash}"
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n20240115T120000Z\n20240115/us-east-1/lambda/aws4_request\n{}",
+        aws_sigv4::sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = aws_sigv4::derive_signing_key(
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "20240115",
+        "us-east-1",
+        "lambda",
+    )
+    .expect("signing key derives");
+    let expected: String = aws_sigv4::hmac_sha256(&signing_key, string_to_sign.as_bytes())
+        .expect("signature computes")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    assert!(
+        authorization.ends_with(&format!("Signature={expected}")),
+        "IPv6 canonical Host must stay bracketed; got {authorization}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5175 — supplied-field validation is provider-independent
+// ---------------------------------------------------------------------------
+
+#[test]
+#[parallel(serverless_env)]
+fn test_inactive_provider_fields_still_reject_wrong_json_types() {
+    for (provider, field) in [
+        ("azure_functions", "aws_region"),
+        ("azure_functions", "aws_access_key_id"),
+        ("azure_functions", "aws_secret_access_key"),
+        ("azure_functions", "aws_function_name"),
+        ("azure_functions", "aws_session_token"),
+        ("azure_functions", "aws_qualifier"),
+        ("azure_functions", "aws_endpoint_url"),
+        ("azure_functions", "gcp_bearer_token"),
+        ("gcp_cloud_functions", "azure_function_key"),
+        ("aws_lambda", "azure_function_key"),
+        ("aws_lambda", "gcp_bearer_token"),
+    ] {
+        let mut config = json!({
+            "provider": provider,
+            "function_url": "http://127.0.0.1:45678/pre"
+        });
+        config[field] = json!(123);
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(
+            err.contains(&format!("'{field}' must be a string")),
+            "provider={provider} field={field}, got: {err}"
+        );
+    }
+}
+
+#[test]
+#[parallel(serverless_env)]
+fn test_well_typed_inactive_provider_fields_remain_accepted() {
+    ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "aws_region": "us-east-1",
+            "aws_function_name": "other-function",
+            "aws_qualifier": "prod",
+            "aws_endpoint_url": "http://127.0.0.1:4566",
+            "gcp_bearer_token": "ya29.example-token"
+        }),
+        default_client(),
+    )
+    .expect("well-typed inactive provider fields stay accepted");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5176 — forward_headers entries are HTTP field-name tokens
+// ---------------------------------------------------------------------------
+
+#[test]
+#[parallel(serverless_env)]
+fn test_forward_headers_rejects_empty_and_separator_bearing_names() {
+    for (entry, fragment) in [
+        (json!(""), "non-empty string"),
+        (json!("bad header"), "not a valid HTTP header name"),
+        (json!("bad:header"), "not a valid HTTP header name"),
+        (json!("bad\theader"), "not a valid HTTP header name"),
+    ] {
+        let err = expect_err(ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": "https://example.com/func",
+                "forward_headers": [entry]
+            }),
+            default_client(),
+        ));
+        assert!(err.contains(fragment), "got: {err}");
+    }
+}
+
+#[test]
+#[parallel(serverless_env)]
+fn test_forward_headers_accepts_legal_token_punctuation() {
+    ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forward_headers": ["X-Request-ID", "x_custom.name", "a!#$%&'*+^`|~1"]
+        }),
+        default_client(),
+    )
+    .expect("legal field-name tokens are accepted");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5178 — one lexical URL contract for runtime and schema
+// ---------------------------------------------------------------------------
+
+#[test]
+#[parallel(serverless_env)]
+fn test_function_url_lexical_contract_rejects_the_published_grammar_failures() {
+    for url in [
+        "https://:1234",
+        "https://127.0.0.1:65536/pre",
+        "http://127.0.0.1/a b",
+        "http://127.0.0.1/a\tb",
+        "http://127.0.0.1\n/a",
+        "http://127.0.0.1/\u{7f}",
+    ] {
+        let err = expect_err(ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": url
+            }),
+            default_client(),
+        ));
+        assert!(err.contains("function_url"), "url={url:?}, got: {err}");
+    }
+}
+
+#[test]
+#[parallel(serverless_env)]
+fn test_function_url_lexical_contract_accepts_hostname_ipv4_and_ipv6_origins() {
+    for url in [
+        "http://127.0.0.1/a%20b",
+        "https://functions.example/api/transform",
+        "https://functions.example:65535/api/transform",
+        "https://[2001:db8::1]:8443/api/transform",
+        "http://127.0.0.1:0/pre",
+    ] {
+        ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": url
+            }),
+            default_client(),
+        )
+        .unwrap_or_else(|error| panic!("url={url} should be accepted: {error}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5179 — CP/admin admission defers node-local credentials
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial(serverless_env)]
+fn test_shape_only_admission_defers_node_local_aws_credentials() {
+    let _env = cleared_provider_env();
+
+    let config = json!({
+        "provider": "aws_lambda",
+        "aws_region": "us-east-1",
+        "aws_function_name": "audit"
+    });
+
+    ferrum_edge::plugins::validate_plugin_config("serverless_function", &config)
+        .expect("CP/admin admission must not require DP-only AWS credentials");
+
+    let err = expect_err(ServerlessFunction::new(&config, default_client()));
+    assert!(
+        err.contains("'aws_access_key_id' is required for aws_lambda"),
+        "runtime construction must still fail closed, got: {err}"
+    );
+}
+
+#[test]
+#[serial(serverless_env)]
+fn test_shape_only_admission_still_rejects_supplied_field_errors() {
+    let _env = cleared_provider_env();
+
+    for (config, fragment) in [
+        (
+            json!({"provider": "aws_lambda", "aws_region": 123}),
+            "'aws_region' must be a string",
+        ),
+        (
+            json!({"provider": "aws_lambda", "aws_function_name": "bad name"}),
+            "'aws_function_name' is not a valid Lambda function name",
+        ),
+        (
+            json!({"provider": "aws_lambda", "aws_endpoint_url": "tcp://localhost:4566"}),
+            "aws_endpoint_url must use http:// or https://",
+        ),
+        (
+            json!({"provider": "aws_lambda", "mode": "terminat"}),
+            "unknown mode",
+        ),
+        (
+            json!({"provider": "azure_functions"}),
+            "'function_url' is required for azure_functions",
+        ),
+        (json!({"provider": "nope"}), "unknown provider"),
+    ] {
+        let err = ferrum_edge::plugins::validate_plugin_config("serverless_function", &config)
+            .expect_err("shape-only admission must still reject supplied-field errors");
+        assert!(err.contains(fragment), "config={config}, got: {err}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5180 — partition-aware default Lambda endpoint
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial(serverless_env)]
+fn test_default_lambda_endpoint_is_partition_aware() {
+    let _env = cleared_provider_env();
+
+    for (region, expected_host) in [
+        ("cn-north-1", "lambda.cn-north-1.amazonaws.com.cn"),
+        ("cn-northwest-1", "lambda.cn-northwest-1.amazonaws.com.cn"),
+        ("us-east-1", "lambda.us-east-1.amazonaws.com"),
+        ("us-gov-west-1", "lambda.us-gov-west-1.amazonaws.com"),
+    ] {
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "aws_lambda",
+                "aws_region": region,
+                "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+                "aws_secret_access_key": "secret",
+                "aws_function_name": "audit"
+            }),
+            default_client(),
+        )
+        .unwrap_or_else(|error| panic!("region={region} should be accepted: {error}"));
+
+        assert_eq!(
+            plugin.warmup_hostnames(),
+            vec![expected_host.to_string()],
+            "region={region}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5181 — Lambda identifier grammars
+// ---------------------------------------------------------------------------
+
+#[test]
+#[parallel(serverless_env)]
+fn test_invalid_lambda_identifiers_are_rejected_at_admission() {
+    for (field, value, fragment) in [
+        ("aws_function_name", " ", "not a valid Lambda function name"),
+        (
+            "aws_function_name",
+            "my function",
+            "not a valid Lambda function name",
+        ),
+        (
+            "aws_function_name",
+            "my/function",
+            "not a valid Lambda function name",
+        ),
+        (
+            "aws_function_name",
+            "my-function:bad alias",
+            "not a valid Lambda function name",
+        ),
+        (
+            "aws_qualifier",
+            "not a qualifier",
+            "not a valid Lambda version or alias qualifier",
+        ),
+        (
+            "aws_qualifier",
+            "bad/alias",
+            "not a valid Lambda version or alias qualifier",
+        ),
+    ] {
+        let mut config = json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func"
+        });
+        config[field] = json!(value);
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(
+            err.contains(fragment),
+            "field={field} value={value:?}, got: {err}"
+        );
+    }
+}
+
+#[test]
+#[parallel(serverless_env)]
+fn test_over_length_lambda_identifiers_are_rejected() {
+    let long_name = "a".repeat(171);
+    let long_qualifier = "b".repeat(129);
+    for (field, value, fragment) in [
+        (
+            "aws_function_name",
+            long_name.as_str(),
+            "'aws_function_name' must be at most 170 characters",
+        ),
+        (
+            "aws_qualifier",
+            long_qualifier.as_str(),
+            "'aws_qualifier' must be at most 128 characters",
+        ),
+    ] {
+        let mut config = json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func"
+        });
+        config[field] = json!(value);
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(err.contains(fragment), "field={field}: {err}");
+    }
+}
+
+#[test]
+#[serial(serverless_env)]
+fn test_supported_lambda_identifier_forms_are_accepted() {
+    let _env = cleared_provider_env();
+
+    for function_name in [
+        "my-function",
+        "my_function.v2",
+        "my-function:prod",
+        "my-function:$LATEST",
+        "123456789012:function:my-function",
+        "us-east-1:123456789012:function:my-function",
+        "arn:aws:lambda:us-east-1:123456789012:function:my-function",
+        "arn:aws-cn:lambda:cn-north-1:123456789012:function:my-function:prod",
+        "arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:my-function",
+    ] {
+        for qualifier in ["$LATEST", "prod", "1", "blue-green_2"] {
+            ServerlessFunction::new(
+                &json!({
+                    "provider": "aws_lambda",
+                    "aws_region": "us-east-1",
+                    "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+                    "aws_secret_access_key": "secret",
+                    "aws_function_name": function_name,
+                    "aws_qualifier": qualifier
+                }),
+                default_client(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("name={function_name} qualifier={qualifier} should be accepted: {error}")
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5189 — provider credentials must be representable as header values
+// ---------------------------------------------------------------------------
+
+#[test]
+#[parallel(serverless_env)]
+fn test_unrepresentable_credential_headers_fail_admission() {
+    for (provider, field, value) in [
+        ("azure_functions", "azure_function_key", "audit\ncredential"),
+        ("azure_functions", "azure_function_key", "audit\rcredential"),
+        ("azure_functions", "azure_function_key", "audit\u{0}cred"),
+        (
+            "gcp_cloud_functions",
+            "gcp_bearer_token",
+            "audit\ncredential",
+        ),
+        ("gcp_cloud_functions", "gcp_bearer_token", "audit\u{7f}cred"),
+    ] {
+        let mut config = json!({
+            "provider": provider,
+            "function_url": "http://127.0.0.1:45678/pre"
+        });
+        config[field] = json!(value);
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(
+            err.contains(&format!("'{field}' is not a valid HTTP header value")),
+            "provider={provider} field={field}: {err}"
+        );
+        assert!(
+            !err.contains("audit"),
+            "the diagnostic must not reflect the credential: {err}"
+        );
+    }
+}
+
+#[test]
+#[parallel(serverless_env)]
+fn test_ordinary_credential_headers_are_accepted() {
+    ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "azure_function_key": "my-secret-key=="
+        }),
+        default_client(),
+    )
+    .expect("ordinary Azure function key is accepted");
+    ServerlessFunction::new(
+        &json!({
+            "provider": "gcp_cloud_functions",
+            "function_url": "https://example.com/func",
+            "gcp_bearer_token": "ya29.example-token"
+        }),
+        default_client(),
+    )
+    .expect("ordinary GCP bearer token is accepted");
+}
+
+/// An environment-resolved credential must reach the same validator as a
+/// configured one (issue #5189).
+///
+/// Asserted over the source rather than by publishing a malformed value.
+/// `AZURE_FUNCTIONS_KEY` and `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` are
+/// process-global, and EVERY credential-less construction in this test binary
+/// resolves them — including sibling files this file's `serverless_env` gate
+/// cannot reach (`plugin_cache_tests`, `request_deduplication_tests`,
+/// `plugin_utils::minimal_plugin_config`). A malformed fixture published for
+/// the microseconds this test needs fails those unrelated tests instead, which
+/// is exactly the flake this accounting replaces.
+///
+/// The behavioral halves stay covered: the configured path rejects a malformed
+/// credential in `test_unrepresentable_credential_headers_fail_admission`, and
+/// the fallbacks are live in `test_azure_function_key_falls_back_to_env` and
+/// `test_gcp_bearer_token_falls_back_to_env`. What is left to pin is that the
+/// two meet — the fallback merges BEFORE the validator, so no environment
+/// value can reach a request header on an unvalidated path.
+#[test]
+#[parallel(serverless_env)]
+fn test_environment_resolved_credentials_are_validated_too() {
+    let source = include_str!("../../../src/plugins/serverless_function.rs");
+
+    let azure = source
+        .split("Provider::AzureFunctions => {")
+        .nth(1)
+        .expect("azure provider arm must remain present")
+        .split("Provider::GcpCloudFunctions => {")
+        .next()
+        .expect("azure provider arm must remain bounded");
+    let azure_fallback = azure
+        .find("env_non_empty(\"AZURE_FUNCTIONS_KEY\")")
+        .expect("azure key must keep its environment fallback");
+    let azure_validated = azure
+        .find("credential_header_value(\"azure_function_key\",")
+        .expect("azure key must be validated as a header value");
+    assert!(
+        azure_fallback < azure_validated,
+        "the AZURE_FUNCTIONS_KEY fallback must merge before admission validates the key"
+    );
+
+    let gcp = source
+        .split("Provider::GcpCloudFunctions => {")
+        .nth(1)
+        .expect("gcp provider arm must remain present")
+        .split("// Extract hostname for DNS warmup")
+        .next()
+        .expect("gcp provider arm must remain bounded");
+    let gcp_fallback = gcp
+        .find("env_non_empty(\"GCP_CLOUD_FUNCTIONS_BEARER_TOKEN\")")
+        .expect("gcp token must keep its environment fallback");
+    let gcp_validated = gcp
+        .find("gcp_authorization_header_value(&token)")
+        .expect("gcp token must be validated as an assembled header value");
+    assert!(
+        gcp_fallback < gcp_validated,
+        "the GCP_CLOUD_FUNCTIONS_BEARER_TOKEN fallback must merge before admission"
+    );
+
+    let assembler = source
+        .split("fn gcp_authorization_header_value(")
+        .nth(1)
+        .expect("gcp header assembler must remain present")
+        .split("\n}\n")
+        .next()
+        .expect("gcp header assembler must remain bounded");
+    assert!(
+        assembler.contains("credential_header_value(\"gcp_bearer_token\","),
+        "the assembled `Bearer <token>` value must go through the shared validator"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GHSA-4xpr-23qf-v649 — an over-limit native gRPC terminate output must reject
+// ---------------------------------------------------------------------------
+
+async fn oversized_terminate_server() -> wiremock::MockServer {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(4096)))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_oversized_native_grpc_terminate_output_never_continues_to_the_backend() {
+    let server = oversized_terminate_server().await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "on_error": "continue",
+            "max_response_body_bytes": 64,
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    match plugin.finalized_egress(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("response_body_too_large"), "got: {body}");
+            assert!(
+                !body.contains("xxxxxxxx"),
+                "the untrusted function body must never be reflected: {body}"
+            );
+        }
+        other => panic!(
+            "oversized native gRPC terminate output must fail closed, got {:?}",
+            other
+        ),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.standalone.error_class")
+            .map(String::as_str),
+        Some("response_body_too_large")
+    );
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_oversized_native_grpc_terminate_output_rejects_under_on_error_reject() {
+    let server = oversized_terminate_server().await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "on_error": "reject",
+            "max_response_body_bytes": 64,
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    assert!(matches!(
+        plugin.finalized_egress(&mut ctx, &mut headers).await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+/// The promotion is scoped to the native gRPC terminate output contract:
+/// ordinary HTTP terminate keeps the documented `on_error: continue` behavior.
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_oversized_http_terminate_output_still_honors_on_error_continue() {
+    let server = oversized_terminate_server().await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "on_error": "continue",
+            "max_response_body_bytes": 64,
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    assert!(matches!(
+        plugin.finalized_egress(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.standalone.error_class")
+            .map(String::as_str),
+        Some("response_body_too_large")
     );
 }

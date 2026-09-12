@@ -15,6 +15,7 @@ use super::admission::{
     XdsAdmissionController, XdsAdmissionLimits, XdsAdmissionRejection, XdsStreamPermit,
     principal_key, redacted_identifier, xds_state_key,
 };
+use super::bounded_xds_log_value;
 use super::nonce::{AckOutcome, XdsNonceTracker};
 use super::proto::aggregated_discovery_service_server::{
     AggregatedDiscoveryService, AggregatedDiscoveryServiceServer,
@@ -24,7 +25,7 @@ use super::proto::{
     DiscoveryResponse,
 };
 use super::snapshot::{XdsConfigFingerprint, XdsSnapshot, XdsSnapshotCache};
-use super::translator::translate_mesh_slice_to_snapshot;
+use super::translator::{translate_mesh_slice_to_snapshot, xds_type_url_log_label};
 use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
@@ -1061,13 +1062,13 @@ impl XdsAdsServer {
             match self.record_sotw_ack(cache_key, request) {
                 AckOutcome::Acked => debug!(
                     node = %redacted_identifier(node_id),
-                    type_url = %request.type_url,
+                    type_url = xds_type_url_log_label(&request.type_url),
                     "xDS ACK accepted"
                 ),
                 AckOutcome::Nacked { message } => {
                     warn!(
                         node = %redacted_identifier(node_id),
-                        type_url = %request.type_url,
+                        type_url = xds_type_url_log_label(&request.type_url),
                         error = %message,
                         "xDS NACK received"
                     );
@@ -1075,7 +1076,7 @@ impl XdsAdsServer {
                 outcome => {
                     warn!(
                         node = %redacted_identifier(node_id),
-                        type_url = %request.type_url,
+                        type_url = xds_type_url_log_label(&request.type_url),
                         outcome = ?outcome,
                         "xDS ACK ignored"
                     );
@@ -1245,13 +1246,13 @@ impl XdsAdsServer {
         match &outcome {
             AckOutcome::Acked | AckOutcome::VersionDrift { .. } => debug!(
                 node = %redacted_identifier(node_id),
-                type_url = %request.type_url,
+                type_url = xds_type_url_log_label(&request.type_url),
                 "xDS delta ACK accepted"
             ),
             AckOutcome::Nacked { message } => {
                 warn!(
                     node = %redacted_identifier(node_id),
-                    type_url = %request.type_url,
+                    type_url = xds_type_url_log_label(&request.type_url),
                     error = %message,
                     "xDS delta NACK received"
                 );
@@ -1259,7 +1260,7 @@ impl XdsAdsServer {
             outcome => {
                 warn!(
                     node = %redacted_identifier(node_id),
-                    type_url = %request.type_url,
+                    type_url = xds_type_url_log_label(&request.type_url),
                     outcome = ?outcome,
                     "xDS delta ACK ignored"
                 );
@@ -1540,7 +1541,8 @@ fn ensure_supported_type_url(type_url: &str) -> Result<(), Status> {
     }
     if !super::translator::XDS_TYPE_URLS.contains(&type_url) {
         return Err(Status::invalid_argument(format!(
-            "unsupported xDS type_url: {type_url}"
+            "unsupported xDS type_url: {}",
+            bounded_xds_log_value(type_url)
         )));
     }
     Ok(())
@@ -1582,10 +1584,10 @@ fn warn_xds_request_rejected(
         method,
         namespace,
         node = %redacted_identifier(node_id),
-        type_url,
+        type_url = xds_type_url_log_label(type_url),
         resource_name_count,
         status_code = ?status.code(),
-        status_message = %status.message(),
+        status_message = %bounded_xds_log_value(status.message()),
         "xDS request rejected"
     );
 }

@@ -9,6 +9,8 @@
 //! listener, leaving a Permissive verifier in place after a Strict policy
 //! advance.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -170,7 +172,7 @@ async fn initial_dtls_generation_precedes_generated_listener_startup() {
         [("app", "coap")],
         ["10.244.3.12"],
     );
-    let holder = tokio::net::UdpSocket::bind("127.0.0.1:0")
+    let holder = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("reserve UDP listener port");
     let port = holder.local_addr().expect("reserved address").port();

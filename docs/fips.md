@@ -406,7 +406,7 @@ walks through, so all of the following are refused:
 | Surface | Setting |
 |---|---|
 | Global outbound | `FERRUM_TLS_NO_VERIFY=true` |
-| Admin API client | `FERRUM_ADMIN_TLS_NO_VERIFY=true` |
+| Admin listener client authentication | `FERRUM_ADMIN_TLS_NO_VERIFY=true` |
 | Admin listener transport | `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` |
 | CP/DP configuration transport | `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` |
 | Injector admission webhook | `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |

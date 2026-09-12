@@ -30,7 +30,13 @@ authenticate()                  ── can reject (auth plugins only)
 authorize()                     ── can reject
   │
   ▼
+validate_client_request_body_contract() ── can reject (client-facing contract over original body; phase 3c)
+  │
+  ▼
 before_proxy()                  ── can reject, can modify headers
+  │
+  ▼
+on_backend_path_resolved()      ── can reject (backend-effective path pinned; phase 5b)
   │
   ▼
 transform_request_body()        ── can transform request body (buffered only)
@@ -39,16 +45,31 @@ transform_request_body()        ── can transform request body (buffered only
 on_final_request_body()         ── can reject (post-transform validation)
   │
   ▼
+dispatch_finalized_request_egress() ── can reject (irreversible outbound egress; phase 5e)
+  │
+  ▼
+try_backend_admission()         ── can reject (target-aware admission after load balancing; phase 6)
+  │
+  ▼
 Proxy to backend
   │
   ▼
 after_proxy()                   ── can reject, can modify response headers
   │
   ▼
+on_final_response_headers()     ── observe-only header effects (phase 7b; streamed responses stop here)
+  │
+  ▼
 on_response_body()              ── can reject (buffered responses only)
   │
   ▼
-transform_response_body()       ── can transform response body (buffered only)
+transform_response_body()       ── can transform response body (buffered only; semantic stage 10, then transport-encoding stage 10c)
+  │
+  ▼
+on_response_body_transformed()  ── refresh representation metadata after a body replacement
+  │
+  ▼
+finalize_client_visible_response_body() ── can reject (authoritative output policy; phase 10b)
   │
   ▼
 on_final_response_body()        ── can reject (post-transform validation)
@@ -62,6 +83,11 @@ log()                           ── sequential; see transaction log hook timi
   ▼
 Buffered response returned to the embedded HTTP server, then sent to the client
 ```
+
+Phase numbers and deferred sub-phases (`5c` deferred `before_proxy`, `7c`
+`finalize_client_visible_response_headers`, and others) are defined in
+[docs/plugin_execution_order.md](docs/plugin_execution_order.md). Link there
+rather than duplicating the full ladder in this guide.
 
 Streamed responses have a different terminal path. For hyper-owned H1/H2 and
 gRPC bodies, the handler returns the response first; body completion then
@@ -98,6 +124,13 @@ on_stream_disconnect()          ── fire-and-forget (logging, metrics)
 ### 1. Create your plugin file
 
 Create a new `.rs` file in the `custom_plugins/` directory at the project root. The file name becomes the plugin name (e.g., `my_header_injector.rs` → plugin name `my_header_injector`).
+
+A custom plugin file stem must not match any built-in plugin name from
+`BUILTIN_PLUGIN_REGISTRATIONS` (for example `cors.rs` or `jwt_auth.rs`). The
+build fails with a collision error naming the file and the built-in it shadows.
+Built-in names always win at runtime, so a colliding custom plugin would compile
+and register but never run, would still apply any `plugin_migrations()`, and
+would appear twice in `available_plugins()`.
 
 Each plugin file must export a `create_plugin` factory function that returns
 `Result` and a `failure_policy` metadata function:
@@ -291,13 +324,20 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `on_request_received(&mut ctx)` | Post-route, post-allowed-method admission | Yes | IP filtering, request validation, early termination for matched/allowed requests |
 | `authenticate(&mut ctx, &consumer_index)` | Authentication | Yes | Verify identity (JWT, API key, custom tokens) |
 | `authorize(&mut ctx)` | Authorization | Yes | Check permissions, enforce rate limits |
+| `validate_client_request_body_contract(&mut ctx, &headers, &body)` | Pre-`before_proxy` client contract (phase 3c) | Yes | Decide a client-facing request-body contract over the **original** client body after gateway-owned normalization and before any `before_proxy` or `transform_request_body` hook. Read-only: admit or reject, never rewrite. Requires `validates_client_request_body_contract()` **and** `requires_request_body_before_before_proxy()`; declaring the first without the second is a **startup-fatal** plugin-cache rejection because the phase would never run. See [plugin execution order](docs/plugin_execution_order.md#lifecycle-phases). |
 | `before_proxy(&mut ctx, &mut headers)` | Pre-backend | Yes | Transform request headers, add tracing IDs. **Read request headers from `headers`, not `ctx.headers`** (see note below) |
+| `on_backend_path_resolved(&mut ctx, backend_path)` | After path assembly (phase 5b) | Yes | Run once with the backend-effective path pinned and the selected target fixed. Use for route-sensitive policy such as `grpc_method_router`. Deferred external/synthetic `before_proxy` work (phase 5c) runs later — see [plugin execution order](docs/plugin_execution_order.md#lifecycle-phases). |
 | `transform_request_body(&body, content_type)` | Pre-backend (buffered) | No | Rewrite request body before sending to backend |
 | `on_final_request_body(&headers, &body)` | Pre-backend (post-transform) | Yes | Validate the final request body after all transforms |
+| `dispatch_finalized_request_egress(&mut ctx, &headers, &body, &mut backend_header_overlay)` | Finalized request egress (phase 5e) | Yes | Irreversible outbound request egress after request transforms and every final request-body policy hook accept the exact backend-visible bytes. Write backend header overlays into `backend_header_overlay`, not the immutable snapshot. Built-in participants include `serverless_function`, `request_mirror`, and `ai_federation`. |
+| `try_backend_admission(&ctx, &admission)` | Target-aware backend admission (phase 6) | Yes* | Called after load balancing selects a target and before dial/dispatch. Opt in with `is_backend_admission_plugin()`. Returns `BackendAdmissionDecision::Continue` or a rejection permit decision — not `PluginResult`. |
 | `after_proxy(&mut ctx, status, &mut headers)` | Post-backend | Yes | Transform response headers, reject responses |
 | `apply_websocket_handshake_response_headers(&ctx, status, &mut headers)` | Successful WebSocket handshake (H1 `101`; H2/H3 `200`) | No | Synchronously decorate successful handshake response headers in configured order. After this non-rejecting hook returns, proxy core scrubs transport-owned handshake/framing fields and reconstructs them authoritatively. |
+| `on_final_response_headers(&mut ctx, status, &headers)` | Post-`after_proxy` (phase 7b) | No | Header-only effects for the selected response on both buffered and streaming paths. Non-rejecting; streamed responses stop body hooks after this phase. Pair with `on_final_response_body()` only when both must be idempotent. |
 | `on_response_body(&mut ctx, status, &headers, &body)` | Post-backend (buffered) | Yes | Inspect buffered response body, extract metrics |
-| `transform_response_body(&body, content_type, &headers)` | Post-backend (buffered) | No | Rewrite response body before sending to client |
+| `transform_response_body(&body, content_type, &headers)` | Post-backend (buffered) | No | Rewrite response body before sending to client. Runs in the semantic stage (phase 10) and may run again in the transport-encoding stage (phase 10c) for plugins such as `compression`. |
+| `on_response_body_transformed(&ctx, status, &headers, &body)` | Between response transforms | No | Synchronous metadata refresh after this plugin's `transform_response_body` returns a replacement body. Not invoked when the transform returns `None`. |
+| `finalize_client_visible_response_body(&mut ctx, status, &headers, &body)` | Post-transform output policy (phase 10b) | Yes | Authoritative, rejecting policy over the exact client-visible bytes after semantic and transport transforms. Opt in with `enforces_final_client_visible_response_body()`. Header policy belongs in `finalize_client_visible_response_headers()` (phase 7c). |
 | `on_final_response_body(&mut ctx, status, &headers, &body)` | Post-backend (post-transform) | Yes | Validate the final response body after all transforms |
 | `on_response_committed(&mut ctx, status, &headers, &body)` | Post-backend (buffered commit) | No | Export the final client-visible buffered response after validators and rejection replacement; opt in with `requires_response_committed_hook()` |
 | `response_stream_inspector(&ctx, status, content_type)` | Post-backend (streaming) | No (can truncate) | Create one stateful, per-response body inspector |
@@ -390,7 +430,13 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn modifies_request_body(&self) -> bool` | `false` | Set to `true` if your plugin transforms the request body via `transform_request_body`. |
 | `fn egresses_request_body_before_finalization(&self) -> bool` | `false` | Set to `true` if `before_proxy` sends the buffered request body to an external service before request transforms/final hooks. Candidate admission and runtime cache construction then reject same-protocol body-transform compositions and same HTTP/gRPC-protocol final request-body policy plugins (`enforces_finalized_request_policy()`). |
 | `fn requires_prior_request_deduplication(&self) -> bool` | `false` | Set to `true` if `before_proxy` can execute an external side effect and return a terminal response. Any attached same-protocol `request_deduplication` instance must then have a strictly lower effective priority. |
-| `fn requires_request_body_before_before_proxy(&self) -> bool` | `false` | Set to `true` if your plugin needs the raw request body available during `before_proxy`. |
+| `fn requires_request_body_before_before_proxy(&self) -> bool` | `false` | Set to `true` if your plugin needs the raw request body available during `before_proxy`. **Required** when `validates_client_request_body_contract()` is `true`; omitting it is a startup-fatal cache rejection. |
+| `fn validates_client_request_body_contract(&self) -> bool` | `false` | Set to `true` when `validate_client_request_body_contract()` enforces a client-facing body contract over the original client representation (phase 3c). Must be paired with `requires_request_body_before_before_proxy()`. |
+| `fn requires_backend_path_resolution(&self) -> bool` | `false` | Set to `true` when the plugin implements `on_backend_path_resolved()`. Pre-computed so proxies without an opt-in plugin do not scan the chain. |
+| `fn dispatches_finalized_request_egress(&self) -> bool` | `false` | Set to `true` when the plugin performs irreversible outbound request egress from `dispatch_finalized_request_egress()` (phase 5e). Must not egress from `before_proxy`. |
+| `fn is_backend_admission_plugin(&self) -> bool` | `false` | Set to `true` when the plugin participates in `try_backend_admission()` after load balancing (phase 6). |
+| `fn enforces_final_client_visible_response_body(&self, &ctx) -> bool` | `false` | Per-request opt-in for `finalize_client_visible_response_body()` (phase 10b). |
+| `fn enforces_final_client_visible_response_headers(&self, &ctx) -> bool` | `false` | Per-request opt-in for `finalize_client_visible_response_headers()` (phase 7c). |
 | `fn requires_request_body_buffering(&self) -> bool` | Derived | By default returns `true` if `modifies_request_body()` or `requires_request_body_before_before_proxy()`. Override for custom logic. |
 | `fn should_buffer_request_body(&self, &ctx) -> bool` | Delegates | Per-request decision on whether to buffer. Defaults to `requires_request_body_buffering()`. Override for conditional buffering (e.g., only for certain content types). |
 | `fn requires_response_body_buffering(&self) -> bool` | `false` | Config-time upper bound. Set to `true` if the plugin may need the complete response body. |
@@ -1426,17 +1472,17 @@ CustomPluginMigration {
 # Apply all pending migrations (core + plugin)
 FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up \
   FERRUM_DB_TYPE=sqlite FERRUM_DB_URL=sqlite://ferrum.db \
-  cargo run
+  cargo run -- run
 
 # Dry run — show what would be applied without making changes
 FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up FERRUM_MIGRATE_DRY_RUN=true \
   FERRUM_DB_TYPE=sqlite FERRUM_DB_URL=sqlite://ferrum.db \
-  cargo run
+  cargo run -- run
 
 # Check migration status (core + plugin)
 FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=status \
   FERRUM_DB_TYPE=sqlite FERRUM_DB_URL=sqlite://ferrum.db \
-  cargo run
+  cargo run -- run
 ```
 
 Example output:
@@ -1596,7 +1642,10 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] `modifies_request_body()` returns `true` if it transforms the request body
 - [ ] `egresses_request_body_before_finalization()` returns `true` if `before_proxy` sends body bytes to an external service before finalization (candidate admission then refuses same-protocol body transformers and same HTTP/gRPC-protocol final request-body policy plugins)
 - [ ] `requires_prior_request_deduplication()` returns `true` if a terminal external side effect must run after attached deduplication instances
+- [ ] `requires_request_body_before_before_proxy()` returns `true` if it reads the request body during `before_proxy` or implements `validate_client_request_body_contract()`
+- [ ] `validates_client_request_body_contract()` is paired with `requires_request_body_before_before_proxy()` when the client-contract hook is implemented
 - [ ] `requires_request_body_buffering()` returns `true` if it reads the request body
+- [ ] Backend-path, finalized-egress, backend-admission, and final response hooks are implemented only with their matching capability flags — see [plugin execution order](docs/plugin_execution_order.md)
 - [ ] Complete-body response plugins declare `requires_response_body_buffering()` and only narrow it in `should_buffer_response_body*()`
 - [ ] Non-producers override `response_body_production()` to return `ResponseBodyProduction::Never`; producers declare `BoundedByRetainedCeiling` only with construction-time bounded sinks (`BoundedResponseBodySink` / `bounded_json_vec`); leaving the method undeclared is fail-closed refusal before invocation
 - [ ] Streaming response plugins declare `requires_response_stream_hooks()` and return a bounded, state-owning `ResponseStreamInspector`

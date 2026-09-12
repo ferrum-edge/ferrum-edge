@@ -1,5 +1,7 @@
 //! HTTP/3 HEAD/GET contract for `request_termination` synthetic responses.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 
@@ -59,7 +61,7 @@ async fn spawn_h3_gateway(backend_port: u16) -> (TestGateway, u16) {
     let mut last_error = String::new();
 
     for _ in 0..MAX_ATTEMPTS {
-        let reservation = match TcpListener::bind("127.0.0.1:0").await {
+        let reservation = match TcpListener::bind_test("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) => {
                 last_error = error.to_string();
@@ -106,7 +108,7 @@ async fn spawn_h3_gateway(backend_port: u16) -> (TestGateway, u16) {
 #[tokio::test]
 async fn functional_request_termination_h3_head_omits_data_and_get_keeps_body() {
     // Backend must never be contacted — bind and leave it idle so any dial fails loudly.
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind idle backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
@@ -186,7 +188,7 @@ async fn spawn_h3_drain_gateway(backend_port: u16, drain_seconds: u64) -> (TestG
     let mut last_error = String::new();
 
     for _ in 0..MAX_ATTEMPTS {
-        let reservation = match TcpListener::bind("127.0.0.1:0").await {
+        let reservation = match TcpListener::bind_test("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) => {
                 last_error = error.to_string();
@@ -237,7 +239,7 @@ async fn start_slow_http_backend(
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind slow backend");
     let port = listener.local_addr().expect("backend addr").port();

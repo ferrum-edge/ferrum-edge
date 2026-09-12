@@ -1,7 +1,12 @@
 //! OpenTelemetry Tracing Plugin
 //!
 //! Provides W3C Trace Context propagation (`traceparent`/`tracestate`) and
-//! exports spans to OTLP/Zipkin/Datadog collectors via HTTP/JSON.
+//! exports spans to an OTLP/HTTP JSON collector.
+//!
+//! The Zipkin, Datadog, and Lightstep exporters in this module are reachable
+//! only through mesh Telemetry providers (`workload_metrics`): the standalone
+//! `otel_tracing` plugin has no provider selector and always builds the OTLP
+//! exporter.
 //!
 //! When no endpoint is configured, the plugin runs in propagation-only mode:
 //! it generates/propagates trace context without exporting spans.
@@ -9,10 +14,16 @@
 //! Security and contract notes:
 //! - Trace-context trust is explicit and fail-closed (`trace_context_trust`).
 //! - Parent-based sampling is honored; root sampling is configurable.
+//! - OTLP/JSON carries trace, span, and parent IDs as lowercase hex, which is
+//!   the OTLP JSON mapping rather than the generic protobuf bytes convention.
+//! - `authorization` is a credential: it is admitted only when it can become an
+//!   HTTP header value, and rejected values are never echoed in diagnostics.
 //! - Span names use low-cardinality route/proxy identifiers, never raw paths.
 //!   HTTP methods in span names are bounded to the standard set (`_OTHER`
 //!   for extensions); `http.request.method` retains the observed token.
 //! - Exporter queues are count- and byte-bounded; diagnostics use redacted URLs.
+
+use crate::plugins::utils::log_sampling::warn_sampled;
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
@@ -30,6 +41,7 @@ use uuid::Uuid;
 use crate::modes::mesh::config::TracingProvider;
 use crate::observability_delivery::DeliveryWorkerControl;
 use crate::util::accept_backoff::LogRateLimiter;
+use crate::util::backoff::random_backoff_entropy;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mesh::mesh_trace_attributes;
@@ -89,6 +101,10 @@ const DEFAULT_MAX_RETRIES: u64 = 2;
 const MIN_RETRY_DELAY_MS: u64 = 0;
 const MAX_RETRY_DELAY_MS: u64 = 60_000;
 const DEFAULT_RETRY_DELAY_MS: u64 = 1_000;
+/// Fixed diagnostic for an unusable `authorization` value. The rejected value
+/// is a credential, so it never appears in the message.
+const INVALID_AUTHORIZATION_ERROR: &str =
+    "otel_tracing: 'authorization' contains characters not permitted in HTTP header values";
 const MAX_PARTIAL_SUCCESS_MESSAGE_BYTES: usize = 512;
 const MAX_OTLP_SUCCESS_BODY_BYTES: usize = 64 * 1024;
 const MAX_URL_PATH_BYTES: usize = 512;
@@ -162,6 +178,9 @@ pub(crate) struct SpanData {
     pub(crate) trace_id: String,
     pub(crate) span_id: String,
     pub(crate) parent_span_id: String,
+    /// Configured service identity, copied as configured. `max_attribute_bytes`
+    /// bounds request-derived attribute values; it is not applied to operator
+    /// identity, which is already bounded by the stored plugin config.
     pub(crate) service_name: String,
     pub(crate) span_name: String,
     pub(crate) span_kind: u8,
@@ -599,7 +618,10 @@ impl OtelTracing {
         )?;
 
         let endpoint = optional_string_config(config, "endpoint")?;
-        let authorization = optional_string_config(config, "authorization")?;
+        // Validated even in propagation-only mode: an unusable value must fail
+        // admission now, not silently lose every export once an endpoint is
+        // added later.
+        let authorization = parse_authorization(config)?;
         let custom_headers = parse_custom_headers(config.get("headers"))?;
         // Validate exporter controls even in propagation-only mode. A stored
         // typo or invalid queue setting must not become latent until an
@@ -1185,6 +1207,11 @@ impl BufferedTraceExporter {
         buffer_max_bytes: usize,
     ) -> Result<Self, String> {
         let hostname = validate_endpoint_for_provider(cfg.provider_name, &cfg.endpoint)?;
+        // `buffer_capacity` bounds this channel only. The flush worker moves
+        // spans out of it into its own batch, so total pending spans can reach
+        // `buffer_capacity + batch_size` before a flush completes. Aggregate
+        // retention is bounded by bytes (`buffer_max_bytes` plus the process
+        // ceiling), not by this count.
         let (sender, receiver) = mpsc::channel(buffer_capacity);
         let provider_name = cfg.provider_name;
         let queued_bytes = Arc::new(AtomicUsize::new(0));
@@ -1965,6 +1992,119 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
     }
 }
 
+/// Whether a non-success export response may be retried.
+///
+/// OTLP/HTTP publishes an exact retryable set (429, 502, 503, 504); every other
+/// status — 400, 408, 500, 501 included — is terminal for the batch and must
+/// not consume the retry budget. Zipkin and Datadog publish no such contract,
+/// so they keep the historical "retry anything that is not a client error"
+/// rule with the 408/429 exemptions.
+fn trace_status_is_retryable(kind: TracePayloadKind, status: reqwest::StatusCode) -> bool {
+    match kind {
+        TracePayloadKind::Otlp => matches!(status.as_u16(), 429 | 502 | 503 | 504),
+        TracePayloadKind::Zipkin | TracePayloadKind::Datadog => {
+            !status.is_client_error()
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+    }
+}
+
+/// Collector throttling instruction from a retryable response, if any.
+///
+/// Accepts both `Retry-After` forms: `delay-seconds` and an HTTP-date. A date
+/// already in the past means "retry now", not "wait forever".
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    parse_retry_after(raw, std::time::SystemTime::now())
+}
+
+fn parse_retry_after(value: &str, now: std::time::SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let deadline = httpdate::parse_http_date(value).ok()?;
+    Some(deadline.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+/// Doubling ceiling for the retry backoff. `1 << 10` keeps the multiplication
+/// away from overflow while still reaching the 60 s clamp from any base.
+const MAX_RETRY_BACKOFF_SHIFT: u32 = 10;
+
+/// Delay before the retry that follows `attempt` (1 = the first retry).
+///
+/// A collector `Retry-After` wins outright and is used as given — the collector
+/// asked for an exact wait, so jitter would contradict it. Otherwise the
+/// configured `retry_delay_ms` is the first retry's delay and doubles per
+/// attempt with +/-25% jitter. Both forms are clamped to `MAX_RETRY_DELAY_MS`
+/// so one throttled batch cannot hold the shutdown drain open indefinitely.
+fn trace_retry_delay(
+    base: Duration,
+    attempt: u32,
+    retry_after: Option<Duration>,
+    entropy: u64,
+) -> Duration {
+    let max_ms = MAX_RETRY_DELAY_MS;
+    if let Some(retry_after) = retry_after {
+        return retry_after.min(Duration::from_millis(max_ms));
+    }
+    let shift = attempt.saturating_sub(1).min(MAX_RETRY_BACKOFF_SHIFT);
+    let configured_ms = u64::try_from(base.as_millis()).unwrap_or(max_ms);
+    let scaled_ms = configured_ms.saturating_mul(1u64 << shift).min(max_ms);
+    Duration::from_millis(jittered_retry_ms(scaled_ms, entropy))
+}
+
+/// +/-25% jitter around `base_ms`, never below zero and never above the clamp.
+/// A base of `0` (an explicitly disabled delay) stays `0`.
+fn jittered_retry_ms(base_ms: u64, entropy: u64) -> u64 {
+    let range = base_ms / 4;
+    if range == 0 {
+        return base_ms;
+    }
+    let offset = (entropy % range.saturating_mul(2)) as i128 - i128::from(range);
+    let jittered = i128::from(base_ms) + offset;
+    jittered.clamp(0, i128::from(MAX_RETRY_DELAY_MS)) as u64
+}
+
+/// Retry classification by provider name, so the response-code table can be
+/// pinned externally without a live collector. `None` for an unknown provider
+/// or an out-of-range status.
+pub(crate) fn trace_status_is_retryable_for_test(provider: &str, status: u16) -> Option<bool> {
+    let kind = match provider {
+        "otlp" => TracePayloadKind::Otlp,
+        "zipkin" => TracePayloadKind::Zipkin,
+        "datadog" => TracePayloadKind::Datadog,
+        _ => return None,
+    };
+    let status = reqwest::StatusCode::from_u16(status).ok()?;
+    Some(trace_status_is_retryable(kind, status))
+}
+
+/// `Retry-After` parsed against a fixed clock, in milliseconds.
+pub(crate) fn parse_retry_after_for_test(value: &str, now_unix_secs: u64) -> Option<u64> {
+    let now = std::time::UNIX_EPOCH + Duration::from_secs(now_unix_secs);
+    let delay = parse_retry_after(value, now)?;
+    Some(delay.as_millis() as u64)
+}
+
+/// The exact retry delay, in milliseconds, for fixed inputs and fixed jitter
+/// entropy — no clock and no sleeping.
+pub(crate) fn trace_retry_delay_ms_for_test(
+    base_ms: u64,
+    attempt: u32,
+    retry_after_ms: Option<u64>,
+    entropy: u64,
+) -> u64 {
+    let retry_after = retry_after_ms.map(Duration::from_millis);
+    let base = Duration::from_millis(base_ms);
+    let delay = trace_retry_delay(base, attempt, retry_after, entropy);
+    delay.as_millis() as u64
+}
+
 async fn deliver_trace_payload(
     cfg: &TraceHttpExporterConfig,
     body: ReservedPayload,
@@ -1973,10 +2113,13 @@ async fn deliver_trace_payload(
     let total_attempts = cfg.max_retries + 1;
 
     for attempt in 1..=total_attempts {
+        // Collector-supplied throttling instruction for THIS attempt only.
+        let mut throttle: Option<Duration> = None;
         let Some(http) = cfg.http_client.get().ok() else {
-            warn!(
+            warn_sampled!(
                 "{} export batch discarded: plugin HTTP client unavailable ({} spans lost)",
-                cfg.provider_name, entry_count,
+                cfg.provider_name,
+                entry_count,
             );
             return;
         };
@@ -2011,36 +2154,47 @@ async fn deliver_trace_payload(
             }
             Ok(response) => {
                 let status = response.status();
-                warn!(
+                warn_sampled!(
                     "{} export failed with status {} for {} (attempt {}/{})",
-                    cfg.provider_name, status, cfg.endpoint_for_logs, attempt, total_attempts,
+                    cfg.provider_name,
+                    status,
+                    cfg.endpoint_for_logs,
+                    attempt,
+                    total_attempts,
                 );
-                if status.is_client_error()
-                    && status != reqwest::StatusCode::REQUEST_TIMEOUT
-                    && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-                {
-                    warn!(
+                if !trace_status_is_retryable(cfg.payload_kind, status) {
+                    warn_sampled!(
                         "{} export batch discarded due to {} response ({} spans lost)",
-                        cfg.provider_name, status, entry_count,
+                        cfg.provider_name,
+                        status,
+                        entry_count,
                     );
                     return;
                 }
+                throttle = retry_after_from_headers(response.headers());
             }
             Err(e) => {
-                warn!(
+                warn_sampled!(
                     "{} export failed: {} (attempt {}/{})",
-                    cfg.provider_name, e, attempt, total_attempts,
+                    cfg.provider_name,
+                    e,
+                    attempt,
+                    total_attempts,
                 );
             }
         }
         if attempt < total_attempts {
-            tokio::time::sleep(cfg.retry_delay).await;
+            let entropy = random_backoff_entropy();
+            let delay = trace_retry_delay(cfg.retry_delay, attempt, throttle, entropy);
+            tokio::time::sleep(delay).await;
         }
     }
 
-    warn!(
+    warn_sampled!(
         "{} export batch discarded after {} attempts ({} spans lost)",
-        cfg.provider_name, total_attempts, entry_count,
+        cfg.provider_name,
+        total_attempts,
+        entry_count,
     );
 }
 
@@ -2060,7 +2214,7 @@ async fn handle_otlp_partial_success(
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(error) => {
-                warn!(
+                warn_sampled!(
                     provider = cfg.provider_name,
                     endpoint = %cfg.endpoint_for_logs,
                     %error,
@@ -2070,7 +2224,7 @@ async fn handle_otlp_partial_success(
             }
         };
         if body.len().saturating_add(chunk.len()) > MAX_OTLP_SUCCESS_BODY_BYTES {
-            warn!(
+            warn_sampled!(
                 provider = cfg.provider_name,
                 endpoint = %cfg.endpoint_for_logs,
                 limit_bytes = MAX_OTLP_SUCCESS_BODY_BYTES,
@@ -2088,7 +2242,7 @@ async fn handle_otlp_partial_success(
         .map(otlp_json_content_type)
         .unwrap_or(true)
     {
-        warn!(
+        warn_sampled!(
             provider = cfg.provider_name,
             endpoint = %cfg.endpoint_for_logs,
             body_bytes = body.len(),
@@ -2097,7 +2251,7 @@ async fn handle_otlp_partial_success(
         return;
     }
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
-        warn!(
+        warn_sampled!(
             provider = cfg.provider_name,
             endpoint = %cfg.endpoint_for_logs,
             body_bytes = body.len(),
@@ -2115,7 +2269,7 @@ async fn handle_otlp_partial_success(
         return;
     }
     let Some(partial) = partial_value.as_object() else {
-        warn!(
+        warn_sampled!(
             provider = cfg.provider_name,
             endpoint = %cfg.endpoint_for_logs,
             body_bytes = body.len(),
@@ -2135,7 +2289,7 @@ async fn handle_otlp_partial_success(
         {
             Some(rejected) => rejected,
             None => {
-                warn!(
+                warn_sampled!(
                     provider = cfg.provider_name,
                     endpoint = %cfg.endpoint_for_logs,
                     body_bytes = body.len(),
@@ -2152,7 +2306,7 @@ async fn handle_otlp_partial_success(
         None | Some(Value::Null) => "",
         Some(Value::String(message)) => message.as_str(),
         Some(_) => {
-            warn!(
+            warn_sampled!(
                 provider = cfg.provider_name,
                 endpoint = %cfg.endpoint_for_logs,
                 body_bytes = body.len(),
@@ -2163,7 +2317,7 @@ async fn handle_otlp_partial_success(
     };
     let message = bounded_log_value(message, MAX_PARTIAL_SUCCESS_MESSAGE_BYTES);
     if rejected > 0 || !message.is_empty() {
-        warn!(
+        warn_sampled!(
             provider = cfg.provider_name,
             endpoint = %cfg.endpoint_for_logs,
             rejected_spans = rejected,
@@ -2208,13 +2362,13 @@ fn build_otlp_payload(
     let otlp_spans: Vec<Value> = spans
         .iter()
         .map(|s| {
-            let trace_id_bytes = hex_to_base64(&s.trace_id);
-            let span_id_bytes = hex_to_base64(&s.span_id);
-            let parent_span_bytes = if s.parent_span_id.is_empty() {
-                String::new()
-            } else {
-                hex_to_base64(&s.parent_span_id)
-            };
+            // OTLP/JSON maps `bytes` ID fields to lowercase hex, not to the
+            // generic protobuf base64 encoding. `take_w3c_trace_ids` already
+            // admitted only 32/16-digit lowercase hex, so the retained strings
+            // are the wire representation.
+            let trace_id_hex = s.trace_id.as_str();
+            let span_id_hex = s.span_id.as_str();
+            let parent_span_hex = s.parent_span_id.as_str();
 
             let start_ns = timestamp_nanos(&s.timestamp_received);
             let end_ns = start_ns + (s.duration_ms.max(0.0) * 1_000_000.0) as i64;
@@ -2413,11 +2567,15 @@ fn build_otlp_payload(
                 }));
             }
 
-            let status_code = if s.otlp_error { 2 } else { 1 };
+            // OTel status: `Ok` (1) is reserved for a status an application
+            // explicitly asserts. Gateway instrumentation only ever observes,
+            // so a non-error span stays `Unset` (0) and an error span is
+            // `Error` (2).
+            let status_code = if s.otlp_error { 2 } else { 0 };
 
             let mut span = serde_json::json!({
-                "traceId": trace_id_bytes,
-                "spanId": span_id_bytes,
+                "traceId": trace_id_hex,
+                "spanId": span_id_hex,
                 "name": s.span_name.clone(),
                 "kind": s.span_kind,
                 "startTimeUnixNano": start_ns.to_string(),
@@ -2428,8 +2586,8 @@ fn build_otlp_payload(
                 }
             });
 
-            if !parent_span_bytes.is_empty() {
-                span["parentSpanId"] = Value::String(parent_span_bytes);
+            if !parent_span_hex.is_empty() {
+                span["parentSpanId"] = Value::String(parent_span_hex.to_string());
             }
             if !events.is_empty() {
                 span["events"] = Value::Array(events);
@@ -2729,6 +2887,24 @@ fn datadog_high_trace_id(hex: &str) -> Option<&str> {
     high.chars().any(|ch| ch != '0').then_some(high)
 }
 
+/// JSON type name of a rejected configuration value.
+///
+/// Configuration diagnostics name the offending field and this type, never the
+/// value itself. A mis-templated setting can nest a credential inside an object
+/// or array, and these errors reach file validation and plugin-cache warnings
+/// without passing the admin redactor, so no rejected value node is ever
+/// serialized into one (GHSA-45mw-qr4f-3vfv).
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 fn string_config(config: &Value, key: &str, default: &str) -> Result<String, String> {
     match config.get(key) {
         None => Ok(default.to_string()),
@@ -2742,9 +2918,26 @@ fn string_config(config: &Value, key: &str, default: &str) -> Result<String, Str
             }
         }
         Some(other) => Err(format!(
-            "otel_tracing: '{key}' must be a string, got: {other}"
+            "otel_tracing: '{key}' must be a string, got: {}",
+            json_type_name(other)
         )),
     }
+}
+
+/// Admit `authorization` only when it can actually become an HTTP header value.
+///
+/// The exporter applies this value per request, so a value `reqwest` cannot
+/// build silently loses every export (#5243). Validation matches the custom
+/// `headers` rules and never echoes the rejected value: this field is a
+/// credential.
+fn parse_authorization(config: &Value) -> Result<Option<String>, String> {
+    let Some(value) = optional_string_config(config, "authorization")? else {
+        return Ok(None);
+    };
+    if HeaderValue::from_str(&value).is_err() {
+        return Err(INVALID_AUTHORIZATION_ERROR.to_string());
+    }
+    Ok(Some(value))
 }
 
 fn optional_string_config(config: &Value, key: &str) -> Result<Option<String>, String> {
@@ -2760,7 +2953,8 @@ fn optional_string_config(config: &Value, key: &str) -> Result<Option<String>, S
             }
         }
         Some(other) => Err(format!(
-            "otel_tracing: '{key}' must be a string, got: {other}"
+            "otel_tracing: '{key}' must be a string, got: {}",
+            json_type_name(other)
         )),
     }
 }
@@ -2771,7 +2965,8 @@ fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String>
         Some(Value::Null) => Err(format!("otel_tracing: '{key}' must be a non-null boolean")),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
-            "otel_tracing: '{key}' must be a boolean, got: {other}"
+            "otel_tracing: '{key}' must be a boolean, got: {}",
+            json_type_name(other)
         )),
     }
 }
@@ -2795,7 +2990,8 @@ fn u64_config_range(
             .ok_or_else(|| format!("otel_tracing: '{key}' must be a non-negative integer"))?,
         Some(other) => {
             return Err(format!(
-                "otel_tracing: '{key}' must be a non-negative integer, got: {other}"
+                "otel_tracing: '{key}' must be a non-negative integer, got: {}",
+                json_type_name(other)
             ));
         }
     };
@@ -2843,7 +3039,8 @@ fn parse_trace_context_trust(config: &Value) -> Result<TraceContextTrust, String
             )),
         },
         Some(other) => Err(format!(
-            "otel_tracing: 'trace_context_trust' must be a string, got: {other}"
+            "otel_tracing: 'trace_context_trust' must be a string, got: {}",
+            json_type_name(other)
         )),
     }
 }
@@ -2857,7 +3054,8 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
         Some(Value::String(value)) => value.trim().to_ascii_lowercase(),
         Some(other) => {
             return Err(format!(
-                "otel_tracing: 'root_sampling' must be a string, got: {other}"
+                "otel_tracing: 'root_sampling' must be a string, got: {}",
+                json_type_name(other)
             ));
         }
     };
@@ -2882,7 +3080,8 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
         }
         Some(other) => {
             return Err(format!(
-                "otel_tracing: 'root_sampling_ratio' must be a number, got: {other}"
+                "otel_tracing: 'root_sampling_ratio' must be a number, got: {}",
+                json_type_name(other)
             ));
         }
     };
@@ -3139,24 +3338,6 @@ fn otlp_attribute_bool(key: &str, value: bool) -> Value {
     })
 }
 
-fn hex_to_base64(hex: &str) -> String {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
-
-    let bytes: Vec<u8> = (0..hex.len())
-        .step_by(2)
-        .filter_map(|i| {
-            let end = i + 2;
-            if end > hex.len() {
-                return None;
-            }
-            u8::from_str_radix(&hex[i..end], 16).ok()
-        })
-        .collect();
-
-    STANDARD.encode(&bytes)
-}
-
 fn is_lowercase_hex(value: &str, expected_len: usize) -> bool {
     value.len() == expected_len
         && value
@@ -3293,9 +3474,28 @@ fn http_method_for_span_name(method: &str) -> &'static str {
     }
 }
 
+/// A failure that prevented the response from being transferred completely.
+///
+/// Deliberately narrower than [`TransactionSummary::is_terminal_failure`]: a
+/// gateway rejection (`rejection_phase`) or a mirror error is a *completed*
+/// response, not a broken transfer, so neither may turn an ordinary 4xx into
+/// an ERROR span.
+fn response_transfer_failed(summary: &TransactionSummary) -> bool {
+    summary.error_class.is_some()
+        || summary.body_error_class.is_some()
+        || summary.client_disconnected
+        || (summary.response_streamed && !summary.body_completed)
+}
+
 fn http_span_is_error(summary: &TransactionSummary) -> bool {
     // Nonzero gRPC status is always an error (#2585), even over HTTP 200/4xx.
     if summary.grpc_status().is_some_and(|status| status != 0) {
+        return true;
+    }
+    // A genuine transport/body failure is an error whatever status line was
+    // committed (#5245). Truncating a 404 body is not a successful rejection,
+    // so this is evaluated before — not after — the 4xx rule.
+    if response_transfer_failed(summary) {
         return true;
     }
     let status = summary.response_status_code;
@@ -3609,37 +3809,6 @@ mod tests {
             .count();
         assert_eq!(admitted, 8);
         assert_eq!(exporter.queued_bytes.load(Ordering::Acquire), 1_024);
-    }
-
-    #[test]
-    fn hex_to_base64_decodes_even_length_input() {
-        let hex = "4bf92f3577b34da6a3ce929d0e0e4736";
-        let encoded = hex_to_base64(hex);
-        assert_eq!(encoded, "S/kvNXezTaajzpKdDg5HNg==");
-    }
-
-    #[test]
-    fn hex_to_base64_decodes_8_byte_span_id() {
-        let hex = "00f067aa0ba902b7";
-        let encoded = hex_to_base64(hex);
-        assert_eq!(encoded, "APBnqgupArc=");
-    }
-
-    #[test]
-    fn hex_to_base64_handles_empty_input() {
-        assert_eq!(hex_to_base64(""), "");
-    }
-
-    #[test]
-    fn hex_to_base64_handles_odd_length_without_panic() {
-        let _ = hex_to_base64("abc");
-        let _ = hex_to_base64("4bf92f3577b34da6a3ce929d0e0e473");
-    }
-
-    #[test]
-    fn hex_to_base64_invalid_chars_filtered() {
-        let encoded = hex_to_base64("XX");
-        assert_eq!(encoded, "");
     }
 
     #[test]

@@ -22,6 +22,8 @@
 
 #![cfg(unix)]
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::io::Write;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -104,6 +106,7 @@ fn start_gateway(
     let binary_path = gateway_binary_path();
 
     let mut cmd = std::process::Command::new(binary_path);
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
@@ -135,10 +138,9 @@ async fn wait_for_owned_gateway(
 }
 
 async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Start the gateway with retry against ephemeral-port races.
@@ -249,7 +251,7 @@ async fn test_inflight_request_completes_during_drain() {
 
     // Backend sleeps 3s so the request is definitively in flight when we
     // send SIGTERM 500ms later.
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(start_slow_backend_on(backend_listener, 3_000));
     sleep(Duration::from_millis(200)).await;
@@ -308,7 +310,7 @@ async fn test_inflight_request_completes_during_drain() {
 async fn test_new_connections_refused_during_drain() {
     let temp_dir = TempDir::new().unwrap();
 
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(start_slow_backend_on(backend_listener, 3_000));
     sleep(Duration::from_millis(200)).await;
@@ -394,7 +396,7 @@ async fn test_new_connections_refused_during_drain() {
 async fn test_drain_zero_exits_immediately() {
     let temp_dir = TempDir::new().unwrap();
 
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(start_slow_backend_on(backend_listener, 5_000));
     sleep(Duration::from_millis(200)).await;
@@ -444,7 +446,7 @@ async fn test_drain_sets_connection_close_header() {
     let temp_dir = TempDir::new().unwrap();
 
     // Use a fast backend (100ms sleep) so request turnaround is quick.
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(start_slow_backend_on(backend_listener, 100));
     sleep(Duration::from_millis(200)).await;
@@ -549,7 +551,7 @@ async fn test_drain_timeout_respected() {
     let temp_dir = TempDir::new().unwrap();
 
     // Backend sleeps 10s — longer than the drain timeout of 2s.
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(start_slow_backend_on(backend_listener, 10_000));
     sleep(Duration::from_millis(200)).await;
@@ -806,7 +808,7 @@ where
 #[tokio::test(flavor = "multi_thread")]
 async fn test_tcp_stream_listener_stops_on_sigterm() {
     // Backend echo on its own ephemeral port.
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = start_tcp_echo_backend_on(backend_listener).await;
 
@@ -910,7 +912,9 @@ async fn test_tcp_stream_listener_stops_on_sigterm() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_udp_stream_listener_stops_on_sigterm() {
     // Backend echo on its own ephemeral UDP port.
-    let backend_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let backend_socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_socket.local_addr().unwrap().port();
     let backend_task = start_udp_echo_backend_on(backend_socket).await;
 
@@ -937,7 +941,9 @@ async fn test_udp_stream_listener_stops_on_sigterm() {
     sleep(Duration::from_millis(500)).await;
 
     // Send a datagram and confirm the relay round-trips it.
-    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     client
         .connect(format!("127.0.0.1:{}", stream_port))
         .await
@@ -961,7 +967,7 @@ async fn test_udp_stream_listener_stops_on_sigterm() {
     // must succeed.
     let mut released = false;
     for _ in 0..30 {
-        match tokio::net::UdpSocket::bind(format!("127.0.0.1:{}", stream_port)).await {
+        match tokio::net::UdpSocket::bind_test(format!("127.0.0.1:{}", stream_port)).await {
             Ok(_) => {
                 released = true;
                 break;

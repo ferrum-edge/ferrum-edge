@@ -426,6 +426,9 @@ pub(crate) async fn validate_api_spec_recovered_plugin_graph(
     let http_client = http_client.clone();
     tokio::task::spawn_blocking(move || {
         for plugin in &candidate.plugin_configs {
+            if !plugin.enabled {
+                continue;
+            }
             crate::plugins::validate_plugin_config_with_http_client(
                 &plugin.plugin_name,
                 &plugin.config,

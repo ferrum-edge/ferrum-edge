@@ -33,7 +33,7 @@
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -48,9 +48,10 @@ use super::utils::log_schema::view::{
     MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata,
 };
 use super::utils::log_schema::{
-    DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
-    TimestampFormat, resolve_schema,
+    DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
+    SummarySchema, TimestampFormat, resolve_schema,
 };
+use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
     BatchConfigDefaults, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE,
     MAX_BUFFER_CAPACITY, PluginHttpClient, validate_batch_config, wait_until_committed_or_closed,
@@ -66,7 +67,7 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Authoritative closed set of top-level `ws_logging` configuration keys.
-const WS_LOGGING_CONFIG_KEYS: &[&str] = &[
+pub const WS_LOGGING_CONFIG_KEYS: &[&str] = &[
     "batch_size",
     "buffer_capacity",
     "buffer_max_bytes",
@@ -92,6 +93,8 @@ pub const WS_MAX_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
 const WS_MIN_RESOURCE_BYTES: usize = 1024;
 const WS_MIN_BUFFER_MAX_BYTES: usize = (WS_MIN_RESOURCE_BYTES + 1) * 2;
 const WS_DROP_WARN_EVERY: u64 = 100;
+/// Fixed `plugin` label for this sink's process-wide loss accounting.
+const WS_PLUGIN_NAME: &str = "ws_logging";
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_WRITE_TIMEOUT_MS: u64 = 5_000;
 const MIN_TIMEOUT_MS: u64 = 100;
@@ -258,7 +261,7 @@ impl SchemaSerializable for WsDisconnectLogEntry<'_> {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -297,9 +300,9 @@ impl<'a> From<&'a WsDisconnectContext> for WsDisconnectLogEntry<'a> {
 }
 
 struct WsConfig {
-    /// Full dial URL retained only for connection establishment. Handed to
-    /// tungstenite as the *request* (Host authority + TLS SNI); the transport
-    /// socket is opened separately against a policy-screened address.
+    /// Canonical admitted URL handed to tungstenite as the *request*
+    /// (Host authority + TLS SNI); the transport socket is opened separately
+    /// against a policy-screened address.
     endpoint_url: String,
     /// Structurally redacted form used in every diagnostic (`scheme://host[:port]/redacted`).
     endpoint_url_for_logs: String,
@@ -401,7 +404,10 @@ impl WsByteBudget {
         // Process ceiling first: a failed aggregate reservation must never
         // leave per-instance bytes held.
         let Some(process) = ProcessByteReservation::try_acquire(bytes) else {
-            self.record_drop("process-wide retained-byte ceiling exhausted");
+            self.record_drop(
+                SinkLossReason::ByteBudget,
+                "process-wide retained-byte ceiling exhausted",
+            );
             return None;
         };
         let reserved = self
@@ -412,7 +418,10 @@ impl WsByteBudget {
             });
         if reserved.is_err() {
             drop(process);
-            self.record_drop("retained-content byte budget exhausted");
+            self.record_drop(
+                SinkLossReason::ByteBudget,
+                "retained-content byte budget exhausted",
+            );
             return None;
         }
 
@@ -423,7 +432,10 @@ impl WsByteBudget {
         }))
     }
 
-    fn record_drop(&self, reason: &str) {
+    /// Count one lost record on the instance tally and on the process-wide
+    /// `ferrum_plugin_log_sink_records_dropped_total` family.
+    fn record_drop(&self, loss_reason: SinkLossReason, reason: &str) {
+        sink_loss::record_dropped(WS_PLUGIN_NAME, loss_reason, 1);
         let dropped = self.dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
         if dropped == 1 || dropped.is_multiple_of(WS_DROP_WARN_EVERY) {
             warn!(
@@ -534,6 +546,14 @@ impl WsLogging {
         }
         let endpoint_hostname = endpoint_hostname(&parsed_url)?;
         let endpoint_url_for_logs = redacted_endpoint_url(&parsed_url);
+        // `Url::parse` is more lenient than tungstenite's `http::Uri` request
+        // builder (uppercase schemes, raw spaces, non-ASCII paths). Store the
+        // canonical serialized URL so admission and the collector handshake share
+        // one representation, then refuse values that still cannot be a request URI.
+        let endpoint_url = parsed_url.as_str().to_string();
+        if let Err(error) = endpoint_url.parse::<http::Uri>() {
+            return Err(format!("ws_logging: invalid 'endpoint_url': {error}"));
+        }
 
         // Build TLS connector for wss:// using gateway CA/verify settings.
         // This is sync admission work (no Tokio spawn) and remains in `new`
@@ -702,23 +722,30 @@ impl WsLogging {
     where
         T: serde::Serialize,
     {
+        let budget = self.byte_budget.as_ref();
         let Some(worker) = self.worker.get() else {
-            self.byte_budget
-                .record_drop("worker unavailable before start_background_tasks");
+            budget.record_drop(
+                SinkLossReason::Shutdown,
+                "worker unavailable before start_background_tasks",
+            );
             return;
         };
         let Some(_admission) = worker.try_admit() else {
-            self.byte_budget
-                .record_drop("worker unavailable during shutdown");
+            budget.record_drop(
+                SinkLossReason::Shutdown,
+                "worker unavailable during shutdown",
+            );
             return;
         };
         let Some(sender) = self.sender.get() else {
-            self.byte_budget
-                .record_drop("worker unavailable before start_background_tasks");
+            budget.record_drop(
+                SinkLossReason::Shutdown,
+                "worker unavailable before start_background_tasks",
+            );
             return;
         };
         let Ok(permit) = sender.try_reserve() else {
-            self.byte_budget.record_drop("queue slot exhausted");
+            budget.record_drop(SinkLossReason::QueueFull, "queue slot exhausted");
             return;
         };
         self.outstanding_count.fetch_add(1, Ordering::Relaxed);
@@ -732,6 +759,7 @@ impl WsLogging {
             json,
             _lease: lease,
         });
+        sink_loss::record_accepted(WS_PLUGIN_NAME, 1);
     }
 
     fn queue_http(&self, summary: &TransactionSummary) {
@@ -755,23 +783,30 @@ impl WsLogging {
     fn queue_websocket(&self, ctx: &WsDisconnectContext) {
         // Slot first, then provisional aggregate bytes, then a borrowed
         // disconnect view (no deep clone of attacker-shaped strings/metadata).
+        let budget = self.byte_budget.as_ref();
         let Some(worker) = self.worker.get() else {
-            self.byte_budget
-                .record_drop("worker unavailable before start_background_tasks");
+            budget.record_drop(
+                SinkLossReason::Shutdown,
+                "worker unavailable before start_background_tasks",
+            );
             return;
         };
         let Some(_admission) = worker.try_admit() else {
-            self.byte_budget
-                .record_drop("worker unavailable during shutdown");
+            budget.record_drop(
+                SinkLossReason::Shutdown,
+                "worker unavailable during shutdown",
+            );
             return;
         };
         let Some(sender) = self.sender.get() else {
-            self.byte_budget
-                .record_drop("worker unavailable before start_background_tasks");
+            budget.record_drop(
+                SinkLossReason::Shutdown,
+                "worker unavailable before start_background_tasks",
+            );
             return;
         };
         let Ok(permit) = sender.try_reserve() else {
-            self.byte_budget.record_drop("queue slot exhausted");
+            budget.record_drop(SinkLossReason::QueueFull, "queue slot exhausted");
             return;
         };
         self.outstanding_count.fetch_add(1, Ordering::Relaxed);
@@ -794,9 +829,12 @@ impl WsLogging {
         };
         if let Err(error) = serialize_result {
             if writer.limit_exceeded {
-                self.byte_budget
-                    .record_drop("serialized entry exceeded max_entry_bytes");
+                budget.record_drop(
+                    SinkLossReason::RecordTooLarge,
+                    "serialized entry exceeded max_entry_bytes",
+                );
             } else {
+                budget.record_drop(SinkLossReason::SinkError, "entry serialization failed");
                 warn!("WebSocket logging: failed to serialize WebSocket disconnect entry: {error}");
             }
             decrement_outstanding(&self.outstanding_count, 1);
@@ -807,6 +845,7 @@ impl WsLogging {
         let json = match String::from_utf8(writer.bytes) {
             Ok(line) => Arc::<str>::from(line),
             Err(error) => {
+                budget.record_drop(SinkLossReason::SinkError, "serialized entry was not UTF-8");
                 warn!(
                     "WebSocket logging: serialized WebSocket disconnect entry was not UTF-8: {error}"
                 );
@@ -818,6 +857,7 @@ impl WsLogging {
             json,
             _lease: lease,
         });
+        sink_loss::record_accepted(WS_PLUGIN_NAME, 1);
     }
 }
 
@@ -838,8 +878,12 @@ where
     let mut writer = BoundedJsonWriter::new(max_entry_bytes);
     if let Err(error) = serde_json::to_writer(&mut writer, value) {
         if writer.limit_exceeded {
-            byte_budget.record_drop("serialized entry exceeded max_entry_bytes");
+            byte_budget.record_drop(
+                SinkLossReason::RecordTooLarge,
+                "serialized entry exceeded max_entry_bytes",
+            );
         } else {
+            byte_budget.record_drop(SinkLossReason::SinkError, "entry serialization failed");
             warn!("WebSocket logging: failed to serialize {kind}: {error}");
         }
         return None;
@@ -849,6 +893,7 @@ where
     match String::from_utf8(writer.bytes) {
         Ok(line) => Some((Arc::<str>::from(line), lease)),
         Err(error) => {
+            byte_budget.record_drop(SinkLossReason::SinkError, "serialized entry was not UTF-8");
             warn!("WebSocket logging: serialized {kind} was not UTF-8: {error}");
             None
         }
@@ -1383,6 +1428,14 @@ async fn send_batch(
         }
     }
 
+    // Post-admission loss: these records were already counted as accepted.
+    // Count every discarded RECORD, matching the shared batching sender and
+    // the `batch_discard` sink-loss contract.
+    sink_loss::record_dropped(
+        WS_PLUGIN_NAME,
+        SinkLossReason::BatchDiscard,
+        entry_count as u64,
+    );
     warn!(
         "WebSocket logging batch discarded after {} attempts ({} entries lost)",
         total_attempts, entry_count,
@@ -1461,11 +1514,11 @@ async fn connect_screened_stream(cfg: &WsConfig) -> Result<tokio::net::TcpStream
 ///
 /// Resolves and screens the destination through [`connect_screened_stream`],
 /// then runs the TLS + WebSocket handshake over that screened socket with
-/// `client_async_tls_with_config`. The original endpoint URL is still what
-/// tungstenite turns into the client request, so the configured hostname
-/// remains the TLS SNI / certificate-verification identity and the WebSocket
-/// `Host` authority — the screened IP is never substituted into the TLS
-/// identity. The pre-built TLS connector keeps `wss://` on the gateway's CA
+/// `client_async_tls_with_config`. The canonical admitted endpoint URL is
+/// what tungstenite turns into the client request, so the configured
+/// hostname remains the TLS SNI / certificate-verification identity and the
+/// WebSocket `Host` authority — the screened IP is never substituted into
+/// the TLS identity. The pre-built TLS connector keeps `wss://` on the gateway's CA
 /// trust chain, CRL list, and `FERRUM_TLS_NO_VERIFY` setting. The entire
 /// establishment path (DNS, TCP, TLS, and WebSocket Upgrade) is bounded by
 /// `connect_timeout`.

@@ -11,6 +11,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_logging_plugins
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, spawn_http_echo};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +27,7 @@ use tokio::time::sleep;
 // ============================================================================
 
 async fn start_tcp_log_receiver() -> (u16, Arc<AtomicBool>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind TCP log receiver");
     let port = listener.local_addr().unwrap().port();
@@ -42,7 +44,7 @@ async fn start_tcp_log_receiver() -> (u16, Arc<AtomicBool>) {
 }
 
 async fn start_udp_log_receiver() -> (u16, Arc<AtomicBool>) {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+    let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("bind UDP log receiver");
     let port = socket.local_addr().unwrap().port();

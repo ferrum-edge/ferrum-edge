@@ -11,13 +11,14 @@
 //! connection pool settings, DNS cache, trust store, and
 //! `FERRUM_TLS_NO_VERIFY` setting.
 
-use crate::config::types::UpstreamTarget;
+use crate::config::types::{KubernetesAddressType, UpstreamTarget};
 use crate::util::endpointslice::{
     EndpointSliceEndpointEligibility, endpoint_slice_endpoint_eligibility,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -102,6 +103,7 @@ pub struct KubernetesDiscoverer {
     port_name: Option<String>,
     label_selector: Option<String>,
     default_weight: u32,
+    address_type: Option<KubernetesAddressType>,
     api_url_override: Option<String>,
     /// Override for the in-cluster SA token path (tests / fixtures).
     sa_token_path_override: Option<String>,
@@ -123,9 +125,16 @@ impl KubernetesDiscoverer {
             port_name,
             label_selector,
             default_weight,
+            address_type: None,
             api_url_override: None,
             sa_token_path_override: None,
         }
+    }
+
+    /// Select one family, or automatically prefer IPv4 over IPv6 per snapshot.
+    pub fn with_address_type(mut self, address_type: Option<KubernetesAddressType>) -> Self {
+        self.address_type = address_type;
+        self
     }
 
     /// Create a new discoverer with a custom API base URL (for testing).
@@ -370,9 +379,22 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
         let mut non_serving = 0usize;
         let mut missing_addresses = 0usize;
         let mut non_string_addresses = 0usize;
+        let mut invalid_address_type = 0usize;
+        let mut invalid_addresses = 0usize;
 
         for item in &envelope.items {
             slices += 1;
+            let family = match item.get("addressType").and_then(|value| value.as_str()) {
+                Some("IPv4") => KubernetesAddressType::Ipv4,
+                Some("IPv6") => KubernetesAddressType::Ipv6,
+                _ => {
+                    invalid_address_type += 1;
+                    continue;
+                }
+            };
+            if self.address_type.is_some_and(|selected| selected != family) {
+                continue;
+            }
             // Extract ports with checked admission (no wrap on out-of-range).
             let port = match self.classify_port(item) {
                 EndpointSlicePortAdmission::Admitted(port) => Some(port),
@@ -415,8 +437,25 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
                         for addr in addresses {
                             match (addr.as_str(), port) {
                                 (Some(address), Some(port)) => {
+                                    let Ok(ip) = address.parse::<IpAddr>() else {
+                                        invalid_addresses += 1;
+                                        continue;
+                                    };
+                                    let matches_family = matches!(
+                                        (family, ip),
+                                        (KubernetesAddressType::Ipv4, IpAddr::V4(_))
+                                            | (KubernetesAddressType::Ipv6, IpAddr::V6(_))
+                                    );
+                                    // Mapped IPv4 literals do not form a separate
+                                    // IPv6 family and must not bypass family selection.
+                                    if !matches_family
+                                        || ip.is_ipv6() && ip.to_canonical().is_ipv4()
+                                    {
+                                        invalid_addresses += 1;
+                                        continue;
+                                    }
                                     targets.push(UpstreamTarget {
-                                        host: address.to_string(),
+                                        host: ip.to_string(),
                                         port,
                                         service_port_policy_key: None,
                                         weight: self.default_weight,
@@ -438,6 +477,13 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
             }
         }
 
+        // Choose one family for the entire Service snapshot, so dual-stack
+        // pods and endpoints without targetRef cannot gain extra traffic share.
+        // A single-family IPv6 Service remains usable with the default setting.
+        if self.address_type.is_none() && targets.iter().any(|target| !target.host.contains(':')) {
+            targets.retain(|target| !target.host.contains(':'));
+        }
+
         debug!(
             "Kubernetes discovery: found {} targets for {}/{}",
             targets.len(),
@@ -457,6 +503,8 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
                 non_serving,
                 missing_addresses,
                 non_string_addresses,
+                invalid_address_type,
+                invalid_addresses,
                 "Kubernetes discovery produced zero valid targets from EndpointSlice payload"
             );
         }
@@ -486,6 +534,7 @@ mod tests {
             port_name: port_name.map(|s| s.to_string()),
             label_selector: label_selector.map(|s| s.to_string()),
             default_weight: 1,
+            address_type: None,
             api_url_override: Some("https://k8s-api:6443".to_string()),
             sa_token_path_override: None,
         }
@@ -531,6 +580,7 @@ mod tests {
             port_name: None,
             label_selector: None,
             default_weight: 1,
+            address_type: None,
             api_url_override: None, // No override
             sa_token_path_override: None,
         };

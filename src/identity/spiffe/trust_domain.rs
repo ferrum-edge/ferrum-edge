@@ -1,16 +1,30 @@
 //! SPIFFE Trust Domain — the security boundary over which a single CA issues SVIDs.
 //!
-//! Per the SPIFFE ID specification (RFC: SPIFFE-ID), a trust domain is encoded
-//! as the host portion of a `spiffe://` URI. It must be:
+//! Per the SPIFFE ID specification (RFC: SPIFFE-ID) §2.1, a trust domain is
+//! encoded as the host portion of a `spiffe://` URI. It must be:
 //!   - non-empty
+//!   - at most 255 bytes (the spec's maximum trust-domain name length)
 //!   - lowercase
-//!   - composed of letters, digits, hyphens, dots, and underscores
+//!   - composed ONLY of letters, digits, hyphens, dots, and underscores
+//!     (`[a-z0-9.-_]`, the spec's complete allowed set)
 //!   - free of any path component (i.e. no `/`)
+//!
+//! That character set is the whole grammar: the specification imposes no
+//! additional structure on the name, so a leading or trailing `.`, `-`, or `_`
+//! is legal and MUST be accepted. Ferrum used to reject those boundaries and
+//! cap the name at 240 bytes; both restrictions were local inventions that
+//! refused conformant peers (issue #5052). Everything the character set already
+//! excludes — userinfo (`@`), a port (`:`), percent-encoding (`%`), IPv6
+//! literals (`[`/`]`) — stays rejected, as does anything above the SPIFFE ID's
+//! own 2048-byte total bound, which [`super::id`] enforces.
 //!
 //! The reference identifier defines a system of trust — every SVID issued in
 //! the domain is verifiable against that domain's bundle. Unlike DNS, trust
 //! domains are not required to be resolvable; they're identifiers, not
-//! addresses, so we deliberately allow lab values like `cluster.local`.
+//! addresses, so we deliberately allow lab values like `cluster.local`. They
+//! are also only ever compared for byte equality — never normalised, suffix
+//! matched, or resolved — so boundary punctuation cannot collapse two distinct
+//! domains into one.
 
 use serde::{Deserialize, Serialize, de::Error as _};
 use std::fmt;
@@ -90,16 +104,15 @@ pub enum TrustDomainError {
     TooLong(usize, usize),
     #[error("trust domain '{0}' contains invalid character '{1}'")]
     InvalidChar(String, char),
-    #[error("trust domain '{0}' must not begin or end with '.', '-', or '_'")]
-    BadBoundary(String),
 }
 
-/// Per the SPIFFE-ID spec, a trust domain MUST be at most 255 octets when
-/// expressed in URI form. The `spiffe://` prefix is 9 bytes, leaving 246
-/// for the trust-domain itself. We pick a slightly tighter cap (240) so the
-/// total URI stays well under any 256-byte boundary even after the path is
-/// appended.
-pub const MAX_TRUST_DOMAIN_LEN: usize = 240;
+/// Per the SPIFFE-ID spec §2.3, the maximum length of a trust domain name is
+/// 255 bytes. That is the bound enforced here, exactly — a tighter local cap
+/// refuses names a conformant issuer may legitimately mint. The complete
+/// SPIFFE ID carries its own separate 2048-byte bound
+/// ([`super::id::MAX_SPIFFE_ID_LEN`]), so the path length is never charged
+/// against this one.
+pub const MAX_TRUST_DOMAIN_LEN: usize = 255;
 
 fn validate(raw: &str) -> Result<(), TrustDomainError> {
     if raw.is_empty() {
@@ -114,15 +127,13 @@ fn validate(raw: &str) -> Result<(), TrustDomainError> {
     if raw != raw.to_lowercase() {
         return Err(TrustDomainError::NotLowercase(raw.to_string()));
     }
+    // The allowed character set IS the grammar. It already excludes userinfo,
+    // ports, percent-encoding, and IPv6 literals, and the spec adds no
+    // positional rule on top of it, so no boundary check follows.
     for ch in raw.chars() {
         if !is_trust_domain_char(ch) {
             return Err(TrustDomainError::InvalidChar(raw.to_string(), ch));
         }
-    }
-    let first = raw.chars().next().unwrap_or('.');
-    let last = raw.chars().next_back().unwrap_or('.');
-    if matches!(first, '.' | '-' | '_') || matches!(last, '.' | '-' | '_') {
-        return Err(TrustDomainError::BadBoundary(raw.to_string()));
     }
     Ok(())
 }

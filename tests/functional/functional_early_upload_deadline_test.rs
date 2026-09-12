@@ -13,6 +13,8 @@
 //!   cargo test --test functional_tests functional_early_upload_deadline -- --ignored --nocapture
 //! ```
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
 use crate::scaffolding::clients::{
@@ -372,7 +374,7 @@ async fn spawn_h3_gateway(yaml: String) -> (TestGateway, u16) {
     const MAX_ATTEMPTS: usize = 5;
     let mut last_error = String::new();
     for _ in 0..MAX_ATTEMPTS {
-        let reservation = match TcpListener::bind("127.0.0.1:0").await {
+        let reservation = match TcpListener::bind_test("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) => {
                 last_error = error.to_string();

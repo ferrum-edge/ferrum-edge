@@ -72,6 +72,8 @@
 
 #![allow(dead_code, unused_imports)] // Macro consumers pick subsets.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -805,7 +807,7 @@ mod tests {
                 assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
             }
             assert!(
-                tokio::net::TcpListener::bind(address).await.is_err(),
+                tokio::net::TcpListener::bind_test(address).await.is_err(),
                 "matrix handle must retain exclusive ownership of the refused port"
             );
         }
@@ -861,6 +863,7 @@ mod tests {
         headers.insert("grpc-status", "14".parse().unwrap());
         let response = MatrixResponse::Grpc(GrpcResponse {
             http_status: 200,
+            initial_headers_end_stream: true,
             headers,
             messages: Vec::new(),
             raw_body_frames: Vec::new(),
@@ -882,6 +885,7 @@ mod tests {
         // only when Trailers-Only metadata is already present.
         let response = MatrixResponse::Grpc(GrpcResponse {
             http_status: 200,
+            initial_headers_end_stream: false,
             headers: http::HeaderMap::new(),
             messages: Vec::new(),
             raw_body_frames: Vec::new(),

@@ -552,6 +552,8 @@ async fn kafka_generation_registers_only_after_commit() {
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn chargeback_activation_failure_publishes_no_active_sink() {
+    let baseline: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("baseline status");
     let tmp = tempfile::tempdir().expect("tempdir");
     let spool = tmp.path().join("missing-secret-spool");
     let cfg = json!({
@@ -669,7 +671,10 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
             .as_array()
             .is_some_and(|instances| instances.is_empty())
     );
-    assert_eq!(status_after["totals"]["export"]["events_enqueued_total"], 0);
+    assert_eq!(
+        status_after["totals"]["export"]["events_enqueued_total"],
+        baseline["totals"]["export"]["events_enqueued_total"]
+    );
 }
 
 #[tokio::test]
@@ -1615,6 +1620,11 @@ fn status_instance_ids(status: &Value) -> Vec<(String, u64)> {
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn chargeback_two_accepted_instances_render_deterministically() {
+    let baseline: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("baseline status");
+    let enqueued_baseline = baseline["totals"]["export"]["events_enqueued_total"]
+        .as_u64()
+        .expect("process-wide enqueued counter");
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = ApiChargebackSink::new_with_config_id(
         &chargeback_sink_config_for_id(&tmp, "alpha"),
@@ -1668,10 +1678,10 @@ async fn chargeback_two_accepted_instances_render_deterministically() {
     assert_ne!(gen_a, gen_b);
 
     let prom = api_chargeback_sink::render_prometheus();
+    let expected_counter = format!("chargeback_sink_events_enqueued_total {enqueued_baseline}");
     assert!(
-        prom.lines()
-            .any(|line| line == "chargeback_sink_events_enqueued_total 0"),
-        "missing process-wide aggregate counter:\n{prom}"
+        prom.lines().any(|line| line == expected_counter),
+        "idle accepted instances must preserve the process-wide aggregate counter:\n{prom}"
     );
     assert!(
         !prom.contains("plugin_config_id=") && !prom.contains("generation="),

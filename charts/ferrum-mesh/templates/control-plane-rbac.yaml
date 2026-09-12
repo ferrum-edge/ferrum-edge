@@ -85,6 +85,12 @@ rules:
     verbs: ["get", "patch", "update"]
   {{- end }}
   {{- if .Values.controlPlane.rbac.istio }}
+  # VirtualService destination ports can be named, so Istio translation watches
+  # core Services even when Gateway API and native Pod discovery are disabled.
+  - apiGroups: [""]
+    resources:
+      - services
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["security.istio.io"]
     resources:
       - authorizationpolicies

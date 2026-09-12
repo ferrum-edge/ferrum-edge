@@ -68,6 +68,14 @@ exceptions = [
 ]
 '
 
+  st_case "literal-string license exception with no [expires:] token" 1 \
+'[licenses]
+version = 2
+exceptions = [
+    { crate = '\''some-crate'\'', allow = ["Bar-1.0"] },
+]
+'
+
   st_case "license exception with a past [expires:] date" 1 \
 '[licenses]
 version = 2
@@ -121,6 +129,15 @@ exceptions = [
     # owner: platform - first [expires:2099-12-31]
     { crate = "a", allow = ["Bar-1.0"] },
     { crate = "b", allow = ["Bar-1.0"] },
+]
+'
+
+  st_case "same-line second exception missing its own token" 1 \
+'[licenses]
+version = 2
+exceptions = [
+    # owner: platform - first [expires:2099-12-31]
+    { crate = "a", allow = ["Bar-1.0"] }, { crate = '\''b'\'', allow = ["Bar-1.0"] },
 ]
 '
 
@@ -216,9 +233,14 @@ license_entries="$(awk '
 
     # An entry opens at its crate spec key. Consume the pending token so a later
     # entry cannot inherit an earlier entry comment.
-    if (match(code, /(crate|name)[[:space:]]*=[[:space:]]*"[^"]*"/)) {
-      spec = substr(code, RSTART, RLENGTH)
-      sub(/^[^"]*"/, "", spec); sub(/"$/, "", spec)
+    # TOML permits several entries on one line. Check each of them; the
+    # first entry must not hide a later exception without its own token.
+    remaining = code
+    while (match(remaining, /(crate|name)[[:space:]]*=[[:space:]]*("[^"]*"|\047[^\047]*\047)/)) {
+      spec = substr(remaining, RSTART, RLENGTH)
+      remaining = substr(remaining, RSTART + RLENGTH)
+      sub(/^[^=]*=[[:space:]]*/, "", spec)
+      spec = substr(spec, 2, length(spec) - 2)
       printf "%s\t%s\n", spec, pending
       pending = ""
     }

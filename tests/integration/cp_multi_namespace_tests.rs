@@ -6,6 +6,8 @@
 //! path) — the back-compat path is intentionally re-exercised here under
 //! the new scope abstraction to prove the byte-identical guarantee.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -196,7 +198,9 @@ async fn start_cp_with_scope(
         .require_ns_claim(require_ns_claim)
         .build();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
@@ -271,7 +275,9 @@ async fn start_mesh_with_scope(
         .require_ns_claim(require_ns_claim)
         .build();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
@@ -309,7 +315,9 @@ async fn start_xds_with_scope(
     .with_scope(scope)
     .with_require_namespace_claim(require_ns_claim);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 

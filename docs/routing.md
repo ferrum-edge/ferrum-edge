@@ -236,6 +236,20 @@ Named captures are extracted on match and forwarded to backends and plugins:
 - **Request headers**: `x-path-param-{name}: value` (e.g., `x-path-param-user_id: 42`). Header names are case-insensitive, and the capture name is preserved verbatim after the prefix
 - **Plugin context**: `ctx.metadata["path_param.user_id"]`
 
+### Path Overrides
+
+A plugin path rewrite replaces the routed path and invalidates its strip offset.
+The rewritten path is not stripped again, even when `strip_listen_path` is true.
+Ordinary rewrites still compose with the selected target's `path`, or the proxy's
+`backend_path` when the target omits one. A prefix rewrite preserves the unmatched
+suffix: rewriting `/public` to `/users` sends `/public/list` as `/users/list`
+before backend base-path composition. Absolute provider overrides additionally
+clear the proxy base path through the existing route-override contract.
+
+URL construction refuses offsets outside the path or inside a UTF-8 character;
+it does not clamp them to a different forwarded path. Rejection diagnostics use
+the router's matched offset (or zero after a rewrite), just like dispatch.
+
 ### Path Stripping with Regex Routes
 
 When `strip_listen_path: true`, the **matched portion** of the path is stripped (not the literal pattern text). With full-path anchoring, the entire path is the matched portion:
@@ -340,7 +354,13 @@ HTTP/3 Extended CONNECT — must carry an `Origin` header that matches one of th
 values (case-insensitive; default ports normalized). Missing or disallowed origins
 receive **403 Forbidden** with body `{"error":"WebSocket Origin not allowed"}` before
 backend dispatch. When `allowed_ws_origins` is **empty** (the default), no Origin check
-runs and any browser origin may upgrade.
+runs and any browser origin may upgrade. Entries are literal origins of the form
+`scheme://host[:port]`, plus the literal opaque origin `null` (sent by sandboxed frames and
+`data:`/`file:` documents). `*` is **not** a wildcard: Admin API create/update (POST/PUT/PATCH
+proxies, batch, restore) and `ferrum-edge validate` reject it with a validation error that
+states empty list = allow all origins. Existing file/database/CP rows that still contain
+`*` keep loading and emit one warning per proxy; they do **not** allow all origins at
+runtime.
 
 Operators who configure a strict `cors` allowlist on a proxy that also serves WebSocket
 traffic should set `allowed_ws_origins` to the same origin set. The gateway logs a

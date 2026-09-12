@@ -166,11 +166,11 @@
 //!   `Content-Type` is not part of this gap: the transform treats it as JSON, so
 //!   the claim predicate does too and the gate inspects it (see
 //!   [`crate::plugins::response_transformer`]).
-//! * **Trailing bytes after a gzip member.** Decoding uses `MultiGzDecoder`, for
-//!   consistency with the bounded decoders in `ai_tool_governor` and
-//!   `ai_semantic_firewall`. It is stricter than browsers about padding after the
-//!   final member, so such a body is rejected rather than decoded. Trailing bytes
-//!   after a complete `br` stream are rejected for the same reason.
+//! * **Trailing bytes after a gzip member.** The shared charged decoder accepts
+//!   exactly one complete member per gzip coding, just as request normalization
+//!   and the request representation gate do. Any bytes after that member,
+//!   including another valid member or padding, reject a claimed response.
+//!   Trailing bytes after a complete `br` stream are also rejected.
 //! * **Large Window Brotli.** `br` decoding refuses the LWB window extension
 //!   (see [`super::charged_decode::StrictBrotliReader`]). RFC 7932 caps the
 //!   `br` window at 24 bits, so

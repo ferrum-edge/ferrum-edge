@@ -1,12 +1,24 @@
 //! UDP response-amplification budget and fixed-cardinality observability.
 //!
 //! Accounting is **cumulative per admitted client request**: every backend
-//! response datagram charges the same remaining payload-byte budget until the
-//! next policy-admitted client datagram resets it. A per-datagram size check
-//! is not sufficient — several in-budget replies to one small request would
-//! otherwise amplify without bound. A zero-length response still consumes one
-//! unit of remaining budget so a finite factor cannot admit an unbounded
-//! packet count.
+//! response datagram charges the same remaining payload-byte budget. Each
+//! policy-admitted client datagram **accrues** its per-request budget onto the
+//! session's remaining budget instead of resetting it, so an in-flight reply is
+//! charged against the budget its request earned rather than a later, smaller
+//! request's budget. Accrual is saturating and capped at a fixed multiple of a
+//! single per-request budget, so a long-lived session can neither accumulate
+//! unbounded credit nor overflow the accumulator, while the aggregate bound —
+//! a session's total outbound bytes never exceeds `factor ×` its total inbound
+//! bytes — is preserved exactly. A per-datagram size check is not sufficient —
+//! several in-budget replies to one small request would otherwise amplify
+//! without bound. A zero-length response still consumes one unit of remaining
+//! budget so a finite factor cannot admit an unbounded packet count.
+//!
+//! Sessions start at zero; each admitted request is credited exactly once,
+//! immediately before its backend send. Credit remains live until charged or
+//! the session expires. Exhausting the budget leaves no credit for the next
+//! exchange. UDP has no generic request-completion marker, so a short reply
+//! does not retire unused credit that may still fund delayed reply datagrams.
 //!
 //! Metrics are process-wide and unlabeled except for the Prometheus plugin's
 //! own gateway-namespace series. They never carry route, backend, source,
@@ -30,6 +42,16 @@ pub const DEFAULT_UDP_AMPLIFICATION_FACTOR: f32 = 8.0;
 /// rejected at admission; protocols that need more must use the explicit
 /// unlimited override.
 pub const MAX_UDP_AMPLIFICATION_FACTOR: f32 = 1024.0;
+
+/// Fixed multiple of a single per-request budget that caps how much remaining
+/// response budget a session may hold at once. Accrual never lowers the
+/// accumulator below what it already holds, so a smaller follow-up request can
+/// never clamp away credit earned by a larger in-flight request; the cap only
+/// stops credit from growing without bound across a long-lived session. The
+/// amplification bound itself is independent of this constant: a session's
+/// total outbound bytes remain bounded by `factor ×` its total inbound bytes
+/// regardless of the cap.
+pub const UDP_AMPLIFICATION_BUDGET_CAP_MULTIPLE: u64 = 16;
 
 /// Ferrum-owned Direct Policy Attachment group.
 pub const UDP_AMPLIFICATION_POLICY_GROUP: &str = "gateway.ferrum.io";
@@ -139,21 +161,45 @@ pub fn udp_amplification_response_budget(request_size: u64, factor: f32) -> u64 
     }
 }
 
-/// Reset the remaining response budget for a newly admitted client datagram.
+/// Accrue the response budget earned by a newly admitted client datagram onto
+/// the session's remaining budget, saturating at a fixed multiple of this
+/// request's own budget.
+///
+/// Unlike a reset, accrual never discards budget a prior in-flight request
+/// earned, so a backend reply for request *N* is charged against the budget
+/// request *N* accumulated rather than a later, smaller request's budget. The
+/// accumulator is monotonic under accrual: when credit from larger requests
+/// already exceeds this request's cap, the smaller cap does not lower it. The
+/// cap keeps a long-lived session from accumulating unbounded credit while the
+/// aggregate bound — outbound bytes ≤ `factor ×` inbound bytes — is preserved
+/// exactly. Returns the new remaining budget.
+///
+/// Initialize `remaining` to zero, including for the first request: seeding it
+/// with that request's budget and then publishing would double its allowance.
 pub fn publish_request_budget(remaining: &AtomicU64, request_size: u64, factor: f32) -> u64 {
     let budget = udp_amplification_response_budget(request_size, factor);
-    remaining.store(budget, Ordering::Release);
-    budget
+    if budget == 0 {
+        return 0;
+    }
+    let cap = budget.saturating_mul(UDP_AMPLIFICATION_BUDGET_CAP_MULTIPLE);
+    loop {
+        let current = remaining.load(Ordering::Acquire);
+        let next = current.saturating_add(budget).min(cap).max(current);
+        match remaining.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(_) => continue,
+        }
+    }
 }
 
-/// Atomically charge `bytes` against a remaining per-request response budget.
+/// Atomically charge `bytes` against a session's remaining response budget.
 ///
 /// Nonempty datagrams charge their payload size exactly. A zero-length
 /// datagram still consumes one unit so a finite budget cannot admit an
 /// unbounded number of empty replies. Returns `true` when the datagram is
 /// admitted. The check is fail-closed: insufficient remaining refuses without
 /// partial consumption. Several in-budget datagrams still fail closed once
-/// their cumulative charge exceeds the request budget.
+/// their cumulative charge exceeds the accumulated budget.
 pub fn charge_response_budget(remaining: &AtomicU64, bytes: u64) -> bool {
     let charge = bytes.max(1);
     loop {

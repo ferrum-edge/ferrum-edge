@@ -914,6 +914,26 @@ fn looks_like_provider_native(json: &Value) -> bool {
         // Anthropic Messages and Cohere v2 can be indistinguishable from
         // OpenAI-style chat when they carry only a `messages` array.
         || json.get("messages").and_then(Value::as_array).is_some()
+        // Google Vertex legacy `predict`, whose prompt lives in
+        // `instances[].prompt` and now counts toward `max_prompt_characters`.
+        || looks_like_vertex_predict(json)
+}
+
+/// Google Vertex legacy `predict`: `{"instances": [{"prompt": "..."}], ...}`.
+///
+/// Shape-qualified rather than a bare `instances` key, because this predicate
+/// decides what a strict `supported_schema` config ADMITS: `instances` is an
+/// ordinary word in unrelated JSON, so a bare key would admit non-AI bodies as
+/// provider-native. Requiring an entry that actually carries a `prompt` binds
+/// admission to the same field `count_prompt_characters` counts. This mirrors
+/// the shape-qualification the sibling `ai_semantic_firewall` applies to
+/// Anthropic batch `requests` for the same reason.
+fn looks_like_vertex_predict(json: &Value) -> bool {
+    let Some(instances) = json.get("instances").and_then(Value::as_array) else {
+        return false;
+    };
+    let carries_prompt = |instance: &Value| instance.get("prompt").is_some();
+    instances.iter().any(carries_prompt)
 }
 
 /// Recognizes legacy text-completion and text-generation bodies that carry a
@@ -1365,12 +1385,14 @@ fn count_prompt_characters(json: &Value) -> u64 {
         count_text_value(json.get(field), &mut total);
     }
 
-    for field in [
-        "documents",
-        "retrieved_context",
-        "tool_results",
-        "toolResults",
-    ] {
+    // Cohere v1 `documents` entries are provider document *maps* whose eligible
+    // string members are all serialized into the model-visible prompt, so they
+    // are read member-wise rather than through the single-member content
+    // selector that `count_text_value` applies to nested content objects (see
+    // [`count_document_value`]).
+    count_document_value(json.get("documents"), &mut total);
+
+    for field in ["retrieved_context", "tool_results", "toolResults"] {
         count_text_value(json.get(field), &mut total);
     }
 
@@ -1381,6 +1403,18 @@ fn count_prompt_characters(json: &Value) -> u64 {
     // non-prompt config such as endpoints/keys/index names) so the cap reflects
     // model-visible text, consistent with how other RAG fields are counted.
     count_data_source_role_information(json, &mut total);
+
+    // Google Vertex legacy `predict`: the prompt lives in `instances[].prompt`
+    // and no other counted field reaches it, so `{"instances": [{"prompt":
+    // "<huge prompt>"}]}` bypassed the cap entirely. Scoped to `prompt` —
+    // the surrounding instance fields are prediction inputs and identifiers,
+    // not model-visible prose — matching the `$.instances[*].prompt` path the
+    // sibling `ai_semantic_firewall` and `ai_prompt_shield` plugins read.
+    if let Some(instances) = json.get("instances").and_then(Value::as_array) {
+        for instance in instances {
+            count_text_value(instance.get("prompt"), &mut total);
+        }
+    }
 
     count_tool_definition_text(json.get("tools"), &mut total);
     count_tool_definition_text(json.get("functions"), &mut total);
@@ -1436,6 +1470,21 @@ fn count_text_value(value: Option<&Value>, total: &mut u64) {
                 count_text_value(Some(parts), total);
             } else if let Some(content) = obj.get("content") {
                 count_text_value(Some(content), total);
+            } else if let Some(tool_result) = obj.get("toolResult") {
+                // Amazon Bedrock Converse tool results:
+                // `messages[].content[].toolResult.content[].text`. The block
+                // carries no `type` and no `content` of its own, so without
+                // this arm a tool result re-fed to the model — often the
+                // largest text in the turn — counted zero characters and
+                // dodged `max_prompt_characters` entirely. Scoped to
+                // `content`: the sibling `toolUseId`/`status` fields are
+                // plumbing, not model-visible prose.
+                count_text_value(tool_result.get("content"), total);
+            } else if let Some(guard_content) = obj.get("guardContent") {
+                // Bedrock Converse guarded text, nested
+                // (`{"text": {"text": "..."}}`) or flat
+                // (`{"text": "..."}`); the recursive call counts either.
+                count_text_value(guard_content.get("text"), total);
             } else if let Some(message) = obj.get("message") {
                 count_text_value(Some(message), total);
             } else if let Some(text) = obj.get("text") {
@@ -1443,6 +1492,74 @@ fn count_text_value(value: Option<&Value>, total: &mut u64) {
             }
         }
         _ => {}
+    }
+}
+
+/// Cohere document-map member holding the citation identifier. It is bookkeeping
+/// for citation retrieval rather than prompt prose, so it is not counted.
+const DOCUMENT_ID_MEMBER: &str = "id";
+
+/// Cohere document-map member naming the document members the provider keeps out
+/// of the model-visible rendering. Neither the control list nor the members it
+/// names reach the model, so neither is counted.
+const DOCUMENT_EXCLUDES_MEMBER: &str = "_excludes";
+
+/// Counts model-visible text in the top-level `documents` RAG array.
+///
+/// Cohere v1 document entries are arbitrary string-to-string maps and the
+/// provider serializes their eligible members into the prompt the model reads,
+/// so every eligible member counts toward `max_prompt_characters`. The generic
+/// content selector in [`count_text_value`] picks at most one recognized
+/// `text`/`content`-like member per object, which leaves a document's other
+/// documented members (`title`, `snippet`, `url`, ...) outside the cap — and
+/// contributes nothing at all for a document whose members are all
+/// operator-chosen keys. Document objects are therefore read member-wise, minus
+/// the two members Cohere itself excludes from the model-visible rendering:
+/// [`DOCUMENT_ID_MEMBER`] and [`DOCUMENT_EXCLUDES_MEMBER`] (plus every member the
+/// latter names, which stays available for citation retrieval only).
+///
+/// Each retained member value is still handed to [`count_text_value`], so a
+/// document that nests provider content shapes keeps that accounting and is
+/// counted exactly once. An entry carrying a `type` discriminator is a content
+/// *part*, not a document map, and is delegated whole to [`count_text_value`] so
+/// non-text multimodal parts and base64 document sources stay excluded from
+/// prose accounting rather than being counted as sibling strings.
+///
+/// Member *names* are deliberately not counted: like the JSON-Schema boilerplate
+/// keys excluded from tool definitions, they are structure rather than
+/// operator-supplied prose.
+fn count_document_value(value: Option<&Value>, total: &mut u64) {
+    match value {
+        Some(Value::Array(items)) => {
+            for item in items {
+                count_document_value(Some(item), total);
+            }
+        }
+        Some(Value::Object(obj)) if !obj.contains_key("type") => {
+            let excluded_members = document_excluded_members(obj.get(DOCUMENT_EXCLUDES_MEMBER));
+            for (member, member_value) in obj {
+                let member = member.as_str();
+                if member == DOCUMENT_ID_MEMBER
+                    || member == DOCUMENT_EXCLUDES_MEMBER
+                    || excluded_members.contains(member)
+                {
+                    continue;
+                }
+                count_text_value(Some(member_value), total);
+            }
+        }
+        other => count_text_value(other, total),
+    }
+}
+
+/// Parse a document's exclusion control once before visiting its members. This
+/// keeps processing linear when both collections are attacker-controlled.
+fn document_excluded_members(excludes: Option<&Value>) -> HashSet<&str> {
+    match excludes {
+        Some(Value::Array(excludes)) => excludes.iter().filter_map(Value::as_str).collect(),
+        // Tolerate the single-value spelling of the same control.
+        Some(Value::String(excluded)) => HashSet::from([excluded.as_str()]),
+        _ => HashSet::new(),
     }
 }
 
@@ -1515,8 +1632,10 @@ fn count_tool_definition_text(value: Option<&Value>, total: &mut u64) {
 /// known message arrays and pull arguments from:
 ///   * OpenAI Chat Completions: `messages[].tool_calls[].function.arguments`
 ///   * OpenAI Responses function-call items: `input[].arguments`
-///   * Anthropic / Bedrock content blocks: `messages[].content[]` entries of
+///   * Anthropic content blocks: `messages[].content[]` entries of
 ///     `type: "tool_use"` carrying an `input` arguments object
+///   * Bedrock Converse content blocks: `messages[].content[].toolUse.input`,
+///     the untyped union spelling of the same call
 ///   * Gemini: `contents[].parts[]` entries carrying `functionCall.args`
 fn count_tool_argument_fields(json: &Value, total: &mut u64) {
     for field in ["messages", "input", "contents", "chat_history"] {
@@ -1552,15 +1671,34 @@ fn count_item_tool_arguments(item: &Value, total: &mut u64) {
         }
     }
 
-    // Anthropic / Bedrock Converse assistant message: tool calls are typed
-    // content blocks (`content[]` entries of `type: "tool_use"` whose `input`
-    // object is the model-emitted arguments). Scope to the typed block so an
-    // unrelated `input` key elsewhere is not counted.
+    // Anthropic and Bedrock Converse assistant messages both carry tool calls as
+    // `content[]` blocks, but in two different spellings, and each needs its own
+    // arm:
+    //
+    // * Anthropic Messages uses a typed block (`type: "tool_use"`) whose `input`
+    //   object is the model-emitted arguments.
+    // * The canonical Converse `ContentBlock` union instead carries an untyped
+    //   `{"toolUse": {"toolUseId", "name", "input"}}` member, which never matches
+    //   the typed arm. `count_text_value` does not reach it either — the block
+    //   exposes no `text`/`content`/`parts` member of its own — so its arguments,
+    //   often the largest text in the turn, are read here.
+    //
+    // Both are scoped to `input`: the sibling `type`/`toolUseId`/`name`/`id`
+    // fields are call plumbing, not model-visible prose, and scoping to the block
+    // keeps an unrelated `input` key elsewhere in the body out of the count.
     if let Some(Value::Array(blocks)) = obj.get("content") {
         for block in blocks {
-            if let Value::Object(block_obj) = block
-                && block_obj.get("type").and_then(Value::as_str) == Some("tool_use")
+            let Value::Object(block_obj) = block else {
+                continue;
+            };
+            if block_obj.get("type").and_then(Value::as_str) == Some("tool_use")
                 && let Some(input) = block_obj.get("input")
+            {
+                count_argument_value(input, total);
+            }
+            if let Some(input) = block_obj
+                .get("toolUse")
+                .and_then(|tool_use| tool_use.get("input"))
             {
                 count_argument_value(input, total);
             }

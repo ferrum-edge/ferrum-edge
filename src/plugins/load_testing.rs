@@ -10,10 +10,16 @@
 //! headers from the effective request before later deferred transforms (notably
 //! `request_mirror`) or backends can observe them. A matching key then spawns a
 //! background load test that sends concurrent requests back through the
-//! gateway's local listener (`127.0.0.1:{gateway_port}`). Synthetic requests
-//! omit the trigger key, so they flow through the full proxy pipeline without
-//! re-triggering the load test. Native transaction logging captures every
-//! synthetic request.
+//! gateway's local listener (`127.0.0.1:{gateway_port}`). When `gateway_port`
+//! is omitted, that listener port is resolved with the same
+//! environment > `ferrum.conf`/`--settings` precedence startup uses. Synthetic
+//! requests omit the trigger key, so they flow through the full proxy pipeline
+//! without re-triggering the load test. Native transaction logging captures
+//! every synthetic request.
+//!
+//! The replayed header snapshot is taken from the pristine ingress view, not
+//! from the already-transformed hook map, so a configured header-rule chain is
+//! applied exactly once to the synthetic cohort as well.
 //!
 //! The triggering request itself proceeds normally through the proxy pipeline
 //! and is not blocked by the load test.
@@ -23,7 +29,10 @@
 //! When `gateway_addresses` is configured, the originating controller fans out
 //! once with `X-Loadtesting-Fanout: 1`. Peer nodes that accept a fan-out
 //! trigger start a local cohort only — they never re-fanout — and terminate
-//! the control request before backend dispatch.
+//! the control request with `204` before backend dispatch. Fan-out stays
+//! fire-and-forget for the application request, but any other parsed HTTP
+//! outcome (a rejection status, or an unfollowed redirect) means no remote
+//! cohort started and is reported with a bounded, sanitized warning.
 //!
 //! ## HTTPS loopback
 //!
@@ -33,6 +42,11 @@
 //! domain (not `127.0.0.1`), `gateway_tls_no_verify` (default `true` when
 //! `gateway_tls` is enabled) skips certificate verification for the loopback
 //! connection only.
+//!
+//! Synthetic and fan-out requests are sent over HTTP/1.1. They preserve the
+//! triggering client's `Host` while dialing a different authority, and over
+//! HTTP/2 that pair becomes `:authority` != `host` — which Ferrum's ingress
+//! consistency check correctly rejects with 400 before routing.
 //!
 //! ## Caveats
 //!
@@ -104,6 +118,9 @@ const MAX_PROCESS_RETAINED_BODY_BYTES: u64 = 67_108_864;
 pub(crate) const HEADER_TRIGGER_KEY: &str = "x-loadtesting-key";
 pub(crate) const HEADER_FANOUT: &str = "x-loadtesting-fanout";
 const FANOUT_MARKER: &str = "1";
+/// The only response a peer returns when it admits a fan-out trigger. Every
+/// other parsed HTTP outcome means no remote cohort started.
+const FANOUT_ACK_STATUS: u16 = 204;
 const INVALID_ADDRESS_LABEL: &str = "invalid-gateway-address";
 
 static PROCESS_ACTIVE_CLIENTS: AtomicU64 = AtomicU64::new(0);
@@ -530,9 +547,16 @@ impl LoadTesting {
             })
             .transpose()?
             .unwrap_or_else(|| {
-                std::env::var(default_env_var)
-                    .ok()
-                    .and_then(|v| v.parse::<u16>().ok())
+                // Startup resolves the listener ports through the conf-aware
+                // `resolve_default` macro, so a bare `std::env::var` lookup
+                // here would ignore `ferrum.conf` / `--settings`: identical
+                // listener settings would admit differently depending only on
+                // where the operator wrote them, and a non-default settings
+                // file listener would leave synthetic traffic aimed at the
+                // hardcoded default port. Use the same env > conf-file
+                // precedence the effective listener uses (issue #5156).
+                crate::config::conf_file::resolve_ferrum_var(default_env_var)
+                    .and_then(|v| v.trim().parse::<u16>().ok())
                     .unwrap_or(default_port)
             });
 
@@ -553,6 +577,16 @@ gateway_port in 1–65535"
             // inherited proxy environment (matches the shared PluginHttpClient
             // builders).
             .no_proxy()
+            // Synthetic replays dial `127.0.0.1:{gateway_port}` while carrying
+            // the triggering request's `Host` so host-based routing selects the
+            // same virtual host. RFC 9113 §8.3.1 / RFC 9114 §4.3.1 forbid
+            // `Host` and `:authority` from disagreeing, and Ferrum's own
+            // ingress check correctly answers 400 before routing when they do —
+            // so an ALPN-negotiated `h2` loopback (the ordinary `gateway_tls`
+            // case) rejects every replay. HTTP/1.1 makes the preserved `Host`
+            // the request authority, keeping the intended virtual host without
+            // weakening inbound validation (issue #5155).
+            .http1_only()
             .danger_accept_invalid_certs(gateway_tls_no_verify)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(request_timeout_ms));
@@ -989,7 +1023,17 @@ impl Plugin for LoadTesting {
         let raw_query = ctx.raw_query_string().map(str::to_owned);
         let method = ctx.method.clone();
 
-        let synthetic_headers = filter_outbound_headers(headers, ctx.forwarding_peer_trusted);
+        // Replay from the pristine ingress view (`ctx.headers`), never from the
+        // already-transformed hook map. A synthetic request re-enters the whole
+        // proxy pipeline, so every earlier header rule runs again on it: a
+        // snapshot of the post-transform map applies non-idempotent chains
+        // twice and the cohort stops representing the traffic under test
+        // (issue #5157). `load_testing` declares `modifies_request_headers()`,
+        // so the dispatcher always hands hooks a clone and `ctx.headers` stays
+        // the untouched client view. Reserved control headers are stripped from
+        // this snapshot by `filter_outbound_headers` regardless of which map it
+        // reads.
+        let synthetic_headers = filter_outbound_headers(&ctx.headers, ctx.forwarding_peer_trusted);
         // Fan-out starts from the same fully sanitized snapshot and appends one
         // canonical key/marker pair below. Never preserve a transformed alias
         // of either reserved control header.
@@ -1022,7 +1066,15 @@ impl Plugin for LoadTesting {
                 let body = Arc::clone(&request_body);
 
                 tokio::spawn(async move {
-                    let Ok(http) = client.get() else {
+                    // The fan-out control request preserves the triggering
+                    // client's `Host` so the peer selects the same virtual host,
+                    // while its URL names the peer's own authority. Over a
+                    // negotiated `h2` connection to an HTTPS peer those two
+                    // disagree and the peer correctly answers 400 before
+                    // routing, so the trigger never reaches the remote cohort.
+                    // The HTTP/1.1-pinned companion keeps the preserved `Host`
+                    // the request authority (issue #5155).
+                    let Ok(http) = client.get_http1() else {
                         tracing::warn!(
                             remote = %remote_label,
                             "load_testing: plugin HTTP client unavailable; skipping fan-out"
@@ -1041,15 +1093,34 @@ impl Plugin for LoadTesting {
                     if let Some(bytes) = &body.bytes {
                         req = req.body(bytes.clone());
                     }
-                    if let Err(err) = client
-                        .execute_redacted(req, "load_testing_fanout", &remote_label)
+                    // A parsed HTTP response is not an accepted trigger. Only
+                    // `fanout_ack_result()`'s 204 means the peer admitted a
+                    // cohort; a 4xx/5xx refusal, an unfollowed redirect, or any
+                    // other status is a silent peer failure unless it is
+                    // reported (issue #5158). Log the status alone — never the
+                    // key, raw path/query, or response body — and keep the
+                    // originating application request fire-and-forget.
+                    match client
+                        .execute_http1_redacted(req, "load_testing_fanout", &remote_label)
                         .await
                     {
-                        tracing::warn!(
-                            remote = %remote_label,
-                            error = %err,
-                            "load_testing: failed to fan out trigger to remote node"
-                        );
+                        Ok(response) if response.status().as_u16() == FANOUT_ACK_STATUS => {}
+                        Ok(response) => {
+                            tracing::warn!(
+                                remote = %remote_label,
+                                status = response.status().as_u16(),
+                                expected_status = FANOUT_ACK_STATUS,
+                                "load_testing: remote node did not acknowledge the fan-out \
+                                 trigger; no remote cohort was started"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                remote = %remote_label,
+                                error = %err,
+                                "load_testing: failed to fan out trigger to remote node"
+                            );
+                        }
                     }
                 });
             }
@@ -1394,7 +1465,7 @@ impl Drop for ProcessClientBudget {
 
 fn fanout_ack_result() -> PluginResult {
     PluginResult::Reject {
-        status_code: 204,
+        status_code: FANOUT_ACK_STATUS,
         body: String::new(),
         headers: HashMap::new(),
     }

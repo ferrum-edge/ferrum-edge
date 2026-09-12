@@ -504,7 +504,7 @@ jobs:
           shared-key: ci-test
 
       - name: Compile the unchanged external unit target
-        run: cargo test --test unit_tests --no-run
+        run: cargo test --test unit_gateway_core_tests --no-run
 
       - name: Measure the isolated scale regression three times
         run: |
@@ -512,7 +512,7 @@ jobs:
           for round in 1 2 3; do
             /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' \
               --output="$RUNNER_TEMP/route-status-profile/round-$round.time" \
-              cargo test --test unit_tests -- \
+              cargo test --test unit_gateway_core_tests -- \
               --exact unit::gateway_core::k8s_status_planning_tests::large_route_snapshots_scale_indexing_while_budget_bounds_planning \
               --nocapture 2>&1 | tee "$RUNNER_TEMP/route-status-profile/round-$round.log"
           done
@@ -668,7 +668,7 @@ jobs:
           )
 
           set +e
-          test_output="$(cargo test --test unit_tests -- --exact "${hardening_tests[@]}" 2>&1)"
+          test_output="$(cargo test --test unit_plugins_b_tests -- --exact "${hardening_tests[@]}" 2>&1)"
           test_status=$?
           set -e
 
@@ -746,6 +746,8 @@ jobs:
           python3 .github/scripts/run_unit_ci.py default-unit
         env:
           RUST_BACKTRACE: 1
+          # The experiment measures the `unit_tests` (core) target only.
+          UNIT_SHARD: core
 
       - name: Precompile ACME library and DNS hook test binaries
         # Keep inline ACME coverage, but compile only the two-test DNS target

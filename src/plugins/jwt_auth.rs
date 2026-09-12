@@ -16,6 +16,7 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
+use http::header::HeaderName;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, dangerous::insecure_decode, decode};
 use serde_json::Value;
 use tracing::debug;
@@ -288,23 +289,67 @@ auth_flow::impl_auth_plugin!(
     fn request_headers_to_redact(&self) -> &[String] {
         &self.request_headers_to_redact
     }
+
+    /// HTTP/3 materializes decoded query parameters only when an active plugin
+    /// declares it needs them; H1/H2 always decode. Without this, the same URL
+    /// authenticates over H1/H2 and returns `401` over H3 whenever the
+    /// configured parameter name or the token itself carries percent-encoding
+    /// (`t%6fken`, or `%2E` for a JWT's `.` separators). `key_auth` and
+    /// `jwks_auth` already declare it for their query token locations; this is
+    /// the same contract for `token_lookup: query:<name>`.
+    fn requires_decoded_query_params(&self) -> bool {
+        matches!(self.token_lookup, TokenLookup::Query(_))
+    }
 );
 
+/// Parse `token_lookup` into an extraction location, refusing any location a
+/// request can never satisfy.
+///
+/// `jwt_auth` is a fail-closed plugin, so an unusable credential location is
+/// not a benign misconfiguration: a header name that is not an RFC 9110 token
+/// (a space, a control character, a `:`) can never appear on the wire, and the
+/// route would answer every request `401` while `validate`, the admin API, and
+/// DP/CP admission all reported the configuration as good. Admission therefore
+/// applies the same contract `key_auth` applies to `key_location`: the value
+/// carries no surrounding whitespace, a header name is a valid HTTP header
+/// name, and a query name contains no whitespace.
 fn parse_token_lookup(value: Option<&Value>) -> Result<TokenLookup, String> {
-    let raw = parse_non_empty_string(value, "token_lookup", "header:Authorization")?;
+    let raw = match value {
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| format!("jwt_auth: 'token_lookup' must be a string, got: {value}"))?,
+        None => "header:Authorization",
+    };
+    if raw.is_empty() {
+        return Err("jwt_auth: 'token_lookup' must not be empty".to_string());
+    }
+    if raw.trim() != raw {
+        return Err(
+            "jwt_auth: 'token_lookup' must not have leading or trailing whitespace".to_string(),
+        );
+    }
     if let Some(name) = raw.strip_prefix("header:") {
-        let name = name.trim();
         if name.is_empty() {
             return Err("jwt_auth: 'token_lookup' header name must not be empty".to_string());
         }
+        let canonical = HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes())
+            .map_err(|_| {
+                "jwt_auth: 'token_lookup' header name is not a valid HTTP header name".to_string()
+            })?
+            .as_str()
+            .to_string();
         Ok(TokenLookup::Header {
-            lower_name: name.to_ascii_lowercase(),
+            lower_name: canonical,
             original_name: name.to_string(),
         })
     } else if let Some(name) = raw.strip_prefix("query:") {
-        let name = name.trim();
         if name.is_empty() {
             return Err("jwt_auth: 'token_lookup' query name must not be empty".to_string());
+        }
+        if name.chars().any(char::is_whitespace) {
+            return Err(
+                "jwt_auth: 'token_lookup' query name must not contain whitespace".to_string(),
+            );
         }
         Ok(TokenLookup::Query(name.to_string()))
     } else {

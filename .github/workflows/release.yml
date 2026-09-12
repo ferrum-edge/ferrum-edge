@@ -111,6 +111,12 @@ jobs:
     name: Build (${{ matrix.asset_name }})
     needs: validate-release-sha
     runs-on: ${{ matrix.os }}
+    # Issue #4674: the worst observed job is 2h16m (macOS aarch64), so 180 is
+    # 1.32x that with headroom for a cold cache. Raise it only when a
+    # SUCCESSFUL run exceeds it; never to absorb a hang. The build steps below
+    # carry their own 165-minute budget so a stalled compile is killed while
+    # the job is still alive to upload its timings.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -243,7 +249,8 @@ jobs:
       # exactly the defect issue #4301 fixes.
       - name: Build release binary
         if: matrix.target != 'x86_64-unknown-linux-gnu'
-        run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}
+        timeout-minutes: 165
+        run: cargo build --features cloud-secrets --release --target ${{ matrix.target }} --timings
 
       # Canonical x86_64 GNU producer. The digest-pinned AlmaLinux 8.10
       # sysroot links against glibc 2.28, below the declared GLIBC_2.34 floor,
@@ -253,6 +260,7 @@ jobs:
       # `release-binaries-x86_64-unknown-linux-gnu`; there is no second build.
       - name: Build x86_64 GNU release binaries in the pinned sysroot
         if: matrix.target == 'x86_64-unknown-linux-gnu'
+        timeout-minutes: 165
         env:
           LINUX_GNU_TARGET: x86_64-unknown-linux-gnu
           LINUX_GNU_FEATURES: cloud-secrets
@@ -264,6 +272,12 @@ jobs:
           python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test
           bash .github/scripts/build_linux_gnu_sysroot.sh
 
+      # Issue #4674: cargo's per-crate timing report for the native cells.
+      # Uploaded whatever the build did (`if: always()`) so a step killed by
+      # its budget still leaves evidence, under a name the ABI-gated canonical
+      # `release-binaries-<target>` artifact and the `docker-digest-*` manifest
+      # wildcards can never match. The x86_64 GNU cell compiles inside the
+      # pinned sysroot script and records no report, hence `warn`.
       - name: Create release assets directory
         shell: bash
         run: mkdir -p release-assets
@@ -324,11 +338,26 @@ jobs:
           name: release-binaries-${{ matrix.target }}
           path: release-assets/
 
+      # Trusted policy: every artifact upload in this job must follow the
+      # staged published-asset ABI gate (issue #4674 added this capture).
+      - name: Upload build timings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-build-timings-${{ matrix.target }}
+          path: target/cargo-timings/
+          if-no-files-found: warn
+          retention-days: 14
+
   build-release-arm64-cross:
     name: Build (ferrum-edge-linux-aarch64)
     needs: validate-release-sha
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # Issue #4674: 2.6x the 45m39s observed compile step, leaving room for the
+    # image pull and sysroot preparation. Raise only when a successful run
+    # exceeds it.
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -1372,9 +1401,16 @@ jobs:
           all(.[]; .critical.image["docker-manifest-digest"] == $digest)
           JQ
 
+          # `cosign verify-attestation` prints one DSSE envelope per line
+          # (`{"payloadType","payload","signatures"}`), not a JSON array. Both
+          # attestation filters therefore run over a slurped (`jq -s`) document,
+          # flatten it so a future array-shaped output still verifies, and decode
+          # the envelope payload into the in-toto statement they check.
           cat > "$work/require_provenance.jq" <<'JQ'
           [
-            .[].payload
+            flatten[]
+            | (.payload // .dsseEnvelope.payload)
+            | select(type == "string")
             | @base64d
             | fromjson
             | select(.predicateType == "https://slsa.dev/provenance/v1")
@@ -1390,7 +1426,9 @@ jobs:
 
           cat > "$work/require_sbom_attest.jq" <<'JQ'
           [
-            .[].payload
+            flatten[]
+            | (.payload // .dsseEnvelope.payload)
+            | select(type == "string")
             | @base64d
             | fromjson
             | select(any(.subject[]?; .digest.sha256 == $digest))
@@ -1431,7 +1469,7 @@ jobs:
               "${verify_common_args[@]}" \
               --type slsaprovenance1 \
               "$image_ref" > "${prefix}-provenance.json"
-            jq -e --arg digest "$expected_digest" --arg source_sha "$GITHUB_SHA" \
+            jq -e -s --arg digest "$expected_digest" --arg source_sha "$GITHUB_SHA" \
               -f "$work/require_provenance.jq" \
               "${prefix}-provenance.json" >/dev/null
 
@@ -1439,7 +1477,7 @@ jobs:
               "${verify_common_args[@]}" \
               --type spdxjson \
               "$image_ref" > "${prefix}-sbom.json"
-            jq -e --arg digest "$expected_digest" \
+            jq -e -s --arg digest "$expected_digest" \
               -f "$work/require_sbom_attest.jq" \
               "${prefix}-sbom.json" >/dev/null
           }

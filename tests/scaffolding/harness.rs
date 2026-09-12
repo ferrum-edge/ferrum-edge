@@ -550,6 +550,12 @@ fn apply_env_overrides(
             "FERRUM_MAX_CONNECTIONS" => {
                 env_config.max_connections = parse_numeric(k, v)?;
             }
+            "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES" => {
+                env_config.response_buffer_cutoff_bytes = parse_numeric(k, v)?;
+            }
+            "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => {
+                env_config.max_response_body_size_bytes = parse_numeric(k, v)?;
+            }
             "FERRUM_SHUTDOWN_DRAIN_SECONDS" => {
                 env_config.shutdown_drain_seconds = parse_numeric(k, v)?;
             }
@@ -575,6 +581,15 @@ fn apply_env_overrides(
             }
             "FERRUM_HTTP3_SEND_WINDOW" => {
                 env_config.http3_send_window = parse_numeric(k, v)?;
+            }
+            "FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW" => {
+                env_config.http3_backend_stream_receive_window = parse_numeric(k, v)?;
+            }
+            "FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW" => {
+                env_config.http3_backend_receive_window = parse_numeric(k, v)?;
+            }
+            "FERRUM_HTTP3_BACKEND_SEND_WINDOW" => {
+                env_config.http3_backend_send_window = parse_numeric(k, v)?;
             }
             // Unknown vars: ignored. Add cases as tests need them.
             _ => {}

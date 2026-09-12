@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     AdaptiveConcurrencyDecreaseHarness, AdaptiveConcurrencyTransitionHarness,
+    body_validator_descriptor_preload_required_for_test,
 };
 use ferrum_edge::PluginCache;
 use ferrum_edge::adaptive_concurrency::{
@@ -984,6 +985,42 @@ async fn adaptive_concurrency_global_route_refresh_preserves_unrelated_global_st
     let replacement_adaptive = expect_admitted(acquire_from_cache(&cache, &reloaded));
     drop(replacement_adaptive);
     drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_global_route_refresh_skips_unrelated_global_descriptor_preload() {
+    let mut config = cache_config("global", json!({}));
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "body-validator-1",
+            "namespace": "default",
+            "plugin_name": "body_validator",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "protobuf_descriptor_path": format!(
+                    "{}/tests/fixtures/test_validator.bin",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+                "protobuf_request_type": "test.HelloRequest"
+            }
+        }))
+        .expect("body validator config should deserialize"),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+
+    let mut reloaded = config.clone();
+    reloaded.proxies[0].backend_host = "replacement.local".to_string();
+
+    assert!(
+        !body_validator_descriptor_preload_required_for_test(
+            &cache,
+            &reloaded,
+            &HashSet::new(),
+            false,
+        ),
+        "an adaptive-only global refresh preserves the body validator and must not preload its descriptor"
+    );
 }
 
 #[test]

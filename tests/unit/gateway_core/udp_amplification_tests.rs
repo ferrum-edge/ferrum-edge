@@ -1,8 +1,8 @@
 //! Cumulative UDP amplification budget and charge accounting (#3836).
 
 use ferrum_edge::udp_amplification::{
-    MAX_UDP_AMPLIFICATION_FACTOR, charge_response_budget, factor_is_valid,
-    udp_amplification_response_budget,
+    MAX_UDP_AMPLIFICATION_FACTOR, UDP_AMPLIFICATION_BUDGET_CAP_MULTIPLE, charge_response_budget,
+    factor_is_valid, publish_request_budget, udp_amplification_response_budget,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -91,4 +91,79 @@ fn nonempty_response_still_charges_exact_payload_bytes() {
     assert_eq!(remaining.load(Ordering::Acquire), 6);
     assert!(charge_response_budget(&remaining, 6));
     assert_eq!(remaining.load(Ordering::Acquire), 0);
+}
+
+// ---- issue #4771: per-request budget accrual instead of reset ----
+
+#[test]
+fn publish_accrues_budget_instead_of_resetting_it() {
+    let remaining = AtomicU64::new(0);
+    publish_request_budget(&remaining, 200, 8.0); // +1600
+    publish_request_budget(&remaining, 20, 8.0); // +160
+    assert_eq!(remaining.load(Ordering::Acquire), 1760);
+}
+
+#[test]
+fn two_pipelined_requests_deliver_both_replies() {
+    let remaining = AtomicU64::new(0);
+    publish_request_budget(&remaining, 200, 8.0);
+    publish_request_budget(&remaining, 20, 8.0);
+    // The 1200-byte answer to the 200-byte request must survive the later,
+    // smaller request's publish.
+    assert!(charge_response_budget(&remaining, 1200));
+    assert!(charge_response_budget(&remaining, 20));
+}
+
+#[test]
+fn a_single_request_cannot_exceed_factor_times_size() {
+    let remaining = AtomicU64::new(0);
+    publish_request_budget(&remaining, 100, 8.0);
+    assert!(charge_response_budget(&remaining, 800));
+    assert!(!charge_response_budget(&remaining, 1));
+}
+
+#[test]
+fn exhausted_exchanges_do_not_subsidize_a_later_over_budget_reply() {
+    let remaining = AtomicU64::new(0);
+    for _ in 0..32 {
+        publish_request_budget(&remaining, 200, 8.0);
+        assert!(charge_response_budget(&remaining, 1600));
+        assert_eq!(remaining.load(Ordering::Acquire), 0);
+    }
+
+    assert_eq!(publish_request_budget(&remaining, 100, 8.0), 800);
+    assert!(!charge_response_budget(&remaining, 900));
+    assert!(charge_response_budget(&remaining, 300));
+    assert!(charge_response_budget(&remaining, 300));
+    assert!(!charge_response_budget(&remaining, 300));
+}
+
+#[test]
+fn accrual_is_capped_at_a_fixed_multiple_of_the_per_request_budget() {
+    let remaining = AtomicU64::new(0);
+    for _ in 0..100_000 {
+        publish_request_budget(&remaining, 100, 8.0);
+    }
+    let budget = udp_amplification_response_budget(100, 8.0);
+    assert_eq!(
+        remaining.load(Ordering::Acquire),
+        budget * UDP_AMPLIFICATION_BUDGET_CAP_MULTIPLE
+    );
+}
+
+#[test]
+fn a_smaller_followup_request_does_not_clamp_away_inflight_credit() {
+    let remaining = AtomicU64::new(0);
+    publish_request_budget(&remaining, 8000, 8.0); // 64000
+    publish_request_budget(&remaining, 1, 8.0); // budget 8, cap 128 (< 64000)
+    assert_eq!(remaining.load(Ordering::Acquire), 64000);
+    assert!(charge_response_budget(&remaining, 64000));
+}
+
+#[test]
+fn a_zero_length_keepalive_does_not_kill_a_pending_answer() {
+    let remaining = AtomicU64::new(0);
+    publish_request_budget(&remaining, 200, 8.0); // +1600
+    publish_request_budget(&remaining, 0, 8.0); // +1, must not reset or clamp
+    assert!(charge_response_budget(&remaining, 1200));
 }

@@ -2,7 +2,8 @@
 
 use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, priority, rate_limiting::RateLimiting,
+    ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+    rate_limiting::RateLimiting,
 };
 use ferrum_edge::proxy::client_ip::{TrustedProxies, resolve_client_ip};
 use serde_json::{Value, json};
@@ -1839,4 +1840,185 @@ async fn local_fallback_policy_admits_while_redis_is_unavailable() {
         refusal.is_none(),
         "local_fallback must admit on per-process state, got {refusal:?}"
     );
+}
+
+// ── Composed limiters and the single public header set (issue #5003) ──────
+//
+// `x-ratelimit-limit` / `-remaining` / `-window` are one fixed public contract,
+// but a route may carry several `rate_limiting` instances and every instance
+// opts into the shared rejection finalizer. Composition therefore has to name
+// one authoritative verdict — the refusing limiter, or the tightest budget when
+// all of them admitted — instead of whichever `after_proxy` happened to run
+// last.
+
+fn composed_limiter(requests_per_minute: u64, expose_headers: bool) -> Arc<dyn Plugin> {
+    Arc::new(make_rate_limiter(json!({
+        "limit_by": "ip",
+        "expose_headers": expose_headers,
+        "requests_per_minute": requests_per_minute,
+    }))) as Arc<dyn Plugin>
+}
+
+fn meta<'a>(ctx: &'a RequestContext, key: &str) -> Option<&'a str> {
+    ctx.metadata.get(key).map(String::as_str)
+}
+
+/// Assert the refusal status without consuming the result: `PluginResult` is
+/// not `Clone`, and the finalizer needs the original value.
+fn expect_reject(result: PluginResult, expected_status: u16) -> PluginResult {
+    match &result {
+        PluginResult::Reject { status_code, .. } => {
+            assert_eq!(*status_code, expected_status);
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+    result
+}
+
+/// Run the shared rejection finalizer over `plugins` and return its headers.
+async fn finalized_rejection_headers(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    rejection: PluginResult,
+) -> HashMap<String, String> {
+    use ferrum_edge::_test_support::finalize_plugin_rejection_for_test;
+
+    let finalized = finalize_plugin_rejection_for_test(plugins, ctx, rejection).await;
+    match finalized {
+        PluginResult::RejectBinary { headers, .. } => headers,
+        other => panic!("Expected finalized RejectBinary, got {other:?}"),
+    }
+}
+
+fn assert_no_ratelimit_headers(headers: &HashMap<String, String>) {
+    assert!(
+        !headers
+            .keys()
+            .any(|key| key.to_ascii_lowercase().starts_with("x-ratelimit-")),
+        "no rate-limit telemetry may describe this response: {headers:?}"
+    );
+}
+
+/// The refusing limiter's 429 telemetry must survive the finalizer, not be
+/// overwritten by a sibling that admitted the very same request.
+#[tokio::test]
+async fn composed_limiters_publish_the_refusing_budget_on_a_429() {
+    let generous = composed_limiter(100, true);
+    let strict = composed_limiter(1, true);
+    let plugins = [Arc::clone(&generous), Arc::clone(&strict)];
+
+    // Request 1 consumes the strict limiter's only slot.
+    let mut first = create_test_context();
+    assert_continue(generous.on_request_received(&mut first).await);
+    assert_continue(strict.on_request_received(&mut first).await);
+
+    // Request 2: the generous limiter admits and stages `remaining: 98`, then
+    // the strict limiter refuses.
+    let mut ctx = create_test_context();
+    assert_continue(generous.on_request_received(&mut ctx).await);
+    assert_eq!(meta(&ctx, "ratelimit_remaining"), Some("98"));
+    let rejection = expect_reject(strict.on_request_received(&mut ctx).await, 429);
+
+    let finalized = finalized_rejection_headers(&plugins, &mut ctx, rejection).await;
+    assert_standard_ratelimit_headers(&finalized, "1", "0");
+}
+
+/// Refusal wins across the two enforcement phases too: an IP limiter admits in
+/// `on_request_received`, and a consumer limiter then refuses in `authorize`.
+#[tokio::test]
+async fn a_consumer_limiter_refusal_outranks_an_admitted_ip_budget() {
+    let by_ip = composed_limiter(100, true);
+    let by_consumer = Arc::new(make_rate_limiter(json!({
+        "limit_by": "consumer",
+        "expose_headers": true,
+        "requests_per_minute": 1,
+    }))) as Arc<dyn Plugin>;
+    let plugins = [Arc::clone(&by_ip), Arc::clone(&by_consumer)];
+
+    let mut first = create_test_context();
+    assert_continue(by_ip.on_request_received(&mut first).await);
+    assert_continue(by_consumer.authorize(&mut first).await);
+
+    let mut ctx = create_test_context();
+    assert_continue(by_ip.on_request_received(&mut ctx).await);
+    let rejection = expect_reject(by_consumer.authorize(&mut ctx).await, 429);
+
+    let finalized = finalized_rejection_headers(&plugins, &mut ctx, rejection).await;
+    assert_standard_ratelimit_headers(&finalized, "1", "0");
+}
+
+/// A refusing limiter configured not to expose headers publishes nothing — and
+/// that verdict also retires the budget a sibling staged for the same request.
+#[tokio::test]
+async fn a_refusing_limiter_that_hides_headers_retires_a_sibling_budget() {
+    let generous = composed_limiter(100, true);
+    let strict = composed_limiter(1, false);
+    let plugins = [Arc::clone(&generous), Arc::clone(&strict)];
+
+    let mut first = create_test_context();
+    assert_continue(generous.on_request_received(&mut first).await);
+    assert_continue(strict.on_request_received(&mut first).await);
+
+    let mut ctx = create_test_context();
+    assert_continue(generous.on_request_received(&mut ctx).await);
+    assert_eq!(meta(&ctx, "ratelimit_remaining"), Some("98"));
+    let rejection = expect_reject(strict.on_request_received(&mut ctx).await, 429);
+
+    let finalized = finalized_rejection_headers(&plugins, &mut ctx, rejection).await;
+    assert_no_ratelimit_headers(&finalized);
+}
+
+/// A fail-closed `503` is not a budget verdict. An earlier sibling's admitted
+/// telemetry must not be published as the unavailable limiter's answer.
+#[tokio::test]
+async fn an_admitted_sibling_budget_is_not_published_on_a_fail_closed_503() {
+    use ferrum_edge::_test_support::rate_limiting_mark_redis_unavailable_for_test;
+
+    let generous = composed_limiter(100, true);
+    let centralized = make_rate_limiter(redis_rate_limit_config(json!({
+        "expose_headers": true,
+        // Nothing listens on port 1; the client is then forced unavailable so
+        // the outage is deterministic rather than dial-timing dependent.
+        "redis_url": "redis://127.0.0.1:1/0",
+    })));
+    assert!(
+        rate_limiting_mark_redis_unavailable_for_test(&centralized),
+        "sync_mode=redis must build a client that can be marked unavailable"
+    );
+    let centralized = Arc::new(centralized) as Arc<dyn Plugin>;
+    let plugins = [Arc::clone(&generous), Arc::clone(&centralized)];
+
+    let mut ctx = create_test_context();
+    assert_continue(generous.on_request_received(&mut ctx).await);
+    assert_eq!(meta(&ctx, "ratelimit_remaining"), Some("99"));
+    let rejection = expect_reject(centralized.on_request_received(&mut ctx).await, 503);
+
+    let finalized = finalized_rejection_headers(&plugins, &mut ctx, rejection).await;
+    assert_no_ratelimit_headers(&finalized);
+}
+
+/// With every limiter admitting, the tightest budget is published — the same
+/// rule one instance already applies across its own windows — and the answer
+/// does not depend on the order the instances run in.
+#[tokio::test]
+async fn composed_admitted_limiters_publish_the_tightest_budget_in_either_order() {
+    let generous = composed_limiter(100, true);
+    let strict = composed_limiter(5, true);
+    let mut ctx = create_test_context();
+    assert_continue(generous.on_request_received(&mut ctx).await);
+    assert_continue(strict.on_request_received(&mut ctx).await);
+    assert_eq!(meta(&ctx, "ratelimit_limit"), Some("5"));
+    assert_eq!(meta(&ctx, "ratelimit_remaining"), Some("4"));
+
+    let generous_reversed = composed_limiter(100, true);
+    let strict_reversed = composed_limiter(5, true);
+    let mut reversed = create_test_context();
+    assert_continue(strict_reversed.on_request_received(&mut reversed).await);
+    assert_continue(generous_reversed.on_request_received(&mut reversed).await);
+    assert_eq!(
+        meta(&reversed, "ratelimit_limit"),
+        Some("5"),
+        "plugin order must not decide which budget the client sees"
+    );
+    assert_eq!(meta(&reversed, "ratelimit_remaining"), Some("4"));
 }

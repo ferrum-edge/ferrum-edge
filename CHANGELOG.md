@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Chargeback counts explicitly zero-priced call tiers and rejects duplicate
+  effective durable sinks on one proxy. Successful H2/H3 Extended CONNECT
+  WebSocket handshakes now use the `101` price and `ws` protocol label, matching
+  H1; deployments previously charging the `200` tier will see this billing change.
+- Durable sink process counters survive reload/removal, and pending per-event
+  rows and cancellation losses remain observable across worker retirement.
+  Document the pre-persistence crash window and emission-time billing periods.
+
 ## [0.9.3] - 2026-09-06
 
 Patch release replacing `v0.9.2`, whose release workflow was retracted after

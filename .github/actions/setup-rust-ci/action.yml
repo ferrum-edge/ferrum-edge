@@ -8,19 +8,19 @@ description: >-
   sccache is installed by the local checksum-pinned setup-sccache action (not
   mozilla-actions/sccache-action) into a bounded local directory; the
   cache-service credential is never exported into later PR-controlled `run:`
-  steps. rust-cache persists that directory together with Cargo and target
-  directories using isolated shared keys so incompatible job/profile/target
-  artifacts do not mix. rust-cache saves only after successful jobs. Saving
-  during fetch/build cancellation can reserve an immutable key with incomplete
-  contents that later exact-hit consumers cannot enrich. Failed jobs can still
-  restore a previously completed cache; their new state is not published.
-  GitHub Actions cache is a 10 GB repository quota with LRU eviction across
-  every ref, so pull requests and merge groups restore this cache and do not
-  save: `save-if` is true only for a trusted `refs/heads/main` run (push or
-  workflow_dispatch). PR-scoped saves were evicting the default-branch caches
-  every lane restores from, forcing cold compiles. Fork pull requests can
+  steps. rust-cache persists the Cargo home and target directories using a
+  small number of shared lanes. The sccache local store is deliberately NOT
+  persisted: restored target artifacts already skip dependency compilation,
+  and each persisted sccache store cost up to 2 GB of the 10 GB repository
+  quota per lane. GitHub Actions cache is a 10 GB repository quota with LRU
+  eviction across every ref, so pull requests and merge groups restore and
+  never save, and within a lane only the designated producer (`save: "true"`)
+  saves, and only on a trusted `refs/heads/main` run. Fork pull requests can
   never save (`github.ref` is never `refs/heads/main` on a PR, and the fork
-  guard stays fail-closed if that ref check is later weakened).
+  guard stays fail-closed if that ref check is later weakened). Saving during
+  fetch/build cancellation can reserve an immutable key with incomplete
+  contents that later exact-hit consumers cannot enrich; main pushes are no
+  longer cancelled, so producers run to completion.
   Centralizes the setup block so individual jobs only declare their cache key,
   any extra rustup components, and an optional rust-cache `workspaces` list.
 
@@ -37,6 +37,24 @@ inputs:
       string skips component install — most jobs don't need extras.
     required: false
     default: ""
+  save:
+    description: >-
+      Whether this job is the designated PRODUCER of its rust-cache lane.
+      Only "true" allows a save, and even then only on a trusted push to
+      `refs/heads/main`. Every other job in the lane restores only, so one
+      job that compiles the superset of the lane's dependency graph owns the
+      saved entry and the 10 GB repository cache quota holds a handful of
+      warm lanes instead of dozens of cold, mutually-evicting ones.
+    required: false
+    default: "false"
+  cache-on-failure:
+    description: >-
+      rust-cache `cache-on-failure`, honored only for a producer. A producer
+      whose tests fail after a complete compile still publishes the compiled
+      dependency graph; dependency artifacts are deterministic and the
+      workspace crates are stripped before saving.
+    required: false
+    default: "false"
   workspaces:
     description: >-
       Optional rust-cache `workspaces` value, passed through exactly.
@@ -226,9 +244,8 @@ runs:
       with:
         shared-key: ${{ inputs.shared-key }}
         workspaces: ${{ inputs.workspaces }}
-        cache-directories: ${{ github.workspace }}/.cache/sccache
-        cache-on-failure: "false"
-        save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
+        cache-on-failure: ${{ inputs.save == 'true' && inputs.cache-on-failure == 'true' }}
+        save-if: ${{ inputs.save == 'true' && github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
 
     - name: Pre-fetch crate dependencies (isolate transient registry flakes)
       shell: bash

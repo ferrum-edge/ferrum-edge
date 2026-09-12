@@ -126,8 +126,12 @@ async fn try_start_injector(
     let trust_domain = format!("injector-probe-{}-{port}.test", std::process::id());
 
     let mut command = Command::new(gateway_binary_path());
+    command.arg("run");
     command
         .env("FERRUM_MODE", "injector")
+        // Exercise shared startup shard normalization in the injector's real
+        // TLS/plaintext serving cases, including child-owned admission probes.
+        .env("FERRUM_POOL_SHARD_AMOUNT", "1")
         .env("FERRUM_INJECTOR_LISTEN_ADDR", format!("127.0.0.1:{port}"))
         .env(
             "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS",

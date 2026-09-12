@@ -281,7 +281,8 @@ impl ManagedTlsStore {
                 "store directory must not be empty".to_string(),
             ));
         }
-        std::fs::create_dir_all(&dir).map_err(|error| ManagedTlsError::Write(error.to_string()))?;
+        crate::tls::store_dir::create_private_store_dir(&dir)
+            .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
         let path = dir.join(STORE_FILE_NAME);
         let file = match max_document_bytes {
             Some(max_document_bytes) => SharedStoreFile::open_with_limits(

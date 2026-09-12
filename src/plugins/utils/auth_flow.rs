@@ -199,54 +199,120 @@ impl VerifyOutcome {
     }
 }
 
-/// Convert a validated Unix expiry plus its validation leeway to a monotonic
-/// deadline. A wall-clock step after authentication cannot extend the result.
-pub fn credential_deadline_from_unix_seconds(
-    expires_at_unix: i64,
-    leeway_seconds: u64,
-) -> tokio::time::Instant {
-    let now_mono = tokio::time::Instant::now();
-    let now_unix = SystemTime::now()
+/// Outcome of converting a validated Unix expiry into a monotonic deadline.
+///
+/// Separates the two cases a bare `Option` conflated (issue #5396): an interval
+/// that can never bound a live credential, and one whose end is simply further
+/// out than a monotonic `Instant` can represent on this platform. The first
+/// must fail closed; the second describes a perfectly valid long-lived
+/// credential and must not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialDeadline {
+    /// The validated expiry is representable: admit the credential and enforce
+    /// this monotonic bound.
+    Bounded(tokio::time::Instant),
+    /// The credential is usable but its expiry is beyond the range a monotonic
+    /// `Instant` can express — the RFC 5280 "no well-defined expiration" value
+    /// `99991231235959Z` on a nanosecond-based platform clock, for example.
+    ///
+    /// Admit the credential with NO deadline bound. The deadline is only an
+    /// upper bound used to cut long-lived authenticated streams, and a
+    /// credential accepted without one is still bounded by the finite
+    /// `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback in
+    /// `proxy::auth_lifetime`, so nothing becomes indefinitely authorized.
+    Unbounded,
+    /// The expiry cannot describe a live credential at all — an end before the
+    /// Unix epoch, or a leeway too wide to be a signed offset. Reject.
+    Invalid,
+}
+
+impl CredentialDeadline {
+    /// The representable deadline, if there is one. `None` for both
+    /// `Unbounded` and `Invalid`, so this must never decide admission.
+    pub fn bounded(self) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Bounded(deadline) => Some(deadline),
+            Self::Unbounded | Self::Invalid => None,
+        }
+    }
+}
+
+/// Wall-clock seconds since the Unix epoch, saturating for a host clock that
+/// predates it. The conversions below then read that saturation as "nothing
+/// remains", which is the fail-closed direction.
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .unwrap_or(u64::MAX);
-    credential_deadline_from_unix_seconds_at(expires_at_unix, leeway_seconds, now_unix, now_mono)
+        .unwrap_or(u64::MAX)
 }
 
-fn credential_deadline_from_unix_seconds_at(
-    expires_at_unix: i64,
-    leeway_seconds: u64,
-    now_unix: u64,
-    now_mono: tokio::time::Instant,
-) -> tokio::time::Instant {
-    try_credential_deadline_from_unix_seconds_at(
-        expires_at_unix,
-        leeway_seconds,
-        now_unix,
-        now_mono,
-    )
-    .unwrap_or(now_mono)
-}
-
-/// Fallible conversion used by providers that must fail closed when the
-/// expiry cannot be represented as a monotonic instant (issue #3816).
+/// Convert a validated Unix expiry plus its validation leeway to a monotonic
+/// deadline. A wall-clock step after authentication cannot extend the result.
 ///
-/// `None` covers a clock before the Unix epoch, a negative expiry, arithmetic
-/// overflow, and an `Instant` that cannot hold the remaining duration. Callers
-/// must treat `None` as rejection, never as "no deadline".
-pub fn try_credential_deadline_from_unix_seconds(
+/// `None` means "publish no bound for this credential", not "expired": the
+/// validated expiry is further out than an `Instant` can express on this
+/// platform (issue #5420). An interval that can never bound a live credential
+/// still fails closed, as an already-elapsed deadline.
+pub fn credential_deadline_from_unix_seconds(
     expires_at_unix: i64,
     leeway_seconds: u64,
 ) -> Option<tokio::time::Instant> {
     let now_mono = tokio::time::Instant::now();
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .ok()?;
-    try_credential_deadline_from_unix_seconds_at(
+    credential_deadline_from_unix_seconds_at(
+        expires_at_unix,
+        leeway_seconds,
+        now_unix_seconds(),
+        now_mono,
+    )
+}
+
+pub(crate) fn credential_deadline_from_unix_seconds_at(
+    expires_at_unix: i64,
+    leeway_seconds: u64,
+    now_unix: u64,
+    now_mono: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    match try_credential_deadline_from_unix_seconds_at(
         expires_at_unix,
         leeway_seconds,
         now_unix,
+        now_mono,
+    ) {
+        CredentialDeadline::Bounded(deadline) => Some(deadline),
+        // Admit with no bound. The credential is valid and simply outlives what
+        // this platform's monotonic clock can hold (issue #5420); the finite
+        // `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback in
+        // `proxy::auth_lifetime` still bounds the authenticated stream, so
+        // nothing becomes indefinitely authorized.
+        CredentialDeadline::Unbounded => None,
+        // An unusable interval keeps the pre-existing fail-closed collapse to
+        // `now_mono`: a deadline already elapsed at authentication time.
+        CredentialDeadline::Invalid => Some(now_mono),
+    }
+}
+
+/// Fallible conversion used by providers that must fail closed when the
+/// expiry cannot bound a live credential (issue #3816).
+///
+/// [`CredentialDeadline::Invalid`] covers a clock before the Unix epoch, a
+/// negative expiry, and a leeway that is not a signed offset; callers must
+/// treat it as rejection. [`CredentialDeadline::Unbounded`] is NOT a rejection:
+/// the credential is valid and simply outlives what an `Instant` can hold
+/// (issue #5396).
+pub fn try_credential_deadline_from_unix_seconds(
+    expires_at_unix: i64,
+    leeway_seconds: u64,
+) -> CredentialDeadline {
+    let now_mono = tokio::time::Instant::now();
+    let Ok(since_epoch) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        // A host clock before the Unix epoch cannot place the expiry at all.
+        return CredentialDeadline::Invalid;
+    };
+    try_credential_deadline_from_unix_seconds_at(
+        expires_at_unix,
+        leeway_seconds,
+        since_epoch.as_secs(),
         now_mono,
     )
 }
@@ -256,22 +322,55 @@ pub(crate) fn try_credential_deadline_from_unix_seconds_at(
     leeway_seconds: u64,
     now_unix: u64,
     now_mono: tokio::time::Instant,
-) -> Option<tokio::time::Instant> {
-    let valid_until = expires_at_unix.checked_add(i64::try_from(leeway_seconds).ok()?)?;
-    let valid_until = u64::try_from(valid_until).ok()?;
+) -> CredentialDeadline {
+    // A leeway wider than a signed offset is a malformed validation parameter,
+    // not a far-future expiry: fail closed rather than drop the bound.
+    let Ok(leeway) = i64::try_from(leeway_seconds) else {
+        return CredentialDeadline::Invalid;
+    };
+    // `leeway` is non-negative, so this can only overflow when the validated
+    // expiry is itself astronomically far in the future.
+    let Some(valid_until) = expires_at_unix.checked_add(leeway) else {
+        return CredentialDeadline::Unbounded;
+    };
+    // An expiry before the Unix epoch can never bound a live credential.
+    let Ok(valid_until) = u64::try_from(valid_until) else {
+        return CredentialDeadline::Invalid;
+    };
     let remaining = valid_until.saturating_sub(now_unix);
-    now_mono.checked_add(Duration::from_secs(remaining))
+    match now_mono.checked_add(Duration::from_secs(remaining)) {
+        Some(deadline) => CredentialDeadline::Bounded(deadline),
+        // The monotonic clock ran out of representable range, not the
+        // credential out of validity. Platform dependent by construction: a
+        // nanosecond-based `Instant` saturates centuries before a
+        // `timespec`-based one does.
+        None => CredentialDeadline::Unbounded,
+    }
 }
 
 /// Extract an authoritative numeric `exp` from already-validated claims.
+///
+/// `None` covers both "no numeric `exp` to bound this credential with" and an
+/// `exp` beyond the representable monotonic range (issue #5420). Neither
+/// publishes a deadline, and neither is an expiry.
 pub fn credential_deadline_from_claims(
     claims: &serde_json::Value,
     leeway_seconds: u64,
 ) -> Option<tokio::time::Instant> {
+    let now_mono = tokio::time::Instant::now();
+    credential_deadline_from_claims_at(claims, leeway_seconds, now_unix_seconds(), now_mono)
+}
+
+pub(crate) fn credential_deadline_from_claims_at(
+    claims: &serde_json::Value,
+    leeway_seconds: u64,
+    now_unix: u64,
+    now_mono: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
     let exp = claims
         .get("exp")
         .and_then(|value| value.as_i64().or_else(|| value.as_u64()?.try_into().ok()))?;
-    Some(credential_deadline_from_unix_seconds(exp, leeway_seconds))
+    credential_deadline_from_unix_seconds_at(exp, leeway_seconds, now_unix, now_mono)
 }
 
 macro_rules! impl_auth_plugin {
@@ -471,7 +570,11 @@ pub fn commit_authentication_attempt(
         if ctx.auth_method.is_none() {
             ctx.auth_method = Some(auth_method);
         }
-        ctx.credential_deadline_at = credential_deadline;
+        // Earliest wins rather than assign: an identity mechanism that ran
+        // earlier on this request (`spiffe_identity`, priority 940, publishing
+        // the peer SVID's `notAfter`) may already have established a shorter
+        // bound, and a second, longer-lived credential must not widen it.
+        ctx.observe_credential_deadline(credential_deadline);
         attempt.commit_principal_state(ctx);
     }
 
@@ -908,15 +1011,15 @@ mod tests {
         let now = tokio::time::Instant::now();
         assert_eq!(
             credential_deadline_from_unix_seconds_at(1_000, 0, 1_000, now),
-            now
+            Some(now)
         );
         assert_eq!(
             credential_deadline_from_unix_seconds_at(995, 5, 1_000, now),
-            now
+            Some(now)
         );
         assert_eq!(
             credential_deadline_from_unix_seconds_at(1_000, 5, 1_000, now),
-            now + Duration::from_secs(5)
+            Some(now + Duration::from_secs(5))
         );
     }
 

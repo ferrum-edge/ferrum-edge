@@ -23,8 +23,19 @@ impl VaultClientWrapper {
         let vault_token = env::var("VAULT_TOKEN")
             .map_err(|_| "VAULT_TOKEN must be set to resolve secrets from Vault".to_string())?;
 
+        let parsed_addr = url::Url::parse(&vault_addr)
+            .map_err(|e| format!("VAULT_ADDR is not a valid URL: {e}"))?;
+        if !matches!(parsed_addr.scheme(), "http" | "https") {
+            return Err("VAULT_ADDR must use http or https".to_string());
+        }
+
         let mut settings_builder = vaultrs::client::VaultClientSettingsBuilder::default();
-        settings_builder.address(&vault_addr).token(&vault_token);
+        // vaultrs 0.8's address setter panics on parse failure. A serialized
+        // Url reparses successfully; never pass the unchecked environment value.
+        // Parse diagnostics above contain only the failure class, not credentials.
+        settings_builder
+            .address(parsed_addr.as_str())
+            .token(&vault_token);
 
         if let Ok(ca_path) = env::var("FERRUM_TLS_CA_BUNDLE_PATH")
             && !ca_path.is_empty()

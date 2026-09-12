@@ -6,6 +6,8 @@
 //! Covers: pool construction, pool_size tracking, get_sender error paths,
 //! and live connection lifecycle against a real TLS+H2 echo backend.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use bytes::Bytes;
 use ferrum_edge::backend_conn_limit::BackendConnectionLimiter;
 use ferrum_edge::config::PoolConfig;
@@ -170,7 +172,7 @@ async fn start_h2_tls_backend_with_cert(
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let handle = start_tls_backend_on(listener, cert_pem, key_pem, vec![b"h2".to_vec()]).await?;
 
@@ -248,7 +250,7 @@ struct TestDnsServer {
 
 impl TestDnsServer {
     async fn spawn(answers: Vec<IpAddr>) -> Self {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
             .await
             .expect("bind test DNS server");
         let addr = socket.local_addr().expect("test DNS server address");
@@ -296,23 +298,67 @@ fn multi_address_dns_cache(dns_addr: SocketAddr) -> DnsCache {
     })
 }
 
-async fn bind_dual_loopback_listeners() -> (
+/// Secondary IPv4 loopback aliases this fixture will try, in order.
+///
+/// The multi-address candidate loop is an A-record fixture: one hostname must
+/// resolve to two IPv4 addresses that share one port, so the second address
+/// cannot be IPv6 (`do_resolve` returns the first record type that answers, it
+/// never merges A with AAAA) and cannot be the wildcard (which would swallow
+/// the first address's port). Linux assigns all of `127.0.0.0/8` to `lo`, so
+/// `127.0.0.2` is always available there; macOS assigns only `127.0.0.1` to
+/// `lo0` unless an operator adds an alias, so the whole fixture is skipped
+/// there with an explicit reason rather than failing as a pool defect
+/// (issue #4983).
+const SECONDARY_LOOPBACK_CANDIDATES: [Ipv4Addr; 4] = [
+    Ipv4Addr::new(127, 0, 0, 2),
+    Ipv4Addr::new(127, 0, 0, 3),
+    Ipv4Addr::new(127, 0, 0, 4),
+    Ipv4Addr::new(127, 0, 0, 5),
+];
+
+/// The message a skipped multi-address case prints, so a green run on a host
+/// without a loopback alias is never mistaken for coverage.
+fn report_missing_secondary_loopback(test: &str) {
+    eprintln!(
+        "skipping {test}: this host has no secondary IPv4 loopback alias (tried \
+         {SECONDARY_LOOPBACK_CANDIDATES:?}); add one (macOS: `sudo ifconfig lo0 alias \
+         127.0.0.2`) to run the multi-address candidate cases"
+    );
+}
+
+/// The first secondary IPv4 loopback address this host actually assigns.
+async fn secondary_loopback_address() -> Option<Ipv4Addr> {
+    for candidate in SECONDARY_LOOPBACK_CANDIDATES {
+        if let Ok(probe) = tokio::net::TcpListener::bind_test((candidate, 0)).await {
+            drop(probe);
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// `(healthy, failing, failing_ip, shared_port)`.
+type DualLoopbackListeners = (
     tokio::net::TcpListener,
     tokio::net::TcpListener,
     Ipv4Addr,
     u16,
-) {
-    let failing_ip = Ipv4Addr::new(127, 0, 0, 2);
+);
+
+/// Two listeners sharing one port on two distinct IPv4 loopback addresses, or
+/// `None` when this host assigns only `127.0.0.1`.
+async fn bind_dual_loopback_listeners() -> Option<DualLoopbackListeners> {
+    let failing_ip = secondary_loopback_address().await?;
     for _ in 0..10 {
-        let healthy = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        let healthy = tokio::net::TcpListener::bind_test((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind healthy loopback listener");
         let port = healthy
             .local_addr()
             .expect("healthy loopback listener address")
             .port();
-        if let Ok(failing) = tokio::net::TcpListener::bind((failing_ip, port)).await {
-            return (healthy, failing, failing_ip, port);
+        if let Ok(failing) = tokio::net::TcpListener::bind_test((failing_ip, port)).await {
+            return Some((healthy, failing, failing_ip, port));
         }
     }
     panic!("could not reserve one TCP port on both test loopback addresses");
@@ -492,8 +538,13 @@ async fn test_http2_pool_get_sender_connects() {
 
 #[tokio::test]
 async fn test_http2_pool_fails_over_after_tcp_success_but_tls_failure() {
-    let (healthy_listener, failing_listener, failing_ip, port) =
-        bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((healthy_listener, failing_listener, failing_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_http2_pool_fails_over_after_tcp_success_but_tls_failure",
+        );
+        return;
+    };
     let failing_attempts = Arc::new(AtomicUsize::new(0));
     let task_attempts = Arc::clone(&failing_attempts);
     let _failing_task = tokio::spawn(async move {
@@ -547,8 +598,13 @@ async fn test_http2_pool_fails_over_after_tcp_success_but_tls_failure() {
 
 #[tokio::test]
 async fn test_http2_pool_preserves_http1_downgrade_before_later_candidate_failure() {
-    let (later_failure_listener, http1_listener, http1_ip, port) =
-        bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((later_failure_listener, http1_listener, http1_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_http2_pool_preserves_http1_downgrade_before_later_candidate_failure",
+        );
+        return;
+    };
     let later_attempts = Arc::new(AtomicUsize::new(0));
     let task_attempts = Arc::clone(&later_attempts);
     let _later_failure_task = tokio::spawn(async move {
@@ -602,7 +658,13 @@ async fn test_http2_pool_preserves_http1_downgrade_before_later_candidate_failur
 
 #[tokio::test]
 async fn test_http2_pool_sni_override_skips_http1_candidate_for_later_h2() {
-    let (h2_listener, http1_listener, http1_ip, port) = bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((h2_listener, http1_listener, http1_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_http2_pool_sni_override_skips_http1_candidate_for_later_h2",
+        );
+        return;
+    };
     let http1_attempts = Arc::new(AtomicUsize::new(0));
     let _http1_task = start_tls_backend_on_counted(
         http1_listener,
@@ -659,7 +721,13 @@ async fn test_http2_pool_sni_override_skips_http1_candidate_for_later_h2() {
 /// alter both.
 #[tokio::test]
 async fn test_http2_pool_sni_override_exhausts_all_http1_candidates() {
-    let (second_listener, first_listener, first_ip, port) = bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((second_listener, first_listener, first_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_http2_pool_sni_override_exhausts_all_http1_candidates",
+        );
+        return;
+    };
     let first_attempts = Arc::new(AtomicUsize::new(0));
     let second_attempts = Arc::new(AtomicUsize::new(0));
     let _first_task = start_tls_backend_on_counted(
@@ -722,8 +790,13 @@ async fn test_http2_pool_sni_override_exhausts_all_http1_candidates() {
 
 #[tokio::test]
 async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
-    let (healthy_listener, failing_listener, failing_ip, port) =
-        bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((healthy_listener, failing_listener, failing_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure",
+        );
+        return;
+    };
     let failing_attempts = Arc::new(AtomicUsize::new(0));
     let task_attempts = Arc::clone(&failing_attempts);
     let _failing_task = tokio::spawn(async move {
@@ -804,7 +877,7 @@ async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
 
 #[tokio::test]
 async fn test_grpc_h2c_accepts_settings_with_zero_concurrent_streams() {
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+    let listener = tokio::net::TcpListener::bind_test((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind scripted h2c backend");
     let port = listener
@@ -859,7 +932,13 @@ async fn test_grpc_h2c_accepts_settings_with_zero_concurrent_streams() {
 
 #[tokio::test]
 async fn test_grpc_tls_pool_fails_over_when_first_peer_omits_h2_alpn() {
-    let (healthy_listener, non_h2_listener, non_h2_ip, port) = bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((healthy_listener, non_h2_listener, non_h2_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_grpc_tls_pool_fails_over_when_first_peer_omits_h2_alpn",
+        );
+        return;
+    };
     let non_h2_attempts = Arc::new(AtomicUsize::new(0));
     let _non_h2_task = start_tls_backend_on_counted(
         non_h2_listener,
@@ -1208,7 +1287,7 @@ async fn test_http2_pool_sender_is_not_closed() {
 
 /// h2c echo backend that counts every accepted TCP connection.
 async fn start_counting_h2c_backend() -> (u16, Arc<AtomicUsize>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind h2c backend");
     let port = listener.local_addr().expect("backend addr").port();
@@ -1875,7 +1954,7 @@ async fn start_h2_tls_host_echo_backend()
 -> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
     let cert_pem = include_str!("../certs/server.crt");
     let key_pem = include_str!("../certs/server.key");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
 
     let mut cert_reader = cert_pem.as_bytes();
@@ -1936,7 +2015,7 @@ async fn start_h2_tls_host_echo_backend()
 async fn start_direct_h2_test_gateway(
     state: ProxyState,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
     let gateway_addr = listener.local_addr().expect("gateway addr");
@@ -1958,7 +2037,19 @@ async fn start_direct_h2_test_gateway(
                     .max_header_list_size(state.max_header_size_bytes as u32);
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
-                    async move { handle_proxy_request(req, state, remote_addr, false, None, None).await }
+                    async move {
+                        let request =
+                            handle_proxy_request(req, state, remote_addr, false, None, None);
+                        // This future is embedded in Hyper's service future.
+                        // Do not box it in the fixture: that would hide a
+                        // regression at the production request boundary.
+                        let bytes = std::mem::size_of_val(&request);
+                        assert!(
+                            bytes <= 32 * 1024,
+                            "frontend service future must stay within 32 KiB, got {bytes} bytes"
+                        );
+                        request.await
+                    }
                 });
                 let _ = builder.serve_connection_with_upgrades(io, svc).await;
             });
@@ -1970,6 +2061,18 @@ async fn start_direct_h2_test_gateway(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_h2_backend_sees_matching_host_and_authority_on_non_default_port() {
+    assert_direct_h2_host_and_authority(false).await;
+}
+
+// Both frontend dispatch stacks must fit the default Tokio worker stack in
+// the unoptimized hosted test profile. Keep the H1 reproducer above as well:
+// H2 streams are polled through a different Hyper task path.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_h2_backend_sees_matching_host_and_authority_from_h2_frontend() {
+    assert_direct_h2_host_and_authority(true).await;
+}
+
+async fn assert_direct_h2_host_and_authority(h2_frontend: bool) {
     let (_backend_handle, port) = start_h2_tls_host_echo_backend()
         .await
         .expect("start host-echo H2 TLS backend");
@@ -2002,23 +2105,39 @@ async fn direct_h2_backend_sees_matching_host_and_authority_on_non_default_port(
         .expect("connect gateway");
     let _ = stream.set_nodelay(true);
     let io = TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .expect("h1 handshake");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
     let request = Request::builder()
         .method("GET")
-        .uri("/h2test")
+        .uri(if h2_frontend {
+            "http://client.example:9000/h2test"
+        } else {
+            "/h2test"
+        })
         .header("host", "client.example:9000")
         .body(Full::new(Bytes::new()))
         .expect("request");
-    let response = sender
-        .send_request(request)
-        .await
-        .expect("gateway response");
+    let response = if h2_frontend {
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+            .await
+            .expect("h2 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+            .send_request(request)
+            .await
+            .expect("gateway response")
+    } else {
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .expect("h1 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+            .send_request(request)
+            .await
+            .expect("gateway response")
+    };
     assert_eq!(response.status(), 200, "direct-H2 dispatch should succeed");
     let headers = response.headers();
     assert_eq!(
@@ -2035,5 +2154,10 @@ async fn direct_h2_backend_sees_matching_host_and_authority_on_non_default_port(
         Some(expected.as_str()),
         "Hyper :authority must include the same non-default port"
     );
-    let _ = response.into_body().collect().await;
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("complete H2 response");
+    assert_eq!(body.to_bytes(), Bytes::from_static(b"ok"));
 }

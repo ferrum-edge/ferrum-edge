@@ -231,8 +231,7 @@ async fn spawn_h3_gateway(yaml: String, pool_warmup: bool) -> (GatewayHarness, u
     let mut last_error = None;
     for attempt in 1..=STARTUP_ATTEMPTS {
         let reservation = reserve_port().await.expect("reserve https port");
-        let https_port = reservation.port;
-        drop(reservation);
+        let https_port = reservation.drop_and_take_port();
 
         let scratch = tempfile::tempdir().expect("scratch");
         let (cert_path, key_path) = write_frontend_certs(scratch.path());

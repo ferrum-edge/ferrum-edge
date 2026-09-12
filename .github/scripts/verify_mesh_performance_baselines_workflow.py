@@ -22,7 +22,7 @@ SUMMARY_SCRIPT = REPO_ROOT / ".github" / "scripts" / "summarize_mesh_baseline_re
 LEDGER_SCRIPT = REPO_ROOT / ".github" / "scripts" / "mesh_baseline_ledger.py"
 HEALTH_SCRIPT = REPO_ROOT / ".github" / "scripts" / "mesh_baseline_runner_health.py"
 STEP_SUMMARY_SCRIPT = REPO_ROOT / ".github" / "scripts" / "mesh_baseline_step_summary.py"
-CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+CI_YML = REPO_ROOT / ".github" / "workflows" / "performance-regression.yml"
 PROTOCOL_DOC = REPO_ROOT / "docs" / "protocol_perf_regression.md"
 CI_CD_DOC = REPO_ROOT / "docs" / "ci_cd.md"
 MESH_BASELINE = REPO_ROOT / "tests" / "performance" / "mesh" / "baseline.md"
@@ -880,7 +880,7 @@ def check_pr_ci_wiring(failures: list[str]) -> None:
     body = match.group("body") if match else ""
     require(
         bool(body),
-        "ci.yml performance-regression job required for mesh baseline contract host",
+        "performance-regression.yml performance-regression job required for mesh baseline contract host",
         failures,
     )
     require(
@@ -897,7 +897,7 @@ def check_pr_ci_wiring(failures: list[str]) -> None:
     detect_idx = ci.find("Detect performance-sensitive changes")
     require(
         static_idx != -1 and detect_idx != -1 and static_idx < detect_idx,
-        "ci.yml must run mesh baseline workflow contracts after checkout and "
+        "performance-regression.yml must run mesh baseline workflow contracts after checkout and "
         "before optional benchmark path gating",
         failures,
     )
