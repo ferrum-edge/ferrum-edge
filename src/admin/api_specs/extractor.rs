@@ -1220,10 +1220,7 @@ fn extract_operation_schemas(
                     if !listen_prefix.is_empty() && spec_template == "/" {
                         (listen_prefix.to_string(), "")
                     } else {
-                        (
-                            format!("{listen_prefix}{spec_template}"),
-                            spec_template.as_str(),
-                        )
+                        (format!("{listen_prefix}{spec_template}"), spec_template.as_str())
                     };
                 if !seen_templates.insert(effective_template.clone()) {
                     continue;
