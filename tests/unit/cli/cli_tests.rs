@@ -13,47 +13,9 @@ use tempfile::TempDir;
 /// mutex only orders this module against itself, which is not what
 /// `std::env::set_var`'s Rust 2024 safety contract requires: it is a data race
 /// against any concurrent `getenv` anywhere in the process, and the secrets and
-/// config suites read the same `FERRUM_*` variables these tests write.
-use crate::unit::env_lock::ENV_LOCK;
-
-/// Helper to set env vars, run a closure, then clean them up.
-fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-    // Poison-tolerant: the lock now spans the whole binary, so one panicking
-    // env test elsewhere must not cascade into unrelated failures here. It
-    // guards no invariant of its own — only mutual exclusion.
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for (k, v) in vars {
-        unsafe { std::env::set_var(k, v) };
-    }
-    f();
-    for (k, _) in vars {
-        unsafe { std::env::remove_var(k) };
-    }
-}
-
-/// Helper to temporarily unset env vars, run a closure, then restore.
-fn without_env_vars<F: FnOnce()>(vars: &[&str], f: F) {
-    // Poison-tolerant: the lock now spans the whole binary, so one panicking
-    // env test elsewhere must not cascade into unrelated failures here. It
-    // guards no invariant of its own — only mutual exclusion.
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let saved: Vec<(&str, Option<String>)> =
-        vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-    for k in vars {
-        unsafe { std::env::remove_var(k) };
-    }
-    f();
-    for (k, v) in &saved {
-        match v {
-            Some(val) => unsafe { std::env::set_var(k, val) },
-            None => unsafe { std::env::remove_var(k) },
-        }
-    }
-}
+/// config suites read the same `FERRUM_*` variables these tests write. The
+/// shared helpers also isolate ambient `FERRUM_*` from a local gateway.
+use crate::unit::env_lock::{with_env_vars, without_env_vars};
 
 // ── Clap parsing tests ──────────────────────────────────────────────────────
 

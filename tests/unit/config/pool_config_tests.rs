@@ -10,54 +10,7 @@ use ferrum_edge::config::types::{
     MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE, Proxy,
 };
 
-use crate::unit::env_lock::ENV_LOCK;
-
-const POOL_ENV_VARS: &[&str] = &[
-    "FERRUM_POOL_MAX_IDLE_PER_HOST",
-    "FERRUM_POOL_IDLE_TIMEOUT_SECONDS",
-    "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE",
-    "FERRUM_POOL_ENABLE_HTTP2",
-    "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST",
-    "FERRUM_POOL_TCP_KEEPALIVE_SECONDS",
-    "FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS",
-    "FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS",
-    "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE",
-    "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
-    "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW",
-    "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE",
-    "FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS",
-];
-
-fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for key in POOL_ENV_VARS {
-        // SAFETY: We hold ENV_LOCK preventing concurrent env access.
-        unsafe {
-            std::env::remove_var(key);
-        }
-    }
-    for (k, v) in vars {
-        // SAFETY: We hold ENV_LOCK preventing concurrent env access.
-        unsafe {
-            std::env::set_var(k, v);
-        }
-    }
-    f();
-    for (k, _) in vars {
-        // SAFETY: We hold ENV_LOCK preventing concurrent env access.
-        unsafe {
-            std::env::remove_var(k);
-        }
-    }
-    for key in POOL_ENV_VARS {
-        // SAFETY: We hold ENV_LOCK preventing concurrent env access.
-        unsafe {
-            std::env::remove_var(key);
-        }
-    }
-}
+use crate::unit::env_lock::with_env_vars;
 
 fn parse_pool() -> Result<PoolConfig, String> {
     PoolConfig::from_env_with_conf(&ConfFile::default())
