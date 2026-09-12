@@ -3249,30 +3249,25 @@ const DOCUMENT_ID_MEMBER: &str = "id";
 /// it names reach the model, so neither is scanned or rewritten.
 const DOCUMENT_EXCLUDES_MEMBER: &str = "_excludes";
 
+/// Parse a document's exclusion control once before visiting its members. This
+/// keeps processing linear when both collections are attacker-controlled.
+fn document_excluded_members(excludes: Option<&Value>) -> HashSet<&str> {
+    match excludes {
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
+        // Tolerate the single-value spelling of the same control.
+        Some(Value::String(excluded)) => HashSet::from([excluded.as_str()]),
+        _ => HashSet::new(),
+    }
+}
+
 /// Whether a Cohere document-map member is bookkeeping the provider keeps out
 /// of what the model reads: the citation [`DOCUMENT_ID_MEMBER`], the
 /// [`DOCUMENT_EXCLUDES_MEMBER`] control itself, or a member that control names.
-///
-/// Shared by the detector and the redactor — passing the control value in
-/// rather than the whole map is what lets the redactor apply the identical
-/// predicate while it holds the map borrowed mutably, so the two cannot drift.
-///
-/// The control list is scanned in place rather than collected into a set: both
-/// it and a document's member list are a handful of entries, and this runs on
-/// the request path.
-fn document_member_is_hidden(member: &str, excludes: Option<&Value>) -> bool {
+fn document_member_is_hidden(member: &str, excluded_members: &HashSet<&str>) -> bool {
     if member == DOCUMENT_ID_MEMBER || member == DOCUMENT_EXCLUDES_MEMBER {
         return true;
     }
-    match excludes {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|excluded| excluded == member),
-        // Tolerate the single-value spelling of the same control.
-        Some(Value::String(excluded)) => excluded == member,
-        _ => false,
-    }
+    excluded_members.contains(member)
 }
 
 /// Collect Cohere v1 `/chat` RAG document text for Content-mode scanning:
@@ -3313,9 +3308,9 @@ fn collect_cohere_document_text<'a>(json: &'a Value, texts: &mut Vec<&'a str>) {
             }
             continue;
         }
-        let excludes = object.get(DOCUMENT_EXCLUDES_MEMBER);
+        let excluded_members = document_excluded_members(object.get(DOCUMENT_EXCLUDES_MEMBER));
         for (member, value) in object {
-            if document_member_is_hidden(member, excludes) {
+            if document_member_is_hidden(member, &excluded_members) {
                 continue;
             }
             collect_tool_result_content_text(Some(value), texts);
@@ -3344,11 +3339,12 @@ fn redact_cohere_document_text(json: &mut Value, redact: &impl Fn(&str) -> Strin
             continue;
         }
         let excludes = document.get(DOCUMENT_EXCLUDES_MEMBER).cloned();
+        let excluded_members = document_excluded_members(excludes.as_ref());
         let Some(object) = document.as_object_mut() else {
             continue;
         };
         for (member, value) in object.iter_mut() {
-            if document_member_is_hidden(member, excludes.as_ref()) {
+            if document_member_is_hidden(member, &excluded_members) {
                 continue;
             }
             redact_tool_result_content_text(Some(value), redact);

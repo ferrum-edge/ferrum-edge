@@ -1536,11 +1536,12 @@ fn count_document_value(value: Option<&Value>, total: &mut u64) {
             }
         }
         Some(Value::Object(obj)) if !obj.contains_key("type") => {
+            let excluded_members = document_excluded_members(obj.get(DOCUMENT_EXCLUDES_MEMBER));
             for (member, member_value) in obj {
                 let member = member.as_str();
                 if member == DOCUMENT_ID_MEMBER
                     || member == DOCUMENT_EXCLUDES_MEMBER
-                    || document_member_is_excluded(obj, member)
+                    || excluded_members.contains(member)
                 {
                     continue;
                 }
@@ -1551,21 +1552,14 @@ fn count_document_value(value: Option<&Value>, total: &mut u64) {
     }
 }
 
-/// True when a document map's `_excludes` control names `member`, i.e. the
-/// provider drops that member from what it sends to the model.
-///
-/// The control list is scanned in place rather than collected into a set: both it
-/// and the document's member list are a handful of entries, and this runs on the
-/// request path.
-fn document_member_is_excluded(obj: &serde_json::Map<String, Value>, member: &str) -> bool {
-    match obj.get(DOCUMENT_EXCLUDES_MEMBER) {
-        Some(Value::Array(excludes)) => excludes
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|excluded| excluded == member),
+/// Parse a document's exclusion control once before visiting its members. This
+/// keeps processing linear when both collections are attacker-controlled.
+fn document_excluded_members(excludes: Option<&Value>) -> HashSet<&str> {
+    match excludes {
+        Some(Value::Array(excludes)) => excludes.iter().filter_map(Value::as_str).collect(),
         // Tolerate the single-value spelling of the same control.
-        Some(Value::String(excluded)) => excluded.as_str() == member,
-        _ => false,
+        Some(Value::String(excluded)) => HashSet::from([excluded.as_str()]),
+        _ => HashSet::new(),
     }
 }
 
