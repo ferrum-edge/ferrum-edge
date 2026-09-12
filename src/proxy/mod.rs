@@ -15050,7 +15050,7 @@ async fn handle_websocket_request_authenticated(
                 // health as a connect-class failure.
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 https_to_plaintext::maybe_warn_https_to_plaintext_backend(
-                    proxy,
+                    &proxy,
                     &current_backend_url,
                     e.as_ref(),
                 );
@@ -36741,7 +36741,7 @@ async fn handle_proxy_request_inner(
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
                 https_to_plaintext::maybe_warn_https_to_plaintext_backend(
-                    proxy,
+                    &proxy,
                     &format!("{}:{}", proxy.backend_host, proxy.backend_port),
                     &e,
                 );
