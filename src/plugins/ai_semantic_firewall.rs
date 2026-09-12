@@ -2924,22 +2924,18 @@ fn builtin_pack_examples(
         Value::Bool(enabled) => Ok(enabled.then(|| strings_to_vec(default_examples))),
         Value::Object(object) => {
             let enabled = optional_bool_in_object(Some(object), "enabled")?.unwrap_or(true);
-            if !enabled {
-                return Ok(None);
-            }
-
             let examples_mode =
                 optional_string_from_object(object, "examples_mode")?.unwrap_or("append");
             let custom_examples =
                 optional_examples_from_object(object, &format!("builtins.{key}.examples"))?;
 
-            match examples_mode {
+            let examples = match examples_mode {
                 "append" => {
                     let mut examples = strings_to_vec(default_examples);
                     if let Some(custom_examples) = custom_examples {
                         append_unique_examples(&mut examples, custom_examples);
                     }
-                    Ok(Some(examples))
+                    examples
                 }
                 "replace" => {
                     let Some(custom_examples) = custom_examples else {
@@ -2947,12 +2943,15 @@ fn builtin_pack_examples(
                             "ai_semantic_firewall: builtins.{key}.examples is required when examples_mode is 'replace'"
                         ));
                     };
-                    Ok(Some(custom_examples))
+                    custom_examples
                 }
-                other => Err(format!(
-                    "ai_semantic_firewall: builtins.{key}.examples_mode must be 'append' or 'replace', got {other:?}"
-                )),
-            }
+                other => {
+                    return Err(format!(
+                        "ai_semantic_firewall: builtins.{key}.examples_mode must be 'append' or 'replace', got {other:?}"
+                    ));
+                }
+            };
+            Ok(enabled.then_some(examples))
         }
         _ => Err(format!(
             "ai_semantic_firewall: builtins.{key} must be a boolean or object"
