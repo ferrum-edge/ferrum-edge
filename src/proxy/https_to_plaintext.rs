@@ -23,9 +23,8 @@ static PER_PROXY_WARN: OnceLock<DashMap<String, AtomicLogRateLimiter>> = OnceLoc
 static GLOBAL_WARN: AtomicLogRateLimiter = AtomicLogRateLimiter::new();
 
 fn per_proxy_warn() -> &'static DashMap<String, AtomicLogRateLimiter> {
-    PER_PROXY_WARN.get_or_init(|| {
-        DashMap::with_shard_amount(crate::util::sharding::pool_shard_amount(0))
-    })
+    PER_PROXY_WARN
+        .get_or_init(|| DashMap::with_shard_amount(crate::util::sharding::pool_shard_amount(0)))
 }
 
 /// Emit at most one WARN per proxy (and one process-wide) per limiter

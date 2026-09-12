@@ -12,7 +12,10 @@ fn looks_like(error: impl StdError + 'static) -> bool {
 
 #[test]
 fn reason_token_is_stable() {
-    assert_eq!(ERROR_REASON_HTTPS_TO_PLAINTEXT, "https_to_plaintext_backend");
+    assert_eq!(
+        ERROR_REASON_HTTPS_TO_PLAINTEXT,
+        "https_to_plaintext_backend"
+    );
 }
 
 #[test]

@@ -12469,10 +12469,10 @@ fn omitted_backend_scheme_https_default_has_openapi_and_docs_parity() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
 
-    let scheme_desc = spec["components"]["schemas"]["Proxy"]["properties"]
-        ["backend_scheme"]["description"]
-        .as_str()
-        .expect("Proxy.backend_scheme description");
+    let scheme_desc =
+        spec["components"]["schemas"]["Proxy"]["properties"]["backend_scheme"]["description"]
+            .as_str()
+            .expect("Proxy.backend_scheme description");
     assert!(
         scheme_desc.contains("defaults to `https` when omitted"),
         "OpenAPI must document the HTTP-family https default: {scheme_desc}"
