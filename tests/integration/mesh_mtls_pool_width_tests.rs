@@ -46,6 +46,9 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
 const APP_PORT: u16 = 8080;
+/// Peer path answered with a 1 KiB body instead of the 2-byte `ok`.
+const KIB_PATH: &str = "/kib";
+const PEER_MAX_CONCURRENT_STREAMS: u32 = 1024;
 
 // ===== identity fixtures =====
 
@@ -244,15 +247,21 @@ async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
                 };
                 let service = service_fn(move |request: Request<hyper::body::Incoming>| {
                     let mut release_rx = release_rx.clone();
+                    let body = if request.uri().path() == KIB_PATH {
+                        Bytes::from(vec![b'x'; 1024])
+                    } else {
+                        Bytes::from_static(b"ok")
+                    };
                     async move {
                         let _ = request.into_body().collect().await;
                         let _ = release_rx.wait_for(|released| *released).await;
-                        Ok::<_, std::convert::Infallible>(Response::new(Full::new(
-                            Bytes::from_static(b"ok"),
-                        )))
+                        Ok::<_, std::convert::Infallible>(Response::new(Full::new(body)))
                     }
                 });
+                // Wider than any test's concurrency so the peer's stream cap never
+                // masks what the pool's own connection does under load.
                 let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .max_concurrent_streams(PEER_MAX_CONCURRENT_STREAMS)
                     .serve_connection(TokioIo::new(tls), service)
                     .await;
             });
@@ -334,9 +343,13 @@ impl Fixture {
 }
 
 fn request() -> Request<MeshMtlsRequestBody> {
+    request_for("/width")
+}
+
+fn request_for(path: &str) -> Request<MeshMtlsRequestBody> {
     Request::builder()
         .method("GET")
-        .uri("https://orders.example.com/width")
+        .uri(format!("https://orders.example.com{path}"))
         .body(MeshMtlsRequestBody::Grpc(GrpcBody::Buffered(Full::new(
             Bytes::new(),
         ))))
@@ -570,4 +583,43 @@ async fn failed_growth_dial_keeps_serving_on_the_existing_connection() {
     for (_, future) in parked {
         expect_ok(future).await;
     }
+}
+
+/// Issue #5464: one connection under the shipped `PoolConfig` must carry
+/// hundreds of concurrent small responses without either side closing it.
+///
+/// With hyper's adaptive window on (the old default) the connection window
+/// starts at 65,535 bytes; 512 streams sharing it force the peer into
+/// sub-256-byte DATA frames, and h2's small-frame flood budget then answers
+/// with `GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`. Fixed 8 MiB / 32 MiB
+/// windows keep frames whole and size that budget to 16 MiB.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_connection_carries_hundreds_of_concurrent_small_responses() {
+    // The fixture builds its pool from `PoolConfig::default()`.
+    assert!(
+        !PoolConfig::default().http2_adaptive_window,
+        "the shipped default is fixed windows"
+    );
+    let fixture = fixture(1, None).await;
+    const CONCURRENCY: usize = 512;
+
+    for path in [KIB_PATH, "/width", KIB_PATH, "/width"] {
+        let mut in_flight: Vec<ResponseFuture> = Vec::with_capacity(CONCURRENCY);
+        for _ in 0..CONCURRENCY {
+            let mut sender = fixture.checkout().await;
+            in_flight.push(Box::pin(
+                sender.send_request(request_for(path)).expect("send"),
+            ));
+        }
+        for future in in_flight {
+            expect_ok(future).await;
+        }
+    }
+
+    assert_eq!(fixture.pool.pool_size(), 1);
+    assert_eq!(
+        fixture.peer.accepted(),
+        1,
+        "every round rode the single bounded connection; nothing was torn down"
+    );
 }

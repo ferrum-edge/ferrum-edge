@@ -189,9 +189,10 @@ async fn connection_pool_key_direct_backend_format() {
         key.contains("||||||||1|svidg=static|rcfg="),
         "key should carry empty dns/subset/ca/mtls/sni/sans, verify=1, SVID generation, and rcfg: {key}"
     );
-    // Defaults: adaptive window on → fixed windows omitted from rcfg.
+    // Defaults (issue #5464): adaptive window off → the fixed 8 MiB stream /
+    // 32 MiB connection windows are part of the client behavior.
     assert!(
-        key.ends_with("|rcfg=i90;ka60;h2=1;h2i30;h2t45;aw1;mf1048576"),
+        key.ends_with("|rcfg=i90;ka60;h2=1;h2i30;h2t45;aw0;sw8388608;cw33554432;mf1048576"),
         "default client-behavior suffix mismatch: {key}"
     );
 }
@@ -692,8 +693,8 @@ async fn connection_pool_key_client_level_settings_partition() {
     );
 
     let mut stream_window = minimal_proxy();
-    // Adaptive defaults to true and overrides fixed windows — disable it so
-    // the window override is material to create_client behavior.
+    // Adaptive replaces fixed windows when on — pin it off so the window
+    // override is material to create_client behavior regardless of default.
     stream_window.pool_http2_adaptive_window = Some(false);
     stream_window.pool_http2_initial_stream_window_size = Some(65_535);
     let mut other_window = minimal_proxy();

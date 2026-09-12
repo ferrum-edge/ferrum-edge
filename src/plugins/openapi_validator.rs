@@ -88,7 +88,7 @@ const XML_NAMESPACE_CONFLICT_DETAIL: &str =
 const XML_COMMENT_IN_VALUE_DETAIL: &str =
     "XML element contains a comment inside its character data";
 const XML_PI_IN_VALUE_DETAIL: &str =
-    "XML processing instruction inside a scalar value cannot be represented by the schema";
+    "XML processing instruction cannot be represented by the schema";
 const XML_DEPTH_DETAIL: &str = "XML document nesting exceeds the supported depth";
 /// XML document bounds, split across three layers because no single one is
 /// sufficient:
@@ -2920,7 +2920,6 @@ fn xml_array_item_name<'a>(
 fn xml_direct_text_children(node: roxmltree::Node<'_, '_>) -> Result<String, String> {
     let mut text = String::new();
     let mut saw_comment = false;
-    let mut saw_pi = false;
     for child in node.children() {
         if child.is_text() {
             if let Some(chunk) = child.text() {
@@ -2931,21 +2930,12 @@ fn xml_direct_text_children(node: roxmltree::Node<'_, '_>) -> Result<String, Str
         if child.is_comment() {
             saw_comment = true;
         }
-        // A processing instruction carries no application data, so it is
-        // ignored at structural positions exactly like a comment; inside a
-        // scalar value it could hide content the backend still parses, so it
-        // is refused there for the same reason a comment is.
         if child.is_pi() {
-            saw_pi = true;
-        }
-    }
-    if !text.trim().is_empty() {
-        if saw_comment {
-            return Err(XML_COMMENT_IN_VALUE_DETAIL.to_string());
-        }
-        if saw_pi {
             return Err(XML_PI_IN_VALUE_DETAIL.to_string());
         }
+    }
+    if !text.trim().is_empty() && saw_comment {
+        return Err(XML_COMMENT_IN_VALUE_DETAIL.to_string());
     }
     Ok(text)
 }
