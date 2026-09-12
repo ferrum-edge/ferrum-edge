@@ -9387,6 +9387,28 @@ fn upstream_runtime_serialization_is_covered_by_openapi() {
 }
 
 #[test]
+fn proxy_allowed_ws_origins_description_rejects_star_wildcard() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let description = spec
+        .pointer("/components/schemas/Proxy/properties/allowed_ws_origins/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("allowed_ws_origins description");
+    assert!(
+        description.contains("Empty array (default) allows all origins"),
+        "OpenAPI must state empty list is allow-all: {description}"
+    );
+    assert!(
+        description.contains("`*` is not a wildcard"),
+        "OpenAPI must state star is not a wildcard: {description}"
+    );
+    assert!(
+        description.contains("rejected at Admin API"),
+        "OpenAPI must state admission rejects star: {description}"
+    );
+}
+
+#[test]
 fn config_schemas_reject_nulls_that_rust_does_not_accept() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

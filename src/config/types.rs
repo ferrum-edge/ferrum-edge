@@ -40,6 +40,11 @@ pub const MAX_CUSTOM_ID_LENGTH: usize = 255;
 pub const MAX_HOST_LENGTH: usize = 253;
 /// Maximum number of host entries per proxy.
 pub const MAX_HOSTS_PER_PROXY: usize = 100;
+/// Operator-facing guidance for the CORS-style `allowed_ws_origins: ["*"]`
+/// footgun (issue #5454). Empty list is the only allow-all; entries are
+/// literal origins; `*` is not a wildcard.
+pub const ALLOWED_WS_ORIGINS_STAR_GUIDANCE: &str =
+    "empty list = allow all origins; entries are literal origins; `*` is not a wildcard";
 /// Maximum number of targets per upstream.
 pub const MAX_TARGETS_PER_UPSTREAM: usize = 1000;
 /// Maximum number of tags per upstream target.
@@ -2964,7 +2969,9 @@ pub struct Proxy {
     /// Optional list of allowed WebSocket Origin values (e.g., ["https://example.com"]).
     /// When non-empty, WebSocket upgrade requests must include an Origin header
     /// matching one of these values (case-insensitive). Empty list (default) means
-    /// no origin check — all origins are permitted. Protects against Cross-Site
+    /// no origin check — all origins are permitted. Entries are literal
+    /// `scheme://host[:port]` origins; `*` is not a wildcard and is rejected at
+    /// Admin API / `ferrum-edge validate` admission. Protects against Cross-Site
     /// WebSocket Hijacking (CSWSH) per RFC 6455 §10.2.
     #[serde(default)]
     pub allowed_ws_origins: Vec<String>,
@@ -7642,12 +7649,92 @@ impl Proxy {
         }
     }
 
+    /// Whether `raw` is a literal WebSocket Origin `scheme://host[:port]` that
+    /// the runtime matcher can normalize (`http`/`https`/`ws`/`wss`, no
+    /// userinfo, path, query, or fragment). Used at admission so configured
+    /// allow-list entries match what `websocket_origin_allowed` compares.
+    pub fn is_literal_websocket_origin(raw: &str) -> bool {
+        let Ok(parsed) = url::Url::parse(raw) else {
+            return false;
+        };
+        if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+            return false;
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return false;
+        }
+        match parsed.scheme() {
+            "http" | "https" | "ws" | "wss" => parsed.host_str().is_some(),
+            _ => false,
+        }
+    }
+
+    /// Admission-only errors for `allowed_ws_origins` beyond empty-string
+    /// checks: CORS-style `"*"` and entries that are not a literal origin.
+    ///
+    /// Load paths (file/database/CP/DP `validate_all_fields`) must not treat
+    /// these as rejecting errors — existing rows keep loading with a warning
+    /// from [`Self::warn_legacy_allowed_ws_origins`].
+    pub fn allowed_ws_origins_admission_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
+            if origin.trim().is_empty() {
+                continue;
+            }
+            if origin.trim() == "*" {
+                errors.push(format!(
+                    "allowed_ws_origins[{}] is '*': {}",
+                    i, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+                ));
+            } else if !Self::is_literal_websocket_origin(origin) {
+                errors.push(format!(
+                    "allowed_ws_origins[{}] must be a literal origin \
+                     (scheme://host[:port]); {}",
+                    i, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+                ));
+            }
+        }
+        errors
+    }
+
+    /// Warn once when a loaded proxy still carries the CORS-style `"*"`
+    /// footgun or a non-origin `allowed_ws_origins` entry. Never fails the load.
+    pub fn warn_legacy_allowed_ws_origins(&self) {
+        let has_legacy_entry = self.allowed_ws_origins.iter().any(|origin| {
+            let trimmed = origin.trim();
+            !trimmed.is_empty() && (trimmed == "*" || !Self::is_literal_websocket_origin(origin))
+        });
+        if !has_legacy_entry {
+            return;
+        }
+        tracing::warn!(
+            proxy = %self.id,
+            namespace = %self.namespace,
+            "Proxy '{}' allowed_ws_origins contains '*' or a non-origin entry; {}; \
+             existing config is still loaded. Admin API writes and `ferrum-edge validate` \
+             reject this value.",
+            self.id,
+            ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+        );
+    }
+
     /// Validate all fields of a proxy for correctness and safe lengths.
     ///
     /// This validates field values only — uniqueness checks (listen_path conflicts,
     /// name uniqueness, upstream_id existence) are done separately in the admin handlers.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
-        self.validate_fields_inner(None, crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS)
+        let mut errors = match self
+            .validate_fields_inner(None, crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS)
+        {
+            Ok(()) => Vec::new(),
+            Err(errors) => errors,
+        };
+        errors.extend(self.allowed_ws_origins_admission_errors());
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     /// Validate fields with a shared cache of already-validated TLS file paths.
@@ -8234,7 +8321,11 @@ impl Proxy {
             }
         }
 
-        // Allowed WebSocket origins validation
+        // Allowed WebSocket origins validation. Empty strings are a hard
+        // error on every path. CORS-style `"*"` and non-origin entries are
+        // admission-only (`validate_fields` / Admin / `ferrum-edge validate`);
+        // load snapshots warn via `warn_legacy_allowed_ws_origins` instead of
+        // failing startup.
         for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
             if origin.trim().is_empty() {
                 errors.push(format!("allowed_ws_origins[{}] must not be empty", i));
@@ -10218,6 +10309,19 @@ impl ServiceDiscoveryConfig {
 }
 
 impl GatewayConfig {
+    /// Admission-only `allowed_ws_origins` errors across every proxy (`*` and
+    /// non-origin entries). Load snapshots must not use this as a rejecting
+    /// gate; they warn via [`Proxy::warn_legacy_allowed_ws_origins`] instead.
+    pub fn allowed_ws_origins_admission_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for proxy in &self.proxies {
+            for e in proxy.allowed_ws_origins_admission_errors() {
+                errors.push(format!("Proxy '{}': {}", proxy.id, e));
+            }
+        }
+        errors
+    }
+
     /// Validate all field-level constraints across every resource in the config.
     ///
     /// This validates individual field values (lengths, ranges, formats) — not
@@ -10282,6 +10386,10 @@ impl GatewayConfig {
                     errors.push(format!("Proxy '{}': {}", proxy.id, e));
                 }
             }
+            // Grandfather existing `"*"` / non-origin rows: never fail a
+            // file/database/CP/DP load for this (issue #5454). Admission
+            // rejects the same values through `validate_fields`.
+            proxy.warn_legacy_allowed_ws_origins();
         }
         for consumer in &self.consumers {
             if let Err(errs) = consumer.validate_fields() {

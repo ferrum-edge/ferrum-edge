@@ -9383,6 +9383,10 @@ async fn handle_restore(
             }
         }
     }
+    // Restore is an operator write, so reject CORS-style `"*"` / non-origin
+    // `allowed_ws_origins` the same way `POST /proxies` does. Load snapshots
+    // warn instead of failing (issue #5454).
+    validation_errors.extend(candidate.allowed_ws_origins_admission_errors());
     if candidate
         .plugin_configs
         .iter()

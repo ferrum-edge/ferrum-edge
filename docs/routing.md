@@ -354,7 +354,12 @@ HTTP/3 Extended CONNECT — must carry an `Origin` header that matches one of th
 values (case-insensitive; default ports normalized). Missing or disallowed origins
 receive **403 Forbidden** with body `{"error":"WebSocket Origin not allowed"}` before
 backend dispatch. When `allowed_ws_origins` is **empty** (the default), no Origin check
-runs and any browser origin may upgrade.
+runs and any browser origin may upgrade. Entries are literal origins of the form
+`scheme://host[:port]`. `*` is **not** a wildcard: Admin API create/update (POST/PUT/PATCH
+proxies, batch, restore) and `ferrum-edge validate` reject it with a validation error that
+states empty list = allow all origins. Existing file/database/CP rows that still contain
+`*` keep loading and emit one warning per proxy; they do **not** allow all origins at
+runtime.
 
 Operators who configure a strict `cors` allowlist on a proxy that also serves WebSocket
 traffic should set `allowed_ws_origins` to the same origin set. The gateway logs a

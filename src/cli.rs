@@ -960,6 +960,16 @@ pub fn execute_validate() -> Result<(), String> {
         crate::fips::policy::check_gateway_config(&config)
             .map_err(|e| format!("FIPS policy validation failed: {e}"))?;
 
+        // File-mode run still loads existing `"*"` rows (warn-only). Validate
+        // is the operator admission gate and must reject the CORS footgun.
+        let ws_origin_errors = config.allowed_ws_origins_admission_errors();
+        if !ws_origin_errors.is_empty() {
+            return Err(format!(
+                "Spec validation failed: {}",
+                ws_origin_errors.join("; ")
+            ));
+        }
+
         // Validate stream proxy port conflicts
         let reserved_ports = env_config.reserved_gateway_ports();
         if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {

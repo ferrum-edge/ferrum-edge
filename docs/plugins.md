@@ -4411,7 +4411,8 @@ see the [complete example](cors_plugin.md#example-3-per-proxy-cors).
 
 **WebSocket upgrades:** CORS does not govern WebSocket handshake `Origin` checks.
 Configure per-proxy `allowed_ws_origins` for Cross-Site WebSocket Hijacking (CSWSH)
-protection. See [cors_plugin.md](cors_plugin.md#websocket-upgrades-and-cswsh) and
+protection. Empty list allows every origin; `*` is not a wildcard and is rejected at
+admission. See [cors_plugin.md](cors_plugin.md#websocket-upgrades-and-cswsh) and
 [routing.md](routing.md#websocket-origin-admission).
 
 See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshooting.
