@@ -18,6 +18,17 @@ Companion documents:
 > tag; latest at time of writing: **v0.9.4**). Read
 > [support_policy.md](support_policy.md) before treating any item here as a
 > stability commitment.
+>
+> **Feature availability by release.** Resource labels (`labels` /
+> `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig) landed on
+> `main` in [#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483) on
+> 2026-09-12. Published releases through **v0.9.4** reject the field with
+> `unknown field \`labels\``. Pin a build from `main` after that merge or the
+> next tagged release. Companion clients that inject `labels.provisioned-by`
+> require matching gateway builds: Git Forge Ops ≥
+> [#218](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/pull/218),
+> Nexus ≥ [#245](https://github.com/ferrum-edge/ferrum-nexus/pull/245), Foundry
+> ≥ [#340](https://github.com/ferrum-edge/ferrum-foundry/pull/340).
 
 ## 1. Admin plane
 

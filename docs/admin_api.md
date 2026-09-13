@@ -2266,6 +2266,12 @@ map of strings, for example:
 {"labels": {"provisioned-by": "ferrum-nexus", "team": "platform"}}
 ```
 
+**Availability.** Resource labels landed on `main` in
+[#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483) on 2026-09-12.
+Every published release up to and including **v0.9.4** rejects the `labels`
+field with `unknown field \`labels\``. Operators and clients need a build from
+`main` after that merge, or the next tagged release.
+
 Labels appear on GET/list, backup/restore, file configuration, and CP/DP
 configuration, and survive namespace renames. Empty maps are omitted from
 responses. A resource PUT without

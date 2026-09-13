@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Resource labels on Proxy, Consumer, Upstream, and PluginConfig**
+  (issue #5493, pull request #5483). Bounded `labels` maps (including
+  `provisioned-by`) persist through the Admin API, file configuration, CP/DP
+  sync, backup/restore, and namespace rename. The field landed on `main` on
+  2026-09-12; published releases through **v0.9.4** reject it with
+  `unknown field \`labels\``. Operators and companion clients that inject
+  `labels.provisioned-by` (Git Forge Ops ≥ #218, Nexus ≥ #245, Foundry ≥ #340)
+  need a build from `main` after that merge or the next tagged release.
+
 ### Fixed
 
 - Chargeback counts explicitly zero-priced call tiers and rejects duplicate
