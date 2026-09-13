@@ -8960,6 +8960,10 @@ components:
         retained in GET/list, backup/restore, file configuration and CP/DP sync.
         The provisioned-by label identifies the application that provisioned a
         resource; it is caller-supplied information, not proof of ownership.
+        Resource labels landed on main in pull request 5483 on 2026-09-12, and
+        every published release through v0.9.4 rejects the `labels` field with
+        unknown field `labels`, so operators and clients need a build from main
+        after that merge or the next tagged release.
       examples:
         - provisioned-by: ferrum-nexus
           team: platform

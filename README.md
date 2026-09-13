@@ -93,6 +93,8 @@ Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/relea
 
 Pin an explicit release tag in download URLs. Production artifacts are published only for version tags; merging main no longer refreshes a moving `latest` build. GitHub's `/releases/latest` endpoint skips prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and pin deployments to that version.
 
+Feature availability by release: resource labels (`labels` / `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig) landed on `main` in [#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483) on 2026-09-12. Published artifacts through **v0.9.4** reject `labels` with `unknown field \`labels\``. Use a build from `main` after that merge or the next tagged release. Companion clients that inject `labels.provisioned-by` require matching gateway builds: Git Forge Ops ≥ [#218](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/pull/218), Nexus ≥ [#245](https://github.com/ferrum-edge/ferrum-nexus/pull/245), and Foundry ≥ [#340](https://github.com/ferrum-edge/ferrum-foundry/pull/340).
+
 ```bash
 # Example: Linux x86_64
 set -euo pipefail
