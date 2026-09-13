@@ -7660,12 +7660,6 @@ impl Proxy {
     /// userinfo, path, query, or fragment). Used at admission so configured
     /// allow-list entries match what `websocket_origin_allowed` compares.
     pub fn is_literal_websocket_origin(raw: &str) -> bool {
-        // RFC 6454 opaque origin: browsers send `Origin: null` for sandboxed
-        // frames and `data:`/`file:` documents; the runtime matcher compares it
-        // literally, so it stays admissible.
-        if raw.trim().eq_ignore_ascii_case("null") {
-            return true;
-        }
         let Ok(parsed) = url::Url::parse(raw) else {
             return false;
         };

@@ -805,10 +805,10 @@ fn websocket_origin_preserves_non_default_ports() {
 }
 
 #[test]
-fn websocket_origin_falls_back_to_exact_match_for_unparseable_values() {
+fn websocket_origin_rejects_opaque_null_from_legacy_allowlist() {
     let allowed = vec!["null".to_string()];
 
-    assert!(websocket_origin_allowed(&allowed, "NULL"));
+    assert!(!websocket_origin_allowed(&allowed, "NULL"));
     assert!(!websocket_origin_allowed(&allowed, "https://null"));
 }
 
