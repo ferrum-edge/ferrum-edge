@@ -1176,7 +1176,13 @@ async fn load_http_document(
             "external $ref HTTP fetch timed out",
         )
         .await?
-        .map_err(|_| external_ref_error("external $ref HTTP fetch failed"))?;
+        .map_err(|error| {
+            map_external_ref_reqwest_error(
+                error,
+                "external $ref HTTP fetch timed out",
+                "external $ref HTTP fetch failed",
+            )
+        })?;
 
         if response.status().is_redirection() {
             if redirect_count >= policy.max_redirects {
@@ -1233,7 +1239,13 @@ async fn load_http_document(
                 "external $ref HTTP body read timed out",
             )
             .await?
-            .map_err(|_| external_ref_error("external $ref HTTP body read failed"))?;
+            .map_err(|error| {
+                map_external_ref_reqwest_error(
+                    error,
+                    "external $ref HTTP body read timed out",
+                    "external $ref HTTP body read failed",
+                )
+            })?;
             let Some(chunk) = chunk else {
                 break;
             };
@@ -1283,6 +1295,40 @@ where
     tokio::time::timeout(remaining, future)
         .await
         .map_err(|_| external_ref_error(timeout_message))
+}
+
+/// Classify a reqwest I/O failure without forwarding inner error text.
+///
+/// The per-request client timeout and `timeout_external_ref` share the same
+/// hop deadline. When reqwest wins the race, `is_timeout()` (including the
+/// `source()` chain) must keep the same sanitized timeout diagnostic the outer
+/// wrapper would have produced.
+fn map_external_ref_reqwest_error(
+    error: reqwest::Error,
+    timeout_message: &'static str,
+    failed_message: &'static str,
+) -> ExtractError {
+    if reqwest_error_is_timeout(&error) {
+        external_ref_error(timeout_message)
+    } else {
+        external_ref_error(failed_message)
+    }
+}
+
+fn reqwest_error_is_timeout(error: &reqwest::Error) -> bool {
+    if error.is_timeout() {
+        return true;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(err) = source {
+        if let Some(inner) = err.downcast_ref::<reqwest::Error>()
+            && inner.is_timeout()
+        {
+            return true;
+        }
+        source = std::error::Error::source(err);
+    }
+    false
 }
 
 fn remaining_budget(deadline: Instant) -> Result<Duration, ExtractError> {

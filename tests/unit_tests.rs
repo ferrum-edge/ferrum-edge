@@ -18,4 +18,12 @@
 mod isolated_audit_fallback;
 pub use isolated_audit_fallback::isolated_audit_fallback_dir;
 
+#[allow(dead_code)]
+#[path = "scaffolding/port_registry.rs"]
+pub(crate) mod port_registry;
+
+mod scaffolding {
+    pub(crate) use super::port_registry;
+}
+
 mod unit;
