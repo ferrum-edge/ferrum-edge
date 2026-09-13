@@ -3219,6 +3219,14 @@ pub fn websocket_origin_allowed(allowed_origins: &[String], origin: &str) -> boo
 }
 
 fn websocket_origin_matches(allowed: &str, origin: &str) -> bool {
+    // Opaque origins from unrelated sandboxed and local documents all serialize
+    // as `null`, so treating it as a trusted literal would defeat CSWSH isolation.
+    // Keep this runtime guard for configurations loaded through legacy paths that
+    // warn instead of applying admission validation.
+    if allowed.trim().eq_ignore_ascii_case("null") {
+        return false;
+    }
+
     if allowed.eq_ignore_ascii_case(origin) {
         return true;
     }

@@ -2367,9 +2367,20 @@ fn test_proxy_allowed_ws_origins_accepts_http_ws_and_ports() {
         "http://localhost:8080".into(),
         "wss://app.example.com".into(),
         "https://[::1]".into(),
-        "null".into(),
     ];
     assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_allowed_ws_origins_rejects_opaque_null_origin() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.allowed_ws_origins = vec![" NULL ".into()];
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| { e.contains("allowed_ws_origins[0]") && e.contains("scheme://host[:port]") }),
+        "opaque null origins must be rejected: {errs:?}"
+    );
 }
 
 #[test]
