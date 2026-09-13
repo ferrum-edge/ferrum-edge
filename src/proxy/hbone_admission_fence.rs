@@ -445,7 +445,9 @@ impl HboneAdmissionFence {
             // dev/test-profile net; under `abort` the process is gone and no
             // tunnel is left silently unfenced either way.
             let reevaluate = self.reevaluate(&tunnel.inner.snapshot, &epoch, &policy);
-            let outcome = std::panic::AssertUnwindSafe(reevaluate).catch_unwind().await;
+            let outcome = std::panic::AssertUnwindSafe(reevaluate)
+                .catch_unwind()
+                .await;
             let reason = match outcome {
                 Ok(reason) => reason,
                 Err(_) => {

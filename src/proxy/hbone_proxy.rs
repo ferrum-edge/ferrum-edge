@@ -1124,12 +1124,13 @@ pub(super) async fn handle_hbone_request(
                 // from a flag a sweep could flip inside this window: a genuine
                 // backend reset racing a revocation must still count as a relay
                 // failure, and a revocation must never count as one.
-                let revoked_by_fence = result
-                    .first_failure
-                    .as_ref()
-                    .is_some_and(|(_, _, _, message)| {
-                        message.as_str() == HBONE_ADMISSION_REVOKED_MESSAGE
-                    });
+                let revoked_by_fence =
+                    result
+                        .first_failure
+                        .as_ref()
+                        .is_some_and(|(_, _, _, message)| {
+                            message.as_str() == HBONE_ADMISSION_REVOKED_MESSAGE
+                        });
                 if let Some((direction, class, side, message)) = result.first_failure.as_ref() {
                     if revoked_by_fence {
                         // Policy termination, already counted by the fence
