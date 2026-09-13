@@ -40,7 +40,17 @@ This project and everyone participating in it is governed by our [Code of Conduc
 
 - **Rust** toolchain (stable 1.85+)
 - **protoc** (Protocol Buffers compiler) - required for gRPC code generation
+- **cmake** and **curl development headers** — required to compile librdkafka from
+  source (`rdkafka` `cmake-build` + vendored TLS for `kafka_logging`). A missing
+  `curl/curl.h` still fails the native build even when cmake is passed `-DWITH_CURL=0`.
+  The bootstrap script below installs these (`cmake` plus `libcurl4-openssl-dev` on
+  Debian/Ubuntu, `libcurl-devel` on Fedora/RHEL, and Homebrew `curl` on macOS).
 - **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB for testing database mode
+
+A full-debuginfo `codegen-units=1` `dev` build can OOM rustc on a 15 GiB host with no
+swap. If the compiler is killed for memory, retry with `CARGO_PROFILE_DEV_DEBUG=0`
+and more codegen units (for example `CARGO_PROFILE_DEV_CODEGEN_UNITS=16`). That is
+host sizing, not a missing bootstrap package; do not change `[profile.dev]` for it.
 
 ### One-time local bootstrap
 
@@ -54,11 +64,13 @@ fallback below. From the cloned repository, run the bootstrap once per workstati
 ```
 
 The [script](scripts/install-build-deps.sh) supports macOS with Homebrew already installed
-and apt-based Linux with `sudo` access and Rust/Cargo on PATH. On macOS it installs
-`sccache` and `lld` via Homebrew; on Linux it installs `mold` and `clang` via apt, then
-`sccache` via `cargo install --locked` if missing. It does not install Rust, `protoc`, or
-all native build dependencies. It detects the OS, not the architecture; package availability
-depends on the host's repositories. It does not set up cross-compilation toolchains.
+and apt- or dnf-based Linux with `sudo` access and Rust/Cargo on PATH. On macOS it
+installs `sccache`, `lld`, `cmake`, and `curl` via Homebrew; on Debian/Ubuntu it
+installs `mold`, `clang`, `cmake`, and `libcurl4-openssl-dev` via apt; on Fedora/RHEL
+it installs `mold`, `clang`, `cmake`, and `libcurl-devel` via dnf. Linux then installs
+`sccache` via `cargo install --locked` if missing. It does not install Rust or `protoc`.
+It detects the OS, not the architecture; package availability depends on the host's
+repositories. It does not set up cross-compilation toolchains.
 
 On other Linux distributions, install the same tools through your distribution's package
 manager or use the fallback. The script rejects other operating systems, including Windows.
@@ -66,9 +78,12 @@ Windows keeps its system linker (`link.exe` for MSVC), but still needs `sccache`
 manually or the wrapper disabled. Targets outside the four triples above have no fast-linker
 override in the checked-in configuration.
 
-CI installs these tools through separate setup actions. Missing tools locally cause a build
-failure; there is no automatic local fallback. To relocate the compiler cache, set
-`SCCACHE_DIR` in your shell profile.
+CI installs the linker/cache tools through separate setup actions. GitHub-hosted Ubuntu
+images already include `cmake`; Linux CI jobs and `setup-rust-ci` install
+`libcurl4-openssl-dev`. The Docker builder and `Dockerfile.test` install `cmake`;
+ARM64 Cross `pre-build` installs both `cmake` and `libcurl4-openssl-dev`. Missing tools
+locally cause a build failure; there is no automatic local fallback. To relocate the
+compiler cache, set `SCCACHE_DIR` in your shell profile.
 
 #### Build without sccache or fast linkers
 
