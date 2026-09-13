@@ -2661,8 +2661,9 @@ requirements or explicit wrapper/system-linker fallback.
 
 ```bash
 # Build binaries manually with the same release features as CI. Install protoc
-# for every host first. Linux hosts also need libcurl4-openssl-dev, Windows
-# MSVC builds need NASM in PATH. For Linux ARM64, install the pinned Cross 0.2.5
+# for every host first. Linux hosts also need cmake and libcurl4-openssl-dev
+# (or libcurl-devel on Fedora/RHEL) so rdkafka-sys can compile librdkafka;
+# Windows MSVC builds need NASM in PATH. For Linux ARM64, install the pinned Cross 0.2.5
 # binary and copy the exact `env -i` invocation from build-release-arm64-cross;
 # do not substitute an unpinned `cargo install cross` or inherited environment.
 # On a Linux host:
@@ -3240,7 +3241,7 @@ git show v0.2.0
 3. Expand job logs for details
 
 **Common Issues**:
-- Build prerequisites: CI installs `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows
+- Build prerequisites: CI installs `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows. Hosted Ubuntu already provides `cmake`; the Docker builder, `Dockerfile.test`, FIPS compile jobs, and ARM64 Cross `pre-build` also install `cmake` (Cross additionally installs `libcurl4-openssl-dev`). Local workstations get both from `scripts/install-build-deps.sh`.
 - Missing dependencies: Check `Cargo.toml` and the release Build Process prerequisites above
 - Rust version: Workflows use `stable` Rust toolchain
 

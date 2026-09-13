@@ -698,7 +698,7 @@ Build-matrix review for this feature:
 | --- | --- |
 | GNU x86_64 sysroot | The pinned AlmaLinux producer installs Perl, make, GCC, and CMake already; OpenSSL comes from the locked source crate. |
 | ARM64 Cross | `Cross.toml` already supplies Perl/make and the target C compiler/archiver. `rdkafka-sys` registers the OpenSSL dependency with CMake, which consumes the target build's root. No Cross command, image, or passthrough change is needed. |
-| Native macOS / Linux | Vendored OpenSSL needs Perl, make, and a C compiler, available in the existing native build environments. |
+| Native macOS / Linux | Vendored OpenSSL needs Perl, make, and a C compiler, available in the existing native build environments. `rdkafka-sys` also needs `cmake` and curl development headers (`libcurl4-openssl-dev` / `libcurl-devel` / Homebrew `curl`); `scripts/install-build-deps.sh` installs those on apt, dnf, and Homebrew hosts. |
 | Windows MSVC | Vendored OpenSSL uses Perl and nmake; the [hosted Windows image](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md) supplies Perl and Visual Studio, and the producers already install NASM. Keep the Windows build in the merge-group/release matrix. |
 | Docker | The Rust builder includes the native toolchain; only static OpenSSL code goes into the distroless runtime. |
 | musl | The locked `openssl-src` supports x86_64/aarch64 musl target configuration. Ferrum currently publishes GNU Linux binaries, not musl gateway binaries; a musl feature-graph resolve is not a claim of a tested release target. |
