@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use super::hbone_admission_fence::{
     HBONE_ADMISSION_REVOKED_MESSAGE, HboneAdmissionSnapshot, HboneRelayDestinationGate,
+    HboneRevocationReason,
 };
 use super::{
     ClientRequestBody, LoadBalancerConnectionGuard, ProxyBody, ProxyState, backend_dispatch,
@@ -569,6 +570,22 @@ fn node_waypoint_inbound_relay_mark_enabled() -> bool {
     })
 }
 
+/// What the request path resolved the admitting plugin view with, plus the
+/// admission fence's sweep counter as captured BEFORE that resolution (issue
+/// #5042 step 1).
+///
+/// The authorize chain is protocol-scoped and the protocol is peer-selectable
+/// (`content-type: application/grpc` on the CONNECT classifies as gRPC), so a
+/// sweep must re-resolve the SAME view rather than assume plain HTTP. The
+/// counter is what turns a publication that raced this admission into a fresh
+/// sweep; see [`super::hbone_admission_fence::HboneAdmissionFence::admit`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HboneAdmissionView {
+    pub(super) request_protocol: crate::plugins::ProxyProtocol,
+    pub(super) grpc_web_request: bool,
+    pub(super) sweep_epoch: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_hbone_request(
     state: &ProxyState,
@@ -582,6 +599,7 @@ pub(super) async fn handle_hbone_request(
     start_time: Instant,
     method: &str,
     plugin_execution_ns: u64,
+    admission_view: HboneAdmissionView,
 ) -> Response<ProxyBody> {
     // Apply route overrides set by `before_proxy` plugins (e.g.,
     // `mesh_route_dispatch` from a VirtualService header/method match). The
@@ -1034,7 +1052,15 @@ pub(super) async fn handle_hbone_request(
         } else {
             HboneRelayDestinationGate::Configured
         },
+        // The address `connect_backend` actually dialled, so a sweep can
+        // re-apply its post-DNS loopback screen.
+        resolved_ip: backend_resolved_ip
+            .as_deref()
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok()),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
+        request_protocol: admission_view.request_protocol,
+        grpc_web_request: admission_view.grpc_web_request,
+        admission_sweep_epoch: admission_view.sweep_epoch,
     });
     let relay_proxy = proxy.clone();
     let relay_method = method.to_string();
@@ -1081,6 +1107,11 @@ pub(super) async fn handle_hbone_request(
                     )),
                 )
                 .await;
+                // The relay is over: deregister before the transaction summary
+                // and the operator logging chain (an unbounded await over
+                // logging plugins) so a sweep in that window neither re-judges
+                // nor counts a tunnel that is no longer carrying bytes.
+                tunnel.retire();
                 bytes_sent_observed.fetch_add(result.bytes_client_to_backend, Ordering::Release);
                 adaptive_buffer.record_connection(
                     &relay_proxy.namespace,
@@ -1089,14 +1120,26 @@ pub(super) async fn handle_hbone_request(
                         .bytes_client_to_backend
                         .saturating_add(result.bytes_backend_to_client),
                 );
-                let revoked_reason = tunnel.revoked_reason();
+                // Classify from the failure the relay actually recorded, not
+                // from a flag a sweep could flip inside this window: a genuine
+                // backend reset racing a revocation must still count as a relay
+                // failure, and a revocation must never count as one.
+                let revoked_by_fence = result
+                    .first_failure
+                    .as_ref()
+                    .is_some_and(|(_, _, _, message)| {
+                        message.as_str() == HBONE_ADMISSION_REVOKED_MESSAGE
+                    });
                 if let Some((direction, class, side, message)) = result.first_failure.as_ref() {
-                    if let Some(reason) = revoked_reason {
+                    if revoked_by_fence {
                         // Policy termination, already counted by the fence
                         // sweep; not a transport relay failure.
                         info!(
                             proxy_id = %relay_proxy.id,
-                            reason = reason.as_str(),
+                            reason = tunnel
+                                .revoked_reason()
+                                .map(HboneRevocationReason::as_str)
+                                .unwrap_or("unknown"),
                             bytes_client_to_backend = result.bytes_client_to_backend,
                             bytes_backend_to_client = result.bytes_backend_to_client,
                             "HBONE tunnel closed: admission revoked"
@@ -1115,17 +1158,16 @@ pub(super) async fn handle_hbone_request(
                         );
                     }
                 }
-                let (body_completed, client_disconnected, body_error_class) =
-                    if revoked_reason.is_some() {
-                        // Neither endpoint disconnected: the fence cut the tunnel.
-                        (
-                            false,
-                            false,
-                            result.first_failure.as_ref().map(|(_, class, _, _)| *class),
-                        )
-                    } else {
-                        hbone_relay_body_outcome(result.first_failure.as_ref())
-                    };
+                let (body_completed, client_disconnected, body_error_class) = if revoked_by_fence {
+                    // Neither endpoint disconnected: the fence cut the tunnel.
+                    (
+                        false,
+                        false,
+                        result.first_failure.as_ref().map(|(_, class, _, _)| *class),
+                    )
+                } else {
+                    hbone_relay_body_outcome(result.first_failure.as_ref())
+                };
                 let summary = build_hbone_relay_summary(
                     &relay_proxy,
                     relay_ctx,
@@ -1153,6 +1195,10 @@ pub(super) async fn handle_hbone_request(
                 crate::plugins::log_with_mirror(&relay_plugins, &summary, relay_ctx).await;
             }
             Err(err) => {
+                // The tunnel was registered before the upgrade handshake, so a
+                // peer that vanishes here would otherwise leave a sweepable
+                // entry with no relay behind it.
+                tunnel.retire();
                 let error_class = retry::classify_boxed_error(&err);
                 warn!(
                     proxy_id = %relay_proxy.id,
@@ -1237,6 +1283,7 @@ pub(super) async fn handle_hbone_udp_request(
     start_time: Instant,
     method: &str,
     plugin_execution_ns: u64,
+    admission_view: HboneAdmissionView,
 ) -> Response<ProxyBody> {
     let proxy_arc = ctx
         .apply_route_overrides_with_upstreams(Arc::clone(proxy), epoch.load_balancer.upstreams());
@@ -1703,7 +1750,15 @@ pub(super) async fn handle_hbone_udp_request(
         has_verified_peer_certificate: ctx.tls_client_cert_der.is_some(),
         mesh_inbound_pre_handshake_app_port,
         destination_gate: HboneRelayDestinationGate::Datagram,
+        // The local socket's dialled peer. The datagram gate re-checks the
+        // terminator-owned / external-UDP destination by authority, so nothing
+        // consumes this today; it is captured for parity with the byte-stream
+        // relay rather than left silently absent.
+        resolved_ip: Some(dest_addr.ip()),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
+        request_protocol: admission_view.request_protocol,
+        grpc_web_request: admission_view.grpc_web_request,
+        admission_sweep_epoch: admission_view.sweep_epoch,
     });
     let relay_proxy = proxy.clone();
     let relay_plugins: Vec<Arc<dyn Plugin>> = plugins.to_vec();
@@ -1725,6 +1780,10 @@ pub(super) async fn handle_hbone_udp_request(
                 let io = TokioIo::new(upgraded);
                 let (bytes_to_app, bytes_to_tunnel) =
                     relay_hbone_udp(io, socket, idle, tunnel.revocation_token()).await;
+                // Deregister before the summary and the logging chain; the
+                // reason a sweep already recorded stays readable (the fence
+                // records it before cancelling), so classification is unchanged.
+                tunnel.retire();
                 let revoked_reason = tunnel.revoked_reason();
                 if let Some(reason) = revoked_reason {
                     info!(
@@ -1770,6 +1829,9 @@ pub(super) async fn handle_hbone_udp_request(
                 crate::plugins::log_with_mirror(&relay_plugins, &summary, relay_ctx).await;
             }
             Err(err) => {
+                // Registered before the upgrade handshake: a peer that vanishes
+                // here must not leave a sweepable entry with no relay behind it.
+                tunnel.retire();
                 let error_class = retry::classify_boxed_error(&err);
                 warn!(proxy_id = %relay_proxy_id, error = %err, "HBONE UDP client upgrade failed");
                 // Derive client_disconnected from the error class rather than
@@ -2013,8 +2075,11 @@ const HBONE_UDP_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 /// byte-stream relay (codex r5 P2).
 ///
 /// `revocation` is the admission fence's cancellation handle (issue #5042 step
-/// 1): when it fires the relay ends exactly like an idle expiry, half-closing
-/// the tunnel write half.
+/// 1): it is a fourth arm of the same `select!` as the two pumps and the idle
+/// watchdog, so when it fires the surviving pumps are DROPPED and the tunnel
+/// ends by dropping `Upgraded` — no `shutdown()` is sent, because only the
+/// `from_app` pump running to completion reaches that call. The peer observes
+/// the same end-of-stream it would from an idle expiry.
 async fn relay_hbone_udp<S>(
     tunnel: S,
     socket: tokio::net::UdpSocket,

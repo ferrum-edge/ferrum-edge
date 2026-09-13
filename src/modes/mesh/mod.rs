@@ -15505,15 +15505,16 @@ async fn arm_mesh_runtime_startup(
     proxy_state
         .mesh_inbound_tls
         .store(Arc::new(frontend_tls.clone()));
-    proxy_state
-        .mesh_inbound_tls_policy
-        .store(Arc::new(crate::proxy::MeshInboundTlsPolicy {
-            default: frontend_tls.clone(),
-            by_port: frontend_tls_by_port,
-            default_mode: effective_inbound_mtls_mode,
-            modes_by_port: effective_inbound_mtls_modes_by_port,
-            app_port_by_orig_dst_port: inbound_app_port_by_orig_dst_port,
-        }));
+    // Startup publication goes through the same publisher as every reload, so
+    // the slot has exactly one writer path (issue #5042 step 1). No tunnel can
+    // exist yet, so the scheduled sweep short-circuits on an empty registry.
+    proxy_state.publish_mesh_inbound_tls_policy(crate::proxy::MeshInboundTlsPolicy {
+        default: frontend_tls.clone(),
+        by_port: frontend_tls_by_port,
+        default_mode: effective_inbound_mtls_mode,
+        modes_by_port: effective_inbound_mtls_modes_by_port,
+        app_port_by_orig_dst_port: inbound_app_port_by_orig_dst_port,
+    });
     proxy_state.mesh_inbound_spiffe_verifier_active.store(
         mesh_inbound_spiffe_verifier_active(
             has_inbound_tls_termination_listener,
@@ -19046,20 +19047,12 @@ fn effective_node_waypoint_dtls_peer_auth_mode(
 }
 
 fn publish_mesh_inbound_app_port_aliases(proxy_state: &ProxyState, slice: &MeshSlice) {
+    // Goes through the `ProxyState` publisher, never a raw
+    // `mesh_inbound_tls_policy.store()`: that keeps the read-modify-write a CAS
+    // against a concurrent PeerAuthentication swap and keeps the HBONE
+    // admission-fence sweep attached to every writer of the slot.
     let aliases = resolve_inbound_app_ports_by_orig_dst_port(Some(slice));
-    let current = proxy_state.mesh_inbound_tls_policy.load_full();
-    if current.app_port_by_orig_dst_port == aliases {
-        return;
-    }
-    proxy_state
-        .mesh_inbound_tls_policy
-        .store(Arc::new(crate::proxy::MeshInboundTlsPolicy {
-            default: current.default.clone(),
-            by_port: current.by_port.clone(),
-            default_mode: current.default_mode,
-            modes_by_port: current.modes_by_port.clone(),
-            app_port_by_orig_dst_port: aliases,
-        }));
+    proxy_state.publish_mesh_inbound_app_port_aliases(aliases);
 }
 
 /// Reconcile the SPIFFE federation pollers against the latest accepted mesh

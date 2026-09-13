@@ -2760,6 +2760,15 @@ impl Plugin for MeshAuthz {
         ALL_PROTOCOLS
     }
 
+    /// The local ALLOW/DENY/AUDIT tiers are a pure evaluation of the request
+    /// context against the published slice, so the HBONE admission fence may
+    /// re-run them against a live tunnel. The one side-effecting arm —
+    /// `action: CUSTOM` external delegation — is skipped on a re-evaluation;
+    /// see [`MESH_AUTHZ_REEVALUATION_METADATA_KEY`].
+    fn reevaluates_live_admission(&self) -> bool {
+        true
+    }
+
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         // Istio parity: `AuthorizationPolicy` is an INBOUND contract, so the
         // outbound capture leg is not judged at all (issue #4158). This is the

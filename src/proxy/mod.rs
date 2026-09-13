@@ -8782,6 +8782,40 @@ impl ProxyState {
         self.hbone_admission_fence.request_sweep();
     }
 
+    /// Republish only the captured-listener-port → application-port alias table,
+    /// carrying every other field of the live snapshot forward.
+    ///
+    /// A read-modify-write is NOT a store: this uses `ArcSwap::rcu` so a
+    /// concurrent [`Self::publish_mesh_inbound_tls_policy`] cannot be clobbered
+    /// by a snapshot taken before it landed, and it schedules the same
+    /// admission-fence sweep so the one-publication rule holds for every writer
+    /// of the slot (issue #5042 step 1). Returns whether the table changed;
+    /// an unchanged table republishes nothing and schedules no sweep.
+    pub fn publish_mesh_inbound_app_port_aliases(
+        &self,
+        aliases: std::collections::BTreeMap<u16, u16>,
+    ) -> bool {
+        let mut changed = false;
+        self.mesh_inbound_tls_policy.rcu(|current| {
+            if current.app_port_by_orig_dst_port == aliases {
+                changed = false;
+                return Arc::clone(current);
+            }
+            changed = true;
+            Arc::new(MeshInboundTlsPolicy {
+                default: current.default.clone(),
+                by_port: current.by_port.clone(),
+                default_mode: current.default_mode,
+                modes_by_port: current.modes_by_port.clone(),
+                app_port_by_orig_dst_port: aliases.clone(),
+            })
+        });
+        if changed {
+            self.hbone_admission_fence.request_sweep();
+        }
+        changed
+    }
+
     /// Install a freshly loaded source/CA-backed gateway SVID as the live
     /// identity and publish it into the request epoch.
     ///
@@ -30616,6 +30650,12 @@ async fn handle_proxy_request_inner(
     });
     ctx.request_authority = request_authority;
 
+    // HBONE admission-fence publish-then-recheck (issue #5042 step 1). Captured
+    // BEFORE the epoch load and before the PeerAuthentication policy read the
+    // HBONE gates perform, because both publishers bump this counter AFTER their
+    // store: a gate that read stale state necessarily captured a stale counter
+    // too, and `HboneAdmissionFence::admit` turns that into a fresh sweep.
+    let hbone_admission_sweep_epoch = state.hbone_admission_fence.sweep_epoch();
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
     ctx.config_generation = epoch.config_generation;
@@ -32263,6 +32303,11 @@ async fn handle_proxy_request_inner(
             start_time,
             &method,
             plugin_execution_ns,
+            hbone_proxy::HboneAdmissionView {
+                request_protocol,
+                grpc_web_request,
+                sweep_epoch: hbone_admission_sweep_epoch,
+            },
         )
         .await);
     }
@@ -32283,6 +32328,11 @@ async fn handle_proxy_request_inner(
             start_time,
             &method,
             plugin_execution_ns,
+            hbone_proxy::HboneAdmissionView {
+                request_protocol,
+                grpc_web_request,
+                sweep_epoch: hbone_admission_sweep_epoch,
+            },
         )
         .await);
     }
