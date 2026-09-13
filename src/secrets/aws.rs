@@ -44,6 +44,36 @@ pub async fn fetch_secret(reference: &str, key: &str) -> Result<String, String> 
     wrapper.fetch_secret(reference, key).await
 }
 
+/// Upper bound on the `source()` chain rendered into a fetch error, so a
+/// pathologically deep (or self-referential) chain cannot build an unbounded
+/// message on the startup path.
+const MAX_ERROR_CHAIN_DEPTH: usize = 8;
+
+/// Flatten an error and its `source()` chain into one operator-facing line.
+///
+/// `aws_sdk_secretsmanager`'s `SdkError` displays as a bare failure *category* —
+/// "service error", "dispatch failure", "timeout" — and keeps every actionable
+/// detail behind `source()`. A message built from `Display` alone therefore
+/// cannot tell an operator whether Secrets Manager answered
+/// `ResourceNotFoundException` or whether the request never reached the endpoint
+/// at all, and the two are equally unactionable at startup (issue #5488).
+///
+/// The chain carries transport and modeled-service diagnostics only; the secret
+/// value is never part of it, and the source reference an SDK error may echo
+/// back is removed by `registry::redact_source_reference` before this text
+/// reaches a log or `validate` output.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    for _ in 0..MAX_ERROR_CHAIN_DEPTH {
+        let Some(cause) = source else { break };
+        rendered.push_str(": ");
+        rendered.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    rendered
+}
+
 /// Shared fetch logic used by both single and batch paths.
 async fn fetch_with_client(
     client: &aws_sdk_secretsmanager::Client,
@@ -57,7 +87,13 @@ async fn fetch_with_client(
         .secret_id(secret_id)
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch {} from AWS Secrets Manager: {}", key, e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to fetch {} from AWS Secrets Manager: {}",
+                key,
+                error_chain(&e)
+            )
+        })?;
 
     // Errors name the base key and the failure class only — the secret id/ARN
     // and JSON field are the source reference and are treated as sensitive.

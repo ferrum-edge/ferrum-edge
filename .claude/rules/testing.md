@@ -89,8 +89,9 @@ The parity tables live in:
 - `tests/unit/gateway_core/shared_invariant_parity_tests.rs` — circuit-breaker
   HALF_OPEN probe release, discovery-target health pruning, RFC 9113
   protocol-NACK classification, CLI external-secret resolution, discovery
-  dial-identity dedup, the `pool_shard_amount` minimum, and SVID
-  generation-segment matching across all four pool families.
+  dial-identity dedup, the `pool_shard_amount` minimum, SVID
+  generation-segment matching across all four pool families, and pinned
+  non-ephemeral host ports across every Docker-backed test fixture.
 - `tests/unit/plugins/waf_body_charset_parity_tests.rs` — wide-charset
   (UTF-16/UTF-32) body decoding on both the request and response scan paths.
 
@@ -154,13 +155,25 @@ shares.
 - Every retry needs fresh ports and fresh temp dirs/DBs. Reusing killed SQLite can corrupt WAL.
 - Backend/echo server should hold its listener. Do not drop+rebind; pass pre-bound `TcpListener` to `start_echo_server_on()`.
 - `wait_for_health` returns `bool` or `Result`; it must not panic.
-- **Service-integration testcontainers** (`tests/service_integration/`) pin host
-  ports outside Linux `/proc/sys/net/ipv4/ip_local_port_range` and retry only
-  Docker `port is already allocated` / `address already in use` bind failures
-  with a fresh port (issue #3999; same family as #3993). Do not let Docker
-  auto-assign ephemeral host ports, and do not blanket-retry unrelated
-  container-start errors — a fixture that genuinely cannot start must still
-  fail in CI.
+- **Every testcontainer fixture** — `tests/service_integration/` and
+  `tests/secrets_functional/` alike — pins host ports outside Linux
+  `/proc/sys/net/ipv4/ip_local_port_range` through
+  `tests/service_integration/common/host_ports.rs` (the secrets fixtures include
+  that module with `#[path]`) and retries only Docker
+  `port is already allocated` / `address already in use` bind failures with a
+  fresh port (issue #3999; same family as #3993). Do not let Docker auto-assign
+  ephemeral host ports, and do not blanket-retry unrelated container-start
+  errors — a fixture that genuinely cannot start must still fail in CI.
+  `tests/unit/gateway_core/shared_invariant_parity_tests.rs` asserts this
+  structurally over both fixture modules.
+- **A fixture must prove its PUBLISHED mapping before a test asserts through
+  it** (issue #5488). A `WaitFor` log match and a `docker exec` seed both
+  observe the container from the inside; neither shows that the host port
+  reaches the service. Poll the published endpoint from the host in the fixture,
+  so an unreachable mapping fails as a fixture error instead of surfacing as a
+  provider/protocol failure inside the assertion under test. Check the exit
+  code of a seeding `exec`, too: a silently failed seed makes a
+  "resource does not exist" answer look like the behaviour under test.
 - **Readiness for a spawned gateway must be bound to THAT CHILD, not to "some process accepts this port"** (issue #2132). A reservation has to be released before the subprocess binds it, so a competing listener can take that port; the child then dies with `Address already in use` while a bare port probe keeps succeeding, and the driver reports the competitor's connection reset as a datapath failure. `functional_mesh_mode_test.rs` is the reference implementation: `wait_for_gateway_listener` polls `Child::try_wait()` before and after each probe, and a `ChildExited` outcome consumes the bounded attempt.
 - **A fixture-owned server must not bind a port already promised to a gateway.**
   `bind_fixture_listener` and all native socket fixtures use the same registry;
