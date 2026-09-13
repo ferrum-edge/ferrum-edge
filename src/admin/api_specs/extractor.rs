@@ -1092,10 +1092,10 @@ fn extract_operation_schemas(
     // The validator matches the full inbound path. Only literal prefix routes
     // contribute a mount path; exact/regex routes already describe full paths.
     // strip_listen_path affects backend forwarding, not operation matching.
-    let listen_prefix = listen_path
+    let literal_listen_prefix = listen_path
         .filter(|path| path.starts_with('/'))
-        .unwrap_or("")
-        .trim_end_matches('/');
+        .unwrap_or("");
+    let listen_prefix = literal_listen_prefix.trim_end_matches('/');
     let resolver = LocalSchemaResolver::build(root, version, document_base, externals)?;
     let root = resolver.primary_root();
     let Some(paths) = root.get("paths").and_then(Value::as_object) else {
@@ -1215,15 +1215,17 @@ fn extract_operation_schemas(
             let mut seen_templates = HashSet::new();
             for base in &effective_bases {
                 let spec_template = join_server_base_and_path(base, path_template)?;
-                // Mounting follows the server-base join rule: the Paths-key root
-                // `/` yields the listen prefix itself, never a trailing slash.
-                let (effective_template, regex_tail) =
+                // A root operation must match the literal route key. In
+                // particular, the router preserves a trailing slash on a listen
+                // path even though non-root joins normalize the slash boundary.
+                let (effective_template, regex_tail, regex_prefix) =
                     if !listen_prefix.is_empty() && spec_template == "/" {
-                        (listen_prefix.to_string(), "")
+                        (literal_listen_prefix.to_string(), "", literal_listen_prefix)
                     } else {
                         (
                             format!("{listen_prefix}{spec_template}"),
                             spec_template.as_str(),
+                            listen_prefix,
                         )
                     };
                 if !seen_templates.insert(effective_template.clone()) {
@@ -1240,7 +1242,7 @@ fn extract_operation_schemas(
                 );
                 entry.insert(
                     "path_regex".to_string(),
-                    Value::String(path_template_to_regex(regex_tail, listen_prefix)?),
+                    Value::String(path_template_to_regex(regex_tail, regex_prefix)?),
                 );
                 if let Some((required, content)) = &request_body {
                     entry.insert("request_required".to_string(), Value::Bool(*required));

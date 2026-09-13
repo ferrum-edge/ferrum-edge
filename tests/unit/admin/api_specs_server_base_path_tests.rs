@@ -106,14 +106,12 @@ fn listen_path_prefixes_generated_operations_for_all_spec_versions() {
                 spec[version_key] = json!(version);
                 let config = extract_validator_config(&spec.to_string());
                 assert_eq!(config["fail_on_unknown_operation"], true);
+                let root_path = listen_path.to_string();
+                let root_regex = format!("^{listen_path}$");
                 assert_eq!(
                     op_templates(&config),
                     vec![
-                        (
-                            "GET".to_string(),
-                            "/p2/oas2".to_string(),
-                            "^/p2/oas2$".to_string()
-                        ),
+                        ("GET".to_string(), root_path, root_regex),
                         (
                             "POST".to_string(),
                             "/p2/oas2/items".to_string(),
