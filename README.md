@@ -336,7 +336,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -d @backup.json "http://localhost
 
 Submit an OpenAPI/Swagger spec to atomically provision a proxy, upstream, and plugins in one call — see [docs/api_specs.md](docs/api_specs.md).
 
-See [docs/admin_api.md](docs/admin_api.md) for the full endpoint reference, and [openapi.yaml](openapi.yaml) for the OpenAPI specification.
+See [docs/admin_api.md](docs/admin_api.md) for the full endpoint reference, including [first-create minimal requests](docs/admin_api.md#admin-api-first-create--minimal-working-requests), and [openapi.yaml](openapi.yaml) for the OpenAPI specification.
 
 ## Plugin System
 
