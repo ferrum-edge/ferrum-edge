@@ -22,6 +22,8 @@ use ferrum_edge::admin::api_specs::{
 use serde_json::{Value, json};
 use url::Url;
 
+use crate::scaffolding::port_registry::TestSocket;
+
 fn proxy_block() -> &'static str {
     r#"{
     "id": "ext-ref-proxy",
@@ -144,10 +146,28 @@ fn spawn_stalled_http_peer() -> (
     std::sync::mpsc::Receiver<std::net::TcpStream>,
     std::thread::JoinHandle<()>,
 ) {
+    spawn_stalled_http_peer_with_partial_body(true)
+}
+
+/// Accept one request and stall before writing response headers so `.send()`
+/// is the stage waiting on the hop deadline.
+fn spawn_stalled_http_fetch_peer() -> (
+    u16,
+    std::sync::mpsc::Receiver<std::net::TcpStream>,
+    std::thread::JoinHandle<()>,
+) {
+    spawn_stalled_http_peer_with_partial_body(false)
+}
+
+fn spawn_stalled_http_peer_with_partial_body(write_partial_body: bool) -> (
+    u16,
+    std::sync::mpsc::Receiver<std::net::TcpStream>,
+    std::thread::JoinHandle<()>,
+) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled HTTP fixture");
+    let listener = TcpListener::bind_test("127.0.0.1:0").expect("bind stalled HTTP fixture");
     let port = listener
         .local_addr()
         .expect("stalled HTTP fixture address")
@@ -161,6 +181,41 @@ fn spawn_stalled_http_peer() -> (
         };
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request);
+        if write_partial_body {
+            let partial_body = b"{\"type\":\"string\"";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                partial_body.len() + 64
+            );
+            let _ = stream.write_all(headers.as_bytes());
+            let _ = stream.write_all(partial_body);
+        }
+        let _ = stalled_tx.send(stream);
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("stalled HTTP fixture must reach accept boundary");
+    (port, stalled_rx, server)
+}
+
+/// Accept one request, write headers plus a short body, then close so the
+/// remaining `Content-Length` bytes never arrive.
+fn spawn_peer_that_closes_mid_body() -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
+
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .expect("bind mid-body close HTTP fixture");
+    let port = listener
+        .local_addr()
+        .expect("mid-body close HTTP fixture address")
+        .port();
+    let server = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
         let partial_body = b"{\"type\":\"string\"";
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -168,12 +223,60 @@ fn spawn_stalled_http_peer() -> (
         );
         let _ = stream.write_all(headers.as_bytes());
         let _ = stream.write_all(partial_body);
-        let _ = stalled_tx.send(stream);
+        let _ = stream.shutdown(Shutdown::Both);
     });
-    ready_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("stalled HTTP fixture must reach accept boundary");
-    (port, stalled_rx, server)
+    (port, server)
+}
+
+/// Drive a stalled peer until the loader fail-closes, then drop the held
+/// stream so the fixture thread does not wait on FIN.
+async fn load_against_stalled_peer(
+    port: u16,
+    stalled_rx: std::sync::mpsc::Receiver<std::net::TcpStream>,
+    server: std::thread::JoinHandle<()>,
+    mut process: ExternalRefProcessPolicy,
+    uri_path: &str,
+) -> (Result<LoadedExternalDocument, ExtractError>, Duration) {
+    process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
+    let uri = format!("http://127.0.0.1:{port}{uri_path}");
+    let started = Instant::now();
+    let (load_result, stalled_result) = tokio::join!(
+        load_production_http(uri, process),
+        tokio::task::spawn_blocking(move || {
+            stalled_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("stalled fixture must deliver I/O stream")
+        }),
+    );
+    let elapsed = started.elapsed();
+    let _stalled = stalled_result.expect("stalled fixture worker");
+    server.join().expect("deadline fixture thread");
+    (load_result, elapsed)
+}
+
+fn assert_classified_timeout(
+    error: ExtractError,
+    elapsed: Duration,
+    expected_message: &str,
+    budget: Duration,
+) {
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains(expected_message),
+        "expected {expected_message:?} in {rendered}"
+    );
+    assert!(
+        !rendered.contains("failed"),
+        "timeout must not use the generic failed diagnostic: {rendered}"
+    );
+    assert!(
+        elapsed >= budget.saturating_sub(Duration::from_millis(250)),
+        "elapsed {elapsed:?} shorter than deadline {budget:?}: {rendered}"
+    );
+    assert!(
+        elapsed < budget + Duration::from_secs(4),
+        "elapsed {elapsed:?} exceeded deadline slack {budget:?}: {rendered}"
+    );
 }
 
 #[test]
@@ -1473,23 +1576,95 @@ async fn total_deadline_covers_response_io() {
     let mut process = process_enabled(None);
     process.request_timeout = Duration::from_secs(10);
     process.total_timeout = Duration::from_secs(1);
-    process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
-    let uri = format!("http://127.0.0.1:{port}/slow");
-    let (load_result, stalled_result) = tokio::join!(
-        load_production_http(uri, process),
-        tokio::task::spawn_blocking(move || {
-            stalled_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("stalled fixture must deliver response-body I/O stream")
-        }),
-    );
+    let (load_result, elapsed) =
+        load_against_stalled_peer(port, stalled_rx, server, process, "/slow").await;
     let error = load_result.expect_err("total timeout must cover request and response I/O");
-    // Reclaim the stalled peer only after the client has fail-closed so the
-    // partial response body covered the total deadline. Dropping the stream
-    // here also finishes the fixture thread without waiting on FIN.
-    let _stalled = stalled_result.expect("stalled fixture worker");
-    server.join().expect("deadline fixture thread");
-    assert!(error.to_string().contains("timed out") || error.to_string().contains("timeout"));
+    assert_classified_timeout(
+        error,
+        elapsed,
+        "external $ref HTTP body read timed out",
+        Duration::from_secs(1),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_timeout_covers_response_io() {
+    let (port, stalled_rx, server) = spawn_stalled_http_peer();
+    let mut process = process_enabled(None);
+    process.request_timeout = Duration::from_secs(1);
+    process.total_timeout = Duration::from_secs(10);
+    let (load_result, elapsed) =
+        load_against_stalled_peer(port, stalled_rx, server, process, "/slow").await;
+    let error = load_result.expect_err("request timeout must cover response-body I/O");
+    assert_classified_timeout(
+        error,
+        elapsed,
+        "external $ref HTTP body read timed out",
+        Duration::from_secs(1),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn total_deadline_covers_http_fetch() {
+    let (port, stalled_rx, server) = spawn_stalled_http_fetch_peer();
+    let mut process = process_enabled(None);
+    process.request_timeout = Duration::from_secs(10);
+    process.total_timeout = Duration::from_secs(1);
+    let (load_result, elapsed) =
+        load_against_stalled_peer(port, stalled_rx, server, process, "/slow").await;
+    let error = load_result.expect_err("total timeout must cover HTTP fetch");
+    assert_classified_timeout(
+        error,
+        elapsed,
+        "external $ref HTTP fetch timed out",
+        Duration::from_secs(1),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_timeout_covers_http_fetch() {
+    let (port, stalled_rx, server) = spawn_stalled_http_fetch_peer();
+    let mut process = process_enabled(None);
+    process.request_timeout = Duration::from_secs(1);
+    process.total_timeout = Duration::from_secs(10);
+    let (load_result, elapsed) =
+        load_against_stalled_peer(port, stalled_rx, server, process, "/slow").await;
+    let error = load_result.expect_err("request timeout must cover HTTP fetch");
+    assert_classified_timeout(
+        error,
+        elapsed,
+        "external $ref HTTP fetch timed out",
+        Duration::from_secs(1),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn premature_peer_close_keeps_generic_body_read_failure() {
+    let (port, server) = spawn_peer_that_closes_mid_body();
+    let mut process = process_enabled(None);
+    process.connect_timeout = Duration::from_secs(2);
+    process.request_timeout = Duration::from_secs(5);
+    process.total_timeout = Duration::from_secs(10);
+    process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
+    let started = Instant::now();
+    let error = load_production_http(format!("http://127.0.0.1:{port}/truncated"), process)
+        .await
+        .expect_err("peer close mid-body must stay a generic read failure");
+    let elapsed = started.elapsed();
+    server.join().expect("mid-body close fixture thread");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("external $ref HTTP body read failed"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("timed out") && !rendered.contains("timeout"),
+        "non-timeout I/O must not be classified as a timeout: {rendered}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "peer close must fail closed before the request deadline, elapsed {elapsed:?}"
+    );
 }
 
 #[test]
