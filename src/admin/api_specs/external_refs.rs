@@ -1321,10 +1321,10 @@ fn reqwest_error_is_timeout(error: &reqwest::Error) -> bool {
     }
     let mut source = std::error::Error::source(error);
     while let Some(err) = source {
-        if let Some(inner) = err.downcast_ref::<reqwest::Error>() {
-            if inner.is_timeout() {
-                return true;
-            }
+        if let Some(inner) = err.downcast_ref::<reqwest::Error>()
+            && inner.is_timeout()
+        {
+            return true;
         }
         source = std::error::Error::source(err);
     }

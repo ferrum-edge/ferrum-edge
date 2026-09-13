@@ -159,7 +159,9 @@ fn spawn_stalled_http_fetch_peer() -> (
     spawn_stalled_http_peer_with_partial_body(false)
 }
 
-fn spawn_stalled_http_peer_with_partial_body(write_partial_body: bool) -> (
+fn spawn_stalled_http_peer_with_partial_body(
+    write_partial_body: bool,
+) -> (
     u16,
     std::sync::mpsc::Receiver<std::net::TcpStream>,
     std::thread::JoinHandle<()>,
