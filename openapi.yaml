@@ -8962,8 +8962,8 @@ components:
         resource; it is caller-supplied information, not proof of ownership.
         Resource labels landed on main in pull request 5483 on 2026-09-12, and
         every published release through v0.9.4 rejects the `labels` field with
-        unknown field `labels`, so operators and clients need a build from main
-        after that merge or the next tagged release.
+        unknown field `labels`. v0.9.5 is the first tagged release with resource
+        labels; operators and clients should use v0.9.5 or later.
       examples:
         - provisioned-by: ferrum-nexus
           team: platform

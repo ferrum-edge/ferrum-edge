@@ -15,7 +15,7 @@ Companion documents:
 > **Build-out status.** Ferrum Edge is pre-1.0 and publishes semver releases on
 > the `v0.9.x` channel (see the [Releases
 > page](https://github.com/ferrum-edge/ferrum-edge/releases) for the current
-> tag; latest at time of writing: **v0.9.4**). Read
+> tag). This document targets **v0.9.5**. Read
 > [support_policy.md](support_policy.md) before treating any item here as a
 > stability commitment.
 >
@@ -23,8 +23,10 @@ Companion documents:
 > `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig) landed on
 > `main` in [#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483) on
 > 2026-09-12. Published releases through **v0.9.4** reject the field with
-> `unknown field \`labels\``. Pin a build from `main` after that merge or the
-> next tagged release. Companion clients that inject `labels.provisioned-by`
+> ``unknown field `labels` ``. **v0.9.5 is the first tagged release with resource
+> labels**; pin v0.9.5 or later and follow the
+> [upgrade guidance](upgrade_guide.md#upgrading-to-095).
+> Companion clients that inject `labels.provisioned-by`
 > require matching gateway builds: Git Forge Ops ≥
 > [#218](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/pull/218),
 > Nexus ≥ [#245](https://github.com/ferrum-edge/ferrum-nexus/pull/245), Foundry

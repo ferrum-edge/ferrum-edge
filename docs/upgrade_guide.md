@@ -26,6 +26,23 @@ over production traffic.** File-mode config version bumps still use in-memory or
 `FERRUM_MODE=migrate` config migration; that is separate from the database
 baseline contract above.
 
+## Upgrading to 0.9.5
+
+v0.9.5 is the first tagged release accepting resource `labels` on proxies,
+consumers, upstreams, and plugin configurations. v0.9.4 and earlier reject the
+field. See [Resource labels and application attribution](admin_api.md#resource-labels-and-application-attribution)
+for limits, PUT semantics, and `X-Ferrum-Provisioned-By` behavior.
+
+- **Database mode / control plane:** the PostgreSQL, MySQL, and SQLite baseline
+  now includes labels columns. Follow the [build-out database procedure](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
+  using a fresh database and a namespace-complete logical export; retain the old
+  database for rollback. MongoDB stores labels in its existing BSON resources.
+- **CP/DP:** upgrade all data planes to v0.9.5 or later before the control plane.
+  Older data planes reject any namespace snapshot containing non-empty labels.
+- **File mode and companion clients:** upgrade gateways and file validators
+  before clients begin emitting labels, including `labels.provisioned-by`.
+  Existing unlabeled resources remain valid and are not automatically attributed.
+
 ## Breaking changes in 0.9.0
 
 ### ConfigSync subscription identity binding

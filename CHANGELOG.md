@@ -7,16 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-09-13
+
+Release from main introducing resource labels in tagged artifacts. Includes the
+fixes merged since v0.9.4; see the version comparison for the complete change list.
+
 ### Added
 
 - **Resource labels on Proxy, Consumer, Upstream, and PluginConfig**
   (issue #5493, pull request #5483). Bounded `labels` maps (including
   `provisioned-by`) persist through the Admin API, file configuration, CP/DP
-  sync, backup/restore, and namespace rename. The field landed on `main` on
-  2026-09-12; published releases through **v0.9.4** reject it with
-  `unknown field \`labels\``. Operators and companion clients that inject
+  sync, backup/restore, and namespace rename. **v0.9.5 is the first tagged
+  release with this capability**; v0.9.4 and earlier reject the field with
+  ``unknown field `labels` ``. Companion clients that inject
   `labels.provisioned-by` (Git Forge Ops ≥ #218, Nexus ≥ #245, Foundry ≥ #340)
-  need a build from `main` after that merge or the next tagged release.
+  require v0.9.5 or later.
+
+### Upgrade notes
+
+- Upgrade every data plane before the control plane, and upgrade gateways and
+  file validators before clients emit labels. Older data planes reject snapshots
+  containing non-empty labels. SQL deployments require a fresh database using
+  the updated baseline; follow the [v0.9.5 upgrade guidance](docs/upgrade_guide.md#upgrading-to-095).
+
+## [0.9.4] - 2026-09-09
 
 ### Fixed
 
@@ -3482,5 +3496,7 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.4...v0.9.5
+[0.9.4]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.3...v0.9.4
 [0.9.0]: https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.0
