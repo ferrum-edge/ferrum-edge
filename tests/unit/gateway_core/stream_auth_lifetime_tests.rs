@@ -784,7 +784,11 @@ async fn a_stalled_backend_read_cannot_starve_the_tcp_authorization_deadline() {
 /// The userspace fast path parks both halves on the opposite endpoint and
 /// cannot observe the client-leg wrapper. An authorization-bound session
 /// must take the direction-tracking path and pass the deadline into both
-/// TLS Deadline arms.
+/// TLS Deadline arms. The HBONE admission fence's revocation bound
+/// (`RelayRevocation`, issue #5042) is raced at the same top-level points and
+/// is equally load-bearing: tokio's `copy_bidirectional_with_sizes` never polls
+/// the revocation future, so a relay with every timeout disabled would take the
+/// fast path and ignore revocation entirely — a fail-open with no signal.
 #[test]
 fn an_authorization_bound_tcp_relay_refuses_the_unbounded_fast_path() {
     let src = include_str!("../../../src/proxy/tcp_proxy.rs");
@@ -792,8 +796,12 @@ fn an_authorization_bound_tcp_relay_refuses_the_unbounded_fast_path() {
         src.contains("&& auth_deadline.is_none()"),
         "the copy_bidirectional_with_sizes fast path must refuse an authorization bound"
     );
+    assert!(
+        src.contains("&& revocation.is_none()"),
+        "the copy_bidirectional_with_sizes fast path must refuse an admission-revocation bound"
+    );
     assert!(src.contains("copy_bidirectional_with_sizes"));
-    assert!(src.contains("drain_remaining_or_authorization_expire"));
+    assert!(src.contains("drain_remaining_or_terminate"));
     let tls = src
         .split("ClientRelayStream::Tls(tls_stream) => {")
         .nth(1)

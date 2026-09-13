@@ -387,6 +387,15 @@ impl Plugin for AccessControl {
         true
     }
 
+    /// `authorize` is a pure function of the request's client IP, mapped
+    /// Consumer, and authenticated identity against this instance's immutable
+    /// allow/deny sets: no budget, no permit, no mutation of `ctx`, and no
+    /// external call. Safe for the HBONE admission fence to re-run against a
+    /// live tunnel.
+    fn reevaluates_live_admission(&self) -> bool {
+        true
+    }
+
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         self.authorize_identity(
             &ctx.client_ip,

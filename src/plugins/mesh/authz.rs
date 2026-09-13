@@ -81,6 +81,15 @@ use crate::util::unknown_keys::reject_unknown_keys;
 
 pub(crate) const IGNORED_UDP_SOURCE_SCOPE_METADATA: &str = "mesh_authz.ignored_udp_source_scope";
 
+/// Request-metadata marker the HBONE admission fence sets when it re-runs
+/// `authorize` for a LIVE tunnel against a later policy generation (issue
+/// #5042 step 1). The DENY / ALLOW tiers are re-applied in full; a matched
+/// `action: CUSTOM` delegation is NOT re-consulted — the provider's
+/// admission-time verdict stands for the tunnel's life, exactly as it did
+/// before the fence existed — so one publication cannot fan out into one
+/// external authorization call per open tunnel.
+pub const MESH_AUTHZ_REEVALUATION_METADATA_KEY: &str = "mesh_authz.reevaluation";
+
 pub struct MeshAuthz {
     slice: MeshSlice,
     /// Istio `action: CUSTOM` external-authorization executor (issue #3235).
@@ -2751,6 +2760,15 @@ impl Plugin for MeshAuthz {
         ALL_PROTOCOLS
     }
 
+    /// The local ALLOW/DENY/AUDIT tiers are a pure evaluation of the request
+    /// context against the published slice, so the HBONE admission fence may
+    /// re-run them against a live tunnel. The one side-effecting arm —
+    /// `action: CUSTOM` external delegation — is skipped on a re-evaluation;
+    /// see [`MESH_AUTHZ_REEVALUATION_METADATA_KEY`].
+    fn reevaluates_live_admission(&self) -> bool {
+        true
+    }
+
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         // Istio parity: `AuthorizationPolicy` is an INBOUND contract, so the
         // outbound capture leg is not judged at all (issue #4158). This is the
@@ -3265,6 +3283,15 @@ impl Plugin for MeshAuthz {
         }
         let decision = match evaluation.custom {
             None => evaluation.decision,
+            // Live-tunnel re-evaluation keeps the provider's admission-time
+            // verdict (see `MESH_AUTHZ_REEVALUATION_METADATA_KEY`).
+            Some(_)
+                if ctx
+                    .metadata
+                    .contains_key(MESH_AUTHZ_REEVALUATION_METADATA_KEY) =>
+            {
+                evaluation.decision
+            }
             Some(delegation) => {
                 match self
                     .run_custom_delegation(ctx, &delegation, request.host.clone())

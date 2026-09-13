@@ -3,6 +3,7 @@ mod allowed_methods_logging_tests;
 mod ambient_host_udp_live_contract_tests;
 mod ambient_udp_placement_established_helm_tests;
 mod ambient_udp_preflight_proc_root_tests;
+mod authorize_reevaluation_contract_tests;
 mod backend_capability_commit_tests;
 mod backend_capability_probe_merge_tests;
 mod backend_capability_refresh_coalescer_tests;
