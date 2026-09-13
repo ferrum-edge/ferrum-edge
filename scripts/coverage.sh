@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Run cargo-llvm-cov across the deterministic test suites (lib + unit +
-# integration) and emit HTML, LCOV, JSON, and stdout summary reports under
-# target/llvm-cov/.
+# Run cargo-llvm-cov across the deterministic test suites (lib + the four unit
+# targets + integration) and emit HTML, LCOV, JSON, and stdout summary reports
+# under target/llvm-cov/.
 #
 # The first run on a clean checkout may take 5-10 minutes because llvm-cov
 # rebuilds instrumented artifacts in target/llvm-cov-target/. Later runs are
@@ -100,6 +100,9 @@ run_coverage_target --lib
 
 echo "Collecting unit test coverage..."
 run_coverage_target --test unit_tests
+run_coverage_target --test unit_plugins_a_tests
+run_coverage_target --test unit_plugins_b_tests
+run_coverage_target --test unit_gateway_core_tests
 
 echo "Collecting integration test coverage..."
 run_coverage_target --test integration_tests

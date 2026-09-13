@@ -1,2 +1,3 @@
 mod builtin_plugin_names_tests;
+mod coverage_target_dispatch_tests;
 mod protoc_preflight_tests;
