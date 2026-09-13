@@ -3,6 +3,7 @@
 The Admin API provides full CRUD operations for managing Ferrum Edge configuration at runtime. It is available in **Database** and **Control Plane** modes (read/write) and **Data Plane** mode (read-only).
 
 See also:
+- [Admin API first create — minimal working requests](#admin-api-first-create--minimal-working-requests) — copy-pasteable first `POST` bodies
 - [admin_read_only_mode.md](admin_read_only_mode.md) — Read-only mode configuration
 - [admin_backup_restore.md](admin_backup_restore.md) — Backup and restore details
 - [admin_batch_api.md](admin_batch_api.md) — Batch operations
@@ -63,6 +64,155 @@ Generate a token:
 # Example using Node.js jsonwebtoken:
 node -e "const jwt=require('jsonwebtoken'); const now=Math.floor(Date.now()/1000); console.log(jwt.sign({iss:'ferrum-edge', sub:'admin', role:'admin', iat:now, nbf:now, exp:now+3600, jti:require('crypto').randomUUID()}, 'my-super-secret-jwt-key-at-least-32-chars'))"
 ```
+
+## Admin API first create — minimal working requests
+
+First-time Admin API creates often fail on three naming rules that diverge from
+naive REST guesses. The bodies below are the smallest `POST` shapes that match
+[`openapi.yaml`](../openapi.yaml) (`ProxyCreate`, `PluginConfigCreate`,
+`ConsumerCreate`, `UpstreamCreate`) and the example file-mode document
+[`tests/config.yaml`](../tests/config.yaml). Unknown fields are rejected.
+
+Mint `$TOKEN` as in [Authentication](#authentication) (`role` `admin` is
+required for consumers; `operator` can create proxies, plugin configs, and
+upstreams). Namespace-scoped routes read **`X-Ferrum-Namespace`**, not a
+`namespace` field in the JSON body (that property is read-only on the wire and
+is ignored). Omitting the header selects `ferrum`.
+
+```bash
+export TOKEN="<admin-jwt>"
+export NS=ferrum   # or omit the header to get the same default
+```
+
+Every example sends both headers:
+
+```
+Authorization: Bearer $TOKEN
+X-Ferrum-Namespace: $NS
+Content-Type: application/json
+```
+
+### `POST /proxies`
+
+HTTP-family proxies need `listen_path` and/or `hosts`, plus either
+`backend_host`+`backend_port` or `upstream_id`. `auth_mode` accepts only
+`single` or `multi` (default `single`). There is no `none`. Omitting
+`backend_scheme` stores `https`; plaintext backends must send `http`.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: $NS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "listen_path": "/httpbin",
+    "backend_scheme": "http",
+    "backend_host": "127.0.0.1",
+    "backend_port": 8080,
+    "auth_mode": "single"
+  }' \
+  http://localhost:9000/proxies
+```
+
+Save the returned `id` for the proxy-scoped plugin example below.
+
+### `POST /plugins/config` (global)
+
+Required fields are `plugin_name` and `scope`. There is no top-level `name`.
+`GET /plugins` lists valid `plugin_name` values. `enabled` defaults to `true`
+on create.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: $NS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plugin_name": "stdout_logging",
+    "config": {},
+    "scope": "global"
+  }' \
+  http://localhost:9000/plugins/config
+```
+
+### `POST /plugins/config` (proxy scope)
+
+`scope: "proxy"` requires `proxy_id` of an existing proxy in this namespace.
+The plugin type for API-key checks is `key_auth` (underscore). That is **not**
+the consumer credential map key.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: $NS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plugin_name": "key_auth",
+    "config": {"key_location": "header:X-API-Key"},
+    "scope": "proxy",
+    "proxy_id": "YOUR_PROXY_ID"
+  }' \
+  http://localhost:9000/plugins/config
+```
+
+Replace `YOUR_PROXY_ID` with the `id` returned by `POST /proxies`.
+
+### `POST /consumers`
+
+Required field is `username`. Built-in credential map keys are `keyauth`,
+`basicauth`, `jwt`, `hmac_auth`, and `mtls_auth`. Each value is a **non-empty
+rotation array** of objects, not a single object. `keyauth` is the API-key
+credential type; `key_auth` is rejected here.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: $NS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "alice",
+    "credentials": {
+      "keyauth": [
+        {"key": "alice-current-api-key"},
+        {"key": "alice-next-api-key"}
+      ]
+    }
+  }' \
+  http://localhost:9000/consumers
+```
+
+Default max entries per type is `FERRUM_MAX_CREDENTIALS_PER_TYPE` (2). Ordinary
+`GET` responses redact `keyauth` keys as `[REDACTED]`.
+
+### `POST /upstreams`
+
+Required field is `targets` (each target needs `host` and `port`). `name` is
+optional. `algorithm` defaults to `round_robin`.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: $NS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "example-pool",
+    "targets": [
+      {"host": "backend.example.com", "port": 8080}
+    ]
+  }' \
+  http://localhost:9000/upstreams
+```
+
+A later proxy create may set `upstream_id` instead of `backend_host` /
+`backend_port`; those two fields are then omitted.
+
+### Common rejections
+
+| Attempt | Rejection | Accepted shape |
+| --- | --- | --- |
+| Proxy `"auth_mode": "none"` | unknown variant | `"single"` or `"multi"` only (default `"single"`). No auth plugin is attached until you create a plugin config — that is not an `auth_mode` value. |
+| Plugin config `"name": "key_auth"` | unknown field | `"plugin_name"` (e.g. `"key_auth"`, `"stdout_logging"`) plus `"scope"` (`"global"`, `"proxy"`, or `"proxy_group"`). `"name"` is a friendly label on proxies and upstreams, not on plugin configs. |
+| Consumer `"credentials": {"key_auth": ...}` | rejected type key | `"keyauth"` (also `"basicauth"`, `"jwt"`, `"hmac_auth"`, `"mtls_auth"`). Each value is a rotation **array** of objects: `"keyauth": [{"key": "..."}]`. The plugin type remains `"key_auth"`. |
+| `"backend_scheme": "ws"` / `"grpc"` / `"none"`, or omitted plaintext | unknown variant, or HTTPS dial of HTTP | `"http"`, `"https"`, `"tcp"`, `"tcps"`, `"udp"`, or `"dtls"`. HTTP-family default is `"https"`; plaintext backends must send `"http"`. gRPC and WebSocket are detected per request, not pinned as a scheme. |
+| `"namespace": "prod"` in the JSON body | silently ignored | `X-Ferrum-Namespace: prod` (pattern `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`, max 254). Body `namespace` is read-only. |
+
+Full field lists, status codes, and plugin `config` schemas stay in
+[`openapi.yaml`](../openapi.yaml). Endpoint behavior is in the sections below.
 
 ## Liveness and Health Checks
 
