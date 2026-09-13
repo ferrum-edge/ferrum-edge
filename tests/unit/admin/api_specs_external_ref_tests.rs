@@ -206,8 +206,7 @@ fn spawn_peer_that_closes_mid_body() -> (u16, std::thread::JoinHandle<()>) {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
 
-    let listener = TcpListener::bind_test("127.0.0.1:0")
-        .expect("bind mid-body close HTTP fixture");
+    let listener = TcpListener::bind_test("127.0.0.1:0").expect("bind mid-body close HTTP fixture");
     let port = listener
         .local_addr()
         .expect("mid-body close HTTP fixture address")
