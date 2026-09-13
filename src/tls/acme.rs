@@ -5634,7 +5634,8 @@ mod tests {
             "{error}"
         );
         assert!(
-            message.contains("credential directory URL must use the configured ACME directory origin"),
+            message
+                .contains("credential directory URL must use the configured ACME directory origin"),
             "{error}"
         );
     }
