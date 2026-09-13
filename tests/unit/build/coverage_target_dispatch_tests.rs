@@ -115,7 +115,10 @@ fn in_baseline_test_targets() -> BTreeSet<String> {
 }
 
 fn coverage_md_intro() -> &'static str {
-    COVERAGE_MD.split("\n## ").next().expect("coverage.md intro")
+    COVERAGE_MD
+        .split("\n## ")
+        .next()
+        .expect("coverage.md intro")
 }
 
 fn test_targets_in_order(source: &str) -> Vec<String> {
@@ -167,7 +170,7 @@ fn documented_dispatch_sequence() -> Vec<String> {
     seq
 }
 
-fn workflow_step_body(workflow: &str, step_name: &str) -> &str {
+fn workflow_step_body<'a>(workflow: &'a str, step_name: &str) -> &'a str {
     let marker = format!("- name: {step_name}\n");
     let start = workflow
         .find(&marker)
@@ -245,7 +248,8 @@ fn coverage_dispatchers_match_in_baseline_cargo_test_targets() {
 fn coverage_script_and_workflow_collect_lib_in_documented_order() {
     let script = coverage_sh_dispatch_sequence();
     assert_eq!(
-        script, documented_dispatch_sequence(),
+        script,
+        documented_dispatch_sequence(),
         "scripts/coverage.sh run_coverage_target order must match docs/coverage.md"
     );
     assert!(
