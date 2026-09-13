@@ -1005,3 +1005,46 @@ fn response_content_length_ceiling_skips_bodyless_semantics_on_every_path() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Docker-backed fixtures publish pinned, non-ephemeral host ports (issue #5488)
+//
+// Siblings: the service-integration fixtures (Consul, OpenLDAP, Redpanda,
+// MySQL, ClickHouse, Hydra — issue #3999) and the secret-backend fixtures
+// (Vault dev server, LocalStack). Docker auto-assignment draws the published
+// port from the host's ephemeral source-port range, so a mapping can collide
+// with the test process's own outbound sockets, and a port released by one
+// case's container is immediately reusable by the next case in the same
+// process. Both fixture families must allocate through `common/host_ports.rs`
+// and map the port explicitly instead of reading back what Docker chose.
+// ---------------------------------------------------------------------------
+
+/// Every fixture module that starts a container publishing a host port.
+const CONTAINER_FIXTURE_SOURCES: [&str; 3] = [
+    "tests/service_integration/common/containers.rs",
+    "tests/service_integration/common/hydra.rs",
+    "tests/secrets_functional/common/containers.rs",
+];
+
+#[test]
+fn docker_fixtures_pin_host_ports_outside_the_ephemeral_range() {
+    for relative in CONTAINER_FIXTURE_SOURCES {
+        let text = source(relative);
+        assert!(
+            text.contains("allocate_host_port") && text.contains("retry_on_host_port_collision"),
+            "{relative} must take its host ports from common/host_ports.rs and retry only \
+             genuine bind collisions"
+        );
+        assert!(
+            !text.contains("get_host_port_ipv4"),
+            "{relative} must not read back a Docker-assigned host port; map it explicitly"
+        );
+        let images = text.matches("GenericImage::new(").count();
+        let mapped = text.matches(".with_mapped_port(").count();
+        assert!(
+            images > 0 && mapped >= images,
+            "{relative}: every started image must publish an explicitly mapped host port \
+             ({images} images, {mapped} mappings)"
+        );
+    }
+}

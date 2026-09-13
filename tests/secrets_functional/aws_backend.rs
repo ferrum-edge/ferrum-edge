@@ -18,6 +18,13 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const JSON_SECRET: &str = r#"{"admin_jwt":"aws-json-jwt","port":5432,"enabled":true}"#;
 
+/// A secret id that is never seeded, for the not-found cases.
+const MISSING_SECRET_ID: &str = "ferrum/missing";
+
+/// A distinctive absent JSON field name, so an "absence" assertion cannot pass
+/// by accident on a common English word.
+const ABSENT_FIELD: &str = "ferrum-absent-json-field-sentinel";
+
 /// Standard LocalStack-friendly AWS env (dummy static credentials + endpoint).
 ///
 /// Both the service-specific (`AWS_ENDPOINT_URL_SECRETS_MANAGER`, the primary
@@ -44,6 +51,48 @@ async fn try_localstack(test: &str) -> Option<LocalStackContainer> {
             None
         }
     }
+}
+
+/// Assert that a fetch failed because the SERVICE answered "no such secret",
+/// not because the SDK never reached the service.
+///
+/// `Failed to fetch … from AWS Secrets Manager` on its own is also produced by a
+/// transport failure against a LocalStack that never became reachable, so the
+/// not-found case used to be satisfiable by a broken fixture (issue #5488).
+/// `src/secrets/aws.rs` renders the SDK error's `source()` chain, so a real
+/// service answer names the modeled exception (`ResourceNotFoundException`,
+/// with Secrets Manager's own message) while a transport failure names the
+/// dispatch category instead.
+fn assert_service_not_found(err: &str) {
+    assert!(
+        err.contains("Failed to fetch") && err.contains("AWS Secrets Manager"),
+        "expected an AWS fetch failure, got: {err}"
+    );
+    assert!(
+        mentions_service_not_found(err),
+        "expected the service's not-found response, got: {err}"
+    );
+    assert!(
+        !err.contains("dispatch failure") && !err.contains("Timeout"),
+        "a transport failure must not satisfy the not-found case, got: {err}"
+    );
+    // The secret id is part of the source reference, which is as sensitive as
+    // the value it points at; the registry redacts any occurrence the SDK
+    // echoes back.
+    assert!(
+        !err.contains(MISSING_SECRET_ID),
+        "error must not disclose the source reference, got: {err}"
+    );
+}
+
+/// True when the message carries the service's own "no such secret" answer.
+///
+/// The modeled exception name, rendered out of the SDK error's source chain, is
+/// the primary signal; Secrets Manager's own wording is kept as a fallback so a
+/// differently-spelled modeled name cannot silently weaken the check into "any
+/// failure at all".
+fn mentions_service_not_found(err: &str) -> bool {
+    err.contains("ResourceNotFoundException") || err.contains("specified secret")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -150,9 +199,6 @@ async fn aws_missing_json_field_errors() {
         .expect("seed json secret");
 
     set_aws_env(&guard, &ls.endpoint);
-    // A distinctive absent field name, so the absence assertion below cannot
-    // pass by accident on a common English word.
-    const ABSENT_FIELD: &str = "ferrum-absent-json-field-sentinel";
     guard.set(
         "FERRUM_ADMIN_JWT_SECRET_AWS",
         &format!("ferrum/json#{ABSENT_FIELD}"),
@@ -236,16 +282,87 @@ async fn aws_not_found_errors() {
     };
 
     set_aws_env(&guard, &ls.endpoint);
-    guard.set("FERRUM_ADMIN_JWT_SECRET_AWS", "ferrum/missing");
+    guard.set("FERRUM_ADMIN_JWT_SECRET_AWS", MISSING_SECRET_ID);
 
     let err = resolve_all_env_secrets()
         .await
         .err()
         .expect("unknown secret must fail");
-    assert!(
-        err.contains("Failed to fetch") && err.contains("AWS Secrets Manager"),
-        "expected an AWS fetch failure, got: {err}"
+    assert_service_not_found(&err);
+}
+
+/// Order-independence regression (issue #5488).
+///
+/// Under plain `cargo test` every case in this suite shares ONE process, and a
+/// failed resolution used to leave the next successful one reporting
+/// `dispatch failure` — while each case passed on its own. nextest runs every
+/// case in its own process, so the sequence is only covered if a single case
+/// performs it: both failing resolutions, a success on the same fixture, then a
+/// success against a SECOND container after the first is torn down — the same
+/// teardown / new host mapping / new SDK client transition the suite makes
+/// between cases.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn aws_negative_resolution_does_not_break_later_success() {
+    const TEST: &str = "aws_negative_resolution_does_not_break_later_success";
+
+    let guard = EnvGuard::new();
+    let Some(ls) = try_localstack(TEST).await else {
+        return;
+    };
+    ls.create_secret_string("ferrum/json", JSON_SECRET)
+        .await
+        .expect("seed json secret");
+    ls.create_secret_string("ferrum/plain", "aws-plain-secret")
+        .await
+        .expect("seed plain secret");
+    set_aws_env(&guard, &ls.endpoint);
+
+    // 1. The service answers "no such secret".
+    guard.set("FERRUM_ADMIN_JWT_SECRET_AWS", MISSING_SECRET_ID);
+    let err = resolve_all_env_secrets()
+        .await
+        .err()
+        .expect("unknown secret must fail");
+    assert_service_not_found(&err);
+
+    // 2. The fetch succeeds but the requested JSON field is absent.
+    guard.set(
+        "FERRUM_ADMIN_JWT_SECRET_AWS",
+        &format!("ferrum/json#{ABSENT_FIELD}"),
     );
+    let err = resolve_all_env_secrets()
+        .await
+        .err()
+        .expect("missing JSON field must fail");
+    assert!(
+        err.contains("does not contain the requested key"),
+        "expected a missing-field error, got: {err}"
+    );
+
+    // 3. A later resolution against the same fixture must still succeed.
+    guard.set("FERRUM_ADMIN_JWT_SECRET_AWS", "ferrum/plain");
+    let result = resolve_all_env_secrets()
+        .await
+        .expect("resolution after failed resolutions must still succeed");
+    assert_resolved_var(&result, "FERRUM_ADMIN_JWT_SECRET", "aws-plain-secret");
+
+    // 4. Tear the container down the way the end of a case does, then resolve
+    //    against a replacement container on a different host port.
+    drop(ls);
+    let Some(ls2) = try_localstack(TEST).await else {
+        return;
+    };
+    ls2.create_secret_string("ferrum/plain", "aws-plain-secret")
+        .await
+        .expect("seed plain secret in the replacement container");
+    set_aws_env(&guard, &ls2.endpoint);
+    guard.set("FERRUM_ADMIN_JWT_SECRET_AWS", "ferrum/plain");
+
+    let result = resolve_all_env_secrets()
+        .await
+        .expect("resolution against a replacement container must succeed");
+    assert_resolved_var(&result, "FERRUM_ADMIN_JWT_SECRET", "aws-plain-secret");
 }
 
 #[tokio::test(flavor = "multi_thread")]

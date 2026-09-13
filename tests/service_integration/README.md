@@ -74,6 +74,12 @@ Every testcontainer in this suite that publishes a host port goes through
 | Hydra | `4444` (public) and `4445` (admin); login/consent URLs also consume unique host ports so they cannot collide with the mapped listeners |
 | ClickHouse | `8123` (HTTP interface used by `api_chargeback_sink`) |
 
+`common/host_ports.rs` is shared with the secret-backend suite: the Vault and
+LocalStack fixtures in `tests/secrets_functional/common/containers.rs` include
+this module with `#[path]` rather than reimplementing it (issue #5488), so a
+change here schedules the `Secret Backends` job too. Keep the module free of
+service-integration-specific assumptions.
+
 Docker auto-assignment and `127.0.0.1:0` both land inside
 `/proc/sys/net/ipv4/ip_local_port_range`. The probe socket is then released, an
 unrelated ephemeral connection or sibling container can claim the number, and
