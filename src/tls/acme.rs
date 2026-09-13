@@ -5628,7 +5628,16 @@ mod tests {
         let error = prepare_renewal_order(&certificate, credentials, &config)
             .await
             .expect_err("automatic renewal must reject credential-directory drift");
-        assert!(error.to_string().contains("does not match"), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("ACME outbound boundary rejected the request"),
+            "{error}"
+        );
+        assert!(
+            message
+                .contains("credential directory URL must use the configured ACME directory origin"),
+            "{error}"
+        );
     }
 
     fn generated_cert_and_key() -> (String, String) {
