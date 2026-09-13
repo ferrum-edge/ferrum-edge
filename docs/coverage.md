@@ -27,6 +27,10 @@ Run the deterministic local coverage suite:
 scripts/coverage.sh
 ```
 
+The default path collects `--lib`, the four unit targets, and
+`--test integration_tests` through `run_coverage_target`, matching the CI
+baseline documented above.
+
 The script prints a terminal summary and writes:
 
 - HTML: `target/llvm-cov/html/index.html`
