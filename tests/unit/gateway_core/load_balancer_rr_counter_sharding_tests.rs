@@ -57,6 +57,7 @@ fn upstream_with_locality_lb(
 ) -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: "u1".to_string(),
         name: Some("u1".to_string()),
         namespace: "ferrum".to_string(),
@@ -482,6 +483,7 @@ fn port_override_lane_round_robin_stays_even_under_concurrency() {
         },
     );
     let up = Upstream {
+        labels: Default::default(),
         id: "u1".to_string(),
         name: Some("u1".to_string()),
         namespace: "ferrum".to_string(),

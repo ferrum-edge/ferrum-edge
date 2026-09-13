@@ -1,3 +1,5 @@
+use crate::scaffolding::port_registry::TestSocket;
+
 use bytes::Bytes;
 use chrono::Utc;
 use hyper::{Method, Request, StatusCode};
@@ -47,6 +49,7 @@ use ferrum_edge::proxy::{
 
 pub(super) fn create_mesh_proxy(backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: "mesh-hbone".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Mesh HBONE".to_string()),
@@ -175,6 +178,7 @@ fn create_hmac_consumer(secret: &str) -> Consumer {
     )]);
 
     Consumer {
+        labels: Default::default(),
         id: "hmac-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "hmacuser".to_string(),
@@ -188,6 +192,7 @@ fn create_hmac_consumer(secret: &str) -> Consumer {
 
 fn hmac_auth_plugin_config() -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "hmac-auth".to_string(),
         plugin_name: "hmac_auth".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -212,6 +217,7 @@ fn hmac_auth_plugin_config() -> PluginConfig {
 /// `ctx.peer_spiffe_id` from the verified mTLS peer cert.
 fn spiffe_identity_plugin_config(proxy_id: &str) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "spiffe-identity".to_string(),
         plugin_name: "spiffe_identity".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -341,7 +347,7 @@ async fn start_gateway_mtls(
     state: ProxyState,
     server_config: Arc<rustls::ServerConfig>,
 ) -> (std::net::SocketAddr, watch::Sender<bool>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
     let addr = listener.local_addr().expect("gateway local addr");
@@ -386,7 +392,7 @@ pub(super) async fn connect_hbone_h2_mtls(
 }
 
 async fn start_gateway(state: ProxyState) -> (std::net::SocketAddr, watch::Sender<bool>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
     let addr = listener.local_addr().expect("gateway local addr");
@@ -399,7 +405,7 @@ async fn start_gateway(state: ProxyState) -> (std::net::SocketAddr, watch::Sende
 }
 
 async fn start_echo_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind echo backend");
     let addr = listener.local_addr().expect("echo backend local addr");
@@ -419,7 +425,7 @@ async fn start_echo_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<
 }
 
 async fn start_idle_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind idle backend");
     let addr = listener.local_addr().expect("idle backend local addr");
@@ -443,7 +449,7 @@ async fn start_quiet_backend() -> (
     tokio::task::JoinHandle<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind quiet backend");
     let addr = listener.local_addr().expect("quiet backend local addr");
@@ -476,6 +482,7 @@ fn mesh_route_dispatch_connect_timeout_plugin(
     timeout_ms: u64,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "mesh-route-dispatch-cfg".to_string(),
         plugin_name: "mesh_route_dispatch".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -817,6 +824,7 @@ fn egress_udp_mesh_config_with_endpoints(
 
 fn spiffe_identity_global_plugin_config() -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "spiffe-identity-global".to_string(),
         plugin_name: "spiffe_identity".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -888,7 +896,7 @@ async fn start_egress_udp_gateway(
     state: ProxyState,
     server_config: Arc<rustls::ServerConfig>,
 ) -> (std::net::SocketAddr, watch::Sender<bool>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
     let addr = listener.local_addr().expect("gateway local addr");
@@ -911,7 +919,7 @@ async fn start_egress_udp_gateway(
 /// sent the datagram.
 pub(super) async fn start_external_udp_echo() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
 {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+    let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("bind external udp echo");
     let addr = socket.local_addr().expect("external udp echo addr");
@@ -1101,7 +1109,7 @@ async fn egress_udp_admitted_destination_still_requires_authenticated_peer() {
         external_addr.port(),
         external_addr.port(),
     ));
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
     let gateway_addr = listener.local_addr().expect("gateway local addr");
@@ -2261,7 +2269,6 @@ fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
         failure_status_codes: vec![500, 502, 503],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
-        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
     cb.record_failure(503, true, false);
@@ -4024,7 +4031,7 @@ async fn probe_udp_egress_local_ip(dest: SocketAddr) -> Result<IpAddr, String> {
     } else {
         SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
     };
-    let socket = tokio::net::UdpSocket::bind(bind)
+    let socket = tokio::net::UdpSocket::bind_test(bind)
         .await
         .map_err(|e| format!("probe bind {bind}: {e}"))?;
     socket
@@ -4062,7 +4069,7 @@ async fn discover_bindable_non_loopback_local_ip() -> IpAddr {
                     ));
                     continue;
                 }
-                match TcpListener::bind(SocketAddr::new(ip, 0)).await {
+                match TcpListener::bind_test(SocketAddr::new(ip, 0)).await {
                     Ok(listener) => {
                         drop(listener);
                         return ip;
@@ -4081,6 +4088,7 @@ async fn discover_bindable_non_loopback_local_ip() -> IpAddr {
 
 fn global_mesh_route_dispatch_to(host: &str, port: u16) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "third-workload-route-override".to_string(),
         plugin_name: "mesh_route_dispatch".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -4381,7 +4389,7 @@ async fn start_counting_tcp_backend(
     mpsc::UnboundedReceiver<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let listener = TcpListener::bind(SocketAddr::new(ip, 0))
+    let listener = TcpListener::bind_test(SocketAddr::new(ip, 0))
         .await
         .unwrap_or_else(|e| panic!("bind post-plugin TCP backend on {ip}: {e}"));
     let addr = listener.local_addr().expect("post-plugin TCP backend addr");
@@ -4413,7 +4421,7 @@ async fn start_counting_udp_backend(
     mpsc::UnboundedReceiver<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let socket = tokio::net::UdpSocket::bind(SocketAddr::new(ip, 0))
+    let socket = tokio::net::UdpSocket::bind_test(SocketAddr::new(ip, 0))
         .await
         .unwrap_or_else(|e| panic!("bind post-plugin UDP backend on {ip}: {e}"));
     let addr = socket.local_addr().expect("post-plugin UDP backend addr");

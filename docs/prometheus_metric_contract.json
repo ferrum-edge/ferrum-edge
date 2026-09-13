@@ -1086,20 +1086,6 @@
     "emission": "conditional"
   },
   {
-    "name": "ferrum_circuit_breaker_probe_reclaimed_total",
-    "type": "counter",
-    "help": "Half-open probe slots reclaimed after the dwell because the probe never settled; each one is a leaked probe slot that would otherwise have shed the backend permanently.",
-    "labels": [
-      "proxy_id",
-      "proxy_namespace",
-      "namespace"
-    ],
-    "subsystem": "circuit_breaker",
-    "export_surface": "/metrics",
-    "bundled": "documented_only",
-    "emission": "when_series_present"
-  },
-  {
     "name": "ferrum_circuit_breakers",
     "type": "gauge",
     "help": "Upstream circuit breakers resident for this proxy, counted by breaker state.",

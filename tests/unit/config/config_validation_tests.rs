@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 fn make_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.into(),
@@ -701,6 +702,7 @@ fn runtime_plugin_file_dependency_validation_runs_off_async_workers() {
 #[test]
 fn runtime_plugin_composition_validation_treats_globals_as_gateway_wide() {
     let global_correlation = |id: &str, namespace: &str| PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         plugin_name: "correlation_id".to_string(),
         namespace: namespace.to_string(),
@@ -748,6 +750,7 @@ fn runtime_config_rejection_includes_tcp_throttle_attachment_validation() {
 
 fn plugin_config_for_gate(id: &str, plugin_name: &str, config: serde_json::Value) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         plugin_name: plugin_name.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),

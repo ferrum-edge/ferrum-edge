@@ -5815,6 +5815,7 @@ fn route_mirror_plugin(
 
     let now = chrono::Utc::now();
     Ok(Some(PluginConfig {
+        labels: Default::default(),
         id: format!("istio-vs-mirror-{proxy_id}"),
         plugin_name: "request_mirror".to_string(),
         namespace: object.metadata.namespace.clone(),
@@ -6299,6 +6300,7 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
 
     let now = chrono::Utc::now();
     Some(PluginConfig {
+        labels: Default::default(),
         id: format!("istio-vs-cors-{proxy_id}"),
         plugin_name: "cors".to_string(),
         namespace: object.metadata.namespace.clone(),

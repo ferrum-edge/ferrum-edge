@@ -3312,20 +3312,20 @@ impl DatabaseStore {
     // such helpers verbose without meaningful runtime benefit.
 
     /// Number of `?` placeholders in `PROXY_INSERT_SQL` (no api_spec_id).
-    /// 51 resource columns + `created_at` + `updated_at` = 53.
+    /// 52 resource columns + `created_at` + `updated_at` = 54.
     ///
     /// Used only by the drift-catcher tests in `proxy_insert_sql_drift_tests`;
     /// kept available outside `#[cfg(test)]` so it remains a visible
     /// drift-prevention anchor when reading the SQL definition.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 53;
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 54;
 
     /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
     /// INSERT statement (which adds `api_spec_id` between
     /// `stream_match` and `created_at`).
-    /// 53 base + 1 (api_spec_id) = 54.
+    /// 54 base + 1 (api_spec_id) = 55.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 54;
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 55;
 
     /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
     ///
@@ -3334,7 +3334,7 @@ impl DatabaseStore {
     /// and the corresponding `.bind()` chain — see the drift-prevention contract
     /// block above.
     const PROXY_INSERT_SQL: &'static str = "\
-        INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, \
+        INSERT INTO proxies (labels, id, namespace, name, hosts, listen_path, backend_scheme, \
          backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, \
          backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, \
          backend_tls_client_cert_path, backend_tls_client_key_path, \
@@ -3353,7 +3353,7 @@ impl DatabaseStore {
          stream_proxy_protocol, backend_proxy_protocol, stream_match, \
          upstream_subset, \
          created_at, updated_at) \
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?)";
 
@@ -3386,6 +3386,7 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(&self.q(Self::PROXY_INSERT_SQL))
+            .bind(serde_json::to_string(&proxy.labels)?)
             .bind(&proxy.id)
             .bind(&proxy.namespace)
             .bind(&proxy.name)
@@ -3564,8 +3565,9 @@ impl DatabaseStore {
         let stream_match_json = serialize_stream_match(proxy)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE proxies SET labels=?, name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
         )
+        .bind(serde_json::to_string(&proxy.labels)?)
         .bind(&proxy.name)
         .bind(&hosts_json)
         .bind(&proxy.listen_path)
@@ -4025,8 +4027,9 @@ impl DatabaseStore {
         self.lock_mtls_dns_admission_tx(&mut tx, &consumer.namespace)
             .await?;
         sqlx::query(
-            &self.q("INSERT INTO consumers (id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO consumers (labels, id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
+        .bind(serde_json::to_string(&consumer.labels)?)
         .bind(&consumer.id)
         .bind(&consumer.namespace)
         .bind(&consumer.username)
@@ -4098,8 +4101,9 @@ impl DatabaseStore {
         self.delete_consumer_identity_index_tx(&mut tx, &consumer.namespace, &consumer.id)
             .await?;
         sqlx::query(&self.q(
-            "UPDATE consumers SET username=?, custom_id=?, credentials=?, acl_groups=?, updated_at=? WHERE id=? AND namespace=?",
+            "UPDATE consumers SET labels=?, username=?, custom_id=?, credentials=?, acl_groups=?, updated_at=? WHERE id=? AND namespace=?",
         ))
+        .bind(serde_json::to_string(&consumer.labels)?)
         .bind(&consumer.username)
         .bind(&consumer.custom_id)
         .bind(&creds_json)
@@ -4336,8 +4340,9 @@ impl DatabaseStore {
         self.lock_mtls_dns_admission_tx(&mut tx, &pc.namespace)
             .await?;
         sqlx::query(
-            &self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, trigger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO plugin_configs (labels, id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, trigger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
+        .bind(serde_json::to_string(&pc.labels)?)
         .bind(&pc.id)
         .bind(&pc.namespace)
         .bind(&pc.plugin_name)
@@ -4419,8 +4424,9 @@ impl DatabaseStore {
             return Ok(false);
         }
         sqlx::query(
-            &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, trigger_json=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE plugin_configs SET labels=?, plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, trigger_json=?, updated_at=? WHERE id=? AND namespace=?")
         )
+        .bind(serde_json::to_string(&pc.labels)?)
         .bind(&pc.plugin_name)
         .bind(&config_json)
         .bind(scope_str)
@@ -5331,8 +5337,9 @@ impl DatabaseStore {
         self.lock_mtls_dns_admission_tx(&mut tx, &upstream.namespace)
             .await?;
         sqlx::query(
-            &self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO upstreams (labels, id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
+        .bind(serde_json::to_string(&upstream.labels)?)
         .bind(&upstream.id)
         .bind(&upstream.namespace)
         .bind(&upstream.name)
@@ -5421,8 +5428,9 @@ impl DatabaseStore {
             return Ok(false);
         }
         sqlx::query(
-            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE upstreams SET labels=?, name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=? AND namespace=?")
         )
+        .bind(serde_json::to_string(&upstream.labels)?)
         .bind(&upstream.name)
         .bind(&targets_json)
         .bind(algo_str)
@@ -6932,6 +6940,7 @@ impl DatabaseStore {
             let stream_match_json = serialize_stream_match(proxy)?;
 
             sqlx::query(&insert_sql)
+                .bind(serde_json::to_string(&proxy.labels)?)
                 .bind(&proxy.id)
                 .bind(&proxy.namespace)
                 .bind(&proxy.name)
@@ -7220,12 +7229,13 @@ impl DatabaseStore {
         consumers: &[Consumer],
         touched_namespaces: &mut HashSet<String>,
     ) -> Result<(), anyhow::Error> {
-        let sql = self.q("INSERT INTO consumers (id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO consumers (labels, id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for consumer in consumers {
             let creds_json = serde_json::to_string(&consumer.credentials)?;
             let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
             sqlx::query(&sql)
+                .bind(serde_json::to_string(&consumer.labels)?)
                 .bind(&consumer.id)
                 .bind(&consumer.namespace)
                 .bind(&consumer.username)
@@ -7328,7 +7338,7 @@ impl DatabaseStore {
         configs: &[PluginConfig],
         touched_namespaces: &mut HashSet<String>,
     ) -> Result<(), anyhow::Error> {
-        let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, trigger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO plugin_configs (labels, id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, trigger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql = self.q(
             "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)",
         );
@@ -7341,6 +7351,7 @@ impl DatabaseStore {
                 PluginScope::Global => "global",
             };
             sqlx::query(&sql)
+                .bind(serde_json::to_string(&pc.labels)?)
                 .bind(&pc.id)
                 .bind(&pc.namespace)
                 .bind(&pc.plugin_name)
@@ -7438,7 +7449,7 @@ impl DatabaseStore {
         upstreams: &[Upstream],
         touched_namespaces: &mut HashSet<String>,
     ) -> Result<(), anyhow::Error> {
-        let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO upstreams (labels, id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for upstream in upstreams {
             let targets_json = serde_json::to_string(&upstream.targets)?;
@@ -7467,6 +7478,7 @@ impl DatabaseStore {
             let backend_tls_san_allow_list_json =
                 upstream_backend_tls_san_allow_list_json(upstream)?;
             sqlx::query(&sql)
+                .bind(serde_json::to_string(&upstream.labels)?)
                 .bind(&upstream.id)
                 .bind(&upstream.namespace)
                 .bind(&upstream.name)
@@ -8965,8 +8977,8 @@ impl DatabaseStore {
         self.copy_namespace_pk_rows_tx(
             tx,
             "consumers",
-            "id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at",
-            "id, ?, username, custom_id, credentials, acl_groups, created_at, updated_at",
+            "labels, id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at",
+            "labels, id, ?, username, custom_id, credentials, acl_groups, created_at, updated_at",
             current_name,
             new_name,
         )
@@ -9409,12 +9421,13 @@ impl DatabaseStore {
             let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(u)?;
 
             sqlx::query(&self.q("INSERT INTO upstreams \
-                 (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
+                 (labels, id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
                   health_checks, service_discovery, subsets, backend_tls_client_cert_path, \
                   backend_tls_client_key_path, backend_tls_verify_server_cert, \
                   backend_tls_server_ca_cert_path, backend_tls_sni, \
                   backend_tls_san_allow_list, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+            .bind(serde_json::to_string(&u.labels)?)
             .bind(&u.id)
             .bind(&u.namespace)
             .bind(&u.name)
@@ -9462,7 +9475,7 @@ impl DatabaseStore {
             let stream_match_json = serialize_stream_match(p)?;
 
             sqlx::query(&self.q("INSERT INTO proxies \
-                 (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, \
+                 (labels, id, namespace, name, hosts, listen_path, backend_scheme, backend_host, \
                   backend_port, backend_path, strip_listen_path, preserve_host_header, \
                   backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, \
                   backend_tls_client_cert_path, backend_tls_client_key_path, \
@@ -9480,9 +9493,10 @@ impl DatabaseStore {
                   allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
                   stream_proxy_protocol, backend_proxy_protocol, stream_match, \
                   api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                          ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+            .bind(serde_json::to_string(&p.labels)?)
             .bind(&p.id)
             .bind(&p.namespace)
             .bind(&p.name)
@@ -9585,9 +9599,10 @@ impl DatabaseStore {
                 crate::config::types::PluginScope::Global => "global",
             };
             sqlx::query(&self.q("INSERT INTO plugin_configs \
-                 (id, namespace, plugin_name, config, scope, proxy_id, enabled, \
+                 (labels, id, namespace, plugin_name, config, scope, proxy_id, enabled, \
                   priority_override, trigger_json, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+            .bind(serde_json::to_string(&pc.labels)?)
             .bind(&pc.id)
             .bind(&pc.namespace)
             .bind(&pc.plugin_name)
@@ -9889,12 +9904,13 @@ impl DatabaseStore {
             let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(u)?;
 
             sqlx::query(&self.q("INSERT INTO upstreams \
-                 (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
+                 (labels, id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
                   health_checks, service_discovery, subsets, backend_tls_client_cert_path, \
                   backend_tls_client_key_path, backend_tls_verify_server_cert, \
                   backend_tls_server_ca_cert_path, backend_tls_sni, \
                   backend_tls_san_allow_list, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+            .bind(serde_json::to_string(&u.labels)?)
             .bind(&u.id)
             .bind(&u.namespace)
             .bind(&u.name)
@@ -9937,7 +9953,7 @@ impl DatabaseStore {
             };
             let stream_match_json = serialize_stream_match(p)?;
 
-            sqlx::query(&self.q("UPDATE proxies SET \
+            sqlx::query(&self.q("UPDATE proxies SET labels=?, \
                  namespace = ?, name = ?, hosts = ?, listen_path = ?, backend_scheme = ?, \
                  backend_host = ?, backend_port = ?, backend_path = ?, \
                  strip_listen_path = ?, preserve_host_header = ?, \
@@ -9966,6 +9982,7 @@ impl DatabaseStore {
                  stream_proxy_protocol = ?, backend_proxy_protocol = ?, stream_match = ?, \
                  api_spec_id = ?, updated_at = ? \
                  WHERE id = ? AND namespace = ?"))
+            .bind(serde_json::to_string(&p.labels)?)
             .bind(&p.namespace)
             .bind(&p.name)
             .bind(&hosts_json)
@@ -10059,9 +10076,10 @@ impl DatabaseStore {
                 crate::config::types::PluginScope::Global => "global",
             };
             sqlx::query(&self.q("INSERT INTO plugin_configs \
-                 (id, namespace, plugin_name, config, scope, proxy_id, enabled, \
+                 (labels, id, namespace, plugin_name, config, scope, proxy_id, enabled, \
                   priority_override, trigger_json, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+            .bind(serde_json::to_string(&pc.labels)?)
             .bind(&pc.id)
             .bind(&pc.namespace)
             .bind(&pc.plugin_name)
@@ -12161,6 +12179,7 @@ fn row_to_proxy_inner(
     })?;
 
     Ok(Proxy {
+        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
         id,
         namespace: row_namespace_or_default(row),
         name: row.try_get("name").ok(),
@@ -12512,6 +12531,7 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
     })?;
 
     Ok(Consumer {
+        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         username: row.try_get("username")?,
@@ -12594,6 +12614,7 @@ fn row_to_plugin_config_inner(
     };
 
     Ok(PluginConfig {
+        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         plugin_name: row.try_get("plugin_name")?,
@@ -12840,6 +12861,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
     let backend_tls_sni = optional_utf8_text_column(row, "backend_tls_sni")?;
 
     Ok(Upstream {
+        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         name: row.try_get("name").ok(),
@@ -13158,7 +13180,7 @@ mod proxy_insert_sql_drift_tests {
         // VALUES list has one `?` per column; we lifted this row count from
         // the actual INSERT in submit_api_spec_bundle. Update if columns
         // change there.
-        let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+        let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                                      ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         let placeholders = values_clause.matches('?').count();

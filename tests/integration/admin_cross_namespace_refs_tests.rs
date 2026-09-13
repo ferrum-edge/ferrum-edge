@@ -22,6 +22,8 @@
 //!      that lives in namespace `A` is rejected with 400.
 //!   4. Same-namespace references continue to succeed (regression guard).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
@@ -144,7 +146,7 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual = listener.local_addr().unwrap();
     let state_clone = state.clone();
     let shutdown_rx_clone = shutdown_rx.clone();
@@ -960,6 +962,7 @@ fn mongo_mesh_route_dispatch_upstream_ref_lookup_filters_by_namespace() {
 
 fn ns_upstream(namespace: &str, id: &str) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         name: None,
@@ -1001,6 +1004,7 @@ fn ns_upstream(namespace: &str, id: &str) -> Upstream {
 
 fn ns_plugin_config(namespace: &str, id: &str, scope: PluginScope) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         plugin_name: "stdout_logging".to_string(),
@@ -1018,6 +1022,7 @@ fn ns_plugin_config(namespace: &str, id: &str, scope: PluginScope) -> PluginConf
 
 fn ns_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         name: None,

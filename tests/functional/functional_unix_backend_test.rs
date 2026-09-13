@@ -23,6 +23,8 @@
 //!
 //! Unix-only: there is no Unix-domain socket transport on Windows.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TrustedProjectedGateway, TrustedProjectedGatewayOptions};
 
 use ferrum_edge::config::EnvConfig;
@@ -184,7 +186,7 @@ fn containment_root(temp: &TempDir) -> PathBuf {
 }
 
 async fn reserve_placeholder_port() -> (u16, tokio::net::TcpListener) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind placeholder port");
     let port = listener.local_addr().expect("placeholder addr").port();

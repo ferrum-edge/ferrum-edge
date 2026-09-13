@@ -4,6 +4,8 @@
 //! streaming guard used when clients send request bodies without a
 //! `Content-Length`, such as HTTP/1.1 chunked uploads and HTTP/2 DATA streams.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 
 use bytes::Bytes;
@@ -165,7 +167,7 @@ impl CollectingBackend {
 }
 
 async fn spawn_collecting_backend() -> CollectingBackend {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind collecting backend");
     let port = listener.local_addr().expect("backend addr").port();

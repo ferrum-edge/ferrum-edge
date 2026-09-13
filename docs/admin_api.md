@@ -90,7 +90,8 @@ curl http://localhost:9000/health
 
 # Authenticated: full diagnostics.
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
-# Returns: {"status","timestamp","mode","database":{...},"admin_writes_enabled",
+# Returns: {"status","timestamp","mode","namespace":{...},"database":{...},
+#           "admin_writes_enabled",
 #           "ready","cached_config":{"proxy_count":...},"database_polling":{...},
 #           "config_rejected":true,"mesh":{"egress_scope":{...}},
 #           "listener_failures":{"failures_total":...},
@@ -408,6 +409,77 @@ Sizing note: there is no listener-wide budget for concurrently buffered request 
 
 ## Namespaces
 
+### Admin is multi-namespace; one process's data plane serves one namespace
+
+The Admin API accepts any valid `X-Ferrum-Namespace`. A **proxy data plane does
+not**: it projects every configuration snapshot down to the process's single
+active namespace (`FERRUM_NAMESPACE`, default `ferrum`) before building the
+router, plugin, consumer, and load-balancer caches. Writing a resource under a
+namespace this process does not route therefore succeeds, stays visible to
+Admin reads, and is never matched by the local proxy — the data plane answers
+`404` (issue #5447).
+
+That asymmetry is deliberate, not a bug in the storage layer:
+
+| Mode | Admin writes | Data plane | Multi-namespace writes |
+|---|---|---|---|
+| `cp` | read/write | none | **Intended.** The CP stores every namespace in `FERRUM_CP_NAMESPACES` and each DP subscribes to its own. |
+| `database` | read/write | one namespace | **Unrouted here.** Accepted and durable, but only `FERRUM_NAMESPACE` is served by this process. |
+| `file`, `dp`, `mesh` | read-only | one namespace | Cannot arise — mutations are rejected with `403`. |
+| `node_agent` | read-only | none | Not applicable. |
+
+Two mechanisms make the mismatch visible instead of silent:
+
+**1. Discover the served namespace up front.** The authenticated `/health` and
+`/status` detail carries a `namespace` object:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:9000/status \
+  | jq '.namespace'
+# {
+#   "active": "ferrum",
+#   "serving_scope": "single-namespace-data-plane",
+#   "data_plane_single_namespace": true
+# }
+```
+
+- `active` — the one namespace this process's data plane routes. `null` when the
+  process has no data plane (`cp`, `node_agent`).
+- `serving_scope` — closed set: `single-namespace-data-plane` (`database`,
+  `file`, `dp`, `mesh`), `control-plane` (`cp`), `no-data-plane`
+  (`node_agent`).
+- `data_plane_single_namespace` — `true` when everything outside `active` is
+  unrouted by this process. This is the field to branch on.
+
+The block is authenticated-tier only (the namespace name is operator-supplied
+deployment topology); the unauthenticated probe still carries only `status` and
+`ready`.
+
+**2. Detect it per write.** An **accepted** mutation (`2xx` on
+`POST`/`PUT`/`PATCH`/`DELETE`) to a namespace-scoped route under a namespace this
+process does not route carries:
+
+```
+X-Ferrum-Namespace-Unserved: true
+```
+
+The header is absent when the requested namespace is the served one, on every
+non-`2xx` response (a rejected write never reached the store), on reads, on
+global admin surfaces that `X-Ferrum-Namespace` does not select, and in `cp`
+mode. A deferred `202` never carries it either: `?apply=async` is already a
+no-op for a namespace this process does not serve, so such a write returns its
+synchronous success status and no `X-Ferrum-Config-Cursor`.
+
+The gateway also logs one `WARN` per `(namespace, resource kind)` for these
+accepted-but-unrouted mutations, deduplicated so a provisioning client looping
+over one tenant logs once rather than once per resource, bounded to 256 distinct
+pairs, and rate limited to one line per five seconds past that bound.
+
+Nothing about routing, filtering, admission, or status codes changes: both
+mechanisms are observability. If you need several namespaces served at once, run
+`cp` mode with one `dp` per namespace rather than pointing a multi-namespace
+client at a single-process gateway.
+
 ### Resource identity is `(namespace, id)`
 
 Proxy, upstream, plugin-config, API-spec, and consumer ids are unique **within a
@@ -576,7 +648,12 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
     "strip_listen_path": true
   }' \
   http://localhost:9000/proxies
+```
 
+Plaintext backends need `backend_scheme: http`. Omitting `backend_scheme` on
+`POST /proxies` stores `https` (the HTTP-family default).
+
+```bash
 # Get a proxy
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
 
@@ -2179,3 +2256,46 @@ Returns `404 Not Found` outside mesh mode (when the mesh runtime state is not wi
 ## Mesh Policy Denies (mesh mode)
 
 `GET /mesh/policy-denies/recent` is JWT-authenticated and mesh-only. It returns the top-N most recent `mesh_authz` deny events grouped by the `(rule, source, destination, reason)` tuple, for ad-hoc triage. The recorder is a process-singleton bounded FIFO ring (`FERRUM_MESH_POLICY_DENY_LOG_CAPACITY`, default `10000`) written only on the `mesh_authz` deny branch — allowed requests never touch it, and a denied request takes the recorder mutex once to push the event (so under a deny storm the cost is on the deny path, not on normal traffic). The endpoint reads a one-shot snapshot, filters to a recent `window`, groups by the 4-tuple, sorts by count descending, and truncates to `limit`. Identity / route / policy metadata only; no request bodies, headers, or credentials. Set `FERRUM_MESH_POLICY_DENY_LOG_CAPACITY=0` to disable the recorder (the endpoint still serves an empty `grouped` array).
+
+## Resource labels and application attribution
+
+Proxies, consumers, upstreams, and plugin configurations accept a `labels`
+map of strings, for example:
+
+```json
+{"labels": {"provisioned-by": "ferrum-nexus", "team": "platform"}}
+```
+
+Labels appear on GET/list, backup/restore, file configuration, and CP/DP
+configuration, and survive namespace renames. Empty maps are omitted from
+responses. A resource PUT without
+`labels` preserves the current map; a supplied map replaces it, and `{}` clears
+it. At most 64 labels are allowed, with nonblank keys up to 128 UTF-8 bytes and
+values up to 512 bytes; neither may contain control characters.
+
+Provisioning clients can send `X-Ferrum-Provisioned-By: ferrum-foundry`.
+CRUD creates, batch creates, and non-spec-owned restore rows fill an absent
+`provisioned-by` label from this header, retaining all existing labels.
+API-spec POST/PUT also label extracted proxies, upstreams, plugins and generated
+validators; PUT carries forward missing labels on existing resource identities.
+Spec-owned restore graphs remain verbatim to preserve their resource hashes.
+The three companion values are `ferrum-edge-git-forge-ops`, `ferrum-nexus`, and
+`ferrum-foundry`. Existing unlabeled resources remain unknown until explicitly
+labeled or reconciled by their provisioning tool; editing one through another
+application does not establish its original creator.
+
+Labels are informational, not authorization, ownership, audit identity or
+routing selectors. In particular they do not replace `api_spec_id`, the GitOps
+managed-resource ledger, consumer identities, or upstream target `tags`.
+The gateway namespace registry and fleet-global TLS/ACME/trust management
+surfaces are separate from these four gateway configuration resource types.
+
+This schema change follows the build-out policy: the SQL baseline includes the
+labels column for PostgreSQL, MySQL and SQLite; initialize/rebuild the development
+database from that baseline when deploying it. MongoDB stores labels through its
+existing BSON resource serialization. Upgrade the gateway and file validator
+before upgrading clients that emit labels in resource bodies. In control-plane
+deployments, upgrade every data plane before the control plane: `config_json`
+is parsed with `deny_unknown_fields`, so a data plane that predates this field
+rejects a namespace snapshot as soon as any resource in it carries a non-empty
+`labels` map, and it does not converge until it is upgraded.

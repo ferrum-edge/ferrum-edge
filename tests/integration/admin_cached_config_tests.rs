@@ -3,6 +3,8 @@
 //! Tests that the admin API serves config from the in-memory cache when
 //! the database is unavailable (resilience during data source outages).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::admin::{
@@ -86,6 +88,7 @@ fn generate_expired_test_token(config: &TestConfig) -> String {
 
 fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
@@ -162,6 +165,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             create_test_proxy("proxy-2", "/api/v2", "backend2.example.com", 9090),
         ],
         consumers: vec![Consumer {
+            labels: Default::default(),
             id: "consumer-1".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             username: "alice".to_string(),
@@ -172,6 +176,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             updated_at: Utc::now(),
         }],
         plugin_configs: vec![PluginConfig {
+            labels: Default::default(),
             id: "plugin-cfg-1".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
@@ -194,6 +199,7 @@ fn create_test_gateway_config() -> GatewayConfig {
 
 fn create_test_upstream(id: &str, name: &str) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(name.to_string()),
@@ -254,7 +260,7 @@ async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sen
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
 
     let state_clone = state.clone();
@@ -1493,6 +1499,7 @@ fn create_pagination_test_config() -> GatewayConfig {
             8080,
         ));
         consumers.push(Consumer {
+            labels: Default::default(),
             id: format!("consumer-{}", i),
             namespace: ferrum_edge::config::types::default_namespace(),
             username: format!("user-{}", i),
@@ -1503,6 +1510,7 @@ fn create_pagination_test_config() -> GatewayConfig {
             updated_at: Utc::now(),
         });
         plugin_configs.push(PluginConfig {
+            labels: Default::default(),
             id: format!("plugin-cfg-{}", i),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),

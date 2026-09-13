@@ -2924,22 +2924,18 @@ fn builtin_pack_examples(
         Value::Bool(enabled) => Ok(enabled.then(|| strings_to_vec(default_examples))),
         Value::Object(object) => {
             let enabled = optional_bool_in_object(Some(object), "enabled")?.unwrap_or(true);
-            if !enabled {
-                return Ok(None);
-            }
-
             let examples_mode =
                 optional_string_from_object(object, "examples_mode")?.unwrap_or("append");
             let custom_examples =
                 optional_examples_from_object(object, &format!("builtins.{key}.examples"))?;
 
-            match examples_mode {
+            let examples = match examples_mode {
                 "append" => {
                     let mut examples = strings_to_vec(default_examples);
                     if let Some(custom_examples) = custom_examples {
                         append_unique_examples(&mut examples, custom_examples);
                     }
-                    Ok(Some(examples))
+                    examples
                 }
                 "replace" => {
                     let Some(custom_examples) = custom_examples else {
@@ -2947,12 +2943,15 @@ fn builtin_pack_examples(
                             "ai_semantic_firewall: builtins.{key}.examples is required when examples_mode is 'replace'"
                         ));
                     };
-                    Ok(Some(custom_examples))
+                    custom_examples
                 }
-                other => Err(format!(
-                    "ai_semantic_firewall: builtins.{key}.examples_mode must be 'append' or 'replace', got {other:?}"
-                )),
-            }
+                other => {
+                    return Err(format!(
+                        "ai_semantic_firewall: builtins.{key}.examples_mode must be 'append' or 'replace', got {other:?}"
+                    ));
+                }
+            };
+            Ok(enabled.then_some(examples))
         }
         _ => Err(format!(
             "ai_semantic_firewall: builtins.{key} must be a boolean or object"
@@ -6630,26 +6629,25 @@ const DOCUMENT_ID_MEMBER: &str = "id";
 /// it names reach the model, so neither is inspected.
 const DOCUMENT_EXCLUDES_MEMBER: &str = "_excludes";
 
+/// Parse a document's exclusion control once before visiting its members. This
+/// keeps processing linear when both collections are attacker-controlled.
+fn document_excluded_members(excludes: Option<&Value>) -> HashSet<&str> {
+    match excludes {
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
+        // Tolerate the single-value spelling of the same control.
+        Some(Value::String(excluded)) => HashSet::from([excluded.as_str()]),
+        _ => HashSet::new(),
+    }
+}
+
 /// Whether a Cohere document-map member is bookkeeping the provider keeps out
 /// of what the model reads: the citation [`DOCUMENT_ID_MEMBER`], the
 /// [`DOCUMENT_EXCLUDES_MEMBER`] control itself, or a member that control names.
-///
-/// The control list is scanned in place rather than collected into a set: both
-/// it and a document's member list are a handful of entries, and this runs on
-/// the request path.
-fn document_member_is_hidden(member: &str, excludes: Option<&Value>) -> bool {
+fn document_member_is_hidden(member: &str, excluded_members: &HashSet<&str>) -> bool {
     if member == DOCUMENT_ID_MEMBER || member == DOCUMENT_EXCLUDES_MEMBER {
         return true;
     }
-    match excludes {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|excluded| excluded == member),
-        // Tolerate the single-value spelling of the same control.
-        Some(Value::String(excluded)) => excluded == member,
-        _ => false,
-    }
+    excluded_members.contains(member)
 }
 
 /// Cohere v1 `documents[]` RAG entries, read MEMBER-WISE rather than through a
@@ -6709,9 +6707,9 @@ fn extract_cohere_documents(
             );
             continue;
         }
-        let excludes = object.get(DOCUMENT_EXCLUDES_MEMBER);
+        let excluded_members = document_excluded_members(object.get(DOCUMENT_EXCLUDES_MEMBER));
         for (member, value) in object {
-            if document_member_is_hidden(member, excludes) {
+            if document_member_is_hidden(member, &excluded_members) {
                 continue;
             }
             extract_prose_value(

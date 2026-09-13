@@ -1937,7 +1937,7 @@ struct ApiSpecFixture<'a> {
 }
 
 fn api_spec_document(input: ApiSpecFixture<'_>) -> Value {
-    let operation_path = format!("{}/orders/{{order_id}}", input.listen_path);
+    let operation_path = "/orders/{order_id}".to_string();
     let mut paths = serde_json::Map::new();
     paths.insert(
         operation_path,

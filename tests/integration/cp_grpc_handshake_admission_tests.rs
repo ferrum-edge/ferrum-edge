@@ -23,6 +23,8 @@
 //! Every wait is bounded and every assertion is on limiter state or socket
 //! EOF, so the suite is deterministic enough for hosted CI.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -150,7 +152,7 @@ fn tls_slot(config: Arc<ServerConfig>) -> ferrum_edge::tls::SharedFrontendTls {
 }
 
 async fn bind_listener() -> (TcpListener, SocketAddr) {
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    let listener = TcpListener::bind_test(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .await
         .expect("bind CP gRPC test listener");
     let addr = listener.local_addr().expect("local addr");

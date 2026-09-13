@@ -422,6 +422,30 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     after the chain are governed by `sanitize_client_response_headers_for_wire`,
     not by a further policy pass.
 11. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
+    - A representation this LEGACY hook SELECTS has not been seen by 10b/10c.
+      `mcp_gateway`'s POST-attached MCP event stream is the one such case: the
+      buffered H1/H2 path and the native-H3 buffered writer re-close both
+      authoritative phases over it
+      (`enforce_late_buffered_final_response_policy`) before the committed
+      hooks, and its `Last-Event-ID` retention is a separate two-phase
+      reservation on `RequestContext` settled only AFTER the pre-commit
+      authorization gate (issue #5441). Commit requires status `200`, a
+      `text/event-stream` content type, and the byte-identical staged body;
+      anything else aborts, and dropping the lease aborts, so a replaced or
+      refused response is never replayable and never leaks stream capacity.
+    - Re-running a final phase is only safe when the phase's state model
+      tolerates it. `waf` marks the two final client-visible phases REPLACEABLE
+      (`plugins::WafScorePhase`) so a re-run supersedes its own previous
+      anomaly contribution instead of double-counting one response;
+      `body_validator` is a pure function of the representation;
+      `ai_response_guard` is re-entrant, but its residual-verified exemption is
+      keyed by the exact bytes it verified, so a re-framed representation is
+      re-scanned and a `redact` disposition that left detector-visible residue
+      is refused (fail-closed) rather than delivered.
+    - The SYNTHETIC short-circuit lifecycle runs this same legacy hook but its
+      writers return before that retention boundary, so `mcp_gateway` answers
+      inline there (the `ferrum:synthetic_short_circuit` marker) instead of
+      staging a reservation nothing can settle.
 12. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
 13. `on_ws_frame`: WS size, rate, frame logging, and `waf` complete-message
     body-rule inspection

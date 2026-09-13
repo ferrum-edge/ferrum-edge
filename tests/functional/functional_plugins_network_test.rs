@@ -18,6 +18,8 @@
 
 #![allow(clippy::bool_assert_comparison)]
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
@@ -950,7 +952,7 @@ async fn response_caching_does_not_cache_5xx_from_failed_backends() {
 
     let serve_200 = Arc::new(AtomicBool::new(false));
     let counter = Arc::new(AtomicU32::new(0));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
     let serve_200_task = serve_200.clone();
     let counter_task = counter.clone();

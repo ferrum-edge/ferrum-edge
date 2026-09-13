@@ -3,6 +3,8 @@
 //! These tests verify that the DP client connects to the CP server,
 //! receives initial config snapshots, and processes streaming config updates.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -116,6 +118,7 @@ fn generate_near_expiry_jwt(node_id: &str, audience: Option<&str>) -> String {
 /// Create a test Proxy entry.
 fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
@@ -450,7 +453,9 @@ async fn start_test_cp_server(
         MeshGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
 
     // Bind to port 0 to get a random available port
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
@@ -532,7 +537,9 @@ async fn start_severable_test_cp_server(config: GatewayConfig) -> SeverableTestC
     // registered with one reactor cannot be polled from another.
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
     runtime.spawn(async move {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         if addr_tx.send(addr).is_err() {
@@ -565,7 +572,9 @@ async fn start_test_cp_server_with_real_ip_header(
     let (server, _update_tx) = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
         .real_ip_header(Some(real_ip_header.to_string()))
         .build();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {
@@ -1230,7 +1239,9 @@ async fn test_xds_ads_stream_returns_lds_snapshot() {
         32,
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let _server_handle = tokio::spawn(async move {
@@ -1303,7 +1314,9 @@ async fn test_xds_ads_per_node_stream_cap_rejects_excess_streams() {
     )
     .with_max_streams_per_node(1);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let _server_handle = tokio::spawn(async move {
@@ -1973,7 +1986,9 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
         CUSTOM_ISSUER.to_string(),
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let bound_addr = listener.local_addr().unwrap();
     let server_handle = tokio::spawn(async move {
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -2222,6 +2237,7 @@ async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update()
     .expect("DP should receive the initial snapshot");
 
     let mut upper = Consumer {
+        labels: Default::default(),
         id: "upper".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "alice".to_string(),
@@ -2245,6 +2261,7 @@ async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update()
     let mut invalid_config = create_test_config(2);
     invalid_config.consumers = vec![upper, lower];
     invalid_config.plugin_configs = vec![PluginConfig {
+        labels: Default::default(),
         id: "dns-mtls".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "mtls_auth".to_string(),
@@ -2419,7 +2436,9 @@ async fn start_test_cp_server_with_tls(
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
     let (server, update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
 
     let mut tls_config =
@@ -3245,7 +3264,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
     let (server, _update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let bound_addr = listener.local_addr().unwrap();
 
     let server_handle = tokio::spawn(async move {
@@ -3335,7 +3354,7 @@ async fn test_cp_rejects_dp_with_empty_version() {
     let (server, _update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let bound_addr = listener.local_addr().unwrap();
 
     let server_handle = tokio::spawn(async move {
@@ -3394,6 +3413,7 @@ async fn test_cp_rejects_dp_with_empty_version() {
 
 fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("upstream-{}", id)),
@@ -3438,6 +3458,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
 
 fn create_test_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -3964,7 +3985,9 @@ async fn start_test_cp_server_with_capacity(
         channel_capacity,
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
@@ -4113,7 +4136,9 @@ async fn start_test_cp_server_with_namespace(
             cp_namespace.to_string(),
         );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
@@ -4703,7 +4728,9 @@ async fn spawn_blackhole_relay(
     use tokio::net::TcpStream;
 
     let blackhole = Arc::new(AtomicBool::new(false));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let flag = blackhole.clone();
     let handle = tokio::spawn(async move {
@@ -5777,7 +5804,9 @@ async fn start_native_admission_harness(
         .registry(mesh_registry.clone())
         .max_stream_lifetime(max_stream_lifetime)
         .build();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {
@@ -6323,7 +6352,9 @@ async fn start_severable_native_admission_server() -> SeverableNativeAdmissionSe
         .unwrap();
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
     runtime.spawn(async move {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         if addr_tx.send(addr).is_err() {
             return;
@@ -6466,7 +6497,9 @@ async fn start_test_xds_server_with_limits(
     .with_admission_limits(limits);
     let admission = xds_server.admission();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {
@@ -7128,6 +7161,7 @@ async fn test_xds_simultaneous_client_disconnect_releases_every_permit() {
 async fn test_cp_refuses_unconstructible_plugin_config_and_dp_reports_rejection() {
     let mut unconstructible = create_test_config(1);
     unconstructible.plugin_configs = vec![PluginConfig {
+        labels: Default::default(),
         id: "rsl-typo".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "request_size_limiting".to_string(),
@@ -7413,7 +7447,7 @@ mod configsync_size_bounds {
     }
 
     #[test]
-    fn configsync_rejected_broadcasts_log_namespace_without_reporting_delivery() {
+    fn configsync_rejected_broadcasts_disconnect_subscribers_without_reporting_delivery() {
         let config = oversized_config();
         let (server, tx) = CpGrpcServer::new(
             Arc::new(ArcSwap::from_pointee(create_test_config(1))),
@@ -7450,10 +7484,11 @@ mod configsync_size_bounds {
                 &CpScope::Single("ferrum".to_string()),
             );
         });
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        // The stream-level size guard turns these publications into terminal
+        // RESOURCE_EXHAUSTED errors. They must enter the channel first so an
+        // established subscriber cannot remain healthy on heartbeats alone.
+        assert!(rx.try_recv().unwrap().encoded_len() > LIMIT);
+        assert!(rx.try_recv().unwrap().encoded_len() > LIMIT);
         assert_eq!(registry.snapshot()[0].last_update_at, before);
         let logs = logs.contents();
         assert_eq!(
@@ -7466,8 +7501,8 @@ mod configsync_size_bounds {
         assert!(logs.contains(&format!("max_bytes={LIMIT}")));
         assert!(!logs.contains("configuration-canary"));
 
-        // A real receiver and a subsequent accepted publication make the
-        // negative assertion meaningful; this is not an unsubscribed channel.
+        // A subsequent accepted publication remains deliverable to a receiver
+        // that has not modeled tonic's terminal stream behavior.
         CpGrpcServer::broadcast_namespace_update(
             &broadcasts,
             "ferrum",
@@ -7575,7 +7610,9 @@ mod configsync_size_bounds {
         use hyper::service::service_fn;
         use hyper_util::rt::{TokioExecutor, TokioIo};
 
-        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let backend_addr = backend.local_addr().unwrap();
         let backend_task = tokio::spawn(async move {
             loop {
@@ -7647,7 +7684,9 @@ mod configsync_size_bounds {
         assert_eq!(state.config.load().proxies.len(), count);
         assert!(connection.load().last_config_received_at.is_some());
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let proxy_task = tokio::spawn(

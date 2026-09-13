@@ -9,6 +9,8 @@
 //!   3. Spawn the admin listener on a random port.
 //!   4. Make HTTP requests using `reqwest`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::{
@@ -150,7 +152,7 @@ fn make_admin_state(db: DatabaseStore, max_spec_mib: usize) -> AdminState {
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual = listener.local_addr().unwrap();
     let state_clone = state.clone();
     let rx_clone = rx.clone();
@@ -433,6 +435,7 @@ fn manual_proxy_plugin(
     config: Value,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: plugin_id.to_string(),
         namespace: "ferrum".to_string(),
         plugin_name: plugin_name.to_string(),
@@ -756,6 +759,111 @@ async fn post_happy_path_returns_201_with_id() {
     assert_eq!(body["proxy_id"].as_str().unwrap(), proxy_id);
     assert!(body["content_hash"].is_string());
     assert!(body["spec_version"].is_string());
+}
+
+#[tokio::test]
+async fn post_swagger_with_listen_path_persists_a_working_validator() {
+    use ferrum_edge::plugins::{
+        Plugin, PluginResult, RequestContext, openapi_validator::OpenapiValidator,
+    };
+    use std::collections::HashMap;
+
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("mounted-validator");
+    let spec = format!(
+        r#"swagger: "2.0"
+info:
+  title: Mounted API
+  version: "1.0.0"
+x-ferrum-validate: true
+x-ferrum-proxy:
+  id: {proxy_id}
+  listen_path: /p2/oas2
+  backend_host: backend.internal
+  backend_port: 8080
+consumes: [application/json]
+paths:
+  /items:
+    post:
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [name]
+            properties:
+              name:
+                type: string
+      responses:
+        "201":
+          description: created
+"#
+    );
+    let (status, body) = client.post_yaml("/api-specs", &spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
+    let spec_id = body["id"].as_str().unwrap();
+    let generated = store
+        .list_spec_owned_plugin_configs("ferrum", spec_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|plugin| plugin.plugin_name == "openapi_validator")
+        .expect("POST must persist the generated validator");
+    assert_eq!(
+        generated.config["operations"][0]["path_template"],
+        "/p2/oas2/items"
+    );
+    assert_eq!(
+        generated.config["operations"][0]["path_regex"],
+        "^/p2/oas2/items$"
+    );
+    let proxy = store.get_proxy("ferrum", &proxy_id).await.unwrap().unwrap();
+    assert!(
+        proxy
+            .plugins
+            .iter()
+            .any(|association| association.plugin_config_id == generated.id)
+    );
+    let proxy = Arc::new(proxy);
+    let plugin = OpenapiValidator::new(&generated.config).unwrap();
+    for (path, body, allowed) in [
+        ("/p2/oas2/items", r#"{"name":"book"}"#, true),
+        ("/p2/oas2/items", "{}", false),
+        ("/p2/oas2/unknown", r#"{"name":"book"}"#, false),
+        ("/items", r#"{"name":"book"}"#, false),
+    ] {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), path.into());
+        ctx.matched_proxy = Some(Arc::clone(&proxy));
+        let mut headers = HashMap::from([("content-type".into(), "application/json".into())]);
+        ctx.headers = headers.clone();
+        let mut result = plugin
+            .validate_client_request_body_contract(&mut ctx, &headers, body.as_bytes())
+            .await;
+        if matches!(result, PluginResult::Continue) {
+            result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        }
+        if allowed {
+            assert!(
+                matches!(result, PluginResult::Continue),
+                "{path}: {result:?}"
+            );
+            assert_eq!(
+                ctx.metadata
+                    .get("openapi_validator.matched_operation")
+                    .map(String::as_str),
+                Some("POST /p2/oas2/items")
+            );
+        } else {
+            match result {
+                PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+                other => panic!("{path} must reject: {other:?}"),
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -1411,7 +1519,9 @@ async fn delete_rejects_removing_last_global_tcp_throttle_target_with_422() {
     let store = make_store(&dir).await;
     let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
     let client = AdminClient::new(base);
-    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let listen_port = bound.local_addr().unwrap().port();
     drop(bound);
 
@@ -1451,6 +1561,7 @@ async fn delete_rejects_removing_last_global_tcp_throttle_target_with_422() {
     let now = Utc::now();
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: throttle_id,
             namespace: "ferrum".to_string(),
             plugin_name: "tcp_connection_throttle".to_string(),
@@ -1711,6 +1822,7 @@ async fn api_spec_post_and_exact_put_validate_against_prospective_schema_graph()
     let store = make_store(&dir).await;
     let schema_name = uid("api-spec-schema");
     let schema_plugin = PluginConfig {
+        labels: Default::default(),
         id: uid("schema-plugin"),
         namespace: "ferrum".to_string(),
         plugin_name: "transaction_log_schema".to_string(),
@@ -1780,6 +1892,7 @@ async fn api_spec_writes_ignore_an_unchanged_invalid_persisted_schema_graph() {
 
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: uid("preexisting-dangling-logger"),
             namespace: "ferrum".to_string(),
             plugin_name: "stdout_logging".to_string(),
@@ -1836,6 +1949,7 @@ async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions(
     let schema_id = uid("spec-owned-schema-plugin");
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: schema_id.clone(),
             namespace: "ferrum".to_string(),
             plugin_name: "transaction_log_schema".to_string(),
@@ -1868,6 +1982,7 @@ async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions(
     );
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: uid("manual-schema-referrer"),
             namespace: "ferrum".to_string(),
             plugin_name: "stdout_logging".to_string(),
@@ -1941,6 +2056,7 @@ async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
     let schema_id = uid("cascade-schema-owner");
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: schema_id.clone(),
             namespace: "ferrum".to_string(),
             plugin_name: "transaction_log_schema".to_string(),
@@ -1975,6 +2091,7 @@ async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
 
     let group_logger_id = uid("cascade-group-logger");
     let group_logger = PluginConfig {
+        labels: Default::default(),
         id: group_logger_id.clone(),
         namespace: "ferrum".to_string(),
         plugin_name: "stdout_logging".to_string(),
@@ -2760,6 +2877,7 @@ async fn post_mtls_dns_policy_conflict_returns_409() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
     let mut upper = Consumer {
+        labels: Default::default(),
         id: uid("mtls-upper"),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: uid("mtls-upper-user"),
@@ -5229,7 +5347,9 @@ async fn post_spec_with_unbindable_stream_port_returns_422_or_equivalent() {
 
     // Bind a TCP listener on an ephemeral port and hold it for the duration
     // of the test so the gateway's OS-level probe fails.
-    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let occupied_port = bound.local_addr().unwrap().port();
 
     let mut state = make_admin_state(store, 25);
@@ -5278,7 +5398,9 @@ async fn post_spec_stream_port_cp_mode_skips_os_probe() {
     let store = make_store(&dir).await;
 
     // Bind a port to make it appear occupied.
-    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let occupied_port = bound.local_addr().unwrap().port();
 
     let mut state = make_admin_state(store, 25);
@@ -6993,7 +7115,7 @@ async fn external_ref_http_admission_runs_off_the_async_worker() {
     use std::net::TcpListener;
     use std::thread;
 
-    let fixture = TcpListener::bind("127.0.0.1:0").expect("bind external-ref fixture");
+    let fixture = TcpListener::bind_test("127.0.0.1:0").expect("bind external-ref fixture");
     let fixture_port = fixture.local_addr().expect("fixture address").port();
     let fixture_thread = thread::spawn(move || {
         if let Ok((mut stream, _)) = fixture.accept() {

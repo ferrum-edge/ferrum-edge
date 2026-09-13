@@ -47,6 +47,7 @@ fn checked_in_descriptor() -> String {
 
 fn test_proxy() -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: PROXY_ID.to_string(),
         namespace: default_namespace(),
         name: Some(PROXY_ID.to_string()),
@@ -117,6 +118,7 @@ fn test_proxy() -> Proxy {
 
 fn audit_plugin_config(config: Value) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: AUDIT_PLUGIN_ID.to_string(),
         namespace: default_namespace(),
         plugin_name: PLUGIN_NAME.to_string(),

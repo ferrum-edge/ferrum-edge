@@ -1051,6 +1051,7 @@ mod tests {
 
     fn test_consumer() -> Consumer {
         Consumer {
+            labels: Default::default(),
             id: "phase3-consumer".to_string(),
             username: "phase3-user".to_string(),
             namespace: default_namespace(),

@@ -16,6 +16,8 @@
 //!   cargo test --test functional_tests h3_grpc_streaming -- --ignored --nocapture
 //! ```
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::time::Duration;
 
 use crate::scaffolding::backends::{
@@ -159,8 +161,7 @@ async fn spawn_h3_grpc_gateway_with_response_buffering(
     let mut last_err = String::new();
     for _ in 0..5 {
         let reservation = reserve_port().await.expect("reserve https port");
-        let https_port = reservation.port;
-        drop(reservation);
+        let https_port = reservation.drop_and_take_port();
 
         let scratch = tempfile::tempdir().expect("scratch");
         let (cert_path, key_path) = write_frontend_certs(scratch.path());
@@ -232,7 +233,7 @@ async fn open_grpc_stream_with_retry(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_non_post_method_reject_applies_route_policy() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind unused backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -273,7 +274,7 @@ async fn h3_grpc_non_post_method_reject_applies_route_policy() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_streaming_unary_roundtrip() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -332,7 +333,7 @@ async fn h3_grpc_streaming_unary_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -429,7 +430,7 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_buffered_grpc_security_policy_preserves_initial_and_trailer_provenance() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -513,7 +514,7 @@ async fn h3_buffered_grpc_security_policy_preserves_initial_and_trailer_provenan
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_buffered_grpc_security_removal_wins_over_cookie_rehome_and_trailer_replay() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -592,7 +593,7 @@ async fn h3_buffered_grpc_security_removal_wins_over_cookie_rehome_and_trailer_r
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_buffered_grpc_empty_split_response_keeps_terminal_metadata_in_trailers() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -659,7 +660,7 @@ async fn h3_buffered_grpc_empty_split_response_keeps_terminal_metadata_in_traile
 async fn assert_h3_buffered_grpc_trailers_only_preserves_initial_terminal_status(
     remove_terminal_metadata: bool,
 ) {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -739,7 +740,7 @@ async fn h3_buffered_grpc_trailers_only_resists_terminal_removal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_streaming_server_responds_before_client_half_close() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -809,7 +810,7 @@ async fn h3_grpc_streaming_server_responds_before_client_half_close() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_backend_error_arrives_before_client_half_close() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -868,7 +869,7 @@ async fn h3_grpc_backend_error_arrives_before_client_half_close() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_large_slow_upload_reaches_backend_before_eof() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -946,7 +947,7 @@ async fn h3_grpc_large_slow_upload_reaches_backend_before_eof() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_client_upload_cancellation_resets_backend_stream() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -1000,7 +1001,7 @@ async fn h3_grpc_client_upload_cancellation_resets_backend_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_response_cancellation_resets_open_backend_upload() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -1054,7 +1055,7 @@ async fn h3_grpc_response_cancellation_resets_open_backend_upload() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_streaming_enforces_max_request_size_incrementally() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -1125,7 +1126,7 @@ fn send_sigterm(pid: u32) {
 #[ignore]
 #[cfg(unix)]
 async fn h3_grpc_shutdown_completes_trailers_after_goaway() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();

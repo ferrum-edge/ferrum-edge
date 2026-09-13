@@ -7,6 +7,8 @@
 //! proved empty, while H3 always collects into an empty buffer. Either way a
 //! configured JSON rule must reject, and the backend must never be dialed.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::reserve_colocated_tcp_udp;
@@ -349,7 +351,7 @@ fn request_validator_config(backend_port: u16) -> String {
 
 /// Minimal HTTP/1.1 backend that counts every request it is actually handed.
 async fn spawn_counting_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind counting backend");
     let port = listener.local_addr().expect("local addr").port();

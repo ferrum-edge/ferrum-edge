@@ -69,6 +69,7 @@ fn tagged_target(host: &str, port: u16, tags: &[(&str, &str)]) -> UpstreamTarget
 fn sticky_upstream(targets: Vec<UpstreamTarget>) -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: UPSTREAM_ID.to_string(),
         namespace: NAMESPACE.to_string(),
         name: Some(UPSTREAM_ID.to_string()),

@@ -487,6 +487,62 @@ async fn valid_request_and_gzip_body_continue() {
 }
 
 #[tokio::test]
+async fn hand_authored_full_paths_match_independently_of_listen_path_stripping() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [
+            {
+                "method": "POST",
+                "path_template": "/p2/oas2/items",
+                "path_regex": "^/p2/oas2/items$"
+            },
+            {
+                "method": "POST",
+                "path_template": "/p2/oas2/items/{id}",
+                "path_regex": "^/p2/oas2/items/[^/]+$"
+            }
+        ]
+    }))
+    .unwrap();
+
+    for strip_listen_path in [true, false] {
+        let mut proxy = create_test_proxy();
+        proxy.listen_path = Some("/p2/oas2".to_string());
+        proxy.strip_listen_path = strip_listen_path;
+        let proxy = Arc::new(proxy);
+
+        for (path, label) in [
+            ("/p2/oas2/items", "POST /p2/oas2/items"),
+            ("/p2/oas2/items/42", "POST /p2/oas2/items/{id}"),
+        ] {
+            let mut ctx = post_ctx(path);
+            ctx.matched_proxy = Some(Arc::clone(&proxy));
+            let mut headers = json_headers();
+            assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+            assert_eq!(
+                ctx.metadata
+                    .get("openapi_validator.matched_operation")
+                    .map(String::as_str),
+                Some(label)
+            );
+        }
+
+        for path in [
+            "/items",
+            "/items/42",
+            "/p2/oas2/unknown",
+            "/p2/oas2/items/",
+            "/p2/oas2/items/42/extra",
+            "/p2/oas2/p2/oas2/items",
+        ] {
+            let mut ctx = post_ctx(path);
+            ctx.matched_proxy = Some(Arc::clone(&proxy));
+            let mut headers = json_headers();
+            assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+        }
+    }
+}
+
+#[tokio::test]
 async fn unknown_operation_is_rejected_before_proxy() {
     let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
     let mut ctx = post_ctx("/missing");
@@ -3542,6 +3598,7 @@ async fn xml_scalar_shapes_are_consistent_on_requests_and_responses() {
                 ("<value><child/></value>", false),
                 ("<value label=\"sample\">text</value>", false),
                 ("<value><?note sample?>text</value>", false),
+                ("<value><?note sample?></value>", false),
             ],
         ),
         (
@@ -3554,6 +3611,10 @@ async fn xml_scalar_shapes_are_consistent_on_requests_and_responses() {
                 ("<record><count>3<child/></count></record>", false),
                 ("<record><count unit=\"items\">3</count></record>", false),
                 ("<record><count>3<!-- note -->0</count></record>", false),
+                (
+                    "<record><count>3</count><?backend mode=\"admin\"?></record>",
+                    false,
+                ),
             ],
         ),
     ] {
@@ -5795,6 +5856,7 @@ async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_del
             consumers: vec![],
             plugin_configs: vec![PluginConfig {
                 id: "ov1".to_string(),
+                labels: Default::default(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "openapi_validator".to_string(),
                 config,
@@ -9687,8 +9749,8 @@ async fn xml_depth_screen_does_not_false_reject_legal_constructs() {
         // Comment and CDATA payloads that look like deep nesting.
         "<root><!-- <a><b><c> --><a>x</a></root>".to_string(),
         "<root><a><![CDATA[<b><c><d>]]></a></root>".to_string(),
-        // XML declaration plus a processing instruction.
-        r#"<?xml version="1.0"?><root><?target <a><b> ?><a>x</a></root>"#.to_string(),
+        // An XML declaration does not contribute to element nesting.
+        r#"<?xml version="1.0"?><root><a>x</a></root>"#.to_string(),
         // Self-closing elements never accumulate depth.
         self_closing,
     ];

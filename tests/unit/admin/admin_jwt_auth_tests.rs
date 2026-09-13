@@ -5,6 +5,8 @@ use ferrum_edge::admin::jwt_auth::{AdminClaims, AdminRole, JwtConfig, JwtError, 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
 
+use crate::unit::env_lock::EnvGuard;
+
 fn test_jwt_config() -> JwtConfig {
     JwtConfig {
         secret: "test-secret".to_string(),
@@ -786,58 +788,6 @@ fn test_jwt_hostile_timestamp_extremes_rejected() {
     );
 }
 
-/// Panic-safe snapshot for the admin JWT environment touched by the manager
-/// construction test. The shared lock stays held until Drop restores every
-/// previous value.
-struct AdminJwtEnvGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl AdminJwtEnvGuard {
-    const KEYS: [&'static str; 4] = [
-        "FERRUM_ADMIN_JWT_SECRET",
-        "FERRUM_ADMIN_JWT_ISSUER",
-        "FERRUM_ADMIN_JWT_AUDIENCE",
-        "FERRUM_ADMIN_JWT_MAX_TTL",
-    ];
-
-    fn new() -> Self {
-        let lock = crate::unit::env_lock::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let saved = Self::KEYS
-            .iter()
-            .map(|&key| (key, std::env::var_os(key)))
-            .collect();
-        Self { _lock: lock, saved }
-    }
-
-    fn set(&self, key: &'static str, value: &str) {
-        // SAFETY: this guard holds the process-wide environment lock.
-        unsafe { std::env::set_var(key, value) }
-    }
-
-    fn unset(&self, key: &'static str) {
-        // SAFETY: this guard holds the process-wide environment lock.
-        unsafe { std::env::remove_var(key) }
-    }
-}
-
-impl Drop for AdminJwtEnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in &self.saved {
-            // SAFETY: `_lock` remains held while Drop restores the snapshot.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
-}
-
 /// `FERRUM_ADMIN_JWT_MAX_TTL` is a security control, so a present-but-invalid
 /// value fails startup instead of silently falling back to the default or to
 /// an effectively unlimited cap.
@@ -845,7 +795,7 @@ impl Drop for AdminJwtEnvGuard {
 fn test_create_jwt_manager_rejects_invalid_max_ttl() {
     use ferrum_edge::admin::jwt_auth::create_jwt_manager_from_env;
 
-    let env = AdminJwtEnvGuard::new();
+    let env = EnvGuard::new(&[]);
     env.set(
         "FERRUM_ADMIN_JWT_SECRET",
         "secret-padding-for-32-characters!!",
@@ -886,7 +836,7 @@ fn test_create_jwt_manager_rejects_invalid_max_ttl() {
 fn test_create_jwt_manager_distinguishes_unset_from_invalid_explicit_config() {
     use ferrum_edge::admin::jwt_auth::{JwtError, create_jwt_manager_from_env};
 
-    let env = AdminJwtEnvGuard::new();
+    let env = EnvGuard::new(&[]);
     env.unset("FERRUM_ADMIN_JWT_ISSUER");
     env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
     env.unset("FERRUM_ADMIN_JWT_MAX_TTL");

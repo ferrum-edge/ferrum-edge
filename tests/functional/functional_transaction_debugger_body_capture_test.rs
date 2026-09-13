@@ -6,6 +6,8 @@
 //! (oversized, encoded, unknown-length, binary/non-textual) is reported as an
 //! explicit omission and still proxied normally.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::Http2Client;
 
@@ -97,7 +99,7 @@ impl DebugBodyHarness {
     }
 
     async fn try_new() -> Result<Self, String> {
-        let backend_listener = TcpListener::bind("127.0.0.1:0")
+        let backend_listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .map_err(|error| format!("bind backend: {error}"))?;
         let backend_port = backend_listener

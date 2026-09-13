@@ -3183,6 +3183,11 @@ where
                         Err(e) => {
                             let attempt_result =
                                 reqwest_error_response_for_cross_protocol(state, &e, None);
+                            crate::proxy::https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+                                proxy,
+                                &current_url,
+                                &e,
+                            );
                             warn!(
                                 proxy_id = %proxy.id,
                                 error = %e,
@@ -4179,6 +4184,11 @@ where
                             state,
                             &e,
                             final_backend_resolved_ip.clone(),
+                        );
+                        crate::proxy::https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+                            proxy,
+                            &current_url,
+                            &e,
                         );
                         record_cross_protocol_backend_admission_outcome(
                             &mut backend_admission_permits,
@@ -11875,7 +11885,6 @@ mod tests {
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
-            half_open_probe_dwell_seconds: None,
         }
     }
 

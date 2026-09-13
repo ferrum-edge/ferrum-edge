@@ -4,6 +4,8 @@
 //! work, never inside the shared listener recv loop. Client B must complete
 //! while client A is parked on an injected delay.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -100,6 +102,7 @@ impl Plugin for RejectingStreamOrderingProbe {
 
 fn fault_plugin_config(config: serde_json::Value) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: PLUGIN_CONFIG_ID.to_string(),
         plugin_name: "fault_injection".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -117,6 +120,7 @@ fn fault_plugin_config(config: serde_json::Value) -> PluginConfig {
 
 fn udp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("udp fault injection".to_string()),
@@ -391,7 +395,11 @@ async fn spawn_udp_gateway_with_policy(
 
 #[tokio::test]
 async fn udp_stream_rejection_precedes_first_datagram_fault_delay() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
 
@@ -402,7 +410,9 @@ async fn udp_stream_rejection_precedes_first_datagram_fault_delay() {
     )
     .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
 
     client
         .send_to(b"unauthorized", gateway_addr)
@@ -469,7 +479,11 @@ async fn expect_no_echo(client: &UdpSocket, gateway: SocketAddr, payload: &[u8])
 
 #[tokio::test]
 async fn udp_abort_drops_datagram_without_echo() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
 
@@ -479,7 +493,9 @@ async fn udp_abort_drops_datagram_without_echo() {
     )
     .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
 
     expect_no_echo(&client, gateway_addr, b"drop-me").await;
 
@@ -489,7 +505,11 @@ async fn udp_abort_drops_datagram_without_echo() {
 
 #[tokio::test]
 async fn udp_delay_for_client_a_does_not_block_client_b() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
 
@@ -508,8 +528,12 @@ async fn udp_delay_for_client_a_does_not_block_client_b() {
     // functional fixture used `127.0.0.2` here, which needs a secondary
     // loopback alias macOS does not configure (issue #4983); the port alone
     // carries the peer identity this test asserts on.
-    let client_a = UdpSocket::bind("127.0.0.1:0").await.expect("client A bind");
-    let client_b = UdpSocket::bind("127.0.0.1:0").await.expect("client B bind");
+    let client_a = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client A bind");
+    let client_b = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client B bind");
     assert_ne!(
         client_a.local_addr().expect("client A addr"),
         client_b.local_addr().expect("client B addr"),
@@ -548,7 +572,11 @@ async fn udp_delay_for_client_a_does_not_block_client_b() {
 
 #[tokio::test]
 async fn udp_session_connect_abort_refuses_new_session() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
 
@@ -560,7 +588,9 @@ async fn udp_session_connect_abort_refuses_new_session() {
     )
     .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
 
     expect_no_echo(&client, gateway_addr, b"never").await;
     expect_no_echo(&client, gateway_addr, b"still-never").await;

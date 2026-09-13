@@ -12,6 +12,8 @@
 //! the path/body name themselves (list filtering plus per-name 403s, including
 //! a rename's target name).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::_test_support::lock_namespace_registry_admission_for_test;
@@ -251,7 +253,9 @@ fn file_mode_state() -> AdminState {
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr parses");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind_test(addr)
+        .await
+        .expect("bind");
     let actual = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(
@@ -616,6 +620,7 @@ async fn rename_moves_resources_and_rejects_target_collision() {
     let store = make_store(&dir).await;
     let (base, _shutdown) = start_admin(admin_state(store)).await;
     let token = admin_token();
+    let labels = json!({"provisioned-by":"ferrum-foundry", "team":"platform"});
 
     let (status, body) = send(
         reqwest::Method::POST,
@@ -635,12 +640,37 @@ async fn rename_moves_resources_and_rejects_target_collision() {
         "tenant-a",
         Some(json!({
             "id": "up-a",
+            "labels": labels.clone(),
             "name": "up-a-name",
             "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
         })),
     )
     .await;
     assert_eq!(status, 201, "create upstream in tenant-a");
+
+    for (path, mut body) in [
+        ("/consumers", json!({"id":"consumer-a", "username":"alice"})),
+        (
+            "/proxies",
+            json!({"id":"proxy-a", "listen_path":"/labels-rename", "backend_host":"example.com", "backend_port":80}),
+        ),
+        (
+            "/plugins/config",
+            json!({"id":"plugin-a", "plugin_name":"cors", "scope":"global", "enabled":false, "config":{}}),
+        ),
+    ] {
+        body["labels"] = labels.clone();
+        let status = send_in_namespace(
+            reqwest::Method::POST,
+            &base,
+            path,
+            &token,
+            "tenant-a",
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, 201, "create {path} in tenant-a");
+    }
 
     let (status, body) = send(
         reqwest::Method::PUT,
@@ -691,6 +721,25 @@ async fn rename_moves_resources_and_rejects_target_collision() {
     )
     .await;
     assert_eq!(status, 200, "upstream moved with the tenant");
+
+    for path in [
+        "/upstreams/up-a",
+        "/consumers/consumer-a",
+        "/proxies/proxy-a",
+        "/plugins/config/plugin-a",
+    ] {
+        let response = reqwest::Client::new()
+            .get(format!("{base}{path}"))
+            .bearer_auth(&token)
+            .header("X-Ferrum-Namespace", "tenant-b")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(status, 200, "{path}: {body:?}");
+        assert_eq!(body["labels"], labels, "labels moved with {path}");
+    }
 
     let (status, body) = send(
         reqwest::Method::POST,

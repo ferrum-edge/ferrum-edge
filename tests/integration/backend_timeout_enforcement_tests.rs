@@ -14,6 +14,8 @@
 //! suite (`scripted_backend_tests.rs`, `scripted_backend_h2_tests.rs`,
 //! `scripted_backend_h3_tests.rs`).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::Http2Client;
 use crate::scaffolding::backends::{
     HttpStep, RequestMatcher, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
@@ -663,7 +665,7 @@ async fn send_queue_drain_watch_terminates_a_peer_that_never_reads() {
         // `docs/configuration.md` next to `backend_write_timeout_ms`.
         return;
     }
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind never-reading peer");
     // Constrain what the peer's kernel will absorb for a socket nobody reads.
@@ -714,7 +716,7 @@ async fn send_queue_drain_watch_lets_a_reading_peer_finish() {
     if !ferrum_edge::_test_support::send_queue_probe_supported() {
         return;
     }
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind reading peer");
     let addr = listener.local_addr().expect("local addr");
@@ -975,7 +977,7 @@ mod vendored_established_hook {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn established_reports_the_dialed_socket_once_per_physical_connection() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let addr = listener.local_addr().expect("local addr");

@@ -158,6 +158,7 @@ fn mysql_sequence_and_route_lock_helpers_skip_redundant_for_update() {
 
 fn make_upstream(id: &str) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("tls-upstream".to_string()),
@@ -199,6 +200,7 @@ fn make_upstream(id: &str) -> Upstream {
 
 fn make_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -237,6 +239,7 @@ fn make_tcp_proxy(id: &str, listen_port: u16) -> Proxy {
 fn make_global_tcp_throttle(id: &str) -> PluginConfig {
     let now = chrono::Utc::now();
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         plugin_name: "tcp_connection_throttle".to_string(),
         namespace: "ferrum".to_string(),
@@ -953,6 +956,7 @@ async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
     let now = chrono::Utc::now();
     let error = store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: "dns-mtls".to_string(),
             plugin_name: "mtls_auth".to_string(),
             namespace: "ferrum".to_string(),
@@ -1012,6 +1016,7 @@ async fn independent_sqlite_stores_serialize_mtls_dns_consumer_admission() {
     let now = chrono::Utc::now();
     store_a
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: "dns-mtls".to_string(),
             plugin_name: "mtls_auth".to_string(),
             namespace: "ferrum".to_string(),
@@ -1235,6 +1240,7 @@ async fn independent_sqlite_stores_atomically_serialize_policy_association_and_i
     let now = chrono::Utc::now();
     store_a
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: "dns-mtls".to_string(),
             plugin_name: "mtls_auth".to_string(),
             namespace: "ferrum".to_string(),
@@ -1518,6 +1524,7 @@ async fn mtls_dns_admission_loads_consumers_only_for_effective_dns_policy() {
     let now = chrono::Utc::now();
     let error = store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: "dns-mtls".to_string(),
             plugin_name: "mtls_auth".to_string(),
             namespace: "ferrum".to_string(),
@@ -1577,6 +1584,7 @@ async fn mtls_dns_repair_deletes_may_only_reduce_existing_ambiguity() {
     let now = chrono::Utc::now();
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: "dns-mtls".to_string(),
             plugin_name: "mtls_auth".to_string(),
             namespace: "ferrum".to_string(),
@@ -1647,6 +1655,7 @@ async fn load_full_config_rejects_hmac_request_body_transform_composition() {
     ] {
         store
             .create_plugin_config(&PluginConfig {
+                labels: Default::default(),
                 id: id.to_string(),
                 plugin_name: plugin_name.to_string(),
                 namespace: "ferrum".to_string(),
@@ -2047,6 +2056,7 @@ async fn plugin_trigger_round_trips_create_update_full_load_and_clear() {
     .unwrap();
     let now = chrono::Utc::now();
     let mut plugin = PluginConfig {
+        labels: Default::default(),
         id: "triggered-transformer".to_string(),
         plugin_name: "request_transformer".to_string(),
         namespace: "ferrum".to_string(),

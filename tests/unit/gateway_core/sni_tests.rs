@@ -158,6 +158,7 @@ fn make_test_config(
 
 fn make_proxy(id: &str, hosts: Vec<&str>) -> ferrum_edge::config::types::Proxy {
     ferrum_edge::config::types::Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

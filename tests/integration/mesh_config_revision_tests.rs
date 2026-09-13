@@ -46,6 +46,8 @@
 //!    exact-content replay that must keep installing, revision/identity pairing
 //!    across rollback and reset, and the multi-scope Kubernetes counterexample.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -351,6 +353,7 @@ fn full_load_consumer_config(namespace: &str, generation: &str, timestamp: i64) 
     GatewayConfig {
         version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
         consumers: vec![Consumer {
+            labels: Default::default(),
             id: format!("{namespace}-{generation}"),
             username: format!("{namespace}-{generation}"),
             namespace: namespace.to_string(),
@@ -1492,7 +1495,7 @@ impl CpHandle {
 }
 
 async fn start_cp(updates: Vec<MeshConfigUpdate>) -> CpHandle {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind stub CP");
     let addr = listener.local_addr().expect("stub CP addr");

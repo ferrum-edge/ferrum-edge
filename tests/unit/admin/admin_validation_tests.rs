@@ -101,7 +101,16 @@ fn batch_create_admission_uses_point_uniqueness_instead_of_namespace_snapshot() 
 
     assert!(
         handler.contains("if batch_needs_consumer_snapshot(&batch)"),
-        "full consumer snapshot is only for mTLS/HMAC credential candidates"
+        "full consumer snapshot is only for mTLS/HMAC credential or mTLS plugin candidates"
+    );
+    let snapshot_gate = handler
+        .split("fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("consumer snapshot gate body");
+    assert!(
+        snapshot_gate.contains("plugin.plugin_name == \"mtls_auth\""),
+        "an mTLS plugin batch must load consumers before enabling the policy"
     );
     let snapshot = handler
         .find("load_namespace_snapshot(namespace)")
@@ -548,6 +557,7 @@ fn make_consumer(
     credentials: std::collections::HashMap<String, serde_json::Value>,
 ) -> ferrum_edge::config::types::Consumer {
     ferrum_edge::config::types::Consumer {
+        labels: Default::default(),
         id: "test-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "test-user".to_string(),
@@ -616,6 +626,7 @@ fn test_basic_credential_server_configuration_failures_are_internal_errors() {
 fn test_disabled_basic_auth_config_skips_plugin_construction() {
     let now = chrono::Utc::now();
     let mut plugin_config = ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
         id: "disabled-basic-auth".to_string(),
         plugin_name: "basic_auth".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -703,6 +714,7 @@ fn restore_admission_covers_batch_contracts_before_the_namespace_clear() {
 fn test_disabled_unknown_plugin_name_remains_invalid() {
     let now = chrono::Utc::now();
     let plugin_config = ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
         id: "disabled-unknown-plugin".to_string(),
         plugin_name: "not_a_registered_plugin".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -736,6 +748,7 @@ fn test_admin_stdout_logging_validation_rejects_unknown_paths() {
         ),
     ] {
         let plugin_config = ferrum_edge::config::types::PluginConfig {
+            labels: Default::default(),
             id: format!("invalid-{path}"),
             plugin_name: "stdout_logging".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
@@ -763,6 +776,7 @@ fn test_admin_stdout_logging_validation_preserves_null_defaults() {
         .enumerate()
     {
         let plugin_config = ferrum_edge::config::types::PluginConfig {
+            labels: Default::default(),
             id: format!("stdout-null-default-{index}"),
             plugin_name: "stdout_logging".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
@@ -816,6 +830,7 @@ fn test_admin_transaction_log_schema_rejects_unknown_closed_object_keys() {
         ),
     ] {
         let plugin_config = ferrum_edge::config::types::PluginConfig {
+            labels: Default::default(),
             id: id.to_string(),
             plugin_name: "transaction_log_schema".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
@@ -1025,6 +1040,7 @@ fn recovery_plugin(
     config: serde_json::Value,
 ) -> ferrum_edge::config::types::PluginConfig {
     ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: plugin_name.to_string(),
@@ -1908,4 +1924,44 @@ fn put_replace_semantics_are_documented_in_the_spec_and_admin_docs() {
             "docs/admin_api.md must document {statement:?}"
         );
     }
+}
+
+#[test]
+fn proxy_ws_origin_star_is_rejected_on_admin_and_validate_admission() {
+    let crud = include_str!("../../../src/admin/crud.rs");
+    let proxy_impl = crud
+        .find("impl AdminResource for Proxy")
+        .expect("Proxy admin implementation must exist");
+    let validate = crud[proxy_impl..]
+        .find("fn validate(")
+        .map(|offset| proxy_impl + offset)
+        .expect("Proxy admin validate");
+    let region_end = crud[validate..]
+        .find("fn cached_items(")
+        .map(|offset| validate + offset)
+        .expect("Proxy admin cached_items follows validate");
+    let validate = &crud[validate..region_end];
+    assert!(
+        validate.contains("self.validate_fields()"),
+        "Admin Proxy POST/PUT/PATCH/batch must reject '*' via validate_fields"
+    );
+
+    let restore = include_str!("../../../src/admin/mod.rs");
+    assert!(
+        restore.contains("candidate.allowed_ws_origins_admission_errors()"),
+        "POST /restore must reject '*' the same way as Proxy admission"
+    );
+
+    let cli = include_str!("../../../src/cli.rs");
+    let execute_validate = cli
+        .split("pub fn execute_validate(")
+        .nth(1)
+        .expect("execute_validate")
+        .split("pub fn execute_health(")
+        .next()
+        .unwrap_or(cli);
+    assert!(
+        execute_validate.contains("allowed_ws_origins_admission_errors()"),
+        "ferrum-edge validate must reject '*' after loading the file spec"
+    );
 }

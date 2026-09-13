@@ -1,3 +1,5 @@
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -280,13 +282,14 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
         // Reserve a port that's still bindable; the reservation drops here so
         // the manager can re-bind. Reconcile races a new bind against any other
         // grabber, but the test environment is single-tenant enough for this.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("reserve ephemeral");
         listener.local_addr().expect("local addr").port()
     };
 
     let mut proxy = Proxy {
+        labels: Default::default(),
         id: "stream-mtls".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -548,7 +551,7 @@ async fn mesh_peer_auth_live_reload_does_not_mutate_active_ordinary_dtls_listene
     let (cert_path, key_path) = write_ecdsa_pem_pair(dir.path(), "dtls-dedicated");
     let (ca_path, _) = write_ecdsa_pem_pair(dir.path(), "dtls-client-ca");
 
-    let holder = tokio::net::UdpSocket::bind("127.0.0.1:0")
+    let holder = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("udp holder");
     let port = holder.local_addr().expect("addr").port();

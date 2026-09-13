@@ -913,6 +913,7 @@ mod tests {
     fn rejecting_runtime_contract_includes_invalid_ip_restriction_shape() {
         let config = GatewayConfig {
             plugin_configs: vec![PluginConfig {
+                labels: Default::default(),
                 id: "broadened-ip-policy".to_string(),
                 namespace: default_namespace(),
                 plugin_name: "ip_restriction".to_string(),
@@ -939,6 +940,7 @@ mod tests {
     fn rejecting_runtime_contract_includes_invalid_geo_restriction_shape() {
         let config = GatewayConfig {
             plugin_configs: vec![PluginConfig {
+                labels: Default::default(),
                 id: "broadened-geo-policy".to_string(),
                 namespace: default_namespace(),
                 plugin_name: "geo_restriction".to_string(),
@@ -969,6 +971,7 @@ mod tests {
     fn rejecting_runtime_contract_includes_mesh_dispatch_upstream_references() {
         let config = GatewayConfig {
             plugin_configs: vec![PluginConfig {
+                labels: Default::default(),
                 id: "mesh-dispatch".to_string(),
                 namespace: default_namespace(),
                 plugin_name: "mesh_route_dispatch".to_string(),
@@ -1056,6 +1059,7 @@ mod tests {
         let mut config = GatewayConfig {
             version: "1".to_string(),
             plugin_configs: vec![PluginConfig {
+                labels: Default::default(),
                 id: "bad-stdout".to_string(),
                 namespace: default_namespace(),
                 plugin_name: "stdout_logging".to_string(),

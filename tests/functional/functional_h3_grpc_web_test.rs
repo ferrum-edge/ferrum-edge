@@ -7,6 +7,8 @@
 //! only after the grpc_web plugin stamps its trusted translation marker;
 //! plugin-free deployments retain their original pass-through transport.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -120,8 +122,7 @@ async fn spawn_h3_gateway(config: Value) -> (GatewayHarness, u16, tempfile::Temp
     let mut last_error = String::new();
     for _ in 0..5 {
         let reservation = reserve_port().await.expect("reserve H3 listener port");
-        let https_port = reservation.port;
-        drop(reservation);
+        let https_port = reservation.drop_and_take_port();
 
         let scratch = tempfile::tempdir().expect("gateway scratch dir");
         let (cert_path, key_path) = write_frontend_certs(scratch.path());
@@ -341,7 +342,7 @@ fn reject_config(backend_port: u16) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind reject sentinel backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
@@ -507,7 +508,7 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind pass-through backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
@@ -647,7 +648,7 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn streaming_h3_grpc_web_deadline_cancels_withheld_backend_headers() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind stalled pass-through backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
@@ -741,7 +742,7 @@ async fn streaming_h3_grpc_web_deadline_cancels_withheld_backend_headers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gRPC backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
@@ -1051,7 +1052,7 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_web_preserves_ascii_custom_trailers_binary_and_text() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gRPC backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
@@ -1182,7 +1183,7 @@ async fn h3_grpc_web_preserves_ascii_custom_trailers_binary_and_text() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_web_server_streaming_reaches_client_before_backend_eof() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gRPC backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
@@ -1331,7 +1332,7 @@ async fn h3_grpc_web_server_streaming_reaches_client_before_backend_eof() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_web_validates_complete_binary_and_text_request_envelopes() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gRPC backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();

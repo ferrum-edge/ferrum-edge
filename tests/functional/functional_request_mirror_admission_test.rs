@@ -37,6 +37,8 @@
 //! per-instance lease/permit lifecycle those transports share is covered by
 //! `tests/unit/plugins/request_mirror_tests.rs`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::Http3Client;
 
@@ -256,7 +258,7 @@ struct CaptureBackend {
 
 impl CaptureBackend {
     async fn spawn() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind capture backend");
         let port = listener.local_addr().expect("local addr").port();
@@ -454,7 +456,7 @@ struct HangingBackend {
 
 impl HangingBackend {
     async fn spawn() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind hanging backend");
         let port = listener.local_addr().expect("local addr").port();

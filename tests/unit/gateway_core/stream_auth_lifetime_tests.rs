@@ -49,6 +49,7 @@ const DEFAULT_MAX: u64 = 3_600;
 
 fn consumer(username: &str) -> Arc<Consumer> {
     Arc::new(Consumer {
+        labels: Default::default(),
         id: username.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),

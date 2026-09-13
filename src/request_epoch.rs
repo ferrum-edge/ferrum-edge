@@ -285,6 +285,7 @@ mod tests {
 
     fn proxy(id: &str, path: &str, plugins: Vec<&str>) -> Proxy {
         Proxy {
+            labels: Default::default(),
             id: id.to_string(),
             namespace: default_namespace(),
             name: Some(id.to_string()),
@@ -370,6 +371,7 @@ mod tests {
 
     fn upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         Upstream {
+            labels: Default::default(),
             id: id.to_string(),
             name: Some(id.to_string()),
             namespace: default_namespace(),
@@ -432,6 +434,7 @@ mod tests {
 
     fn plugin_config(id: &str, plugin_name: &str, config: Value) -> PluginConfig {
         PluginConfig {
+            labels: Default::default(),
             id: id.to_string(),
             namespace: default_namespace(),
             plugin_name: plugin_name.to_string(),
@@ -1012,6 +1015,7 @@ mod tests {
             Value::Array(vec![Value::Object(keyauth)]),
         );
         let consumer = crate::config::types::Consumer {
+            labels: Default::default(),
             id: "c1".to_string(),
             namespace: default_namespace(),
             username: "alice".to_string(),

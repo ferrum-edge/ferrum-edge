@@ -657,6 +657,43 @@ fn typed_component_properties_match_serde_field_inventories() {
 }
 
 #[test]
+fn circuit_breaker_config_documents_cooldown_seconds_input_alias() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let timeout_seconds = spec
+        .pointer("/components/schemas/CircuitBreakerConfig/properties/timeout_seconds")
+        .expect("CircuitBreakerConfig.timeout_seconds");
+    let timeout_description = timeout_seconds["description"]
+        .as_str()
+        .expect("timeout_seconds description");
+    assert!(
+        timeout_description.contains("cooldown_seconds"),
+        "timeout_seconds must document the cooldown_seconds input alias: {timeout_description}"
+    );
+    assert!(
+        timeout_description.contains("never returned"),
+        "timeout_seconds must say the alias is never returned: {timeout_description}"
+    );
+    // The alias is a real accepted input key, so the schema lists it (the
+    // serde/OpenAPI field-inventory parity test requires that) as a
+    // write-only, deprecated property pointing back at `timeout_seconds`.
+    let alias = spec
+        .pointer("/components/schemas/CircuitBreakerConfig/properties/cooldown_seconds")
+        .expect("CircuitBreakerConfig.cooldown_seconds is documented as an input alias");
+    assert_eq!(alias["writeOnly"], serde_json::Value::Bool(true));
+    assert_eq!(alias["deprecated"], serde_json::Value::Bool(true));
+    assert_eq!(alias["type"], timeout_seconds["type"]);
+    assert_eq!(alias["format"], timeout_seconds["format"]);
+    let alias_description = alias["description"]
+        .as_str()
+        .expect("cooldown_seconds description");
+    assert!(
+        alias_description.contains("alias for `timeout_seconds`"),
+        "cooldown_seconds must point back at timeout_seconds: {alias_description}"
+    );
+}
+
+#[test]
 fn mtls_auth_schemas_match_runtime_contract() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -9387,6 +9424,28 @@ fn upstream_runtime_serialization_is_covered_by_openapi() {
 }
 
 #[test]
+fn proxy_allowed_ws_origins_description_rejects_star_wildcard() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let description = spec
+        .pointer("/components/schemas/Proxy/properties/allowed_ws_origins/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("allowed_ws_origins description");
+    assert!(
+        description.contains("Empty array (default) allows all origins"),
+        "OpenAPI must state empty list is allow-all: {description}"
+    );
+    assert!(
+        description.contains("`*` is not a wildcard"),
+        "OpenAPI must state star is not a wildcard: {description}"
+    );
+    assert!(
+        description.contains("rejected at Admin API"),
+        "OpenAPI must state admission rejects star: {description}"
+    );
+}
+
+#[test]
 fn config_schemas_reject_nulls_that_rust_does_not_accept() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -12461,6 +12520,47 @@ fn delete_proxy_cleanup_orphaned_upstream_query_has_openapi_parity() {
     assert!(
         upstream_desc.contains("cleanup_orphaned_upstream=false"),
         "DELETE /upstreams/{{id}} must point at the proxy-delete opt-out: {upstream_desc}"
+    );
+}
+
+#[test]
+fn omitted_backend_scheme_https_default_has_openapi_and_docs_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let scheme_desc =
+        spec["components"]["schemas"]["Proxy"]["properties"]["backend_scheme"]["description"]
+            .as_str()
+            .expect("Proxy.backend_scheme description");
+    assert!(
+        scheme_desc.contains("defaults to `https` when omitted"),
+        "OpenAPI must document the HTTP-family https default: {scheme_desc}"
+    );
+    assert!(
+        scheme_desc.contains("Plaintext backends must set `backend_scheme: http`"),
+        "OpenAPI must tell operators how to reach plaintext backends: {scheme_desc}"
+    );
+
+    let created = spec["paths"]["/proxies"]["post"]["responses"]["201"]["description"]
+        .as_str()
+        .expect("POST /proxies 201 description");
+    assert!(
+        created.contains("defaults to `https` when omitted"),
+        "POST /proxies 201 must document the stored https default: {created}"
+    );
+
+    let create_desc = spec["components"]["schemas"]["ProxyCreate"]["description"]
+        .as_str()
+        .expect("ProxyCreate description");
+    assert!(
+        create_desc.contains("Plaintext backends must set `backend_scheme: http`"),
+        "ProxyCreate must document the plaintext-backend requirement: {create_desc}"
+    );
+
+    let admin_docs = include_str!("../../docs/admin_api.md");
+    assert!(
+        admin_docs.contains("Plaintext backends need `backend_scheme: http`"),
+        "docs/admin_api.md must note the plaintext-backend scheme next to POST /proxies"
     );
 }
 
@@ -16385,6 +16485,11 @@ fn ai_semantic_firewall_schema_matches_runtime_admission() {
             "provider": provider,
             "builtins": {"prompt_injection": {"examples_mode": "replace"}}
         }),
+        // Disabled nested packs still validate the tuning blocks they carry.
+        json!({
+            "enabled": false,
+            "builtins": {"prompt_injection": {"enabled": false, "examples_mode": "replace"}}
+        }),
         json!({"provider": provider, "streaming": {}}),
         json!({
             "provider": provider,
@@ -17397,5 +17502,258 @@ fn api_chargeback_schema_admits_only_constructible_configs() {
     assert!(
         section.contains("unsigned 64-bit integer"),
         "docs/plugins.md must state the unsigned bound on the timer knobs"
+    );
+}
+
+/// Namespace-scoped Admin mutations that can carry
+/// `X-Ferrum-Namespace-Unserved: true` on an accepted response (issue #5447),
+/// paired with the success statuses the dispatcher can return for them.
+///
+/// This is `LIVE_APPLIED_CONFIG_MUTATIONS` minus the two `/namespaces` registry
+/// operations: the namespace header does not select a tenant on a global
+/// registry route, so `is_namespace_scoped_route` excludes them and they must
+/// never claim the header.
+///
+/// The deferred `202` is deliberately absent from every row. `?apply=async` is
+/// already a no-op for a namespace this process does not serve — the covering
+/// cursor is `None`, so the handler returns the synchronous success status — so
+/// `AcceptedDeferred` must not declare the header either.
+const UNSERVED_NAMESPACE_MARKED_MUTATIONS: &[(&str, &[&str])] = &[
+    ("batchCreate", &["201"]),
+    ("restoreConfig", &["200"]),
+    ("createProxy", &["201"]),
+    ("updateProxy", &["200"]),
+    ("deleteProxy", &["204"]),
+    ("createConsumer", &["201"]),
+    ("updateConsumer", &["200"]),
+    ("deleteConsumer", &["204"]),
+    ("updateConsumerCredentials", &["200"]),
+    ("appendConsumerCredential", &["200"]),
+    ("deleteConsumerCredentials", &["204"]),
+    ("deleteConsumerCredentialByIndex", &["200"]),
+    ("createPluginConfig", &["201"]),
+    ("updatePluginConfig", &["200"]),
+    ("deletePluginConfig", &["204"]),
+    ("createUpstream", &["201"]),
+    ("updateUpstream", &["200"]),
+    ("deleteUpstream", &["204"]),
+    ("createGatewayTrustBundle", &["201"]),
+    ("updateGatewayTrustBundle", &["200"]),
+    ("deleteGatewayTrustBundle", &["204"]),
+    ("submitApiSpec", &["201"]),
+    ("replaceApiSpec", &["200"]),
+    ("deleteApiSpec", &["204"]),
+];
+
+const UNSERVED_NAMESPACE_HEADER_NAME: &str = "X-Ferrum-Namespace-Unserved";
+const UNSERVED_NAMESPACE_HEADER_REF: &str = "#/components/headers/X-Ferrum-Namespace-Unserved";
+
+fn response_declares_unserved_namespace_header(
+    spec: &serde_json::Value,
+    response: &serde_json::Value,
+) -> bool {
+    let resolved = resolve_openapi_value(spec, response);
+    match resolved.pointer("/headers/X-Ferrum-Namespace-Unserved") {
+        Some(header) => {
+            header.get("$ref").and_then(serde_json::Value::as_str)
+                == Some(UNSERVED_NAMESPACE_HEADER_REF)
+        }
+        None => false,
+    }
+}
+
+/// The runtime stamps `X-Ferrum-Namespace-Unserved` from one place, so the
+/// spec must declare it on exactly the responses that place can reach:
+/// the accepted-mutation statuses of namespace-scoped routes, and nothing else.
+/// A generated client that never sees the header cannot detect the issue #5447
+/// silent failure, and a client told to expect it on a read or on a global
+/// route would branch on a field the gateway never sends.
+#[test]
+fn unserved_namespace_header_is_declared_on_exactly_the_accepted_namespace_mutations() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    // The runtime constant and the spec key must be the same field name.
+    let runtime_header = ferrum_edge::admin::NAMESPACE_UNSERVED_HEADER;
+    assert_eq!(
+        runtime_header, UNSERVED_NAMESPACE_HEADER_NAME,
+        "the runtime header name drifted from the documented spelling"
+    );
+    let header = spec
+        .pointer("/components/headers/X-Ferrum-Namespace-Unserved")
+        .expect("X-Ferrum-Namespace-Unserved header component");
+    assert_eq!(header["required"], false, "the marker is optional");
+    assert_eq!(
+        header["schema"]["enum"],
+        json!(["true"]),
+        "the gateway only ever sends the literal `true`"
+    );
+    let header_description = header["description"]
+        .as_str()
+        .expect("the header component is documented");
+    for expected in ["cp", "GET /status", "2xx"] {
+        assert!(
+            header_description.contains(expected),
+            "the header description must explain `{expected}`: {header_description}"
+        );
+    }
+
+    // Deferred 202 can never carry it: an unserved write captures no covering
+    // cursor, so `?apply=async` returns the synchronous success status instead.
+    let accepted_deferred = spec
+        .pointer("/components/responses/AcceptedDeferred")
+        .expect("AcceptedDeferred response component");
+    assert!(
+        !response_declares_unserved_namespace_header(&spec, accepted_deferred),
+        "an unserved write never reaches the deferred 202 path"
+    );
+
+    let mut expected_sites: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut table_ids = BTreeSet::new();
+    for (operation_id, success_statuses) in UNSERVED_NAMESPACE_MARKED_MUTATIONS {
+        assert!(
+            table_ids.insert(*operation_id),
+            "duplicate marked-mutation operationId `{operation_id}`"
+        );
+        let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
+        let responses = operation["responses"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{method} {path} responses is an object"));
+        for status in *success_statuses {
+            let response = responses.get(*status).unwrap_or_else(|| {
+                panic!("{method} {path} ({operation_id}) missing success status {status}")
+            });
+            assert!(
+                response_declares_unserved_namespace_header(&spec, response),
+                "{method} {path} ({operation_id}) {status} must declare \
+                 {UNSERVED_NAMESPACE_HEADER_REF}"
+            );
+            expected_sites.insert((operation_id.to_string(), (*status).to_string()));
+        }
+    }
+
+    // Inverse direction: nothing outside the table may claim the header. This is
+    // what keeps a read route, a `503`, or a `/namespaces` registry operation
+    // from documenting a marker the dispatcher will not send.
+    let mut documented_sites: BTreeSet<(String, String)> = BTreeSet::new();
+    for (path, path_item) in spec["paths"].as_object().expect("paths is an object") {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item {path} is an object"));
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = path_item.get(*method) else {
+                continue;
+            };
+            let operation_id = operation["operationId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method} {path} is missing operationId"));
+            let Some(responses) = operation["responses"].as_object() else {
+                continue;
+            };
+            for (status, response) in responses {
+                if response_declares_unserved_namespace_header(&spec, response) {
+                    documented_sites.insert((operation_id.to_string(), status.clone()));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        documented_sites, expected_sites,
+        "openapi.yaml declares the unserved-namespace marker somewhere the \
+         dispatcher does not stamp it (or is missing a site it does)"
+    );
+
+    // The header parameter that causes the condition must point at both
+    // mitigations so a client reading only the parameter still finds them.
+    let parameter_description = spec
+        .pointer("/components/parameters/XFerrumNamespace/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("XFerrumNamespace is documented");
+    assert!(
+        parameter_description.contains(UNSERVED_NAMESPACE_HEADER_NAME)
+            && parameter_description.contains("GET /status"),
+        "the namespace parameter must name the marker and the discovery surface: \
+         {parameter_description}"
+    );
+}
+
+/// `/health` and `/status` publish which namespace this process's data plane
+/// routes (issue #5447). The schema must stay a fixed three-field report on the
+/// authenticated tier: it is the one-call discovery surface downstream
+/// provisioning tooling branches on, so its shape is API, and it must never
+/// grow into a listing of the other tenants a shared database holds.
+#[test]
+fn health_namespace_serving_report_is_a_fixed_authenticated_detail_block() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let schema = spec
+        .pointer("/components/schemas/NamespaceServingReport")
+        .expect("NamespaceServingReport exists");
+    let fields: BTreeSet<String> = schema["properties"]
+        .as_object()
+        .expect("the schema declares properties")
+        .keys()
+        .cloned()
+        .collect();
+    let expected_fields: BTreeSet<String> =
+        ["active", "data_plane_single_namespace", "serving_scope"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    assert_eq!(
+        fields, expected_fields,
+        "the serving report must stay exactly the three documented fields"
+    );
+    assert_eq!(
+        schema["required"],
+        json!(["active", "serving_scope", "data_plane_single_namespace"])
+    );
+    assert_eq!(
+        schema["properties"]["active"]["type"],
+        json!(["string", "null"]),
+        "`active` is null when the process has no data plane"
+    );
+    assert_eq!(
+        schema["properties"]["serving_scope"]["enum"],
+        json!([
+            "single-namespace-data-plane",
+            "control-plane",
+            "no-data-plane"
+        ]),
+        "the serving scope must stay the closed set the runtime emits"
+    );
+    assert_eq!(
+        schema["properties"]["data_plane_single_namespace"]["type"],
+        json!("boolean")
+    );
+
+    // The runtime emits these labels from `NamespaceServingScope::as_str`; the
+    // handler assigns the block under `namespace` on `HealthResponse`.
+    let admin_source = include_str!("../../src/admin/mod.rs");
+    for label in [
+        "single-namespace-data-plane",
+        "control-plane",
+        "no-data-plane",
+    ] {
+        assert!(
+            admin_source.contains(&format!("\"{label}\"")),
+            "src/admin/mod.rs must emit the `{label}` serving-scope label"
+        );
+    }
+
+    let health = spec
+        .pointer("/components/schemas/HealthResponse")
+        .expect("HealthResponse exists");
+    assert_eq!(
+        health["properties"]["namespace"]["$ref"],
+        json!("#/components/schemas/NamespaceServingReport")
+    );
+    let description = health["description"]
+        .as_str()
+        .expect("HealthResponse documents its tiering");
+    assert!(
+        description.contains("`namespace`"),
+        "the detailed-tier field list must name the serving report: {description}"
     );
 }

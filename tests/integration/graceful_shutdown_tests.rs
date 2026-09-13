@@ -17,6 +17,8 @@
 //!   (bounded by `FERRUM_SHUTDOWN_DRAIN_SECONDS`), and only then calls
 //!   `endpoint.close()` + `wait_idle()`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -39,6 +41,7 @@ use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
 
 fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Graceful Shutdown Test {}", id)),
@@ -154,7 +157,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
 /// Start a plain HTTP/1.1 backend that responds 200 OK on every request.
 async fn start_h1_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use hyper::server::conn::http1;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
         loop {
@@ -207,7 +210,7 @@ async fn http2_connection_receives_goaway_on_shutdown() {
     let proxy = create_test_proxy("h2-shutdown", "/api", backend_addr.port());
     let state = create_test_proxy_state(vec![proxy]);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let gateway_addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -274,7 +277,7 @@ async fn http1_keepalive_connection_closes_on_shutdown() {
     let proxy = create_test_proxy("h1-shutdown", "/api", backend_addr.port());
     let state = create_test_proxy_state(vec![proxy]);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let gateway_addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -330,7 +333,7 @@ async fn shutdown_with_no_active_connections_returns_immediately() {
     let proxy = create_test_proxy("idle-shutdown", "/api", backend_addr.port());
     let state = create_test_proxy_state(vec![proxy]);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let listener_handle = tokio::spawn(async move {
@@ -630,7 +633,9 @@ fn drain_admin_state(proxy_state: ProxyState) -> ferrum_edge::admin::AdminState 
 /// stay alive for the listener's shutdown receiver to remain valid.
 async fn start_drain_admin(proxy_state: ProxyState) -> (String, tokio::sync::watch::Sender<bool>) {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind admin");
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind admin");
     let addr = listener.local_addr().expect("admin addr");
     let state = drain_admin_state(proxy_state);
     tokio::spawn(async move {

@@ -48,7 +48,7 @@ The diagnostic does not echo the address or token.
 |---|---|---|---|
 | `FERRUM_CONF_PATH` | No | `./ferrum.conf` | Path to optional conf file (provides defaults; env vars override). Loaded once at process start through the shared bounded stable-file reader: opened target must be a regular file (Kubernetes/projected-secret symlinks allowed), Unix opens are non-blocking, size is capped at **1 MiB** with a streaming `limit + 1` read, and two probes separated by a **20ms settle interval** must observe byte-identical content (the same delay is used between unstable retries; worst-case synchronous sleep is 180ms). The accepted snapshot (or a precise load error) is cached for the process lifetime — a failed load is never converted into an empty config. When unset — or set to an empty / whitespace-only value, which configures nothing and is treated as unset — a genuinely absent `./ferrum.conf` still yields empty defaults; an explicit non-empty path that is missing, non-regular, oversized, unstable, invalid UTF-8, or malformed fails closed. `ferrum.conf` is not live-reloaded; restart to pick up changes. |
 | `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `node_agent`, `migrate` |
-| `FERRUM_NAMESPACE` | No | `ferrum` | Namespace this gateway loads and manages |
+| `FERRUM_NAMESPACE` | No | `ferrum` | The single namespace this process's **data plane** serves; every config source is projected down to it before being served. The Admin API still accepts any `X-Ferrum-Namespace`, so a write outside this namespace is stored and Admin-visible but never routed by this process — see [Namespace Semantics](#namespace-semantics). File mode and mesh file-protocol `ferrum-edge validate` print this value and the post-filter resource counts, and fail closed (exit 1) when the document contains namespaced resources but none survive this filter. Pass `--allow-empty-namespace` to accept that empty slice. Runtime loading is unchanged. |
 | `FERRUM_LOG_LEVEL` | No | `warn` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace`. Controls the runtime tracing logs only; per-transaction access logs from the `stdout_logging` plugin are emitted independent of this level |
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `4096` | Per-sink hard record-slot limit (stdout/access logs share one sink; stderr is separate). Actual admission is also constrained by `FERRUM_LOG_BUFFER_BYTES`. Clamped to 1–65,536; admission is lossy and non-blocking when either limit is full |
 | `FERRUM_LOG_BUFFER_BYTES` | No | `33554432` | Per-sink aggregate serialized-payload byte budget. Admission provisionally reserves `FERRUM_LOG_MAX_RECORD_BYTES` before serialization, then queues an exact-sized allocation and shrinks that reservation to the serialized length until write completion. Clamped between `FERRUM_LOG_MAX_RECORD_BYTES` and 1 GiB |
@@ -414,7 +414,7 @@ existing targeted route-table, load-balancer, and plugin-cache rebuild paths. HT
 proxies are covered by the route-table content comparison rather than by this fingerprint, for
 the same reason.
 
-File loading, `ferrum-edge validate --mode file --spec <path>`, and SIGHUP reload run the shared rejecting runtime-config admission gate used by SQL and MongoDB full loads, in addition to file mode's stricter field, identity, and local-file checks. A `tcp_connection_throttle` attached to an HTTP proxy (or globally with one or more attached proxies, all using unsupported protocols) is rejected before runtime construction. Duplicate effective `correlation_id` header writers are also rejected at admission. Diagnostics identify the rejected rule; a rejected reload keeps the last known-good generation. A successful validation checks configuration admission, but does not promise that runtime resources such as listener ports will be available at startup.
+File loading, `ferrum-edge validate --mode file --spec <path>`, and SIGHUP reload run the shared rejecting runtime-config admission gate used by SQL and MongoDB full loads, in addition to file mode's stricter field, identity, and local-file checks. File-mode loading still filters resources to `FERRUM_NAMESPACE` after deserialize; `validate` does not change that filter, but it prints the active namespace and post-filter counts and fails closed when a non-empty document is reduced to zero resources (override with `--allow-empty-namespace`). A `tcp_connection_throttle` attached to an HTTP proxy (or globally with one or more attached proxies, all using unsupported protocols) is rejected before runtime construction. Duplicate effective `correlation_id` header writers are also rejected at admission. Diagnostics identify the rejected rule; a rejected reload keeps the last known-good generation. A successful validation checks configuration admission, but does not promise that runtime resources such as listener ports will be available at startup.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -741,7 +741,7 @@ For NodeWaypoint discovery, `FERRUM_K8S_CONTROLLER_NAMESPACE` identifies the nam
 | `FERRUM_K8S_KUBECONFIG_PATH` | No | — | Override kubeconfig path for out-of-cluster development. When unset, the controller tries the in-cluster service-account config first, then falls back to standard kubeconfig inference (`KUBECONFIG` / `~/.kube/config`) |
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
 | `FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB` | No | `4` | Maximum `POST /mutate` AdmissionReview request body size, in MiB, accepted before JSON parsing. Values must be 1..64 |
-| `FERRUM_INJECTOR_SIDECAR_IMAGE` | No | `ferrum-edge:latest` | Image injected into workload pods as the Ferrum mesh sidecar and capture init container. `FERRUM_MESH_CAPTURE_MODE=iptables` requires a `-ebpf-tools` tag (optionally followed by `@sha256:digest`); bare-digest, plain and `-ebpf` references are refused before startup/admission |
+| `FERRUM_INJECTOR_SIDECAR_IMAGE` | No | `ferrumedge/ferrum-edge:v<CARGO_PKG_VERSION>` | Image injected into workload pods as the Ferrum mesh sidecar and capture init container. Unset uses the Helm chart repository (`ferrumedge/ferrum-edge`) plus this binary's `v*` release tag. Production deployments should set this explicitly; an unset value logs a startup warning. `latest` and untagged references (implicit `latest`) are refused at startup. `FERRUM_MESH_CAPTURE_MODE=iptables` requires a `-ebpf-tools` tag (optionally followed by `@sha256:digest`); bare-digest, plain and `-ebpf` references are refused before startup/admission |
 | `FERRUM_INJECTOR_REQUIRE_ANNOTATION` | No | `true` | Require pod label `ferrum.io/mesh=enabled` or annotation `ferrum.io/inject=true` before injecting |
 | `FERRUM_INJECTOR_TRUST_DOMAIN` | No | `cluster.local` | Trust domain used to derive injected sidecar `FERRUM_MESH_WORKLOAD_SPIFFE_ID` from pod namespace and service account |
 | `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` | No | — | Kubernetes Secret name used as the injected sidecar `FERRUM_CP_DP_GRPC_JWT_SECRET` source |
@@ -867,9 +867,13 @@ UDP capture (`FERRUM_MESH_CAPTURE_UDP_ENABLED`, default off) is read by both the
 **Per-proxy WebSocket Origin (`allowed_ws_origins`).** Each proxy may set
 `allowed_ws_origins: ["https://app.example.com"]` to require a matching browser
 `Origin` on WebSocket upgrades (HTTP/1.1, H2 Extended CONNECT, H3 Extended CONNECT).
-The default empty list allows every origin. This gate is independent of the `cors`
-plugin, which does not run on WebSocket upgrades; operators with a strict CORS
-allowlist on the same route should mirror those origins in `allowed_ws_origins`. See
+The default empty list allows every origin. Entries are literal origins of the form
+`scheme://host[:port]`; `*` is not a wildcard and is rejected at Admin API admission
+and `ferrum-edge validate`. Existing file/database/CP rows containing `*` still load,
+with one warning per proxy; they continue to match the literal origin string `*` only.
+This gate is independent of the `cors` plugin, which does not run on WebSocket
+upgrades; operators with a strict CORS allowlist on the same route should mirror those
+origins in `allowed_ws_origins`. See
 [routing.md](routing.md#websocket-origin-admission) and
 [cors_plugin.md](cors_plugin.md#websocket-upgrades-and-cswsh).
 
@@ -1175,6 +1179,68 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 | `FERRUM_SO_BUSY_POLL_US` | No | `0` | Linux SO_BUSY_POLL duration for latency-sensitive UDP sockets |
 
 Core environment parsing lives in `src/config/env_config.rs`; early startup/pool settings use the same `FERRUM_*` names via conf-aware helpers.
+
+## Namespace Semantics
+
+`FERRUM_NAMESPACE` (default `ferrum`) is the **single namespace this process's
+data plane serves**. Every configuration source — a database load, a CP
+snapshot, a file config, an externally provisioned startup backup — is projected
+down to that namespace (`retain_namespace` in
+`src/config/namespace_filter.rs`) before cross-resource validation, router
+construction, and plugin/consumer/load-balancer cache builds. Resources owned by
+any other namespace are dropped from the served snapshot.
+
+The Admin API is deliberately **not** so restricted: it accepts any valid
+`X-Ferrum-Namespace` on namespace-scoped routes. That combination is what makes
+a multi-namespace control plane work — `cp` stores every namespace in
+`FERRUM_CP_NAMESPACES` and each `dp` subscribes to its own `FERRUM_NAMESPACE` —
+and it is also a silent-misconfiguration trap on a single process: an accepted
+`POST /proxies` under a foreign namespace is durable and Admin-visible, yet the
+local proxy answers `404` for its `listen_path` (issue #5447).
+
+Which namespaces a process serves, by mode:
+
+| Mode | Admin writes | Data-plane namespaces |
+|---|---|---|
+| `database` | read/write | exactly `FERRUM_NAMESPACE` |
+| `file` | read-only | exactly `FERRUM_NAMESPACE` |
+| `dp` | read-only | exactly `FERRUM_NAMESPACE` (its CP subscription) |
+| `mesh` | read-only | exactly `FERRUM_NAMESPACE` |
+| `cp` | read/write | none — it distributes `FERRUM_CP_NAMESPACES` to data planes |
+| `node_agent` | read-only | none — no proxy listeners |
+
+### Discovering the served namespace
+
+Read the `namespace` object on the authenticated `GET /status` (or
+`GET /health`) rather than assuming the default:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:9000/status \
+  | jq '.namespace'
+# { "active": "ferrum",
+#   "serving_scope": "single-namespace-data-plane",
+#   "data_plane_single_namespace": true }
+```
+
+`active` is the served namespace (`null` when the process has no data plane),
+`serving_scope` is one of `single-namespace-data-plane`, `control-plane`, or
+`no-data-plane`, and `data_plane_single_namespace` is `true` when everything
+outside `active` is unrouted here. The block is authenticated-tier only: the
+unauthenticated probe still returns just `status` and `ready`.
+
+### Detecting an unserved write
+
+When this process is both Admin and data plane, an **accepted** mutation
+(`2xx` on `POST`/`PUT`/`PATCH`/`DELETE`) to a namespace-scoped route under any
+other namespace carries the response header `X-Ferrum-Namespace-Unserved: true`,
+and the gateway logs one `WARN` per `(namespace, resource kind)` — deduplicated,
+bounded to 256 pairs, then rate limited to one line per five seconds. Routing,
+filtering, admission, and status codes are unchanged; both signals are
+observability only. See
+[admin_api.md](admin_api.md#admin-is-multi-namespace-one-processs-data-plane-serves-one-namespace).
+
+To serve several namespaces at once, run `cp` mode with one `dp` per namespace
+instead of pointing a multi-namespace client at a single-process gateway.
 
 ## Backend Egress / SSRF Protection
 

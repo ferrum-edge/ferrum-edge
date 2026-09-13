@@ -3,6 +3,8 @@
 //! Run with: cargo build --bin ferrum-edge && cargo test --test functional_tests \
 //!   functional_ai_stream_router -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -57,10 +59,10 @@ async fn wait_for_owned_gateway(
 
 async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
     for attempt in 1..=3 {
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
@@ -217,7 +219,7 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn test_ai_stream_router_normalizes_anthropic_sse_and_requests_identity_encoding() {
-    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let provider_port = provider_listener.local_addr().unwrap().port();
     let capture = Arc::new(Mutex::new(None));
     let provider_task = tokio::spawn(anthropic_provider(
@@ -297,7 +299,7 @@ async fn test_ai_stream_router_normalizes_anthropic_sse_and_requests_identity_en
 #[ignore]
 #[tokio::test]
 async fn test_ai_stream_router_premature_provider_eof_is_not_success() {
-    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let provider_port = provider_listener.local_addr().unwrap().port();
     let capture = Arc::new(Mutex::new(None));
     let provider_task = tokio::spawn(anthropic_provider(
@@ -351,7 +353,7 @@ async fn test_ai_stream_router_live_gzip_br_chain_normalizes_through_real_proxy(
     use flate2::write::GzEncoder;
 
     // Hold the provider listener for the process lifetime (no bind-drop-rebind).
-    let provider_listener = TcpListener::bind("127.0.0.1:0")
+    let provider_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind held anthropic provider listener");
     let provider_port = provider_listener

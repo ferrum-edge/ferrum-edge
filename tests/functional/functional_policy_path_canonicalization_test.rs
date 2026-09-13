@@ -10,6 +10,8 @@
 //! Every case runs identically over all three frontend protocols, because a
 //! per-protocol difference is itself a bypass.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 
@@ -50,7 +52,7 @@ impl RecordingBackend {
     async fn start() -> Self {
         // Hold the bound listener rather than drop-and-rebind, so parallel
         // tests cannot steal the port between reservation and use.
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let port = listener.local_addr().expect("backend addr").port();
@@ -187,7 +189,7 @@ async fn spawn_path_gateway(
     for _ in 0..MAX_ATTEMPTS {
         // Reserve a fresh HTTPS/QUIC port per attempt (functional-test rule:
         // every retry gets fresh ports).
-        let reservation = match TcpListener::bind("127.0.0.1:0").await {
+        let reservation = match TcpListener::bind_test("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) => {
                 last_error = error.to_string();
@@ -1002,7 +1004,7 @@ async fn coordinate_backend(flavor: CoordinateFlavor) -> RecordingBackend {
     if flavor == CoordinateFlavor::Http {
         return RecordingBackend::start().await;
     }
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let targets = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&targets);
@@ -1431,10 +1433,13 @@ async fn rewritten_path_matrix(flavor: CoordinateFlavor) {
             ("/api/users", true, 200, Some("/base/v2/users")),
             ("/slash/users", true, 200, Some("/base/v2/users")),
             (
+                // `..hidden` is not a complete `.` / `..` segment, so the
+                // unmatched tail stays literal rather than gaining a
+                // synthesized separator.
                 "/api..hidden/users",
                 true,
                 200,
-                Some("/base/v2/..hidden/users"),
+                Some("/base/v2..hidden/users"),
             ),
             ("/other/users", true, 200, Some("/base/other/users")),
         ] {

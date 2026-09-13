@@ -37,6 +37,8 @@
 //! set a duration longer than the gateway's `udp_idle_timeout_seconds` to
 //! force session cleanup.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -503,7 +505,9 @@ mod tests {
             .spawn()
             .expect("spawn udp");
 
-        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+        let client = UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("client bind");
         client
             .connect(format!("127.0.0.1:{port}"))
             .await
@@ -538,7 +542,7 @@ mod tests {
             .spawn()
             .expect("spawn");
 
-        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let client = UdpSocket::bind_test("127.0.0.1:0").await.expect("bind");
         client
             .connect(format!("127.0.0.1:{port}"))
             .await
@@ -572,7 +576,7 @@ mod tests {
             .spawn()
             .expect("spawn");
 
-        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let client = UdpSocket::bind_test("127.0.0.1:0").await.expect("bind");
         client
             .connect(format!("127.0.0.1:{port}"))
             .await
@@ -595,7 +599,7 @@ mod tests {
             .spawn()
             .expect("spawn");
 
-        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let client = UdpSocket::bind_test("127.0.0.1:0").await.expect("bind");
         client
             .connect(format!("127.0.0.1:{port}"))
             .await

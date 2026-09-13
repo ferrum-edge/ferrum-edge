@@ -49,6 +49,7 @@ fn rate_limiting_policy(max_requests: u64, window_seconds: u64, limit_by: &str) 
 
 fn global_plugin_config(id: &str, plugin_name: &str, config: Value) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: NS.to_string(),
         plugin_name: plugin_name.to_string(),

@@ -19,6 +19,26 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
 
+/// Informational labels are never routing selectors or proof of ownership.
+/// Bounds keep labels small enough for every supported database backend.
+pub fn validate_resource_labels(labels: &BTreeMap<String, String>) -> Result<(), String> {
+    if labels.len() > 64 {
+        return Err("labels must not have more than 64 entries".to_string());
+    }
+    for (key, value) in labels {
+        if key.trim().is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
+            return Err("labels keys must be nonblank, at most 128 UTF-8 bytes, and contain no control characters".to_string());
+        }
+        if value.len() > 512 || value.chars().any(char::is_control) {
+            return Err(
+                "labels values must be at most 512 UTF-8 bytes and contain no control characters"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Maximum length for resource IDs.
 pub(crate) const MAX_ID_LENGTH: usize = 254;
 
@@ -40,6 +60,11 @@ pub const MAX_CUSTOM_ID_LENGTH: usize = 255;
 pub const MAX_HOST_LENGTH: usize = 253;
 /// Maximum number of host entries per proxy.
 pub const MAX_HOSTS_PER_PROXY: usize = 100;
+/// Operator-facing guidance for the CORS-style `allowed_ws_origins: ["*"]`
+/// footgun (issue #5454). Empty list is the only allow-all; entries are
+/// literal origins; `*` is not a wildcard.
+pub const ALLOWED_WS_ORIGINS_STAR_GUIDANCE: &str =
+    "empty list = allow all origins; entries are literal origins; `*` is not a wildcard";
 /// Maximum number of targets per upstream.
 pub const MAX_TARGETS_PER_UPSTREAM: usize = 1000;
 /// Maximum number of tags per upstream target.
@@ -1799,6 +1824,9 @@ impl BackendTlsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     #[serde(default)]
@@ -2199,7 +2227,13 @@ pub struct CircuitBreakerConfig {
     pub failure_threshold: u32,
     #[serde(default = "default_success_threshold")]
     pub success_threshold: u32,
-    #[serde(default = "default_circuit_timeout")]
+    /// Seconds the circuit stays open before transitioning to half-open.
+    ///
+    /// `cooldown_seconds` is accepted as a serde input alias (Admin API, file
+    /// config, database rows, and batch/restore payloads). Serialization always
+    /// emits `timeout_seconds`. Supplying both spellings in one object is a
+    /// duplicate-field error.
+    #[serde(default = "default_circuit_timeout", alias = "cooldown_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_failure_status_codes")]
     pub failure_status_codes: Vec<u16>,
@@ -2207,18 +2241,6 @@ pub struct CircuitBreakerConfig {
     pub half_open_max_requests: u32,
     #[serde(default = "default_trip_on_connection_errors")]
     pub trip_on_connection_errors: bool,
-    /// Seconds a HALF_OPEN probe slot may stay unsettled before the breaker
-    /// reclaims it (defence in depth for a probe that is never released).
-    ///
-    /// Omitted derives `max(timeout_seconds * 2, 60)`. A configured value is
-    /// clamped to at least `timeout_seconds` and at least 1 second.
-    ///
-    /// The dwell MUST exceed the longest legitimate backend dispatch a probe
-    /// can take (backend connect + read timeouts): reclaiming a slot while a
-    /// real probe is still in flight lets a second probe reach a backend the
-    /// breaker is protecting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub half_open_probe_dwell_seconds: Option<u64>,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -2230,7 +2252,6 @@ impl Default for CircuitBreakerConfig {
             failure_status_codes: default_failure_status_codes(),
             half_open_max_requests: default_half_open_max(),
             trip_on_connection_errors: default_trip_on_connection_errors(),
-            half_open_probe_dwell_seconds: None,
         }
     }
 }
@@ -2586,6 +2607,9 @@ pub enum PluginScope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     #[serde(default)]
@@ -2977,7 +3001,9 @@ pub struct Proxy {
     /// Optional list of allowed WebSocket Origin values (e.g., ["https://example.com"]).
     /// When non-empty, WebSocket upgrade requests must include an Origin header
     /// matching one of these values (case-insensitive). Empty list (default) means
-    /// no origin check — all origins are permitted. Protects against Cross-Site
+    /// no origin check — all origins are permitted. Entries are literal
+    /// `scheme://host[:port]` origins; `*` is not a wildcard and is rejected at
+    /// Admin API / `ferrum-edge validate` admission. Protects against Cross-Site
     /// WebSocket Hijacking (CSWSH) per RFC 6455 §10.2.
     #[serde(default)]
     pub allowed_ws_origins: Vec<String>,
@@ -2997,6 +3023,9 @@ pub struct PluginAssociation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Consumer {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     pub username: String,
@@ -3022,6 +3051,9 @@ pub struct Consumer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginConfig {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     pub plugin_name: String,
@@ -7655,12 +7687,97 @@ impl Proxy {
         }
     }
 
+    /// Whether `raw` is a literal WebSocket Origin `scheme://host[:port]` that
+    /// the runtime matcher can normalize (`http`/`https`/`ws`/`wss`, no
+    /// userinfo, path, query, or fragment). Used at admission so configured
+    /// allow-list entries match what `websocket_origin_allowed` compares.
+    pub fn is_literal_websocket_origin(raw: &str) -> bool {
+        // RFC 6454 opaque origin: browsers send `Origin: null` for sandboxed
+        // frames and `data:`/`file:` documents; the runtime matcher compares it
+        // literally, so it stays admissible.
+        if raw.trim().eq_ignore_ascii_case("null") {
+            return true;
+        }
+        let Ok(parsed) = url::Url::parse(raw) else {
+            return false;
+        };
+        if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+            return false;
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return false;
+        }
+        match parsed.scheme() {
+            "http" | "https" | "ws" | "wss" => parsed.host_str().is_some(),
+            _ => false,
+        }
+    }
+
+    /// Admission-only errors for `allowed_ws_origins` beyond empty-string
+    /// checks: CORS-style `"*"` and entries that are not a literal origin.
+    ///
+    /// Load paths (file/database/CP/DP `validate_all_fields`) must not treat
+    /// these as rejecting errors — existing rows keep loading with a warning
+    /// from [`Self::warn_legacy_allowed_ws_origins`].
+    pub fn allowed_ws_origins_admission_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
+            if origin.trim().is_empty() {
+                continue;
+            }
+            if origin.trim() == "*" {
+                errors.push(format!(
+                    "allowed_ws_origins[{}] is '*': {}",
+                    i, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+                ));
+            } else if !Self::is_literal_websocket_origin(origin) {
+                errors.push(format!(
+                    "allowed_ws_origins[{}] must be a literal origin \
+                     (scheme://host[:port]); {}",
+                    i, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+                ));
+            }
+        }
+        errors
+    }
+
+    /// Warn once when a loaded proxy still carries the CORS-style `"*"`
+    /// footgun or a non-origin `allowed_ws_origins` entry. Never fails the load.
+    pub fn warn_legacy_allowed_ws_origins(&self) {
+        let has_legacy_entry = self.allowed_ws_origins.iter().any(|origin| {
+            let trimmed = origin.trim();
+            !trimmed.is_empty() && (trimmed == "*" || !Self::is_literal_websocket_origin(origin))
+        });
+        if !has_legacy_entry {
+            return;
+        }
+        tracing::warn!(
+            proxy = %self.id,
+            namespace = %self.namespace,
+            "Proxy '{}' allowed_ws_origins contains '*' or a non-origin entry; {}; \
+             existing config is still loaded. Admin API writes and `ferrum-edge validate` \
+             reject this value.",
+            self.id,
+            ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+        );
+    }
+
     /// Validate all fields of a proxy for correctness and safe lengths.
     ///
     /// This validates field values only — uniqueness checks (listen_path conflicts,
     /// name uniqueness, upstream_id existence) are done separately in the admin handlers.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
-        self.validate_fields_inner(None, crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS)
+        let mut errors =
+            match self.validate_fields_inner(None, crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS) {
+                Ok(()) => Vec::new(),
+                Err(errors) => errors,
+            };
+        errors.extend(self.allowed_ws_origins_admission_errors());
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     /// Validate fields with a shared cache of already-validated TLS file paths.
@@ -7680,6 +7797,9 @@ impl Proxy {
         cert_expiry_warning_days: u64,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if let Err(error) = validate_resource_labels(&self.labels) {
+            errors.push(error);
+        }
         // `validate_fields_inner` runs on a serde-deserialized Proxy BEFORE
         // `normalize_fields()` populates `dispatch_kind` (file_loader's
         // pipeline orders field validation first, normalization second).
@@ -8247,7 +8367,11 @@ impl Proxy {
             }
         }
 
-        // Allowed WebSocket origins validation
+        // Allowed WebSocket origins validation. Empty strings are a hard
+        // error on every path. CORS-style `"*"` and non-origin entries are
+        // admission-only (`validate_fields` / Admin / `ferrum-edge validate`);
+        // load snapshots warn via `warn_legacy_allowed_ws_origins` instead of
+        // failing startup.
         for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
             if origin.trim().is_empty() {
                 errors.push(format!("allowed_ws_origins[{}] must not be empty", i));
@@ -8375,6 +8499,9 @@ impl Consumer {
     /// Validate all fields of a consumer for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if let Err(error) = validate_resource_labels(&self.labels) {
+            errors.push(error);
+        }
 
         // Username
         if self.username.trim().is_empty() {
@@ -9029,6 +9156,9 @@ impl Upstream {
     /// Validate all fields of an upstream for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if let Err(error) = validate_resource_labels(&self.labels) {
+            errors.push(error);
+        }
 
         if self.targets.is_empty() && self.service_discovery.is_none() {
             errors.push("must have at least one target or service_discovery".to_string());
@@ -9682,6 +9812,9 @@ impl PluginConfig {
     /// Validate all fields of a plugin config for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if let Err(error) = validate_resource_labels(&self.labels) {
+            errors.push(error);
+        }
 
         // Plugin name length (should already be validated against known plugins,
         // but enforce a length limit as defense-in-depth)
@@ -9828,16 +9961,6 @@ impl CircuitBreakerConfig {
             errors.push(e);
         }
         if let Err(e) = validate_status_codes("failure_status_codes", &self.failure_status_codes) {
-            errors.push(e);
-        }
-        if let Some(dwell) = self.half_open_probe_dwell_seconds
-            && let Err(e) = validate_u64_range(
-                "half_open_probe_dwell_seconds",
-                dwell,
-                1,
-                MAX_TIMEOUT_SECONDS,
-            )
-        {
             errors.push(e);
         }
 
@@ -10241,6 +10364,19 @@ impl ServiceDiscoveryConfig {
 }
 
 impl GatewayConfig {
+    /// Admission-only `allowed_ws_origins` errors across every proxy (`*` and
+    /// non-origin entries). Load snapshots must not use this as a rejecting
+    /// gate; they warn via [`Proxy::warn_legacy_allowed_ws_origins`] instead.
+    pub fn allowed_ws_origins_admission_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for proxy in &self.proxies {
+            for e in proxy.allowed_ws_origins_admission_errors() {
+                errors.push(format!("Proxy '{}': {}", proxy.id, e));
+            }
+        }
+        errors
+    }
+
     /// Validate all field-level constraints across every resource in the config.
     ///
     /// This validates individual field values (lengths, ranges, formats) — not
@@ -10305,6 +10441,10 @@ impl GatewayConfig {
                     errors.push(format!("Proxy '{}': {}", proxy.id, e));
                 }
             }
+            // Grandfather existing `"*"` / non-origin rows: never fail a
+            // file/database/CP/DP load for this (issue #5454). Admission
+            // rejects the same values through `validate_fields`.
+            proxy.warn_legacy_allowed_ws_origins();
         }
         for consumer in &self.consumers {
             if let Err(errs) = consumer.validate_fields() {

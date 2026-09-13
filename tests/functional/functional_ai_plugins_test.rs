@@ -6,6 +6,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_ai_plugins
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use std::io::Write;
 use std::sync::Arc;
@@ -303,11 +305,11 @@ async fn wait_for_owned_gateway(
 async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
@@ -339,7 +341,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 #[ignore]
 #[tokio::test]
 async fn test_ai_federation_terminal_dispatch_is_backend_accounting_neutral() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_task = tokio::spawn(start_counted_json_server_on(
@@ -350,7 +352,7 @@ async fn test_ai_federation_terminal_dispatch_is_backend_accounting_neutral() {
         Arc::clone(&backend_hits),
     ));
 
-    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let provider_port = provider_listener.local_addr().unwrap().port();
     let provider_hits = Arc::new(AtomicUsize::new(0));
     let provider_task = tokio::spawn(start_counted_json_server_on(
@@ -694,7 +696,7 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn test_ai_federation_streams_first_token_before_provider_completes() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_task = tokio::spawn(start_counted_json_server_on(
@@ -705,7 +707,7 @@ async fn test_ai_federation_streams_first_token_before_provider_completes() {
         Arc::clone(&backend_hits),
     ));
 
-    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let provider_port = provider_listener.local_addr().unwrap().port();
     let provider_hits = Arc::new(AtomicUsize::new(0));
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -817,7 +819,7 @@ async fn test_ai_federation_streams_first_token_before_provider_completes() {
 #[ignore]
 #[tokio::test]
 async fn test_ai_federation_truncated_provider_stream_fails_closed_without_splicing() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_task = tokio::spawn(start_counted_json_server_on(
@@ -828,7 +830,7 @@ async fn test_ai_federation_truncated_provider_stream_fails_closed_without_splic
         Arc::clone(&backend_hits),
     ));
 
-    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let provider_port = provider_listener.local_addr().unwrap().port();
     let provider_hits = Arc::new(AtomicUsize::new(0));
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -915,7 +917,7 @@ async fn test_ai_federation_truncated_provider_stream_fails_closed_without_splic
 #[ignore]
 #[tokio::test]
 async fn test_ai_federation_client_disconnect_cancels_without_wedging_the_route() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_task = tokio::spawn(start_counted_json_server_on(
@@ -926,7 +928,7 @@ async fn test_ai_federation_client_disconnect_cancels_without_wedging_the_route(
         Arc::clone(&backend_hits),
     ));
 
-    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let provider_port = provider_listener.local_addr().unwrap().port();
     let provider_hits = Arc::new(AtomicUsize::new(0));
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -1056,7 +1058,7 @@ async fn test_ai_prompt_shield_rejects_pii() {
     let config_path = temp_dir.path().join("config.yaml");
 
     // Bind echo server — hold the listener to avoid port races
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
 
     let config_content = format!(
@@ -1148,7 +1150,7 @@ async fn test_ai_prompt_shield_allows_clean_request() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
 
     let config_content = format!(
@@ -1233,7 +1235,7 @@ async fn test_ai_request_guard_rejects_disallowed_model() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
 
     let config_content = format!(
@@ -1321,7 +1323,7 @@ async fn test_ai_request_guard_rejects_excess_tokens() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
 
     let config_content = format!(
@@ -1414,7 +1416,7 @@ async fn test_ai_request_guard_allows_valid_request() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
 
     let config_content = format!(

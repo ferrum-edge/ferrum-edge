@@ -107,6 +107,7 @@ fn runtime() -> MeshRuntimeConfig {
 fn matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: "default".to_string(),
         name: Some(id.to_string()),
@@ -885,6 +886,7 @@ fn distribute_projects_through_mesh_apply_onto_upstream_locality_lb_setting() {
 fn multi_port_upstream(id: &str, host_fqdn: &str) -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: "default".to_string(),
         name: Some(id.to_string()),
@@ -1034,6 +1036,7 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
 
     let now = Utc::now();
     let mut upstream = Upstream {
+        labels: Default::default(),
         id: "reviews-u".to_string(),
         namespace: "default".to_string(),
         name: Some("reviews-u".to_string()),

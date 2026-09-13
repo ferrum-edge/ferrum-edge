@@ -14,6 +14,7 @@ fn make_plugin(config: &Value) -> Result<Arc<dyn Plugin>, String> {
 
 fn make_consumer(username: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: format!("consumer-{username}"),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),

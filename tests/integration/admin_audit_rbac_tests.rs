@@ -1,3 +1,5 @@
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::{
@@ -147,7 +149,7 @@ fn admin_state(db: DatabaseStore) -> AdminState {
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(
@@ -837,6 +839,7 @@ async fn malformed_persisted_serverless_url_is_wholly_redacted_from_views_and_au
     let plugin_id = "malformed-serverless-redaction";
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: plugin_id.to_string(),
             plugin_name: "serverless_function".to_string(),
             namespace: "ferrum".to_string(),

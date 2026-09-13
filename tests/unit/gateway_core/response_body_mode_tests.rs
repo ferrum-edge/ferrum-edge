@@ -12,6 +12,7 @@ use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 
 fn test_proxy() -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: "test".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Test Proxy".into()),

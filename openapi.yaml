@@ -273,7 +273,10 @@ paths:
         Readiness + diagnostics. Also accessible at `/status`.
 
         **Unauthenticated** callers receive only `status` and `ready` (suitable
-        for readiness probes). The **detailed** diagnostics — `mode`, `database`
+        for readiness probes). The **detailed** diagnostics — `mode`, the
+        `namespace` data-plane serving report (issue #5447: the one namespace
+        this process routes, its closed-set `serving_scope`, and whether
+        everything else is unrouted here), `database`
         connectivity/pool stats, `fips` deployment-mode metadata,
         `cached_config` proxy/consumer counts,
         `database_polling` degradation, `config_rejected`, mesh state,
@@ -4315,6 +4318,7 @@ paths:
             schema:
               $ref: "#/components/schemas/BatchCreateRequest"
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
       responses:
         "202":
@@ -4326,6 +4330,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -4571,6 +4577,7 @@ paths:
         (generated via `GET /backup?resources=proxies`, etc.).
       tags: [Backup & Restore]
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
         - name: confirm
           in: query
@@ -4604,6 +4611,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -4808,6 +4817,7 @@ paths:
             schema:
               $ref: "#/components/schemas/ProxyCreate"
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
       responses:
         "202":
@@ -4816,9 +4826,15 @@ paths:
           description: |
             Proxy created. In database mode a covering `config_changes`
             generation is already live on this process.
+
+            HTTP-family `backend_scheme` defaults to `https` when omitted and
+            the stored scheme is returned on this response. Plaintext backends
+            must set `backend_scheme: http`.
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -4902,6 +4918,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -4974,6 +4992,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "400":
           description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely, or `cleanup_orphaned_upstream` was duplicated or supplied with a value other than the exact strings `true` or `false`
           content:
@@ -5057,6 +5077,7 @@ paths:
             schema:
               $ref: "#/components/schemas/ConsumerCreate"
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
       responses:
         "202":
@@ -5066,6 +5087,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5143,6 +5166,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5186,6 +5211,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -5259,6 +5286,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5316,6 +5345,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5373,6 +5404,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -5427,6 +5460,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5627,6 +5662,7 @@ paths:
             schema:
               $ref: "#/components/schemas/PluginConfigCreate"
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
       responses:
         "202":
@@ -5636,6 +5672,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5726,6 +5764,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5763,6 +5803,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "400":
           description: Deletion would expose an invalid plugin-composition graph, including unsupported TCP connection-throttle attachments
           content:
@@ -5830,6 +5872,7 @@ paths:
             schema:
               $ref: "#/components/schemas/UpstreamCreate"
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
       responses:
         "202":
@@ -5839,6 +5882,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5908,6 +5953,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5949,6 +5996,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -6044,6 +6093,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -6130,6 +6181,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -6172,6 +6225,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -6791,6 +6846,7 @@ paths:
         contract, worked examples, and curl recipes.
       tags: [API Specs]
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
         - name: X-Ferrum-Namespace
           in: header
@@ -6848,6 +6904,8 @@ paths:
               description: URL of the newly created spec (`/api-specs/{id}`)
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -7045,6 +7103,7 @@ paths:
         This mutation requires the `admin` role.
       tags: [API Specs]
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
         - name: X-Ferrum-Namespace
           in: header
@@ -7080,6 +7139,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -7199,6 +7260,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7359,6 +7422,23 @@ components:
 
   # ── Reusable parameters ────────────────────────────────────────────
   parameters:
+    ProvisionedBy:
+      name: X-Ferrum-Provisioned-By
+      in: header
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+      description: >-
+        Optional application identifier, stored as labels.provisioned-by on
+        created core resources when that label is absent. Must occur once, be
+        nonblank, and contain no control characters (512 UTF-8 bytes maximum).
+        Covers CRUD creates, batch, non-spec-owned restore rows, and all
+        API-spec-generated resources, including generated validators. Existing
+        labels and spec-owned restore graphs retain their recorded origin.
+        API-spec replacement preserves existing labels by resource identity and
+        stamps newly generated resources. This header grants no authority.
     ResourceId:
       name: id
       in: path
@@ -7387,6 +7467,17 @@ components:
         the request body (which is therefore effectively read-only on the
         wire). Resources from other namespaces are not visible to this
         request and uniqueness constraints apply per-namespace.
+
+        **Admin is multi-namespace; one process's data plane is not**
+        (issue #5447). Writing a resource under a namespace this process does
+        not route succeeds and stays Admin-visible, but the local router never
+        matches it — so the proxy answers `404`. That is by design for a control
+        plane (`cp` stores every namespace in its scope and each data plane
+        subscribes to its own), and a silent misconfiguration for a
+        single-process deployment. Read the `namespace` object on the
+        authenticated `GET /status` to discover the namespace this process
+        serves, and watch for the `X-Ferrum-Namespace-Unserved: true` response
+        header on accepted mutations.
 
     CleanupOrphanedUpstream:
       name: cleanup_orphaned_upstream
@@ -7512,6 +7603,40 @@ components:
       schema:
         type: string
         pattern: '^[0-9]+:[0-9]+$'
+
+    X-Ferrum-Namespace-Unserved:
+      description: |
+        Present with value `true` when an **accepted** mutation (`2xx` on
+        `POST`/`PUT`/`PATCH`/`DELETE`) targeted a namespace-scoped resource in a
+        namespace this process's data plane does not route (issue #5447).
+
+        The Admin API is deliberately multi-namespace, but a proxy data plane
+        serves exactly one namespace (`FERRUM_NAMESPACE`), so a process that is
+        both Admin and data plane — `database` mode, the only writable one, plus
+        any future serving mode with a writable admin — commits the resource,
+        keeps it Admin-visible, and never matches it in the local router. The
+        write succeeds and the data plane answers `404`. This header is that
+        signal, so a provisioning client can detect the mismatch without probing
+        the proxy.
+
+        Absent when the requested namespace is the one this process serves, on
+        every non-`2xx` response (a rejected write never reached the store), on
+        reads, on global admin surfaces that `X-Ferrum-Namespace` does not
+        select, and in `cp` mode — a control plane stores every namespace in its
+        scope on purpose and routes none itself, so nothing is unserved there.
+        `file`, `dp`, and `mesh` serve one namespace but reject admin mutations
+        outright, so the condition cannot arise there either. A deferred `202`
+        never carries it: `?apply=async` is a no-op for a namespace this process
+        does not serve, so such a write returns its synchronous success status
+        (and no `X-Ferrum-Config-Cursor`).
+
+        Routing, filtering, admission, and status codes are unchanged; this is a
+        marker only. Discover the active namespace up front with the `namespace`
+        object on the authenticated `GET /status` (or `GET /health`).
+      required: false
+      schema:
+        type: string
+        enum: ["true"]
 
   # ── Reusable responses ─────────────────────────────────────────────
   responses:
@@ -8816,9 +8941,34 @@ components:
           minimum: 0
 
     # ── Proxy ───────────────────────────────────────────────────────
+    ResourceLabels:
+      type: object
+      maxProperties: 64
+      propertyNames:
+        type: string
+        minLength: 1
+        maxLength: 128
+      additionalProperties:
+        type: string
+        maxLength: 512
+      description: >-
+        Informational operator metadata. Keys must be nonblank; keys and values
+        cannot contain control characters. Runtime length limits are UTF-8 bytes
+        (128 per key, 512 per value). Independent of target tags, routing, access
+        control and api_spec_id. Omitted labels on resource PUT preserve the
+        current map; an explicit map replaces it and {} clears it. Labels are
+        retained in GET/list, backup/restore, file configuration and CP/DP sync.
+        The provisioned-by label identifies the application that provisioned a
+        resource; it is caller-supplied information, not proof of ownership.
+      examples:
+        - provisioned-by: ferrum-nexus
+          team: platform
+
     Proxy:
       type: object
       properties:
+        labels:
+          $ref: "#/components/schemas/ResourceLabels"
         id:
           type: string
           description: >-
@@ -8940,7 +9090,9 @@ components:
           description: >-
             Wire-level scheme the proxy uses to talk to its backend.
             Optional for HTTP-family proxies — defaults to `https` when
-            omitted. **Required for stream-family proxies** (`tcp`, `tcps`,
+            omitted. Plaintext backends must set `backend_scheme: http`;
+            otherwise an HTTPS dial of an HTTP origin fails with a generic
+            502. **Required for stream-family proxies** (`tcp`, `tcps`,
             `udp`, `dtls`); validation rejects stream proxies that omit it.
 
             gRPC and WebSocket are no longer schemes — they are detected
@@ -9399,8 +9551,12 @@ components:
           description: |
             Optional list of allowed WebSocket Origin values (e.g., ["https://example.com"]).
             When non-empty, WebSocket upgrade requests must include an Origin header matching
-            one of these values (case-insensitive comparison). Empty array (default) means
-            no origin check. Protects against Cross-Site WebSocket Hijacking (CSWSH).
+            one of these values (case-insensitive comparison).
+            Empty array (default) allows all origins. Entries are literal origins of the
+            form `scheme://host[:port]`; `*` is not a wildcard and is rejected at Admin API
+            create/update (POST/PUT/PATCH proxies, batch, restore) and `ferrum-edge validate`.
+            Existing file/database/CP rows containing `*` still load, with a warning naming
+            the proxy. Protects against Cross-Site WebSocket Hijacking (CSWSH).
 
             Independent of the `cors` plugin, which does not run on WebSocket upgrades.
             Operators with a strict CORS allowlist on the same proxy should mirror those
@@ -9467,6 +9623,8 @@ components:
         - Stream-family proxies (`tcp`/`tcps`/`udp`/`dtls`): `listen_path`
           MUST be null/omitted, and `listen_port` MUST be set,
           and `backend_scheme` MUST be set explicitly.
+        - HTTP-family `backend_scheme` defaults to `https` when omitted.
+          Plaintext backends must set `backend_scheme: http`.
         - Unknown fields are rejected. Backend H3 selection is runtime
           capability-driven for `Https` backends — there is no scheme for it.
         - `backend_host` and `backend_port` may be omitted when `upstream_id`
@@ -9635,6 +9793,8 @@ components:
       type: object
       required: [username]
       properties:
+        labels:
+          $ref: "#/components/schemas/ResourceLabels"
         id:
           type: string
           description: >-
@@ -10680,6 +10840,8 @@ components:
       type: object
       required: [plugin_name, scope]
       properties:
+        labels:
+          $ref: "#/components/schemas/ResourceLabels"
         id:
           type: string
           description: >-
@@ -12109,7 +12271,21 @@ components:
           type: integer
           format: uint64
           default: 30
-          description: Seconds to wait in open state before transitioning to half-open
+          description: >
+            Seconds to wait in open state before transitioning to half-open.
+            `cooldown_seconds` is accepted as an input alias on Admin API, file
+            config, database rows, and batch/restore payloads, and is never
+            returned.
+        cooldown_seconds:
+          type: integer
+          format: uint64
+          writeOnly: true
+          deprecated: true
+          description: >
+            Input alias for `timeout_seconds`, accepted on Admin API, file
+            config, database rows, and batch/restore payloads. Never returned:
+            responses always carry `timeout_seconds`. Supplying both spellings
+            in one object is rejected as a duplicate field.
         failure_status_codes:
           type: array
           items:
@@ -12131,22 +12307,6 @@ components:
             of failure_status_codes. When true (default), connection errors always
             trip the breaker. When false, only real HTTP response status codes in
             failure_status_codes are counted.
-        half_open_probe_dwell_seconds:
-          type: [integer, "null"]
-          format: uint64
-          minimum: 1
-          maximum: 86400
-          description: >
-            Seconds a half-open probe slot may stay unsettled before the breaker
-            reclaims it, so a probe that is never released degrades to a bounded
-            delay instead of shedding the backend for the process lifetime. Omitted
-            derives max(timeout_seconds * 2, 60); a configured value is clamped up
-            to timeout_seconds and to at least 1. The dwell MUST exceed the longest
-            legitimate backend dispatch a probe can take (backend connect and read
-            timeouts): reclaiming a slot while a real probe is still in flight lets
-            a second probe reach the backend the breaker is protecting. Every
-            reclaim increments ferrum_circuit_breaker_probe_reclaimed_total and logs
-            a warning naming the proxy and target.
 
     # ── Retry ───────────────────────────────────────────────────────
     RetryConfig:
@@ -12508,6 +12668,8 @@ components:
       type: object
       required: [targets]
       properties:
+        labels:
+          $ref: "#/components/schemas/ResourceLabels"
         id:
           type: string
           description: >-
@@ -14090,7 +14252,7 @@ components:
       type: object
       description: |
         Tiered: unauthenticated callers receive only `status` and `ready`. The
-        remaining detailed fields (`timestamp`, `mode`, `database`,
+        remaining detailed fields (`timestamp`, `mode`, `namespace`, `database`,
         `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `gateway_listeners`,
         `logging`, `log_sink_record_loss`,
@@ -14208,6 +14370,8 @@ components:
             - cp
             - dp
             - file
+        namespace:
+          $ref: "#/components/schemas/NamespaceServingReport"
         database:
           type: object
           description: |
@@ -14451,6 +14615,59 @@ components:
           $ref: "#/components/schemas/CpDpTrustReloadSnapshot"
         replay_authority:
           $ref: "#/components/schemas/SharedReplayAuthorityHealth"
+
+    NamespaceServingReport:
+      type: object
+      description: |
+        Which namespace **this process's data plane** routes, and how that
+        relates to the deliberately multi-namespace Admin API (issue #5447).
+
+        The Admin API accepts any valid `X-Ferrum-Namespace`, but a proxy data
+        plane projects every configuration snapshot down to one namespace
+        (`FERRUM_NAMESPACE`) before serving it. Without this block a client that
+        provisions under its own namespace cannot tell from a `201` whether the
+        resource will ever be routed here; it discovers the mismatch as a
+        data-plane `404`. Read it once at startup and provision into `active`.
+
+        Authenticated detail tier only: the namespace name is operator-supplied
+        deployment topology. Every field is a namespace identifier, a closed-set
+        label, or a boolean — never a resource id, count, or listing of other
+        tenants.
+      required: [active, serving_scope, data_plane_single_namespace]
+      properties:
+        active:
+          type: [string, "null"]
+          description: >-
+            The one namespace this process's data plane routes
+            (`FERRUM_NAMESPACE`). `null` when this process has no data plane —
+            `cp` (which distributes every namespace in `FERRUM_CP_NAMESPACES` to
+            subscribing data planes) and `node_agent`.
+          examples:
+            - ferrum
+          maxLength: 254
+        serving_scope:
+          type: string
+          enum: [single-namespace-data-plane, control-plane, no-data-plane]
+          description: |
+            Closed-set label for how the data plane is scoped:
+
+            - `single-namespace-data-plane` — this process routes traffic for
+              `active` only (`database`, `file`, `dp`, `mesh`). A resource
+              written under any other namespace is stored and Admin-visible but
+              never matched by the local router.
+            - `control-plane` — `cp`: stores and distributes every namespace in
+              its scope and routes no traffic itself, so multi-namespace Admin
+              writes are the intended usage and nothing is unserved here.
+            - `no-data-plane` — an admin surface with neither a local proxy nor a
+              control-plane scope (`node_agent`).
+        data_plane_single_namespace:
+          type: boolean
+          description: >-
+            `true` when everything outside `active` is unrouted by this process,
+            i.e. `serving_scope` is `single-namespace-data-plane`. This is the
+            field to branch on: when it is `true`, an accepted mutation under a
+            different `X-Ferrum-Namespace` also carries
+            `X-Ferrum-Namespace-Unserved: true`.
 
     SharedReplayAuthorityHealth:
       type: object
@@ -28231,14 +28448,18 @@ components:
             Effective OpenAPI path template used for metadata and path specificity
             ordering. When generated from a spec, this is the Paths key joined to the
             effective Server Object pathname (OpenAPI 3.x) or Swagger `basePath`, with
-            one entry per distinct server pathname when multiple servers apply.
+            the literal proxy listen_path prefix prepended (trailing prefix slashes
+            trimmed). Root, host-only, exact, and regex listen routes add no prefix.
+            One entry is emitted per distinct server pathname when multiple servers
+            apply. strip_listen_path affects backend forwarding only.
         path_regex:
           type: string
           minLength: 1
           description: >-
             Regex used to match the full inbound request path, compiled at plugin load.
             Auto-generated specs derive it from the effective path template (including
-            server/`basePath` prefix); operator-supplied patterns are automatically
+            literal listen prefix and server/`basePath` prefix); operator-supplied
+            full-path patterns are not prefixed or stripped and are automatically
             anchored as `^(?:...)$` (full-path match) so a loose pattern cannot
             substring-match an unintended superstring path.
         operation_label:

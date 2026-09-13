@@ -3,24 +3,7 @@
 
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 
-use crate::unit::env_lock::ENV_LOCK;
-
-fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-    let _guard = ENV_LOCK.lock().unwrap();
-    for (k, v) in vars {
-        // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe {
-            std::env::set_var(k, v);
-        }
-    }
-    f();
-    for (k, _) in vars {
-        // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe {
-            std::env::remove_var(k);
-        }
-    }
-}
+use crate::unit::env_lock::with_env_vars;
 
 const SHARED_SECRET: &str = "shared-hmac-secret-32-chars-min!!";
 const ADMIN_SECRET: &str = "admin-secret-padding-32-chars!!!";

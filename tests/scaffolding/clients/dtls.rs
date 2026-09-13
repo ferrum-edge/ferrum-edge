@@ -24,6 +24,8 @@
 //! general-purpose DTLS client — it never completes a handshake — it
 //! exists so the gateway's SNI-peek logic has something to peek at.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,7 +59,7 @@ impl DtlsClient {
         let _ = rustls::crypto::CryptoProvider::install_default(
             rustls::crypto::ring::default_provider(),
         );
-        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let socket = UdpSocket::bind_test("127.0.0.1:0").await?;
         let peer = peer.into();
         socket.connect(peer).await?;
 

@@ -14,6 +14,8 @@
 //! to the polling loop in `src/modes/database.rs` to verify the cursor only
 //! advances on `Applied`/`Unchanged`, never on `Rejected`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::{collections::HashMap, sync::Arc};
 
 use base64::Engine;
@@ -60,6 +62,7 @@ fn country_mmdb_with_country(replacement: &[u8; 2]) -> Vec<u8> {
 /// Minimal test proxy with safe defaults.
 fn test_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
@@ -129,6 +132,7 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
 
 fn test_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -142,6 +146,7 @@ fn test_consumer(id: &str, username: &str) -> Consumer {
 
 fn test_plugin_config(id: &str, enabled: bool) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "stdout_logging".to_string(),
@@ -159,6 +164,7 @@ fn test_plugin_config(id: &str, enabled: bool) -> PluginConfig {
 
 fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -472,6 +478,7 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
         proxies: vec![test_proxy("geo-proxy", "/geo")],
         plugin_configs: vec![
             PluginConfig {
+                labels: Default::default(),
                 id: "geo-policy".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "geo_restriction".to_string(),
@@ -578,6 +585,7 @@ async fn incremental_preloads_geo_for_adaptive_route_rebuild_scope_expansion() {
         proxies: vec![p1.clone(), p2],
         plugin_configs: vec![
             PluginConfig {
+                labels: Default::default(),
                 id: "adaptive-policy".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "adaptive_concurrency".to_string(),
@@ -597,6 +605,7 @@ async fn incremental_preloads_geo_for_adaptive_route_rebuild_scope_expansion() {
                 updated_at: Utc::now(),
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "geo-policy".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "geo_restriction".to_string(),
@@ -666,6 +675,7 @@ async fn incremental_preloaded_geo_handoff_normalizes_padded_db_path() {
         serde_json::from_value(serde_json::json!({"plugin_config_id": "geo-policy"})).unwrap(),
     );
     let geo_policy = PluginConfig {
+        labels: Default::default(),
         id: "geo-policy".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "geo_restriction".to_string(),
@@ -744,6 +754,7 @@ async fn incremental_geo_refresh_preserves_out_of_scope_policy_snapshot() {
             .unwrap(),
     );
     let first_policy = PluginConfig {
+        labels: Default::default(),
         id: "first-geo-policy".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "geo_restriction".to_string(),
@@ -762,6 +773,7 @@ async fn incremental_geo_refresh_preserves_out_of_scope_policy_snapshot() {
         updated_at: Utc::now(),
     };
     let second_policy = PluginConfig {
+        labels: Default::default(),
         id: "second-geo-policy".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "geo_restriction".to_string(),
@@ -862,6 +874,7 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
         proxies: vec![test_proxy("geo-proxy", "/geo")],
         plugin_configs: vec![
             PluginConfig {
+                labels: Default::default(),
                 id: "geo-policy".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "geo_restriction".to_string(),
@@ -1042,6 +1055,7 @@ async fn dp_full_snapshot_applies_new_geo_policy_over_retained_mmdb() {
     std::fs::write(&mmdb_path, country_mmdb_bytes()).unwrap();
 
     let geo_plugin_config = |config: serde_json::Value| PluginConfig {
+        labels: Default::default(),
         id: "geo-policy".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "geo_restriction".to_string(),
@@ -2752,7 +2766,7 @@ async fn apply_incremental_upstream_only_tls_change_reconciles_stream_listeners(
     std::fs::write(&ca_b_path, &ca_b_pem).expect("write ca b");
 
     // Backend: TLS echo server with a CA-B-signed cert.
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend echo listener");
     let backend_port = backend_listener
@@ -2934,6 +2948,7 @@ async fn proxy_delta_updates_only_the_owning_namespace_for_a_shared_proxy_id() {
 
 fn ai_rate_limiter_plugin_config(id: &str) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "ai_rate_limiter".to_string(),

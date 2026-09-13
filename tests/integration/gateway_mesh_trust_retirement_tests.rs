@@ -8,6 +8,8 @@
 //! cloned HTTP/2 sender — because those are the handles that kept forwarding
 //! before this change.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
@@ -126,6 +128,7 @@ fn trust_view_with_jwt(td: &str, key_id: &str, public_key_pem: &str) -> TrustBun
 fn proxy_for_test() -> Proxy {
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: "gateway-mesh-trust".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Gateway mesh trust".to_string()),
@@ -203,7 +206,7 @@ fn proxy_for_test() -> Proxy {
 async fn start_mesh_echo_server(
     server_slot: SharedSvidBundle,
 ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind mesh echo server");
     let addr = listener.local_addr().expect("listener addr");

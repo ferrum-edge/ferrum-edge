@@ -4,6 +4,8 @@
 //! validation, so method allowlists are checked on HTTP/1.1, h2c HTTP/2, and
 //! HTTP/3 requests before backend dispatch.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 
@@ -95,7 +97,7 @@ struct CountingBackend {
 
 impl CountingBackend {
     async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let port = listener.local_addr().expect("backend addr").port();

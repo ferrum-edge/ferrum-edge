@@ -29,6 +29,7 @@ use tokio::sync::broadcast;
 
 fn make_proxy(id: &str, namespace: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         name: Some(id.to_string()),

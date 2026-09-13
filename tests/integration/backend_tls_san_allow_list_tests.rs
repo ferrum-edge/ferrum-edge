@@ -1,5 +1,7 @@
 //! Integration coverage for per-upstream backend TLS SAN allow-lists.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::sync::Arc;
 use std::sync::Once;
 
@@ -78,6 +80,7 @@ fn create_test_proxy(port: u16, ca_path: &str, san_allow_list: Vec<String>) -> P
     resolved_tls.recompute_san_digest();
 
     Proxy {
+        labels: Default::default(),
         id: "h2-san-test".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -161,7 +164,7 @@ async fn start_h2_tls_backend(
     tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
 
     let handle = tokio::spawn(async move {

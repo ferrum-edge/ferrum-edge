@@ -6,6 +6,8 @@
 //! allow/deny verdicts are asserted with oneshot barriers (no fragile
 //! wall-clock latency thresholds).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -127,6 +129,7 @@ impl Plugin for GatedClientADatagramHook {
 
 fn udp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("udp hook concurrency".to_string()),
@@ -395,7 +398,11 @@ async fn echo_round_trip(
 
 #[tokio::test]
 async fn slow_udp_datagram_hook_for_client_a_does_not_block_client_b() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
 
@@ -409,7 +416,7 @@ async fn slow_udp_datagram_hook_for_client_a_does_not_block_client_b() {
     // hook-concurrency defect — and do it before a gateway is spawned.
     let mut client_b_socket = None;
     for candidate in ["127.0.0.2:0", "127.0.0.3:0", "127.0.0.4:0", "127.0.0.5:0"] {
-        if let Ok(socket) = UdpSocket::bind(candidate).await {
+        if let Ok(socket) = UdpSocket::bind_test(candidate).await {
             client_b_socket = Some(socket);
             break;
         }
@@ -424,7 +431,9 @@ async fn slow_udp_datagram_hook_for_client_a_does_not_block_client_b() {
     };
 
     // Bind client A after B so we know its source IP for the gated plugin.
-    let client_a = UdpSocket::bind("127.0.0.1:0").await.expect("client A bind");
+    let client_a = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client A bind");
     let client_a_ip = Arc::from(
         client_a
             .local_addr()

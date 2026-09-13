@@ -10,6 +10,7 @@ use ferrum_edge::proxy::build_backend_url;
 /// Helper to create a test proxy with sensible defaults.
 fn test_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test {}", id)),

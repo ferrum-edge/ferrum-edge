@@ -5,6 +5,8 @@
 //! so tests can fire requests at the gateway's QUIC listener without
 //! hand-rolling the QUIC + H3 handshake each time.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +25,7 @@ use tokio::task::JoinHandle;
 /// Use the same explicit constructor as the production HTTP/3 path so this
 /// scaffolding compiles under both Ferrum crypto profiles.
 pub fn bind_quinn_client_endpoint(addr: SocketAddr) -> std::io::Result<Endpoint> {
-    let socket = std::net::UdpSocket::bind(addr)?;
+    let socket = std::net::UdpSocket::bind_test(addr)?;
     socket.set_nonblocking(true)?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| std::io::Error::other("quinn requires a Tokio runtime"))?;
@@ -35,7 +37,7 @@ pub fn bind_quinn_server_endpoint(
     config: quinn::ServerConfig,
     addr: SocketAddr,
 ) -> std::io::Result<Endpoint> {
-    let socket = std::net::UdpSocket::bind(addr)?;
+    let socket = std::net::UdpSocket::bind_test(addr)?;
     socket.set_nonblocking(true)?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| std::io::Error::other("quinn requires a Tokio runtime"))?;

@@ -390,9 +390,8 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 |-------|-------|-------------|
 | `failure_threshold` | 1–10,000 | Failures before opening |
 | `success_threshold` | 1–10,000 | Successes to close |
-| `timeout_seconds` | 1–86,400 | Open-state duration |
+| `timeout_seconds` | 1–86,400 | Open-state duration. `cooldown_seconds` is accepted as an input alias and is never returned. |
 | `half_open_max_requests` | 1–10,000 | Probe requests in half-open |
-| `half_open_probe_dwell_seconds` | 1–86,400 (optional) | Unsettled probe-slot dwell before reclaim |
 | `failure_status_codes` | 50 entries, 100–599 | Status codes that count as failure |
 
 ### Retry Config Fields

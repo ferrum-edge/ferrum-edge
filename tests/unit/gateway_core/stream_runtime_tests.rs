@@ -4,6 +4,9 @@ use ferrum_edge::config::types::{BackoffStrategy, ResolvedPortOverride, RetryCon
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
 
+#[path = "../../scaffolding/port_registry.rs"]
+#[allow(dead_code)] // shared allocator; this target uses only the lease API
+mod port_registry;
 #[allow(dead_code)]
 #[path = "../../scaffolding/ports.rs"]
 mod ports;

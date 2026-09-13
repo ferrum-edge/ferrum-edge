@@ -5,6 +5,8 @@
 //! admin writes stay open so the offending row can be repaired in-band —
 //! matching the #2158 validation-rejection contract for decode failures.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
@@ -38,6 +40,7 @@ async fn sqlite_store() -> (Arc<DatabaseStore>, TempDir) {
 
 fn test_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: Some(format!("proxy-{id}")),
@@ -106,6 +109,7 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
 
 fn test_consumer(id: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         username: format!("user-{id}"),
@@ -147,7 +151,9 @@ fn admin_token() -> String {
 }
 
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {

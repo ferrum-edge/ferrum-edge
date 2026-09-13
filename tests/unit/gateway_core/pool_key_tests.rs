@@ -31,6 +31,7 @@ use std::sync::{Arc, Barrier, Once};
 fn minimal_proxy() -> Proxy {
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: "test-proxy".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -2314,6 +2315,7 @@ fn test_client_config() -> rustls::ClientConfig {
 fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

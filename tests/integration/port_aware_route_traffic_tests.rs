@@ -17,6 +17,8 @@
 //! - generation-bound admission before listener reconcile acknowledgement,
 //!   including the ordinary-bind-failure Service remap distinction.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -40,6 +42,7 @@ const HOST: &str = "app.example.com";
 
 fn port_scoped_proxy(id: &str, backend_port: u16, listen_port: Option<u16>) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Port Aware {id}")),
@@ -147,7 +150,7 @@ fn serve_options(proxy_http: TcpListener, admin_http: TcpListener) -> ServeOptio
 
 async fn start_body_backend(body: &'static [u8]) -> (u16, tokio::task::JoinHandle<()>) {
     use hyper::server::conn::http1;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         loop {
@@ -195,7 +198,7 @@ const PORT_RESERVATION_ATTEMPTS: u32 = 10;
 async fn reserve_free_port_avoiding(avoid: &[u16]) -> u16 {
     let mut held = Vec::new();
     for _ in 0..PORT_RESERVATION_ATTEMPTS {
-        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let listener = TcpListener::bind_test("0.0.0.0:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         if avoid.contains(&port) {
             held.push(listener);
@@ -285,8 +288,8 @@ async fn start_two_same_protocol_gateway_listeners(
             .validate_unique_listen_paths()
             .expect("distinct listener ports are independent route-table slots");
 
-        let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+        let admin_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let global_proxy_port = proxy_http.local_addr().unwrap().port();
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
@@ -469,8 +472,8 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
         let listener_b_port = reserve_free_port_avoiding(&used_ports).await;
         used_ports.push(listener_b_port);
 
-        let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+        let admin_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let handles = serve(
             test_env_config(0, 0),
@@ -608,8 +611,8 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
 async fn matching_global_proxy_port_already_serves_the_gateway_listener() {
     let (backend, _b) = start_body_backend(b"listener-a").await;
 
-    let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+    let admin_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let global_proxy_port = proxy_http.local_addr().unwrap().port();
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -653,8 +656,8 @@ async fn matching_global_proxy_port_already_serves_the_gateway_listener() {
 async fn gateway_listener_port_colliding_with_admin_is_refused() {
     let (backend, _b) = start_body_backend(b"listener-a").await;
 
-    let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+    let admin_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let global_proxy_port = proxy_http.local_addr().unwrap().port();
     let admin_port = admin_http.local_addr().unwrap().port();
 
@@ -696,8 +699,8 @@ async fn refused_gateway_listener_does_not_poison_sibling_and_recovers() {
     // same number loses the same race.
     let mut used_ports: Vec<u16> = Vec::new();
     for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
-        let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+        let admin_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let admin_port = admin_http.local_addr().unwrap().port();
         let sibling_port = reserve_free_port_avoiding(&used_ports).await;
         used_ports.push(sibling_port);
@@ -946,11 +949,11 @@ async fn listener_admission_is_generation_bound_before_reconcile_acknowledgement
     use ferrum_edge::proxy::ProxyState;
     use ferrum_edge::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
 
-    let global_proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let global_proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let global_proxy_port = global_proxy_listener.local_addr().unwrap().port();
-    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let admin_port = admin_listener.local_addr().unwrap().port();
-    let busy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let busy_port = busy_listener.local_addr().unwrap().port();
 
     let state = ProxyState::new(

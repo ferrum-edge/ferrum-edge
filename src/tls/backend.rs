@@ -1199,6 +1199,7 @@ mod tests {
 
     fn test_proxy() -> Proxy {
         Proxy {
+            labels: Default::default(),
             id: "proxy-1".to_string(),
             name: Some("proxy-1".to_string()),
             namespace: "ferrum".to_string(),

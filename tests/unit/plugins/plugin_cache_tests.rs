@@ -5016,6 +5016,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
         ],
         vec![
             PluginConfig {
+                labels: Default::default(),
                 id: "cors-no-body-plugin".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "cors".to_string(),
@@ -5030,6 +5031,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 updated_at: Utc::now(),
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "graphql-guarded-plugin".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "graphql".to_string(),
@@ -5044,6 +5046,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 updated_at: Utc::now(),
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "response-only-plugin".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "body_validator".to_string(),
@@ -5058,6 +5061,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 updated_at: Utc::now(),
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "request-xml-plugin".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "body_validator".to_string(),
@@ -5168,6 +5172,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
         vec![make_proxy("p1", "/api", vec!["ps1", "ps2"])],
         vec![
             PluginConfig {
+                labels: Default::default(),
                 id: "ps1".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "request_termination".to_string(),
@@ -5182,6 +5187,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 updated_at: Utc::now(),
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "ps2".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "cors".to_string(),
@@ -5268,6 +5274,7 @@ async fn test_rate_limiter_state_persists_across_calls() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec![])],
         vec![PluginConfig {
+            labels: Default::default(),
             id: "g1".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
@@ -5424,6 +5431,7 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
                 true,
             ),
             PluginConfig {
+                labels: Default::default(),
                 id: "pc2".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "ip_restriction".to_string(),
@@ -5478,6 +5486,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
                 true,
             ),
             PluginConfig {
+                labels: Default::default(),
                 id: "pc2".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "jwt_auth".to_string(),
@@ -5919,6 +5928,7 @@ fn test_plugin_cache_rejects_invalid_waf_config_as_security_plugin() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["pc1"])],
         vec![PluginConfig {
+            labels: Default::default(),
             id: "pc1".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "waf".to_string(),
@@ -8457,6 +8467,7 @@ fn make_plugin_config_with_priority(
 ) -> PluginConfig {
     let config = minimal_plugin_config(plugin_name);
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: plugin_name.to_string(),

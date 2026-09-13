@@ -16,6 +16,8 @@
 //!   cargo build --bin ferrum-edge
 //!   cargo test --test functional_tests -- --ignored functional_host_only_routing --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -28,7 +30,7 @@ use tokio::task::JoinHandle;
 // ============================================================================
 
 async fn spawn_backend(identifier: &'static str) -> (u16, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         loop {
@@ -51,10 +53,9 @@ async fn spawn_backend(identifier: &'static str) -> (u16, JoinHandle<()>) {
 }
 
 async fn ephemeral_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 async fn get_with_host_header(client: &reqwest::Client, url: String, host: &str) -> (u16, String) {

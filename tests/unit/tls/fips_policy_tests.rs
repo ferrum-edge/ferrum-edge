@@ -21,6 +21,7 @@ use serde_json::json;
 
 fn plugin(name: &str, config: serde_json::Value) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: format!("{name}-1"),
         plugin_name: name.to_string(),
         namespace: "ferrum".to_string(),
@@ -40,6 +41,7 @@ fn consumer_with(basicauth: serde_json::Value) -> Consumer {
     let mut credentials = std::collections::HashMap::new();
     credentials.insert("basicauth".to_string(), basicauth);
     Consumer {
+        labels: Default::default(),
         id: "consumer-1".to_string(),
         username: "alice".to_string(),
         namespace: "ferrum".to_string(),

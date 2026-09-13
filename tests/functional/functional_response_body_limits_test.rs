@@ -4,6 +4,8 @@
 //! `Content-Length` exceeds the configured ceiling before oversized bytes are
 //! delivered to the frontend client.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::{Http3Client, Http3Response};
 
@@ -160,7 +162,7 @@ fn response_limit_config(backend_port: u16) -> String {
 }
 
 async fn spawn_oversized_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind oversized backend");
     let port = listener.local_addr().expect("backend addr").port();

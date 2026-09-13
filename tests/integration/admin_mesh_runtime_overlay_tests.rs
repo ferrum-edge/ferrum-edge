@@ -8,6 +8,8 @@
 //! integration leg validates the slice → admin handler contract that GAP-3E
 //! exposes to operators.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::admin::{
@@ -142,7 +144,7 @@ fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeStat
 async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(

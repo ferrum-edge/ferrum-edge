@@ -7,6 +7,8 @@
 //! - gRPC error responses are properly formatted when backend is unavailable
 //! - Auth plugins work with gRPC metadata (HTTP/2 headers)
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,6 +38,7 @@ use ferrum_edge::proxy::ProxyState;
 /// Create a test proxy configured for gRPC backend.
 fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("gRPC Test Proxy {}", id)),
@@ -297,6 +300,7 @@ fn attach_grpc_web_deadline_plugins(
     ];
     vec![
         PluginConfig {
+            labels: Default::default(),
             id: "grpc-web-bridge".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "grpc_web".to_string(),
@@ -311,6 +315,7 @@ fn attach_grpc_web_deadline_plugins(
             updated_at: Utc::now(),
         },
         PluginConfig {
+            labels: Default::default(),
             id: "grpc-deadline".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "grpc_deadline".to_string(),
@@ -329,6 +334,7 @@ fn attach_grpc_web_deadline_plugins(
 
 fn create_test_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("gRPC Test Upstream {id}")),
@@ -362,6 +368,7 @@ fn create_test_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
 
 fn security_headers_plugin(id: &str) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "security_headers".to_string(),
@@ -431,7 +438,7 @@ fn create_test_proxy_state_with_env(
 /// - The request path echoed in a custom `x-echo-path` header
 /// - The request body echoed back
 async fn start_mock_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -504,7 +511,7 @@ async fn start_mock_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) 
 /// (Hyper reconstructs the latter from `:authority`) so RFC 9113 §8.3.1
 /// agreement can be asserted on the native-gRPC outbound path.
 async fn start_host_echoing_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -563,7 +570,7 @@ async fn start_host_echoing_grpc_backend() -> (SocketAddr, tokio::task::JoinHand
 /// an incomplete frontend upload never dispatches a partial primary request.
 async fn start_counting_grpc_echo_backend()
 -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(AtomicUsize::new(0));
     let service_requests = Arc::clone(&requests);
@@ -605,7 +612,7 @@ async fn start_counting_grpc_echo_backend()
 
 async fn start_connection_counting_backend()
 -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let connection_count = Arc::new(AtomicUsize::new(0));
     let task_count = Arc::clone(&connection_count);
@@ -623,7 +630,7 @@ async fn start_connection_counting_backend()
 /// Uses an internal listener approach to avoid port race conditions:
 /// we accept connections ourselves and feed them to the gateway's handler.
 async fn start_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let gateway_addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -1203,7 +1210,7 @@ async fn start_grpc_backend_echoing_request_trailers() -> (SocketAddr, tokio::ta
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -1575,6 +1582,7 @@ fn test_plugin_config(
     config: serde_json::Value,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: plugin_name.to_string(),
@@ -2242,6 +2250,7 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
 
     let secret = "0123456789abcdef0123456789abcdef";
     let consumer = Consumer {
+        labels: Default::default(),
         id: "grpc-hmac-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "grpc-hmac-user".to_string(),
@@ -2317,6 +2326,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
 
     let secret = "0123456789abcdef0123456789abcdef";
     let consumer = Consumer {
+        labels: Default::default(),
         id: "grpc-hmac-cd-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "grpc-hmac-cd-user".to_string(),
@@ -2798,7 +2808,7 @@ async fn start_streaming_grpc_backend(
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -2991,7 +3001,7 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -3111,7 +3121,7 @@ async fn start_grpc_backend_that_errors_after_data_frame()
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -3179,6 +3189,7 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
         plugin_config_id: "rt-trailer-remove".to_string(),
     }];
     let plugin = PluginConfig {
+        labels: Default::default(),
         id: "rt-trailer-remove".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "response_transformer".to_string(),
@@ -3313,6 +3324,7 @@ async fn grpc_buffered_security_removal_wins_over_cookie_rehome_and_trailer_repl
     let mut proxy = create_grpc_proxy("grpc-security-removal", "/grpc", backend_addr.port());
     proxy.response_body_mode = ResponseBodyMode::Buffer;
     let transformer = PluginConfig {
+        labels: Default::default(),
         id: "grpc-cookie-transformer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "response_transformer".to_string(),
@@ -3526,6 +3538,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
         },
     ];
     let plugin = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -3544,6 +3557,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     sibling.config = serde_json::json!({"expose_headers": ["x-grpc-web-sibling"]});
     sibling.priority_override = Some(270);
     let cookie_transformer = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-cookie-transformer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "response_transformer".to_string(),
@@ -3732,7 +3746,7 @@ async fn start_grpc_backend_with_custom_trailer_fixture()
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -3848,7 +3862,7 @@ async fn start_grpc_web_cadence_backend() -> (SocketAddr, tokio::task::JoinHandl
     use http_body_util::StreamBody;
     use tokio_stream::wrappers::ReceiverStream;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -3910,6 +3924,7 @@ async fn grpc_web_server_streaming_reaches_h1_and_h2_before_backend_eof() {
         plugin_config_id: "grpc-web-cadence".to_string(),
     }];
     let plugin = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-cadence".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -4128,6 +4143,7 @@ async fn grpc_web_preserves_ascii_custom_trailers_on_h1_and_h2_binary_and_text()
         plugin_config_id: "grpc-web-custom-trailers".to_string(),
     }];
     let plugin = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-custom-trailers".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -4204,6 +4220,7 @@ async fn grpc_web_text_keeps_security_policy_in_initial_headers() {
         },
     ];
     let grpc_web = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-text-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -4333,6 +4350,7 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
         plugin_config_id: "grpc-web-bridge".to_string(),
     }];
     let plugin = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -4583,6 +4601,7 @@ async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
         },
     ];
     let grpc_web = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-method-policy-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -4597,6 +4616,7 @@ async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
         updated_at: Utc::now(),
     };
     let method_router = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-method-policy-router".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_method_router".to_string(),
@@ -4686,6 +4706,7 @@ async fn grpc_retry_does_not_dial_path_changing_target() {
     }];
 
     let method_router = PluginConfig {
+        labels: Default::default(),
         id: "grpc-retry-method-policy-router".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_method_router".to_string(),
@@ -4934,7 +4955,7 @@ async fn start_streaming_response_backend(
     use http_body::Frame;
     use http_body_util::{BodyExt, StreamBody};
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -5015,7 +5036,7 @@ async fn start_clean_grpc_streaming_backend() -> (SocketAddr, tokio::task::JoinH
     use http_body::Frame;
     use http_body_util::StreamBody;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -5105,7 +5126,6 @@ async fn grpc_streaming_late_upload_overflow_during_response_records_neutral() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
-        half_open_probe_dwell_seconds: None,
     });
     let cb_config = proxy.circuit_breaker.clone().unwrap();
     let backend_host = proxy.backend_host.clone();
@@ -5245,7 +5265,6 @@ async fn grpc_streaming_clean_probe_heals_breaker_at_body_completion() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
-        half_open_probe_dwell_seconds: None,
     });
     let cb_config = proxy.circuit_breaker.clone().unwrap();
     let backend_host = proxy.backend_host.clone();
@@ -5338,7 +5357,6 @@ async fn grpc_streaming_closed_state_backend_failure_trips_breaker_at_header_tim
         failure_status_codes: vec![503],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
-        half_open_probe_dwell_seconds: None,
     });
     let cb_config = proxy.circuit_breaker.clone().unwrap();
     let backend_host = proxy.backend_host.clone();

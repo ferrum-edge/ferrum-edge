@@ -21,6 +21,7 @@ use ferrum_edge::fips::policy;
 
 fn plugin(name: &str, config: serde_json::Value) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: format!("{name}-1"),
         plugin_name: name.to_string(),
         namespace: "ferrum".to_string(),

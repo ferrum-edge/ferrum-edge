@@ -16,6 +16,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_db_outage
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use serde_json::json;
 use std::path::PathBuf;
@@ -120,7 +122,7 @@ impl DbOutageTestHarness {
 type HeaderEchoBackend = (u16, tokio::task::JoinHandle<()>);
 
 async fn start_header_echo_backend() -> Result<HeaderEchoBackend, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let handle = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {

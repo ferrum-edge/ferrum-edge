@@ -11,6 +11,8 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_db_tls -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{
     DbType, TestGateway, continue_if_tls_fixture_available, ensure_shared_sql_containers_resumed,
     provision_isolated_sql_database,
@@ -121,7 +123,7 @@ impl DbTlsTestHarness {
 async fn start_echo_backend(
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
 
     let handle = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
@@ -509,7 +511,7 @@ async fn test_postgresql_tls_verify_full() {
         .expect("Failed to create harness");
 
     // Start echo backend
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -558,7 +560,7 @@ async fn test_postgresql_tls_require() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -617,7 +619,7 @@ async fn test_mysql_tls_verify_identity() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -666,7 +668,7 @@ async fn test_mysql_tls_required() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -706,7 +708,7 @@ async fn test_sqlite_without_tls_settings() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -764,7 +766,7 @@ async fn test_health_endpoint_shows_db_status() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();

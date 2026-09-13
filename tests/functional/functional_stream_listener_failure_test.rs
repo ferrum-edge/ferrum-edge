@@ -30,9 +30,11 @@
 //! TODO: add a DP-mode bind-failure case if/when the CP test harness is
 //! refactored to allow injecting a bad-port proxy from an in-process CP.
 
+use crate::scaffolding::port_registry::TestSocket;
+use crate::scaffolding::ports::reserve_refused_tcp_port;
+
 use serde_json::json;
 use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
@@ -58,44 +60,12 @@ fn gateway_binary_path() -> &'static str {
     }
 }
 
-/// Bind an ephemeral port then drop the listener. Vulnerable to races — only
-/// used where the gateway subprocess must bind the port itself. Ownership is
-/// proven afterwards by [`prove_child_owns_admin`], not by holding a
-/// reservation: a `BoundTcpPortReservation` (or any live socket) would block
-/// the child's own bind of `FERRUM_ADMIN_HTTP_PORT` / `FERRUM_PROXY_HTTP_PORT`.
+/// Lease a port across test processes, releasing only the socket for the child.
+/// [`prove_child_owns_admin`] still verifies the spawned gateway's identity.
 async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let p = listener.local_addr().unwrap().port();
-    drop(listener);
-    p
-}
-
-struct BoundTcpPortReservation {
-    port: u16,
-    _socket: socket2::Socket,
-}
-
-/// Reserve a TCP port without listening on it.
-///
-/// `port_is_bound()` stays false, but another process cannot bind the port
-/// before we drop the socket immediately before triggering a reload.
-fn reserve_unlistened_tcp_port() -> std::io::Result<BoundTcpPortReservation> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-    socket.bind(&addr.into())?;
-    let port = socket
-        .local_addr()?
-        .as_socket()
-        .ok_or_else(|| std::io::Error::other("reserved address was not a socket address"))?
-        .port();
-    Ok(BoundTcpPortReservation {
-        port,
-        _socket: socket,
-    })
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Minimal TCP stream proxy definition for the admin API.
@@ -540,7 +510,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
 
     // Phase 2: occupy `stream_listen_port` with an external listener and start
     // a fresh gateway that will try to bind to it. The bind must fail fatally.
-    let squatter = TcpListener::bind(format!("127.0.0.1:{}", stream_listen_port))
+    let squatter = TcpListener::bind_test(format!("127.0.0.1:{}", stream_listen_port))
         .await
         .expect("bind squatter");
 
@@ -637,11 +607,11 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
 #[tokio::test(flavor = "multi_thread")]
 async fn functional_stream_listener_reload_remove_and_add() {
     // Pre-bind two backends (held in-process to avoid port races).
-    let backend_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_a = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_a_port = backend_a.local_addr().unwrap().port();
     let echo_a = start_tcp_echo_server_on(backend_a).await;
 
-    let backend_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_b = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_b_port = backend_b.local_addr().unwrap().port();
     let echo_b = start_tcp_echo_server_on(backend_b).await;
 
@@ -652,8 +622,7 @@ async fn functional_stream_listener_reload_remove_and_add() {
 
     for attempt in 1..=MAX_ATTEMPTS {
         let stream_port_a = ephemeral_port().await;
-        let reserved_b =
-            reserve_unlistened_tcp_port().expect("reserve future stream listener port");
+        let reserved_b = reserve_refused_tcp_port().expect("reserve future stream listener port");
         let stream_port_b = reserved_b.port;
         // Sanity: ensure they don't collide
         if stream_port_a == stream_port_b {
@@ -760,7 +729,7 @@ plugin_configs: []
     f.write_all(updated.as_bytes()).unwrap();
     f.sync_all().unwrap();
     drop(f);
-    drop(stream_b_reservation);
+    stream_b_reservation.drop_and_take_port();
 
     // SIGHUP to reload.
     #[cfg(unix)]

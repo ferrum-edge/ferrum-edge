@@ -5,6 +5,8 @@
 //! Run with:
 //! `cargo build --bin ferrum-edge && cargo test --test functional_tests functional_mcp_gateway_batch -- --ignored`
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -173,7 +175,7 @@ async fn functional_mcp_gateway_batch_backend_handles_fragmented_requests() {
     // (or echoes its default body); the framing-aware one reassembles. The two
     // client writes additionally split the headers themselves. No sleeps or
     // retries: completion is decided entirely by the parsed framing.
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     tokio::spawn(start_mcp_echo_server_on(backend_listener));
 
@@ -223,7 +225,7 @@ async fn functional_mcp_gateway_batch_backend_handles_fragmented_requests() {
 #[tokio::test]
 #[ignore]
 async fn functional_mcp_gateway_batch_empty_rejected_before_upstream() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     tokio::spawn(start_mcp_echo_server_on(backend_listener));
 
@@ -249,7 +251,7 @@ async fn functional_mcp_gateway_batch_empty_rejected_before_upstream() {
 #[tokio::test]
 #[ignore]
 async fn functional_mcp_gateway_batch_transparent_forwards_ordered_array() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     tokio::spawn(start_mcp_echo_server_on(backend_listener));
 

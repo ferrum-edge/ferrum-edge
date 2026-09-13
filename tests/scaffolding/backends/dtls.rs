@@ -46,6 +46,8 @@
 //! appended to `received_datagrams()` with the client address; replies
 //! are counted by `packets_sent()`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -397,7 +399,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Use the in-crate DtlsConnection to exercise a real handshake.
-        let client_socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let client_socket = UdpSocket::bind_test("127.0.0.1:0").await.expect("bind");
         client_socket
             .connect(format!("127.0.0.1:{port}"))
             .await

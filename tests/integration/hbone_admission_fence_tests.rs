@@ -22,6 +22,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -163,7 +165,7 @@ async fn start_inbound_gateway(
     state: ProxyState,
     server_config: std::sync::Arc<rustls::ServerConfig>,
 ) -> (SocketAddr, watch::Sender<bool>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
     let addr = listener.local_addr().expect("gateway local addr");
@@ -185,7 +187,7 @@ async fn start_inbound_gateway(
 /// Echoes every chunk back as it arrives, so a tunnel's liveness can be probed
 /// mid-flight (the classic `read_to_end` echo only answers at EOF).
 async fn start_interactive_echo_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind echo backend");
     let addr = listener.local_addr().expect("echo backend local addr");

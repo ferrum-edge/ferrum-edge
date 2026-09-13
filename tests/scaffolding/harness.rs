@@ -98,6 +98,7 @@
 
 use crate::common::gateway_harness::{DbType, TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::Http1Client;
+use crate::scaffolding::port_registry::TestSocket;
 use crate::scaffolding::ports::{PortReservation, reserve_port_pair};
 use chrono::Utc;
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
@@ -107,8 +108,9 @@ use ferrum_edge::modes::file::{ServeHandles, ServeOptions};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::Child;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -1102,6 +1104,111 @@ async fn wait_for_in_process_proxy_port(
             .into());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A stream listener whose port is already leased by the spawning test.
+#[derive(Clone, Copy, Debug)]
+pub enum StreamListener {
+    Tcp(u16),
+    Udp(u16),
+}
+
+/// Wait up to 30 seconds for a live gateway child's HTTP port and optional stream listener.
+///
+/// HTTP readiness alone is insufficient: file mode starts HTTP before reconciling
+/// TCP/UDP stream listeners. TCP readiness uses a raw connect. UDP (including DTLS)
+/// readiness uses a loopback bind on the test's existing registry lease: `AddrInUse`
+/// means the listener is bound, while a successful probe socket is dropped immediately
+/// without awaiting so it cannot remain held between polls. Sending a probe datagram
+/// would create a session and change the counts or ordering asserted by UDP tests.
+///
+/// The HTTP and stream stages share one deadline. Child exit is checked before and
+/// after every probe, and errors identify the stage and port. Fixtures with an
+/// authenticated identity barrier must retain it before calling this helper.
+pub async fn wait_for_spawned_gateway(
+    child: &mut Child,
+    http_port: u16,
+    stream_listener: Option<StreamListener>,
+) -> io::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    wait_for_spawned_listener(child, StreamListener::Tcp(http_port), "HTTP", deadline).await?;
+    if let Some(listener) = stream_listener {
+        let stage = match listener {
+            StreamListener::Tcp(_) => "TCP stream",
+            StreamListener::Udp(_) => "UDP stream",
+        };
+        wait_for_spawned_listener(child, listener, stage, deadline).await?;
+    }
+    Ok(())
+}
+
+async fn wait_for_spawned_listener(
+    child: &mut Child,
+    listener: StreamListener,
+    stage: &str,
+    deadline: tokio::time::Instant,
+) -> io::Result<()> {
+    let port = match listener {
+        StreamListener::Tcp(port) | StreamListener::Udp(port) => port,
+    };
+    loop {
+        check_gateway_child(child, stage, port)?;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("gateway {stage} listener on port {port} not ready within 30s"),
+            ));
+        }
+        let ready = match listener {
+            StreamListener::Tcp(_) => match tokio::time::timeout_at(
+                deadline.min(now + Duration::from_millis(100)),
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => {
+                    drop(stream);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            },
+            StreamListener::Udp(_) => match std::net::UdpSocket::bind_test(("127.0.0.1", port)) {
+                Ok(socket) => {
+                    drop(socket);
+                    Ok(false)
+                }
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => Ok(true),
+                Err(error) => Err(io::Error::new(
+                    error.kind(),
+                    format!("gateway {stage} readiness probe on port {port} failed: {error}"),
+                )),
+            },
+        };
+        check_gateway_child(child, stage, port)?;
+        if ready? {
+            return Ok(());
+        }
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(20)),
+        )
+        .await;
+    }
+}
+
+fn check_gateway_child(child: &mut Child, stage: &str, port: u16) -> io::Result<()> {
+    match child.try_wait().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("checking gateway child while waiting for {stage} port {port}: {error}"),
+        )
+    })? {
+        Some(status) => Err(io::Error::other(format!(
+            "gateway child {} exited with {status} while waiting for {stage} listener on port {port}",
+            child.id()
+        ))),
+        None => Ok(()),
     }
 }
 

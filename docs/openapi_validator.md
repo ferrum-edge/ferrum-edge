@@ -22,7 +22,7 @@ x-ferrum-proxy:
   backend_port: 8080
 
 paths:
-  /orders:
+  /:
     post:
       requestBody:
         required: true
@@ -49,6 +49,8 @@ paths:
 
 The importer generates a proxy-scoped `openapi_validator` plugin, resolves local Path Item and schema `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
 
+This example validates `POST /orders`: the Paths key `/` is mounted under `listen_path: /orders`, and the Paths-key root yields the listen prefix itself.
+
 ### Schema Object `$ref` siblings
 
 A keyword adjacent to `$ref` inside a Schema Object never replaces the referenced keyword.
@@ -62,12 +64,18 @@ Previously each adjacent key was inserted into the materialized target, so `{$re
 
 ### Server base paths
 
-OpenAPI path keys are relative to the applicable Server Object; Swagger 2.0 path keys are relative to `basePath`. The importer prepends the effective server pathname when generating each operation's `path_template` and `path_regex`, so runtime matching against the full inbound URI path stays consistent across HTTP/1.x, HTTP/2, and HTTP/3:
+The plugin matches the full canonical inbound request path (`ctx.path`, without the query string), including the proxy's listen prefix. It does not strip that prefix during matching. The importer generates `path_template` and `path_regex` by joining the effective server pathname and OpenAPI Paths key, then prepending the literal `x-ferrum-proxy.listen_path` prefix. For example, `/p2/oas2` plus `/items` generates `/p2/oas2/items` and `^/p2/oas2/items$`; with server pathname `/v1`, it generates `/p2/oas2/v1/items`.
+
+Trailing slashes on the listen prefix are removed before joining: `/p2/oas2/` plus `/items/{id}` produces `/p2/oas2/items/{id}` and `^/p2/oas2/items/[^/]+$`. The listen prefix is always literal in the regex. The Paths-key root `/` follows the same rule as a server base: with no server base it yields the listen prefix itself (`/p2/oas2`, regex `^/p2/oas2$`). Any other Paths-key trailing slash is preserved (`/items/` produces `/p2/oas2/items/`). Root (`/`) and host-only proxies add no prefix. Exact (`=...`) and regex (`~...`) listen routes also add no prefix; their spec's server/basePath and Paths keys must describe the full inbound paths.
+
+`strip_listen_path` controls backend forwarding only and does not change generated operation paths. With no `backend_path`, `/p2/oas2/items` forwards as `/items` when stripping is enabled and as `/p2/oas2/items` when disabled. Hand-authored `operations` and `bypass.paths` continue to match full inbound paths as written; the importer does not prepend a prefix to bypass patterns. With `x-ferrum-validate` enabled, `operations` is regenerated even when supplied in `x-ferrum-plugins`.
+
+OpenAPI path keys are relative to the applicable Server Object; Swagger 2.0 path keys are relative to `basePath`. The server-path portion is resolved identically across HTTP/1.x, HTTP/2, and HTTP/3:
 
 - **Precedence (OpenAPI 3.x):** operation-level `servers` override Path Item `servers`, which override root `servers`. Absence at a narrower scope inherits the next outer scope. Swagger 2.0 uses document `basePath` only.
 - **Pathname only:** absolute-path references (`/v1`), relative references (`v1`), and absolute / scheme-relative URIs contribute only the pathname. Because uploaded specs have no document URL, relative references resolve from a synthetic document root. Scheme, authority, query, and fragment never enter the matcher.
 - **Variables:** `{name}` placeholders use the Server Variable Object `default` only. Declared `enum` values are not expanded into additional matchers. Missing defaults, defaults outside `enum`, malformed braces, and defaults containing `{`, `}`, `?`, or `#` fail closed at import.
-- **Multiple servers:** one generated operation entry per distinct effective pathname, in document order, with equivalent pathnames deduplicated. Root-only servers (`https://api.example.com`) and absent servers keep raw Paths-key matching.
+- **Multiple servers:** one generated operation entry per distinct effective pathname, in document order, with equivalent pathnames deduplicated. Root-only servers (`https://api.example.com`) and absent servers add no server prefix; the listen prefix still applies.
 - **Joining:** exactly one slash boundary between base and Paths key; Paths-key `/` under a non-root base yields the base itself. Raw or percent-encoded `.` / `..` segments fail closed before URL parsing can normalize them. Empty segments remain literal and safe because generated operation regexes are fully anchored.
 - **Path Item `$ref`:** effective `servers` on the resolved Path Item (including sibling overlays) participate in the same precedence rules.
 
@@ -187,8 +195,8 @@ The generated plugin config has this shape:
 | `fail_on_missing_response_schema` | `false` | Reject a response whose selected response object yields no schema. Applied **after** status selection to a missing `Content-Type`, a content type outside `response_content_types`, an unmatched declared media type, a body returned for a status declared with no content, and a status covered by no response object. An empty body for an explicitly empty response declaration remains valid. Strict enforcement stays scheduled even when every declared response media map is empty. Statuses with no body semantics (HEAD, 1xx, 204, 205, 304) are always skipped. |
 | `max_body_bytes` | `1048576` | Maximum raw body size and per-layer decoded size while undoing `Content-Encoding` chains. |
 | `schema_draft` | generated | Sole authoritative draft selector: `draft7`, `draft2020-12`, or `auto`. Emitted only at the top level; operations do not carry a draft field. |
-| `operations` | required | Generated per-operation schema table. Required in file mode and other direct plugin configuration; `POST /api-specs` / `PUT /api-specs/{id}` generate it from the attached document when `x-ferrum-validate` is enabled. Each entry's `path_template` / `path_regex` include the effective server/`basePath` pathname (one entry per distinct server pathname). Request and response media schemas are ordinary JSON Schema objects or OpenAPI 3.1 boolean schemas (`true` / `false`). Form-urlencoded and multipart request entries with encoding metadata use the strict Media Type Object `{schema, encoding}`; both fields are required, extra wrapper fields are rejected, and a bare schema remains canonical when encoding is absent. |
-| `bypass.paths` | `[]` | Regexes that skip validation when the request path matches. |
+| `operations` | required | Generated per-operation schema table. Required in file mode and other direct plugin configuration; `POST /api-specs` / `PUT /api-specs/{id}` generate it from the attached document when `x-ferrum-validate` is enabled. Each entry's `path_template` / `path_regex` include the literal listen prefix and effective server/`basePath` pathname (one entry per distinct server pathname), independently of `strip_listen_path`. Request and response media schemas are ordinary JSON Schema objects or OpenAPI 3.1 boolean schemas (`true` / `false`). Form-urlencoded and multipart request entries with encoding metadata use the strict Media Type Object `{schema, encoding}`; both fields are required, extra wrapper fields are rejected, and a bare schema remains canonical when encoding is absent. |
+| `bypass.paths` | `[]` | Regexes that skip validation when the full inbound request path matches. No listen prefix is added to these patterns. |
 | `bypass.methods` | `[]` | HTTP methods that skip validation. |
 | `bypass.consumers` | `[]` | Authenticated identities or mapped consumer usernames that skip validation. |
 | `bypass.header_present` | `{}` | Header-name map. `null` means any value; a string requires an exact value match. Case-equivalent duplicate keys are rejected at construction. |
@@ -213,7 +221,7 @@ Intentionally free-form maps stay open but are shape-validated instead of key-en
 
 Encoding metadata is admitted only on form-urlencoded and multipart request media entries. `headers` and `contentType` require multipart. `spaceDelimited` and `pipeDelimited` require an array or object and `explode: false` (the default for those styles); `deepObject` requires an object and explicit `explode: true`. Each encoding key must name a declared schema property. Exploded object keys must be unambiguous across root siblings and other exploded objects; a free-form exploded object cannot coexist with another exploded object. These property-membership and key-overlap checks require the constructor. Multipart `contentType` is trimmed and must contain 1–4096 UTF-8 bytes after trimming. Header names are trimmed, limited to 256 bytes, normalized case-insensitively, and checked for duplicates and reserved part-header names. Response `description` belongs on the response object or generated response media map, never inside a nested `content` map. Response media entries cannot contain encoding metadata.
 
-XML scalar elements contain text only, without attributes, nested elements, or processing instructions. Namespace declarations remain available for expanded-name matching. A present empty wrapped array becomes `[]`; an absent wrapper leaves the property absent. Array containers reject attributes, non-whitespace text, and unmodeled wrapper children. Generic XML members retain their attribute representation. Comments between object children remain valid.
+XML scalar elements contain text only, without attributes or nested elements. An XML processing instruction anywhere inside the document element is rejected, at scalar and structural positions alike, because a backend may interpret it while the schema projection cannot represent it. Namespace declarations remain available for expanded-name matching. A present empty wrapped array becomes `[]`; an absent wrapper leaves the property absent. Array containers reject attributes, non-whitespace text, and unmodeled wrapper children. Generic XML members retain their attribute representation. Comments between object children remain valid.
 
 Multipart Header Object schema values use `style: simple`: arrays are comma-separated, objects use alternating comma-separated keys and values by default, and `explode: true` objects use comma-separated `name=value` members. `explode` defaults to false. Required-header and full header-schema checks apply to every associated part, including serialized collections and nested exploded/deepObject members.
 
@@ -307,6 +315,8 @@ tracing.
 ## Overrides
 
 Persistent changes should be made in the spec's `x-ferrum-validate` block and applied with `PUT /api-specs/{id}`.
+
+To repair a previously imported validator whose generated paths omit the listen prefix, resubmit the spec with `PUT /api-specs/{id}`. Existing stored plugin configs are not rewritten at runtime. For generated validators, the spec's Paths keys are relative to the mount; do not repeat the listen prefix in Paths keys or server/basePath unless the intended inbound path contains that prefix twice.
 
 Emergency changes can be made directly to the generated plugin row with `PUT /plugins/config/{id}`. This is intentionally ephemeral: the next spec `PUT` regenerates the spec-owned plugin and replaces direct edits. Use it for incident response, then backport the change into the spec.
 

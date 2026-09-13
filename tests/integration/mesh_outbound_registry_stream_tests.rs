@@ -20,6 +20,8 @@
 //!   - Enforcement Skip path (non-outbound-capture listen_port) → traffic
 //!     flows through unchanged so the policy never gates inbound listeners.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -69,6 +71,7 @@ const MAX_GATEWAY_ATTEMPTS: u32 = crate::scaffolding::ports::BIND_DROP_SPAWN_ATT
 
 fn tcp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("t5b stream tcp proxy".to_string()),
@@ -388,7 +391,7 @@ async fn spawn_tcp_listener_with_retry(
 async fn tcp_admitted_destination_passes_through_to_backend() {
     // Backend bound + held so the gateway can dial it. The registry
     // contains `127.0.0.1:<backend_port>` so the destination is admitted.
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("backend bind");
     let backend_addr = backend_listener.local_addr().expect("backend addr");
@@ -437,7 +440,7 @@ async fn tcp_admitted_destination_passes_through_to_backend() {
 #[tokio::test]
 async fn tcp_unadmitted_destination_is_dropped_before_backend_dial() {
     // Backend exists but the registry does NOT contain its address.
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("backend bind");
     let backend_addr = backend_listener.local_addr().expect("backend addr");
@@ -510,7 +513,7 @@ async fn tcp_skips_enforcement_when_listener_not_in_capture_ports() {
     // Same backend + unadmitted-by-registry destination as the deny test,
     // but the enforcement's capture-port list does NOT contain our
     // gateway port. Result: `Decision::Skip` → traffic flows through.
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("backend bind");
     let backend_addr = backend_listener.local_addr().expect("backend addr");
@@ -701,7 +704,11 @@ async fn spawn_udp_listener_with_retry(
 
 #[tokio::test]
 async fn udp_admitted_destination_passes_through_to_backend() {
-    let backend_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_socket = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_addr = backend_socket.local_addr().expect("backend addr");
     let backend_bytes = Arc::new(AtomicU64::new(0));
     let _backend = spawn_udp_echo_backend(backend_socket, backend_bytes.clone()).await;
@@ -718,7 +725,9 @@ async fn udp_admitted_destination_passes_through_to_backend() {
         .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
     client.send_to(b"ping", gateway_addr).await.expect("send");
     let mut buf = [0u8; 4];
     let read = tokio::time::timeout(TEST_TIMEOUT, client.recv_from(&mut buf))
@@ -739,7 +748,11 @@ async fn udp_admitted_destination_passes_through_to_backend() {
 #[tokio::test]
 async fn udp_unadmitted_destination_is_silently_dropped() {
     // Backend bound — but registry does NOT admit it.
-    let backend_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_socket = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_addr = backend_socket.local_addr().expect("backend addr");
     let backend_bytes = Arc::new(AtomicU64::new(0));
     let _backend = spawn_udp_echo_backend(backend_socket, backend_bytes.clone()).await;
@@ -758,7 +771,9 @@ async fn udp_unadmitted_destination_is_silently_dropped() {
     let deny_before = stream_deny_count(UDP_DENY_NAMESPACE, "udp");
     let admit_before = stream_admit_count(UDP_DENY_NAMESPACE, "udp");
 
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
     client.send_to(b"ping", gateway_addr).await.expect("send");
     let mut buf = [0u8; 64];
     // No echo should come back — silent drop. Use a short timeout to
@@ -793,7 +808,11 @@ async fn udp_unadmitted_destination_is_silently_dropped() {
 
 #[tokio::test]
 async fn udp_skips_enforcement_when_listener_not_in_capture_ports() {
-    let backend_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_socket = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_addr = backend_socket.local_addr().expect("backend addr");
     let backend_bytes = Arc::new(AtomicU64::new(0));
     let _backend = spawn_udp_echo_backend(backend_socket, backend_bytes.clone()).await;
@@ -811,7 +830,9 @@ async fn udp_skips_enforcement_when_listener_not_in_capture_ports() {
         .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
     client.send_to(b"ping", gateway_addr).await.expect("send");
     let mut buf = [0u8; 4];
     let read = tokio::time::timeout(TEST_TIMEOUT, client.recv_from(&mut buf))

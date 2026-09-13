@@ -149,6 +149,7 @@ fn materialized_spoofed_context(client_ip: &str) -> RequestContext {
 
 fn make_geo_plugin(id: &str, enabled: bool, config: serde_json::Value) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.into(),
         namespace: default_namespace(),
         plugin_name: "geo_restriction".into(),

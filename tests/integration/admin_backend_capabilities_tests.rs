@@ -10,6 +10,8 @@
 //! against an in-process admin listener (no gateway binary) so the test
 //! lives in the integration test suite, not the functional one.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
@@ -213,7 +215,7 @@ async fn start_counting_http_backend(
     response_delay: Duration,
     release: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind counting backend");
     let addr = listener.local_addr().expect("backend addr");
@@ -261,6 +263,7 @@ fn make_minimal_proxy(id: &str) -> ferrum_edge::config::types::Proxy {
     };
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -340,7 +343,7 @@ async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sen
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
 
     let state_clone = state.clone();

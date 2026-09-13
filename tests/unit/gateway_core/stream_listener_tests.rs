@@ -43,6 +43,7 @@ const STREAM_LISTENER_SOURCE: &str = include_str!("../../../src/proxy/stream_lis
 
 fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
     let mut proxy = Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

@@ -12,6 +12,8 @@
 //! responses can be held back, so "pending requests" is a deterministic
 //! quantity rather than a race.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
@@ -123,6 +125,7 @@ fn proxy_for_test(max_connections: Option<u32>) -> Proxy {
         overrides
     });
     Proxy {
+        labels: Default::default(),
         id: "mesh-mtls-pool-width".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Mesh mTLS pool width".to_string()),
@@ -221,7 +224,9 @@ impl HoldingPeer {
 }
 
 async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind peer");
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind peer");
     let addr = listener.local_addr().expect("peer addr");
     let connections = Arc::new(AtomicUsize::new(0));
     let (release, release_rx) = watch::channel(true);
@@ -281,6 +286,7 @@ struct Fixture {
     proxy: Proxy,
     peer: HoldingPeer,
     peer_id: SpiffeId,
+    limiter: Arc<BackendConnectionLimiter>,
 }
 
 async fn fixture(width: usize, max_connections: Option<u32>) -> Fixture {
@@ -310,14 +316,14 @@ async fn fixture(width: usize, max_connections: Option<u32>) -> Fixture {
         gateway_slot,
         4,
     );
-    if max_connections.is_some() {
-        pool.attach_backend_conn_limit(Arc::new(BackendConnectionLimiter::new()));
-    }
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    pool.attach_backend_conn_limit(Arc::clone(&limiter));
     Fixture {
         pool,
         proxy: proxy_for_test(max_connections),
         peer,
         peer_id,
+        limiter,
     }
 }
 
@@ -553,6 +559,36 @@ async fn growth_never_bypasses_destination_rule_max_connections() {
     }
     let (_, future) = dispatch(&fixture).await;
     expect_ok(future).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uncapped_connections_are_counted_when_a_cap_is_applied_later() {
+    let mut fixture = fixture(3, None).await;
+    let threshold = MESH_MTLS_GROWTH_PENDING_PER_CONNECTION;
+
+    // Widen to two physical connections before any cap exists, then pressure
+    // both so the next checkout attempts to open a third connection.
+    let mut parked = park(&fixture, threshold).await;
+    let _ = fixture.checkout().await;
+    for _ in 0..threshold {
+        parked.push(dispatch(&fixture).await);
+    }
+    assert_eq!(fixture.pool.pool_size(), 2);
+    assert_eq!(fixture.peer.accepted(), 2);
+    assert_eq!(fixture.limiter.current("127.0.0.1", APP_PORT), 2);
+
+    fixture.proxy = proxy_for_test(Some(1));
+    let _ = fixture.checkout().await;
+    assert_eq!(
+        fixture.peer.accepted(),
+        2,
+        "the newly applied cap must observe uncapped resident connections"
+    );
+
+    fixture.peer.release_all();
+    for (_, future) in parked {
+        expect_ok(future).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

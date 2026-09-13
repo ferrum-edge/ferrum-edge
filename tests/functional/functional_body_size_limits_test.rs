@@ -4,6 +4,8 @@
 //! proxying path honors `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` and
 //! `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, including `0` as unlimited.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 
 use bytes::Bytes;
@@ -31,7 +33,7 @@ struct BodyLimitHarness {
 
 impl BodyLimitHarness {
     async fn new(mode: BackendMode, env: &[(&str, &str)]) -> Self {
-        let backend_listener = TcpListener::bind("127.0.0.1:0")
+        let backend_listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let backend_port = backend_listener.local_addr().expect("backend addr").port();

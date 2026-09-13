@@ -15,6 +15,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_plugin
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -186,7 +188,7 @@ impl PluginTestHarness {
 async fn start_header_echo_backend(
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
     let handle = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -280,7 +282,7 @@ async fn start_h2_tls_header_echo_backend(
     tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
     let handle = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
@@ -394,7 +396,9 @@ async fn test_plugin_rate_limiting() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -472,7 +476,9 @@ async fn test_plugin_cors_preflight() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -596,7 +602,9 @@ async fn test_plugin_ip_restriction() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -719,7 +727,9 @@ async fn test_plugin_request_termination() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -838,7 +848,9 @@ async fn test_plugin_request_termination_preserves_cors_preflight() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -950,7 +962,9 @@ async fn test_plugin_correlation_id() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1125,7 +1139,9 @@ async fn test_plugin_request_size_limiting() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1192,7 +1208,9 @@ async fn test_plugin_request_size_limiting_checks_transformed_body() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1268,7 +1286,9 @@ async fn test_plugin_response_size_limiting_fast_path() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1336,7 +1356,9 @@ async fn test_plugin_body_validator_request_validation_without_transformer() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1413,7 +1435,9 @@ async fn test_plugin_request_transformer() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1488,7 +1512,9 @@ async fn test_plugin_request_transformer_updates_body_content_length() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1564,7 +1590,9 @@ async fn test_plugin_request_transformer_body_rules_bypass_direct_h2_pool() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_h2_tls_header_echo_backend(backend_port)
@@ -1688,7 +1716,7 @@ async fn test_oidc_callback_materializes_query_in_production_pipeline() {
     let harness = PluginTestHarness::new()
         .await
         .expect("Failed to create harness");
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend port");
     let backend_port = backend_listener
@@ -1783,7 +1811,9 @@ async fn test_plugin_response_transformer() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1861,7 +1891,9 @@ async fn test_plugin_bot_detection() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1954,7 +1986,9 @@ async fn test_plugin_chain_multiple_plugins() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();

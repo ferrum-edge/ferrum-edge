@@ -12,6 +12,8 @@
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_tcp_proxy --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{GatewayChildGuard, configure_coverage_gateway_command, explicit_test_binary};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -321,15 +323,15 @@ where
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         // Allocate fresh ephemeral ports each attempt
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let proxy_listen_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let http_port = http_listener.local_addr().unwrap().port();
         drop(http_listener);
 
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
@@ -449,7 +451,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 #[tokio::test]
 async fn test_tcp_proxy_plain_bidirectional() {
     // Backend echo server — pass pre-bound listener (no port race)
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
@@ -516,7 +518,7 @@ plugin_configs: []
 #[tokio::test]
 async fn test_tcp_proxy_frontend_tls_termination() {
     // Backend echo server — bind in-process (no port race)
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
@@ -591,7 +593,7 @@ plugin_configs: []
 #[tokio::test]
 async fn test_tcp_proxy_backend_tls_origination() {
     // Backend TLS echo server — bind in-process (no port race)
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let echo_server = start_tls_echo_server_on(backend_listener).await;
 
@@ -643,7 +645,7 @@ plugin_configs: []
 #[tokio::test]
 async fn test_tcp_proxy_full_tls() {
     // Backend TLS echo server — bind in-process (no port race)
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let echo_server = start_tls_echo_server_on(backend_listener).await;
 
@@ -720,7 +722,7 @@ plugin_configs: []
 #[tokio::test]
 async fn test_tcp_proxy_idle_timeout() {
     // Backend echo server — bind in-process (no port race)
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
@@ -795,7 +797,7 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_global_idle_timeout_env() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
@@ -864,7 +866,7 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_backend_read_timeout() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let silent_backend = start_tcp_silent_reader_server_on(backend_listener).await;
 
@@ -926,7 +928,7 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_global_idle_timeout_env_fallback() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
@@ -997,7 +999,7 @@ async fn test_tcp_proxy_client_half_close_allows_delayed_backend_response() {
     const REQUEST: &[u8] = b"half-close-request";
     const RESPONSE: &[u8] = b"delayed-half-close-response";
 
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let response_server = start_half_close_response_server_on(
         backend_listener,
@@ -1065,11 +1067,11 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_active_connection_survives_config_reload() {
-    let backend_a_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_a_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_a_port = backend_a_listener.local_addr().unwrap().port();
     let backend_a = start_tagged_tcp_echo_server_on(backend_a_listener, b"A:").await;
 
-    let backend_b_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_b_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_b_port = backend_b_listener.local_addr().unwrap().port();
     let backend_b = start_tagged_tcp_echo_server_on(backend_b_listener, b"B:").await;
 
@@ -1169,6 +1171,9 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_backend_unreachable() {
+    let backend_port = crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease unreachable backend port");
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
         |proxy_port| {
             format!(
@@ -1179,7 +1184,7 @@ proxies:
     listen_port: {proxy_port}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: 19899
+    backend_port: {backend_port}
     backend_connect_timeout_ms: 1000
 
 consumers: []
@@ -1226,11 +1231,11 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_weighted_upstream_distribution() {
-    let heavy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let heavy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let heavy_port = heavy_listener.local_addr().unwrap().port();
     let heavy = start_tagged_tcp_echo_server_on(heavy_listener, b"H:").await;
 
-    let light_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let light_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let light_port = light_listener.local_addr().unwrap().port();
     let light = start_tagged_tcp_echo_server_on(light_listener, b"L:").await;
 
@@ -1360,7 +1365,7 @@ fn v2_header_tcp4_bytes(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16
 #[ignore]
 #[tokio::test]
 async fn test_tcp_outbound_proxy_protocol_v2_direct_client() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let observed_tuple = Arc::new(tokio::sync::Mutex::new(None));
     let backend =
@@ -1422,7 +1427,7 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_outbound_proxy_protocol_v2_chained_inbound() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let observed_tuple = Arc::new(tokio::sync::Mutex::new(None));
     let backend =
@@ -1503,15 +1508,15 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_least_connections_distributes_across_targets() {
-    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_a = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port_a = listener_a.local_addr().unwrap().port();
     let backend_a = start_tagged_tcp_echo_server_on(listener_a, b"A:").await;
 
-    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_b = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port_b = listener_b.local_addr().unwrap().port();
     let backend_b = start_tagged_tcp_echo_server_on(listener_b, b"B:").await;
 
-    let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_c = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port_c = listener_c.local_addr().unwrap().port();
     let backend_c = start_tagged_tcp_echo_server_on(listener_c, b"C:").await;
 
@@ -1609,7 +1614,7 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_per_source_ip_connection_limit() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = listener.local_addr().unwrap().port();
     let backend = start_tcp_echo_server_on(listener).await;
 
@@ -1645,10 +1650,8 @@ plugin_configs: []
     /// relayed for it. A refused connection is closed at accept, so the echo
     /// round-trip fails (EOF or write error) rather than returning bytes.
     async fn try_relay(source_ip: &str, proxy_port: u16) -> Option<tokio::net::TcpStream> {
-        let socket = tokio::net::TcpSocket::new_v4().expect("client socket");
-        socket
-            .bind(format!("{source_ip}:0").parse().expect("source addr"))
-            .expect("bind client source");
+        let socket =
+            tokio::net::TcpSocket::bind_test(format!("{source_ip}:0")).expect("bind client source");
         let mut stream = socket
             .connect(
                 format!("127.0.0.1:{proxy_port}")
@@ -1701,7 +1704,7 @@ plugin_configs: []
     let mut other_source = None;
     let mut second_source_bound = false;
     for candidate in ["127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5"] {
-        if std::net::TcpListener::bind((candidate, 0)).is_err() {
+        if std::net::TcpListener::bind_test((candidate, 0)).is_err() {
             continue;
         }
         second_source_bound = true;
@@ -1730,7 +1733,7 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_userspace_tls_write_timeout_preserves_request_then_push_session() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
@@ -1817,7 +1820,7 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_gateway_guard_reaps_the_child_on_a_panicking_fixture() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = listener.local_addr().unwrap().port();
     let backend = start_tcp_echo_server_on(listener).await;
 
@@ -1901,7 +1904,7 @@ fn process_is_alive(_pid: u32) -> bool {
 async fn wait_for_bindable_port(port: u16) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
+        if let Ok(listener) = TcpListener::bind_test(("127.0.0.1", port)).await {
             drop(listener);
             return true;
         }

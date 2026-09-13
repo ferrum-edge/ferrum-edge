@@ -94,6 +94,7 @@ pub mod host_udp_capture;
 #[path = "host_udp_capture_live_tests.rs"]
 mod host_udp_capture_live_tests;
 pub mod http2_pool;
+pub(crate) mod https_to_plaintext;
 /// Unbuffered rustls server handshake used to hand a frontend-TLS TCP socket
 /// to the kernel TLS ULP (issue #3619). Linux-only: every other platform keeps
 /// the buffered tokio-rustls accept and the userspace relay.
@@ -1098,6 +1099,7 @@ fn inject_gateway_workload_metrics_if_svid(
 
     let timestamp = gateway_managed_plugin_timestamp();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
         plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
         namespace: namespace.to_string(),
@@ -3388,6 +3390,11 @@ fn http2_pool_sender_error_response(
     if matches!(h2_error_class, retry::ErrorClass::PortExhaustion) {
         state.overload.record_port_exhaustion();
     }
+    https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+        proxy,
+        &format!("{}:{}", proxy.backend_host, proxy.backend_port),
+        err,
+    );
     error!(proxy_id = %proxy.id, error = %msg, "HTTP/2 pool connection failed");
     // Derive status/body/connection_error from the class so a gateway-side
     // egress denial (DispatchPolicyRejected) stays non-retryable and
@@ -15075,6 +15082,11 @@ async fn handle_websocket_request_authenticated(
                 // `retry_on_connect_failure` and do NOT charge passive
                 // health as a connect-class failure.
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
+                https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+                    &proxy,
+                    &current_backend_url,
+                    e.as_ref(),
+                );
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
                 // A gateway-side egress-policy rejection (denied literal-IP
                 // backend) never reached a backend: it must be non-retryable AND
@@ -27295,6 +27307,113 @@ pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy
     true
 }
 
+/// Whether the staged MCP POST-attached SSE publication describes EXACTLY the
+/// response that is about to reach the client.
+///
+/// The reservation promised one `200 text/event-stream` body. Only those bytes,
+/// under that status and representation, may enter `Last-Event-ID` replay
+/// history: anything a later policy, header phase, committed hook, or the
+/// pre-commit authorization gate replaced or refused fails this check and is
+/// aborted instead. Fail-closed in every direction — an absent or renamed
+/// content type, a rewritten body, or a deliverable (non-POST-attached)
+/// reservation all read as "not accepted".
+pub(crate) fn mcp_sse_publication_matches_response(
+    publication: &crate::plugins::mcp_aggregate_sse::AggregateSsePublication,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+    response_body: &[u8],
+) -> bool {
+    response_status == 200
+        && response_headers_select_event_stream(response_headers)
+        && publication.matches_post_attached_body(response_body)
+}
+
+/// Settle a staged MCP POST-attached SSE publication exactly once.
+///
+/// `accepted` is [`mcp_sse_publication_matches_response`] plus whatever else the
+/// transport knows about the write. Committing is what makes the event
+/// resumable; aborting releases the reservation and returns the request stream's
+/// per-session capacity. Both are idempotent, and dropping the lease without
+/// calling either aborts, so no path can leak capacity or a payload.
+pub(crate) fn settle_mcp_sse_publication(
+    publication: crate::plugins::mcp_aggregate_sse::AggregateSsePublication,
+    accepted: bool,
+) -> bool {
+    if accepted {
+        publication.commit().is_ok()
+    } else {
+        publication.abort();
+        false
+    }
+}
+
+/// Re-close policy over a representation selected by a legacy final-body hook.
+///
+/// Phases 10b/10c decide over the representation they are handed. A LEGACY
+/// final-body hook runs after them and may select a different one —
+/// `mcp_gateway` re-frames a governed JSON-RPC answer as the POST-attached
+/// `text/event-stream` body — which neither authoritative phase has seen. This
+/// re-closes both over the bytes that actually reach the client, and it is
+/// fail-closed: a representation that genuinely trips a rule is refused here and
+/// replaces the response.
+///
+/// Running a phase a SECOND time is only safe if the phase's own state model
+/// tolerates it, so the participants are:
+///
+/// * `waf` — anomaly scores accumulate across phases, so a plain re-run would
+///   count the same response-phase evidence twice and carry an instance over its
+///   own block threshold for a response that legitimately passed. The scoring
+///   model marks the two final client-visible phases REPLACEABLE
+///   (`plugins::WafScorePhase`): a re-run supersedes that phase's previous
+///   contribution and leaves independent request-phase scores alone, so a
+///   genuinely worse representation still scores higher and still blocks. The
+///   header phase additionally memoizes the map it scanned, so only a map that
+///   actually changed is rescanned.
+/// * `body_validator` — a pure function of method, status, headers, and body
+///   (plus an idempotent JSON scan memo). Re-running is exactly the intent: the
+///   re-framed representation is validated on its own terms, and a
+///   `text/event-stream` content type that no configured rule claims is simply
+///   not inspected.
+/// * `ai_response_guard` — re-entrant, and its pending-redaction promise is a
+///   one-shot the first pass already consumed, so the second pass is a fresh
+///   residual scan of the delivered bytes (it understands SSE framing natively).
+///   One deliberate consequence: its residual-verified exemption is keyed by the
+///   exact `(content-type, body)` pair it verified, so a re-framed
+///   representation does NOT inherit it. A `redact` disposition that left
+///   detector-visible residue the first pass tolerated is therefore refused
+///   here instead of delivered. That is the fail-closed direction, it replaces
+///   the response rather than leaking one, and the staged retention boundary
+///   below then correctly refuses to retain the replacement.
+pub(crate) async fn enforce_late_buffered_final_response_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> bool {
+    if run_final_client_visible_response_body_policy(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
+    )
+    .await
+    {
+        return true;
+    }
+    enforce_buffered_final_client_visible_response_header_policy(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+    )
+    .await
+}
+
 /// Run buffered response transforms under the request's absolute gRPC
 /// deadline. A transform that exhausts the deadline selects the same
 /// flavor-aware terminal response as every other buffered response phase.
@@ -36787,6 +36906,11 @@ async fn handle_proxy_request_inner(
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
+                https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+                    &proxy,
+                    &format!("{}:{}", proxy.backend_host, proxy.backend_port),
+                    &e,
+                );
                 let grpc_backend_connection_error = matches!(
                     &e,
                     GrpcProxyError::BackendUnavailable { kind, message, .. }
@@ -38898,6 +39022,22 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    if ctx.mcp_sse_publication.is_some()
+        && let ResponseBody::Buffered(ref mut data) = response_body
+    {
+        let phase_start = Instant::now();
+        let _ = enforce_late_buffered_final_response_policy(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            data,
+            initial_response_header_policy_plugins.as_ref(),
+        )
+        .await;
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
     // Inject the sticky-session cookie before committed exporters observe the
     // final header view. This remains after every rejection/body replacement so
     // the cookie lands on the same response that will be sent downstream.
@@ -38984,6 +39124,32 @@ async fn handle_proxy_request_inner(
         // The terminal is fully buffered, so the summary and the latency
         // derivation below must not describe this as a streamed response.
         is_streaming_response = false;
+    }
+    // Retention boundary for an MCP POST-attached SSE response (issue #5441).
+    // Everything that can still replace or refuse this response has now run:
+    // the late final body/header policy, the committed hooks, and the
+    // authoritative pre-commit authorization gate above. Only now may the
+    // staged event become `Last-Event-ID` replay history, and only if the bytes
+    // that reach the client are still exactly the ones it promised.
+    //
+    // On this path the commit is a PRE-WRITE commitment: the response has been
+    // decided but not yet handed to the transport, so "retained" means "the
+    // gateway is committed to sending exactly these bytes", not "the client
+    // received them". The native-H3 writer deliberately draws the line one step
+    // later (see its own note); neither line is proof of client receipt, and a
+    // client whose connection dies mid-response resumes with `Last-Event-ID`
+    // precisely because the event was retained.
+    if let Some(publication) = ctx.mcp_sse_publication.take() {
+        let mut accepted = false;
+        if let ResponseBody::Buffered(ref body) = response_body {
+            accepted = mcp_sse_publication_matches_response(
+                &publication,
+                response_status,
+                &response_headers,
+                body,
+            );
+        }
+        settle_mcp_sse_publication(publication, accepted);
     }
     // Whether the gate above could ever have fired for this request. The
     // buffered terminal-log arm below uses this to decide whether it may await
@@ -41599,6 +41765,11 @@ pub(crate) async fn proxy_to_backend_retry(
             // `retry_on_connect_failure` another chance against the next
             // upstream target. A post-wire read/write timeout is 504, not a
             // generic 502 (#3922).
+            https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+                proxy,
+                strip_query_params(backend_url),
+                &e,
+            );
             let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,
@@ -45676,6 +45847,11 @@ async fn proxy_to_backend(
             // direct H2, gRPC, and H3 paths. Post-wire read/write deadline
             // expiry is 504 with a timeout-specific body (#3922); genuine
             // connect/refused failures stay 502.
+            https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+                proxy,
+                strip_query_params(backend_url),
+                &e,
+            );
             let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,
@@ -55179,7 +55355,6 @@ mod tests {
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
-            half_open_probe_dwell_seconds: None,
         });
         cb.record_failure(500, false, false);
         assert!(
@@ -56032,7 +56207,6 @@ mod tests {
                 failure_status_codes: vec![500],
                 half_open_max_requests: 1,
                 trip_on_connection_errors: true,
-                half_open_probe_dwell_seconds: None,
             }
         }
 
@@ -62727,6 +62901,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -62793,6 +62968,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -62851,6 +63027,7 @@ mod tests {
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -62908,6 +63085,7 @@ mod tests {
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -62947,6 +63125,7 @@ mod tests {
         let now = chrono::Utc::now();
         let upstream = upstream_with_targets("real-upstream", &[("backend.test", 8080)]);
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -62981,6 +63160,7 @@ mod tests {
         proxy.namespace = "tenant-a".to_string();
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "tenant-a".to_string(),
@@ -63022,6 +63202,7 @@ mod tests {
         tenant_b.namespace = "tenant-b".to_string();
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "global-mrd".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "tenant-a".to_string(),
@@ -63059,6 +63240,7 @@ mod tests {
     fn validate_global_mesh_route_dispatch_without_http_proxies_rejects_dangling_reference() {
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "global-mrd".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "tenant-a".to_string(),
@@ -63093,6 +63275,7 @@ mod tests {
     fn validate_global_mesh_route_dispatch_without_http_proxies_uses_own_namespace() {
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "global-mrd".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "tenant-a".to_string(),
@@ -63131,6 +63314,7 @@ mod tests {
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -65107,6 +65291,7 @@ mod tests {
         let mut config = make_validation_config(vec![]);
         config.plugin_configs = vec![
             PluginConfig {
+                labels: Default::default(),
                 id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65121,6 +65306,7 @@ mod tests {
                 updated_at: timestamp,
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "operator-metrics".to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65170,6 +65356,7 @@ mod tests {
         let mut config = make_validation_config(vec![]);
         config.plugin_configs = vec![
             PluginConfig {
+                labels: Default::default(),
                 id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65184,6 +65371,7 @@ mod tests {
                 updated_at: timestamp,
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "operator-disabled".to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65198,6 +65386,7 @@ mod tests {
                 updated_at: timestamp,
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "operator-enabled".to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65252,6 +65441,7 @@ mod tests {
         let timestamp = gateway_managed_plugin_timestamp();
         let mut config = make_validation_config(vec![]);
         config.plugin_configs = vec![PluginConfig {
+            labels: Default::default(),
             id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
             plugin_name: "key_auth".to_string(),
             namespace: "ferrum".to_string(),
@@ -65286,6 +65476,7 @@ mod tests {
         let mut config = make_validation_config(vec![]);
         config.plugin_configs = vec![
             PluginConfig {
+                labels: Default::default(),
                 id: "tenant-b-metrics".to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "tenant-b".to_string(),
@@ -65302,6 +65493,7 @@ mod tests {
                 updated_at: timestamp,
             },
             PluginConfig {
+                labels: Default::default(),
                 id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65354,6 +65546,7 @@ mod tests {
         let timestamp = gateway_managed_plugin_timestamp();
         let mut config = make_validation_config(vec![]);
         config.plugin_configs = vec![PluginConfig {
+            labels: Default::default(),
             id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
             plugin_name: "key_auth".to_string(),
             namespace: "ferrum".to_string(),
@@ -65391,6 +65584,7 @@ mod tests {
         )))));
         let timestamp = gateway_managed_plugin_timestamp();
         let managed = |namespace: &str, spiffe_id: &str| PluginConfig {
+            labels: Default::default(),
             id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
             plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
             namespace: namespace.to_string(),
@@ -65724,6 +65918,7 @@ mod tests {
         let proxy = make_validation_proxy("p1", "/api");
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p1".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -65767,6 +65962,7 @@ mod tests {
         let proxy = make_validation_proxy("p1", "/api");
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p1".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -65838,6 +66034,7 @@ mod tests {
         }];
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "pc1".to_string(),
             plugin_name: "correlation_id".to_string(),
             namespace: "ferrum".to_string(),
@@ -67070,6 +67267,7 @@ mod tests {
         // single field read.
         use crate::config::types::{Upstream, UpstreamPortOverride};
         let mut upstream = Upstream {
+            labels: Default::default(),
             id: "u1".to_string(),
             namespace: "ferrum".to_string(),
             name: Some("u1".to_string()),
@@ -67130,6 +67328,7 @@ mod tests {
         let mut config_no_overrides = GatewayConfig {
             proxies: vec![proxy_with_port_overrides_for_test(5000, &[])],
             upstreams: vec![Upstream {
+                labels: Default::default(),
                 id: "u1".to_string(),
                 namespace: "ferrum".to_string(),
                 name: Some("u1".to_string()),
@@ -67747,6 +67946,7 @@ mod tests {
         // `dispatch_port_override_fallback`, independently of the per-port map.
         use crate::config::types::{Upstream, UpstreamPortOverride};
         let mut upstream = Upstream {
+            labels: Default::default(),
             id: "u1".to_string(),
             namespace: "ferrum".to_string(),
             name: Some("u1".to_string()),
@@ -67814,6 +68014,7 @@ mod tests {
         // `connectionPool.http` sets DIFFERENT values plus an unrelated field. At
         // runtime the named targetPort resolves to workload port 8080.
         let mut upstream = Upstream {
+            labels: Default::default(),
             id: "u1".to_string(),
             namespace: "ferrum".to_string(),
             name: Some("u1".to_string()),

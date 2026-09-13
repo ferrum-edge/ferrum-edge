@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 fn make_proxy(id: &str, plugin_ids: &[&str]) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: Some(format!("Proxy {id}")),
@@ -104,6 +105,7 @@ fn plugin_config(
     trigger: Option<PluginTrigger>,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         plugin_name: plugin_name.to_string(),

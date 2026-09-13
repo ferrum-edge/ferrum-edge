@@ -6,6 +6,8 @@
 //! must fail `file::serve` closed instead of silently replacing operator
 //! intent.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -145,10 +147,10 @@ async fn file_mode_rejects_explicit_short_admin_jwt_secret() {
     env.set("FERRUM_ADMIN_JWT_SECRET", "short-secret-20-chars");
     env.unset("FERRUM_ADMIN_JWT_MAX_TTL");
 
-    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind proxy");
-    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind admin");
     let proxy_port = proxy_listener.local_addr().unwrap().port();
@@ -198,10 +200,10 @@ async fn file_mode_rejects_invalid_max_ttl_even_when_secret_unset() {
     env.unset("FERRUM_ADMIN_JWT_SECRET");
     env.set("FERRUM_ADMIN_JWT_MAX_TTL", "not-a-ttl");
 
-    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind proxy");
-    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind admin");
     let proxy_port = proxy_listener.local_addr().unwrap().port();
@@ -244,10 +246,10 @@ async fn file_mode_unset_admin_jwt_starts_and_rejects_external_tokens() {
     env.unset("FERRUM_ADMIN_JWT_ISSUER");
     env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
 
-    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind proxy");
-    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind admin");
     let proxy_port = proxy_listener.local_addr().unwrap().port();

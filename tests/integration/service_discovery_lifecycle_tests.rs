@@ -83,6 +83,7 @@ fn upstream_with_sd(
     sd: Option<ServiceDiscoveryConfig>,
 ) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: None,

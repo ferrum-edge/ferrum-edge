@@ -90,6 +90,7 @@ fn unix_target(socket_path: &str, h2c: bool) -> UpstreamTarget {
 
 fn unix_upstream(socket_path: &str, h2c: bool, stamp: DateTime<Utc>) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: UPSTREAM_ID.to_string(),
         namespace: default_namespace(),
         name: None,
@@ -123,6 +124,7 @@ fn unix_upstream(socket_path: &str, h2c: bool, stamp: DateTime<Utc>) -> Upstream
 
 fn unix_proxy(id: &str, listen_path: &str, stamp: DateTime<Utc>) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: None,

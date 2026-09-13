@@ -157,6 +157,7 @@ fn test_shared_admin_file_and_snapshot_admission_reject_invalid_shapes() {
 
     let now = chrono::Utc::now();
     let plugin_config = ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-admin".to_string(),
         plugin_name: "grpc_web".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),

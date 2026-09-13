@@ -101,6 +101,7 @@ impl Plugin for GatedFirstStreamConnect {
 
 fn dtls_proxy(listen_port: u16, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("dtls accept isolation".to_string()),

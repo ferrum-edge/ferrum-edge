@@ -1258,6 +1258,7 @@ mod tests {
     fn test_proxy() -> Proxy {
         let now = Utc::now();
         Proxy {
+            labels: Default::default(),
             id: "pool-test".to_string(),
             namespace: crate::config::types::default_namespace(),
             name: None,

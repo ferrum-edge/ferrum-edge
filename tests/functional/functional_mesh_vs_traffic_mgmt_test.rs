@@ -15,6 +15,8 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_mesh_vs_traffic_mgmt -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 
 use std::sync::Arc;
@@ -37,7 +39,7 @@ struct RecordingBackend {
 
 impl RecordingBackend {
     async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let port = listener.local_addr().expect("backend addr").port();

@@ -11,6 +11,8 @@
 //!   - native gRPC wire normalization (HTTP 200 + grpc-status mapping)
 //!   - inbound / non-capture listen ports keep the generic 404
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -104,7 +106,7 @@ fn make_proxy_state(
 }
 
 async fn start_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind route-miss test gateway");
     let gateway_addr = listener.local_addr().expect("gateway addr");

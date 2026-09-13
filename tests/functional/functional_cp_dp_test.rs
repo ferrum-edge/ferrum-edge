@@ -12,6 +12,8 @@
 //! to avoid running during normal `cargo test`. Run with:
 //!   cargo test --test functional_cp_dp_test -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
@@ -148,6 +150,7 @@ fn create_test_env_config() -> EnvConfig {
 /// Create a test Proxy entry
 fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
@@ -256,6 +259,7 @@ async fn test_cp_dp_grpc_config_sync() {
         version: "1".to_string(),
         proxies: vec![create_test_proxy("proxy-func-1", "/api/v1", 3001)],
         consumers: vec![Consumer {
+            labels: Default::default(),
             id: "consumer-1".into(),
             namespace: ferrum_edge::config::types::default_namespace(),
             username: "test-user".into(),
@@ -277,7 +281,7 @@ async fn test_cp_dp_grpc_config_sync() {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(initial_config.clone())));
     let (cp_server, update_tx) = CpGrpcServer::new(config_arc.clone(), GRPC_JWT_SECRET.to_string());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind CP gRPC server");
     let addr = listener.local_addr().expect("Failed to get local addr");
@@ -482,6 +486,7 @@ async fn test_namespace_isolation_in_database() {
         .expect("Failed to create production proxy");
 
     let prod_consumer = Consumer {
+        labels: Default::default(),
         id: "prod-consumer-1".into(),
         namespace: "production".to_string(),
         username: "prod-user".into(),
@@ -509,6 +514,7 @@ async fn test_namespace_isolation_in_database() {
         .expect("Failed to create staging proxy 2");
 
     let staging_consumer = Consumer {
+        labels: Default::default(),
         id: "staging-consumer-1".into(),
         namespace: "staging".to_string(),
         username: "staging-user".into(),
@@ -645,6 +651,7 @@ async fn test_cp_dp_namespace_isolation_over_grpc() {
             p
         }],
         consumers: vec![Consumer {
+            labels: Default::default(),
             id: "prod-consumer".into(),
             namespace: "production".to_string(),
             username: "prod-user".into(),
@@ -670,7 +677,7 @@ async fn test_cp_dp_namespace_isolation_over_grpc() {
         "production".to_string(),
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind CP");
     let addr = listener.local_addr().expect("CP addr");

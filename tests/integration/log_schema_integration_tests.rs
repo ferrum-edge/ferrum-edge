@@ -52,6 +52,7 @@ fn registry_lock() -> registry::ReloadBracketTestGuard {
 
 fn graph_plugin(id: &str, namespace: &str, plugin_name: &str, config: Value) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         plugin_name: plugin_name.to_string(),
         namespace: namespace.to_string(),
@@ -761,6 +762,7 @@ fn failed_cache_build_does_not_leak_registry_changes() {
 
     fn schema_plugin(id: &str, schema_name: &str) -> PluginConfig {
         PluginConfig {
+            labels: Default::default(),
             id: id.into(),
             plugin_name: "transaction_log_schema".into(),
             namespace: "ferrum".into(),
@@ -780,6 +782,7 @@ fn failed_cache_build_does_not_leak_registry_changes() {
 
     fn broken_keyauth() -> PluginConfig {
         PluginConfig {
+            labels: Default::default(),
             id: "broken-keyauth".into(),
             plugin_name: "key_auth".into(),
             namespace: "ferrum".into(),

@@ -1,5 +1,7 @@
 //! Integration coverage for GET /backup security audit (#2422).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::admin::audit::{self, list_local_fallback_events};
@@ -220,6 +222,7 @@ fn admin_state(db: DatabaseStore) -> AdminState {
 
 fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {id}")),
@@ -293,6 +296,7 @@ fn sample_cached_config() -> GatewayConfig {
         version: "1".to_string(),
         proxies: vec![create_test_proxy("p1", "/cached")],
         consumers: vec![Consumer {
+            labels: Default::default(),
             id: "c1".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             username: "secret-user".to_string(),
@@ -321,7 +325,7 @@ fn cached_only_state(config: GatewayConfig) -> AdminState {
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(
@@ -986,4 +990,247 @@ async fn backup_paths_omit_hostile_canaries_from_tracing_output() {
             "audit-sink failure must withhold detail:\n{captured}"
         );
     }
+}
+
+#[tokio::test]
+async fn resource_labels_survive_crud_batch_backup_and_restore() {
+    let tmp = TempDir::new().unwrap();
+    let db = make_store(&tmp).await;
+    let (base, _shutdown) = start_admin(admin_state(db)).await;
+    let bearer = token("label-admin", Some("admin"));
+    let client = reqwest::Client::new();
+    let resources = [
+        (
+            "upstreams",
+            json!({"id":"label-u", "targets":[{"host":"backend.example.com","port":443}]}),
+        ),
+        (
+            "consumers",
+            json!({"id":"label-c", "username":"label-user"}),
+        ),
+        (
+            "plugins/config",
+            json!({"id":"label-pc", "plugin_name":"cors", "scope":"global", "enabled":false, "config":{}}),
+        ),
+        (
+            "proxies",
+            json!({"id":"label-p", "listen_path":"/labels", "backend_host":"backend.example.com", "backend_port":443}),
+        ),
+    ];
+    for (path, mut body) in resources {
+        body["labels"] = json!({"team":"platform"});
+        let created = client
+            .post(format!("{base}/{path}"))
+            .bearer_auth(&bearer)
+            .header("X-Ferrum-Provisioned-By", "ferrum-nexus")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+        let id = body["id"].as_str().unwrap().to_string();
+        let get = client
+            .get(format!("{base}/{path}/{id}"))
+            .bearer_auth(&bearer)
+            .send()
+            .await
+            .unwrap();
+        let saved: Value = get.json().await.unwrap();
+        assert_eq!(
+            saved["labels"],
+            json!({"team":"platform","provisioned-by":"ferrum-nexus"})
+        );
+        body.as_object_mut().unwrap().remove("labels");
+        let updated = client
+            .put(format!("{base}/{path}/{id}"))
+            .bearer_auth(&bearer)
+            .header("X-Ferrum-Provisioned-By", "ferrum-foundry")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), 200, "{}", updated.text().await.unwrap());
+        let saved: Value = client
+            .get(format!("{base}/{path}/{id}"))
+            .bearer_auth(&bearer)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(saved["labels"]["provisioned-by"], "ferrum-nexus");
+    }
+    let batch = client
+        .post(format!("{base}/batch"))
+        .bearer_auth(&bearer)
+        .header("X-Ferrum-Provisioned-By", "ferrum-edge-git-forge-ops")
+        .json(&json!({"consumers":[{"id":"batch-label-c","username":"batch-label-user"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        batch.status().is_success(),
+        "{}",
+        batch.text().await.unwrap()
+    );
+    let (status, backup, _) = get_backup(&base, "/backup", &bearer, None).await;
+    assert_eq!(status, 200);
+    for key in ["proxies", "upstreams", "plugin_configs"] {
+        assert_eq!(backup[key][0]["labels"]["provisioned-by"], "ferrum-nexus");
+    }
+    let restored = client
+        .post(format!("{base}/restore?confirm=true"))
+        .bearer_auth(&bearer)
+        .header("X-Ferrum-Provisioned-By", "ferrum-foundry")
+        .json(&backup)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        restored.status().is_success(),
+        "{}",
+        restored.text().await.unwrap()
+    );
+    let (_, roundtrip, _) = get_backup(&base, "/backup", &bearer, None).await;
+    for key in ["proxies", "consumers", "upstreams", "plugin_configs"] {
+        let before = backup[key].as_array().unwrap();
+        for after in roundtrip[key].as_array().unwrap() {
+            let old = before
+                .iter()
+                .find(|item| item["id"] == after["id"])
+                .unwrap();
+            assert_eq!(after["labels"], old["labels"]);
+        }
+    }
+    let cleared = client
+        .put(format!("{base}/consumers/label-c"))
+        .bearer_auth(&bearer)
+        .json(&json!({"username":"label-user","labels":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), 200);
+    assert!(
+        cleared
+            .json::<Value>()
+            .await
+            .unwrap()
+            .get("labels")
+            .is_none()
+    );
+    let invalid = client
+        .post(format!("{base}/consumers"))
+        .bearer_auth(&bearer)
+        .json(&json!({"username":"bad-label", "labels":{"bad":42}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), 400);
+}
+
+#[tokio::test]
+async fn resource_labels_cover_spec_generated_resources_and_preserve_origin_on_replace() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let bearer = token("label-admin", Some("admin"));
+    let client = reqwest::Client::new();
+    let mut document = json!({
+        "openapi":"3.0.3", "info":{"title":"Labels", "version":"1"},
+        "paths":{"/items":{"get":{"responses":{"200":{"description":"OK"}}}}},
+        "x-ferrum-validate":true,
+        "x-ferrum-proxy":{"id":"spec-label-p", "listen_path":"/spec-labels", "backend_host":"backend.example.com","backend_port":443},
+        "x-ferrum-upstream":{"id":"spec-label-u","targets":[{"host":"backend.example.com","port":443}]},
+        "x-ferrum-plugins":[{"id":"spec-label-cors","plugin_name":"cors","scope":"proxy","config":{"allowed_origins":["https://portal.example.com"]}}]
+    });
+    let created = client
+        .post(format!("{base}/api-specs"))
+        .bearer_auth(&bearer)
+        .header("X-Ferrum-Provisioned-By", "ferrum-nexus")
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let (_, backup, _) = get_backup(&base, "/backup", &bearer, None).await;
+    let spec_id = backup["proxies"][0]["api_spec_id"].as_str().unwrap();
+    assert!(backup["plugin_configs"].as_array().unwrap().len() >= 2);
+    for key in ["proxies", "upstreams", "plugin_configs"] {
+        for item in backup[key].as_array().unwrap() {
+            assert_eq!(item["labels"]["provisioned-by"], "ferrum-nexus");
+        }
+    }
+    document["info"]["version"] = json!("2");
+    document["x-ferrum-proxy"]["backend_path"] = json!("/v2");
+    let replaced = client
+        .put(format!("{base}/api-specs/{spec_id}"))
+        .bearer_auth(&bearer)
+        .header("X-Ferrum-Provisioned-By", "ferrum-foundry")
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), 200, "{}", replaced.text().await.unwrap());
+    let (_, backup, _) = get_backup(&base, "/backup", &bearer, None).await;
+    for key in ["proxies", "upstreams", "plugin_configs"] {
+        for item in backup[key].as_array().unwrap() {
+            assert_eq!(item["labels"]["provisioned-by"], "ferrum-nexus");
+        }
+    }
+    let restored = client
+        .post(format!("{base}/restore?confirm=true"))
+        .bearer_auth(&bearer)
+        .header("X-Ferrum-Provisioned-By", "ferrum-foundry")
+        .json(&backup)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), 200, "{}", restored.text().await.unwrap());
+    let (_, restored_backup, _) = get_backup(&base, "/backup", &bearer, None).await;
+    assert_eq!(restored_backup["api_specs"], backup["api_specs"]);
+    for key in ["proxies", "upstreams", "plugin_configs"] {
+        for item in restored_backup[key].as_array().unwrap() {
+            assert_eq!(item["labels"]["provisioned-by"], "ferrum-nexus");
+        }
+    }
+}
+
+#[tokio::test]
+async fn resource_labels_spec_edit_keeps_unknown_origins_and_attributes_new_plugins() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let bearer = token("label-admin", Some("admin"));
+    let client = reqwest::Client::new();
+    let mut document = json!({
+        "openapi":"3.0.3", "info":{"title":"Unknown origin", "version":"1"}, "paths":{},
+        "x-ferrum-proxy":{"id":"unknown-origin", "listen_path":"/unknown-origin", "backend_host":"backend.example.com","backend_port":443}
+    });
+    let created = client
+        .post(format!("{base}/api-specs"))
+        .bearer_auth(&bearer)
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let (_, backup, _) = get_backup(&base, "/backup", &bearer, None).await;
+    let spec_id = backup["proxies"][0]["api_spec_id"].as_str().unwrap();
+    document["x-ferrum-plugins"] = json!([
+        {"id":"new-origin-cors","plugin_name":"cors","scope":"proxy","enabled":false,"config":{}}
+    ]);
+    let replaced = client
+        .put(format!("{base}/api-specs/{spec_id}"))
+        .bearer_auth(&bearer)
+        .header("X-Ferrum-Provisioned-By", "ferrum-foundry")
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), 200, "{}", replaced.text().await.unwrap());
+    let (_, backup, _) = get_backup(&base, "/backup", &bearer, None).await;
+    assert!(backup["proxies"][0].get("labels").is_none());
+    assert_eq!(
+        backup["plugin_configs"][0]["labels"]["provisioned-by"],
+        "ferrum-foundry"
+    );
 }

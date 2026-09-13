@@ -29,6 +29,8 @@
 //! cgroup hooks), and a shared UDP frontend socket has no per-source-pod
 //! cookie. See `docs/mesh.md` and the comments in `src/proxy/udp_proxy.rs`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -325,7 +327,7 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
     let hash_a = id_a.workload_spiffe_hash;
     resolver.upsert_identity(id_a);
 
-    let listener = TcpListener::bind(("127.0.0.1", 0))
+    let listener = TcpListener::bind_test(("127.0.0.1", 0))
         .await
         .expect("bind ephemeral listener");
     let addr = listener.local_addr().expect("listener addr");

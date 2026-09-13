@@ -15,6 +15,8 @@
 //! This test is marked with #[ignore] as it requires the binary to be built
 //! and should be run with: cargo test --test functional_tests functional_websocket -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use futures_util::{SinkExt, StreamExt};
 use http::StatusCode;
 use std::io::Write;
@@ -45,12 +47,11 @@ const WS_H3_FRAME_LIMIT_UNDER_TEST: usize = 64;
 const WS_H3_OVERSIZE_FRAME_BYTES: usize = WS_H3_FRAME_LIMIT_UNDER_TEST * 2;
 const WS_JWT_SECRET: &str = "ws-jwt-functional-secret-32-bytes-minimum";
 
-/// Allocate a free port by binding to port 0 and returning the assigned port.
+/// Lease a gateway port until the test process exits.
 async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    crate::scaffolding::ports::unbound_port()
         .await
-        .expect("Failed to bind to port 0");
-    listener.local_addr().unwrap().port()
+        .expect("lease test port")
 }
 
 /// Start a WebSocket echo server on the given port.
@@ -69,7 +70,7 @@ async fn start_ws_echo_server_with_subprotocol(
     port: u16,
     selected_subprotocol: Option<&'static str>,
 ) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind WS echo server");
 
@@ -134,7 +135,7 @@ async fn start_ws_echo_server_with_subprotocol(
 async fn start_ws_ping_responsive_server(port: u16) {
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind ping-responsive WS server");
 
@@ -171,7 +172,7 @@ async fn start_ws_ping_responsive_server(port: u16) {
 async fn start_ws_silent_ping_server(port: u16) {
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind silent-ping WS server");
 
@@ -216,7 +217,7 @@ async fn start_ws_backend_ping_server(
 ) {
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind backend-ping WS server");
 
@@ -272,7 +273,7 @@ async fn start_ws_frame_limit_probe_server(
     client_oversize_frames: Arc<AtomicUsize>,
     server_oversize_frames: Arc<AtomicUsize>,
 ) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind WS frame-limit probe server");
 
@@ -337,7 +338,7 @@ async fn start_ws_frame_limit_probe_server(
 /// Start a WebSocket probe backend that counts oversized client frames.
 #[allow(clippy::collapsible_match)]
 async fn start_ws_oversize_probe_server(port: u16, oversized_frames: Arc<AtomicUsize>) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind WS oversize probe server");
 
@@ -387,7 +388,7 @@ async fn start_ws_oversize_probe_server(port: u16, oversized_frames: Arc<AtomicU
 }
 
 async fn start_http_text_server(port: u16, body: &'static str) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind HTTP text server");
 
@@ -456,7 +457,7 @@ fn start_gateway_with_extra_env(
     // The admin HTTP port must be a real port, never the `0` sentinel: `0`
     // disables the plaintext admin listener, and this file's readiness barrier
     // proves child identity through that listener.
-    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
+    let admin_http_port = std::net::TcpListener::bind_test("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .map(|a| a.port())?;
     let stderr_path =
@@ -2344,7 +2345,7 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
     // `SO_REUSEADDR`, a `127.0.0.1` listener and a `0.0.0.0` listener can hold
     // one port simultaneously on Darwin, which would let the gateway start and
     // dissolve the precondition (issue #4983).
-    let squatter = TcpListener::bind("0.0.0.0:0")
+    let squatter = TcpListener::bind_test("0.0.0.0:0")
         .await
         .expect("bind foreign listener");
     let contested_port = squatter.local_addr().unwrap().port();
@@ -2614,7 +2615,7 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
 #[ignore]
 #[tokio::test]
 async fn test_h3_websocket_open_circuit_reject_strips_transport_policy_fields() {
-    let dead_backend_listener = TcpListener::bind("127.0.0.1:0")
+    let dead_backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind non-responsive backend listener");
     let dead_backend_port = dead_backend_listener.local_addr().unwrap().port();
@@ -4139,7 +4140,7 @@ async fn test_websocket_idle_timeout_sends_symmetric_1001_close() {
 /// observes a transport failure (`connection_reset`) rather than a clean close.
 #[allow(clippy::collapsible_match)]
 async fn start_ws_reset_after_echo_server(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind WS reset-after-echo server");
 

@@ -743,6 +743,7 @@ fn lb_with_port_override(targets: Vec<UpstreamTarget>, port: u16) -> Arc<LoadBal
         },
     );
     let upstream = Upstream {
+        labels: Default::default(),
         id: "u1".to_string(),
         namespace: "ferrum".to_string(),
         name: Some("u1".to_string()),

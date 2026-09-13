@@ -60,6 +60,7 @@ fn make_consumer(
     );
 
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -263,6 +264,7 @@ fn test_consumer_with_no_keyauth_credentials() {
     );
 
     let consumer = Consumer {
+        labels: Default::default(),
         id: "c1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "nokey".to_string(),
@@ -391,6 +393,7 @@ fn make_consumer_with_array_keys(id: &str, username: &str, keys: &[&str]) -> Con
     credentials.insert("keyauth".to_string(), Value::Array(arr));
 
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -468,6 +471,7 @@ fn make_consumer_with_array_mtls(id: &str, username: &str, identities: &[&str]) 
     credentials.insert("mtls_auth".to_string(), Value::Array(arr));
 
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -519,6 +523,7 @@ fn make_consumer_with_jwt(id: &str, username: &str) -> Consumer {
     );
 
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -543,6 +548,7 @@ fn make_consumer_with_hmac(id: &str, username: &str) -> Consumer {
     );
 
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -658,6 +664,7 @@ fn test_auth_type_counts_multiple_jwt_array_credentials() {
         ]),
     );
     let c = Consumer {
+        labels: Default::default(),
         id: "c1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "alice".to_string(),
@@ -712,6 +719,7 @@ fn test_build_index_single_consumer_basicauth_only() {
         Value::Array(vec![Value::Object(basic_creds)]),
     );
     let c = Consumer {
+        labels: Default::default(),
         id: "c1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "alice".to_string(),
@@ -830,6 +838,7 @@ fn test_build_index_consumer_with_all_credential_types() {
     );
 
     let c = Consumer {
+        labels: Default::default(),
         id: "c-all".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "multi-cred-user".to_string(),
@@ -1080,6 +1089,7 @@ fn test_multi_jwt_array_credential_count() {
         ]),
     );
     let c = Consumer {
+        labels: Default::default(),
         id: "c1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "jwt-rotator".to_string(),
@@ -1288,6 +1298,7 @@ fn test_apply_delta_modify_hmac_consumer_updates_count() {
         ]),
     );
     let c1_modified = Consumer {
+        labels: Default::default(),
         id: "c1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "alice".to_string(),
@@ -1340,6 +1351,7 @@ fn test_find_by_mtls_identity_returns_none_for_unknown() {
 #[test]
 fn test_consumer_with_empty_credentials() {
     let c = Consumer {
+        labels: Default::default(),
         id: "c1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "bare-user".to_string(),
@@ -1418,6 +1430,7 @@ fn test_non_object_array_elements_filtered_out() {
         ]),
     );
     let c = Consumer {
+        labels: Default::default(),
         id: "c1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "alice".to_string(),
@@ -1479,6 +1492,7 @@ fn test_keyauth_entry_missing_key_field_not_indexed() {
         Value::Array(vec![Value::Object(creds)]),
     );
     let c = Consumer {
+        labels: Default::default(),
         id: "c1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "alice".to_string(),
@@ -1512,6 +1526,7 @@ fn test_mtls_entry_missing_identity_field_not_indexed() {
         Value::Array(vec![Value::Object(creds)]),
     );
     let c = Consumer {
+        labels: Default::default(),
         id: "c1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "alice".to_string(),

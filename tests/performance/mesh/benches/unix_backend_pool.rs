@@ -99,6 +99,7 @@ mod unix_bench {
     /// config model changes.
     fn bench_proxy(id: &str) -> Proxy {
         Proxy {
+labels: Default::default(),
             id: id.to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             name: None,

@@ -25,6 +25,8 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_mongodb -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{
     configure_coverage_gateway_command, continue_if_backend_available,
     continue_if_tls_fixture_available, explicit_test_binary, host_port_from_db_url,
@@ -72,11 +74,11 @@ impl MongoTestHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let identity = crate::common::SpawnedGatewayIdentity::mint("mongodb");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         let admin_port = admin_listener.local_addr()?.port();
         drop(admin_listener);
 
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         let proxy_port = proxy_listener.local_addr()?.port();
         drop(proxy_listener);
 
@@ -452,11 +454,11 @@ impl MongoTestHarness {
 
     /// Reallocate ephemeral ports after a failed startup attempt.
     async fn reallocate_ports(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         self.admin_port = admin_listener.local_addr()?.port();
         drop(admin_listener);
 
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         self.proxy_port = proxy_listener.local_addr()?.port();
         drop(proxy_listener);
 
@@ -530,7 +532,7 @@ fn find_binary() -> Result<String, Box<dyn std::error::Error>> {
 async fn start_echo_backend(
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
 
     let handle = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
@@ -818,7 +820,7 @@ async fn test_mongodb_plaintext_full_lifecycle() {
     }
 
     // Start echo backend
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Bind backend");
     let backend_port = backend_listener.local_addr().expect("Backend addr").port();
@@ -873,7 +875,7 @@ async fn test_mongodb_tls_connection() {
         return;
     }
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Bind backend");
     let backend_port = backend_listener.local_addr().expect("Backend addr").port();
@@ -919,7 +921,7 @@ async fn test_mongodb_tls_require_connection() {
         return;
     }
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Bind backend");
     let backend_port = backend_listener.local_addr().expect("Backend addr").port();
@@ -970,7 +972,7 @@ async fn test_mongodb_mtls_connection() {
         return;
     }
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Bind backend");
     let backend_port = backend_listener.local_addr().expect("Backend addr").port();

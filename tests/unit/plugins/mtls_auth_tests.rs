@@ -340,6 +340,7 @@ fn create_mtls_consumer(id: &str, username: &str, identity: &str) -> Consumer {
     );
 
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
