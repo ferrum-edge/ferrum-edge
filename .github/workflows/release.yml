@@ -374,7 +374,7 @@ jobs:
           targets: aarch64-unknown-linux-gnu
 
       - name: Install checksum-verified Cross 0.2.5
-        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: cross@0.2.5
           fallback: none
