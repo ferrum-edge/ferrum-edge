@@ -187,6 +187,15 @@ pub struct HboneRelayFailureKey {
     pub error_class: &'static str,
 }
 
+/// Composite key for live HBONE tunnels revoked by the receiver-side
+/// admission fence (issue #5042 step 1). `reason` is a compiled-in
+/// [`crate::proxy::hbone_admission_fence::HboneRevocationReason`] label.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HboneTunnelRevocationKey {
+    pub proxy_id: Arc<str>,
+    pub reason: &'static str,
+}
+
 /// Composite key for raw-TCP mesh egress relay connections, labelled by the
 /// transport that carried them (`hbone` for Ambient, `mtls` for Sidecar) and
 /// the relay outcome. Bounded cardinality: both labels are compiled-in
@@ -872,6 +881,10 @@ pub struct MetricsRegistry {
     /// Incremented when the background CONNECT relay observes a copy failure
     /// after the client already received `200 OK`.
     pub hbone_relay_failure_counter: DashMap<HboneRelayFailureKey, TimestampedCounter>,
+    /// Live HBONE tunnels revoked by the admission fence, keyed by
+    /// (proxy_id, reason). Incremented once per revoked tunnel when a later
+    /// policy generation would no longer admit its CONNECT (issue #5042).
+    pub hbone_tunnel_revocation_counter: DashMap<HboneTunnelRevocationKey, TimestampedCounter>,
     /// Raw-TCP mesh egress relay connections keyed by (transport, result).
     /// Incremented once per captured raw-TCP connection that established a
     /// tunnel, labelled by the transport (`hbone`/`mtls`) and relay outcome
@@ -1062,6 +1075,7 @@ impl MetricsRegistry {
             stream_disconnect_counter: DashMap::new(),
             mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
             hbone_relay_failure_counter: DashMap::new(),
+            hbone_tunnel_revocation_counter: DashMap::new(),
             mesh_tcp_egress_connection_counter: DashMap::new(),
             mesh_outbound_registry_decisions: DashMap::new(),
             mesh_outbound_registry_stream_decisions: DashMap::new(),
@@ -1812,6 +1826,24 @@ impl MetricsRegistry {
             error_class: error_class.as_str(),
         };
         self.hbone_relay_failure_counter
+            .entry(key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one live HBONE tunnel revoked by the admission fence.
+    pub fn record_hbone_tunnel_revocation(
+        &self,
+        proxy_id: &str,
+        reason: crate::proxy::hbone_admission_fence::HboneRevocationReason,
+    ) {
+        let key = HboneTunnelRevocationKey {
+            proxy_id: Arc::from(proxy_id),
+            reason: reason.as_str(),
+        };
+        self.hbone_tunnel_revocation_counter
             .entry(key)
             .or_insert_with(|| TimestampedCounter::new(self.epoch))
             .increment(self.epoch);
@@ -2755,6 +2787,14 @@ impl MetricsRegistry {
             keep
         });
 
+        self.hbone_tunnel_revocation_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
         self.mesh_tcp_egress_connection_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
@@ -3354,6 +3394,7 @@ impl MetricsRegistry {
             + self.ws_bytes_counter.len() * 180
             + self.ws_frames_counter.len() * 180
             + self.hbone_relay_failure_counter.len() * 240
+            + self.hbone_tunnel_revocation_counter.len() * 200
             + self.mesh_tcp_egress_connection_counter.len() * 120
             + self
                 .mesh_outbound_registry_decisions
@@ -4456,6 +4497,22 @@ impl MetricsRegistry {
                 output.push_str(&format!(
                     "ferrum_mesh_hbone_relay_failures_total{{proxy_id=\"{}\",direction=\"{}\",error_class=\"{}\"{}}} {}\n",
                     proxy_id, key.direction, error_class, ns_label, count
+                ));
+            }
+        }
+
+        if !self.hbone_tunnel_revocation_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_mesh_hbone_tunnel_revocations_total Live HBONE tunnels revoked by the admission fence because a later policy generation would no longer admit their CONNECT.\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_hbone_tunnel_revocations_total counter\n");
+            for entry in self.hbone_tunnel_revocation_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(&key.proxy_id);
+                output.push_str(&format!(
+                    "ferrum_mesh_hbone_tunnel_revocations_total{{proxy_id=\"{}\",reason=\"{}\"{}}} {}\n",
+                    proxy_id, key.reason, ns_label, count
                 ));
             }
         }

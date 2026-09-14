@@ -11159,6 +11159,28 @@ pub trait Plugin: Send + Sync {
         true
     }
 
+    /// Returns `true` if [`Self::authorize`] may be re-run against an ALREADY
+    /// ADMITTED, still-live session to decide whether it may keep running.
+    ///
+    /// The HBONE admission fence
+    /// ([`crate::proxy::hbone_admission_fence`], issue #5042) re-applies the
+    /// authorize chain to every live tunnel on each policy publication. Only
+    /// plugins that opt in here are re-run, because a re-evaluation is NOT a
+    /// new request: it must not consume a budget, acquire a permit, mutate
+    /// admission state, dispatch a mirror, accumulate a score, or make an
+    /// external call. A plugin that does any of those would, on a routine
+    /// config apply, spend a real client's quota and then revoke healthy,
+    /// policy-compliant sessions.
+    ///
+    /// The default is `false`: a plugin nobody has declared re-evaluation-safe
+    /// is simply not consulted by a sweep, which fails toward "did not
+    /// re-check" rather than toward a spurious revocation. Override to `true`
+    /// only when `authorize` is a pure function of the request context and the
+    /// plugin's own immutable configuration.
+    fn reevaluates_live_admission(&self) -> bool {
+        false
+    }
+
     /// Returns hostnames that this plugin will send traffic to.
     ///
     /// Used during DNS warmup to pre-resolve plugin endpoint hostnames

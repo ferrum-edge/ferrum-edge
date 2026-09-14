@@ -47,7 +47,7 @@ use ferrum_edge::proxy::{
     start_proxy_listener_with_bound_listener_and_mesh_direction,
 };
 
-fn create_mesh_proxy(backend_port: u16) -> Proxy {
+pub(super) fn create_mesh_proxy(backend_port: u16) -> Proxy {
     Proxy {
         labels: Default::default(),
         id: "mesh-hbone".to_string(),
@@ -237,7 +237,7 @@ fn spiffe_identity_plugin_config(proxy_id: &str) -> PluginConfig {
 /// server leaf SVID (with a `127.0.0.1` SAN so rustls accepts the listener),
 /// and a client leaf SVID whose URI SAN is the source workload identity that
 /// `spiffe_identity` extracts into `ctx.peer_spiffe_id`.
-struct HboneMtlsCerts {
+pub(super) struct HboneMtlsCerts {
     ca_der: rustls::pki_types::CertificateDer<'static>,
     server_cert_der: rustls::pki_types::CertificateDer<'static>,
     server_key_der: rustls::pki_types::PrivateKeyDer<'static>,
@@ -245,7 +245,7 @@ struct HboneMtlsCerts {
     client_key_der: rustls::pki_types::PrivateKeyDer<'static>,
 }
 
-fn generate_hbone_mtls_certs(client_spiffe: &str) -> HboneMtlsCerts {
+pub(super) fn generate_hbone_mtls_certs(client_spiffe: &str) -> HboneMtlsCerts {
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
         KeyPair, KeyUsagePurpose, SanType, string::Ia5String,
@@ -309,7 +309,7 @@ fn generate_hbone_mtls_certs(client_spiffe: &str) -> HboneMtlsCerts {
 /// Server-side `ServerConfig` for the inbound HBONE listener: requires and
 /// verifies a client cert against the test CA and negotiates `h2` via ALPN so
 /// the HBONE CONNECT arrives as HTTP/2.
-fn hbone_server_config(certs: &HboneMtlsCerts) -> Arc<rustls::ServerConfig> {
+pub(super) fn hbone_server_config(certs: &HboneMtlsCerts) -> Arc<rustls::ServerConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(certs.ca_der.clone()).expect("add ca");
@@ -328,7 +328,7 @@ fn hbone_server_config(certs: &HboneMtlsCerts) -> Arc<rustls::ServerConfig> {
 }
 
 /// Client-side `ClientConfig` presenting the SPIFFE client cert. ALPN `h2`.
-fn hbone_client_config(certs: &HboneMtlsCerts) -> Arc<rustls::ClientConfig> {
+pub(super) fn hbone_client_config(certs: &HboneMtlsCerts) -> Arc<rustls::ClientConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(certs.ca_der.clone()).expect("add ca");
@@ -367,7 +367,7 @@ async fn start_gateway_mtls(
 
 /// Open an mTLS HTTP/2 connection to the gateway and return the h2 request
 /// sender plus the driver task handle.
-async fn connect_hbone_h2_mtls(
+pub(super) async fn connect_hbone_h2_mtls(
     gateway_addr: std::net::SocketAddr,
     client_config: Arc<rustls::ClientConfig>,
 ) -> (
@@ -793,7 +793,7 @@ async fn hbone_connect_closes_idle_tunnel() {
 /// EgressGateway terminates for no in-mesh workload (issue #4150). Whatever the
 /// relay admits here therefore came from the external UDP allowlist and nothing
 /// else.
-fn egress_udp_mesh_config(host: &str, port: u16, dial_port: u16) -> MeshConfig {
+pub(super) fn egress_udp_mesh_config(host: &str, port: u16, dial_port: u16) -> MeshConfig {
     egress_udp_mesh_config_with_endpoints(host, port, &[("127.0.0.1", dial_port)])
 }
 
@@ -843,7 +843,7 @@ fn spiffe_identity_global_plugin_config() -> PluginConfig {
 /// Build an inbound-direction mesh gateway with a static mTLS `ServerConfig`
 /// and the supplied mesh block, so `udp`-marked CONNECTs reach the relay
 /// synthesis path.
-fn create_egress_udp_gateway_state(mesh: MeshConfig) -> ProxyState {
+pub(super) fn create_egress_udp_gateway_state(mesh: MeshConfig) -> ProxyState {
     let spiffe_plugin = spiffe_identity_global_plugin_config();
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
@@ -917,7 +917,8 @@ async fn start_egress_udp_gateway(
 
 /// A stand-in "external" UDP service: echoes `pong:<payload>` back to whoever
 /// sent the datagram.
-async fn start_external_udp_echo() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+pub(super) async fn start_external_udp_echo() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
+{
     let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("bind external udp echo");
@@ -939,7 +940,7 @@ async fn start_external_udp_echo() -> (std::net::SocketAddr, tokio::task::JoinHa
 }
 
 /// `[u16 big-endian length][payload]` — the datagram-over-mesh wire framing.
-fn frame_datagram(payload: &[u8]) -> Bytes {
+pub(super) fn frame_datagram(payload: &[u8]) -> Bytes {
     let mut framed = Vec::with_capacity(2 + payload.len());
     framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     framed.extend_from_slice(payload);
@@ -947,7 +948,7 @@ fn frame_datagram(payload: &[u8]) -> Bytes {
 }
 
 /// Read framed bytes off the tunnel until one whole datagram is decoded.
-async fn read_framed_datagram(body: &mut h2::RecvStream) -> Vec<u8> {
+pub(super) async fn read_framed_datagram(body: &mut h2::RecvStream) -> Vec<u8> {
     let mut buffered: Vec<u8> = Vec::new();
     loop {
         if buffered.len() >= 2 {
@@ -966,7 +967,7 @@ async fn read_framed_datagram(body: &mut h2::RecvStream) -> Vec<u8> {
     }
 }
 
-fn udp_connect_request(authority: &str) -> Request<()> {
+pub(super) fn udp_connect_request(authority: &str) -> Request<()> {
     Request::builder()
         .method(Method::CONNECT)
         .uri(authority)

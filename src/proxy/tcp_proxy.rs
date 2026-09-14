@@ -1369,6 +1369,47 @@ fn authorization_expired_first_failure() -> StreamFirstFailure {
     )
 }
 
+/// Top-level admission-revocation bound for relays whose CONNECT admission
+/// can be withdrawn while the tunnel runs (HBONE admission fence, issue #5042
+/// step 1). Like [`AuthorizationCopyBound`] it is raced ahead of both copy
+/// halves in Phase 1 and against the Phase 2 drain, so a relay parked on a
+/// stalled opposite endpoint still observes revocation promptly, and it opts
+/// the relay out of the tokio fast path for the same reason.
+///
+/// Carries no policy material — only the cancellation handle and a fixed
+/// message for the relay's error classifier / connection-scoped debug log.
+pub(crate) struct RelayRevocation {
+    token: tokio_util::sync::CancellationToken,
+    message: &'static str,
+}
+
+impl RelayRevocation {
+    pub(crate) fn new(token: tokio_util::sync::CancellationToken, message: &'static str) -> Self {
+        Self { token, message }
+    }
+}
+
+/// Armed Phase 1 / Phase 2 revocation wait derived from a [`RelayRevocation`].
+type ArmedRelayRevocation = (
+    &'static str,
+    Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+);
+
+fn relay_revoked_first_failure(message: &'static str) -> StreamFirstFailure {
+    // `ConnectionAborted`, not `TimedOut`: the relay was cut by policy, not by
+    // a lifetime, and the stream error classifier must not report it as an
+    // upstream inactivity timeout.
+    let err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, message);
+    let msg = err.to_string();
+    let classified = anyhow::Error::new(err);
+    (
+        Direction::ClientToBackend,
+        classify_stream_error(&classified),
+        Some(StreamIoSide::Read),
+        msg,
+    )
+}
+
 impl<S: AsyncRead + Unpin> AsyncRead for AuthorizationDeadlineStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -1443,6 +1484,40 @@ where
         backend_write_timeout,
         buf_size,
         None,
+    )
+    .await
+}
+
+/// [`bidirectional_copy_for_relay`] for tunnels whose admission can be
+/// revoked while they run. When `revocation` is `Some`, the relay ends with a
+/// `ConnectionAborted` first failure carrying the revocation message as soon
+/// as the token is cancelled, in either relay phase, regardless of whether the
+/// opposite endpoint is making progress.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn bidirectional_copy_for_fenced_relay<C, B>(
+    client: C,
+    backend: B,
+    idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
+    backend_read_timeout: Option<Duration>,
+    backend_write_timeout: Option<Duration>,
+    buf_size: usize,
+    revocation: Option<RelayRevocation>,
+) -> StreamCopyResult
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    bidirectional_copy_with_bounds(
+        client,
+        backend,
+        idle_timeout,
+        half_close_cap,
+        backend_read_timeout,
+        backend_write_timeout,
+        buf_size,
+        None,
+        revocation,
     )
     .await
 }
@@ -8742,9 +8817,39 @@ fn poll_ready_watchdog_ticks(
 /// preserves counters. An authorization-bound stream never takes this fast
 /// path: tokio's copy can park both halves on the opposite endpoint and
 /// starve the client-leg wrapper. Clean completion preserves per-direction
-/// byte counts.
+/// byte counts. An admission-revocation bound ([`RelayRevocation`]) is raced
+/// at the same top-level points and likewise refuses the fast path.
 #[allow(clippy::too_many_arguments)]
 async fn bidirectional_copy<C, B>(
+    client: C,
+    backend: B,
+    idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
+    backend_read_timeout: Option<Duration>,
+    backend_write_timeout: Option<Duration>,
+    buf_size: usize,
+    auth_deadline: Option<AuthorizationCopyBound>,
+) -> StreamCopyResult
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    bidirectional_copy_with_bounds(
+        client,
+        backend,
+        idle_timeout,
+        half_close_cap,
+        backend_read_timeout,
+        backend_write_timeout,
+        buf_size,
+        auth_deadline,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn bidirectional_copy_with_bounds<C, B>(
     mut client: C,
     mut backend: B,
     idle_timeout: Option<Duration>,
@@ -8753,6 +8858,7 @@ async fn bidirectional_copy<C, B>(
     backend_write_timeout: Option<Duration>,
     buf_size: usize,
     auth_deadline: Option<AuthorizationCopyBound>,
+    revocation: Option<RelayRevocation>,
 ) -> StreamCopyResult
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -8768,9 +8874,9 @@ where
     // `backend_read_timeout` / `backend_write_timeout` inherently require the
     // direction-tracking path — they wrap individual `read`/`write` polls,
     // which tokio's bidirectional copy does not expose. Any non-zero timeout
-    // here opts out of the fast path. An authorization bound also opts out:
-    // the fast path can park both halves on the opposite endpoint and never
-    // poll the wrapped client leg.
+    // here opts out of the fast path. An authorization or revocation bound
+    // also opts out: the fast path can park both halves on the opposite
+    // endpoint and never poll the wrapped client leg.
     let idle_disabled = idle_timeout.is_none_or(|d| d.is_zero());
     let cap_disabled = half_close_cap.is_none_or(|d| d.is_zero());
     let read_to_disabled = backend_read_timeout.is_none_or(|d| d.is_zero());
@@ -8780,6 +8886,7 @@ where
         && read_to_disabled
         && write_to_disabled
         && auth_deadline.is_none()
+        && revocation.is_none()
     {
         return match tokio::io::copy_bidirectional_with_sizes(
             &mut client,
@@ -8883,6 +8990,10 @@ where
     let mut auth_deadline_sleep = auth_deadline
         .as_ref()
         .map(|bound| Box::pin(tokio::time::sleep_until(bound.at)));
+    // Top-level admission revocation: same placement and rationale as the
+    // authorization timer, driven by the HBONE admission fence.
+    let mut revocation_wait: Option<ArmedRelayRevocation> = revocation
+        .map(|RelayRevocation { token, message }| (message, Box::pin(token.cancelled_owned())));
 
     // Phase 1: race the two directions (plus optional idle check).
     let mut first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>, String)> = None;
@@ -8913,6 +9024,13 @@ where
             return Poll::Ready(Phase1Outcome::Watchdog(
                 authorization_expired_first_failure(),
             ));
+        }
+        if let Some((message, wait)) = revocation_wait.as_mut()
+            && std::future::Future::poll(wait.as_mut(), cx).is_ready()
+        {
+            return Poll::Ready(Phase1Outcome::Watchdog(relay_revoked_first_failure(
+                message,
+            )));
         }
 
         let poll_c2b_this_turn = poll_c2b_first;
@@ -9030,9 +9148,10 @@ where
     let clean_eof = first_failure.is_none();
     if !c2b_done {
         if clean_eof {
-            first_failure = drain_remaining_or_authorization_expire(
+            first_failure = drain_remaining_or_terminate(
                 auth_deadline.as_ref(),
                 auth_deadline_sleep.as_mut(),
+                revocation_wait.as_mut(),
                 drain_half_close_direction(
                     &mut client,
                     &mut backend,
@@ -9096,9 +9215,10 @@ where
     }
     if !b2c_done {
         if clean_eof {
-            first_failure = drain_remaining_or_authorization_expire(
+            first_failure = drain_remaining_or_terminate(
                 auth_deadline.as_ref(),
                 auth_deadline_sleep.as_mut(),
+                revocation_wait.as_mut(),
                 drain_half_close_direction(
                     &mut backend,
                     &mut client,
@@ -9159,28 +9279,39 @@ where
 }
 
 /// Race a Phase-2 half-close drain against the remaining authorization
-/// deadline. When no bound is armed this is exactly `drain.await`.
-async fn drain_remaining_or_authorization_expire<F>(
+/// deadline and the admission-revocation bound. When neither bound is armed
+/// this is exactly `drain.await`. Both bounds are polled ahead of the drain
+/// so a simultaneously ready write cannot escape after either has fired.
+async fn drain_remaining_or_terminate<F>(
     bound: Option<&AuthorizationCopyBound>,
-    sleep: Option<&mut Pin<Box<tokio::time::Sleep>>>,
+    mut sleep: Option<&mut Pin<Box<tokio::time::Sleep>>>,
+    mut revocation: Option<&mut ArmedRelayRevocation>,
     drain: F,
 ) -> Option<StreamFirstFailure>
 where
     F: std::future::Future<Output = Option<StreamFirstFailure>>,
 {
-    let Some(sleep) = sleep else {
+    if sleep.is_none() && revocation.is_none() {
         return drain.await;
-    };
-    tokio::select! {
-        biased;
-        () = sleep.as_mut() => {
+    }
+    let mut drain = std::pin::pin!(drain);
+    poll_fn(|cx| {
+        if let Some(sleep) = sleep.as_deref_mut()
+            && std::future::Future::poll(sleep.as_mut(), cx).is_ready()
+        {
             if let Some(bound) = bound {
                 bound.expired.store(true, Ordering::Release);
             }
-            Some(authorization_expired_first_failure())
+            return Poll::Ready(Some(authorization_expired_first_failure()));
         }
-        result = drain => result,
-    }
+        if let Some((message, wait)) = revocation.as_deref_mut()
+            && std::future::Future::poll(wait.as_mut(), cx).is_ready()
+        {
+            return Poll::Ready(Some(relay_revoked_first_failure(message)));
+        }
+        drain.as_mut().poll(cx)
+    })
+    .await
 }
 
 /// Drain one direction of the bidirectional copy during the clean-EOF half-close
