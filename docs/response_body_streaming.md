@@ -856,6 +856,14 @@ Cost and invariants:
   no pump at all: no future, no channel, no timer. That path is unchanged. With
   the write watermark live, the pump is one boxed future and one bounded
   channel, driven inline as described above.
+- A **fully buffered** upload under the write watermark has nothing to relay
+  and uses no bridge: the transport takes refcounted 64 KiB slices of the
+  collected buffer synchronously — so the request head and the first body
+  slice leave in one write — and records each take; a watcher future enforces
+  the same terminals from that record (write idle since the latest take,
+  cancellation, release, completion) and owns the same post-EOS drain
+  judgment. The last slice is the body's end of stream, so an HTTP/2 backend
+  sees `END_STREAM` on the final DATA frame.
 - Termination messages are compiled-in literals from a closed set, and the
   fixed-cardinality counter is recorded through the request's shared once-only
   latch, so an upload and a response body racing the same plan still count

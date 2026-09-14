@@ -3269,6 +3269,180 @@ async fn dropping_a_cancel_on_drop_join_settles_an_inline_pump_in_place() {
     }
 }
 
+// --- Buffered uploads take the direct route (#5505) --------------------------
+//
+// A fully buffered upload has nothing to relay, yet bridging it through the
+// pump's channel made hyper's first body poll find an empty bridge: the request
+// head was flushed alone and the body followed in a second TLS record and a
+// second `writev`, and every frame paid a channel hop. The transport now takes
+// slices of the buffer directly and a watcher enforces the same bounds from
+// the progress it records.
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_upload_is_handed_over_synchronously_frame_by_frame() {
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let total = frame * 2 + 5;
+    let mut probe = BufferedUploadPumpProbe::start(total, 600_000).expect("buffered pump");
+    assert_eq!(probe.declared_content_length(), Some(total as u64));
+
+    // Every poll yields a frame at once — never `Pending` — because nothing
+    // has to be relayed first. This is what lets hyper encode the request head
+    // and the first body frame into the same write.
+    let mut sizes = Vec::new();
+    loop {
+        match probe.poll_transport_only() {
+            ProbeTransportPoll::Data(len) => sizes.push(len),
+            ProbeTransportPoll::Ended => break,
+            other => panic!("a buffered upload must never make the transport wait: {other:?}"),
+        }
+    }
+    assert_eq!(
+        sizes,
+        vec![frame, frame, 5],
+        "the buffer is still handed over in bounded slices so the watermark judges per-frame progress"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_last_buffered_frame_is_the_end_of_stream() {
+    // Before the watermark was installed on buffered uploads the transport
+    // held the reusable `Bytes` itself, so an HTTP/2 backend saw END_STREAM on
+    // the final DATA frame. The bridge lost that — the source could not know
+    // it was at its end until the pump's `None` crossed the channel — and the
+    // direct source restores it.
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let mut probe = BufferedUploadPumpProbe::start(frame + 1, 600_000).expect("buffered pump");
+    assert!(!probe.transport_sees_end_stream());
+    assert!(matches!(
+        probe.poll_transport_only(),
+        ProbeTransportPoll::Data(len) if len == frame
+    ));
+    assert!(
+        !probe.transport_sees_end_stream(),
+        "a byte is still unhanded"
+    );
+    assert!(matches!(
+        probe.poll_transport_only(),
+        ProbeTransportPoll::Data(1)
+    ));
+    assert!(
+        probe.transport_sees_end_stream(),
+        "nothing of the upload remains once the last slice is taken"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_direct_upload_finished_inside_the_dispatch_poll_settles_without_a_task() {
+    // hyper takes the last frame inside the very poll of the dispatch future
+    // that also yields the response head, so the race ends before it ever
+    // polls the pump again. The join must still recognise a finished upload
+    // and not pay a task to learn what one poll would tell it.
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let mut probe = BufferedUploadPumpProbe::start(frame * 2, 600_000).expect("buffered pump");
+    assert!(matches!(
+        probe.poll_transport_only(),
+        ProbeTransportPoll::Data(_)
+    ));
+    assert!(matches!(
+        probe.poll_transport_only(),
+        ProbeTransportPoll::Data(_)
+    ));
+    assert_eq!(
+        probe.pump_runs_on_its_own_task(),
+        Some(false),
+        "the race has not polled the watcher since the transport finished"
+    );
+    assert_eq!(
+        probe.header_arrives_while_still_uploading().await,
+        None,
+        "a finished upload must settle in place when the race ends, not be detached"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_direct_write_watermark_measures_idleness_from_the_latest_frame_taken() {
+    // Slow-but-progressing consumption keeps the watermark fresh, exactly as
+    // the bridged pump's per-`reserve()` reset did: the bound is idle time
+    // since the transport LAST took a frame, not time since it took the first.
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let mut probe = BufferedUploadPumpProbe::start(frame * 8, 800).expect("buffered pump");
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_)
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_)
+    ));
+
+    // 800 ms after the FIRST take the transport has been idle for only 300 ms.
+    let started = tokio::time::Instant::now();
+    assert!(
+        !probe
+            .write_watermark_wins_header_wait(Duration::from_millis(700))
+            .await,
+        "a transport that took a frame 300 ms ago is not idle"
+    );
+    // 800 ms after the LAST take it is.
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "the watermark must fire once the transport has been idle for the bound"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(800) && elapsed < Duration::from_millis(900),
+        "expected the watermark 800 ms after the last take: {elapsed:?}"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+    match probe.poll_transport_only() {
+        ProbeTransportPoll::Errored(message) => assert!(
+            message.contains("backend request body write timeout"),
+            "unexpected termination message: {message}"
+        ),
+        other => panic!("the remaining slices must never be handed over: {other:?}"),
+    }
+    assert!(
+        !probe.transport_sees_end_stream(),
+        "a truncated upload must not present itself as complete"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn releasing_a_direct_upload_early_ends_its_watcher_as_consumer_gone() {
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let mut probe = BufferedUploadPumpProbe::start(frame * 4, 800).expect("buffered pump");
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_)
+    ));
+    // The transport lets go of the body with three slices unhanded — a reset
+    // stream, a connection that died — and no bridge exists whose close the
+    // watcher could observe. It must still learn of the release.
+    probe.drop_transport();
+    assert_eq!(probe.join().await, ProbePumpOutcome::ConsumerGone);
+}
+
+#[tokio::test(start_paused = true)]
+async fn releasing_a_direct_upload_after_its_last_byte_is_completion() {
+    // hyper's HTTP/1 length-delimited encoder drops the body the moment the
+    // last declared byte is written, without polling for the trailing end of
+    // stream. That is a transport that is done, not one that went away.
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let mut probe = BufferedUploadPumpProbe::start(frame, 800).expect("buffered pump");
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(len) if len == frame
+    ));
+    probe.drop_transport();
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
 #[tokio::test(start_paused = true)]
 async fn releasing_the_transport_body_ends_an_inline_pump_parked_on_the_client() {
     // The pump holds a bridge permit and is parked on a client that never
