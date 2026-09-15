@@ -9,10 +9,21 @@
 //! publishes one bit per complete HTTP/1 request head. It does not retain a
 //! head, allocate per request, or inspect body payloads. A small framing state
 //! machine skips fixed and chunked bodies so keep-alive and pipelined requests
-//! remain aligned. Reads that can contain request heads expose at most 8 KiB
-//! beyond a known body boundary; this hard-bounds the fixed signal ring's
-//! producer lead without limiting reads wholly inside a body. The configured
-//! Hyper head-buffer limit bounds work on an unterminated head.
+//! remain aligned. Reads that can contain request heads expose at most
+//! [`OBSERVED_READ_CAP`] (16 KiB) beyond a known body boundary; this
+//! hard-bounds the fixed signal ring's producer lead without limiting reads
+//! wholly inside a body. The configured Hyper head-buffer limit bounds work on
+//! an unterminated head.
+//!
+//! The window is sized to the transport, not to the scanner: 16 KiB is the
+//! largest plaintext a single TLS record can carry (RFC 8446 §5.1) and the
+//! first step of Hyper's adaptive read buffer above its 8 KiB initial size. A
+//! smaller window split every keep-alive request larger than it into an extra
+//! read — and, for a fixed-length upload, into an extra body frame that the
+//! backend transport then wrote as an extra TLS record — without observing any
+//! head byte the larger window does not (issue #5505). Larger windows would
+//! not save another read for the ordinary request sizes this proxy serves,
+//! but would grow the per-connection signal ring required below.
 //!
 //! Three shapes that Hyper would reject during parse (conflicting
 //! `Content-Length` values, HTTP/1.0 + `Transfer-Encoding`, invalid UTF-8 on
@@ -81,9 +92,27 @@ pub(super) fn envelope_for_hint(hint: u8) -> &'static [u8] {
 }
 
 const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-const OBSERVED_READ_CAP: usize = 8 * 1024;
-const SIGNAL_WORDS: usize = 16;
+/// Largest read exposed to the inner stream while the bytes it returns can
+/// contain a request head. See the module docs for why this is one TLS
+/// record; see [`H1FramingSignals`] for the ring capacity it implies.
+const OBSERVED_READ_CAP: usize = 16 * 1024;
+const SIGNAL_WORDS: usize = 32;
 const SIGNAL_CAPACITY: u64 = (SIGNAL_WORDS * u64::BITS as usize) as u64;
+/// Shortest request head Hyper accepts and dispatches (httparse tolerates a
+/// bare LF line terminator). Heads the observer completes but Hyper rejects
+/// are shorter still (`X\n\n`), but such a connection ends on Hyper's parse
+/// error; the ring only needs headroom for heads that reach the consumer.
+const MIN_DISPATCHABLE_HEAD_BYTES: usize = b"GET / HTTP/1.1\n\n".len();
+// A single window full of the shortest dispatchable heads, plus the one partial
+// head a boundary-crossing read can complete, must not exhaust the ring: the
+// observer publishes every head in a read at once while Hyper dispatches them
+// one at a time, so this lead is reachable by a legitimate pipelining client.
+// Overflow is fail-closed (400 + close), which must stay reserved for shapes
+// Hyper itself would not dispatch.
+const _: () = assert!(
+    OBSERVED_READ_CAP / MIN_DISPATCHABLE_HEAD_BYTES + 1 < SIGNAL_CAPACITY as usize,
+    "OBSERVED_READ_CAP can overflow the signal ring with dispatchable heads"
+);
 // Mirrored from hyper 1.9.0 `src/proto/h1/decode.rs`:
 // `CHUNKED_EXTENSIONS_LIMIT` (line 20) and `TRAILER_LIMIT` (line 25).
 // The safety invariant is one-directional: hyper must error at or before the
@@ -120,15 +149,22 @@ pub(super) enum H1FramingResult {
 /// `request_line`, and the second `\n` takes the `!line_has_data &&
 /// !request_line` branch and publishes. Hyper returns after parsing the first
 /// head instead of issuing another read, and a boundary-crossing read exposes
-/// at most 8 KiB after the body, so one prior partial head plus `8192 / 3`
-/// complete heads can lead the consumer: at most 2,731 entries. That exceeds
-/// the 1,024-entry ring, so wrap is possible while the observer remains
-/// congruent. The capacity check in [`Self::push`] is therefore load-bearing,
-/// not belt-and-braces; overflow is a sticky fail-closed `ObserverFailed`.
-/// Capacity exhaustion, an observer/parser divergence, and a consumer
-/// underflow are sticky fail-closed states.
+/// at most [`OBSERVED_READ_CAP`] (16 KiB) after the body, so one prior partial
+/// head plus `16384 / 3` complete heads can lead the consumer: at most 5,462
+/// entries. That exceeds the 2,048-entry ring, so wrap is possible while the
+/// observer remains congruent. The capacity check in [`Self::push`] is
+/// therefore load-bearing, not belt-and-braces; overflow is a sticky
+/// fail-closed `ObserverFailed`. Capacity exhaustion, an observer/parser
+/// divergence, and a consumer underflow are sticky fail-closed states.
 ///
-/// The 16-word conflict ring is heap-allocated only when the scanner first
+/// Overflow must stay unreachable for heads Hyper would actually dispatch,
+/// or a legitimate pipelining client could be failed closed. The shortest
+/// such head is [`MIN_DISPATCHABLE_HEAD_BYTES`] (16 bytes), so one window
+/// holds at most 1,024 of them plus one completed partial: 1,025 entries,
+/// half the ring. The compile-time assertion next to [`OBSERVED_READ_CAP`]
+/// pins that relationship so neither constant can move without the other.
+///
+/// The 32-word conflict ring is heap-allocated only when the scanner first
 /// classifies the connection as HTTP/1, so an h2c preface match never pays
 /// for it. TLS connections that negotiated ALPN `h2` skip this type entirely.
 pub(super) struct H1FramingSignals {
@@ -1518,6 +1554,108 @@ mod tests {
     }
 
     #[test]
+    fn head_bearing_reads_expose_one_tls_record() {
+        // RFC 8446 §5.1: one record carries at most 2^14 bytes of plaintext.
+        // A smaller window split every larger keep-alive request into an
+        // extra read and an extra body frame (issue #5505); a larger one
+        // would only grow the signal ring below.
+        assert_eq!(OBSERVED_READ_CAP, 16 * 1024);
+
+        let signals = H1FramingSignals::new();
+        let mut scanner = WireScanner::new(TEST_MAX_HEAD_BYTES);
+        assert_eq!(
+            scanner.read_cap(64 * 1024),
+            OBSERVED_READ_CAP,
+            "protocol detection"
+        );
+
+        scanner.observe(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n", &signals);
+        assert_eq!(
+            scanner.read_cap(64 * 1024),
+            OBSERVED_READ_CAP,
+            "awaiting next head"
+        );
+
+        scanner.observe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 70000\r\n\r\n",
+            &signals,
+        );
+        assert_eq!(
+            scanner.read_cap(64 * 1024),
+            64 * 1024,
+            "a read wholly inside a fixed body is not capped"
+        );
+        assert_eq!(
+            scanner.read_cap(90 * 1024),
+            70_000 + OBSERVED_READ_CAP,
+            "a boundary-crossing read exposes one window past the body"
+        );
+        assert_eq!(signals.next_conflict(), H1FramingResult::Clear);
+        assert_eq!(signals.next_conflict(), H1FramingResult::Clear);
+        assert!(!signals.overflowed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn one_window_of_minimal_dispatchable_heads_cannot_overflow_the_ring() {
+        // Hyper dispatches heads one at a time while the observer publishes
+        // every head in a read at once, so a pipelining client that fills one
+        // window with the shortest heads Hyper accepts leads the consumer by
+        // exactly that many entries. Fail-closed overflow must stay
+        // unreachable for them, or a legitimate burst would be rejected.
+        let head = b"GET / HTTP/1.1\n\n";
+        assert_eq!(head.len(), MIN_DISPATCHABLE_HEAD_BYTES);
+        let heads_per_window = OBSERVED_READ_CAP / head.len();
+        assert_eq!(heads_per_window * head.len(), OBSERVED_READ_CAP);
+
+        // One partial head straddles into the window, then a full window of
+        // complete heads, then more bytes than the window may expose.
+        let mut wire = b"GET / HTTP/1.1\n\n".repeat(heads_per_window + 3);
+        wire.extend_from_slice(b"GET /trailing HTTP/1.1\r\nHost: a\r\n\r\n");
+        let split = 5;
+        let (mut guard, signals) = H1FramingGuardIo::new(
+            MockIo::new(&[&wire[..split], &wire[split..]]),
+            TEST_MAX_HEAD_BYTES,
+            None,
+        );
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut storage = vec![0u8; 4 * OBSERVED_READ_CAP];
+
+        let mut buf = ReadBuf::new(&mut storage);
+        assert!(matches!(
+            Pin::new(&mut guard).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled().len(), split);
+
+        let mut buf = ReadBuf::new(&mut storage);
+        assert!(matches!(
+            Pin::new(&mut guard).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            buf.filled().len(),
+            OBSERVED_READ_CAP,
+            "a head-bearing read is capped at exactly one window"
+        );
+
+        // The partial head completed plus a window's worth of heads (the last
+        // one in the window is cut short by the cap and completes later).
+        let produced = signals.produced.load(Ordering::Acquire);
+        assert_eq!(produced, heads_per_window as u64);
+        assert!(
+            produced + 1 < SIGNAL_CAPACITY,
+            "a window of dispatchable heads must leave ring headroom"
+        );
+        assert!(!signals.overflowed.load(Ordering::Acquire));
+        assert!(!signals.unknown.load(Ordering::Acquire));
+        for _ in 0..produced {
+            assert_eq!(signals.next_conflict(), H1FramingResult::Clear);
+        }
+        assert_eq!(signals.take_parse_rejects(), 0);
+        assert!(guard.inner.written.is_empty(), "nothing was rejected");
+    }
+
+    #[test]
     fn signal_overflow_and_consumer_underflow_fail_closed() {
         let overflowed = H1FramingSignals::new();
         for _ in 0..SIGNAL_CAPACITY {
@@ -1685,8 +1823,15 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            if let Some(chunk) = self.reads.pop_front() {
-                buf.put_slice(&chunk);
+            if let Some(mut chunk) = self.reads.pop_front() {
+                // Honour the guard's read cap the way a socket does: hand over
+                // what fits and keep the rest for the next read.
+                let take = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    chunk.drain(..take);
+                    self.reads.push_front(chunk);
+                }
             }
             Poll::Ready(Ok(()))
         }
