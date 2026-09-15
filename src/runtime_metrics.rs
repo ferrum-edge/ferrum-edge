@@ -9,7 +9,7 @@ use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -262,22 +262,35 @@ impl RuntimeMetrics {
     }
 
     pub fn record_transaction(&self, summary: &TransactionSummary) {
-        if summary.client_disconnected {
+        self.record_terminal_outcome(TerminalOutcome {
+            proxy_id: summary.proxy_id.as_deref(),
+            grpc: is_grpc_summary(summary),
+            error_class: summary.error_class,
+            body_error_class: summary.body_error_class,
+            client_disconnected: summary.client_disconnected,
+        });
+    }
+
+    /// Everything [`record_transaction`](Self::record_transaction) reads from a
+    /// summary, so a terminal path that never builds one records exactly the
+    /// same counters.
+    pub fn record_terminal_outcome(&self, outcome: TerminalOutcome<'_>) {
+        if outcome.client_disconnected {
             self.client_disconnects.fetch_add(1, Ordering::Relaxed);
         }
 
-        if let Some(class) = summary.error_class {
-            if is_grpc_summary(summary) {
-                self.record_grpc_error_inner(summary.proxy_id.as_deref(), class, false);
+        if let Some(class) = outcome.error_class {
+            if outcome.grpc {
+                self.record_grpc_error_inner(outcome.proxy_id, class, false);
             } else {
-                self.record_http_error_inner(summary.proxy_id.as_deref(), class, false);
+                self.record_http_error_inner(outcome.proxy_id, class, false);
             }
         }
 
-        if let Some(class) = summary.body_error_class {
+        if let Some(class) = outcome.body_error_class {
             self.increment_error_map(
                 &self.body_errors_by_class,
-                summary.proxy_id.as_deref().unwrap_or("unknown"),
+                outcome.proxy_id.unwrap_or("unknown"),
                 class.as_str(),
             );
         }
@@ -1054,12 +1067,29 @@ fn unix_seconds() -> u64 {
 }
 
 fn is_grpc_summary(summary: &TransactionSummary) -> bool {
-    summary
-        .metadata
+    terminal_metadata_is_grpc(&summary.metadata)
+}
+
+/// The metadata reading that files a terminal error under the gRPC counters
+/// rather than the HTTP ones. Shared with the summary-free terminal path so
+/// both classify identically.
+pub fn terminal_metadata_is_grpc(metadata: &HashMap<String, String>) -> bool {
+    metadata
         .get("request_protocol")
-        .or_else(|| summary.metadata.get("mesh.request_protocol"))
+        .or_else(|| metadata.get("mesh.request_protocol"))
         .is_some_and(|value| value == "grpc" || value == "grpc-web")
-        || summary.metadata.contains_key("grpc_status")
+        || metadata.contains_key("grpc_status")
+}
+
+/// What [`RuntimeMetrics::record_transaction`] reads from a summary, spelled
+/// out so the same counters can be recorded without building one.
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalOutcome<'a> {
+    pub proxy_id: Option<&'a str>,
+    pub grpc: bool,
+    pub error_class: Option<ErrorClass>,
+    pub body_error_class: Option<ErrorClass>,
+    pub client_disconnected: bool,
 }
 
 fn direction_label(direction: Direction) -> &'static str {

@@ -1295,6 +1295,8 @@ Only set when the gateway itself could not communicate with the backend (or when
 
 Deferred logging emits this summary at body termination. `latency_total_ms` reflects the full streamed lifetime. `latency_backend_total_ms`, `latency_gateway_processing_ms`, and `latency_gateway_overhead_ms` remain `-1.0` because concurrent backend-body production and client delivery cannot be separated on the default streaming path — they are never filled by treating TTFB as full backend duration. Use `latency_backend_ttfb_ms` for streaming backend alerting.
 
+A streamed response on a proxy with **no plugins** has no `log` hook, termination hook, inspector, or mirror to receive a summary, so none is built for it; the body carries a compact terminal that records the same `GET /metrics/runtime` accounting (`error_class`, `body_error_class`, `client_disconnects`, filed under HTTP or gRPC exactly as the summary would be) through the same single-fire latch and drop safety net. Configuring any plugin on the proxy restores the full summary path for that proxy.
+
 #### Example: HTTP/3 (QUIC)
 
 ```json

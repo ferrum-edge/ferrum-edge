@@ -35659,7 +35659,19 @@ async fn handle_proxy_request_inner(
                 // body wrapper (non-exceeded streaming path).
                 let deferred_grpc_logger: Option<
                     Arc<crate::proxy::deferred_log::DeferredTransactionLogger>,
-                > = if !plugins.is_empty() || streamed || final_error_class.is_some() {
+                > = if plugins.is_empty() && streamed {
+                    // No plugin observes this stream: record the terminal
+                    // accounting alone (the summary below would exist only for
+                    // `record_transaction`). This is a gRPC response by
+                    // construction, as the summary's `request_protocol` says.
+                    Some(
+                        crate::proxy::deferred_log::DeferredTransactionLogger::compact(
+                            proxy.id.clone(),
+                            true,
+                            ctx.response_policy_error_class(final_error_class),
+                        ),
+                    )
+                } else if !plugins.is_empty() || streamed || final_error_class.is_some() {
                     let grpc_resolved_ip = if !plugins.is_empty() {
                         state
                             .dns_cache
@@ -39193,10 +39205,25 @@ async fn handle_proxy_request_inner(
     // summary below. Response framing still needs the request-method semantic,
     // but the hot path does not need to clone the method string.
     let is_head = method.eq_ignore_ascii_case("HEAD");
-    let needs_transaction_summary =
-        !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
+    // A streaming response with no plugin on the proxy still owes the runtime
+    // metrics its terminal accounting, but that is *all* it owes: no `log`,
+    // termination hook, inspector, or mirror exists to receive a summary. Hand
+    // the body a compact terminal that records exactly what the summary path
+    // would have recorded, without the summary, the context clone, or the
+    // delivery task.
+    let compact_terminal_only = plugins.is_empty() && body_will_stream;
+    let needs_transaction_summary = !compact_terminal_only
+        && (!plugins.is_empty() || body_will_stream || backend_error_class.is_some());
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
-        if needs_transaction_summary {
+        if compact_terminal_only {
+            Some(
+                crate::proxy::deferred_log::DeferredTransactionLogger::compact(
+                    proxy.id.clone(),
+                    crate::runtime_metrics::terminal_metadata_is_grpc(&ctx.metadata),
+                    ctx.response_policy_error_class(backend_error_class),
+                ),
+            )
+        } else if needs_transaction_summary {
             // Request bytes: SizeLimitedIncoming / CountingIncoming publish
             // per DATA frame, so this load is the total once those adapters
             // have finished. Unlimited direct-H2 passthrough publishes only
@@ -40176,7 +40203,8 @@ async fn handle_proxy_request_inner(
     // Attach deferred logger to the body so `log_with_mirror` fires when the
     // body reaches a terminal state (completion, streaming error, or client
     // disconnect via the Drop safety net) rather than at header-flush time.
-    // `deferred_logger` is `Some` only for streaming responses with plugins.
+    // `deferred_logger` is `Some` only for streaming responses; without a
+    // plugin it is the compact terminal that records runtime metrics alone.
     let body = if let Some(guard) = per_ip_guard {
         body.with_per_ip_request_guard(guard)
     } else {

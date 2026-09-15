@@ -1421,3 +1421,185 @@ async fn drop_while_still_streaming_is_still_a_client_disconnect() {
     assert_eq!(got.body_error_class, Some(ErrorClass::ClientDisconnect));
     assert_eq!(got.bytes_received, expected_len as u64);
 }
+
+// ── Compact terminal (no plugin observes the stream) ─────────────────────────
+
+/// Read one `(class, proxy)` cell of a runtime-metrics error map.
+fn error_count(
+    map: &ferrum_edge::runtime_metrics::ErrorCounterMap,
+    class: ErrorClass,
+    proxy_id: &str,
+) -> u64 {
+    map.get(class.as_str())
+        .and_then(|by_proxy| by_proxy.get(proxy_id).map(|c| c.load(Ordering::Relaxed)))
+        .unwrap_or(0)
+}
+
+/// The process-wide client-disconnect counter, as `/metrics/runtime` reports it.
+fn global_client_disconnects() -> u64 {
+    ferrum_edge::runtime_metrics::build_snapshot("test", None)
+        .http
+        .client_disconnects
+}
+
+/// Every counter `record_transaction` derives from a summary, read for one
+/// proxy so tests sharing the global registry cannot see each other.
+fn proxy_terminal_counts(
+    metrics: &ferrum_edge::runtime_metrics::RuntimeMetrics,
+    proxy_id: &str,
+) -> Vec<(&'static str, ErrorClass, u64)> {
+    let mut counts = Vec::new();
+    for (name, map) in [
+        ("http", &metrics.http_errors_by_class),
+        ("grpc", &metrics.grpc_errors_by_class),
+        ("body", &metrics.body_errors_by_class),
+    ] {
+        for class in [
+            ErrorClass::TlsError,
+            ErrorClass::ConnectionReset,
+            ErrorClass::ClientDisconnect,
+            ErrorClass::DispatchPolicyRejected,
+            ErrorClass::RequestError,
+        ] {
+            let n = error_count(map, class, proxy_id);
+            if n > 0 {
+                counts.push((name, class, n));
+            }
+        }
+    }
+    counts
+}
+
+/// The compact terminal must file exactly the counters the summary path
+/// files, for every terminal shape, without a summary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compact_terminal_records_exactly_what_the_summary_path_records() {
+    let cases: Vec<(&str, bool, Option<ErrorClass>, BodyOutcome)> = vec![
+        ("compact-success", false, None, BodyOutcome::success(10)),
+        (
+            "compact-backend-error",
+            false,
+            Some(ErrorClass::TlsError),
+            BodyOutcome::error(ErrorClass::ConnectionReset, 5, false),
+        ),
+        (
+            "compact-disconnect",
+            false,
+            Some(ErrorClass::ConnectionReset),
+            BodyOutcome::client_disconnect(0),
+        ),
+        (
+            "compact-grpc-protocol",
+            true,
+            Some(ErrorClass::ConnectionReset),
+            BodyOutcome::success(1),
+        ),
+        (
+            "compact-grpc-status-in-trailers",
+            false,
+            Some(ErrorClass::ConnectionReset),
+            BodyOutcome::success(1).with_grpc_status(Some(13)),
+        ),
+    ];
+    let global = ferrum_edge::runtime_metrics::global_ref();
+    for (proxy_id, grpc, error_class, outcome) in cases {
+        let proxy_id = format!("{proxy_id}-{}", std::process::id());
+        assert!(proxy_terminal_counts(global, &proxy_id).is_empty());
+
+        // What the full path records: the same fields on a summary.
+        let reference = ferrum_edge::runtime_metrics::RuntimeMetrics::new();
+        let mut summary = make_summary_with_status(200);
+        summary.proxy_id = Some(proxy_id.clone());
+        summary.error_class = error_class;
+        summary.body_error_class = outcome.body_error_class;
+        summary.client_disconnected = outcome.client_disconnected;
+        if grpc {
+            summary
+                .metadata
+                .insert("request_protocol".to_string(), "grpc".to_string());
+        }
+        if let Some(status) = outcome.grpc_status {
+            summary
+                .metadata
+                .insert("grpc_status".to_string(), status.to_string());
+        }
+        reference.record_transaction(&summary);
+
+        let before_disconnects = global_client_disconnects();
+        let logger = DeferredTransactionLogger::compact(proxy_id.clone(), grpc, error_class);
+        logger.fire(outcome.clone());
+
+        assert_eq!(
+            proxy_terminal_counts(global, &proxy_id),
+            proxy_terminal_counts(&reference, &proxy_id),
+            "{proxy_id}: compact terminal and summary path disagree"
+        );
+        if outcome.client_disconnected {
+            assert!(
+                global_client_disconnects() > before_disconnects,
+                "{proxy_id}: a disconnect must count"
+            );
+        }
+    }
+}
+
+/// Exactly once: an explicit fire wins over the Drop safety net, and a body
+/// dropped without firing is one client disconnect — the same latch as the
+/// summary path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compact_terminal_fires_once_through_the_same_latch_and_drop_net() {
+    let global = ferrum_edge::runtime_metrics::global_ref();
+    let fired_then_dropped = format!("compact-fired-then-dropped-{}", std::process::id());
+    let logger = DeferredTransactionLogger::compact(fired_then_dropped.clone(), false, None);
+    logger.fire(BodyOutcome::success(3));
+    logger.fire(BodyOutcome::client_disconnect(3));
+    drop(logger);
+    assert!(
+        proxy_terminal_counts(global, &fired_then_dropped).is_empty(),
+        "a completed body must not be recounted as a disconnect"
+    );
+
+    let dropped_unfired = format!("compact-dropped-unfired-{}", std::process::id());
+    let before = global_client_disconnects();
+    let logger = DeferredTransactionLogger::compact(dropped_unfired.clone(), false, None);
+    drop(logger);
+    assert_eq!(
+        proxy_terminal_counts(global, &dropped_unfired),
+        vec![("body", ErrorClass::ClientDisconnect, 1)]
+    );
+    assert!(global_client_disconnects() > before);
+}
+
+/// Attached to a real streaming body, the compact terminal sees the same
+/// outcomes the body wrapper hands the summary path: a proven end of stream is
+/// a completion, a body abandoned mid-stream is a disconnect.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compact_terminal_on_a_streaming_body_classifies_like_the_summary_path() {
+    let global = ferrum_edge::runtime_metrics::global_ref();
+
+    let completed = format!("compact-body-completed-{}", std::process::id());
+    let logger = DeferredTransactionLogger::compact(completed.clone(), false, None);
+    let inner = Box::pin(EndStreamAfterFinalFrame {
+        data: Some(Bytes::from_static(b"data: only\n\n")),
+    });
+    let mut body = proxy_body_streaming_for_test(inner).with_logger(logger);
+    assert!(poll_one_data_frame(&mut body) > 0);
+    drop(body);
+    assert!(
+        proxy_terminal_counts(global, &completed).is_empty(),
+        "a proven end-of-stream is a completion, not a disconnect"
+    );
+
+    let abandoned = format!("compact-body-abandoned-{}", std::process::id());
+    let logger = DeferredTransactionLogger::compact(abandoned.clone(), false, None);
+    let inner = Box::pin(StillStreamingAfterFrame {
+        data: Some(Bytes::from_static(b"data: first\n\n")),
+    });
+    let mut body = proxy_body_streaming_for_test(inner).with_logger(logger);
+    assert!(poll_one_data_frame(&mut body) > 0);
+    drop(body);
+    assert_eq!(
+        proxy_terminal_counts(global, &abandoned),
+        vec![("body", ErrorClass::ClientDisconnect, 1)]
+    );
+}

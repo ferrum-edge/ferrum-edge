@@ -14,6 +14,16 @@
 //!
 //! The logger is single-fire (guarded by `AtomicBool` CAS) so a normal
 //! body-complete fire and the Drop safety net can never both emit.
+//!
+//! A streaming response that no plugin observes still owes the runtime
+//! metrics its terminal accounting (error class, body error class, client
+//! disconnect) — but nothing else: no plugin `log`, no termination hook, no
+//! inspector, no mirror. [`DeferredTransactionLogger::compact`] captures only
+//! what [`crate::runtime_metrics::RuntimeMetrics::record_transaction`] reads
+//! and records it synchronously at the terminal, so the common no-plugin
+//! request builds no `TransactionSummary`, clones no `RequestContext`, and
+//! spawns no delivery task while keeping exactly-once accounting through the
+//! same single-fire latch and Drop safety net.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -23,6 +33,7 @@ use std::time::Instant;
 use crate::plugins::{Plugin, RequestContext, TransactionSummary, log_with_mirror};
 use crate::proxy::body::DirectH2BytesLatch;
 use crate::retry::ErrorClass;
+use crate::runtime_metrics::TerminalOutcome;
 
 /// Observed outcome of a streaming response body.
 ///
@@ -141,7 +152,7 @@ pub async fn run_response_stream_termination_hooks(
 /// Single-fire: the first call to [`fire`](Self::fire) wins; subsequent
 /// calls (e.g. a Drop safety net running after an explicit fire) are no-ops.
 pub struct DeferredTransactionLogger {
-    state: Mutex<Option<LogState>>,
+    state: Mutex<Option<Captured>>,
     fired: AtomicBool,
     // Test-only owned delivery lifecycle. Production paths leave this unset and
     // dispatch through the process-global structured lifecycle.
@@ -149,10 +160,48 @@ pub struct DeferredTransactionLogger {
     delivery: Option<crate::observability_delivery::OwnedDeliveryLifecycle>,
 }
 
-/// Captured log state. Held inside a [`Mutex`] so [`fire`](DeferredTransactionLogger::fire)
-/// can `take()` it and move it into the spawned log task. After the first fire
-/// the slot is `None`, but the `fired` CAS already prevents a second fire so
-/// the `None` state is only visible to no-op callers.
+/// What the logger captured at header commit. Held inside a [`Mutex`] so
+/// [`fire`](DeferredTransactionLogger::fire) can `take()` it. After the first
+/// fire the slot is `None`, but the `fired` CAS already prevents a second fire
+/// so the `None` state is only visible to no-op callers.
+enum Captured {
+    /// A full summary, the plugin chain, and a context clone: everything a
+    /// plugin `log` / termination hook / mirror can ask for. Boxed so the
+    /// compact variant's allocation is not sized for it.
+    Full(Box<LogState>),
+    /// Runtime-metrics accounting alone, for a response no plugin observes.
+    Compact(CompactTerminal),
+}
+
+/// The fields [`crate::runtime_metrics::RuntimeMetrics::record_transaction`]
+/// reads that are known at header commit. The rest of the terminal outcome
+/// arrives with the body's [`BodyOutcome`].
+struct CompactTerminal {
+    proxy_id: String,
+    /// Whether an error class files under the gRPC counters. Fixed at header
+    /// commit from the request's protocol metadata; a terminal gRPC status
+    /// observed in trailers also makes it so, as it does for a summary.
+    grpc: bool,
+    /// The response's error class as the full path would carry it on the
+    /// summary: the backend's class, unless a gateway output-policy refusal
+    /// replaced the response.
+    error_class: Option<ErrorClass>,
+}
+
+impl CompactTerminal {
+    fn record(&self, outcome: &BodyOutcome) {
+        crate::runtime_metrics::global_ref().record_terminal_outcome(TerminalOutcome {
+            proxy_id: Some(self.proxy_id.as_str()),
+            grpc: self.grpc || outcome.grpc_status.is_some(),
+            error_class: self.error_class,
+            body_error_class: outcome.body_error_class,
+            client_disconnected: outcome.client_disconnected,
+        });
+    }
+}
+
+/// Captured log state for the full path: moved into the spawned log task
+/// on fire.
 struct LogState {
     summary: TransactionSummary,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -194,13 +243,43 @@ impl DeferredTransactionLogger {
         ctx: RequestContext,
     ) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(Some(LogState {
+            state: Mutex::new(Some(Captured::Full(Box::new(LogState {
                 summary,
                 plugins,
                 ctx,
                 start_time: None,
                 request_bytes_latch: None,
-            })),
+            })))),
+            fired: AtomicBool::new(false),
+            #[cfg(test)]
+            delivery: None,
+        })
+    }
+
+    /// Build a logger that records only the runtime-metrics terminal
+    /// accounting, for a streaming response with **no plugin** on the proxy.
+    ///
+    /// Without a plugin there is no `log`, no response-stream termination
+    /// hook, no inspector, and no mirror to serve, so the full path's
+    /// `TransactionSummary`, `RequestContext` clone, and spawned delivery task
+    /// would exist only to reach
+    /// [`RuntimeMetrics::record_transaction`](crate::runtime_metrics::RuntimeMetrics::record_transaction).
+    /// This captures exactly the fields that call reads and records them
+    /// synchronously at the terminal — the recording is a handful of atomic
+    /// increments, so it needs no task — through the same single-fire latch
+    /// and Drop safety net, so client disconnects and body errors are counted
+    /// exactly once, exactly as the full path counts them.
+    ///
+    /// `grpc` is the request's protocol classification at header commit
+    /// (see [`crate::runtime_metrics::terminal_metadata_is_grpc`]);
+    /// `error_class` is the response's class as the summary would carry it.
+    pub fn compact(proxy_id: String, grpc: bool, error_class: Option<ErrorClass>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(Some(Captured::Compact(CompactTerminal {
+                proxy_id,
+                grpc,
+                error_class,
+            }))),
             fired: AtomicBool::new(false),
             #[cfg(test)]
             delivery: None,
@@ -235,13 +314,13 @@ impl DeferredTransactionLogger {
         start_time: Instant,
     ) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(Some(LogState {
+            state: Mutex::new(Some(Captured::Full(Box::new(LogState {
                 summary,
                 plugins,
                 ctx,
                 start_time: Some(start_time),
                 request_bytes_latch: None,
-            })),
+            })))),
             fired: AtomicBool::new(false),
             #[cfg(test)]
             delivery: None,
@@ -258,18 +337,14 @@ impl DeferredTransactionLogger {
         latch: Option<Arc<DirectH2BytesLatch>>,
     ) -> Arc<Self> {
         if let Some(latch) = latch {
-            match self.state.lock() {
-                Ok(mut guard) => {
-                    if let Some(state) = guard.as_mut() {
-                        state.request_bytes_latch = Some(latch);
-                    }
-                }
-                Err(poisoned) => {
-                    let mut guard = poisoned.into_inner();
-                    if let Some(state) = guard.as_mut() {
-                        state.request_bytes_latch = Some(latch);
-                    }
-                }
+            let mut guard = match self.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // A compact terminal records no byte counts, so it has nothing to
+            // wait for.
+            if let Some(Captured::Full(state)) = guard.as_mut() {
+                state.request_bytes_latch = Some(latch);
             }
         }
         self
@@ -304,8 +379,13 @@ impl DeferredTransactionLogger {
             // proceed — losing a log entry is worse than propagating poison.
             Err(poisoned) => poisoned.into_inner().take(),
         };
-        let Some(state) = state else {
-            return;
+        let state = match state {
+            Some(Captured::Full(state)) => *state,
+            Some(Captured::Compact(terminal)) => {
+                terminal.record(&outcome);
+                return;
+            }
+            None => return,
         };
         let LogState {
             mut summary,
@@ -435,13 +515,13 @@ impl DeferredTransactionLogger {
         start_time: Option<Instant>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(Some(LogState {
+            state: Mutex::new(Some(Captured::Full(Box::new(LogState {
                 summary,
                 plugins,
                 ctx,
                 start_time,
                 request_bytes_latch: None,
-            })),
+            })))),
             fired: AtomicBool::new(false),
             delivery: Some(delivery),
         })
