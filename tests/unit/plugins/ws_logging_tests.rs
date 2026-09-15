@@ -1,4 +1,11 @@
 //! Tests for ws_logging plugin
+//!
+//! The `sink_loss` counters are process-global per registered plugin name, so
+//! every `WsLogging` instance in this binary shares one `ws_logging` row and
+//! `cargo test --test unit_plugins_b_tests` runs these cases on parallel
+//! threads. The cases that assert an exact counter value, or that can land a
+//! `batch_discard` in that row, serialize on [`WS_BUCKET_LOCK`] for their whole
+//! body, awaits included.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,6 +101,44 @@ async fn test_ws_logging_plugin_creation() {
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
     assert!(plugin.requires_ws_disconnect_hooks());
     assert_eq!(plugin.warmup_hostnames(), vec!["localhost".to_string()]);
+}
+
+/// Serializes every case that asserts an exact `ws_logging` sink-loss value or
+/// can land a `batch_discard` in that bucket.
+///
+/// `assert_ws_batch_discard_projections` reads `dropped_total` and then expects
+/// `snapshot()` and `render_prometheus()` to project the same number. The
+/// counters are shared by every `WsLogging` in the process, so a sibling case's
+/// exhausted-retry discard landing between those reads fails the projection;
+/// under CPU oversubscription this showed up locally as `left: Some(7)`,
+/// `right: Some(6)`. Same family as PR #5520 (`OTHER_BUCKET_LOCK` in
+/// `sink_loss_metric_tests.rs`).
+///
+/// Held by the four `ws_logging_exhausted_*` cases (one of which asserts the
+/// projection), by every case whose passing run discards a batch because its
+/// collector times out, refuses the dial, or goes away mid-pump (silent peers,
+/// denied resolved addresses, the ack-generation reconnects, the redaction
+/// probe), and by every case that queues records into a started worker aimed
+/// at `127.0.0.1:1`, whose drop-time drain is a discard whenever the flush loop
+/// gets polled. Cases whose collector reads every queued record, and
+/// construction-only cases, never move the `batch_discard` series and stay
+/// unserialized.
+///
+/// A tokio mutex rather than a `std` one so the async cases hold the guard
+/// across their awaits, and so a panicking case releases it instead of
+/// poisoning it for the rest of the binary. Bind the guard FIRST in the test
+/// body: locals drop in reverse order, so it then outlives every plugin,
+/// listener, and server task the case builds, and a drop-time drain's discard
+/// stays inside the window. Nothing outside this file drives the `ws_logging`
+/// `batch_discard` series in this binary: `logging_sink_lifecycle_tests` only
+/// builds the plugin with no queued records or with a pre-start (`shutdown`)
+/// drop, and the plugin-cache / integration / trigger-carrier files construct
+/// it without starting a worker. Ordering this file against itself is
+/// therefore sufficient.
+static WS_BUCKET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn ws_bucket_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    WS_BUCKET_LOCK.lock().await
 }
 
 async fn wait_for_ws_sink_loss(reason: SinkLossReason, at_least: u64) -> u64 {
@@ -370,6 +415,7 @@ async fn test_ws_logging_rejects_empty_authority_endpoint() {
 
 #[tokio::test]
 async fn test_ws_logging_log_does_not_panic() {
+    let _ws_bucket = ws_bucket_guard().await;
     let plugin = WsLogging::new(
         &json!({
             "endpoint_url": "ws://127.0.0.1:1/unreachable",
@@ -390,6 +436,7 @@ async fn test_ws_logging_log_does_not_panic() {
 
 #[tokio::test]
 async fn test_ws_logging_ws_disconnect_does_not_panic() {
+    let _ws_bucket = ws_bucket_guard().await;
     let plugin = WsLogging::new(
         &json!({
             "endpoint_url": "ws://127.0.0.1:1/unreachable",
@@ -411,6 +458,7 @@ async fn test_ws_logging_ws_disconnect_does_not_panic() {
 
 #[tokio::test]
 async fn test_ws_logging_ws_disconnect_with_auth_method() {
+    let _ws_bucket = ws_bucket_guard().await;
     let plugin = WsLogging::new(
         &json!({
             "endpoint_url": "ws://127.0.0.1:1/unreachable",
@@ -521,6 +569,7 @@ async fn test_ws_logging_custom_schema_applies_to_ws_disconnect() {
 
 #[tokio::test]
 async fn test_ws_logging_stream_disconnect_does_not_panic() {
+    let _ws_bucket = ws_bucket_guard().await;
     let plugin = WsLogging::new(
         &json!({
             "endpoint_url": "ws://127.0.0.1:1/unreachable",
@@ -542,6 +591,7 @@ async fn test_ws_logging_stream_disconnect_does_not_panic() {
 
 #[tokio::test]
 async fn test_ws_logging_unreachable_endpoint_does_not_panic() {
+    let _ws_bucket = ws_bucket_guard().await;
     let plugin = WsLogging::new(
         &json!({
             "endpoint_url": "ws://127.0.0.1:1/unreachable",
@@ -627,6 +677,7 @@ async fn test_ws_logging_custom_batch_config() {
 
 #[tokio::test]
 async fn test_ws_logging_buffer_accepts_multiple_entries() {
+    let _ws_bucket = ws_bucket_guard().await;
     let plugin = WsLogging::new(
         &json!({
             "endpoint_url": "ws://127.0.0.1:1/unreachable",
@@ -650,6 +701,7 @@ async fn test_ws_logging_buffer_accepts_multiple_entries() {
 
 #[tokio::test]
 async fn test_ws_logging_buffer_full_drops_gracefully() {
+    let _ws_bucket = ws_bucket_guard().await;
     let plugin = WsLogging::new(
         &json!({
             "endpoint_url": "ws://127.0.0.1:1/unreachable",
@@ -971,6 +1023,7 @@ async fn test_ws_logging_native_disconnect_preserves_bytes_and_timestamps() {
 
 #[tokio::test]
 async fn test_ws_logging_connect_timeout_against_silent_tcp_peer() {
+    let _ws_bucket = ws_bucket_guard().await;
     // Accept TCP but never complete the WebSocket Upgrade. Establishment must
     // fail within connect_timeout_ms; a later accept proves the delivery worker
     // recovered enough to keep making queue progress.
@@ -1113,6 +1166,7 @@ async fn test_ws_logging_write_timeout_against_slow_reader_then_recovers() {
 
 #[tokio::test]
 async fn test_ws_logging_application_frame_invalidates_and_reconnects() {
+    let _ws_bucket = ws_bucket_guard().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let endpoint = format!("ws://{addr}/logs");
@@ -1200,6 +1254,7 @@ async fn test_ws_logging_application_frame_invalidates_and_reconnects() {
 
 #[tokio::test]
 async fn test_ws_logging_connect_timeout_against_silent_tls_peer() {
+    let _ws_bucket = ws_bucket_guard().await;
     // WSS peer accepts TCP but withholds TLS handshake progress. The same
     // connect_timeout_ms bound must cover the TLS phase; a later accept proves
     // the delivery worker recovered enough to keep making queue progress.
@@ -1267,6 +1322,7 @@ async fn test_ws_logging_connect_timeout_against_silent_tls_peer() {
 
 #[tokio::test]
 async fn test_ws_logging_binary_and_repeated_ack_generations() {
+    let _ws_bucket = ws_bucket_guard().await;
     // Extend beyond a single Text acknowledgement: Binary then Text acks across
     // reconnect generations, with a stale first socket kept alive server-side,
     // then Ping/Pong + Close on the latest generation. Proves delivery keeps
@@ -1401,6 +1457,7 @@ async fn test_ws_logging_binary_and_repeated_ack_generations() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_ws_logging_diagnostics_redact_endpoint_path_and_query() {
+    let _ws_bucket = ws_bucket_guard().await;
     let (writer, guard) = super::plugin_utils::capture_logs();
 
     let path_secret = "path-token-secret-canary";
@@ -1586,6 +1643,7 @@ async fn ws_logging_hostname_endpoint_keeps_original_authority_over_screened_dia
 
 #[tokio::test]
 async fn ws_logging_refuses_dial_when_hostname_resolves_to_denied_ipv4() {
+    let _ws_bucket = ws_bucket_guard().await;
     // The endpoint hostname is allowed at admission (it is not a literal), but
     // at dial time it resolves to the cloud-metadata address, which the default
     // production policy denies. No socket may be opened.
@@ -1632,6 +1690,7 @@ async fn ws_logging_refuses_dial_when_hostname_resolves_to_denied_ipv4() {
 
 #[tokio::test]
 async fn ws_logging_refuses_dial_when_hostname_resolves_to_denied_ipv6() {
+    let _ws_bucket = ws_bucket_guard().await;
     // IPv6 parity: the AWS IPv6 instance-metadata host is in the dangerous
     // baseline and must be refused the same way as its IPv4 counterpart.
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1762,6 +1821,7 @@ async fn ws_logging_canonical_urls_complete_collector_handshake() {
 
 #[tokio::test]
 async fn ws_logging_exhausted_connection_failure_counts_batch_discard() {
+    let _ws_bucket = ws_bucket_guard().await;
     let discarded_before = dropped_total("ws_logging", SinkLossReason::BatchDiscard);
     let accepted_before = accepted_total("ws_logging");
     let plugin = WsLogging::new(
@@ -1808,6 +1868,7 @@ async fn ws_logging_exhausted_connection_failure_counts_batch_discard() {
 
 #[tokio::test]
 async fn ws_logging_exhausted_connect_timeout_counts_batch_discard() {
+    let _ws_bucket = ws_bucket_guard().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let discarded_before = dropped_total("ws_logging", SinkLossReason::BatchDiscard);
@@ -1837,6 +1898,7 @@ async fn ws_logging_exhausted_connect_timeout_counts_batch_discard() {
 
 #[tokio::test]
 async fn ws_logging_exhausted_handshake_failure_counts_batch_discard() {
+    let _ws_bucket = ws_bucket_guard().await;
     use tokio::io::AsyncWriteExt;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1879,6 +1941,7 @@ async fn ws_logging_exhausted_handshake_failure_counts_batch_discard() {
 
 #[tokio::test]
 async fn ws_logging_exhausted_multi_record_batch_counts_each_entry() {
+    let _ws_bucket = ws_bucket_guard().await;
     let discarded_before = dropped_total("ws_logging", SinkLossReason::BatchDiscard);
     let accepted_before = accepted_total("ws_logging");
     let plugin = WsLogging::new(
