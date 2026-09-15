@@ -367,12 +367,20 @@ pub(crate) fn publish_reqwest_backend_socket(fd: std::os::fd::RawFd) {
 }
 
 /// Debug-build counters for every link of the bundled-client socket handoff
-/// and the post-EOS drain judgment (issue #4411).
+/// and the post-EOS drain judgment (issue #4411), and for which task ended up
+/// driving each upload pump (issue #5505).
 ///
 /// Compiled to no-ops in release builds. Read through
 /// `_test_support::post_eos_drain_diagnostics`, so an in-process acceptance
 /// test that misses the drain bound can say WHICH link never happened instead
-/// of only reporting the elapsed time.
+/// of only reporting the elapsed time — and a pump test can prove that an
+/// ordinary upload was never handed to a task of its own.
+///
+/// Pump-driver counters: `PUMP_DETACHED_AT_INSTALL` is a pump spawned at
+/// install because it carries an authorization lifetime;
+/// `PUMP_DETACHED_LIVE` is an inline pump handed to a task because its
+/// dispatcher stopped polling it before it resolved. An inline pump that
+/// reached its terminal under the race bumps nothing.
 ///
 /// `#[allow(dead_code)]`: the snapshot side is reached only through
 /// `_test_support`, and the binary target recompiles this module without the
@@ -422,6 +430,8 @@ pub(crate) mod diagnostics {
         POST_EOS_CANCELLED,
         POST_EOS_NOT_STALLED,
         POST_EOS_STALLED,
+        PUMP_DETACHED_AT_INSTALL,
+        PUMP_DETACHED_LIVE,
     );
 
     #[inline]

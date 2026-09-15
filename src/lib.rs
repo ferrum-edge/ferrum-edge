@@ -10326,8 +10326,8 @@ pub mod _test_support {
                 std::task::Poll::Ready(Some(data)) => {
                     std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))))
                 }
-                // The feed channel is kept open by the probe, so this arm only
-                // fires once the probe itself is gone.
+                // The feed channel stays open until the probe ends the client
+                // body or is itself gone.
                 std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
                 std::task::Poll::Pending => std::task::Poll::Pending,
             }
@@ -10369,9 +10369,36 @@ pub mod _test_support {
             }
         }
 
+        /// Start a pump over a stalled client body with NO authorization
+        /// plan, only `backend_write_timeout_ms`: the shape that is driven
+        /// inline by the dispatcher's header race (issue #5505).
+        pub fn start_watermark_only(write_timeout_ms: u64) -> Self {
+            let (feed, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let body = ProbeClientBody {
+                receiver,
+                released: std::sync::Arc::clone(&released),
+            };
+            let (source, join) =
+                crate::proxy::upload_pump::spawn_upload_pump(body, None, write_timeout_ms);
+            Self {
+                feed: Some(feed),
+                source: Some(source),
+                join: Some(join),
+                released,
+            }
+        }
+
         /// Whether the pump has dropped the inbound client body.
         pub fn client_body_released(&self) -> bool {
             self.released.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        /// Which task drives the pump (issue #5505): `Some(true)` on one of
+        /// its own, `Some(false)` inline on the dispatcher's, `None` once it
+        /// has finished or was never installed.
+        pub fn pump_runs_on_its_own_task(&self) -> Option<bool> {
+            self.join.as_ref().and_then(|join| join.runs_on_own_task())
         }
 
         /// Hand the client body one DATA frame.
@@ -10382,13 +10409,22 @@ pub mod _test_support {
             })
         }
 
+        /// End the client body: the feed closes and the body reports end of
+        /// stream once everything fed so far has been taken.
+        pub fn end_client_body(&mut self) {
+            self.feed = None;
+        }
+
         /// The bounded bridge's in-flight frame budget.
         pub fn channel_capacity() -> usize {
             crate::proxy::upload_pump::upload_pump_channel_capacity()
         }
 
-        /// Poll the transport side exactly once with a no-op waker.
+        /// Poll the transport side exactly once with a no-op waker, after one
+        /// poll of the dispatcher's header race (a no-op for a pump that has
+        /// a task of its own).
         pub fn poll_transport_once(&mut self) -> ProbeTransportPoll {
+            poll_upload_pump_race_once(self.join.as_mut());
             let Some(source) = self.source.as_mut() else {
                 return ProbeTransportPoll::Ended;
             };
@@ -10400,6 +10436,19 @@ pub mod _test_support {
                     ProbeTransportPoll::Data(frame.data_ref().map_or(0, bytes::Bytes::len))
                 }
                 std::task::Poll::Ready(Some(Err(e))) => ProbeTransportPoll::Errored(e.to_string()),
+            }
+        }
+
+        /// Observe the write watermark for `observation` while the dispatcher's
+        /// header race is live. `true` means it stayed dormant.
+        pub async fn write_watermark_stays_dormant(&mut self, observation: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return true;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(observation) => true,
+                () = join.backend_write_watermark_expired() => false,
             }
         }
 
@@ -10507,6 +10556,38 @@ pub mod _test_support {
         )
     }
 
+    /// One poll of the dispatcher's header race, with a no-op waker.
+    ///
+    /// A watermark-only pump is driven INLINE by `backend_write_watermark_expired`
+    /// — the arm every dispatcher races against its response-header wait —
+    /// rather than by a task of its own (issue #5505). The probes below model
+    /// a transport polling the body while that race is live, so each
+    /// transport poll is preceded by one poll of the race. Anything the pump
+    /// does here it would have done on the dispatcher's task; a real-waker
+    /// poll (`write_watermark_wins_header_wait`, `join`) re-registers every
+    /// waker on its own.
+    fn poll_upload_pump_race_once(join: Option<&mut crate::proxy::upload_pump::UploadPumpJoin>) {
+        let Some(join) = join else {
+            return;
+        };
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let race = join.backend_write_watermark_expired();
+        let mut race = std::pin::pin!(race);
+        // `Ready` means the watermark fired; the join point remembers that
+        // and reports it on the next real poll, so the result is not needed.
+        let _ = std::future::Future::poll(race.as_mut(), &mut cx);
+    }
+
+    /// Whether any upload pump has been handed to a task of its own since
+    /// the process started, and how each was settled (issue #5505). Debug
+    /// builds only; empty in release builds.
+    pub fn upload_pump_driver_diagnostics() -> Vec<(&'static str, u64)> {
+        crate::proxy::backend_send_queue::diagnostics::snapshot()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("PUMP_"))
+            .collect()
+    }
+
     /// One gateway-owned BUFFERED upload pump under test (issue #4055).
     ///
     /// The buffered reqwest dispatch has no body adapter to hang a deadline
@@ -10515,6 +10596,10 @@ pub mod _test_support {
     /// side is held and DELIBERATELY NOT DRAINED — the shape of a reqwest
     /// connection task parked on socket writability against a backend that
     /// accepts and never reads.
+    ///
+    /// This pump carries no authorization plan, so it is driven inline by the
+    /// dispatcher's race (issue #5505); [`Self::poll_transport_once`] polls
+    /// that race once before each transport poll.
     pub struct BufferedUploadPumpProbe {
         body: Option<crate::proxy::upload_pump::PumpedUploadBody>,
         join: Option<crate::proxy::upload_pump::UploadPumpJoin>,
@@ -10548,8 +10633,42 @@ pub mod _test_support {
                 .and_then(|body| http_body::Body::size_hint(body).exact())
         }
 
-        /// Poll the transport side exactly once with a no-op waker.
+        /// Which task drives the pump (issue #5505): `Some(true)` on one of
+        /// its own, `Some(false)` inline on the dispatcher's, `None` once it
+        /// has finished or was never installed.
+        pub fn pump_runs_on_its_own_task(&self) -> Option<bool> {
+            self.join.as_ref().and_then(|join| join.runs_on_own_task())
+        }
+
+        /// Run the PRODUCTION header race with a dispatch future that is
+        /// already resolved — a backend that answered before consuming the
+        /// upload — and report whether the race handed the still-live pump to
+        /// a task of its own on the way out (issue #5505).
+        pub async fn header_arrives_while_still_uploading(&mut self) -> Option<bool> {
+            let raced = crate::proxy::await_upload_write_watermark_first(
+                std::future::ready(()),
+                self.join.as_mut(),
+            )
+            .await;
+            assert!(
+                raced.is_ok(),
+                "a resolved dispatch future must win the race"
+            );
+            self.pump_runs_on_its_own_task()
+        }
+
+        /// Drop the join point with cancel-on-drop armed, the way a
+        /// handler-scoped dispatcher's early return releases its upload.
+        pub fn drop_join_cancelling(&mut self) {
+            if let Some(join) = self.join.take() {
+                drop(join.cancel_on_drop());
+            }
+        }
+
+        /// Poll the transport side exactly once with a no-op waker, after one
+        /// poll of the dispatcher's live header race.
         pub fn poll_transport_once(&mut self) -> ProbeTransportPoll {
+            poll_upload_pump_race_once(self.join.as_mut());
             let Some(body) = self.body.as_mut() else {
                 return ProbeTransportPoll::Ended;
             };
@@ -10752,8 +10871,10 @@ pub mod _test_support {
             }
         }
 
-        /// Poll the transport side exactly once with a no-op waker.
+        /// Poll the transport side exactly once with a no-op waker, after one
+        /// poll of the dispatcher's live header race.
         pub fn poll_transport_once(&mut self) -> ProbeReplayFrame {
+            poll_upload_pump_race_once(self.join.as_mut());
             let Some(body) = self.body.as_mut() else {
                 return ProbeReplayFrame::Ended;
             };
@@ -10783,7 +10904,7 @@ pub mod _test_support {
         }
 
         /// Drain the transport side until it blocks, ends, or errors, yielding
-        /// to the runtime between polls so the pump task can refill the bridge.
+        /// to the runtime between polls as a connection task would.
         ///
         /// Returns every frame observed, in order.
         pub async fn drain_transport(&mut self, max_polls: usize) -> Vec<ProbeReplayFrame> {
@@ -10938,8 +11059,10 @@ pub mod _test_support {
             }
         }
 
-        /// Poll the transport side exactly once with a no-op waker.
+        /// Poll the transport side exactly once with a no-op waker, after one
+        /// poll of the dispatcher's live header race.
         pub fn poll_transport_once(&mut self) -> ProbeReplayFrame {
+            poll_upload_pump_race_once(self.join.as_mut());
             let Some(body) = self.body.as_mut() else {
                 return ProbeReplayFrame::Ended;
             };
@@ -10969,7 +11092,7 @@ pub mod _test_support {
         }
 
         /// Drain the transport side until it blocks, ends, or errors, yielding
-        /// to the runtime between polls so the pump task can refill the bridge.
+        /// to the runtime between polls as a connection task would.
         pub async fn drain_transport(&mut self, max_polls: usize) -> Vec<ProbeReplayFrame> {
             let mut frames = Vec::new();
             for _ in 0..max_polls {

@@ -3068,6 +3068,251 @@ fn an_empty_buffered_upload_installs_no_pump() {
     );
 }
 
+// --- Who drives the pump (#5505) --------------------------------------------
+//
+// The pump exists to enforce bounds while the backend transport is parked
+// outside a body poll. Enforcing them from a task of its own cost every pumped
+// upload a spawn, a join channel, and a cross-task hop per frame — the largest
+// single share of the HTTP/1.1 TLS POST regression in #5505. A pump whose only
+// bound is `backend_write_timeout_ms` is now driven by the dispatcher's own
+// header race (`backend_write_watermark_expired`), and handed to a task only if
+// that race ends while the upload is still live. Every bound it enforces must
+// still fire, on time, from that race alone.
+
+/// A pump with neither an authorization lifetime nor a write watermark has no
+/// race that will ever poll it, so inline it would relay nothing: it must be
+/// given a task at install. Production never builds one (`install_pump`
+/// returns early), but the trailer-boundary probes do, and the join contract
+/// must not depend on the caller.
+#[tokio::test(start_paused = true)]
+async fn a_pump_with_nothing_to_enforce_relays_on_a_task_of_its_own() {
+    let mut probe = UploadPumpProbe::start_watermark_only(0);
+    assert_eq!(probe.pump_runs_on_its_own_task(), Some(true));
+    assert!(probe.feed("relayed"));
+    probe.end_client_body();
+    // Nothing here polls the join: the relay must progress on its own.
+    let mut relayed = Vec::new();
+    for _ in 0..64 {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(len) => relayed.push(len),
+            ProbeTransportPoll::Ended => break,
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            ProbeTransportPoll::Errored(message) => panic!("unexpected relay error: {message}"),
+        }
+    }
+    assert_eq!(relayed, vec!["relayed".len()]);
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_watermark_only_pump_is_driven_by_the_header_race_not_by_a_task_of_its_own() {
+    let mut probe = BufferedUploadPumpProbe::start(1024 * 1024, 800).expect("buffered pump");
+    assert_eq!(
+        probe.pump_runs_on_its_own_task(),
+        Some(false),
+        "a pump with no authorization lifetime must not spawn at install"
+    );
+
+    // The transport takes one frame and stops: a peer that stopped reading.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
+    assert_eq!(probe.pump_runs_on_its_own_task(), Some(false));
+
+    // The race alone must enforce the watermark, and on time.
+    let started = tokio::time::Instant::now();
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "the inline driver must still end the header wait at backend_write_timeout_ms"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(800) && elapsed < Duration::from_secs(1),
+        "the watermark must fire at the configured bound, not later: {elapsed:?}"
+    );
+    assert_eq!(
+        probe.pump_runs_on_its_own_task(),
+        None,
+        "the pump reached its terminal under the race, so nothing is left to spawn"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+    match probe.poll_transport_once() {
+        ProbeTransportPoll::Errored(message) => assert!(
+            message.contains("backend request body write timeout"),
+            "unexpected termination message: {message}"
+        ),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drained_watermark_only_upload_completes_without_ever_spawning() {
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let mut probe = BufferedUploadPumpProbe::start(frame * 2 + 3, 600_000).expect("buffered pump");
+
+    let mut sizes = Vec::new();
+    for _ in 0..64 {
+        assert_ne!(
+            probe.pump_runs_on_its_own_task(),
+            Some(true),
+            "an ordinary request/response upload must never leave the dispatcher's task"
+        );
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(len) => sizes.push(len),
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            ProbeTransportPoll::Ended => break,
+            other => panic!("unexpected transport poll: {other:?}"),
+        }
+    }
+    assert_eq!(sizes, vec![frame, frame, 3]);
+    assert_eq!(probe.pump_runs_on_its_own_task(), None);
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pump_carrying_an_authorization_lifetime_gets_its_own_task_at_install() {
+    // Its deadline is absolute and armed immediately, and the dispatcher that
+    // installed it may be inside a pre-dispatch wait that polls nothing else.
+    let plan = upload_plan(
+        Duration::from_secs(3_600),
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    );
+    let mut probe = UploadPumpProbe::start(&plan);
+    assert_eq!(probe.pump_runs_on_its_own_task(), Some(true));
+    assert_eq!(probe.cancel_and_join().await, ProbePumpOutcome::Cancelled);
+    assert!(probe.client_body_released());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_backend_that_answers_before_consuming_the_upload_hands_the_pump_to_its_own_task() {
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let mut probe = BufferedUploadPumpProbe::start(frame * 8, 600_000).expect("buffered pump");
+    // One frame taken, seven still to relay: the upload is live.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
+
+    // The production race, ended by the response head. From here the
+    // dispatcher may await the response body without polling the pump again,
+    // so the pump must not stay on this task.
+    assert_eq!(
+        probe.header_arrives_while_still_uploading().await,
+        Some(true),
+        "a live pump must be detached when the race that was driving it ends"
+    );
+
+    // Detached, it relays exactly as the always-spawned pump did: the
+    // transport keeps receiving bounded slices, then a clean end of stream.
+    let mut sizes = Vec::new();
+    for _ in 0..64 {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(len) => sizes.push(len),
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            ProbeTransportPoll::Ended => break,
+            other => panic!("unexpected transport poll: {other:?}"),
+        }
+    }
+    assert_eq!(sizes.iter().sum::<usize>() + frame, frame * 8);
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_finished_pump_is_never_handed_to_a_task_when_the_race_ends() {
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let mut probe = BufferedUploadPumpProbe::start(frame, 600_000).expect("buffered pump");
+    for _ in 0..8 {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Ended => break,
+            ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending => {
+                tokio::task::yield_now().await
+            }
+            other => panic!("unexpected transport poll: {other:?}"),
+        }
+    }
+    assert_eq!(probe.pump_runs_on_its_own_task(), None);
+    assert_eq!(
+        probe.header_arrives_while_still_uploading().await,
+        None,
+        "a pump that already reached its terminal has nothing to detach"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_a_cancel_on_drop_join_settles_an_inline_pump_in_place() {
+    let mut probe = BufferedUploadPumpProbe::start(1024 * 1024, 800).expect("buffered pump");
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
+    // A handler-scoped dispatcher returning early: the join is dropped with
+    // cancel-on-drop armed and never awaited again. The transport body must
+    // still end in the cancellation error, without a task to deliver it.
+    probe.drop_join_cancelling();
+    match probe.poll_transport_once() {
+        ProbeTransportPoll::Errored(message) => assert!(
+            message.contains("cancelled"),
+            "unexpected termination message: {message}"
+        ),
+        ProbeTransportPoll::Data(_) => match probe.poll_transport_once() {
+            ProbeTransportPoll::Errored(message) => assert!(
+                message.contains("cancelled"),
+                "unexpected termination message: {message}"
+            ),
+            other => panic!("expected a transport error after the queued frame, got {other:?}"),
+        },
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn releasing_the_transport_body_ends_an_inline_pump_parked_on_the_client() {
+    // The pump holds a bridge permit and is parked on a client that never
+    // sends another byte when the transport goes away. `reserve()` cannot
+    // report the close while a permit is held, and no task will abort this
+    // pump, so it must notice the released bridge on its own.
+    let mut probe = UploadPumpProbe::start_watermark_only(800);
+    assert_eq!(probe.pump_runs_on_its_own_task(), Some(false));
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Pending
+    ));
+    assert!(!probe.client_body_released());
+    probe.drop_transport();
+    assert_eq!(probe.join().await, ProbePumpOutcome::ConsumerGone);
+    assert!(
+        probe.client_body_released(),
+        "no pump may outlive the transport body it feeds"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_inline_pump_waiting_on_the_client_keeps_the_write_watermark_dormant() {
+    // A slow CLIENT is not a backend write stall: the watermark is dormant
+    // while the pump waits on the client, exactly as on a task of its own.
+    let mut probe = UploadPumpProbe::start_watermark_only(800);
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Pending
+    ));
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_secs(30))
+            .await,
+        "waiting on the client must not consume backend_write_timeout_ms"
+    );
+    assert!(probe.feed("late frame"));
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(10) | ProbeTransportPoll::Pending
+    ));
+    assert_eq!(probe.cancel_and_join().await, ProbePumpOutcome::Cancelled);
+}
+
 // --- Backend write watermark on a REPLAYABLE upload (#4055) ----------------
 //
 // The buffered/body-policy/retry-replay bodies dispatched by the specialized

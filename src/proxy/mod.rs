@@ -48173,6 +48173,16 @@ pub(crate) async fn optional_sleep_elapsed(sleep: std::pin::Pin<&mut Option<toki
 /// `Err(())` means the watermark fired first. The wrapped future is polled
 /// FIRST, so a backend that answered in the same poll still wins the race and a
 /// completed exchange is never reclassified as a write stall.
+///
+/// For a watermark-only pump this race is also what DRIVES the upload (issue
+/// #5505): the pump runs inline on this task rather than on one of its own,
+/// so an ordinary request/response upload costs no spawn and no cross-task
+/// hop per frame. When the race ends before the pump has resolved — the
+/// backend answered before consuming the upload, or the post-EOS drain watch
+/// is still running — the pump is handed to its own task before this returns,
+/// so a caller that goes on to await the response body, join the pump later,
+/// or race it again never leaves it unpolled. Cancellation (dropping this
+/// future) leaves the pump inside the join, whose `Drop` does the same.
 pub(crate) async fn await_upload_write_watermark_first<F>(
     fut: F,
     pump: Option<&mut upload_pump::UploadPumpJoin>,
@@ -48192,15 +48202,20 @@ where
     // already filled the slot; it is write-once, so they still win. The future
     // is pinned once, here, and the scope borrows it: wrapping it by value
     // copied the gateway's largest state machine onto a worker stack that an
-    // HTTP/3 → plain dispatch already fills to the brim.
+    // HTTP/3 → plain dispatch already fills to the brim. For the same reason
+    // the race and the hand-off below live in THIS function rather than in a
+    // nested `async fn`: a nested future would carry its own copy of `fut`
+    // alongside this one, doubling that footprint.
     tokio::pin!(fut);
     let mut fut =
         backend_send_queue::ReqwestBackendSocketScope::new(fut, pump.backend_socket_slot());
-    tokio::select! {
+    let raced = tokio::select! {
         biased;
         output = &mut fut => Ok(output),
         () = pump.backend_write_watermark_expired() => Err(()),
-    }
+    };
+    pump.detach_if_live();
+    raced
 }
 
 /// Install the FULL upload lifecycle on a size-limited streaming client body

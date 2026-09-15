@@ -793,12 +793,28 @@ owns the body the same way and parks on socket writability, or on HTTP/2
 capacity when it negotiates HTTP/2.
 
 `proxy::upload_pump` closes that gap for **authenticated** streaming uploads.
-The inbound `hyper::body::Incoming` moves into a gateway-owned task, and the
-transport is handed a bounded bridge instead. The task selects, biased, over an
-explicit dispatcher cancellation, the admitted stream's absolute authorization
-deadline, and the next unit of work (bridge capacity, then one source frame).
-Arms one and two are polled by the gateway's own task, so they fire while the
-backend transport is parked and polling nothing.
+The inbound `hyper::body::Incoming` moves into a gateway-owned future, and the
+transport is handed a bounded bridge instead. The future selects, biased, over
+an explicit dispatcher cancellation, the admitted stream's absolute
+authorization deadline, and the next unit of work (bridge capacity, then one
+source frame). Arms one and two are polled by the gateway — never by the
+backend transport — so they fire while that transport is parked and polling
+nothing.
+
+Who polls the pump depends on what it enforces. A pump that carries an
+authorization deadline is given **its own task** at install: that deadline is
+absolute and armed immediately, and the dispatcher may still be inside a
+pre-dispatch wait (pool acquisition, admission) that polls nothing else. A pump
+whose only bound is `backend_write_timeout_ms` is driven **inline by the
+dispatcher's own task**, from the response-header race every dispatcher already
+runs against the write watermark: that watermark cannot arm before the
+transport's first body poll, and no transport takes that poll before its
+dispatcher enters the race, so nothing the pump enforces can fall due while no
+one is polling it. An ordinary request/response upload therefore spawns no
+task and pays no cross-task hop per frame. If that race ends while the upload
+is still live — the backend answered before consuming it, a replay is about to
+replace it, or the join is dropped — the pump is handed to a task at that
+moment and continues exactly as the always-spawned pump did.
 
 What this enforces, exactly:
 
@@ -816,9 +832,9 @@ What this enforces, exactly:
   residual early returns still release the upload promptly. The
   streaming-response transports (reqwest, mesh mTLS, HBONE, Unix socket, native
   gRPC) return while the response is still streaming, so their upload's lifetime
-  is the transport body's: the pump's abort guard ends the task when the
-  transport drops that body, and the pump self-terminates at the deadline
-  regardless.
+  is the transport body's: dropping that body closes the bridge, which the pump
+  observes on its very next poll whatever else it is waiting on, and the pump
+  self-terminates at the deadline regardless.
 
 What this deliberately does **not** claim: bytes the pump handed to the
 transport *before* expiry may already sit in that transport's buffers and may
@@ -836,8 +852,10 @@ Cost and invariants:
   counting stay in the adapter above the bridge, so they remain authoritative
   and unchanged. The client body's `size_hint` is snapshotted before the move
   and decremented as frames cross, so `Content-Length` framing survives.
-- Unauthenticated requests construct no pump at all: no task, no channel, no
-  timer. That path is unchanged.
+- Unauthenticated requests with `backend_write_timeout_ms` disabled construct
+  no pump at all: no future, no channel, no timer. That path is unchanged. With
+  the write watermark live, the pump is one boxed future and one bounded
+  channel, driven inline as described above.
 - Termination messages are compiled-in literals from a closed set, and the
   fixed-cardinality counter is recorded through the request's shared once-only
   latch, so an upload and a response body racing the same plan still count

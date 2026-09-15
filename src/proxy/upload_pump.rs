@@ -25,8 +25,8 @@
 //! # What this module guarantees
 //!
 //! The pump moves the inbound `hyper::body::Incoming` into a **gateway-owned
-//! task** and hands the transport a bounded channel receiver instead. The task
-//! selects, biased, over four things on every iteration:
+//! future** and hands the transport a bounded channel receiver instead. The
+//! pump selects, biased, over four things on every iteration:
 //!
 //! 1. an explicit cancellation signal from the dispatcher,
 //! 2. the admitted stream's absolute authorization deadline (when present),
@@ -34,11 +34,42 @@
 //!    consume the previous frame (`sender.reserve()`),
 //! 4. the next unit of work (channel capacity, then one source frame).
 //!
-//! Because arms 1–3 are polled by the gateway's own task, they fire **even
-//! while the backend transport is parked on flow control and is not polling the
-//! body at all**. When any of them fires the task publishes a terminal state,
-//! drops its channel sender, and drops the `Incoming`. From that instant the
-//! gateway neither owns nor polls the client body.
+//! Because arms 1–3 are polled by the gateway — never by the backend
+//! transport — they fire **even while that transport is parked on flow control
+//! and is not polling the body at all**. When any of them fires the pump
+//! publishes a terminal state, drops its channel sender, and drops the
+//! `Incoming`. From that instant the gateway neither owns nor polls the client
+//! body.
+//!
+//! # Who polls the pump (issue #5505)
+//!
+//! The pump is one boxed future, and the gateway drives it in one of two ways:
+//!
+//! * **Inline, from the dispatcher's own task.** A pump whose only owner-side
+//!   bound is `backend_write_timeout_ms` is polled by
+//!   [`UploadPumpJoin::backend_write_watermark_expired`], the arm every
+//!   dispatcher already races against its response-header wait
+//!   (`await_upload_write_watermark_first`). The write watermark cannot arm
+//!   before a transport's first body poll, and every transport first polls the
+//!   body inside that race, so nothing the pump enforces can become due while
+//!   no one is polling it. An ordinary request/response upload finishes here:
+//!   no task is spawned and no cross-task hop is paid per frame.
+//! * **Detached, on its own task.** A pump that carries an authorization
+//!   lifetime is detached at install: that deadline is absolute and armed
+//!   immediately, and the dispatcher may still be inside a pre-dispatch wait
+//!   (pool acquisition, admission) that polls nothing else. An inline pump is
+//!   detached when the race that was polling it ends before the pump has
+//!   resolved — the response head arrived first, a NACK replay is about to
+//!   replace it, or the join is dropped — so from then on it behaves exactly
+//!   as the always-spawned pump did, post-EOS drain watch included. A pump
+//!   that has already resolved is never detached. A pump with nothing to
+//!   enforce at all (no plan, `backend_write_timeout_ms = 0`) is also
+//!   detached at install: no watermark race will ever poll it, so inline it
+//!   would relay nothing. Production never installs one, but the contract of
+//!   the join does not depend on that.
+//!
+//! Both modes run the same loop and publish the same terminals; the mode only
+//! decides which task polls it.
 //!
 //! The write idle arm is reset at the start of each `reserve()` wait and is
 //! not polled while waiting on the client body, so a slow-but-progressing
@@ -71,9 +102,10 @@
 //!
 //! The dispatcher holds an [`UploadPumpJoin`], whose
 //! [`cancel_and_join`](UploadPumpJoin::cancel_and_join) is an actual join: it
-//! resolves only after the task has published its outcome, which it does after
-//! dropping the source. [`UploadPumpSource`] additionally aborts the task when
-//! it is dropped, so no pump can outlive the body the transport owns.
+//! resolves only after the pump has published its outcome, which it does after
+//! dropping the source. Dropping [`UploadPumpSource`] closes the bridge, which
+//! the pump observes on its next poll whatever else it is waiting on, so no
+//! pump can outlive the body the transport owns.
 //!
 //! # Enforceable boundary
 //!
@@ -88,16 +120,19 @@
 //!
 //! # Cost
 //!
-//! One task and one capacity-1 channel per streaming upload that carries an
-//! authorization plan **or** a live `backend_write_timeout_ms`. Uploads with
-//! neither keep `UploadSource::Direct` (no task, no channel, no timer). Frames
-//! move by `Bytes` handle, so no per-chunk copy or allocation is introduced.
+//! One boxed future, one capacity-1 channel, and two control `oneshot`s per
+//! streaming upload that carries an authorization plan **or** a live
+//! `backend_write_timeout_ms`; the timers live inside the future. A task is
+//! spawned only for the detached mode above. Uploads with neither bound keep
+//! `UploadSource::Direct` (no future, no channel, no timer). Frames move by
+//! `Bytes` handle, so no per-chunk copy or allocation is introduced.
 //!
-//! A fully BUFFERED upload pays the same one task + one channel when
-//! `backend_write_timeout_ms` is live, and nothing at all when it is `0`; see
-//! [`spawn_buffered_upload_pump`]. Its frames are refcounted `Bytes::split_to`
-//! slices of the collected buffer, so it copies nothing either.
+//! A fully BUFFERED upload pays the same when `backend_write_timeout_ms` is
+//! live, and nothing at all when it is `0`; see [`spawn_buffered_upload_pump`].
+//! Its frames are refcounted `Bytes::split_to` slices of the collected buffer,
+//! so it copies nothing either.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -107,12 +142,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body::Frame;
 
-use crate::proxy::RequestAuthLifetimePlan;
 use crate::proxy::backend_send_queue::diagnostics as drain_diagnostics;
 use crate::proxy::backend_send_queue::{
     BackendSocketHandle, BackendSocketSlot, await_send_queue_stall,
 };
 use crate::proxy::body::BoxError;
+use crate::proxy::{RequestAuthLifetimePlan, optional_sleep_elapsed};
 
 /// In-flight frame budget of the bridge channel.
 ///
@@ -219,60 +254,51 @@ fn pump_terminal_error(outcome: UploadPumpOutcome) -> BoxError {
     }
 }
 
-/// Aborts the pump task when the transport-side body is dropped, so a pump can
-/// never outlive the body it feeds.
+/// Records that the transport released the body it was fed, so a pump can
+/// never outlive that body.
 ///
-/// The abort is synchronous and lands before the task can be polled again, so
-/// the task itself never observes the closed bridge channel and never publishes
-/// a terminal of its own. The terminal is therefore published HERE, before the
-/// abort: releasing the transport body IS the "consumer went away" outcome, and
-/// recording it is what lets a dispatcher joining this pump distinguish it from
-/// a task that simply died. `RUNNING` is the only state it may overwrite, so a
-/// pump that already settled keeps its own outcome.
+/// Dropping [`UploadPumpSource`] drops the bridge receiver, and the pump
+/// observes the closed bridge on its very next poll: `sender.reserve()` fails
+/// while it waits for capacity, and a dedicated `sender.closed()` arm fires
+/// while it waits on the client body (see `run_upload_pump`). The pump then
+/// publishes its own terminal and drops the client body — whichever task is
+/// driving it, and however the transport's own connection task is parked.
 ///
-/// The abort is likewise conditional on that state (issue #4411). A task that
-/// has already published a terminal has, by construction, ALREADY dropped the
-/// client body and the bridge sender — so it no longer owns anything this guard
-/// exists to reclaim, and the only work it can still be doing is the post-EOS
-/// send-queue drain watch. Every H1/H2 client drops the request body as soon as
-/// it reaches end of stream, which is exactly when that watch starts, so an
-/// unconditional abort here would cancel the #4411 bound before it could ever
-/// fire. The watch is self-bounding: it ends on a drained queue, an
-/// unanswerable socket, a cancellation, or the write watermark.
+/// The terminal is ALSO recorded here, before the receiver drops, for the
+/// pump to read when it sees the closed bridge: releasing the transport body
+/// IS the "consumer went away" outcome. `RUNNING` is the only state it may
+/// overwrite, so a pump that already settled keeps its own outcome — a pump
+/// that has published a terminal has, by construction, already dropped the
+/// client body and the bridge sender, and the only work it can still be doing
+/// is the post-EOS send-queue drain watch (issue #4411), which is
+/// self-bounding: it ends on a drained queue, an unanswerable socket, a
+/// cancellation, or the write watermark.
 ///
 /// The state check alone is not enough: hyper's HTTP/1 length-delimited
 /// encoder ends the message on its OWN eof — the moment the last declared byte
 /// is written — and drops the body without polling it for the trailing end of
 /// stream. That drop can land before the pump has read the client's end of
-/// stream and published `Completed`, so the guard also honours
-/// [`UploadPumpSource`]'s `Drop`, which suppresses the abort when every byte
-/// the client declared has already crossed the bridge: such a transport is done
-/// consuming, not gone.
-struct AbortPumpOnDrop {
-    handle: tokio::task::JoinHandle<()>,
+/// stream and published `Completed`, so [`UploadPumpSource`]'s `Drop`
+/// suppresses this marker when every byte the client declared has already
+/// crossed the bridge: such a transport is done consuming, not gone.
+struct ReleasePumpOnDrop {
     terminal: Arc<AtomicU8>,
     /// Set by [`UploadPumpSource`]'s `Drop` when the transport released the
     /// body only after taking every declared byte.
     suppressed: bool,
 }
 
-impl Drop for AbortPumpOnDrop {
+impl Drop for ReleasePumpOnDrop {
     fn drop(&mut self) {
         if self.suppressed {
             return;
         }
-        if self
-            .terminal
-            .compare_exchange(
-                PUMP_RUNNING,
-                PUMP_CONSUMER_GONE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.handle.abort();
-        }
+        let _ = self.terminal.compare_exchange(
+            PUMP_RUNNING,
+            PUMP_CONSUMER_GONE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
@@ -282,7 +308,7 @@ pub struct UploadPumpSource {
     receiver: tokio::sync::mpsc::Receiver<Frame<Bytes>>,
     terminal: Arc<AtomicU8>,
     /// Held only for its `Drop`.
-    _abort: AbortPumpOnDrop,
+    _release: ReleasePumpOnDrop,
     /// Size hint snapshotted from the client body before it moved into the
     /// pump, so `Content-Length` framing survives the bridge unchanged.
     initial_hint: http_body::SizeHint,
@@ -304,13 +330,13 @@ impl Drop for UploadPumpSource {
         // for the trailing end of stream. The pump is then at most one
         // iteration from publishing `Completed` — and, for a live
         // `backend_write_timeout_ms`, it still owns the post-EOS send-queue
-        // drain judgment (issue #4411). Aborting here would cancel that bound
-        // on precisely the uploads it exists for: the ones the peer's kernel
-        // absorbed whole and never read. A body released early — fewer bytes
-        // delivered than declared, or no declared length at all — keeps the
-        // abort, exactly as before.
+        // drain judgment (issue #4411). Marking the consumer gone here would
+        // end that bound on precisely the uploads it exists for: the ones the
+        // peer's kernel absorbed whole and never read. A body released early
+        // — fewer bytes delivered than declared, or no declared length at all
+        // — keeps the marker, exactly as before.
         if self.ended || self.initial_hint.exact() == Some(self.delivered) {
-            self._abort.suppressed = true;
+            self._release.suppressed = true;
             // Tell the pump WHY its bridge is about to close, so a closed
             // channel reads as completion rather than as a consumer that went
             // away. `RUNNING` only: a pump that already settled keeps its own
@@ -374,10 +400,10 @@ impl UploadPumpSource {
             Poll::Ready(None) => {
                 // The pump publishes its terminal state before dropping the
                 // sender, so a closed channel always has an authoritative
-                // outcome to read. An absent one means the task was aborted
-                // mid-flight; fail closed with an error so the backend resets
-                // the stream instead of accepting a truncated upload as
-                // complete.
+                // outcome to read. An absent one means the pump future was
+                // dropped mid-flight without reaching a terminal; fail closed
+                // with an error so the backend resets the stream instead of
+                // accepting a truncated upload as complete.
                 match code_outcome(self.terminal.load(Ordering::Acquire)) {
                     Some(UploadPumpOutcome::Completed) => {
                         self.ended = true;
@@ -428,6 +454,26 @@ impl UploadPumpSource {
     }
 }
 
+/// The pump future, boxed once at install and polled to completion by exactly
+/// one task at a time.
+type PumpFuture = Pin<Box<dyn Future<Output = UploadPumpOutcome> + Send + 'static>>;
+
+/// Which task is polling one pump (issue #5505). See the module docs, "Who
+/// polls the pump".
+enum PumpDriver {
+    /// Polled from the dispatcher's task by
+    /// [`UploadPumpJoin::backend_write_watermark_expired`] and
+    /// [`UploadPumpJoin::join`] / [`UploadPumpJoin::cancel_and_join`]. No task
+    /// exists for it yet.
+    Inline(PumpFuture),
+    /// Running on its own task; its outcome arrives over this channel.
+    Detached(tokio::sync::oneshot::Receiver<UploadPumpOutcome>),
+    /// Reached a terminal; retained until the join point reads it.
+    Finished(UploadPumpOutcome),
+    /// The join point has already reported the outcome.
+    Consumed,
+}
+
 /// Dispatcher-side half of the pump: the join point.
 pub(crate) struct UploadPumpJoin {
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
@@ -436,17 +482,13 @@ pub(crate) struct UploadPumpJoin {
     /// where the transport's first body poll arms it) and for a pump with no
     /// write bound at all.
     write_start: Option<tokio::sync::oneshot::Sender<()>>,
-    finished: Option<tokio::sync::oneshot::Receiver<UploadPumpOutcome>>,
-    /// Fires ONLY for [`UploadPumpOutcome::WriteTimeout`], and only after the
-    /// task has published its terminal and dropped the client body. Every
-    /// other terminal drops the sender instead, which
+    driver: PumpDriver,
     /// [`backend_write_watermark_expired`](UploadPumpJoin::backend_write_watermark_expired)
-    /// turns into "never" rather than a spurious wake.
-    write_timeout: Option<tokio::sync::oneshot::Receiver<()>>,
-    /// Shared with the pump task and with [`UploadPumpSource`]'s abort guard.
-    /// Read only as a FALLBACK, when the task published no outcome of its own
-    /// because it was aborted — which is exactly what releasing the transport
-    /// body does.
+    /// fires exactly once per pump; afterwards it is "never".
+    write_timeout_reported: bool,
+    /// Shared with the pump and with [`UploadPumpSource`]'s release guard.
+    /// Read only as a FALLBACK, when a detached task published no outcome of
+    /// its own (its runtime shut down under it).
     terminal: Arc<AtomicU8>,
     /// Where the dispatcher publishes the backend socket this upload is being
     /// written to, so the pump can bound the POST-EOS send-queue drain
@@ -512,8 +554,8 @@ impl UploadPumpJoin {
     /// (direct-H2): every residual early return then still releases the inbound
     /// client body promptly, even where an `.await` join is not reachable.
     /// Dispatchers whose upload legitimately outlives the handler — the
-    /// streaming-response transports, where the transport owns the body and the
-    /// [`UploadPumpSource`] abort guard bounds the task — must NOT arm this.
+    /// streaming-response transports, where the transport owns the body and
+    /// releasing the [`UploadPumpSource`] ends the pump — must NOT arm this.
     #[must_use]
     pub(crate) fn cancel_on_drop(mut self) -> Self {
         self.cancel_on_drop = true;
@@ -543,12 +585,13 @@ impl UploadPumpJoin {
 
     /// Cancel the pump and wait for it to finish.
     ///
-    /// Resolves only after the task has published its terminal state, which it
+    /// Resolves only after the pump has published its terminal state, which it
     /// does *after* dropping the client body — so once this returns, the
     /// gateway provably owns and polls no part of the inbound upload. Every
     /// wait inside the pump sits in a `select!` with the cancellation arm, so
     /// this join is bounded by the pump's own scheduling, not by the backend's
-    /// flow-control window.
+    /// flow-control window. An inline pump is finished right here, on the
+    /// caller's task; a detached one is joined over its channel.
     pub(crate) async fn cancel_and_join(mut self) -> Option<UploadPumpOutcome> {
         self.cancel();
         self.await_outcome().await
@@ -567,44 +610,156 @@ impl UploadPumpJoin {
     /// configured. Racing this future against that wait is what makes the
     /// watermark client-visible at the watermark.
     ///
-    /// Cancel-safe, and non-consuming: the `finished` channel is untouched, so
-    /// a caller that loses this race can still [`cancel_and_join`] and read the
-    /// typed terminal. Any other terminal — and a pump with no write bound at
-    /// all — drops the sender, which this turns into a future that stays
-    /// pending forever, so a `select!` arm built on it cannot fire spuriously.
+    /// For an inline pump this arm IS the pump's driver (issue #5505): every
+    /// poll of it advances the relay, and the relay's own wakers — the client
+    /// body, the bridge, the timers — wake the task that owns the `select!`.
+    /// The watermark cannot arm before the transport's first body poll, and no
+    /// transport takes that poll before its dispatcher enters this race, so
+    /// nothing the pump enforces can fall due while no one is polling it.
+    ///
+    /// Cancel-safe, and non-consuming: the pump stays where it is, so a caller
+    /// that loses this race can still [`cancel_and_join`] and read the typed
+    /// terminal. Any other terminal — and a pump with no write bound at all —
+    /// turns this into a future that stays pending forever, so a `select!` arm
+    /// built on it cannot fire spuriously. It resolves only after the pump has
+    /// published its terminal and dropped the client body.
     ///
     /// [`cancel_and_join`]: Self::cancel_and_join
     pub(crate) async fn backend_write_watermark_expired(&mut self) {
-        loop {
-            match self.write_timeout.as_mut() {
-                Some(receiver) => {
-                    if await_oneshot_signal(receiver).await.is_ok() {
-                        return;
-                    }
-                    // Sender dropped without firing: this pump settled on some
-                    // other terminal and can never report a write timeout.
-                    self.write_timeout = None;
-                }
-                None => never().await,
+        if !self.write_timeout_reported
+            && self.drive_to_terminal().await == Some(UploadPumpOutcome::WriteTimeout)
+        {
+            self.write_timeout_reported = true;
+            return;
+        }
+        never().await
+    }
+
+    /// Hand an inline pump to its own task if the caller is about to stop
+    /// polling it before it has resolved (issue #5505).
+    ///
+    /// Called by `await_upload_write_watermark_first` when its race ends, and
+    /// by `Drop`. Whatever the pump is still doing — relaying frames because
+    /// the backend answered before consuming the upload, parked on backend
+    /// flow control, not yet having observed a bridge the transport just
+    /// released, or watching the post-EOS send-queue drain (issue #4411) — it
+    /// continues on its own task exactly as the always-spawned pump did, so a
+    /// dispatcher that races the watermark again later (direct-H2's upload
+    /// completion wait) or joins it still observes the same terminals. A pump
+    /// that has already resolved is never spawned.
+    pub(crate) fn detach_if_live(&mut self) {
+        self.detach(&drain_diagnostics::PUMP_DETACHED_LIVE);
+    }
+
+    /// Finish an inline pump that has just been told to cancel, without a
+    /// task: every wait in the relay is a `biased` `select!` whose first arm
+    /// is the cancellation, so one poll reaches the terminal. `true` when it
+    /// did. A `Pending` here is unexpected and falls back to detaching.
+    ///
+    /// Polled through a no-op waker on purpose: if the pump does settle, no
+    /// wake is owed to anyone; if it does not, the task it is handed to
+    /// re-registers every waker on its own first poll. Requires a runtime, as
+    /// the relay's timers do; outside one the caller detaches instead, which
+    /// knows how to drop the pump.
+    fn settle_cancelled_inline(&mut self) -> bool {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return false;
+        }
+        let PumpDriver::Inline(pump) = &mut self.driver else {
+            return false;
+        };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match pump.as_mut().poll(&mut cx) {
+            Poll::Ready(outcome) => {
+                self.driver = PumpDriver::Finished(outcome);
+                true
+            }
+            Poll::Pending => false,
+        }
+    }
+
+    /// Which task is driving this pump right now: `Some(false)` inline on the
+    /// dispatcher's, `Some(true)` on one of its own, `None` once it has
+    /// reached its terminal. Reached through `crate::_test_support`.
+    #[allow(dead_code)]
+    pub(crate) fn runs_on_own_task(&self) -> Option<bool> {
+        match self.driver {
+            PumpDriver::Inline(_) => Some(false),
+            PumpDriver::Detached(_) => Some(true),
+            PumpDriver::Finished(_) | PumpDriver::Consumed => None,
+        }
+    }
+
+    /// Move an inline pump onto its own task. No-op for every other driver.
+    fn detach(&mut self, counter: &drain_diagnostics::Counter) {
+        if !matches!(self.driver, PumpDriver::Inline(_)) {
+            return;
+        }
+        let PumpDriver::Inline(pump) = std::mem::replace(&mut self.driver, PumpDriver::Consumed)
+        else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+                handle.spawn(async move {
+                    let _ = finished_tx.send(pump.await);
+                });
+                self.driver = PumpDriver::Detached(finished_rx);
+                drain_diagnostics::bump(counter);
+            }
+            Err(_) => {
+                // No runtime can poll it: dropping the future drops the client
+                // body and the bridge sender at once. Publish the terminal the
+                // transport side will read, so the release is reported as a
+                // cancellation rather than as an absent outcome.
+                let _ = self.terminal.compare_exchange(
+                    PUMP_RUNNING,
+                    outcome_code(UploadPumpOutcome::Cancelled),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                drop(pump);
+                self.driver = PumpDriver::Finished(
+                    code_outcome(self.terminal.load(Ordering::Acquire))
+                        .unwrap_or(UploadPumpOutcome::Cancelled),
+                );
             }
         }
     }
 
-    /// The pump's terminal state: its own published outcome when it ran to a
-    /// terminal, otherwise the shared one.
+    /// Drive the pump to its terminal on the caller's task (inline) or wait
+    /// for its task to publish one (detached), and remember it.
     ///
-    /// A `oneshot` `Err` means the task was aborted (its `finished` sender
-    /// dropped with it), which also implies the client body was dropped. That
-    /// happens on exactly one path — the transport released
-    /// [`UploadPumpSource`] — and its abort guard publishes
-    /// [`UploadPumpOutcome::ConsumerGone`] before aborting, so the join point
-    /// reports why rather than collapsing it into "no outcome".
+    /// Non-consuming and cancel-safe: an inline pump dropped mid-poll keeps its
+    /// state in `self.driver`; a detached pump's channel keeps its value.
+    ///
+    /// A detached task that published nothing (its `finished` sender dropped
+    /// with it, which only a runtime shutdown can cause) falls back to the
+    /// shared terminal, so the join point reports the last state the pump or
+    /// the transport recorded rather than collapsing it into "no outcome".
+    async fn drive_to_terminal(&mut self) -> Option<UploadPumpOutcome> {
+        let outcome = match &mut self.driver {
+            PumpDriver::Inline(pump) => Some(pump.as_mut().await),
+            PumpDriver::Detached(finished) => match finished.await {
+                Ok(outcome) => Some(outcome),
+                Err(_) => code_outcome(self.terminal.load(Ordering::Acquire)),
+            },
+            PumpDriver::Finished(outcome) => Some(*outcome),
+            PumpDriver::Consumed => None,
+        };
+        self.driver = match outcome {
+            Some(outcome) => PumpDriver::Finished(outcome),
+            None => PumpDriver::Consumed,
+        };
+        outcome
+    }
+
+    /// The pump's terminal state, reported once.
     async fn await_outcome(&mut self) -> Option<UploadPumpOutcome> {
-        let finished = self.finished.take()?;
-        match finished.await {
-            Ok(outcome) => Some(outcome),
-            Err(_) => code_outcome(self.terminal.load(Ordering::Acquire)),
-        }
+        let outcome = self.drive_to_terminal().await;
+        self.driver = PumpDriver::Consumed;
+        outcome
     }
 }
 
@@ -612,14 +767,27 @@ impl Drop for UploadPumpJoin {
     fn drop(&mut self) {
         if self.cancel_on_drop {
             self.cancel();
+            // The pump was just told to stop, so it can finish right here.
+            if self.settle_cancelled_inline() {
+                return;
+            }
         }
+        // An inline pump loses its only poller with this handle. Give it a
+        // task so it still observes cancellation, its deadlines, the closed
+        // bridge, and end of stream, and still releases the client body.
+        self.detach_if_live();
     }
 }
 
-/// Move a client request body into a gateway-owned pump task.
+/// Move a client request body into a gateway-owned pump.
 ///
 /// The caller must have established that the body is not already at end of
 /// stream; an empty upload needs no pump and keeps the direct path.
+///
+/// Despite the name, a task is spawned here only for a pump that carries an
+/// authorization `plan`; a watermark-only pump is driven inline by the
+/// dispatcher's race until it finishes or that race ends first (issue #5505,
+/// module docs).
 ///
 /// Generic over the source body so the pump can be proven end to end against a
 /// deliberately non-draining consumer in a unit test — `hyper::body::Incoming`
@@ -687,8 +855,6 @@ where
     let initial_hint = http_body::Body::size_hint(&body);
     let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_PUMP_CHANNEL_CAPACITY);
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
-    let (write_timeout_tx, write_timeout_rx) = tokio::sync::oneshot::channel();
     // One channel, one owner. A pump with no write bound creates none at all,
     // so `write_configured` and the arm condition can never disagree.
     let (dispatcher_write_start, consumer_write_start, write_start_rx) = if write_timeout_ms == 0 {
@@ -701,34 +867,48 @@ where
         }
     };
     let terminal = Arc::new(AtomicU8::new(PUMP_RUNNING));
-    let task_terminal = Arc::clone(&terminal);
     // Filled by the dispatcher before `send_request` when the gateway owns the
     // backend socket (issue #4411); left empty otherwise.
     let socket: BackendSocketSlot = Arc::new(std::sync::OnceLock::new());
-    let task_socket = Arc::clone(&socket);
-    let plan = plan.cloned();
-    let handle = tokio::spawn(async move {
-        let outcome = run_upload_pump(UploadPumpTask {
-            body,
-            sender,
-            cancel_rx,
-            plan,
-            write_timeout_ms,
-            write_start_rx,
-            terminal: task_terminal,
-            write_timeout_tx,
-            socket: task_socket,
-        })
-        .await;
-        let _ = finished_tx.send(outcome);
-    });
+    let auth_armed = plan.is_some();
+    let pump: PumpFuture = Box::pin(run_upload_pump(UploadPumpTask {
+        body,
+        sender,
+        cancel_rx,
+        plan: plan.cloned(),
+        write_timeout_ms,
+        write_start_rx,
+        terminal: Arc::clone(&terminal),
+        socket: Arc::clone(&socket),
+    }));
+    let mut join = UploadPumpJoin {
+        cancel: Some(cancel_tx),
+        write_start: dispatcher_write_start,
+        driver: PumpDriver::Inline(pump),
+        write_timeout_reported: false,
+        terminal: Arc::clone(&terminal),
+        socket,
+        cancel_on_drop: false,
+    };
+    // An authorization lifetime is absolute and armed right now, and the
+    // dispatcher installing it may still be inside a pre-dispatch wait that
+    // polls nothing else (pool acquisition, admission). It needs its own task
+    // from the start. A watermark-only pump has nothing due before the
+    // dispatcher's race starts polling it (see the module docs).
+    //
+    // A pump with nothing to enforce at all is a plain relay: no watermark race
+    // will ever drive it, so inline it would relay nothing. Production never
+    // installs one (`UploadSource::install_pump` returns early), but the join
+    // contract must not depend on that.
+    if auth_armed || write_timeout_ms == 0 {
+        join.detach(&drain_diagnostics::PUMP_DETACHED_AT_INSTALL);
+    }
     (
         UploadPumpSource {
             receiver,
             terminal: Arc::clone(&terminal),
-            _abort: AbortPumpOnDrop {
-                handle,
-                terminal: Arc::clone(&terminal),
+            _release: ReleasePumpOnDrop {
+                terminal,
                 suppressed: false,
             },
             initial_hint,
@@ -737,15 +917,7 @@ where
             ended: false,
             reported_error: false,
         },
-        UploadPumpJoin {
-            cancel: Some(cancel_tx),
-            write_start: dispatcher_write_start,
-            finished: Some(finished_rx),
-            write_timeout: Some(write_timeout_rx),
-            terminal,
-            socket,
-            cancel_on_drop: false,
-        },
+        join,
     )
 }
 
@@ -793,11 +965,11 @@ async fn await_oneshot_signal(
     std::future::poll_fn(|cx| std::future::Future::poll(Pin::new(&mut *receiver), cx)).await
 }
 
-/// State moved into the gateway-owned upload task.
+/// State moved into the gateway-owned upload pump.
 ///
-/// Keeping the task controls together makes their shared lifecycle explicit:
-/// every sender is consumed by exactly one pump invocation and every terminal
-/// path publishes through the corresponding terminal and watermark channels.
+/// Keeping the controls together makes their shared lifecycle explicit: every
+/// sender is consumed by exactly one pump invocation and every terminal path
+/// publishes through the shared terminal before releasing anything.
 struct UploadPumpTask<B> {
     body: B,
     sender: tokio::sync::mpsc::Sender<Frame<Bytes>>,
@@ -806,10 +978,13 @@ struct UploadPumpTask<B> {
     write_timeout_ms: u64,
     write_start_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     terminal: Arc<AtomicU8>,
-    write_timeout_tx: tokio::sync::oneshot::Sender<()>,
     socket: BackendSocketSlot,
 }
 
+/// The relay itself. Its return value is the pump's terminal, published to the
+/// shared state — and the client body and bridge sender released — BEFORE it
+/// returns, so whichever task awaits this future (inline dispatcher or
+/// detached task) observes a fully released upload the moment it resolves.
 async fn run_upload_pump<B>(task: UploadPumpTask<B>) -> UploadPumpOutcome
 where
     B: http_body::Body<Data = Bytes> + Unpin,
@@ -822,19 +997,17 @@ where
         write_timeout_ms,
         write_start_rx: mut write_start,
         terminal,
-        write_timeout_tx,
         socket,
     } = task;
     let mut cancel = Some(cancel_rx);
     // Absolute and armed once when a credential admitted the stream. Relayed
     // DATA, gRPC messages, and trailers never refresh it, and it is owned by
-    // THIS task, so it fires regardless of what the backend transport is doing.
-    let auth_armed = plan.is_some();
-    let mut expiry = Box::pin(tokio::time::sleep_until(
-        plan.as_ref()
-            .map(|(deadline, _, _)| deadline.at)
-            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400)),
-    ));
+    // THIS pump, so it fires regardless of what the backend transport is doing.
+    // A pump with no plan builds no timer at all.
+    let expiry = plan
+        .as_ref()
+        .map(|(deadline, _, _)| tokio::time::sleep_until(deadline.at));
+    tokio::pin!(expiry);
     // Per-reserve idle bound. Reset at the start of each capacity wait so a
     // slow-but-progressing upload keeps the watermark fresh. Not polled while
     // waiting on the client body: that stall is not a backend write stall.
@@ -845,24 +1018,26 @@ where
     let write_configured = write_timeout_ms > 0;
     let mut write_armed = false;
     // No `.max(1)` floor: `write_configured` already proves the value is
-    // nonzero, and the timer is allocated only when the bound exists, so a pump
+    // nonzero, and the timer exists only when the bound does, so a pump
     // installed purely for an authorization lifetime carries no write timer
-    // (issue #4074).
+    // (issue #4074). It is registered with the runtime lazily, on its first
+    // poll — which cannot happen before the watermark is armed.
     let write_idle_dur = Duration::from_millis(write_timeout_ms);
-    let mut write_idle = write_configured.then(|| Box::pin(tokio::time::sleep(write_idle_dur)));
+    let write_idle = write_configured.then(|| tokio::time::sleep(write_idle_dur));
+    tokio::pin!(write_idle);
     let outcome = 'pump: loop {
         // Reserve capacity BEFORE reading the client, so a transport that
         // stops draining stops the read rather than filling a buffer.
         if write_armed
-            && let Some(idle) = write_idle.as_mut()
+            && let Some(idle) = write_idle.as_mut().as_pin_mut()
             && let Some(at) = tokio::time::Instant::now().checked_add(write_idle_dur)
         {
-            idle.as_mut().reset(at);
+            idle.reset(at);
         }
         let permit = tokio::select! {
             biased;
             () = cancel_requested(&mut cancel) => break 'pump UploadPumpOutcome::Cancelled,
-            () = &mut expiry, if auth_armed => {
+            () = optional_sleep_elapsed(expiry.as_mut()) => {
                 if let Some((deadline, family, latch)) = plan.as_ref() {
                     latch.record_once(deadline.termination, *family);
                 }
@@ -872,7 +1047,7 @@ where
                 write_armed = true;
                 continue 'pump;
             }
-            () = write_idle_elapsed(&mut write_idle), if write_armed => {
+            () = optional_sleep_elapsed(write_idle.as_mut()), if write_armed => {
                 break 'pump UploadPumpOutcome::WriteTimeout;
             }
             reserved = sender.reserve() => match reserved {
@@ -894,7 +1069,7 @@ where
             break tokio::select! {
                 biased;
                 () = cancel_requested(&mut cancel) => break 'pump UploadPumpOutcome::Cancelled,
-                () = &mut expiry, if auth_armed => {
+                () = optional_sleep_elapsed(expiry.as_mut()) => {
                     if let Some((deadline, family, latch)) = plan.as_ref() {
                         latch.record_once(deadline.termination, *family);
                     }
@@ -903,6 +1078,20 @@ where
                 () = signal_requested(&mut write_start), if write_configured && !write_armed => {
                     write_armed = true;
                     continue 'frame;
+                }
+                // The transport released the body while this pump was waiting
+                // on the client — parked on a slow client, not on the bridge.
+                // With a permit already in hand `reserve()` cannot report the
+                // close, so watch for it here; otherwise a pump could sit on a
+                // client that never sends another byte, owning that body, for
+                // a transport that is long gone. Same terminals as the
+                // `reserve()` error above.
+                () = sender.closed() => {
+                    drop(permit);
+                    if terminal.load(Ordering::Acquire) == PUMP_CONSUMER_DONE {
+                        break 'pump UploadPumpOutcome::Completed;
+                    }
+                    break 'pump UploadPumpOutcome::ConsumerGone;
                 }
                 frame = http_body_util::BodyExt::frame(&mut body) => frame,
             };
@@ -921,11 +1110,10 @@ where
     // Explicit, and the whole point of this module: the gateway stops owning
     // the inbound client body here, whatever the backend transport is doing.
     drop(body);
-    // Published LAST, so a dispatcher woken by this signal already observes
-    // the terminal state, the closed bridge, and a released client body. Only
-    // the write watermark publishes it; every other terminal drops the sender.
+    // Resolving this future is what tells the join point about the terminal,
+    // so a dispatcher woken by `backend_write_watermark_expired` already
+    // observes the terminal state, the closed bridge, and a released body.
     if outcome == UploadPumpOutcome::WriteTimeout {
-        let _ = write_timeout_tx.send(());
         return outcome;
     }
     if outcome != UploadPumpOutcome::Completed || !write_configured || !write_armed {
@@ -981,22 +1169,8 @@ where
     // Rewriting it to a non-clean terminal would describe a whole upload as a
     // truncated one. What the dispatcher needs is only the signal that the
     // write watermark fired, which is what `backend_write_watermark_expired`
-    // races against the response-header wait.
-    let _ = write_timeout_tx.send(());
+    // races against the response-header wait; this return value is it.
     UploadPumpOutcome::WriteTimeout
-}
-
-/// Await the write-idle timer, which exists only when the operator configured
-/// `backend_write_timeout_ms` (issue #4074).
-///
-/// `None` never resolves, expressed as a type rather than as a proxy-path
-/// panic. Cancel-safe: `Sleep` is, and the pinned box is re-borrowed each
-/// `select!` iteration.
-async fn write_idle_elapsed(sleep: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
-    match sleep.as_mut() {
-        Some(sleep) => sleep.as_mut().await,
-        None => match std::future::pending::<std::convert::Infallible>().await {},
-    }
 }
 
 /// Wait for a one-shot control signal, treating a dropped sender as a
