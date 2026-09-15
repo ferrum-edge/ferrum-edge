@@ -10669,6 +10669,23 @@ pub mod _test_support {
         /// poll of the dispatcher's live header race.
         pub fn poll_transport_once(&mut self) -> ProbeTransportPoll {
             poll_upload_pump_race_once(self.join.as_mut());
+            self.poll_transport_only()
+        }
+
+        /// Whether the transport body is at its end of stream — what an
+        /// HTTP/2 transport consults to flag `END_STREAM` on the DATA frame it
+        /// has just taken instead of sending an empty one after it.
+        pub fn transport_sees_end_stream(&self) -> bool {
+            self.body
+                .as_ref()
+                .is_some_and(http_body::Body::is_end_stream)
+        }
+
+        /// Poll the transport side exactly once with a no-op waker and WITHOUT
+        /// polling the dispatcher's race first: what hyper does when it takes
+        /// frames inside the same poll that produces the response head
+        /// (issue #5505).
+        pub fn poll_transport_only(&mut self) -> ProbeTransportPoll {
             let Some(body) = self.body.as_mut() else {
                 return ProbeTransportPoll::Ended;
             };
