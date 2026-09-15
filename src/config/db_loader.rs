@@ -74,9 +74,6 @@ pub use crate::config::db_backend::{
 pub(crate) const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
 
 /// Rewrite `?` placeholders into PostgreSQL's `$n` form.
-///
-/// Shared with the V001 compatibility pass so the migration-time namespace
-/// registry backfill binds parameters exactly the way the runtime store does.
 pub(crate) fn rewrite_query_placeholders(db_type: &str, sql: &str) -> String {
     if db_type != "postgres" {
         return sql.to_string();

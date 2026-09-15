@@ -237,7 +237,7 @@ docker-compose --profile postgres up ferrum-postgres
 
 **Database Initialization**:
 - Tables auto-created on first startup
-- Automatic schema migrations
+- Automatic fresh-database initialization from the current baseline; schema changes require a fresh database during build-out (see [database baselines](migrations.md))
 
 ### 3. MongoDB Single-Node (NoSQL Alternative)
 

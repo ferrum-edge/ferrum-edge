@@ -8,7 +8,7 @@ Ferrum Edge is a high-performance Rust edge proxy for HTTP/1.1, HTTP/2, HTTP/3, 
 
 ## Build-Out Policy
 
-Ferrum Edge is in active build-out. Do not add schema DB migrations for new schema changes; fold schema changes into the current baseline schema. Do not add or preserve legacy shims for old fields, env vars, config shapes, or database values unless explicitly requested. Custom plugin migrations under `custom_plugins/` are unaffected. Breaking changes are acceptable during this phase.
+Ferrum Edge is in active build-out with no deployed-user compatibility obligation. Do not add schema DB migrations for new schema changes; fold schema changes into the current baseline schema. Do not add startup ALTER/backfill/index-replacement passes or compatibility tracking tables; recreate development databases when the baseline changes. Do not add or preserve legacy shims for old fields, env vars, config shapes, or database values unless explicitly requested. Custom plugin migrations under `custom_plugins/` are unaffected. Breaking changes are acceptable during this phase.
 
 ## Read Before Touching
 

@@ -337,48 +337,13 @@ transaction so a lost or stolen lease can never produce a durable write.
 The backend also requires the exact canonical lease-key sequence (global
 `!namespace-registry` first, then affected names sorted and de-duplicated)
 before opening that transaction; an incomplete or substituted set is the same
-retryable lost-lease refusal. Connect/migrate runs a **one-time** compatibility
-backfill of pre-existing derived names plus canonical `ferrum`, then records
-completion in `_ferrum_schema_compat` (not a registry document). That pass runs
-under the **same global `!namespace-registry` admission lease** every live
-create/rename/delete takes, **and inside one transaction**, so it cannot read
-derived names next to a concurrent confirmed `DELETE` and then resurrect the
-removed document. The derived-name discovery (an aggregation `$group`, because
-`distinct` is not accepted inside a transaction on every supported server), the
-registry upserts, the strict split-identity validation, the completion marker,
-and the owner/generation lease proof are all one atomic step. A pair of
-conditional renewals bracketing the upserts would *not* be a proof: the lease
-can lapse between them, another gateway can then acquire the global key and
-commit a delete, and a later upsert from the pre-delete name set would resurrect
-that document — the second renewal only detects the loss after those upserts are
-already durable, and leaving the marker absent does not undo them. The
-transaction closes that window on both sides: a delete that acquired the lease
-before the transaction's snapshot changed the lease document's `owner` and
-`generation`, so the in-session proof matches nothing and the pass aborts; a
-delete that tries to acquire it afterwards must write the same lease document
-the transaction writes and therefore write-conflicts, which orders its mutation
-strictly after the pass rather than inside it. Independently of the lease, an
-upsert of a registry document a concurrent transaction is deleting is itself a
-write conflict.
+retryable lost-lease refusal. Fresh initialization seeds canonical `ferrum` only when the registry is empty.
+Live registry mutations preserve at least one registry row, so later startups
+do not reseed a deleted default. Startup does not materialize resource-derived
+names or maintain a compatibility marker. This single-document initialization
+also works on standalone MongoDB; registry CRUD still requires a replica set.
 
-On a **standalone `mongod` the pass writes nothing at all.** That topology has
-no multi-document transactions, so there is no honest way to make discovery and
-upsert one durable step, and no cross-process atomicity to claim. Nothing is
-lost by deferring: namespace `POST`/`PUT`/`DELETE` already return `501` before
-mutating anything there, so no registry document can be created or removed in
-the first place, and `GET /namespaces` is the union of registry names and
-derived resource names, so listing is identical whether or not the registry was
-seeded. The completion marker stays absent, so the first connect/migrate against
-a replica-set-capable topology runs the full fenced pass. The pass's strict
-split-identity validation moves inside that transaction with it, so on a
-standalone deployment it is not run at startup; `GET /namespaces` still refuses
-to serve a corrupt registry document (`500`) on every topology, which is where a
-standalone deployment would surface one.
-
-A lease held elsewhere defers the pass rather than failing startup, and the
-lease is released on every path, success or error. A failed
-attempt leaves that marker absent so a later startup retries; once complete,
-later migrate/reconnect/startup passes do not reseed deleted names. Registry
+Registry
 lookups and vacancy checks scan both durable `_id` and embedded `name`, then
 require them to agree; a split identity is typed corruption, never an absent
 name that create or rename may reuse. Confirmed cascade delete scans both the

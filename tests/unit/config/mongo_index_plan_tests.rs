@@ -61,9 +61,11 @@ fn canonical_plan_is_non_empty_and_covers_core_collections() {
                 && entry.model.keys == doc! { "namespace": 1, "proxy_id": 1 }
         })
         .expect("api_specs (namespace, proxy_id) index");
-    assert!(
-        api_specs_unique.recreate_on_options_conflict,
-        "api_specs unique+partial must recreate on options conflict"
+    let options = api_specs_unique.model.options.as_ref().unwrap();
+    assert_eq!(options.unique, Some(true));
+    assert_eq!(
+        options.partial_filter_expression,
+        Some(doc! { "proxy_id": { "$type": "string" } })
     );
 
     // Issue #2999: upstream (namespace, name) uniqueness is a durable Mongo
@@ -102,10 +104,6 @@ fn canonical_plan_is_non_empty_and_covers_core_collections() {
         listen_port_opts.unique,
         Some(true),
         "validated SNI/L4 listener groups must be persistable"
-    );
-    assert!(
-        listen_port_index.recreate_on_options_conflict,
-        "the former unique baseline index must be replaced"
     );
 
     let listen_path_index = plan

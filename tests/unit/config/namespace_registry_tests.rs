@@ -7,16 +7,15 @@ use ferrum_edge::config::batch_atomicity::{
 use ferrum_edge::config::namespace_registry::{
     CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACE_OCCUPANCY_TABLES,
     NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE,
-    NAMESPACE_RENAME_COPY_TABLES, NAMESPACE_RENAME_SIMPLE_TABLES, NAMESPACES_REGISTRY_BACKFILL_ID,
-    NamespaceRegistryCorrupt, NamespaceRegistryError, NamespaceRegistryRetryableConflict,
-    SCHEMA_COMPAT_TABLE, UpdateNamespaceBody, is_namespace_registry_retryable_conflict,
-    mtls_dns_admission_namespaces, namespace_prefixed_id_suffix_field,
-    namespace_registry_admission_keys, normalize_description, normalize_protected_namespaces,
-    parse_namespace_rfc3339, protected_namespaces_contains, require_canonical_stored_description,
-    require_namespace_identity, require_namespace_keyed_embedded_namespace,
-    require_namespace_keyed_identity, require_namespace_prefixed_identity,
-    require_namespace_registry_admission_keys, require_namespace_registry_admission_leases,
-    validate_namespace_name,
+    NAMESPACE_RENAME_COPY_TABLES, NAMESPACE_RENAME_SIMPLE_TABLES, NamespaceRegistryCorrupt,
+    NamespaceRegistryError, NamespaceRegistryRetryableConflict, UpdateNamespaceBody,
+    is_namespace_registry_retryable_conflict, mtls_dns_admission_namespaces,
+    namespace_prefixed_id_suffix_field, namespace_registry_admission_keys, normalize_description,
+    normalize_protected_namespaces, parse_namespace_rfc3339, protected_namespaces_contains,
+    require_canonical_stored_description, require_namespace_identity,
+    require_namespace_keyed_embedded_namespace, require_namespace_keyed_identity,
+    require_namespace_prefixed_identity, require_namespace_registry_admission_keys,
+    require_namespace_registry_admission_leases, validate_namespace_name,
 };
 
 #[test]
@@ -448,18 +447,6 @@ fn require_namespace_keyed_identity_requires_id_namespace_and_resource() {
         assert!(text.contains("id"), "{text}");
         assert!(!text.contains("secret"));
     }
-}
-
-#[test]
-fn schema_compat_marker_cannot_collide_with_tenant_namespaces() {
-    assert!(
-        validate_namespace_name(SCHEMA_COMPAT_TABLE).is_err(),
-        "compatibility-state table must be an invalid namespace name"
-    );
-    assert!(
-        validate_namespace_name(NAMESPACES_REGISTRY_BACKFILL_ID).is_ok(),
-        "the backfill id is a legal namespace spelling, so it must live outside the registry"
-    );
 }
 
 #[test]

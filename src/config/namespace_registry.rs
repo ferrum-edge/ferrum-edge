@@ -27,25 +27,8 @@
 //! durable authority for "a namespace still exists". `GET /namespaces` stays
 //! the backward-compatible union of registry names and derived resource names.
 //!
-//! Connect/migrate runs a **one-time** compatibility backfill of pre-existing
-//! derived names plus canonical `ferrum`, then durably records completion in
-//! [`SCHEMA_COMPAT_TABLE`]. That pass takes the SAME global
-//! [`NAMESPACE_REGISTRY_ADMISSION_KEY`] lease every live create/rename/delete
-//! takes AND commits as one atomic unit (an explicit transaction on
-//! PostgreSQL/MySQL; a SAVEPOINT on SQLite's already-open `BEGIN IMMEDIATE`
-//! migration transaction), so a confirmed DELETE can never commit
-//! next to a backfill that already read the derived names and then resurrect the
-//! removed row. Holding a lease is not enough on its own, because a lease can
-//! lapse mid-pass: SQL verifies and row-locks the lease before the derived-name
-//! scan and holds that lock through the commit, and MongoDB performs the
-//! discovery, the upserts, the identity validation, the marker, and the
-//! owner/generation lease proof in one transaction. A standalone `mongod` has
-//! no transactions and already refuses every registry mutation, so the pass is
-//! deferred there rather than writing rows it cannot fence. A failed
-//! attempt leaves that marker absent so a later startup retries. Once complete,
-//! later compatibility passes do not reseed deleted names or materialize newer
-//! derived-only names. The marker is not a registry row and never appears in
-//! `GET /namespaces`.
+//! Fresh database initialization seeds canonical `ferrum`. Startup never
+//! backfills resource-derived names into the registry or rewrites existing rows.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,18 +58,6 @@ pub const MAX_NAMESPACE_DESCRIPTION_CHARS: usize = 1024;
 /// requires an alphanumeric first character — so this key is collision-proof
 /// against any tenant's own admission row.
 pub const NAMESPACE_REGISTRY_ADMISSION_KEY: &str = "!namespace-registry";
-
-/// Internal one-time compatibility-state table (SQL) and collection (MongoDB).
-///
-/// This is not a tenant namespace, not a registry row, and is never unioned
-/// into `GET /namespaces`. The leading `_` is illegal as a namespace name
-/// ([`validate_namespace`] requires an alphanumeric first character), so it
-/// cannot collide with tenant data.
-pub const SCHEMA_COMPAT_TABLE: &str = "_ferrum_schema_compat";
-
-/// Completion marker for the one-time namespace-registry compatibility
-/// backfill. Stored as [`SCHEMA_COMPAT_TABLE`].`name` (SQL) / `_id` (MongoDB).
-pub const NAMESPACES_REGISTRY_BACKFILL_ID: &str = "namespaces_registry_backfill";
 
 /// Normalize the namespaces this process refuses to remove.
 ///

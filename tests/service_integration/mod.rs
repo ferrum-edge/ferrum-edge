@@ -34,7 +34,7 @@
 //!     role / issuer / audience, client auth methods, discovery facade, cache,
 //!     and failure policy (#3333).
 //!   - **clickhouse** — ClickHouse HTTP. Applies
-//!     `migrations/clickhouse/0001_charges.sql` and round-trips
+//!     `schemas/clickhouse/charges.sql` and round-trips
 //!     `api_chargeback_sink` JSONEachRow inserts (issue #4441).
 //!
 //! Container-backed tests self-skip (with a printed notice) when Docker is

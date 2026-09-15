@@ -76,7 +76,7 @@ fn clickhouse_url_with_query(base: &str, params: &[(&str, &str)]) -> String {
     url.to_string()
 }
 
-/// Split `0001_charges.sql` into ClickHouse statements.
+/// Split `charges.sql` into ClickHouse statements.
 ///
 /// Line comments are stripped first so the `--` block before
 /// `charges_hourly` is not a statement of its own. The file's only
@@ -293,7 +293,7 @@ async fn clickhouse_insert_round_trip_when_configured() {
 // `tests/service_integration/clickhouse.rs`.
 // ---------------------------------------------------------------------------
 
-const CHARGES_RAW_DDL: &str = include_str!("../../migrations/clickhouse/0001_charges.sql");
+const CHARGES_RAW_DDL: &str = include_str!("../../schemas/clickhouse/charges.sql");
 
 const CHARGES_RAW_COLUMN_COUNT: usize = 25;
 
@@ -393,7 +393,7 @@ fn parse_charges_raw_columns(ddl: &str) -> Vec<(String, String)> {
     let table = ddl
         .split(MARKER)
         .nth(1)
-        .expect("migrations/clickhouse/0001_charges.sql must create ferrum.charges_raw");
+        .expect("schemas/clickhouse/charges.sql must create ferrum.charges_raw");
     let open = table
         .find('(')
         .expect("ferrum.charges_raw DDL must open a column list");

@@ -3,7 +3,7 @@
 //! The always-on static gate lives in
 //! `tests/integration/api_chargeback_sink_tests.rs` (issue #4441). This module
 //! boots a pinned ClickHouse HTTP endpoint, applies
-//! `migrations/clickhouse/0001_charges.sql`, and round-trips representative
+//! `schemas/clickhouse/charges.sql`, and round-trips representative
 //! events through the plugin's real INSERT path.
 
 use std::collections::HashMap;
@@ -32,7 +32,7 @@ use super::common::host_ports::{
 const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server";
 const CLICKHOUSE_TAG: &str = "24.8";
 const CLICKHOUSE_HTTP_PORT: u16 = 8123;
-const CHARGES_DDL: &str = include_str!("../../migrations/clickhouse/0001_charges.sql");
+const CHARGES_DDL: &str = include_str!("../../schemas/clickhouse/charges.sql");
 const PRICING_VERSION: &str = "it-clickhouse-wire-4441";
 
 struct ClickHouseFixture {
@@ -166,7 +166,7 @@ fn clickhouse_error_body(text: &str) -> String {
     }
 }
 
-/// Split `0001_charges.sql` into ClickHouse statements.
+/// Split `charges.sql` into ClickHouse statements.
 ///
 /// Line comments are stripped first so the `--` block before
 /// `charges_hourly` is not a statement of its own. The file's only

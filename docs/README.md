@@ -33,7 +33,7 @@ Running and securing a gateway.
 | [graceful_shutdown.md](graceful_shutdown.md) | Shutdown sequence, draining, and rolling deploys |
 | [overload_manager.md](overload_manager.md) | Load shedding, thresholds, and the `/overload` endpoint |
 | [upgrade_guide.md](upgrade_guide.md) | Safe upgrade procedure, rollback, and per-release breaking changes |
-| [migrations.md](migrations.md) | Database schema and migration handling |
+| [migrations.md](migrations.md) | Build-out database baselines, initialization, and custom-plugin migrations |
 | [mongodb.md](mongodb.md) | MongoDB deployment notes |
 | [database_tls.md](database_tls.md) | PostgreSQL and MySQL TLS/mTLS |
 | [frontend_tls.md](frontend_tls.md) | Frontend and admin TLS, mTLS, CRL policy, and reload behaviour |

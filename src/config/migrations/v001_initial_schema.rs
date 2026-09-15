@@ -6,7 +6,7 @@ use super::Migration;
 use super::sql_dialect::V001SqlBuilder;
 
 /// V1: Initial schema — creates the baseline tables.
-/// This matches the original inline schema from db_loader.rs.
+/// During build-out, all core schema changes belong in this baseline.
 pub struct V001InitialSchema;
 
 impl Migration for V001InitialSchema {

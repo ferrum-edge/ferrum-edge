@@ -57,7 +57,7 @@ paths:
   `src/config/mongo_index_plan.rs` (consumed by `MongoStore::run_migrations()`,
   migrate dry-run, and migrate status).
 - Add unit tests under `tests/unit/config/` and update `openapi.yaml` when admin-exposed.
-- Required new fields need a migration/versioning plan even in build-out; do not silently make old config deserialize differently unless intended.
+- During build-out, required-field changes update the current schema, config examples, and validation directly. Document the breaking change; do not add legacy transforms, startup schema repairs/backfills, or compatibility tracking tables. Recreate development databases after a baseline change.
 - Check parent structs for `#[serde(deny_unknown_fields)]` before adding fields.
 
 ## Database Backends

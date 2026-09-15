@@ -26,10 +26,6 @@ pub const REQUIRED_GUARD_COLLECTIONS: &[&str] = &[
 pub struct RequiredMongoIndex {
     pub collection: &'static str,
     pub model: IndexModel,
-    /// When `createIndex` raises IndexOptionsConflict / IndexKeySpecsConflict,
-    /// drop the default-named baseline index and recreate. Used when the
-    /// canonical options of an existing build-out index change.
-    pub recreate_on_options_conflict: bool,
 }
 
 /// Classification of a required index against a live `listIndexes` snapshot.
@@ -82,7 +78,7 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
     plan.push(keys_only("proxies", doc! { "updated_at": 1 }));
     plan.push(keys_only("proxies", doc! { "upstream_id": 1 }));
     plan.push(keys_only("proxies", doc! { "plugins.plugin_config_id": 1 }));
-    plan.push(non_unique_partial_recreate(
+    plan.push(non_unique_partial(
         "proxies",
         doc! { "namespace": 1, "listen_port": 1 },
         doc! { "listen_port": { "$type": "number" } },
@@ -170,7 +166,6 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
                     .build(),
             )
             .build(),
-        recreate_on_options_conflict: false,
     });
     plan.push(sparse_keys("plugin_configs", doc! { "api_spec_id": 1 }));
 
@@ -188,8 +183,7 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
     ));
     plan.push(keys_only("upstreams", doc! { "namespace": 1, "_id": 1 }));
 
-    // api_specs — unique (namespace, proxy_id) with partial filter; recreates
-    // over the legacy unique-only same-keyed index on IndexOptionsConflict.
+    // api_specs — unique (namespace, proxy_id) for attached specifications.
     plan.push(RequiredMongoIndex {
         collection: "api_specs",
         model: IndexModel::builder()
@@ -203,7 +197,6 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
                     .build(),
             )
             .build(),
-        recreate_on_options_conflict: true,
     });
     plan.push(keys_only("api_specs", doc! { "proxy_id": 1 }));
     plan.push(keys_only(
@@ -282,10 +275,7 @@ pub fn dry_run_lines() -> Vec<String> {
             current_collection = entry.collection;
             lines.push(format!("  {current_collection}:"));
         }
-        let mut summary = summarize_index(&entry.model);
-        if entry.recreate_on_options_conflict {
-            summary.push_str(" (recreate on options conflict)");
-        }
+        let summary = summarize_index(&entry.model);
         lines.push(format!("    - {summary}"));
     }
 
@@ -388,7 +378,6 @@ fn keys_only(collection: &'static str, keys: Document) -> RequiredMongoIndex {
     RequiredMongoIndex {
         collection,
         model: IndexModel::builder().keys(keys).build(),
-        recreate_on_options_conflict: false,
     }
 }
 
@@ -399,7 +388,6 @@ fn unique_keys(collection: &'static str, keys: Document) -> RequiredMongoIndex {
             .keys(keys)
             .options(IndexOptions::builder().unique(true).build())
             .build(),
-        recreate_on_options_conflict: false,
     }
 }
 
@@ -419,11 +407,10 @@ fn unique_partial(
                     .build(),
             )
             .build(),
-        recreate_on_options_conflict: false,
     }
 }
 
-fn non_unique_partial_recreate(
+fn non_unique_partial(
     collection: &'static str,
     keys: Document,
     partial: Document,
@@ -438,11 +425,6 @@ fn non_unique_partial_recreate(
                     .build(),
             )
             .build(),
-        // The former baseline used the same default index name with
-        // `unique: true`. Recreate that options-conflicting index so an
-        // initialized build-out database does not keep rejecting valid shared
-        // listener groups after the baseline definition changes.
-        recreate_on_options_conflict: true,
     }
 }
 
@@ -453,7 +435,6 @@ fn sparse_keys(collection: &'static str, keys: Document) -> RequiredMongoIndex {
             .keys(keys)
             .options(IndexOptions::builder().sparse(true).build())
             .build(),
-        recreate_on_options_conflict: false,
     }
 }
 

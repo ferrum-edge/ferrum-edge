@@ -40,9 +40,8 @@
 //! migrations. `createIndex` is idempotent **only when the full index spec
 //! (keys + options) matches**; if the keys match but options differ (e.g. a
 //! new `partialFilterExpression`), MongoDB raises `IndexOptionsConflict`
-//! (server error 85). Where this baseline ships a changed-option index over a
-//! previously-shipped one, `run_migrations()` detects the conflict, drops the
-//! legacy index, and recreates with the new options. Migrate dry-run and status
+//! (server error 85). Initialization fails on conflicting options: changed
+//! build-out schemas require a fresh database. Migrate dry-run and status
 //! consume the same plan so operator output cannot drift from `up`.
 
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
@@ -110,13 +109,11 @@ mod inner {
     use crate::config::mongo_index_plan::{
         HMAC_SECRET_HASHES_FIELD, MongoMigrationStatus, REQUIRED_GUARD_COLLECTIONS,
         RequiredMongoIndex, classify_guard_collections, classify_plan_against_live,
-        default_index_name, required_mongo_indexes,
+        required_mongo_indexes,
     };
     use crate::config::namespace_registry::{
-        DERIVED_NAMESPACE_RESOURCE_TABLES, NAMESPACE_OCCUPANCY_TABLES,
-        NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACES_REGISTRY_BACKFILL_ID, NamespaceRecord,
-        NamespaceRegistryAtomicityUnsupported, NamespaceRegistryCorrupt,
-        NamespaceRegistryError as RegistryError, NamespaceRegistryPhase, SCHEMA_COMPAT_TABLE,
+        NAMESPACE_OCCUPANCY_TABLES, NamespaceRecord, NamespaceRegistryAtomicityUnsupported,
+        NamespaceRegistryCorrupt, NamespaceRegistryError as RegistryError, NamespaceRegistryPhase,
         namespace_prefixed_id_suffix_field, namespace_registry_fault, parse_namespace_rfc3339,
         protected_namespaces_contains, require_canonical_stored_description,
         require_namespace_identity, require_namespace_keyed_identity,
@@ -129,11 +126,7 @@ mod inner {
     // `run_migrations`. Source: src/mongo/db/operation_exit_code.idl (server)
     // and https://www.mongodb.com/docs/manual/reference/error-codes/.
     const MONGO_ERR_NAMESPACE_NOT_FOUND: i32 = 26;
-    const MONGO_ERR_INDEX_NOT_FOUND: i32 = 27;
     const MONGO_ERR_NAMESPACE_EXISTS: i32 = 48;
-    const MONGO_ERR_INDEX_ALREADY_EXISTS: i32 = 68;
-    const MONGO_ERR_INDEX_OPTIONS_CONFLICT: i32 = 85;
-    const MONGO_ERR_INDEX_KEY_SPECS_CONFLICT: i32 = 86;
     const MONGO_ERR_DUPLICATE_KEY: i32 = 11_000;
     /// `maxAwaitTimeMS` for the config-change stream's `getMore`. Bounds how
     /// long one server-side await blocks; it does not delay event delivery.
@@ -234,25 +227,12 @@ mod inner {
         )
     }
 
-    fn is_index_options_conflict(err: &mongodb::error::Error) -> bool {
-        is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_OPTIONS_CONFLICT)
-            || is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_KEY_SPECS_CONFLICT)
-    }
-
-    fn is_index_not_found(err: &mongodb::error::Error) -> bool {
-        is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_NOT_FOUND)
-    }
-
     fn is_namespace_exists(err: &mongodb::error::Error) -> bool {
         is_mongo_command_error_with_code(err, MONGO_ERR_NAMESPACE_EXISTS)
     }
 
     fn is_namespace_not_found(err: &mongodb::error::Error) -> bool {
         is_mongo_command_error_with_code(err, MONGO_ERR_NAMESPACE_NOT_FOUND)
-    }
-
-    fn is_index_already_exists(err: &mongodb::error::Error) -> bool {
-        is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_ALREADY_EXISTS)
     }
 
     fn is_duplicate_key(err: &mongodb::error::Error) -> bool {
@@ -2050,40 +2030,34 @@ mod inner {
             entry: &RequiredMongoIndex,
         ) -> Result<(), anyhow::Error> {
             let collection = self.collection(entry.collection);
-            match collection.create_index(entry.model.clone()).await {
-                Ok(_) => Ok(()),
-                Err(err)
-                    if entry.recreate_on_options_conflict && is_index_options_conflict(&err) =>
-                {
-                    let index_name = default_index_name(&entry.model.keys);
-                    warn!(
-                        collection = entry.collection,
-                        index_keys = %entry.model.keys,
-                        index_name = %index_name,
-                        "MongoDB index exists with conflicting options; replacing it with the \
-                         canonical baseline definition"
-                    );
-                    match collection.drop_index(&index_name).await {
-                        Ok(_) => {}
-                        Err(drop_err) if is_index_not_found(&drop_err) => {}
-                        Err(drop_err) => {
-                            return Err(anyhow::anyhow!(
-                                "Failed to drop conflicting {} index `{index_name}` during baseline reconciliation: \
-                                 {drop_err}. Run `db.{}.dropIndex(\"{index_name}\")` manually \
-                                 and restart.",
-                                entry.collection,
-                                entry.collection,
-                            ));
-                        }
-                    }
-                    match collection.create_index(entry.model.clone()).await {
-                        Ok(_) => Ok(()),
-                        Err(create_err) if is_index_already_exists(&create_err) => Ok(()),
-                        Err(create_err) => Err(create_err.into()),
-                    }
-                }
-                Err(err) => Err(err.into()),
+            // A changed build-out index requires a fresh database. Never drop
+            // an existing constraint as an implicit startup upgrade.
+            collection.create_index(entry.model.clone()).await?;
+            Ok(())
+        }
+
+        /// Initialize an empty registry. Live registry mutations preserve at
+        /// least one row, so later startups do not recreate a deleted default.
+        /// The migration lease serializes concurrent initializers; an upsert
+        /// also makes a retry after an interrupted initialization harmless.
+        async fn initialize_namespace_registry(&self) -> Result<(), anyhow::Error> {
+            if self.namespaces().find_one(doc! {}).await?.is_some() {
+                return Ok(());
             }
+            let name = crate::config::types::DEFAULT_NAMESPACE;
+            let now = Utc::now().to_rfc3339();
+            self.namespaces()
+                .update_one(
+                    doc! { "_id": name },
+                    doc! { "$setOnInsert": {
+                        "name": name,
+                        "created_at": &now,
+                        "updated_at": &now,
+                    } },
+                )
+                .upsert(true)
+                .await?;
+            Ok(())
         }
 
         pub(crate) fn pipeline_update_unsupported_for_test(error: &mongodb::error::Error) -> bool {
@@ -2912,12 +2886,6 @@ mod inner {
         /// First-class namespace registry (issue #3955). `_id` is the name.
         fn namespaces(&self) -> MongoCollectionHandle {
             self.collection("namespaces")
-        }
-
-        /// One-time compatibility-state documents. Not a tenant collection and
-        /// never listed by `GET /namespaces`.
-        fn schema_compat(&self) -> MongoCollectionHandle {
-            self.collection(SCHEMA_COMPAT_TABLE)
         }
 
         fn audit_events(&self) -> MongoCollectionHandle {
@@ -6839,23 +6807,6 @@ mod inner {
         protected_namespaces: Vec<String>,
         /// The row `create_namespace` inserts. `None` for update and delete.
         registry_doc: Option<Document>,
-    }
-
-    /// Everything the one-time namespace-registry compatibility backfill
-    /// transaction needs, precomputed outside the session so every retried
-    /// attempt of the runner sees identical inputs.
-    ///
-    /// The derived name set is deliberately NOT precomputed: discovering it
-    /// inside the transaction is what makes "no delete can commit between
-    /// discovery and the durable upsert" true.
-    struct MongoNamespacesRegistryBackfillPlan {
-        /// Global `!namespace-registry` admission lease identity this pass
-        /// acquired. Re-verified in-session immediately before the commit.
-        owner: String,
-        generation: i64,
-        /// `created_at` / `updated_at` / `completed_at` stamp for every document
-        /// this pass may insert.
-        now: String,
     }
 
     /// Everything one atomic batch transaction needs, precomputed outside the
@@ -13330,7 +13281,7 @@ mod inner {
 
         async fn run_migrations(&self) -> Result<(), anyhow::Error> {
             let mut migration_lease = self.acquire_migration_lease().await?;
-            // Run every index/drop step inside a scoped future so a failure
+            // Run every initialization step inside a scoped future so a failure
             // part-way through still falls through to the lease release below.
             // Without this, an early `?` would exit `run_migrations` with the
             // lease still held, forcing other replicas to wait out the full
@@ -13340,8 +13291,7 @@ mod inner {
             let migration_result: Result<(), anyhow::Error> = async {
                 // MongoDB doesn't use SQL migrations. Instead, ensure indexes
                 // from the canonical plan in `mongo_index_plan`. createIndex is
-                // idempotent when keys+options match; entries marked
-                // `recreate_on_options_conflict` drop+recreate on code 85/86.
+                // idempotent when keys+options match; conflicting options fail.
 
                 // Intentionally no automatic orphan reconcile of
                 // `consumer_identity_index` against `consumers`. Point-read
@@ -13370,7 +13320,7 @@ mod inner {
                     self.ensure_planned_index(&entry).await?;
                 }
 
-                self.backfill_namespaces_registry().await?;
+                self.initialize_namespace_registry().await?;
 
                 info!("MongoDB indexes ensured");
                 Ok(())
@@ -16260,339 +16210,6 @@ mod inner {
                 namespaces.insert(record.name);
             }
             Ok(namespaces)
-        }
-
-        /// Collect distinct namespace values from a single collection **inside
-        /// the caller's transaction**.
-        ///
-        /// The `distinct` command is not accepted inside a transaction on every
-        /// supported server, so the fenced scan uses the equivalent aggregation
-        /// `$group`, which is. Documents whose `namespace` is absent or not a
-        /// string are skipped exactly as [`Self::distinct_namespaces`] skips
-        /// them.
-        async fn distinct_namespaces_in_session(
-            &self,
-            session: &mut ClientSession,
-            collection_name: &str,
-        ) -> mongodb::error::Result<HashSet<String>> {
-            let collection = self.collection(collection_name);
-            let mut cursor = collection
-                .aggregate(vec![doc! { "$group": { "_id": "$namespace" } }])
-                .session(&mut *session)
-                .await?;
-            let mut namespaces = HashSet::new();
-            while cursor.advance(&mut *session).await? {
-                let doc = cursor.deserialize_current()?;
-                if let Ok(value) = doc.get_str("_id") {
-                    namespaces.insert(value.to_string());
-                }
-            }
-            Ok(namespaces)
-        }
-
-        /// [`Self::registry_namespace_names`] inside the caller's transaction.
-        ///
-        /// The strict split-identity rule is unchanged and still fail-closed: a
-        /// document whose `_id` and embedded `name` disagree travels as a custom
-        /// error the transaction runner aborts on, and
-        /// [`Self::namespace_registry_transaction_error`] unwraps it back into
-        /// the typed [`NamespaceRegistryCorrupt`].
-        async fn registry_namespace_names_in_session(
-            &self,
-            session: &mut ClientSession,
-        ) -> mongodb::error::Result<HashSet<String>> {
-            let mut cursor = self
-                .namespaces()
-                .find(doc! {})
-                .session(&mut *session)
-                .await?;
-            let mut namespaces = HashSet::new();
-            while cursor.advance(&mut *session).await? {
-                let doc = cursor.deserialize_current()?;
-                let record = Self::document_to_namespace_record(None, doc)
-                    .map_err(mongodb::error::Error::custom)?;
-                namespaces.insert(record.name);
-            }
-            Ok(namespaces)
-        }
-
-        /// Run the one-time compatibility pass under the SAME global
-        /// `!namespace-registry` admission lease every live create / rename /
-        /// delete takes, and inside ONE MongoDB transaction.
-        ///
-        /// Without that lease the pass reads derived names and upserts registry
-        /// documents outside the authority live namespace CRUD serializes on,
-        /// so a confirmed `DELETE /namespaces/{name}` could commit between the
-        /// read and the upsert and have its document resurrected before the
-        /// completion marker landed. Taking only the global key can never
-        /// invert the established total lock order (global first, then affected
-        /// names ascending), and the lease is a datastore document rather than
-        /// a process-local mutex, so it serializes across gateway processes.
-        ///
-        /// A lease held elsewhere is not an error: the completion marker stays
-        /// absent, which is exactly the crash-retry state, and the next
-        /// migrate / reconnect / startup pass tries again.
-        ///
-        /// **Standalone `mongod` writes nothing.** A topology without
-        /// multi-document transactions cannot make the discovery and the upsert
-        /// one durable step, and a pair of ownership renewals bracketing
-        /// unbounded durable writes is not a proof — the lease can lapse in
-        /// between, another gateway can commit a delete, and a later upsert from
-        /// the pre-delete name set would resurrect that document. Rather than
-        /// claim a cross-process atomicity this topology does not have, the pass
-        /// is deferred entirely. Nothing is lost: `POST` / `PUT` /
-        /// `DELETE /namespaces` already return `501` before mutating anything on
-        /// a standalone deployment, and `GET /namespaces` is the union of
-        /// registry names and derived resource names, so listing is unchanged
-        /// whether or not the registry was seeded. The marker stays absent, so
-        /// the first connect/migrate on a replica-set-capable topology performs
-        /// the full fenced pass.
-        async fn backfill_namespaces_registry(&self) -> Result<(), anyhow::Error> {
-            // Unfenced fast path. After the first completed pass this single
-            // lookup is the entire cost; the authoritative check runs again
-            // inside the fenced transaction so two processes cannot both seed.
-            if self.namespaces_registry_backfill_completed().await? {
-                return Ok(());
-            }
-
-            if !self.replica_set_configured() {
-                info!(
-                    "Namespace registry compatibility backfill deferred: this MongoDB topology has \
-                     no multi-document transactions, so the pass cannot be fenced against a \
-                     concurrent namespace delete. GET /namespaces still lists derived names, and \
-                     namespace create/rename/delete are already refused on this topology; a later \
-                     replica-set-capable startup runs the pass"
-                );
-                return Ok(());
-            }
-
-            let owner = Uuid::new_v4().to_string();
-            let Some(generation) = self
-                .try_acquire_namespace_config_admission_lease(
-                    NAMESPACE_REGISTRY_ADMISSION_KEY,
-                    &owner,
-                )
-                .await?
-            else {
-                info!(
-                    "Namespace registry compatibility backfill deferred: the global registry \
-                     admission lease is held by another mutation; a later startup retries"
-                );
-                return Ok(());
-            };
-            let generation = i64::try_from(generation)
-                .map_err(|_| anyhow::anyhow!("namespace admission generation exceeds i64"))?;
-
-            // Always release, on success AND on error, so a failed pass cannot
-            // hold the global registry key for the rest of its lease and stall
-            // live namespace CRUD. Lease expiry stays the backstop for a hard
-            // crash.
-            let backfill = self
-                .backfill_namespaces_registry_under_lease(&owner, generation)
-                .await;
-            let release = self
-                .release_namespace_config_admission_lease(NAMESPACE_REGISTRY_ADMISSION_KEY, &owner)
-                .await;
-            match (backfill, release) {
-                (Ok(()), Ok(_)) => Ok(()),
-                (Err(backfill_error), _) => Err(backfill_error),
-                (Ok(()), Err(release_error)) => Err(release_error),
-            }
-        }
-
-        /// The compatibility pass itself: ONE MongoDB transaction, opened while
-        /// `owner` holds the global registry admission lease at `generation`.
-        ///
-        /// The derived-name discovery, the registry upserts, the strict
-        /// split-identity validation, the completion marker, and the
-        /// owner/generation lease proof all live inside that single transaction,
-        /// so the name set can never go stale between discovery and durability.
-        /// A lost lease or a write conflict aborts everything with the marker
-        /// absent — exactly the crash-retry state — and a later startup retries.
-        ///
-        /// The abort travels as [`BatchAdmissionLeaseLost`] rather than a
-        /// startup failure: losing a race for a compatibility seed is normal,
-        /// and the pass is idempotent.
-        async fn backfill_namespaces_registry_under_lease(
-            &self,
-            owner: &str,
-            generation: i64,
-        ) -> Result<(), anyhow::Error> {
-            let plan = MongoNamespacesRegistryBackfillPlan {
-                owner: owner.to_string(),
-                generation,
-                now: Utc::now().to_rfc3339(),
-            };
-            let connection = self.connection();
-            let mut session = connection.client.start_session().await?;
-            let result = session
-                .start_transaction()
-                .and_run((self, plan), |s, (this, plan)| {
-                    Box::pin(async move {
-                        this.backfill_namespaces_registry_in_session(&mut *s, plan)
-                            .await
-                    })
-                })
-                .await
-                .map_err(Self::namespace_registry_transaction_error);
-            let Err(error) = result else {
-                return Ok(());
-            };
-            let lease_lost = error
-                .chain()
-                .any(|cause| cause.is::<BatchAdmissionLeaseLost>());
-            if !lease_lost {
-                return Err(error);
-            }
-            warn!(
-                "Namespace registry compatibility backfill rolled back: the global registry \
-                 admission lease was no longer held at the commit boundary; a later startup \
-                 retries"
-            );
-            Ok(())
-        }
-
-        /// The whole compatibility pass, inside the caller's transaction.
-        ///
-        /// Ordering is the durable contract: authoritative completion check,
-        /// derived-name discovery, registry upserts, strict identity
-        /// validation, completion marker last, then the commit-boundary lease
-        /// proof. Because every one of those steps commits or aborts together,
-        /// no delete can land between the discovery and the upserts:
-        ///
-        /// * A delete that acquired the global lease BEFORE this transaction's
-        ///   snapshot changed the lease document's `owner`/`generation`, so the
-        ///   proof below matches nothing and the pass aborts.
-        /// * A delete that acquires it AFTER must write the same lease
-        ///   document this transaction writes, which raises a write conflict —
-        ///   the acquisition cannot succeed until this transaction has
-        ///   committed or aborted, so its delete is strictly ordered after this
-        ///   pass rather than interleaved with it.
-        /// * Independently of the lease, an upsert of a registry document a
-        ///   concurrent transaction is deleting is itself a write conflict.
-        async fn backfill_namespaces_registry_in_session(
-            &self,
-            session: &mut ClientSession,
-            plan: &MongoNamespacesRegistryBackfillPlan,
-        ) -> mongodb::error::Result<()> {
-            // Authoritative completion check, inside the fence: two processes
-            // can never both observe an absent marker and both seed.
-            if self
-                .namespaces_registry_backfill_completed_in_session(&mut *session)
-                .await?
-            {
-                return Ok(());
-            }
-
-            let mut names = HashSet::new();
-            for &collection in DERIVED_NAMESPACE_RESOURCE_TABLES {
-                for ns in self
-                    .distinct_namespaces_in_session(&mut *session, collection)
-                    .await?
-                {
-                    names.insert(ns);
-                }
-            }
-            // The canonical `ferrum` row per issue #3955. Nothing else is
-            // seeded: the backfill must not read the process environment, and a
-            // deployment-specific `FERRUM_NAMESPACE` that has no resources yet
-            // is created through `POST /namespaces`. Ordinary resource writes
-            // isolate data under a derived name but do not insert a registry
-            // row. This insert runs only on the first compatibility pass.
-            names.insert(crate::config::types::DEFAULT_NAMESPACE.to_string());
-
-            // Deterministic write order so a retried attempt and a concurrent
-            // mutation take document locks in the same sequence.
-            let mut ordered: Vec<String> = names.into_iter().collect();
-            ordered.sort();
-            for name in &ordered {
-                self.namespaces()
-                    .update_one(
-                        doc! { "_id": name },
-                        doc! {
-                            "$setOnInsert": {
-                                "name": name,
-                                "created_at": &plan.now,
-                                "updated_at": &plan.now,
-                            }
-                        },
-                    )
-                    .upsert(true)
-                    .session(&mut *session)
-                    .await?;
-            }
-            // Validate every registry identity before declaring compatibility
-            // complete. In particular, an old `_id = other, name = ferrum`
-            // document must fail startup rather than coexist with the valid
-            // row this pass just upserted.
-            let _ = self
-                .registry_namespace_names_in_session(&mut *session)
-                .await?;
-            // Marker last, and never as a namespaces document: an abort or a
-            // crash before this write leaves completion absent so the next
-            // serialized compatibility pass retries the idempotent upserts.
-            self.mark_namespaces_registry_backfill_complete(&mut *session, &plan.now)
-                .await?;
-            // Commit-boundary proof, the same in-session gate every live
-            // registry mutation uses: owner AND generation must still match,
-            // with expiry evaluated by the server's own clock. It UPDATES the
-            // lease document, so it joins this transaction's write set and a
-            // competing acquirer conflicts instead of being masked by the read
-            // snapshot.
-            if !self
-                .verify_namespace_config_admission_lease_in_session(
-                    &mut *session,
-                    NAMESPACE_REGISTRY_ADMISSION_KEY,
-                    &plan.owner,
-                    plan.generation,
-                )
-                .await?
-            {
-                return Err(mongodb::error::Error::custom(
-                    NamespaceRegistryAbort::AdmissionLeaseLost,
-                ));
-            }
-            Ok(())
-        }
-
-        async fn namespaces_registry_backfill_completed(&self) -> Result<bool, anyhow::Error> {
-            Ok(self
-                .schema_compat()
-                .find_one(doc! { "_id": NAMESPACES_REGISTRY_BACKFILL_ID })
-                .await?
-                .is_some())
-        }
-
-        async fn namespaces_registry_backfill_completed_in_session(
-            &self,
-            session: &mut ClientSession,
-        ) -> mongodb::error::Result<bool> {
-            Ok(self
-                .schema_compat()
-                .find_one(doc! { "_id": NAMESPACES_REGISTRY_BACKFILL_ID })
-                .session(&mut *session)
-                .await?
-                .is_some())
-        }
-
-        async fn mark_namespaces_registry_backfill_complete(
-            &self,
-            session: &mut ClientSession,
-            completed_at: &str,
-        ) -> mongodb::error::Result<()> {
-            self.schema_compat()
-                .update_one(
-                    doc! { "_id": NAMESPACES_REGISTRY_BACKFILL_ID },
-                    doc! {
-                        "$setOnInsert": {
-                            "completed_at": completed_at,
-                        }
-                    },
-                )
-                .upsert(true)
-                .session(&mut *session)
-                .await?;
-            Ok(())
         }
 
         fn document_to_namespace_record(

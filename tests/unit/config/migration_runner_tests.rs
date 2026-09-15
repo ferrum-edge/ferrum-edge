@@ -92,132 +92,71 @@ async fn table_exists(pool: &sqlx::AnyPool, table: &str) -> bool {
     !rows.is_empty()
 }
 
-/// Regression test for the route-lock compatibility pass.
-///
-/// `proxy_route_locks` was folded into the V001 baseline after databases could
-/// already have V001 recorded in `_ferrum_migrations`. The migration loop skips
-/// V001 once version 1 is tracked, so without an idempotent compatibility pass
-/// the table would never be created on those databases — and the proxy
-/// persistence path writes to it on every create/update/batch/API-spec write,
-/// so each write would fail with a missing-table error.
-///
-/// This simulates such a database by applying V001, dropping `proxy_route_locks`
-/// (leaving the V001 record intact, exactly as a pre-fold database looks), then
-/// re-running `run_pending()` and asserting the table is restored and writable.
 #[tokio::test]
-async fn test_run_pending_restores_route_lock_table_on_existing_v001_db() {
+async fn test_v001_contains_complete_baseline_without_startup_repairs() {
     let pool = test_pool().await;
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let applied = runner.run_pending().await.unwrap();
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].version, 1);
+    for table in [
+        "proxy_route_locks",
+        "config_change_locks",
+        "config_admission_locks",
+        "config_change_retention",
+        "config_changes",
+        "audit_events",
+        "namespaces",
+        "gateway_trust_bundles",
+        "consumer_identity_index",
+        "mtls_dns_admission_locks",
+    ] {
+        assert!(
+            table_exists(&pool, table).await,
+            "baseline must create {table}"
+        );
+    }
+    assert!(!table_exists(&pool, "_ferrum_schema_compat").await);
+    let indexes = get_index_names(&pool).await;
+    for index in [
+        "idx_audit_events_namespace_ts_id",
+        "idx_audit_events_actor",
+        "idx_audit_events_resource_type",
+        "idx_config_changes_ns_sequence",
+        "idx_config_changes_sequence",
+        "idx_proxies_ns_id",
+        "idx_consumers_ns_id",
+        "idx_plugin_configs_ns_id",
+        "idx_upstreams_ns_id",
+        "idx_proxies_ns_listen_port",
+    ] {
+        assert!(
+            indexes.iter().any(|name| name == index),
+            "baseline must create {index}"
+        );
+    }
+    assert!(
+        !indexes
+            .iter()
+            .any(|name| name == "idx_proxies_unique_listen_port")
+    );
 
-    // Fresh apply records V001 and creates proxy_route_locks.
-    runner.run_pending().await.unwrap();
-    assert!(table_exists(&pool, "proxy_route_locks").await);
-
-    // Simulate a database that recorded V001 *before* proxy_route_locks was
-    // folded in: the V001 record stays, but the table is gone.
+    // Startup validates the recorded baseline; it must not silently repair
+    // missing tables or alter an already-initialized database.
     sqlx::query("DROP TABLE proxy_route_locks")
         .execute(&pool)
         .await
         .unwrap();
+    assert!(runner.run_pending().await.unwrap().is_empty());
     assert!(!table_exists(&pool, "proxy_route_locks").await);
-
-    // The migration loop skips already-tracked V001, but the idempotent
-    // compatibility pass must recreate the table.
-    let applied = runner.run_pending().await.unwrap();
-    assert!(
-        applied.is_empty(),
-        "V001 is already tracked, so no migration should be newly applied"
-    );
-    assert!(
-        table_exists(&pool, "proxy_route_locks").await,
-        "run_pending must restore proxy_route_locks on an existing V001 database"
-    );
-
-    // The restored table must accept the route-lock insert the persistence
-    // path performs.
-    sqlx::query(
-        "INSERT INTO proxy_route_locks (namespace, route_key_hash, created_at) \
-         VALUES ('ferrum', 'deadbeef', '2025-01-01T00:00:00Z')",
-    )
-    .execute(&pool)
-    .await
-    .expect("restored proxy_route_locks must be writable");
 }
 
-/// Regression test for the audit_events compatibility pass.
-///
-/// `audit_events` was folded into the V001 baseline after databases could
-/// already have V001 recorded in `_ferrum_migrations`. The migration loop skips
-/// V001 once version 1 is tracked, so without an idempotent compatibility pass
-/// the table and its indexes would never be created on those databases.
 #[tokio::test]
-async fn test_run_pending_restores_audit_events_table_on_existing_v001_db() {
+async fn test_v001_includes_audit_context_columns() {
     let pool = test_pool().await;
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
 
     runner.run_pending().await.unwrap();
-    assert!(table_exists(&pool, "audit_events").await);
-
-    sqlx::query("DROP TABLE audit_events")
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert!(!table_exists(&pool, "audit_events").await);
-
-    let applied = runner.run_pending().await.unwrap();
-    assert!(
-        applied.is_empty(),
-        "V001 is already tracked, so no migration should be newly applied"
-    );
-    assert!(
-        table_exists(&pool, "audit_events").await,
-        "run_pending must restore audit_events on an existing V001 database"
-    );
-
-    let index_names = get_index_names(&pool).await;
-    for index_name in [
-        "idx_audit_events_namespace_ts_id",
-        "idx_audit_events_actor",
-        "idx_audit_events_resource_type",
-    ] {
-        assert!(
-            index_names.iter().any(|n| n == index_name),
-            "compatibility pass must restore {index_name}"
-        );
-    }
-
-    sqlx::query(
-        "INSERT INTO audit_events \
-         (id, ts, actor, action, resource_type, resource_id, namespace, \
-          source_address, request_id, outcome, diff) \
-         VALUES ('event-1', '2026-01-01T00:00:00Z', 'admin', 'backup', \
-                 'backup', 'export', 'ferrum', '127.0.0.1', 'request-1', \
-                 'success', '{}')",
-    )
-    .execute(&pool)
-    .await
-    .expect("restored audit_events must be writable");
-}
-
-#[tokio::test]
-async fn test_run_pending_adds_audit_context_columns_on_existing_v001_db() {
-    let pool = test_pool().await;
-    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
-
-    runner.run_pending().await.unwrap();
-    for column in [
-        "namespace_at_event",
-        "source_address",
-        "request_id",
-        "outcome",
-    ] {
-        let sql = format!("ALTER TABLE audit_events DROP COLUMN {column}");
-        sqlx::query(&sql).execute(&pool).await.unwrap();
-    }
-
-    let applied = runner.run_pending().await.unwrap();
-    assert!(applied.is_empty(), "V001 must remain already applied");
-
     sqlx::query(
         "INSERT INTO audit_events \
          (id, ts, actor, action, resource_type, resource_id, namespace, \
@@ -228,7 +167,7 @@ async fn test_run_pending_adds_audit_context_columns_on_existing_v001_db() {
     )
     .execute(&pool)
     .await
-    .expect("upgraded audit_events must accept context-aware audit inserts");
+    .expect("baseline audit_events must accept context-aware audit inserts");
 
     let row = sqlx::query(
         "SELECT namespace_at_event, source_address, request_id, outcome \
@@ -247,99 +186,6 @@ async fn test_run_pending_adds_audit_context_columns_on_existing_v001_db() {
     );
     assert_eq!(row.try_get::<String, _>("request_id").unwrap(), "request-1");
     assert_eq!(row.try_get::<String, _>("outcome").unwrap(), "success");
-}
-
-#[tokio::test]
-async fn test_run_pending_restores_config_change_indexes_on_existing_v001_db() {
-    let pool = test_pool().await;
-    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
-
-    runner.run_pending().await.unwrap();
-    sqlx::query("DROP INDEX idx_config_changes_ns_sequence")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DROP INDEX idx_config_changes_sequence")
-        .execute(&pool)
-        .await
-        .unwrap();
-    let index_names = get_index_names(&pool).await;
-    assert!(
-        !index_names
-            .iter()
-            .any(|n| n == "idx_config_changes_ns_sequence")
-    );
-    assert!(
-        !index_names
-            .iter()
-            .any(|n| n == "idx_config_changes_sequence")
-    );
-
-    let applied = runner.run_pending().await.unwrap();
-    assert!(
-        applied.is_empty(),
-        "V001 is already tracked, so no migration should be newly applied"
-    );
-    let index_names = get_index_names(&pool).await;
-    assert!(
-        index_names
-            .iter()
-            .any(|n| n == "idx_config_changes_ns_sequence"),
-        "compatibility pass must restore idx_config_changes_ns_sequence"
-    );
-    assert!(
-        index_names
-            .iter()
-            .any(|n| n == "idx_config_changes_sequence"),
-        "compatibility pass must restore idx_config_changes_sequence"
-    );
-}
-
-#[tokio::test]
-async fn test_run_pending_restores_full_load_indexes_on_existing_v001_db() {
-    let pool = test_pool().await;
-    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
-
-    runner.run_pending().await.unwrap();
-    for index_name in [
-        "idx_proxies_ns_id",
-        "idx_consumers_ns_id",
-        "idx_plugin_configs_ns_id",
-        "idx_upstreams_ns_id",
-    ] {
-        let drop_sql = format!("DROP INDEX {index_name}");
-        sqlx::query(&drop_sql).execute(&pool).await.unwrap();
-    }
-    let index_names = get_index_names(&pool).await;
-    for index_name in [
-        "idx_proxies_ns_id",
-        "idx_consumers_ns_id",
-        "idx_plugin_configs_ns_id",
-        "idx_upstreams_ns_id",
-    ] {
-        assert!(
-            !index_names.iter().any(|n| n == index_name),
-            "{index_name} should be absent after DROP INDEX"
-        );
-    }
-
-    let applied = runner.run_pending().await.unwrap();
-    assert!(
-        applied.is_empty(),
-        "V001 is already tracked, so no migration should be newly applied"
-    );
-    let index_names = get_index_names(&pool).await;
-    for index_name in [
-        "idx_proxies_ns_id",
-        "idx_consumers_ns_id",
-        "idx_plugin_configs_ns_id",
-        "idx_upstreams_ns_id",
-    ] {
-        assert!(
-            index_names.iter().any(|n| n == index_name),
-            "compatibility pass must restore {index_name}"
-        );
-    }
 }
 
 /// Incremental polling reads durable change records after the last accepted
@@ -751,7 +597,7 @@ fn integrity_error_remains_typed_through_anyhow_context() {
 }
 
 #[tokio::test]
-async fn core_checksum_drift_blocks_status_and_compatibility_writes() {
+async fn core_checksum_drift_blocks_status_and_schema_writes() {
     let pool = test_pool().await;
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     runner.run_pending().await.unwrap();
@@ -809,7 +655,7 @@ async fn core_checksum_drift_blocks_status_and_compatibility_writes() {
     assert!(!apply_error.to_string().contains("CREATE TABLE"));
     assert!(
         !table_exists(&pool, "proxy_route_locks").await,
-        "V001 compatibility work must not run after integrity refusal"
+        "Core schema writes must not run after integrity refusal"
     );
 
     let after = sqlx::query(
@@ -828,7 +674,7 @@ async fn core_checksum_drift_blocks_status_and_compatibility_writes() {
 }
 
 #[tokio::test]
-async fn unknown_applied_core_version_blocks_compatibility_schema_and_history_writes() {
+async fn unknown_applied_core_version_blocks_schema_and_history_writes() {
     let pool = test_pool().await;
     sqlx::query(
         "CREATE TABLE _ferrum_migrations (\
@@ -867,7 +713,7 @@ async fn unknown_applied_core_version_blocks_compatibility_schema_and_history_wr
     assert!(apply_error.is::<MigrationHistoryIntegrityError>());
     assert!(
         !table_exists(&pool, "proxy_route_locks").await,
-        "V001 compatibility work must not run after integrity refusal"
+        "Core schema writes must not run after integrity refusal"
     );
     assert!(
         !table_exists(&pool, "proxies").await,

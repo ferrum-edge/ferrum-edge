@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Build-out database initialization:** keep all core SQL schema in `V001` and
+  remove startup column/index repairs, namespace backfills, and the internal
+  compatibility marker. MongoDB uses its current index plan without replacing
+  conflicting indexes and seeds only an empty namespace registry. Recreate
+  development databases after baseline changes; custom-plugin migrations are
+  unchanged. The external ClickHouse baseline is now
+  `schemas/clickhouse/charges.sql`.
+
 ## [0.9.5] - 2026-09-13
 
 Release from main introducing resource labels in tagged artifacts. Includes the

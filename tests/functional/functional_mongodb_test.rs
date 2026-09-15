@@ -2796,3 +2796,129 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
 
     println!("\n=== MongoDB Change-Stream Wake / Reconnect / Fallback Test PASSED ===\n");
 }
+
+/// Build-out initialization must create the current baseline and preserve
+/// existing registry rows and index constraints on every subsequent run.
+#[tokio::test]
+#[ignore = "requires a live MongoDB server"]
+async fn test_mongodb_buildout_baseline_initialization() {
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use ferrum_edge::config::mongo_index_plan::required_mongo_indexes;
+    use ferrum_edge::config::mongo_store::MongoStore;
+    use mongodb::IndexModel;
+    use mongodb::options::IndexOptions;
+
+    let url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !continue_if_backend_available("mongodb", mongodb_is_available(&url).await, "unreachable") {
+        return;
+    }
+    let database_name = format!("ferrum_baseline_{}", Uuid::new_v4().simple());
+    let client = MongoClient::with_uri_str(&url).await.unwrap();
+    let db = client.database(&database_name);
+    let store = MongoStore::connect(
+        &url,
+        &database_name,
+        None,
+        None,
+        None,
+        Some(10),
+        Some(10),
+        false,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    store.run_migrations().await.unwrap();
+    let registry = db.collection::<Document>("namespaces");
+    let seeded = registry
+        .find_one(doc! { "_id": "ferrum" })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seeded.get_str("name").unwrap(), "ferrum");
+    assert!(
+        !db.list_collection_names()
+            .await
+            .unwrap()
+            .iter()
+            .any(|name| name == "_ferrum_schema_compat")
+    );
+
+    // Keep a valid registry row, as live registry mutations require, then
+    // remove the default and add a resource-derived name without a registry row.
+    let now = Utc::now().to_rfc3339();
+    registry
+        .insert_one(doc! {
+            "_id": "keeper", "name": "keeper", "created_at": &now, "updated_at": &now,
+        })
+        .await
+        .unwrap();
+    registry.delete_one(doc! { "_id": "ferrum" }).await.unwrap();
+    db.collection::<Document>("upstreams")
+        .insert_one(doc! {
+            "_id": "derived-only:upstream", "namespace": "derived-only",
+        })
+        .await
+        .unwrap();
+    store.run_migrations().await.unwrap();
+    assert_eq!(registry.count_documents(doc! {}).await.unwrap(), 1);
+    assert_eq!(
+        registry
+            .find_one(doc! {})
+            .await
+            .unwrap()
+            .unwrap()
+            .get_str("name")
+            .unwrap(),
+        "keeper"
+    );
+
+    // Simulate each obsolete same-key baseline index in isolation. Applying
+    // the new baseline must fail and leave the old constraint intact.
+    for (collection_name, keys) in [
+        ("proxies", doc! { "namespace": 1, "listen_port": 1 }),
+        ("api_specs", doc! { "namespace": 1, "proxy_id": 1 }),
+    ] {
+        let collection = db.collection::<Document>(collection_name);
+        let current = required_mongo_indexes()
+            .into_iter()
+            .find(|entry| entry.collection == collection_name && entry.model.keys == keys)
+            .unwrap()
+            .model;
+        let index_name = ferrum_edge::config::mongo_index_plan::default_index_name(&keys);
+        collection.drop_index(&index_name).await.unwrap();
+        collection
+            .create_index(
+                IndexModel::builder()
+                    .keys(keys)
+                    .options(IndexOptions::builder().unique(true).build())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.run_migrations().await.is_err(),
+            "{collection_name} drift must fail"
+        );
+        let mut indexes = collection.list_indexes().await.unwrap();
+        let mut preserved = false;
+        while indexes.advance().await.unwrap() {
+            let index = indexes.deserialize_current().unwrap();
+            if let Some(options) = index.options
+                && options.name.as_deref() == Some(index_name.as_str())
+            {
+                assert_eq!(options.unique, Some(true));
+                assert!(options.partial_filter_expression.is_none());
+                preserved = true;
+            }
+        }
+        assert!(preserved, "conflicting index must remain intact");
+        collection.drop_index(&index_name).await.unwrap();
+        collection.create_index(current).await.unwrap();
+    }
+    db.drop().await.unwrap();
+}

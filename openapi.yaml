@@ -97,18 +97,13 @@ info:
     authorization-scoping `namespace` follows the tenant so a later reuse of
     the old name cannot expose the renamed tenant's `GET /audit` history, while
     immutable `namespace_at_event` keeps the namespace recorded when the event
-    occurred. The one-time
-    connect/migrate compatibility backfill of pre-existing derived names takes
-    that same global registry lease and commits as one transaction — on SQL the
-    lease row is verified and locked (`FOR UPDATE`, or SQLite's writer lock)
-    before the derived-name scan and stays locked through the commit, so the
-    pass neither resurrects a namespace a concurrent confirmed `DELETE` removed
-    nor rolls itself back merely for outrunning the lease TTL. Standalone
-    MongoDB has no multi-document transactions and therefore refuses these
-    three operations with `501` before mutating anything, and for the same
-    reason the compatibility backfill writes nothing on that topology; `GET`
-    remains available and still returns the union of registry names and derived
-    resource names.
+    occurred. Fresh database initialization seeds canonical `ferrum`; startup
+    does not backfill derived names into registry rows. Live registry mutations
+    preserve at least one row, so later startups do not reseed a deleted default.
+    Standalone MongoDB has no multi-document transactions and therefore refuses
+    these three operations with `501` before mutating anything. Single-document
+    initialization still seeds an empty registry; `GET` remains available and
+    returns the union of registry names and derived resource names.
 
     ## Caching and read-only mode
 

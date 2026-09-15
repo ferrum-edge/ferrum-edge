@@ -18,7 +18,7 @@ use ferrum_edge::config::db_loader::{
     sqlstate_is_retryable_transaction_conflict,
 };
 use ferrum_edge::config::namespace_registry::{
-    NAMESPACE_RENAME_COPY_TABLES, NAMESPACE_RENAME_SIMPLE_TABLES, NamespaceRegistryCorrupt,
+    NAMESPACE_RENAME_COPY_TABLES, NAMESPACE_RENAME_SIMPLE_TABLES,
 };
 use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
@@ -2321,15 +2321,6 @@ async fn registry_row_exists(store: &DatabaseStore, name: &str) -> bool {
         > 0
 }
 
-async fn namespace_registry_backfill_completed(store: &DatabaseStore) -> bool {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _ferrum_schema_compat WHERE name = ?")
-        .bind(ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID)
-        .fetch_one(&store.pool())
-        .await
-        .unwrap()
-        > 0
-}
-
 #[tokio::test]
 async fn list_namespaces_paginated_empty_store_returns_default_ferrum() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -2511,26 +2502,14 @@ async fn list_namespaces_paginated_includes_trust_bundle_only_namespace() {
 }
 
 #[tokio::test]
-async fn namespace_registry_backfill_is_one_time_and_does_not_reseed() {
+async fn namespace_registry_baseline_seed_does_not_repeat() {
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let name = "ns-backfill-once";
+    let name = "ns-baseline-once";
     let store = connect_namespaces_test_store(&temp_dir, name).await;
     assert!(
         registry_row_exists(&store, "ferrum").await,
-        "first-run backfill must still seed canonical ferrum"
+        "baseline initialization must still seed canonical ferrum"
     );
-    assert!(
-        namespace_registry_backfill_completed(&store).await,
-        "first-run backfill must durably mark completion"
-    );
-    let listed = store.list_namespaces().await.unwrap();
-    assert!(listed.contains(&"ferrum".to_string()));
-    assert!(
-        !listed.iter().any(|item| item == "_ferrum_schema_compat"
-            || item == ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID),
-        "compatibility state must never appear in GET /namespaces: {listed:?}"
-    );
-
     seed_namespace_upstream(&store, "derived-only", "up-derived").await;
     assert!(
         !registry_row_exists(&store, "derived-only").await,
@@ -2542,7 +2521,7 @@ async fn namespace_registry_backfill_is_one_time_and_does_not_reseed() {
     assert!(registry_row_exists(&store, "ferrum").await);
     assert!(
         !registry_row_exists(&store, "derived-only").await,
-        "a later compatibility pass must not materialize newer derived-only names"
+        "a later startup must not materialize newer derived-only names"
     );
     let listed = store.list_namespaces().await.unwrap();
     assert!(
@@ -2560,88 +2539,9 @@ async fn namespace_registry_backfill_is_one_time_and_does_not_reseed() {
     let store = connect_namespaces_test_store(&temp_dir, name).await;
     assert!(
         !registry_row_exists(&store, "ferrum").await,
-        "a later compatibility pass must not resurrect a deleted ferrum row"
+        "a later startup must not resurrect a deleted ferrum row"
     );
     assert!(!registry_row_exists(&store, "derived-only").await);
-    assert!(namespace_registry_backfill_completed(&store).await);
-}
-
-#[tokio::test]
-async fn unmarked_namespace_registry_backfill_retries_idempotently() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let name = "ns-backfill-retry";
-    let store = connect_namespaces_test_store(&temp_dir, name).await;
-    sqlx::query("DELETE FROM _ferrum_schema_compat")
-        .execute(&store.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM namespaces WHERE name = 'ferrum'")
-        .execute(&store.pool())
-        .await
-        .unwrap();
-    seed_namespace_upstream(&store, "legacy", "up-legacy").await;
-    assert!(
-        !namespace_registry_backfill_completed(&store).await,
-        "clearing the marker simulates an interrupted first-run attempt"
-    );
-    drop(store);
-
-    let store = connect_namespaces_test_store(&temp_dir, name).await;
-    assert!(
-        namespace_registry_backfill_completed(&store).await,
-        "an unmarked attempt must remain retryable"
-    );
-    assert!(
-        registry_row_exists(&store, "ferrum").await,
-        "retry must still seed canonical ferrum"
-    );
-    assert!(
-        registry_row_exists(&store, "legacy").await,
-        "retry must still insert pre-existing derived names"
-    );
-}
-
-#[tokio::test]
-async fn namespace_registry_backfill_rejects_invalid_derived_names_before_completion() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let name = "ns-backfill-invalid-derived";
-    let db_path = temp_dir.path().join(format!("{name}.db"));
-    let url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let store = connect_namespaces_test_store(&temp_dir, name).await;
-
-    sqlx::query("DELETE FROM _ferrum_schema_compat")
-        .execute(&store.pool())
-        .await
-        .unwrap();
-    seed_namespace_upstream(&store, "invalid/namespace", "up-invalid").await;
-
-    let error = match DatabaseStore::connect_with_pool_config(
-        "sqlite",
-        &url,
-        DbPoolConfig::default(),
-    )
-    .await
-    {
-        Ok(_) => panic!("an invalid legacy namespace must fail the compatibility pass"),
-        Err(error) => error,
-    };
-    let diagnostic = format!("{error:#}");
-    assert!(
-        diagnostic.contains(NamespaceRegistryCorrupt::MESSAGE),
-        "the failure must use the redacted registry-corruption diagnostic: {diagnostic}"
-    );
-    assert!(
-        !diagnostic.contains("invalid/namespace"),
-        "the hostile stored value must not be echoed: {diagnostic}"
-    );
-    assert!(
-        !namespace_registry_backfill_completed(&store).await,
-        "a rejected pass must leave the marker absent for a later repair and retry"
-    );
-    assert!(
-        !registry_row_exists(&store, "invalid/namespace").await,
-        "the derived registry insert must roll back with the rejected pass"
-    );
 }
 
 /// Source-level drift guard: issue #3727 trust bundles are a namespaced
@@ -3999,237 +3899,6 @@ fn sql_registry_mutations_map_database_aborts_to_the_typed_retryable_conflict() 
     assert!(
         !classifier.contains(".context(") && !classifier.contains("to_string()"),
         "the driver error must be dropped, never rendered or chained:\n{classifier}"
-    );
-}
-
-// ── One-time backfill serialization (issue #3955 review) ────────────────────
-
-#[test]
-fn sql_namespace_registry_backfill_runs_under_the_global_registry_lease() {
-    let source = include_str!("../../../src/config/migrations/sql_dialect.rs");
-    let start = source
-        .find("async fn run_serialized_namespaces_registry_backfill(")
-        .expect("serialized backfill entry point");
-    let serialized = source[start..]
-        .split("\n    /// Conditionally take the global registry admission lease.")
-        .next()
-        .expect("serialized backfill body");
-
-    let acquire_at = serialized
-        .find("try_acquire_namespaces_registry_backfill_lease")
-        .expect("the pass must take the global registry admission lease");
-    let backfill_at = serialized
-        .find(".backfill_namespaces_registry(")
-        .expect("the pass must run the backfill under that lease");
-    let release_at = serialized
-        .find("release_namespaces_registry_backfill_lease")
-        .expect("the pass must release the lease");
-    assert!(
-        acquire_at < backfill_at && backfill_at < release_at,
-        "the lease must be held across the whole compatibility pass:\n{serialized}"
-    );
-    assert!(
-        serialized.contains("(Err(backfill_error), _) => Err(backfill_error)"),
-        "the lease must be released on the error path too, without masking the failure:\n{serialized}"
-    );
-    // The lock order stays total: the pass takes ONLY the global key, which is
-    // always first, so it can never invert the order against a live mutation.
-    let acquire = source[source
-        .find("async fn try_acquire_namespaces_registry_backfill_lease(")
-        .expect("acquire helper")..]
-        .split("\n    async fn ")
-        .next()
-        .expect("acquire body");
-    assert!(
-        acquire.contains("NAMESPACE_REGISTRY_ADMISSION_KEY")
-            && acquire.contains("config_admission_lease_acquire_sql"),
-        "acquisition must reuse the runtime store's non-stealing lease SQL:\n{acquire}"
-    );
-}
-
-#[test]
-fn sql_namespace_registry_backfill_commits_once_and_verifies_its_lease() {
-    let source = include_str!("../../../src/config/migrations/sql_dialect.rs");
-    let dispatcher = source[source
-        .find("async fn backfill_namespaces_registry(")
-        .expect("backfill dispatcher")..]
-        .split("\n    /// PostgreSQL / MySQL:")
-        .next()
-        .expect("dispatcher body");
-    assert!(
-        dispatcher.contains("is_sqlite()")
-            && dispatcher.contains("backfill_namespaces_registry_under_sqlite_savepoint")
-            && dispatcher.contains("backfill_namespaces_registry_in_explicit_transaction"),
-        "SQLite must take the savepoint path; PostgreSQL/MySQL keep an explicit transaction:\n\
-         {dispatcher}"
-    );
-    assert!(
-        !dispatcher.contains("connection.begin()") && !dispatcher.contains("tx.commit()"),
-        "the dispatcher must not itself begin or commit a nested transaction:\n{dispatcher}"
-    );
-
-    let explicit = source[source
-        .find("async fn backfill_namespaces_registry_in_explicit_transaction(")
-        .expect("explicit transaction helper")..]
-        .split("\n    /// SQLite: run the backfill")
-        .next()
-        .expect("explicit transaction body");
-    assert!(
-        explicit.contains("connection.begin()")
-            && explicit.contains("tx.commit()")
-            && explicit.contains("tx.rollback()")
-            && explicit.contains("backfill_namespaces_registry_body"),
-        "PostgreSQL/MySQL must retain one explicit backfill transaction:\n{explicit}"
-    );
-
-    let body = source[source
-        .find("async fn backfill_namespaces_registry_body(")
-        .expect("shared backfill body")..]
-        .split("\n    /// Authoritative namespace-keyed")
-        .next()
-        .expect("shared backfill body");
-    let pin_at = body
-        .find("pin_namespaces_registry_backfill_lease")
-        .expect("start-of-transaction lease pin");
-    let completed_at = body
-        .find("namespaces_registry_backfill_completed")
-        .expect("authoritative completion check");
-    let insert_at = body.find("insert_derived").expect("derived-name insert");
-    let mark_at = body
-        .find("mark_namespaces_registry_backfill_complete")
-        .expect("completion mark");
-    let verify_at = body
-        .find("namespaces_registry_backfill_lease_held")
-        .expect("commit-boundary lease verification");
-    let apply_at = body
-        .find("NamespacesRegistryBackfillOutcome::Apply")
-        .expect("apply outcome");
-    assert!(
-        pin_at < completed_at,
-        "the lease row must be verified and locked as the FIRST statement of the atomic unit, \
-         before anything is read or written:\n{body}"
-    );
-    assert!(
-        completed_at < insert_at,
-        "a completed backfill must skip the inserts:\n{body}"
-    );
-    assert!(
-        insert_at < mark_at,
-        "the marker must be written after the idempotent inserts so a crash retries:\n{body}"
-    );
-    assert!(
-        mark_at < verify_at && verify_at < apply_at,
-        "the lease must be re-verified immediately before the caller commits:\n{body}"
-    );
-    assert!(
-        !body.contains("connection.begin()")
-            && !body.contains("tx.commit()")
-            && !body.contains("tx.rollback()"),
-        "the shared body must not begin, commit, or roll back the caller's atomic unit:\n{body}"
-    );
-
-    let pin = source[source
-        .find("async fn pin_namespaces_registry_backfill_lease(")
-        .expect("lease pin helper")..]
-        .split("\n    /// Commit-boundary proof")
-        .next()
-        .expect("lease pin body");
-    assert!(
-        pin.contains("FOR UPDATE") && pin.contains("is_sqlite()"),
-        "the pin must take a real row lock on every dialect that has FOR UPDATE, with an \
-         explicit SQLite branch:\n{pin}"
-    );
-    assert!(
-        pin.contains("UPDATE config_admission_locks SET expires_at"),
-        "the SQLite branch must promote the transaction to a WRITE transaction so the single \
-         database writer lock excludes a competing acquisition:\n{pin}"
-    );
-    assert!(
-        pin.contains("generation = ?") && pin.contains("expires_at > {now}"),
-        "the pin must verify owner, generation, and database-clock expiry before locking:\n{pin}"
-    );
-
-    let verify = source[source
-        .find("async fn namespaces_registry_backfill_lease_held(")
-        .expect("lease verification helper")..]
-        .split("\n    /// Rewrite `?` placeholders")
-        .next()
-        .expect("lease verification body");
-    assert!(
-        verify.contains("FOR UPDATE") && verify.contains("is_sqlite()"),
-        "the lease row must stay pinned through the commit on every dialect that has \
-         FOR UPDATE:\n{verify}"
-    );
-    assert!(
-        verify.contains("owner = ?") && verify.contains("generation = ?"),
-        "the commit-boundary proof must still be owner- and generation-qualified:\n{verify}"
-    );
-    // Regression: an otherwise uncontended backfill that outruns the 120s lease
-    // TTL while the row is transactionally pinned must still commit. Re-testing
-    // `expires_at` here would roll it back and starve it on every retry.
-    assert!(
-        !verify.contains("expires_at"),
-        "elapsed wall time under the row pin is not lost ownership; the commit-boundary proof \
-         must not re-check the lease TTL:\n{verify}"
-    );
-}
-
-/// Hosted SQLite migrations already hold `BEGIN IMMEDIATE` on this connection
-/// (`MigrationConnectionLock`). A nested `connection.begin()` is the
-/// `(code: 1) cannot start a transaction within a transaction` failure.
-#[test]
-fn sql_namespace_registry_backfill_does_not_nest_a_sqlite_begin() {
-    let migrations = include_str!("../../../src/config/migrations/mod.rs");
-    assert!(
-        migrations.contains("BEGIN IMMEDIATE")
-            && migrations.contains("struct MigrationConnectionLock")
-            && migrations.contains("ensure_compatibility_tables(connection)"),
-        "SQLite migrations must take BEGIN IMMEDIATE before the compatibility pass, and that \
-         outer transaction remains the durable commit boundary"
-    );
-
-    let source = include_str!("../../../src/config/migrations/sql_dialect.rs");
-    let sqlite = source[source
-        .find("async fn backfill_namespaces_registry_under_sqlite_savepoint(")
-        .expect("sqlite savepoint helper")..]
-        .split("\n    async fn rollback_sqlite_namespaces_registry_backfill_savepoint(")
-        .next()
-        .expect("sqlite savepoint body");
-    assert!(
-        sqlite.contains("SAVEPOINT namespaces_registry_backfill")
-            && sqlite.contains("RELEASE SAVEPOINT namespaces_registry_backfill")
-            && sqlite.contains("rollback_sqlite_namespaces_registry_backfill_savepoint"),
-        "SQLite must isolate the backfill with a SAVEPOINT on the already-open migration \
-         transaction:\n{sqlite}"
-    );
-    assert!(
-        !sqlite.contains("connection.begin()")
-            && !sqlite.contains("tx.commit()")
-            && !sqlite.contains("tx.rollback()")
-            && !sqlite.contains("sqlx::query(\"BEGIN")
-            && !sqlite.contains("sqlx::query(\"COMMIT")
-            && !sqlite.contains("sqlx::query(\"ROLLBACK"),
-        "the SQLite savepoint path must never emit BEGIN/COMMIT/ROLLBACK that would close \
-         or nest inside the outer BEGIN IMMEDIATE:\n{sqlite}"
-    );
-
-    let rollback = source[source
-        .find("async fn rollback_sqlite_namespaces_registry_backfill_savepoint(")
-        .expect("sqlite savepoint rollback")..]
-        .split("\n    /// Shared pin / scan")
-        .next()
-        .expect("sqlite savepoint rollback body");
-    assert!(
-        rollback.contains("ROLLBACK TO SAVEPOINT namespaces_registry_backfill")
-            && rollback.contains("RELEASE SAVEPOINT namespaces_registry_backfill"),
-        "failure/defer must roll back only the savepoint, then release it:\n{rollback}"
-    );
-    assert!(
-        !rollback.contains("sqlx::query(\"COMMIT")
-            && !rollback.contains("sqlx::query(\"ROLLBACK\")")
-            && !rollback.contains("connection.begin()"),
-        "savepoint rollback must not COMMIT or ROLLBACK the outer migration transaction:\n\
-         {rollback}"
     );
 }
 

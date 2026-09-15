@@ -353,7 +353,7 @@ async fn registry_row_exists(store: &DatabaseStore, name: &str) -> bool {
 }
 
 /// Drop the canonical `ferrum` registry row so a test can create an exact
-/// two-namespace world. The one-time compatibility backfill seeds `ferrum` on
+/// two-namespace world. Baseline initialization seeds `ferrum` on
 /// first connect; with no resources under it the name then genuinely no longer
 /// exists, and a later reconnect must not resurrect it.
 async fn drop_default_registry_row(store: &DatabaseStore) {
@@ -1213,7 +1213,7 @@ async fn deleted_canonical_ferrum_is_not_resurrected_by_later_compatibility_pass
     );
     assert!(
         !registry_row_exists(&store, "ferrum").await,
-        "a later connect/migrate compatibility pass must not resurrect deleted ferrum"
+        "a later startup must not resurrect deleted ferrum"
     );
     let listed = store.list_namespaces().await.unwrap();
     assert!(
@@ -1910,37 +1910,6 @@ async fn corrupt_registry_row_is_not_served_as_plausible_detail() {
 
 // ── Protected namespace set (issue #3955 review) ────────────────────────────
 
-async fn clear_backfill_marker(store: &DatabaseStore) {
-    sqlx::query("DELETE FROM _ferrum_schema_compat WHERE name = ?")
-        .bind(ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID)
-        .execute(&store.pool())
-        .await
-        .unwrap();
-}
-
-async fn backfill_marker_present(store: &DatabaseStore) -> bool {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _ferrum_schema_compat WHERE name = ?")
-        .bind(ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID)
-        .fetch_one(&store.pool())
-        .await
-        .unwrap()
-        > 0
-}
-
-/// Free the global registry admission key deterministically.
-///
-/// Admin handlers release their lease from a `Drop`-spawned task, so a test
-/// that must observe the NEXT startup taking that key cannot depend on when
-/// that task happens to run. Expiring the row is exactly what the lease's own
-/// release statement does, and it needs no sleep or poll.
-async fn expire_global_registry_lease(store: &DatabaseStore) {
-    sqlx::query("UPDATE config_admission_locks SET expires_at = 0 WHERE namespace = ?")
-        .bind(ferrum_edge::config::namespace_registry::NAMESPACE_REGISTRY_ADMISSION_KEY)
-        .execute(&store.pool())
-        .await
-        .unwrap();
-}
-
 fn protected_reason_is_static(body: &Value) {
     use ferrum_edge::config::namespace_registry::NamespaceRegistryError as RegistryError;
     let error = body["error"].as_str().unwrap_or_default();
@@ -2216,229 +2185,6 @@ async fn sql_backend_refuses_protected_namespaces_without_the_handler_precheck()
                 .is_none()
         );
     }
-}
-
-// ── One-time compatibility backfill serialization (issue #3955 review) ──────
-
-/// The compatibility pass takes the SAME global registry admission lease every
-/// live create/rename/delete takes. While that lease is held elsewhere the pass
-/// must defer instead of reading derived names next to a concurrent mutation —
-/// and it must leave the completion marker absent so a later startup retries.
-#[tokio::test]
-async fn namespace_registry_backfill_defers_while_the_global_registry_lease_is_held() {
-    let dir = TempDir::new().unwrap();
-    let store_name = "ns-backfill-deferred";
-    let store: Arc<dyn DatabaseBackend> = Arc::new(make_store_at(&dir, store_name).await);
-
-    // A derived-only tenant the next compatibility pass would seed.
-    {
-        let sql_store = make_store_at(&dir, store_name).await;
-        seed_upstream(&sql_store, "derived-tenant", "up-derived").await;
-        clear_backfill_marker(&sql_store).await;
-        assert!(!registry_row_exists(&sql_store, "derived-tenant").await);
-    }
-
-    // Hold the global registry key exactly the way a live mutation does.
-    let admission = lock_namespace_registry_admission_for_test(store.clone(), &["derived-tenant"])
-        .await
-        .expect("registry admission");
-
-    let contended = make_store_at(&dir, store_name).await;
-    assert!(
-        !registry_row_exists(&contended, "derived-tenant").await,
-        "the compatibility pass must not seed while the global registry lease is held elsewhere"
-    );
-    assert!(
-        !backfill_marker_present(&contended).await,
-        "a deferred pass must leave the completion marker absent so a later startup retries"
-    );
-    drop(admission);
-}
-
-/// A pass that crashed before recording completion leaves the marker absent, so
-/// the next startup retries the same idempotent inserts — and a namespace that
-/// was deliberately deleted in between is NOT resurrected, because it is no
-/// longer a derived name.
-#[tokio::test]
-async fn namespace_registry_backfill_retries_after_a_crash_without_resurrecting_deletes() {
-    let dir = TempDir::new().unwrap();
-    let store_name = "ns-backfill-crash-retry";
-    let store = Arc::new({
-        let mut store = make_store_at(&dir, store_name).await;
-        apply_protected_namespaces(&mut store, &["keeper"]);
-        store
-    });
-    let (base, shutdown) = start_admin(admin_state_from_arc(store.clone())).await;
-    let token = admin_token();
-
-    for name in ["keeper", "doomed"] {
-        let (status, body) = send(
-            reqwest::Method::POST,
-            &base,
-            "/namespaces",
-            &token,
-            Some(json!({ "name": name })),
-        )
-        .await;
-        assert_eq!(status, 201, "create {name}: {body:?}");
-    }
-
-    let (status, body) = send(
-        reqwest::Method::DELETE,
-        &base,
-        "/namespaces/doomed",
-        &token,
-        None,
-    )
-    .await;
-    assert_eq!(status, 204, "delete an empty tenant: {body:?}");
-    assert!(!registry_row_exists(store.as_ref(), "doomed").await);
-
-    // Simulate a compatibility pass that crashed before its marker landed, and
-    // a derived-only tenant that only the retry can materialize.
-    seed_upstream(store.as_ref(), "late-derived", "up-late").await;
-    clear_backfill_marker(store.as_ref()).await;
-    // The DELETE handler releases its admission lease from a Drop-spawned task;
-    // expire the global key outright so the reconnect below deterministically
-    // acquires it instead of racing that task.
-    expire_global_registry_lease(store.as_ref()).await;
-    let _ = shutdown.send(true);
-    drop(store);
-
-    let retried = make_store_at(&dir, store_name).await;
-    assert!(
-        backfill_marker_present(&retried).await,
-        "the retry must record completion"
-    );
-    assert!(
-        registry_row_exists(&retried, "late-derived").await,
-        "the retry must seed pre-existing derived names"
-    );
-    assert!(
-        registry_row_exists(&retried, "keeper").await,
-        "an existing registry row survives the retry"
-    );
-    assert!(
-        !registry_row_exists(&retried, "doomed").await,
-        "a deleted namespace must not be resurrected by a later compatibility pass"
-    );
-}
-
-/// Backfill-then-delete: once the pass has materialized a derived name, an
-/// ordinary confirmed delete removes it for good and no later pass brings it
-/// back (the completion marker is durable, and the name is no longer derived).
-#[tokio::test]
-async fn namespace_registry_backfill_then_delete_is_not_undone_by_a_later_pass() {
-    let dir = TempDir::new().unwrap();
-    let store_name = "ns-backfill-then-delete";
-    let store = Arc::new({
-        let mut store = make_store_at(&dir, store_name).await;
-        apply_protected_namespaces(&mut store, &["anchor"]);
-        store
-    });
-    seed_upstream(store.as_ref(), "seeded-tenant", "up-seeded").await;
-    clear_backfill_marker(store.as_ref()).await;
-    drop(store);
-
-    let store = Arc::new({
-        let mut store = make_store_at(&dir, store_name).await;
-        apply_protected_namespaces(&mut store, &["anchor"]);
-        store
-    });
-    assert!(
-        registry_row_exists(store.as_ref(), "seeded-tenant").await,
-        "the compatibility pass must materialize the derived name"
-    );
-    let (base, shutdown) = start_admin(admin_state_from_arc(store.clone())).await;
-    let token = admin_token();
-
-    let (status, body) = send(
-        reqwest::Method::POST,
-        &base,
-        "/namespaces",
-        &token,
-        Some(json!({ "name": "anchor" })),
-    )
-    .await;
-    assert_eq!(status, 201, "keep a second registry row: {body:?}");
-
-    let (status, body) = send(
-        reqwest::Method::DELETE,
-        &base,
-        "/namespaces/seeded-tenant?confirm=true",
-        &token,
-        None,
-    )
-    .await;
-    assert_eq!(status, 204, "confirmed cascade delete: {body:?}");
-    assert!(!registry_row_exists(store.as_ref(), "seeded-tenant").await);
-
-    let _ = shutdown.send(true);
-    drop(store);
-
-    let reconnected = make_store_at(&dir, store_name).await;
-    assert!(
-        !registry_row_exists(&reconnected, "seeded-tenant").await,
-        "a later compatibility pass must not resurrect a confirmed delete"
-    );
-    let listed = reconnected.list_namespaces().await.unwrap();
-    assert!(
-        !listed.iter().any(|item| item == "seeded-tenant"),
-        "GET /namespaces must not resurrect a confirmed delete: {listed:?}"
-    );
-}
-
-/// The compatibility pass verifies AND locks the global registry lease row as
-/// the FIRST statement of its transaction, at the generation it just acquired.
-///
-/// A predecessor that crashed leaves an expired lease row behind at some
-/// earlier generation. Acquisition steals it and bumps `generation`; the
-/// start-of-pass pin must verify that NEW generation against the database's own
-/// clock. A pin bound to the wrong generation, or one whose placeholders are
-/// mis-ordered for the dialect, would defer every pass forever and never seed.
-/// Fully deterministic: the stale row is written directly, with no sleep and no
-/// timing race.
-#[tokio::test]
-async fn namespace_registry_backfill_pins_the_lease_generation_it_acquired() {
-    let dir = TempDir::new().unwrap();
-    let store_name = "ns-backfill-lease-pin";
-    let registry_key = ferrum_edge::config::namespace_registry::NAMESPACE_REGISTRY_ADMISSION_KEY;
-    {
-        let store = make_store_at(&dir, store_name).await;
-        seed_upstream(&store, "pinned-tenant", "up-pinned").await;
-        clear_backfill_marker(&store).await;
-        sqlx::query(
-            "INSERT INTO config_admission_locks (namespace, owner, expires_at, generation) \
-             VALUES (?, 'crashed-predecessor', 0, 7) \
-             ON CONFLICT (namespace) DO UPDATE SET \
-             owner = 'crashed-predecessor', expires_at = 0, generation = 7",
-        )
-        .bind(registry_key)
-        .execute(&store.pool())
-        .await
-        .unwrap();
-    }
-
-    let retried = make_store_at(&dir, store_name).await;
-    assert!(
-        backfill_marker_present(&retried).await,
-        "a pass that stole an expired lease must still commit"
-    );
-    assert!(
-        registry_row_exists(&retried, "pinned-tenant").await,
-        "the derived name must be seeded under the newly acquired generation"
-    );
-    let generation = sqlx::query_scalar::<_, i64>(
-        "SELECT generation FROM config_admission_locks WHERE namespace = ?",
-    )
-    .bind(registry_key)
-    .fetch_one(&retried.pool())
-    .await
-    .unwrap();
-    assert!(
-        generation > 7,
-        "stealing an expired lease must bump the generation the pin verifies: {generation}"
-    );
 }
 
 /// A database that aborts the committing transaction as a serialization

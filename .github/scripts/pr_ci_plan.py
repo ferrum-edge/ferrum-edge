@@ -796,6 +796,7 @@ RUST_PATTERNS = [
         *RUST_BUILD_GRAPH_PATTERNS,
         r"^src/",
         r"^tests/(?!k8s/)",
+        r"^schemas/clickhouse/",  # DDL embedded by Rust integration tests
         r"^ferrum\.conf$",
         r"^openapi\.yaml$",
         r"^deny\.toml$",
@@ -845,6 +846,7 @@ SERVICE_INTEGRATION_PATTERNS = [
     for pattern in (
         *RUST_BUILD_GRAPH_PATTERNS,
         r"^tests/service_integration/",
+        r"^schemas/clickhouse/",
         r"^src/service_discovery/",
         r"^src/plugins/(?:ldap_auth|kafka_logging|oauth2_introspection|oidc_relying_party|api_chargeback|api_chargeback_sink|chargeback)\.rs$",
         r"^src/plugins/utils/",
@@ -1534,6 +1536,11 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/service_integration/ldap.rs"],
+            rust_only | {"run_service_integration": True},
+        ),
+        (
+            "pull_request",
+            ["schemas/clickhouse/charges.sql"],
             rust_only | {"run_service_integration": True},
         ),
         # Shared host-port allocator: compiled into the secrets fixtures too, so

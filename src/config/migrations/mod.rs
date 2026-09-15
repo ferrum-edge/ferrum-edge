@@ -34,9 +34,8 @@ const SQLITE_MIGRATION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100
 /// PostgreSQL advisory locks and MySQL named locks are session-scoped. SQLite
 /// has no advisory-lock primitive, so `BEGIN IMMEDIATE` holds the file's write
 /// reservation for the entire migration and tracking-row update. That outer
-/// transaction is the durable commit boundary: later work on this connection,
-/// including the namespace-registry compatibility backfill, must not issue
-/// another `BEGIN`, `COMMIT`, or unqualified `ROLLBACK`. Keeping all
+/// transaction is the durable commit boundary: later work on this connection
+/// must not issue another `BEGIN`, `COMMIT`, or unqualified `ROLLBACK`. Keeping all
 /// migration work on this same connection is required for the SQLite lock to
 /// serialize competing processes rather than deadlock against our own pool.
 struct MigrationConnectionLock {
@@ -1030,7 +1029,7 @@ impl MigrationRunner {
 
         // Declaration ambiguity is rejected before inspecting database history.
         // This preflight runs under the same cross-process lock as migration
-        // work and before any tracking table, compatibility, schema, or history
+        // work and before any tracking table, schema, or history
         // write can occur.
         validate_migration_history_integrity(&self.db_type, &declarations, &[])?;
 
@@ -1074,7 +1073,7 @@ impl MigrationRunner {
     /// Startup uses this combined path even when automatic plugin migration
     /// application is disabled or no plugins are currently compiled, so orphan,
     /// missing, duplicate, unknown, or drifted plugin history cannot be hidden
-    /// by successful core migration or V001 compatibility work.
+    /// by successful core initialization.
     pub async fn run_pending_with_plugin_history(
         &self,
         plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
@@ -1175,18 +1174,6 @@ impl MigrationRunner {
 
             newly_applied.push(record);
         }
-
-        // Idempotent compatibility pass for tables folded into the V001
-        // baseline after some databases already recorded V001. The loop above
-        // skips V001 once version 1 is tracked, so a newly folded-in table
-        // (e.g. `proxy_route_locks`, which the proxy persistence path writes to
-        // unconditionally) would otherwise be missing on existing databases.
-        // This runs after every `run_pending()` and idempotently creates folded-in
-        // tables/indexes and adds folded-in columns, so it is a no-op on fresh
-        // databases that just applied V001 in full.
-        sql_dialect::V001SqlBuilder::new(&self.db_type)
-            .ensure_compatibility_tables(connection)
-            .await?;
 
         // MySQL-only: warn when upgraded deployments still carry a non-
         // utf8mb4_0900_bin identity collation. Warn-and-continue (never refuse

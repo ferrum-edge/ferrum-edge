@@ -1183,30 +1183,16 @@ File mode is the simplest to upgrade because there's no database. The config fil
 cp config.yaml config.yaml.backup-v1
 ```
 
-#### 2. Run Config Migration (If Needed)
+#### 2. Update the Config Shape
 
-New Ferrum versions may introduce a new config file version. Use migrate mode to update your file:
-
-```bash
-# Dry run — see what would change
-FERRUM_MODE=migrate \
-  FERRUM_MIGRATE_ACTION=config \
-  FERRUM_MIGRATE_DRY_RUN=true \
-  FERRUM_FILE_CONFIG_PATH=./config.yaml \
-  ./ferrum-edge-new
-
-# Apply migration (creates a timestamped .backup automatically)
-FERRUM_MODE=migrate \
-  FERRUM_MIGRATE_ACTION=config \
-  FERRUM_FILE_CONFIG_PATH=./config.yaml \
-  ./ferrum-edge-new
-```
-
-Even if no version bump is required, the new binary will auto-migrate the config in memory on startup and log a warning if the on-disk version is behind.
+The current config format is `version: "1"`; no config migration transforms are
+shipped. Apply the documented breaking field changes to your config and keep
+the backup until validation succeeds. `FERRUM_MIGRATE_ACTION=config` does not
+convert legacy field shapes during build-out.
 
 #### 3. Validate the New Version
 
-Start the new binary on non-production ports pointing at the (possibly migrated) config file:
+Start the new binary on non-production ports pointing at the updated config file:
 
 ```bash
 FERRUM_MODE=file \
@@ -1263,7 +1249,7 @@ FERRUM_MODE=file \
 |-----------|-------------------|---------------------|
 | Database schema (build-out) | No — rebuild fresh DB + `POST /restore` | No — old binary + old DB only |
 | Database schema (post-freeze tagged releases) | Yes (versioned forward migrations) | No (old binary cannot read new schema) |
-| Config file format | Yes (auto-migrates in memory) | Depends on version gap |
+| Config file format (build-out) | No — update the config shape and validate | No compatibility guarantee |
 | gRPC protocol (CP↔DP) | Same major.minor required (enforced at connect time) | Same major.minor required |
 | Admin API | Generally stable | Check release notes |
 

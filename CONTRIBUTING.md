@@ -178,6 +178,16 @@ For significant features, please open an issue first to discuss the design:
 
 For new plugins, see [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) for the plugin development guide.
 
+## Build-Out Schema Policy
+
+Ferrum Edge has no deployed-user compatibility obligation during active build-out.
+Fold core SQL changes into `src/config/migrations/sql_dialect.rs`, behind the
+single `V001InitialSchema` declaration. Edit MongoDB's `mongo_index_plan.rs` and
+external ClickHouse's `schemas/clickhouse/charges.sql` directly. Do not add new
+core migration versions, startup schema-repair/backfill passes, or legacy config
+transforms. Recreate development databases after baseline changes. Custom-plugin
+migrations remain independently owned. See [database baselines](docs/migrations.md).
+
 ## Changelog Policy
 
 Ferrum Edge is in active build-out, so breaking changes are permitted without

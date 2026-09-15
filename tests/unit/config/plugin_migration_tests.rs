@@ -709,7 +709,7 @@ async fn unknown_applied_plugin_version_blocks_all_compatibility_schema_and_hist
     );
     assert!(
         !table_exists(&pool, "proxy_route_locks").await,
-        "V001 compatibility must remain untouched"
+        "Core schema must remain untouched"
     );
     assert!(
         !table_exists(&pool, "unknown_version_pending_data").await,
@@ -913,7 +913,7 @@ async fn orphan_plugin_history_is_fatal_when_no_plugins_are_compiled() {
     );
     assert!(
         !table_exists(&pool, "proxy_route_locks").await,
-        "combined preflight must reject before V001 compatibility writes"
+        "combined preflight must reject before core schema writes"
     );
     let row = sqlx::query(
         "SELECT checksum FROM _ferrum_plugin_migrations \

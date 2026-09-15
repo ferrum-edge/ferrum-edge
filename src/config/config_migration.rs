@@ -32,20 +32,10 @@ pub struct ConfigMigrateResult {
 }
 
 impl ConfigMigrator {
-    /// Get the ordered list of config migration steps.
-    ///
-    /// Each entry is `(from_version, to_version, migration_fn)`.
-    /// To add a new migration, append to this list:
-    ///
-    /// ```ignore
-    /// ("1", "2", migrate_v1_to_v2 as ConfigMigrationFn),
-    /// ("2", "3", migrate_v2_to_v3 as ConfigMigrationFn),
-    /// ```
+    /// No config transforms are shipped during build-out. Update the current
+    /// config shape directly instead of adding legacy compatibility steps.
     fn migration_chain() -> Vec<(&'static str, &'static str, ConfigMigrationFn)> {
-        vec![
-            // Future migrations go here. Example:
-            // ("1", "2", migrate_v1_to_v2 as ConfigMigrationFn),
-        ]
+        vec![]
     }
 
     /// Migrate a `serde_json::Value` config from its current version to the target version.
@@ -258,15 +248,3 @@ fn parse_yaml_value(content: &str) -> Result<serde_json::Value, anyhow::Error> {
     let yaml_val: serde_yaml::Value = serde_yaml::from_str(content)?;
     Ok(serde_json::to_value(yaml_val)?)
 }
-
-// ---- Future migration functions go here ----
-// Example:
-//
-// fn migrate_v1_to_v2(value: &mut serde_json::Value) -> Result<(), anyhow::Error> {
-//     // Add a new required field with a default value
-//     if let Some(obj) = value.as_object_mut() {
-//         obj.insert("version".to_string(), serde_json::json!("2"));
-//         // ... transform fields as needed
-//     }
-//     Ok(())
-// }

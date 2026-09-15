@@ -396,7 +396,7 @@ verify secrets and storage on the node.
 Apply the reference DDL before enabling the plugin:
 
 ```bash
-clickhouse-client < migrations/clickhouse/0001_charges.sql
+clickhouse-client < schemas/clickhouse/charges.sql
 ```
 
 The DDL creates `ferrum.charges_raw` with `ReplacingMergeTree` idempotency on
@@ -443,7 +443,7 @@ unprojected row is the 25-column `ferrum.charges_raw` contract:
 | `trace_id` | string, omitted when unset | `String` |
 | `snapshot_id` | string, omitted when unset | `String` |
 
-A static integration test parses `migrations/clickhouse/0001_charges.sql` at
+A static integration test parses `schemas/clickhouse/charges.sql` at
 compile time and asserts that exact key set, plus JSON-kind vs declared-type
 compatibility, against the serializer output for a fully populated native
 event and for the identity (order-only) projection. Hosted CI also boots
@@ -1187,7 +1187,7 @@ The reference hourly/daily/monthly views group by `currency` and
 `pricing_version` in addition to namespace/consumer/proxy/time so two sink
 instances that share a table (or one sink that changes currency/pricing
 generation on reload) cannot produce unitless USD+EUR-style rollups. Re-apply
-`migrations/clickhouse/0001_charges.sql` to refresh those views (`CREATE OR
+`schemas/clickhouse/charges.sql` to refresh those views (`CREATE OR
 REPLACE VIEW`).
 
 For snapshot mode, compare `/charges` totals to `sum(call_count)`,
