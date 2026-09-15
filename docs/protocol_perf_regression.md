@@ -115,6 +115,66 @@ python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_s
 Full-mode PR CI runs the same static set in `Performance Regression Check`
 immediately after checkout.
 
+## Historical-baseline H1 TLS POST check
+
+`.github/workflows/h1-tls-post-regression.yml` (daily, plus manual dispatch)
+answers the question the scheduled lanes above cannot: *is today's `main`
+slower than a known historical revision on the HTTP/1.1 TLS POST/echo
+workload?* Issue [#5505](https://github.com/ferrum-edge/ferrum-edge/issues/5505)
+found a June-to-September throughput loss on that workload that only surfaced
+by eye in `gateways-protocol-benchmark.yml` output; absolute RPS from
+different runs cannot guard it because hosted runners change CPU class between
+runs.
+
+The check therefore measures **two revisions on one runner**:
+
+1. Build the reference revision pinned in
+   `tests/performance/multi_protocol/h1_tls_post_reference.json` and the
+   candidate (`main` tip) with the same toolchain and the `ci-release`
+   profile; build `proto_backend` / `proto_bench` once from the candidate tree.
+2. Start one `proto_backend`; for each round start the reference and candidate
+   gateways in alternating order (reference first on odd rounds) with an
+   identical environment and `configs/http1_tls_e2e_perf.yaml` (TLS on both
+   hops, `backend_read_timeout_ms` / `backend_write_timeout_ms` at their
+   production values), warm up, then measure every payload size for
+   `duration_secs` at `concurrency` connections.
+3. Gate the **paired ratio** `candidate_rps / reference_rps` per round and
+   payload size. The median paired ratio must stay at or above
+   `thresholds.<size>.min_ratio`.
+
+Runner-variance handling:
+
+- Every measured sample must verify every echo (`total_errors == 0`); errors,
+  missing rounds, duplicate samples, or missing provenance fail the job in any
+  enforcement mode.
+- If either side's three-round throughput spread exceeds
+  `runner_variance.max_round_spread`, the runner was noisy and a below-floor
+  ratio is downgraded to a **provisional alert** instead of a failure.
+- With at least `rolling.min_samples` prior scheduled runs of the same
+  reference and workload, a ratio below `median − mad_multiplier × MAD` raises
+  a non-blocking alert even when it clears the floor, catching gradual slides.
+- The pre-benchmark step records CPU steal and scheduler jitter alongside the
+  evidence; treat verdicts as provisional when steal exceeds 5%.
+
+The artifact `h1-tls-post-comparison-<sha>` retains every individual sample
+(`samples/*.json`), gateway/backend logs, `rows.json`, `provenance.json`
+(revision SHAs, binary and harness digests, toolchain, host), `report.json`,
+and the extended `h1_tls_post_trends.json` ratio history.
+
+Contract rules: `reference.sha` is an immutable commit; raise `min_ratio`
+toward `1.0` as the gap closes and never lower it or change the workload to
+make a production regression disappear. A manual dispatch may pass
+`reference_sha` to compare the dispatched ref against any other revision on the
+same runner — the matched-host bisect tool for future attribution work. Manual
+runs do not extend the rolling history.
+
+Local static checks:
+
+```bash
+python3 .github/scripts/h1_tls_post_comparison.py self-test
+bash -n .github/scripts/run_h1_tls_post_comparison.sh
+```
+
 ## Native harness cert paths
 
 The scheduled workflow runs `run_protocol_test.sh` **natively** (not in Docker).

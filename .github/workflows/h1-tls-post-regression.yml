@@ -1,0 +1,151 @@
+# Scheduled paired HTTP/1.1 TLS POST/echo check against a pinned historical
+# revision (issue #5505).
+#
+# gateways-protocol-benchmark.yml measured a June-to-September throughput loss
+# for 10 KiB and 70 KiB HTTP/1.1 TLS POST echoes that no scheduled check
+# guarded: cross-run absolute RPS cannot, because hosted runners change CPU
+# class between runs. This lane builds the reference revision pinned in
+# tests/performance/multi_protocol/h1_tls_post_reference.json and the current
+# `main` tip with one toolchain and the ci-release profile, then measures both
+# on ONE runner in interleaved rounds against the same proto_backend and
+# proto_bench. The gate is the paired candidate/reference throughput ratio per
+# payload size; absolute RPS is recorded, never gated.
+#
+# Not a required PR check. A red run marks the daily `main` tip as regressed
+# relative to the pinned reference beyond the versioned floor; provisional
+# (noisy-runner) results alert instead of failing. A manual dispatch may
+# override the reference SHA to run a matched-host comparison between any two
+# revisions, which is the bisect tool the issue asked for.
+
+name: H1 TLS POST Historical Baseline
+
+on:
+  schedule:
+    # 07:41 UTC daily; offset from the 06:17 performance-regression cron and
+    # the top-of-hour GitHub scheduler surge.
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+    inputs:
+      reference_sha:
+        description: "Optional reference commit SHA (40 hex) to compare the dispatched ref against; defaults to the contract's pinned reference"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: h1-tls-post-regression
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+jobs:
+  h1-tls-post-baseline:
+    name: H1 TLS POST vs pinned reference
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify comparison harness (static)
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/h1_tls_post_comparison.py self-test
+          python3 - <<'PY'
+          import json, re
+          contract = json.load(open("tests/performance/multi_protocol/h1_tls_post_reference.json"))
+          assert re.fullmatch(r"[0-9a-f]{40}", contract["reference"]["sha"]), "reference SHA must be pinned"
+          print("contract", contract["reference_version"], "reference", contract["reference"]["sha"])
+          PY
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-h1-tls-post-baseline"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libcurl4-openssl-dev
+
+      - name: Runner health check (pre-benchmark)
+        run: |
+          set -euo pipefail
+          mkdir -p tests/performance/ci_results
+          nproc
+          lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core|MHz|Hypervisor' || true
+          vmstat 1 6 | tee /tmp/vmstat_pre.txt
+          AVG_STEAL=$(tail -n 5 /tmp/vmstat_pre.txt | awk '{sum += $17; n++} END {printf "%.1f", (n ? sum/n : 0)}')
+          echo "Average CPU steal over 5s: ${AVG_STEAL}%"
+          if awk -v s="$AVG_STEAL" 'BEGIN { exit !(s > 5.0) }'; then
+            echo "::warning::CPU steal is ${AVG_STEAL}% — noisy neighbour detected; treat a regression verdict as provisional."
+          fi
+
+      - name: Fetch prior ratio history (best-effort)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p tests/performance/ci_results
+          echo '{"schema_version":1,"points":[]}' > tests/performance/ci_results/h1_tls_post_history.json
+          # Manual dispatches do not publish the trends alias, so walk the
+          # recent successful runs until one carries it.
+          prior_runs="$(gh run list \
+            --workflow h1-tls-post-regression.yml \
+            --branch main \
+            --status success \
+            --limit 10 \
+            --json databaseId,headSha \
+            --jq "map(select(.headSha != \"${CURRENT_SHA}\")) | .[].databaseId" \
+            || true)"
+          loaded=false
+          for prior_run in ${prior_runs}; do
+            rm -rf /tmp/prior-trends
+            mkdir -p /tmp/prior-trends
+            if gh run download "${prior_run}" -n h1-tls-post-trends-latest -D /tmp/prior-trends 2>/dev/null \
+              && [[ -f /tmp/prior-trends/h1_tls_post_trends.json ]]; then
+              cp /tmp/prior-trends/h1_tls_post_trends.json tests/performance/ci_results/h1_tls_post_history.json
+              echo "Loaded prior ratio history from run ${prior_run}"
+              loaded=true
+              break
+            fi
+          done
+          if [[ "${loaded}" != true ]]; then
+            echo "No prior trends artifact found; starting a fresh rolling baseline"
+          fi
+
+      - name: Build both revisions and run the paired comparison
+        timeout-minutes: 100
+        env:
+          H1_REFERENCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.reference_sha || '' }}
+          H1_HISTORY_FILE: ${{ github.workspace }}/tests/performance/ci_results/h1_tls_post_history.json
+        run: bash .github/scripts/run_h1_tls_post_comparison.sh
+
+      - name: Upload comparison evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: h1-tls-post-comparison-${{ github.sha }}
+          path: tests/performance/ci_results/h1-tls-post-comparison/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload trends alias artifact
+        # Only a contract-reference run on main may extend the rolling history.
+        if: success() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: h1-tls-post-trends-latest
+          path: tests/performance/ci_results/h1-tls-post-comparison/h1_tls_post_trends.json
+          retention-days: 90
+          if-no-files-found: ignore

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "reference_version": "2026-09-14.v1",
+  "description": "Historical-baseline contract for the paired HTTP/1.1 TLS POST/echo throughput check (issue #5505). One runner builds the pinned reference revision and the candidate revision with the same toolchain and ci-release profile, then measures them in interleaved rounds against the same proto_backend/proto_bench harness. The gate is the paired candidate/reference throughput ratio, which cancels runner CPU class and absolute-RPS drift; absolute RPS is recorded but never gated. Raise min_ratio toward 1.0 as the gap closes; never lower it or change the workload to make a production regression disappear.",
+  "reference": {
+    "sha": "0c91b23a3f4e3a585eeecc2c0acd68355d3fc203",
+    "label": "main 2026-06-19 (issue #5505 June baseline)"
+  },
+  "workload": {
+    "config": "configs/http1_tls_e2e_perf.yaml",
+    "target": "https://127.0.0.1:18443/echo",
+    "payload_sizes": [10240, 71680],
+    "concurrency": 200,
+    "duration_secs": 15,
+    "warmup_secs": 3,
+    "rounds": 3,
+    "worker_threads": 2
+  },
+  "enforcement": "fail",
+  "thresholds": {
+    "10240": { "min_ratio": 0.70 },
+    "71680": { "min_ratio": 0.78 }
+  },
+  "runner_variance": {
+    "max_round_spread": 0.10,
+    "rolling": { "window": 8, "mad_multiplier": 5.0, "min_samples": 3 }
+  }
+}
