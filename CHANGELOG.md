@@ -13,23 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `local_fallback`, enforcing the configured quota independently in each pod
   during a Redis outage. Set `fail_closed` explicitly to require centralized
   enforcement. Other rate-limit plugins retain their existing defaults (#5519).
-- Redis HTTP, GraphQL, and gRPC method quotas now admit through
-  charge-then-compensate accounting. One atomic `MULTI`/`EXEC` charges every
-  configured window (`GET` previous, `INCR` current, `EXPIRE` current) so the
-  decision is still tied to the caller's own increment, and any refusal issues
-  one compensating atomic `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over every window it
-  charged. A refused request no longer leaves a lasting charge on any window, so
-  sustained overload can no longer lock a client out, and a tighter window's
-  refusal no longer consumes a looser window's budget — the previously
-  documented multi-window "phantom increment" is retired (#5517). Admission
-  stays native RESP on the existing pooled connections: no Lua, no `WATCH`, no
-  per-request connection, and no retry budget. The key layout and the two-window
-  weighted approximation are unchanged, so an in-place upgrade keeps its
-  counters and no Redis ACL change is required. Between a refused attempt's
-  `INCR` and its compensating `DECR` the transient charge is visible to
-  concurrent requests for the same identity, which can refuse slightly early
-  under contention and never over-admits; a refused request costs two round trips
-  instead of one.
+- Redis HTTP, GraphQL, and gRPC method quotas again use one atomic server-side
+  admission script. Redis `TIME` now selects every window epoch at execution,
+  so gateway clock skew or delayed requests cannot split a centralized quota
+  across adjacent buckets. The script charges every configured window or none,
+  preserving the guarantee that refusals neither consume budget nor renew TTLs
+  while retaining one-round-trip admission under contention (#5517). Redis ACLs
+  for these quotas must allow scripting (`EVALSHA`, `SCRIPT LOAD`, and `EVAL`)
+  plus `TIME`, `GETRANGE`, and `SET`; the versioned state key starts a fresh
+  centralized budget and mixed-version replicas should not be deployed.
 - Redis URL database selectors now require canonical decimal integers in
   `0..=2147483647`, without zero-padding, signs, or extra path segments. Runtime
   admission and all shared-parser OpenAPI URL fields use the same rule (#5518).

@@ -14,8 +14,7 @@ use tracing::{info, warn};
 
 use super::http_client::PluginHttpClient;
 use super::redis_rate_limiter::{
-    MAX_REDIS_ADMISSION_WINDOWS, RedisConfig, RedisRateLimitClient, RedisWindowCharge,
-    RedisWindowCharges,
+    RedisAdmissionWindow, RedisConfig, RedisRateLimitClient, RedisWindowKind,
 };
 
 /// Root config keys every Redis-backed rate-limit plugin accepts.
@@ -2054,68 +2053,55 @@ fn check_http_windows(
     outcome
 }
 
+/// Redis key holding the whole multi-window state of one rate identity.
+///
+/// The effective window list is part of the key, so a policy edit starts a
+/// fresh centralized budget exactly as a changed spec resets retained local
+/// state — a shrunk window can never be charged from a wider window's counters.
+fn http_windows_state_key(
+    redis: &RedisRateLimitClient,
+    key: &str,
+    specs: &[RateLimitWindowSpec],
+) -> Result<String, ()> {
+    use std::fmt::Write;
+
+    let mut state_key = redis.make_slot_key(key, &["http-windows"]);
+    for spec in specs {
+        // `fmt::Write` on a String is infallible. A formatting failure would
+        // leave the key no longer bound to this window list, so refuse rather
+        // than risk sharing another policy's budget.
+        write!(state_key, ":{}-{}", spec.duration.as_millis(), spec.limit).map_err(|_| ())?;
+    }
+    Ok(state_key)
+}
+
 /// Distributed (Redis-backed) multi-window admission check.
 ///
-/// Charge-then-compensate on the shared pooled multiplexed connections, using
-/// nothing but plain RESP commands any Redis-compatible server accepts — no
-/// Lua, no `EVAL*`, no `WATCH`, no per-request connection, and no retry budget
-/// a hot key can exhaust:
+/// One `EVALSHA` per decision on the shared pooled connections. The server-side
+/// script owns the whole decision, so:
 ///
-/// 1. ONE atomic `MULTI`/`EXEC` charges EVERY configured window
-///    (`GET previous`, `INCR current`, `EXPIRE current`) and returns each
-///    window's counters. The decision is read off the caller's own increment,
-///    never off a stale read two gateways could both act on.
-/// 2. If every window fits, the request is admitted and the tightest window's
-///    remaining budget is reported.
-/// 3. If ANY window refuses, ONE compensating atomic `MULTI`/`EXEC` hands back
-///    the charge on EVERY window this request incremented — the ones that fit
-///    included — and the refusal names the first refusing window. That
-///    compensation is issued from a DETACHED task holding the client `Arc`, so
-///    it is not tied to the lifetime of the request future that made the
-///    charge.
+/// * **Only admitted requests mutate state.** A refusal charges no window and
+///   does not renew the key's TTL, so sustained excess traffic keeps being
+///   throttled at the configured rate instead of re-arming its own exhaustion
+///   (issue #5517). This is what the earlier `INCR`-then-compare shape got
+///   wrong: every rejected attempt inflated the counter that decided the next
+///   one, and a client over its limit never recovered while it kept trying.
+/// * **Every window is charged, or none is.** A later (tighter) window's
+///   refusal cannot consume an earlier (looser) window's budget.
+/// * **Admission stays O(1) under contention.** There is no optimistic
+///   `WATCH` retry budget to exhaust on a hot key, so a client that is *not*
+///   over its limit is never refused because other gateways were busy.
 ///
-/// Step 3 is what closes issue #5517. Previously a refused attempt kept the
-/// increment it had just made, so a client above its rate re-armed its own
-/// exhaustion on every retry and never recovered while it kept trying; with
-/// one window it received nothing at all after its first allowance. It also
-/// retires the documented multi-window "phantom increment": a tighter window's
-/// refusal no longer consumes a looser window's budget.
-///
-/// # Visible semantics
-///
-/// Between a refused attempt's `INCR` and its compensating `DECR` the transient
-/// charge IS observable: a concurrent request for the same identity may be
-/// refused against a count that is about to be handed back. That error
-/// direction is conservative — the limiter can refuse slightly early under
-/// contention, and never over-admits — and a refusal leaves no lasting charge
-/// on any window once its compensation lands. A compensation that cannot be
-/// delivered (Redis went away mid-decision) leaves the charge in place until
-/// the window's TTL elapses and is reported as a Redis failure, so the
-/// configured `redis_failure_policy` governs the next decision.
-///
-/// Cancelling this request does NOT strand a charge. The hand-back runs on its
-/// own task owning the client `Arc`
-/// ([`RedisRateLimitClient::spawn_uncharge_rate_limit_windows`]), so a dropped
-/// plugin future — a gRPC deadline elapsing under `timeout_at`, a client
-/// disconnect, a config reload retiring this instance — cannot take the
-/// compensation with it. The one remaining exception is a process exit between
-/// the charge and the compensation: the increment is already on the server and
-/// stays until its window's TTL elapses.
-///
-/// # Algorithm
-///
-/// Every window uses the documented previous/current two-window weighted
-/// approximation (`previous * (1 - elapsed_fraction) + current`) over
-/// `{prefix:key}:{window_index}` counters. Local mode's token bucket and its
-/// 64-bucket sliding aggregate are deliberately NOT replicated in Redis:
-/// reproducing them centrally costs either a server-side script or a
-/// read-modify-write per request. Burst and smoothing behaviour therefore
-/// differs from `sync_mode: "local"` within that approximation, while the
-/// contract that matters is identical — one unit per admitted request, refusal
-/// at the configured cap, and no charge left behind by a refusal.
+/// Redis `TIME` is the only clock, so gateways' wall clocks never enter the
+/// math. Windows at or below [`LOCAL_TOKEN_BUCKET_MAX_WINDOW_SECONDS`] use the
+/// same continuously refilling token bucket as [`check_http_windows`]; longer
+/// windows use the documented previous/current weighted approximation rather
+/// than shipping a 64-bucket ring to the server on every request. Both charge
+/// one unit per admitted request and refuse at the configured cap, so the
+/// admitted-request contract matches local mode within that approximation.
 async fn check_http_windows_redis(
     specs: &[RateLimitWindowSpec],
-    redis: &Arc<RedisRateLimitClient>,
+    redis: &RedisRateLimitClient,
     key: &str,
 ) -> Result<RateLimitOutcome, ()> {
     if specs.is_empty() {
@@ -2123,96 +2109,41 @@ async fn check_http_windows_redis(
         // than manufacturing an outage for a policy that limits nothing.
         return Ok(RateLimitOutcome::allow());
     }
-    if specs.len() > MAX_REDIS_ADMISSION_WINDOWS {
-        // Config validation already caps the presets at three windows; this is
-        // the fail-closed backstop for the fixed-capacity buffers below.
-        warn_sampled!(
-            windows = specs.len(),
-            max_windows = MAX_REDIS_ADMISSION_WINDOWS,
-            "Redis rate-limit policy exceeds the supported window count"
-        );
-        return Err(());
+
+    let mut ttl = 1;
+    let mut windows = Vec::with_capacity(specs.len());
+    for spec in specs {
+        ttl = ttl.max(two_window_ttl_seconds(spec.duration.as_secs()));
+        // Admission bounds the window at MAX_RATE_LIMIT_WINDOW_SECONDS, so this
+        // conversion cannot saturate for a configured policy; the floor keeps a
+        // sub-millisecond duration from dividing by zero inside the script.
+        let millis = spec.duration.as_millis();
+        let window_millis = u64::try_from(millis).unwrap_or(u64::MAX).max(1);
+        windows.push(RedisAdmissionWindow {
+            kind: match local_window_algorithm(spec.duration) {
+                LocalWindowAlgorithm::TokenBucket => RedisWindowKind::TokenBucket,
+                LocalWindowAlgorithm::SlidingAggregate => RedisWindowKind::WeightedSliding,
+            },
+            window_millis,
+            limit: spec.limit,
+        });
     }
 
-    // Fixed-capacity, allocated inline: at most `MAX_REDIS_ADMISSION_WINDOWS`
-    // windows by construction, on a proxy hot path.
-    let mut elapsed_fractions = [0.0_f64; MAX_REDIS_ADMISSION_WINDOWS];
-    let mut charges = RedisWindowCharges::default();
-    for (index, spec) in specs.iter().enumerate() {
-        let window_seconds = spec.duration.as_secs().max(1);
-        // One timestamp sample per window, so a boundary straddle cannot pair
-        // an index from one instant with a fraction from another.
-        let progress = RedisRateLimitClient::window_progress(window_seconds);
-        let current_index = progress.index.to_string();
-        let previous_index = progress.index.saturating_sub(1).to_string();
-        let charge = RedisWindowCharge {
-            previous_key: redis.make_slot_key(key, &[&previous_index]),
-            current_key: redis.make_slot_key(key, &[&current_index]),
-            ttl_seconds: two_window_ttl_seconds(window_seconds),
-        };
-        if !charges.push(charge) {
-            // Unreachable behind the bound above; still fail closed rather than
-            // charge a subset of the configured windows.
-            return Err(());
-        }
-        elapsed_fractions[index] = progress.elapsed_fraction;
-    }
-
-    let charged = redis.charge_rate_limit_windows(charges.as_slice()).await?;
-    let counts = charged.as_slice();
-    if counts.len() != specs.len() {
-        // `charge_rate_limit_windows` already refused a short reply; this keeps
-        // the indexing below total rather than trusting that a second time.
-        return Err(());
-    }
-
-    let mut tightest: Option<(u64, u64, u64)> = None;
-    let mut refused: Option<&RateLimitWindowSpec> = None;
-    for (index, spec) in specs.iter().enumerate() {
-        let (previous, current) = counts[index];
-        // A counter can only be negative when a compensation raced this key's
-        // expiry; read that as zero usage rather than as negative budget.
-        let previous = previous.max(0) as u64;
-        let current = current.max(0) as u64;
-        let weighted = weighted_window_count(previous, current, elapsed_fractions[index]);
-        if weighted > spec.limit as f64 {
-            refused = Some(spec);
-            break;
-        }
-
-        let remaining = (spec.limit as f64 - weighted).max(0.0) as u64;
-        match tightest {
-            Some((current_remaining, _, _)) if remaining >= current_remaining => {}
-            _ => {
-                tightest = Some((remaining, spec.limit, spec.duration.as_secs()));
-            }
-        }
-    }
-
-    if let Some(spec) = refused {
-        // Hand back every window this request charged, including the ones that
-        // fit — from a DETACHED task holding the client `Arc`, so dropping this
-        // request future (a gRPC deadline, a client disconnect) cannot strand
-        // the charge, and the refused caller does not pay the second round trip
-        // inline. A failed compensation is still reported through the client's
-        // ordinary failure path, so `redis_failure_policy` governs the NEXT
-        // decision; this one is a correct refusal either way and is returned.
-        Arc::clone(redis)
-            .spawn_uncharge_rate_limit_windows(charges)
-            .await;
-        return Ok(RateLimitOutcome::deny()
-            .with_limit(spec.limit)
-            .with_window(spec.duration.as_secs()));
-    }
-
-    let mut outcome = RateLimitOutcome::allow();
-    if let Some((remaining, limit, window_seconds)) = tightest {
-        outcome = outcome
-            .with_remaining(remaining)
-            .with_limit(limit)
-            .with_window(window_seconds);
-    }
-    Ok(outcome)
+    let state_key = http_windows_state_key(redis, key, specs)?;
+    let admission = redis
+        .admit_rate_limit_windows(&state_key, ttl, &windows)
+        .await?;
+    // The script only ever reports a window it was given; `admit_rate_limit_windows`
+    // already refused an out-of-range index.
+    let spec = specs.get(admission.window).ok_or(())?;
+    let outcome = if admission.allowed {
+        RateLimitOutcome::allow().with_remaining(admission.remaining)
+    } else {
+        RateLimitOutcome::deny()
+    };
+    Ok(outcome
+        .with_limit(spec.limit)
+        .with_window(spec.duration.as_secs()))
 }
 
 #[cfg(test)]

@@ -93,7 +93,20 @@
 //!
 //! # Algorithm
 //!
-//! Uses a **two-window weighted approximation** for sliding window rate limiting:
+//! HTTP, GraphQL, and gRPC-method quotas run one server-side admission script
+//! ([`HTTP_WINDOW_ADMISSION`]) per decision: a single `EVALSHA` on a pooled
+//! multiplexed connection evaluates every configured window against Redis'
+//! own `TIME`, charges all of them or none, and never renews the TTL on a
+//! refusal. Windows up to
+//! [`crate::plugins::utils::rate_limit::LOCAL_TOKEN_BUCKET_MAX_WINDOW_SECONDS`]
+//! use a continuously refilling token bucket, matching local mode exactly;
+//! longer windows use the two-window weighted approximation below. Admission is
+//! O(1) per request: the server serialises the script, so contention on one hot
+//! key neither costs a retry budget nor a round trip.
+//!
+//! Weighted-counter consumers (AI tokens, WebSocket frames, UDP datagrams) keep
+//! pipelined `INCR`/`GET`/`EXPIRE` commands with the same **two-window weighted
+//! approximation**:
 //!
 //! 1. Two fixed windows are maintained: the current window and the previous window.
 //! 2. The effective count = `prev_count * (1 - elapsed_fraction) + current_count`.
@@ -102,21 +115,10 @@
 //!    through `[0, 1)` instead of staying stuck at `0.0`.
 //! 4. This provides smooth rate limiting without boundary bursts.
 //!
-//! This is the same approach used by Cloudflare, Kong, and Nginx — no Lua scripts,
-//! just native Redis `INCR`/`GET`/`EXPIRE` commands pipelined for efficiency.
-//!
-//! HTTP, GraphQL, and gRPC-method quotas add **charge-then-compensate**
-//! admission on top of that approximation
-//! ([`RedisRateLimitClient::charge_rate_limit_windows`] /
-//! [`RedisRateLimitClient::uncharge_rate_limit_windows`]): one atomic
-//! `MULTI`/`EXEC` charges every configured window so the decision is tied to
-//! the caller's own increment, and a refusal issues one compensating
-//! `MULTI`/`EXEC` that hands the charge back on every window it touched. A
-//! refused request therefore leaves no lasting charge and cannot re-arm its own
-//! exhaustion (issue #5517), while the charge still precedes the decision so
-//! racing gateways can never both admit against one stale read. Both
-//! transactions run on the ordinary pooled multiplexed connections: no `WATCH`,
-//! no per-request connection, no retry budget, and still no scripting.
+//! This is the same approach used by Cloudflare, Kong, and Nginx. Everything
+//! except the HTTP-window admission script is plain RESP; that script needs the
+//! `@scripting` ACL category (`EVALSHA`, `SCRIPT LOAD`, `EVAL`) on the
+//! configured Redis user.
 //!
 //! # DNS
 //!
@@ -1874,8 +1876,10 @@ pub fn redis_getrange_end_index(max_bytes: usize) -> Result<isize, RedisGetrange
 
 /// A Redis-backed limiter/store client shared across plugin instances.
 ///
-/// Provides atomic counter and key-value operations using native Redis commands
-/// (no Lua scripts). It does NOT fall back on its own: an unreachable endpoint
+/// Provides atomic counter and key-value operations using native Redis commands,
+/// plus the single HTTP-window admission script ([`HTTP_WINDOW_ADMISSION`]) that
+/// rate-limit quotas evaluate with `EVALSHA`. It does NOT fall back on its own:
+/// an unreachable endpoint
 /// simply reports unavailable, and each consumer's `redis_failure_policy` (or
 /// `request_deduplication`'s `on_redis_unavailable`) decides between failing
 /// closed and an explicit local fallback (`rate_limiting` defaults to the
@@ -2179,6 +2183,176 @@ pub fn classify_replay_set_nx_reply(reply: Option<&str>) -> Result<bool, ReplayS
     }
 }
 
+/// Server-side admission script for HTTP/GraphQL/gRPC rate-limit windows.
+///
+/// Every decision is ONE `EVALSHA` against the shared pooled connection: the
+/// script reads the key's compact state, evaluates every configured window
+/// against Redis' own clock, and rewrites the state only when *all* of them
+/// admit. A refusal therefore charges no window and renews no TTL (issue
+/// #5517), and admission stays O(1) per request no matter how many gateways
+/// contend on one key — there is no `WATCH` retry loop to exhaust and no
+/// per-request connection to dial.
+///
+/// State is a single space-separated string: a format version followed by
+/// three numbers per window. Token-bucket windows store
+/// `tokens`/`updated_micros`/`0`; weighted sliding windows store
+/// `window_index`/`current_count`/`previous_count`.
+const HTTP_WINDOW_ADMISSION_SCRIPT: &str = r#"
+-- Ferrum Edge atomic multi-window rate-limit admission.
+--
+-- KEYS[1]      state key holding every window of one rate identity
+-- ARGV[1]      state TTL in seconds
+-- ARGV[3i-1]   window i kind: 1 = token bucket, 2 = weighted sliding window
+-- ARGV[3i]     window i length in milliseconds
+-- ARGV[3i+1]   window i request limit
+--
+-- Reply: {allowed, remaining, window}. `window` is the 1-based index of the
+-- window the caller reports: the first refusing window, or the admitted window
+-- with the least remaining budget.
+if redis.replicate_commands then
+    redis.replicate_commands()
+end
+
+local count = (#ARGV - 1) / 3
+if count < 1 or count ~= math.floor(count) then
+    return redis.error_reply('ferrum-edge: malformed rate-limit window list')
+end
+
+local clock = redis.call('TIME')
+-- Microseconds since the epoch stay exact in a double well below 2^53, and the
+-- server clock is the only clock: gateway wall clocks never enter the math.
+local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
+
+-- Bounded read: a legitimate state value is at most 52 bytes per window plus
+-- the version tag, so this cap can only truncate a foreign writer's value into
+-- a token count that fails the shape check below.
+local stored = redis.call('GETRANGE', KEYS[1], '0', string.format('%d', count * 64 + 16))
+local state = {}
+local restored = false
+if stored and stored ~= '' then
+    local seen = 0
+    for token in string.gmatch(stored, '[^ ]+') do
+        seen = seen + 1
+        state[seen] = tonumber(token)
+    end
+    restored = (seen == count * 3 + 1) and (state[1] == 1)
+    for i = 2, seen do
+        local value = state[i]
+        -- Unparsable, NaN, and infinite fields restart the budget instead of
+        -- poisoning the arithmetic below.
+        if value == nil or value ~= value or value == math.huge or value == -math.huge then
+            restored = false
+        end
+    end
+end
+
+local allowed = 1
+local report = 1
+local best = -1
+local charged = {}
+
+for i = 1, count do
+    local kind = tonumber(ARGV[3 * i - 1])
+    local length = tonumber(ARGV[3 * i]) * 1000
+    local limit = tonumber(ARGV[3 * i + 1])
+    local base = (i - 1) * 3 + 1
+    local a, b, c
+    if restored then
+        a = state[base + 1]
+        b = state[base + 2]
+        c = state[base + 3]
+    end
+    local fits
+    local remaining
+    if kind == 1 then
+        -- Token bucket: capacity `limit`, refilled continuously over `length`.
+        local tokens = limit
+        local updated = now
+        if a ~= nil then
+            tokens = a
+            updated = b
+            if tokens < 0 then tokens = 0 end
+            if tokens > limit then tokens = limit end
+            -- A server clock that moved backwards must not refill the same
+            -- interval twice; leave the watermark alone, exactly like the
+            -- in-memory bucket's checked elapsed guard.
+            if now > updated then
+                tokens = tokens + ((now - updated) / length) * limit
+                if tokens > limit then tokens = limit end
+                updated = now
+            end
+        end
+        fits = tokens >= 1
+        remaining = tokens - 1
+        charged[i] = {tokens - 1, updated, 0}
+    else
+        -- Two fixed windows weighted by the elapsed fraction of the current one.
+        local index = math.floor(now / length)
+        local fraction = (now - index * length) / length
+        local current = 0
+        local previous = 0
+        if a ~= nil then
+            current = b
+            previous = c
+            if current < 0 then current = 0 end
+            if previous < 0 then previous = 0 end
+            if index == a + 1 then
+                previous = current
+                current = 0
+            elseif index > a + 1 then
+                previous = 0
+                current = 0
+            elseif index < a then
+                -- Backwards clock: keep the charged window and count the
+                -- previous one in full rather than reopening spent budget.
+                index = a
+                fraction = 0
+            end
+        end
+        local weighted = previous * (1 - fraction) + current
+        fits = (weighted + 1) <= limit
+        remaining = limit - (weighted + 1)
+        charged[i] = {index, current + 1, previous}
+    end
+    if not fits then
+        allowed = 0
+        report = i
+        break
+    end
+    if remaining < 0 then remaining = 0 end
+    remaining = math.floor(remaining)
+    if best < 0 or remaining < best then
+        best = remaining
+        report = i
+    end
+end
+
+if allowed == 1 then
+    local out = {'1'}
+    for i = 1, count do
+        local window = charged[i]
+        out[#out + 1] = string.format('%.6f', window[1])
+        out[#out + 1] = string.format('%.0f', window[2])
+        out[#out + 1] = string.format('%.0f', window[3])
+    end
+    -- ARGV[1] is already the decimal TTL string the gateway sent.
+    redis.call('SET', KEYS[1], table.concat(out, ' '), 'EX', ARGV[1])
+end
+
+if best < 0 then
+    best = 0
+end
+return {allowed, best, report}
+"#;
+
+/// Compiled admission script, hashed once per process.
+///
+/// [`redis::Script`] sends `EVALSHA` and only falls back to `SCRIPT LOAD` +
+/// `EVALSHA` when the server answers `NOSCRIPT` (a restart or `SCRIPT FLUSH`),
+/// so the steady state is exactly one round trip per decision.
+static HTTP_WINDOW_ADMISSION: std::sync::LazyLock<redis::Script> =
+    std::sync::LazyLock::new(|| redis::Script::new(HTTP_WINDOW_ADMISSION_SCRIPT));
+
 /// The two fixed-window counters of ONE configured rate-limit window, plus the
 /// retention the charge must (re)assert on the current one.
 ///
@@ -2210,6 +2384,44 @@ pub struct RedisWindowCharge {
 /// widen an atomic operation past the fixed-capacity buffers the admission hot
 /// path is built on. Over the ceiling both helpers fail closed.
 pub const MAX_REDIS_ADMISSION_WINDOWS: usize = 3;
+
+/// Which algorithm the admission script applies to one window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RedisWindowKind {
+    /// Continuous refill, mirroring the in-memory `TokenBucket`.
+    TokenBucket,
+    /// Previous/current fixed windows weighted by the elapsed fraction.
+    WeightedSliding,
+}
+
+impl RedisWindowKind {
+    /// Wire tag the script branches on.
+    fn tag(self) -> u64 {
+        match self {
+            Self::TokenBucket => 1,
+            Self::WeightedSliding => 2,
+        }
+    }
+}
+
+/// One configured window as the admission script evaluates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RedisAdmissionWindow {
+    pub(crate) kind: RedisWindowKind,
+    pub(crate) window_millis: u64,
+    pub(crate) limit: u64,
+}
+
+/// Result of one atomic multi-window admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RedisWindowAdmission {
+    pub(crate) allowed: bool,
+    /// Remaining budget of [`Self::window`]; meaningless when refused.
+    pub(crate) remaining: u64,
+    /// Zero-based index of the window the caller reports — the refusing one, or
+    /// the admitted one with the least remaining budget.
+    pub(crate) window: usize,
+}
 
 /// Fixed-capacity inline list of the windows one atomic charge covers.
 ///
@@ -4314,6 +4526,85 @@ impl RedisRateLimitClient {
                     operation = "compare-delete EXEC",
                     error = %e,
                     "Redis transaction failed"
+                );
+                self.note_command_failure(&e);
+                Err(())
+            }
+        }
+    }
+
+    /// Atomically admit one request against every configured rate-limit window.
+    ///
+    /// Runs [`HTTP_WINDOW_ADMISSION`] with `EVALSHA` on the ordinary pooled
+    /// multiplexed slots: one round trip, no `WATCH`, no `MULTI`, and no
+    /// per-request connection. The script owns the whole decision, so either
+    /// every window is charged or none is, a refusal leaves both the counters
+    /// and the TTL untouched, and contention on a hot key costs nothing — the
+    /// server serialises the script, there is no optimistic-retry budget to
+    /// exhaust.
+    ///
+    /// The connecting Redis user needs the `@scripting` category (`EVALSHA`,
+    /// `SCRIPT LOAD`, and `EVAL`) in addition to `GETRANGE`/`SET` on the
+    /// configured key prefix. `Err(())` covers every failure — transport, a
+    /// denied or unsupported script command, `NOSCRIPT` that a reload could not
+    /// repair, a malformed reply, or a topology proven while the call was in
+    /// flight — and hands the decision to the consumer's
+    /// `redis_failure_policy`. A script-level refusal is an ordinary `Ok`
+    /// outcome with `allowed == false`, never an outage.
+    #[allow(clippy::result_unit_err)]
+    pub(super) async fn admit_rate_limit_windows(
+        &self,
+        key: &str,
+        ttl_seconds: u64,
+        windows: &[RedisAdmissionWindow],
+    ) -> Result<RedisWindowAdmission, ()> {
+        if windows.is_empty() || windows.len() > MAX_REDIS_ADMISSION_WINDOWS {
+            return Err(());
+        }
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let mut invocation = HTTP_WINDOW_ADMISSION.prepare_invoke();
+        invocation.key(key).arg(expire_seconds(ttl_seconds));
+        for window in windows {
+            invocation
+                .arg(window.kind.tag())
+                .arg(window.window_millis)
+                .arg(window.limit);
+        }
+
+        let result: Result<Vec<i64>, redis::RedisError> = invocation.invoke_async(&mut conn).await;
+        match result {
+            Ok(reply) => {
+                self.note_command_success()?;
+                let fields = reply.len();
+                let [allowed, remaining, reported] = reply[..] else {
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        operation = "EVALSHA",
+                        fields,
+                        "Redis rate-limit admission script returned an unexpected reply shape"
+                    );
+                    return Err(());
+                };
+                // A reported window outside the submitted list would silently
+                // advertise another window's limit, so fail closed instead.
+                let window = usize::try_from(reported)
+                    .ok()
+                    .and_then(|index| index.checked_sub(1))
+                    .filter(|index| *index < windows.len())
+                    .ok_or(())?;
+                Ok(RedisWindowAdmission {
+                    allowed: allowed == 1,
+                    remaining: u64::try_from(remaining).unwrap_or(0),
+                    window,
+                })
+            }
+            Err(e) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "EVALSHA",
+                    error = %e,
+                    "Redis rate-limit admission script failed"
                 );
                 self.note_command_failure(&e);
                 Err(())

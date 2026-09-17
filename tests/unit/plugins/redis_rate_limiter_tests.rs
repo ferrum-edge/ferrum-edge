@@ -3515,135 +3515,81 @@ async fn an_unpairable_charge_reply_marks_the_client_unavailable() {
     let _ = server.shutdown.send(());
 }
 
-/// Issue #5517 design pins. The HTTP-window decision is charge-then-compensate
+/// Issue #5517 design pins. The HTTP-window decision is one server-side script
 /// on the SHARED POOLED connection: no per-request dial, no `WATCH` retry loop,
-/// no server-side scripting, and no refusal that keeps its charge.
+/// and no write on a refusal.
 #[test]
-fn http_window_admission_is_pooled_plain_resp_and_hands_back_a_refused_charge() {
+fn http_window_admission_is_one_pooled_script_call_that_only_writes_on_admission() {
     let redis = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
     let limiter = include_str!("../../../src/plugins/utils/rate_limit.rs");
 
-    for (helper, command) in [
-        ("pub async fn charge_rate_limit_windows(", "\"INCR\""),
-        ("pub async fn uncharge_rate_limit_windows(", "\"DECR\""),
-    ] {
-        let start = redis
-            .find(helper)
-            .unwrap_or_else(|| panic!("{helper} must exist"));
-        let rest = &redis[start..];
-        let end = rest[1..]
-            .find("\n    /// ")
-            .map(|index| index + 1)
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
-        assert!(
-            body.contains("self.get_connection().await"),
-            "{helper} must run on the shared pooled multiplexed slots"
-        );
-        assert!(
-            !body.contains("get_dedicated_connection"),
-            "{helper} must never dial a per-request connection"
-        );
-        assert_eq!(
-            body.matches("pipeline.atomic();").count(),
-            1,
-            "{helper} must be exactly one atomic MULTI/EXEC"
-        );
-        assert!(
-            body.contains(command),
-            "{helper} must issue {command} for every window"
-        );
-        for forbidden in ["WATCH", "EVAL", "SCRIPT"] {
-            assert!(
-                !body.contains(forbidden),
-                "{helper} must stay plain RESP; found {forbidden}"
-            );
-        }
-    }
-
-    let start = limiter
-        .find("async fn check_http_windows_redis(")
-        .expect("Redis admission entry point");
-    let rest = &limiter[start..];
-    let end = rest
-        .find("\n}\n")
-        .map(|index| index + 2)
+    let start = redis
+        .find("pub(super) async fn admit_rate_limit_windows(")
+        .expect("admission helper");
+    let rest = &redis[start..];
+    let end = rest[1..]
+        .find("\n    /// ")
+        .map(|i| i + 1)
         .unwrap_or(rest.len());
     let body = &rest[..end];
-    let charge = body
-        .find("redis.charge_rate_limit_windows(charges.as_slice())")
-        .expect("admission must charge every window in one transaction");
-    let refusal = body
-        .find("if let Some(spec) = refused {")
-        .expect("admission must have a single refusal branch");
-    let compensation = body
-        .find(".spawn_uncharge_rate_limit_windows(charges)")
-        .expect("a refusal must hand the charge back");
     assert!(
-        charge < refusal && refusal < compensation,
-        "the charge must precede the decision, and the hand-back must sit behind \
-         the refusal branch"
+        body.contains("self.get_connection().await"),
+        "admission must run on the shared pooled multiplexed slots"
+    );
+    assert!(
+        !body.contains("get_dedicated_connection"),
+        "admission must never dial a per-request connection"
+    );
+    assert!(
+        !body.contains("WATCH") && !body.contains("MULTI"),
+        "admission must not reintroduce an optimistic transaction"
+    );
+    assert!(
+        body.contains("invoke_async"),
+        "admission must run the cached script (EVALSHA, SCRIPT LOAD on NOSCRIPT)"
+    );
+
+    let script_start = redis
+        .find("const HTTP_WINDOW_ADMISSION_SCRIPT: &str = r#\"")
+        .expect("admission script");
+    let tail = &redis[script_start..];
+    let script_end = tail.find("\"#;").expect("admission script terminator");
+    let script = &tail[..script_end];
+    assert!(
+        script.contains("redis.call('TIME')"),
+        "the server's own clock must decide every window"
     );
     assert_eq!(
-        body.matches("uncharge_rate_limit_windows").count(),
+        script.matches("redis.call('SET'").count(),
         1,
-        "an admitted request must never compensate"
+        "the state value must have exactly one write site"
     );
-    // The hand-back must NOT be tied to the request future. Plugin hooks run
-    // under `tokio::time::timeout_at`, so a gRPC deadline or a client
-    // disconnect drops the hook future; awaiting the compensation inline let
-    // that cancellation strand the charge until the window's TTL elapsed, with
-    // no failure accounting and no `redis_failure_policy` involvement.
-    let spawner = redis
-        .find("pub async fn spawn_uncharge_rate_limit_windows(")
-        .expect("the detached compensation entry point must exist");
-    let spawner_body = {
-        let rest = &redis[spawner..];
-        let end = rest[1..]
-            .find("\n    /// ")
-            .map(|index| index + 1)
-            .unwrap_or(rest.len());
-        &rest[..end]
-    };
+    let write = script.find("redis.call('SET'").expect("state write");
+    assert_eq!(
+        script.matches("if allowed == 1 then").count(),
+        1,
+        "there must be exactly one admitted-only guard"
+    );
+    let guard = script
+        .find("if allowed == 1 then")
+        .expect("admitted-only guard");
     assert!(
-        spawner_body.contains("self: Arc<Self>"),
-        "the compensation task must own the client Arc, not borrow the caller's"
+        guard < write,
+        "the only state write must sit behind the admitted-only guard"
     );
     assert!(
-        spawner_body.contains("handle.spawn(compensate)"),
-        "the compensation must be detached from the request future"
-    );
-    assert!(
-        spawner_body.contains("uncharge_rate_limit_windows(charges.as_slice())"),
-        "the detached task must issue the compensating transaction"
+        script.contains("'EX'"),
+        "the TTL must be refreshed with the same admitted-only write"
     );
 
-    for forbidden in [
-        "EVALSHA",
-        "SCRIPT LOAD",
-        "@scripting",
-        "HTTP_WINDOW_ADMISSION",
-        "admit_rate_limit_windows",
-    ] {
-        assert!(
-            !redis.contains(forbidden) && !limiter.contains(forbidden),
-            "the rejected server-side script design must be gone; found {forbidden}"
-        );
-    }
-
-    // Issue #5517 asked for this audit explicitly: the GraphQL and gRPC-method
-    // quotas must reach the SAME helper, not a private copy that keeps the old
-    // charge-a-refusal behaviour.
-    for consumer in [
-        include_str!("../../../src/plugins/rate_limiting.rs"),
-        include_str!("../../../src/plugins/graphql.rs"),
-        include_str!("../../../src/plugins/grpc_method_router.rs"),
-    ] {
-        assert!(
-            consumer.contains("RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>"),
-            "every HTTP-family quota must admit through the shared window helper"
-        );
-    }
+    assert!(
+        !redis.contains("update_rate_limit_state") && !limiter.contains("update_rate_limit_state"),
+        "the retried WATCH snapshot helper must be gone"
+    );
+    assert!(
+        !limiter.contains("RedisHttpWindows"),
+        "the per-request JSON snapshot of the local algorithm state must be gone"
+    );
 }
 
 // ── Cached pool must not transparently reconnect (GHSA-87rq root review) ──
