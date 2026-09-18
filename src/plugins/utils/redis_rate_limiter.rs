@@ -2989,6 +2989,10 @@ pub struct RedisWindowCharge {
     /// [`RedisRateLimitClient::window_charge`], so every range is UTF-8 aligned
     /// by construction. That is the invariant the accessors slice on.
     ranges: [(usize, usize); REDIS_WINDOW_SUB_BUCKET_KEYS],
+    /// Previous/current keys used by pre-sub-bucket releases.  New releases
+    /// keep charging these counters so a rolling deployment has one shared
+    /// budget rather than one budget per key-layout generation.
+    legacy_ranges: [(usize, usize); 2],
     /// Retention asserted on [`Self::charged_key`] by both transactions.
     ttl_seconds: u64,
     /// The sub-bucket this charge selected, kept so the caller can judge after
@@ -3024,6 +3028,27 @@ impl RedisWindowCharge {
     pub fn next_key(&self) -> &str {
         let (start, end) = self.ranges[REDIS_WINDOW_TRAILING_SUB_BUCKETS + 1];
         &self.keys[start..end]
+    }
+
+    /// Previous whole-window key retained for mixed-version enforcement.
+    pub fn legacy_previous_key(&self) -> &str {
+        let (start, end) = self.legacy_ranges[0];
+        &self.keys[start..end]
+    }
+
+    /// Current whole-window key retained for mixed-version enforcement.
+    pub fn legacy_current_key(&self) -> &str {
+        let (start, end) = self.legacy_ranges[1];
+        &self.keys[start..end]
+    }
+
+    /// Whether the server executed in the whole-window bucket whose legacy
+    /// counter this charge selected. A rollover rebuild is required otherwise.
+    pub fn legacy_bucket_is_settled(&self, now: Duration) -> bool {
+        let window_nanos =
+            (self.bucket.window_seconds.max(1) as u128).saturating_mul(1_000_000_000);
+        let server_index = now.as_nanos() / window_nanos;
+        server_index == (self.bucket.index / REDIS_WINDOW_SUB_BUCKETS as u64) as u128
     }
 
     /// Retention asserted on [`Self::charged_key`] by both transactions.
@@ -5700,6 +5725,19 @@ impl RedisRateLimitClient {
                 .arg(window.charged_key())
                 .arg(expire_seconds(window.ttl_seconds()))
                 .ignore();
+            // Dual-write the legacy whole-window counter and include its
+            // weighted usage in admission. This is intentionally permanent:
+            // an old replica has no generation handshake and may coexist for
+            // longer than any configured quota window.
+            pipeline
+                .cmd("GET")
+                .arg(window.legacy_previous_key())
+                .cmd("INCR")
+                .arg(window.legacy_current_key())
+                .cmd("EXPIRE")
+                .arg(window.legacy_current_key())
+                .arg(expire_seconds(window.ttl_seconds()))
+                .ignore();
         }
         // Last, and once per transaction rather than once per window: it is the
         // instant the SERVER applied this whole `EXEC`, which is what orders
@@ -5713,7 +5751,8 @@ impl RedisRateLimitClient {
         // redis-rs's own decode allocation, and it is consumed element by
         // element below — redis-rs decodes a `Value` by value, so borrowing
         // would add one clone per counter on the admission hot path.
-        let expected_values = windows.len() * REDIS_WINDOW_SUB_BUCKET_KEYS + 1;
+        let values_per_window = REDIS_WINDOW_SUB_BUCKET_KEYS + 2;
+        let expected_values = windows.len() * values_per_window + 1;
         // Both samples are this process's own clock, and their DIFFERENCE is
         // the only thing read from them besides the offset: it decides whether
         // the reply arrived promptly enough for its `TIME` to be worth
@@ -5725,10 +5764,11 @@ impl RedisRateLimitClient {
         match result {
             Ok(reply) if reply.len() == expected_values => {
                 self.note_command_success()?;
-                let mut counts = RedisWindowCounts::default();
+                let mut trailing_counts = [0_u64; MAX_REDIS_ADMISSION_WINDOWS];
+                let mut legacy_counts = [(0_i64, 0_i64); MAX_REDIS_ADMISSION_WINDOWS];
                 let mut ladder = [None; REDIS_WINDOW_SUB_BUCKET_KEYS];
                 let mut values = reply.into_iter();
-                for _ in 0..windows.len() {
+                for index in 0..windows.len() {
                     for slot in ladder.iter_mut() {
                         let decoded = match values.next() {
                             Some(value) => redis::from_redis_value::<Option<i64>>(value).ok(),
@@ -5750,7 +5790,23 @@ impl RedisRateLimitClient {
                         };
                         *slot = count;
                     }
-                    counts.push(redis_trailing_window_count(&ladder));
+                    trailing_counts[index] = redis_trailing_window_count(&ladder);
+                    let previous = values
+                        .next()
+                        .and_then(|value| redis::from_redis_value::<Option<i64>>(value).ok());
+                    let current = values
+                        .next()
+                        .and_then(|value| redis::from_redis_value::<i64>(value).ok());
+                    let (Some(previous), Some(current)) = (previous, current) else {
+                        self.mark_unavailable();
+                        warn_sampled!(
+                            redis_url = %self.config.redacted_url(),
+                            operation = "GET+INCR+EXPIRE",
+                            "Redis rate-limit charge returned an unreadable legacy counter"
+                        );
+                        return Err(());
+                    };
+                    legacy_counts[index] = (previous.unwrap_or(0), current);
                 }
                 let sampled = values.next().and_then(parse_redis_server_time);
                 let Some(server_time) = sampled else {
@@ -5766,6 +5822,18 @@ impl RedisRateLimitClient {
                     );
                     return Err(());
                 };
+                let mut counts = RedisWindowCounts::default();
+                for (index, window) in windows.iter().enumerate() {
+                    let window_nanos = (window.bucket().window_seconds.max(1) as u128)
+                        .saturating_mul(1_000_000_000);
+                    let elapsed =
+                        (server_time.as_nanos() % window_nanos) as f64 / window_nanos as f64;
+                    let (previous, current) = legacy_counts[index];
+                    let legacy = (previous.max(0) as f64 * (1.0 - elapsed) + current.max(0) as f64)
+                        .ceil()
+                        .min(u64::MAX as f64) as u64;
+                    counts.push(trailing_counts[index].max(legacy));
+                }
                 // A reply held longer than one sub-bucket of the tightest
                 // window this transaction charged teaches an offset that is
                 // already stale by more than the ladder's forward cover, so the
@@ -5884,6 +5952,14 @@ impl RedisRateLimitClient {
                 .ignore()
                 .cmd("EXPIRE")
                 .arg(window.charged_key())
+                .arg(expire_seconds(window.ttl_seconds()))
+                .ignore();
+            pipeline
+                .cmd("DECR")
+                .arg(window.legacy_current_key())
+                .ignore()
+                .cmd("EXPIRE")
+                .arg(window.legacy_current_key())
                 .arg(expire_seconds(window.ttl_seconds()))
                 .ignore();
         }
@@ -6173,7 +6249,8 @@ impl RedisRateLimitClient {
         let key_len = slot_tag_component_len(&self.config.key_prefix)
             .saturating_add(slot_tag_component_len(rate_key))
             .saturating_add(45);
-        let mut keys = String::with_capacity(key_len.saturating_mul(REDIS_WINDOW_SUB_BUCKET_KEYS));
+        let mut keys =
+            String::with_capacity(key_len.saturating_mul(REDIS_WINDOW_SUB_BUCKET_KEYS + 2));
         let mut ranges = [(0_usize, 0_usize); REDIS_WINDOW_SUB_BUCKET_KEYS];
         for (slot, range) in ranges.iter_mut().enumerate() {
             // Oldest first: slot `K + 1` is the bucket this charge increments
@@ -6202,9 +6279,25 @@ impl RedisRateLimitClient {
             let _ = write!(keys, ":{}:{}", bucket.window_seconds, index);
             *range = (start, keys.len());
         }
+        let legacy_index = bucket.index / REDIS_WINDOW_SUB_BUCKETS as u64;
+        let mut legacy_ranges = [(0_usize, 0_usize); 2];
+        for (slot, index) in [legacy_index.saturating_sub(1), legacy_index]
+            .into_iter()
+            .enumerate()
+        {
+            let start = keys.len();
+            keys.push('{');
+            push_slot_tag_component(&mut keys, &self.config.key_prefix);
+            keys.push(':');
+            push_slot_tag_component(&mut keys, rate_key);
+            keys.push('}');
+            let _ = write!(keys, ":{index}");
+            legacy_ranges[slot] = (start, keys.len());
+        }
         RedisWindowCharge {
             keys,
             ranges,
+            legacy_ranges,
             ttl_seconds,
             bucket,
         }

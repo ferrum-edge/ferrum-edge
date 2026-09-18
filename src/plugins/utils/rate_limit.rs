@@ -2522,11 +2522,10 @@ async fn check_http_windows_redis(
         // to is invisible to every peer reading its own trailing window, and a
         // charge applied more than one bucket after it may have missed a peer.
         // Both rebuild from the server instant that proved the mismatch.
-        if charges
-            .as_slice()
-            .iter()
-            .all(|charge| sub_bucket_charge_is_settled(charge.bucket(), settled_at))
-        {
+        if charges.as_slice().iter().all(|charge| {
+            sub_bucket_charge_is_settled(charge.bucket(), settled_at)
+                && charge.legacy_bucket_is_settled(settled_at)
+        }) {
             break (charges, charged);
         }
 

@@ -56,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transient charge is visible to concurrent requests for the same identity,
   which can refuse slightly early under contention and never over-admits; a
   refused request costs two round trips instead of one.
+- Redis request quotas also charge and consult the previous whole-window keys.
+  The stricter of that weighted count and the trailing-window count governs,
+  preserving live usage across restarts and mixed-version rolling upgrades.
 - **Redis request quotas: what the trailing-window over-count costs.** Counting
   the oldest sub-buckets at face value means the ladder covers slightly more
   than the exact trailing window, so a client sending at *exactly* its configured
@@ -208,11 +211,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (windows over five seconds) and Redis mode are trailing-window caps, and each
   has its own documented over-count bound. `docs/plugins.md` now describes the
   three contracts separately.
-- **Redis request-quota key layout changed** (`rate_limiting`, `graphql`,
-  `grpc_method_router`): counters now live at
-  `{prefix:rate-key}:{window_seconds}:{sub_index}` instead of
-  `{prefix:rate-key}:{window_index}`, over nineteen sub-buckets per window
-  rather than a previous/current pair. The keyspace command set (`GET`, `INCR`,
+- **Redis request-quota key layout extended** (`rate_limiting`, `graphql`,
+  `grpc_method_router`): sub-bucket counters now live at
+  `{prefix:rate-key}:{window_seconds}:{sub_index}` alongside the retained
+  `{prefix:rate-key}:{window_index}` previous/current pair. The keyspace command set (`GET`, `INCR`,
   `DECR`, `EXPIRE`, `MULTI`, `EXEC`) and the key prefix are unchanged, but the
   server-clock contract above adds one **new** command for these three plugins:
   **restrictive Redis ACLs must grant `TIME`** (`+time`, or the category that
@@ -220,10 +222,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a request-quota policy: each of its connections probes `TIME` once before it
   carries a policy command, and a `NOPERM` (or an unimplemented `TIME`) discards
   that connection so `redis_failure_policy` governs. Every other Redis-backed
-  plugin is unaffected and needs no ACL change. An in-place upgrade also starts new counters: expect up
-  to one window of reduced enforcement while the ladder fills, and during a
-  rolling upgrade old and new replicas count against separate keys until every
-  replica is on the new build. Abandoned counters expire on their own TTL.
+  plugin is unaffected and needs no ACL change. New replicas dual-write and
+  consult the previous whole-window counters, preserving still-live usage and
+  one shared budget through in-place and rolling upgrades.
   `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting` are token or
   datagram accounting rather than request quotas; their key layouts and counting
   are unchanged.

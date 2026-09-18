@@ -1360,6 +1360,8 @@ fn window_charge_keys_share_a_hash_tag_and_name_their_window() {
     // The forward counter: read, never written, and what makes two reordered
     // transactions on either side of a boundary see each other.
     assert_eq!(charge.next_key(), format!("{tag}:1:1601"));
+    assert_eq!(charge.legacy_previous_key(), format!("{tag}:99"));
+    assert_eq!(charge.legacy_current_key(), format!("{tag}:100"));
     assert_eq!(
         charge.bucket(),
         RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 1),
@@ -1372,7 +1374,12 @@ fn window_charge_keys_share_a_hash_tag_and_name_their_window() {
 
     // Every key of one transaction hashes to the same slot.
     let charged = charge.charged_key();
-    for key in trailing.iter().copied().chain([charged, charge.next_key()]) {
+    for key in trailing.iter().copied().chain([
+        charged,
+        charge.next_key(),
+        charge.legacy_previous_key(),
+        charge.legacy_current_key(),
+    ]) {
         assert!(key.starts_with(tag), "{key} must carry the shared hash tag");
     }
 
@@ -4978,7 +4985,7 @@ fn the_server_clock_rides_inside_the_charge_transaction_and_is_probed_first() {
          never published, so nothing may branch on a per-client verdict"
     );
     assert!(
-        charge.contains("* REDIS_WINDOW_SUB_BUCKET_KEYS + 1"),
+        charge.contains("windows.len() * values_per_window + 1"),
         "the expected reply length must account for the one TIME element exactly"
     );
     assert!(
@@ -7098,11 +7105,12 @@ const CHARGE_GETS_PER_WINDOW: usize =
 /// Commands one window contributes to a charge transaction: every `GET`, plus
 /// `INCR` and `EXPIRE` on the sub-bucket being charged. Only the `EXPIRE` is
 /// `.ignore()`d, so the client pairs `CHARGE_COMMANDS_PER_WINDOW - 1` values.
-const CHARGE_COMMANDS_PER_WINDOW: usize = CHARGE_GETS_PER_WINDOW + 2;
+const CHARGE_COMMANDS_PER_WINDOW: usize = CHARGE_GETS_PER_WINDOW + 5;
 
 /// How the fake server answers the limiter's two transactions.
 ///
-/// A charge is `MULTI` / (`GET` × K / `INCR` / `EXPIRE`) per window / one
+/// A charge is `MULTI` / (sub-bucket `GET` × K / `INCR` / `EXPIRE` plus legacy
+/// `GET` / `INCR` / `EXPIRE`) per window / one
 /// trailing `TIME` for the whole transaction / `EXEC`; the compensating
 /// transaction a refusal issues is `MULTI` / `DECR` / `EXPIRE` / `EXEC` per
 /// window and carries no clock. The server tells them apart by the queued
@@ -7127,6 +7135,7 @@ enum TransactionScript {
 
 /// `EXEC` array for a charge: per window one `GET` per older sub-bucket (nil or
 /// an exhausted count), then `INCR` (the post-increment count) and `EXPIRE`,
+/// followed by the legacy previous `GET`, current `INCR`, and `EXPIRE`,
 /// and finally the one trailing `TIME` the charge queues once per transaction.
 ///
 /// The trailing clock is there because this fixture answers the standalone
@@ -7147,6 +7156,8 @@ fn charge_reply(windows: usize, exhausted: bool) -> Vec<u8> {
         for _ in 0..CHARGE_GETS_PER_WINDOW {
             reply.extend_from_slice(older);
         }
+        reply.extend_from_slice(charged);
+        reply.extend_from_slice(older);
         reply.extend_from_slice(charged);
     }
     reply.extend_from_slice(&host_clock_time_reply());
@@ -7171,12 +7182,12 @@ async fn await_compensations(client: &Arc<RedisRateLimitClient>) {
     }
 }
 
-/// `EXEC` array for a compensation: per window `DECR` and `EXPIRE`. Both are
+/// `EXEC` array for a compensation: sub-bucket and legacy `DECR`/`EXPIRE`. All are
 /// ignored by the client, so only the shape matters.
 fn compensation_reply(windows: usize) -> Vec<u8> {
-    let mut reply = format!("*{}\r\n", windows * 2).into_bytes();
+    let mut reply = format!("*{}\r\n", windows * 4).into_bytes();
     for _ in 0..windows {
-        reply.extend_from_slice(b":0\r\n:1\r\n");
+        reply.extend_from_slice(b":0\r\n:1\r\n:0\r\n:1\r\n");
     }
     reply
 }
@@ -7289,7 +7300,7 @@ async fn spawn_transaction_redis_server(script: TransactionScript) -> Transactio
                                     let windows = if charge {
                                         ladder / CHARGE_COMMANDS_PER_WINDOW
                                     } else {
-                                        queued.len() / 2
+                                        queued.len() / 4
                                     };
                                     let index = if charge {
                                         transactions.fetch_add(1, Ordering::Relaxed)
