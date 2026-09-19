@@ -256,6 +256,12 @@ cluster.
   documented separately in
   [node_agent_security.md](node_agent_security.md#blast-radius-if-compromised)
   and is materially larger than the gateway's.
+- The enrolled-pod tc guard directly admits DNS-shaped UDP replies (source port
+  53 to a destination port at least 32768) without relay proofs. It also admits
+  TCP to workload-declared probe ports from configured node addresses without
+  proving that the sender is kubelet. These lanes do not enforce relay
+  `mesh_authz`; see [direct-delivery exceptions](node_agent_security.md#direct-delivery-exceptions-in-the-enrolled-pod-guard)
+  for their exact checks, attacker prerequisites, and operational bounds.
 - Trust-bundle and PeerAuthentication reload paths do not independently reload
   the CRL set (see [mesh.md](mesh.md)).
 
@@ -330,6 +336,7 @@ release, not an open defect awaiting a fix in this document's scope.
 | Bounded authorization under an unrevalidatable trust generation | 4 | [Retention of an unrevalidatable verifier is bounded (issue #3813)](cp_namespace_tenancy.md#retention-of-an-unrevalidatable-verifier-is-bounded-issue-3813) |
 | Mesh capability varies by topology; node waypoint is experimental | 5 | [Maturity and Support Status](mesh.md#maturity-and-support-status) |
 | The node agent's blast radius exceeds the gateway's | 5 | [Blast radius if compromised](node_agent_security.md#blast-radius-if-compromised) |
+| DNS-shaped UDP replies and node-source TCP probes bypass the relay's identity checks | 5 | [Direct-delivery exceptions](node_agent_security.md#direct-delivery-exceptions-in-the-enrolled-pod-guard) |
 | WAF default rules ship monitor-only | 1 | [Default rules ship monitor-only](waf.md#default-rules-ship-monitor-only--and-how-to-enforce-them) |
 | A `rate_limiting` Redis outage yields one budget per pod (`local_fallback` default) | 6 | [rate_limiting](plugins.md#rate_limiting) |
 | Non-loopback plaintext admin only warns in `file`/`dp`/`mesh` | 3 | [Admin API](configuration.md#admin-api) |

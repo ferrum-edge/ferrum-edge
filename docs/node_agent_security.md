@@ -78,6 +78,43 @@ mesh-mode topology see [`docs/mesh.md`](mesh.md).
 - Optionally exposes a read-only admin listener for `/metrics` and `/health`
   (loopback-only by default — see [`docs/node_agent.md`](node_agent.md)).
 
+### Direct-delivery exceptions in the enrolled-pod guard
+
+The IPv4 and IPv6 tc guards have two functional exceptions to the authenticated
+relay path. Neither exception proves a mesh identity or runs the relay's
+`mesh_authz` policy:
+
+- **DNS-shaped UDP replies:** source port 53 and destination port at least 32768
+  return `TC_ACT_OK`. This is a port check, with no relay-cgroup, mark,
+  configured-node-source, reply-source-map, or outstanding-DNS-transaction check.
+  A sender able to inject a matching datagram that reaches the enrolled pod can
+  deliver it directly; a node-local raw-socket attacker is one example. Whether
+  a DNS client accepts the contents still depends on its own transaction and
+  response validation. The guard does not authenticate the resolver through
+  this exception. Keep raw-socket and host-network access restricted and review
+  the node's reachable DNS paths; the relay's sender proof does not protect them.
+- **TCP probes from configured node addresses:** a source in
+  `FERRUM_NODE_AGENT_NODE_IP` or `FERRUM_NODE_AGENT_NODE_IPS` may directly reach
+  the destination pod's declared HTTP, TCP, or gRPC liveness/readiness/startup
+  probe ports. Named ports resolve from that pod's container declarations; the
+  set is sorted and deduplicated. This lane checks neither a relay mark nor the
+  originating process or cgroup. A node-local process able to use a configured
+  source address can reach these ports without being kubelet. Workload authors
+  control the probe declarations, so treat those ports as directly exposed to
+  the trusted node-address set, keep probe endpoints narrowly scoped, and
+  restrict who can deploy workloads or gain host-network access. An empty
+  configured node-address set grants no such TCP exception.
+
+These are current compatibility boundaries, not evidence that every packet to
+an enrolled pod passes the relay. Requiring relay proofs on these lanes would
+also reject ordinary DNS responses or kubelet probes; narrowing them needs a
+separate design and live coverage for those callers. The UDP relay's existing
+three-proof admission remains required on its own lanes. The implementing
+predicates are `dns_response_allowed`, `node_probe_port4_allowed`, and
+`node_probe_port6_allowed` in
+[`tc_inbound.rs`](../ebpf/ferrum-ebpf/src/tc_inbound.rs); probe-port collection is
+`pod_probe_ports_from_spec` in [`node_agent.rs`](../src/modes/node_agent.rs).
+
 ### What it can read or modify
 
 - **Read**: every pod's metadata and bounded Node PodCIDR/InternalIP topology via
@@ -856,6 +893,6 @@ under the `system:serviceaccount:<ns>:ferrum-node-agent` identity.
 | PSS misconfigured (restricted / baseline) | This doc explicitly states `privileged` is required; do not apply restricted/baseline to the namespace | Operator |
 | Pinned BPF maps left behind after crash | Cleanup path unpins on SIGTERM; stale pins are removed by `pin_map_at` on next start | Gateway |
 | Kernel exploit via BPF verifier | Track CVEs in your kernel; the agent does not bundle a kernel and inherits the host's | Operator |
-| Same-node workload forges the NodeWaypoint UDP relay (issues #3956, #3957) | A workload in the HOST network namespace holding only SOCKET-level privilege (`CAP_NET_RAW` suffices for `IP_TRANSPARENT`, and for `SO_MARK` since Linux 5.17; `CAP_NET_ADMIN` grants both on any kernel) can `SO_MARK` the public `NODE_WAYPOINT_INBOUND_AUTH_MARK` and bind either a trusted node source address or a published Service ClusterIP, presenting every packet attribute the tc UDP guard used to accept — and because the reply-source map is listener-wide, one published tuple replays against ANY enrolled pod on the node. Every UDP admission therefore also requires `bpf_skb_cgroup_id()` to match `FERRUM_UDP_RELAY_CGROUPS`, the relay pod's own cgroup-v2 subtree as resolved by the node-agent from this node's hierarchy. That id is assigned by the kernel at socket creation from the creating task's cgroup, so it cannot be presented from outside the relay's cgroup; zero (forwarded traffic, tc ingress), a closed gate, an absent map, and an absent entry all deny. Keep `/sys/fs/cgroup` mounted read-only and do not grant workloads write access to the host cgroup hierarchy — a workload that can move itself into the waypoint's cgroup is outside this boundary. TCP admission is unchanged | Gateway + Operator |
+| Same-node workload forges the NodeWaypoint UDP relay (issues #3956, #3957) | A workload in the HOST network namespace holding only SOCKET-level privilege (`CAP_NET_RAW` suffices for `IP_TRANSPARENT`, and for `SO_MARK` since Linux 5.17; `CAP_NET_ADMIN` grants both on any kernel) can `SO_MARK` the public `NODE_WAYPOINT_INBOUND_AUTH_MARK` and bind either a trusted node source address or a published Service ClusterIP, presenting every packet attribute the tc UDP guard used to accept — and because the reply-source map is listener-wide, one published tuple replays against ANY enrolled pod on the node. Every admission through the UDP relay lanes therefore also requires `bpf_skb_cgroup_id()` to match `FERRUM_UDP_RELAY_CGROUPS`, the relay pod's own cgroup-v2 subtree as resolved by the node-agent from this node's hierarchy. That id is assigned by the kernel at socket creation from the creating task's cgroup, so it cannot be presented from outside the relay's cgroup; zero (forwarded traffic, tc ingress), a closed gate, an absent map, and an absent entry all deny. Keep `/sys/fs/cgroup` mounted read-only and do not grant workloads write access to the host cgroup hierarchy — a workload that can move itself into the waypoint's cgroup is outside this boundary. TCP admission is unchanged. The separate DNS-shaped direct-delivery exception is described above | Gateway + Operator |
 | Host-netns `CAP_NET_ADMIN` workload REMOVES the tc guard (issue #4021) | The cgroup sender proof holds against `CAP_NET_ADMIN` too — that capability grants no way to forge a cgroup id — but it does not defend the guard's own attachment. `attach_tc` calls aya's `SchedClassifier::attach`, which uses a TCX link on kernel **>= 6.6** and falls back to the legacy netlink/`clsact` path below it. On the legacy path a host-netns `CAP_NET_ADMIN` workload can `tc qdisc del dev <pod veth> clsact` and remove the classifier outright, with no forgery involved; on the TCX path it cannot preempt the program, because loading a competing one requires `CAP_BPF`. Run kernel >= 6.6, or keep workloads out of the host network namespace and do not grant them `CAP_NET_ADMIN` there | Operator |
 | Operator overrides the relay identity | `FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID` selects which cgroup the node-agent trusts as the UDP relay sender, so the chart renders it from the downward API `metadata.uid` and REJECTS an `ambient.env` override. The node-agent additionally refuses any relay identity that names one of this node's enrolled workloads, or whose resolved cgroup ids overlap an enrolled pod's subtree, so the channel can never authorize a protected pod to answer as the relay | Gateway |

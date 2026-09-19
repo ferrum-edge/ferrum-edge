@@ -81,14 +81,22 @@
 //!
 //! # Credential lifetime
 //!
-//! A lease NEVER prolongs a credential. Every pooled connection records the
-//! earliest monotonic deadline across the credentials that admitted it — the
-//! admitting request's own `RequestContext::credential_deadline_at` (already
-//! the minimum over every accepted credential on that request, SVID and JWT
-//! alike) and the gateway SVID leaf's `notAfter` — and a checkout that finds an
-//! elapsed deadline EVICTS the connection instead of handing it out. A leaf the
-//! gateway cannot parse collapses to an already-elapsed deadline, so it is
-//! never poolable; a `notAfter` beyond the representable monotonic range
+//! A lease NEVER prolongs a credential. An exclusive HTTP/1.1 connection records
+//! the earliest monotonic deadline across the admitting request's
+//! `RequestContext::credential_deadline_at` (the minimum over its accepted SVID
+//! and JWT credentials) and the gateway SVID leaf's `notAfter`. Checkout rejects
+//! expired entries and folds the current request's bound into the exclusive lease.
+//!
+//! A shared HTTP/2 carrier instead records the gateway SVID leaf's `notAfter`,
+//! the credential its CONNECT presents. Checkout enforces that carrier bound;
+//! it deliberately does not fold in an individual RPC's credential deadline,
+//! which would retire a shared transport because one caller has a short-lived
+//! JWT. Each RPC still passes source-side authorization before dispatch, and
+//! inner reuse requires every plugin's explicit reuse permission. Carrier reuse
+//! does not transfer one RPC's authorization to another.
+//!
+//! A gateway SVID leaf that cannot be parsed has an already-elapsed deadline
+//! and is never poolable. A `notAfter` beyond the representable monotonic range
 //! publishes no deadline, exactly as
 //! [`crate::plugins::utils::auth_flow::CredentialDeadline::Unbounded`] does,
 //! and the idle timeout plus the pool bounds still apply.
