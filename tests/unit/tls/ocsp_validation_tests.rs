@@ -3153,3 +3153,74 @@ fn every_certificate_source_accepts_a_staple_through_the_shared_helper() {
         );
     }
 }
+
+#[test]
+fn retiring_a_pinned_older_resolver_preserves_the_refreshed_source_inventory() {
+    use ferrum_edge::tls::inventory::{InventoryScope, TlsInventory, TlsInventoryState};
+
+    let pki = build_pki();
+    let dir = tempfile::tempdir().unwrap();
+    let issued_at = now();
+    let old_deadline = issued_at + 3_600;
+    let new_deadline = issued_at + 7_200;
+    let mut builder = ResponseBuilder::new(&pki, issued_at);
+    builder.this_update = issued_at - 60;
+    builder.next_update = Some(old_deadline);
+    let (cert_path, key_path, ocsp_path) = write_material(dir.path(), &pki, &builder.build());
+    let policy = tls_policy();
+    let load = || {
+        load_frontend_tls_candidate_from_paths(
+            &cert_path,
+            &key_path,
+            None,
+            Some(&ocsp_path),
+            false,
+            &policy,
+            30,
+            0,
+            &[],
+            None,
+        )
+        .unwrap()
+    };
+    let older = load();
+    builder.next_update = Some(new_deadline);
+    let refreshed = builder.build();
+    std::fs::write(&ocsp_path, &refreshed).unwrap();
+    let newer = load();
+
+    let outcome =
+        ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(old_deadline, Some(&ocsp_path));
+    assert_eq!(outcome.dropped, 1);
+    assert_eq!(outcome.tracked, 1);
+    assert!(served_staple(Arc::clone(&older.config), "localhost", b"h2").is_empty());
+    assert_eq!(
+        served_staple(Arc::clone(&newer.config), "localhost", b"h2"),
+        refreshed
+    );
+    assert!(ferrum_edge::tls::ocsp_recheck::dropped_staple_next_update(&ocsp_path).is_none());
+
+    let env_config = EnvConfig {
+        frontend_tls_cert_path: Some(cert_path.clone()),
+        frontend_tls_key_path: Some(key_path.clone()),
+        frontend_tls_ocsp_response_source: Some(ocsp_path.clone()),
+        ..EnvConfig::default()
+    };
+    let inventory = TlsInventory::collect_with_scope(Some(&env_config), None, InventoryScope::Full);
+    let entry = inventory
+        .entries
+        .iter()
+        .find(|entry| entry.material_kind == "ocsp")
+        .unwrap();
+    assert_eq!(entry.state, TlsInventoryState::Loaded);
+    assert_eq!(entry.next_update.map(|at| at.timestamp()), Some(new_deadline));
+
+    let outcome =
+        ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(new_deadline, Some(&ocsp_path));
+    assert_eq!(outcome.dropped, 1);
+    assert!(served_staple(Arc::clone(&newer.config), "localhost", b"h2").is_empty());
+    assert_eq!(
+        ferrum_edge::tls::ocsp_recheck::dropped_staple_next_update(&ocsp_path),
+        Some(new_deadline)
+    );
+}

@@ -378,8 +378,8 @@ fn populate_entry_from_reload_state(entry: &mut TlsInventoryEntry) {
     {
         entry.state = TlsInventoryState::Invalid;
         entry.error = Some(
-            "stapled OCSP response reached its nextUpdate and was dropped at runtime; this \
-             listener serves no staple until the source is refreshed"
+            "stapled OCSP response was dropped at runtime after expiry or tracking-capacity \
+             retirement; refresh or reload the source to attach a tracked staple"
                 .to_string(),
         );
         entry.next_update = None;
@@ -1003,7 +1003,8 @@ fn apply_dropped_staple_state(entry: &mut TlsInventoryEntry, next_update_unix: i
     }
     entry.state = TlsInventoryState::Invalid;
     entry.error = Some(
-        "stapled OCSP response reached its nextUpdate and was dropped at runtime; this listener          serves no staple until the source is refreshed"
+        "stapled OCSP response was dropped at runtime after expiry or tracking-capacity \
+         retirement; refresh or reload the source to attach a tracked staple"
             .to_string(),
     );
     entry.next_update = None;

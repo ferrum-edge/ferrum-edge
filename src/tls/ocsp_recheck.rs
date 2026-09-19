@@ -31,7 +31,7 @@
 //! the config that owned it is dropped.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use rustls::pki_types::CertificateDer;
@@ -53,6 +53,7 @@ pub const STAPLE_RECHECK_INTERVAL: Duration = Duration::from_secs(3600);
 /// frontend, admin frontend) per accepted generation, and dead generations are
 /// pruned on every registration and every run, so this is only a guard against
 /// a pathological reload loop retaining entries faster than they are collected.
+/// A live entry displaced at this bound is retired before it leaves tracking.
 const MAX_TRACKED_STAPLES: usize = 64;
 
 /// One accepted staple, tracked against the exact resolver serving it.
@@ -71,24 +72,46 @@ struct TrackedStaple {
     /// accepted, so the periodic re-warn uses the same window the load-time
     /// warning did.
     warning_days: u64,
+    /// Only the latest accepted generation may publish source-level retirement.
+    /// Older pinned resolvers still retire, without hiding a newer deadline.
+    latest_for_source: bool,
 }
 
-struct Registry {
-    tracked: Mutex<Vec<TrackedStaple>>,
+#[derive(Default)]
+struct RegistryState {
+    tracked: Vec<TrackedStaple>,
     /// Configured source ids whose staple this process dropped, with the
     /// `nextUpdate` that was dropped. Read by the TLS inventory so an entry
     /// stops advertising a deadline for material that is no longer served.
-    dropped: Mutex<Vec<(String, i64)>>,
+    dropped: Vec<(String, i64)>,
+}
+
+#[derive(Default)]
+struct Registry {
+    // One lock serializes retirement, enrollment, and source-level inventory.
+    // Resolver retirement only publishes an ArcSwap snapshot; it must not call
+    // back into this registry. No handshake takes this lock.
+    state: Mutex<RegistryState>,
     task_started: AtomicBool,
+}
+
+impl Registry {
+    fn lock(&self) -> MutexGuard<'_, RegistryState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                // The vectors remain valid after unwinding. Recover them so
+                // poisoning cannot silently disable tracking or retirement.
+                warn!("Recovering poisoned OCSP staple registry");
+                poisoned.into_inner()
+            }
+        }
+    }
 }
 
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
-    REGISTRY.get_or_init(|| Registry {
-        tracked: Mutex::new(Vec::new()),
-        dropped: Mutex::new(Vec::new()),
-        task_started: AtomicBool::new(false),
-    })
+    REGISTRY.get_or_init(Registry::default)
 }
 
 /// Outcome of one re-check pass, returned for tests and for the spawned task's
@@ -120,6 +143,8 @@ pub trait StapleRetiringResolver: rustls::server::ResolvesServerCert {
     /// Must publish atomically: a handshake running concurrently with the
     /// retirement has to observe either the stapled or the stapleless
     /// credential, never a torn one, and must not block on the retirement.
+    /// Called under the registry lock: implementations must not call back into
+    /// registration, re-check, or inventory APIs.
     fn drop_stapled_ocsp_response(&self) -> bool;
 }
 
@@ -262,25 +287,14 @@ fn register_stapled_response(
     next_update: i64,
     warning_days: u64,
 ) {
-    let registry = registry();
-    if let Ok(mut tracked) = registry.tracked.lock() {
-        tracked.retain(|entry| entry.resolver.strong_count() > 0);
-        if tracked.len() >= MAX_TRACKED_STAPLES {
-            tracked.remove(0);
-        }
-        tracked.push(TrackedStaple {
-            resolver: Arc::downgrade(resolver),
-            configured_source_id: configured_source_id.clone(),
-            display_source_id,
-            next_update,
-            warning_days,
-        });
-    }
-    // A newly accepted staple for this source supersedes any earlier drop: the
-    // inventory must go back to reporting the deadline that is now served.
-    if let Ok(mut dropped) = registry.dropped.lock() {
-        dropped.retain(|(source_id, _)| source_id != &configured_source_id);
-    }
+    registry().lock().register(TrackedStaple {
+        resolver: Arc::downgrade(resolver),
+        configured_source_id,
+        display_source_id,
+        next_update,
+        warning_days,
+        latest_for_source: true,
+    });
     ensure_recheck_task();
 }
 
@@ -294,8 +308,9 @@ fn register_stapled_response(
 /// rather than reporting an ever more negative countdown for material nothing
 /// serves.
 pub fn dropped_staple_next_update(configured_source_id: &str) -> Option<i64> {
-    let dropped = registry().dropped.lock().ok()?;
-    dropped
+    registry()
+        .lock()
+        .dropped
         .iter()
         .find(|(source_id, _)| source_id.as_str() == configured_source_id)
         .map(|(_, next_update)| *next_update)
@@ -317,78 +332,106 @@ pub fn run_recheck_at(now: i64) -> RecheckOutcome {
 /// test itself configured keeps that isolation without weakening what the
 /// production pass does — which is the same walk with no filter.
 pub fn run_recheck_at_scoped(now: i64, only_source: Option<&str>) -> RecheckOutcome {
-    let registry = registry();
-    let Ok(mut tracked) = registry.tracked.lock() else {
-        return RecheckOutcome::default();
-    };
-    let mut outcome = RecheckOutcome::default();
-    let mut newly_dropped: Vec<(String, i64)> = Vec::new();
+    registry().lock().recheck(now, only_source)
+}
 
-    tracked.retain(|entry| {
+#[derive(Clone, Copy)]
+enum RetirementReason {
+    Expired,
+    Capacity,
+}
+
+impl RegistryState {
+    fn register(&mut self, entry: TrackedStaple) {
+        self.tracked.retain(|entry| entry.resolver.strong_count() > 0);
+        if self.tracked.len() >= MAX_TRACKED_STAPLES {
+            // Retire the actual serving resolver BEFORE removing its only
+            // tracking entry. Even a pinned old ServerConfig must stop stapling.
+            self.retire(0, RetirementReason::Capacity);
+            self.tracked.remove(0);
+        }
+        for older in &mut self.tracked {
+            if older.configured_source_id == entry.configured_source_id {
+                older.latest_for_source = false;
+            }
+        }
+        // This update and any concurrent retirement are serialized. An older
+        // resolver cannot republish a drop after a newer generation enrolls.
+        self.dropped
+            .retain(|(source_id, _)| source_id != &entry.configured_source_id);
+        self.tracked.push(entry);
+    }
+
+    fn retire(&mut self, index: usize, reason: RetirementReason) -> bool {
+        let entry = &self.tracked[index];
         let Some(resolver) = entry.resolver.upgrade() else {
-            // The generation this staple belonged to is no longer served.
             return false;
         };
-        if only_source.is_some_and(|source| source != entry.configured_source_id.as_str()) {
-            return true;
-        }
-        if now >= entry.next_update {
-            if resolver.drop_stapled_ocsp_response() {
-                outcome.dropped += 1;
-                newly_dropped.push((entry.configured_source_id.clone(), entry.next_update));
-                warn!(
-                    revocation_material = "ocsp",
-                    source = %entry.display_source_id,
-                    next_update = entry.next_update,
-                    "Stapled OCSP response reached its nextUpdate and was dropped: this listener \
-                     now serves no staple on HTTP/1.1, HTTP/2, HTTP/3 and TCP+TLS. Serving an \
-                     expired staple fails the handshake for clients that check it, so no staple \
-                     is the safer state. Refresh the OCSP source; with \
-                     FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true a fresh response is re-attached \
-                     without a restart, otherwise a restart is required — and a must-staple \
-                     certificate has no working posture until one of those happens"
-                );
+        let removed = resolver.drop_stapled_ocsp_response();
+        // Even if another caller already removed the staple, this generation
+        // no longer serves it. Keep source-level inventory truthful.
+        if entry.latest_for_source {
+            self.dropped
+                .retain(|(source_id, _)| source_id != &entry.configured_source_id);
+            if self.dropped.len() >= MAX_TRACKED_STAPLES {
+                self.dropped.remove(0);
             }
-            // Stop tracking either way: the staple is gone from this resolver,
-            // and a refreshed one arrives as a new registration.
-            return false;
+            self.dropped
+                .push((entry.configured_source_id.clone(), entry.next_update));
         }
-        // Still valid. Re-fire the lead-time warning so the operator signal is
-        // not load-time only (issue #4505, item 2): once per pass while inside
-        // the window, on the same `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` window
-        // the load-time warning used.
-        if crate::tls::warn_if_revocation_material_near_expiry(
-            "ocsp",
-            &entry.display_source_id,
-            entry.next_update,
-            entry.warning_days,
-            now,
-        ) {
-            outcome.warned += 1;
+        if removed {
+            let reason = match reason {
+                RetirementReason::Expired => "nextUpdate reached",
+                RetirementReason::Capacity => "tracking capacity reached",
+            };
+            warn!(
+                revocation_material = "ocsp",
+                source = %entry.display_source_id,
+                next_update = entry.next_update,
+                reason,
+                "Stapled OCSP response was retired: this resolver now serves no staple on \
+                 HTTP/1.1, HTTP/2, HTTP/3 and TCP+TLS. Refresh or reload the OCSP source \
+                 to attach a tracked response; without frontend live reload a restart is \
+                 required. A must-staple certificate has no working posture until then"
+            );
         }
-        true
-    });
-    outcome.tracked = match only_source {
-        Some(source) => tracked
-            .iter()
-            .filter(|entry| entry.configured_source_id.as_str() == source)
-            .count(),
-        None => tracked.len(),
-    };
-    drop(tracked);
-
-    if !newly_dropped.is_empty()
-        && let Ok(mut dropped) = registry.dropped.lock()
-    {
-        for (source_id, next_update) in newly_dropped {
-            dropped.retain(|(existing, _)| existing != &source_id);
-            if dropped.len() >= MAX_TRACKED_STAPLES {
-                dropped.remove(0);
-            }
-            dropped.push((source_id, next_update));
-        }
+        removed
     }
-    outcome
+
+    fn recheck(&mut self, now: i64, only_source: Option<&str>) -> RecheckOutcome {
+        let mut outcome = RecheckOutcome::default();
+        let mut index = 0;
+        while index < self.tracked.len() {
+            let entry = &self.tracked[index];
+            if entry.resolver.strong_count() == 0 {
+                self.tracked.remove(index);
+                continue;
+            }
+            if only_source.is_some_and(|source| source != entry.configured_source_id.as_str()) {
+                index += 1;
+                continue;
+            }
+            if now >= entry.next_update {
+                if self.retire(index, RetirementReason::Expired) {
+                    outcome.dropped += 1;
+                }
+                self.tracked.remove(index);
+                continue;
+            }
+            if crate::tls::warn_if_revocation_material_near_expiry(
+                "ocsp",
+                &entry.display_source_id,
+                entry.next_update,
+                entry.warning_days,
+                now,
+            ) {
+                outcome.warned += 1;
+            }
+            outcome.tracked += 1;
+            index += 1;
+        }
+        outcome
+    }
 }
 
 /// Start the process-wide re-check task once, if a tokio runtime is available.
@@ -429,3 +472,9 @@ fn ensure_recheck_task() {
         }
     });
 }
+
+// Private registry instances keep capacity/concurrency tests independent of the
+// process-wide registry used by other TLS tests.
+#[cfg(test)]
+#[path = "../../tests/unit/tls/ocsp_recheck_registry_tests.rs"]
+mod registry_tests;

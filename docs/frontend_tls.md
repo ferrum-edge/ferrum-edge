@@ -713,6 +713,16 @@ its stale `nextUpdate`, so the
 exported rather than counting further and further negative for material nothing
 staples.
 
+The process tracks at most **64 live resolver generations**. Dead generations
+are pruned first. If registration still reaches the bound, Ferrum retires the
+oldest tracked resolver's staple immediately, logs a capacity warning, and
+then removes that tracking entry. A pinned old configuration therefore serves
+no untracked staple, even before its original deadline. This can make a
+must-staple certificate unusable on that resolver until a fresh configuration
+is adopted. Retirement and registration are serialized; an older generation
+cannot overwrite the inventory state of a newer accepted generation from the
+same source. Source-level retirement history is also bounded to 64 entries.
+
 **Every certificate source is enrolled, including the Gateway-API frontend.**
 The operator-configured single-certificate listener and the Gateway-API
 multi-certificate frontend accept a staple through one shared code path that
@@ -1744,6 +1754,31 @@ the whole recovery authority.
   created with owner-only permissions on Unix. The lease table holds only
   instance identities and timestamps — no certificates, keys, or account
   credentials.
+- Managed TLS, ACME certificate/order/account, lease, and event stores create
+  missing Unix directories, including missing parents, with mode `0700` in the
+  creation syscall. Ferrum never changes the process umask or chmods a directory
+  afterward. A stricter umask may cause creation to fail; it never causes Ferrum
+  to widen permissions. Failed creation may leave empty private parents for the
+  operator to inspect; Ferrum does not sweep or remove unrelated files.
+- The configured store-directory leaf must be a real directory, not a symlink
+  (including dangling links or links written with a trailing slash/dot). New
+  directories are opened relative to their parent descriptor with `O_NOFOLLOW`,
+  checked for effective-user ownership and mode `0700`, and compared with the
+  named directory's device/inode. Detected replacement, unreadable metadata,
+  and unsafe concurrent creation fail closed without modifying the replacement.
+  An already-existing legitimate permissive leaf remains **warning-only** and
+  is left unchanged, as are all pre-existing ancestors.
+- **Operators own the existing ancestor chain and filesystem policy.** Keep
+  store paths beneath directories that untrusted users cannot rename or modify;
+  tighten existing leaf/ancestor modes and review ACLs, inherited ACLs, mount
+  semantics, and shared-volume ownership. Existing ancestor symlinks are allowed
+  and must be trusted. These checks secure creation and detect observed
+  substitution; they do not pin the path for the store's lifetime. Stores still
+  use pathnames after the helper returns, so subsequent replacement by an actor
+  with ancestor write access is outside this guarantee. A same-UID or privileged
+  actor can also substitute an indistinguishable private directory before it is
+  opened. Unix mode checks are not an ACL audit, and non-Unix directory creation
+  retains the platform's ordinary permission behavior.
 - `FERRUM_TLS_STORE_INSTANCE_ID` pins a stable, attributable identity for this
   replica's claims (for example the pod name). It does **not** let a restarting
   replica reclaim its own still-live claim: a live claim excludes every
