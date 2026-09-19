@@ -489,7 +489,7 @@ fn assert_local_return_precedes_every_redirect(commands: &[String], family: &str
 
 #[test]
 fn tcp_outbound_chain_returns_local_destinations_before_every_redirect() {
-    let plan = IptablesPlan::for_config(&iptables_config());
+    let plan = IptablesPlan::for_config(&iptables_config()).unwrap();
     assert_local_return_precedes_every_redirect(&plan.v4_commands, "iptables");
     assert_local_return_precedes_every_redirect(&plan.v6_commands, "ip6tables");
 }
@@ -502,7 +502,7 @@ fn tcp_outbound_local_return_survives_operator_excludes_and_port_includes() {
     config.include_outbound_ports = vec![8080];
     config.include_cidrs_explicit = true;
 
-    let plan = IptablesPlan::for_config(&config);
+    let plan = IptablesPlan::for_config(&config).unwrap();
     assert_local_return_precedes_every_redirect(&plan.v4_commands, "iptables");
     assert_local_return_precedes_every_redirect(&plan.v6_commands, "ip6tables");
 }
@@ -515,7 +515,7 @@ fn host_netns_tcp_outbound_chain_omits_the_local_return() {
     let mut config = iptables_config();
     config.host_netns = true;
 
-    let plan = IptablesPlan::for_config(&config);
+    let plan = IptablesPlan::for_config(&config).unwrap();
     assert!(
         !plan
             .v4_commands

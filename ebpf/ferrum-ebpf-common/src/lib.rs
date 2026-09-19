@@ -609,7 +609,7 @@ pub struct BpfCaptureConfig {
 /// BPF gate supports. Sized to cover normal pod annotations (typically 1-5
 /// ports). Pods exceeding this cap fall through to capture-all behavior so
 /// the gate degrades gracefully instead of silently dropping ports — the
-/// userspace loader emits a `warn!` when truncation happens.
+/// userspace loader emits a `warn!` when this fallback happens.
 pub const INCLUDE_PORTS_MAX: usize = 16;
 
 /// Per-cgroup outbound `includeOutboundPorts` policy in the
@@ -618,7 +618,7 @@ pub const INCLUDE_PORTS_MAX: usize = 16;
 /// Semantics:
 /// - No entry for a cgroup → no narrowing, capture every TCP port (preserves
 ///   pre-existing un-annotated pod behavior).
-/// - Entry with `all_ports == 1` → matches the `*` wildcard annotation;
+/// - Entry with `all_ports == 1` → the `*` wildcard or explicit-list overflow;
 ///   capture every port. `port_count` is ignored in this case.
 /// - Entry with `all_ports == 0` and `port_count > 0` → capture only those
 ///   ports; everything else returns from the connect hook without rewrite.
@@ -628,7 +628,7 @@ pub const INCLUDE_PORTS_MAX: usize = 16;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IncludePortsPolicy {
-    /// Non-zero means "capture all outbound ports" (the `*` wildcard).
+    /// Non-zero means "capture all outbound ports" (wildcard or list overflow).
     /// `u32` to keep the struct 4-byte aligned for the BPF verifier.
     pub all_ports: u32,
     /// Number of valid entries in `ports`. Always `<= INCLUDE_PORTS_MAX`.
@@ -649,11 +649,14 @@ impl IncludePortsPolicy {
     }
 
     /// Construct an explicit-ports policy. Caller must have already sorted
-    /// and deduped `ports`; truncates at `INCLUDE_PORTS_MAX` (the userspace
-    /// side warns when this happens).
+    /// and deduped `ports`. Lists exceeding `INCLUDE_PORTS_MAX` become a
+    /// capture-all policy so no requested port is silently dropped.
     pub fn explicit(ports: &[u16]) -> Self {
+        if ports.len() > INCLUDE_PORTS_MAX {
+            return Self::all();
+        }
         let mut storage = [0u16; INCLUDE_PORTS_MAX];
-        let count = ports.len().min(INCLUDE_PORTS_MAX);
+        let count = ports.len();
         for (slot, value) in storage.iter_mut().zip(ports.iter().take(count)) {
             *slot = *value;
         }
@@ -664,7 +667,7 @@ impl IncludePortsPolicy {
         }
     }
 
-    /// `true` when this entry encodes the `*` wildcard.
+    /// `true` for the `*` wildcard or explicit-port overflow fallback.
     pub const fn is_all_ports(&self) -> bool {
         self.all_ports != 0
     }
@@ -1348,17 +1351,13 @@ mod tests {
     }
 
     #[test]
-    fn include_ports_policy_truncates_at_cap() {
+    fn include_ports_policy_overflow_captures_all() {
         let mut ports = [0u16; INCLUDE_PORTS_MAX + 4];
         for (i, slot) in ports.iter_mut().enumerate() {
             *slot = (i as u16) + 1;
         }
         let policy = IncludePortsPolicy::explicit(&ports);
-        assert_eq!(policy.port_count as usize, INCLUDE_PORTS_MAX);
-        // First INCLUDE_PORTS_MAX entries preserved, rest dropped.
-        for i in 0..INCLUDE_PORTS_MAX {
-            assert_eq!(policy.ports[i], ports[i]);
-        }
+        assert_eq!(policy, IncludePortsPolicy::all());
     }
 
     #[test]

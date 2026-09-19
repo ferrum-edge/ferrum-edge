@@ -3947,10 +3947,9 @@ fn parse_pod_include_outbound_ports(
 
 /// Convert a parsed pod-level [`IncludeOutboundPorts`] into the BPF wire
 /// shape. Emits a `warn!` when the explicit-port list overflows the BPF
-/// map's per-entry cap; the resulting policy still narrows traffic but to
-/// the first `INCLUDE_PORTS_MAX` ports only. Operators that hit this cap
-/// in practice should split annotations across multiple pods or revisit
-/// `INCLUDE_PORTS_MAX`.
+/// map's per-entry cap; the shared constructor then captures all ports
+/// instead of silently dropping any requested port. Earlier capture
+/// exclusions still apply.
 fn include_outbound_ports_to_policy(
     pod_uid: &str,
     include: &IncludeOutboundPorts,
@@ -3963,7 +3962,7 @@ fn include_outbound_ports_to_policy(
             pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
             requested = include.ports.len(),
             cap = INCLUDE_PORTS_MAX,
-            "includeOutboundPorts annotation exceeds BPF map capacity; truncating to first {INCLUDE_PORTS_MAX} ports"
+            "includeOutboundPorts annotation exceeds BPF map capacity; capturing all outbound ports subject to earlier exclusions"
         );
     }
     IncludePortsPolicy::explicit(&include.ports)
@@ -9552,7 +9551,8 @@ where
                  injection — configure the injector NodeSelector so pods on this node receive an iptables init container."
             );
 
-            let plan = IptablesPlan::for_config(&config.capture_config);
+            let plan =
+                IptablesPlan::for_config(&config.capture_config).map_err(anyhow::Error::msg)?;
             // Always try IPv6 cleanup: an earlier process/config may have
             // created ip6tables chains even when the current plan has none.
             let include_v6_cleanup = true;
@@ -9857,6 +9857,11 @@ fn initialize_backend(
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
 ) -> Result<(), anyhow::Error> {
+    if let Err(error) = config.capture_config.validate_proxy_uid() {
+        metrics.set_topology_degraded("capture_unavailable");
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        return Err(anyhow::Error::msg(error));
+    }
     if config.capture_config.mode != CaptureMode::Ebpf {
         metrics.set_topology_degraded("capture_mode_not_ebpf");
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
@@ -10730,6 +10735,10 @@ pub mod startup_cleanup_test_seams {
         observed(&watch, sampled, Some(err.to_string()))
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/gateway_core/node_agent_capture_boundary_tests.rs"]
+mod capture_boundary_tests;
 
 #[cfg(test)]
 mod tests {
@@ -14258,7 +14267,7 @@ mod tests {
 
     #[test]
     fn setup_commands_wait_for_xtables_lock() {
-        let plan = IptablesPlan::for_config(&CaptureConfig::explicit(15006, 15001));
+        let plan = IptablesPlan::for_config(&CaptureConfig::explicit(15006, 15001)).unwrap();
         let commands = setup_commands_for_plan(&plan);
 
         assert!(
@@ -20114,28 +20123,14 @@ mod tests {
     }
 
     #[test]
-    fn include_outbound_ports_to_policy_truncates_when_over_cap() {
-        // Build a port list one element larger than the cap so the warn-and-truncate
-        // path is exercised. The resulting policy still narrows, just to the first
-        // INCLUDE_PORTS_MAX ports.
-        let mut ports = Vec::with_capacity(INCLUDE_PORTS_MAX + 1);
-        for i in 0..(INCLUDE_PORTS_MAX as u16 + 1) {
-            ports.push(1000 + i);
-        }
+    fn include_outbound_ports_to_policy_captures_all_when_over_cap() {
+        let ports = (1..=INCLUDE_PORTS_MAX as u16 + 1).collect::<Vec<_>>();
         let include = IncludeOutboundPorts {
             all_ports: false,
-            ports: ports.clone(),
+            ports,
         };
         let policy = include_outbound_ports_to_policy("pod-uid", &include);
-        assert_eq!(policy.port_count as usize, INCLUDE_PORTS_MAX);
-        for (policy_port, requested_port) in policy
-            .ports
-            .iter()
-            .zip(ports.iter())
-            .take(INCLUDE_PORTS_MAX)
-        {
-            assert_eq!(policy_port, requested_port);
-        }
+        assert_eq!(policy, IncludePortsPolicy::all());
     }
 
     #[test]

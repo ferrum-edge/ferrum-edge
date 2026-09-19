@@ -1942,7 +1942,17 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
     ) -> NetnsUdpGuardResult {
         use crate::capture::{Ip6TablesMode, IptablesPlan};
 
-        if IptablesPlan::udp_setup_script(&self.capture_config).is_empty() {
+        let setup_script = match IptablesPlan::udp_setup_script(&self.capture_config) {
+            Ok(script) => script,
+            Err(error) => {
+                warn!(
+                    error = %crate::startup::sanitize_startup_cause(error, &[]),
+                    "Ambient UDP producer replacement: invalid capture configuration"
+                );
+                return NetnsUdpGuardResult::Failed;
+            }
+        };
+        if setup_script.is_empty() {
             return NetnsUdpGuardResult::Failed;
         }
         let include_v6 = self.capture_config.ip6tables_mode != Ip6TablesMode::Disabled;
@@ -2090,7 +2100,16 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         // The UDP-only setup + teardown scripts for THIS pod netns. `host_netns`
         // is never set here (the producer runs against the pod netns), but the
         // scripts still fail closed if UDP capture is somehow disabled.
-        let setup_script = IptablesPlan::udp_setup_script(&self.capture_config);
+        let setup_script = match IptablesPlan::udp_setup_script(&self.capture_config) {
+            Ok(script) => script,
+            Err(error) => {
+                warn!(
+                    error = %crate::startup::sanitize_startup_cause(error, &[]),
+                    "Ambient UDP producer: invalid capture configuration; not opening"
+                );
+                return NetnsUdpOpenResult::Failed;
+            }
+        };
         if setup_script.is_empty() {
             warn!(
                 pod_uid = %target.pod_uid,

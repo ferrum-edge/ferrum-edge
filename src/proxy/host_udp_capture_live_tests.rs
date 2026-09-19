@@ -1300,7 +1300,7 @@ fn pod_capture_config() -> CaptureConfig {
 /// and leave NO listener bound behind them — the exact state a node carries
 /// after the predecessor producer went away but its rules did not.
 fn install_predecessor_pod_capture(pod_pid: u32) -> Result<(), String> {
-    let script = IptablesPlan::udp_setup_script(&pod_capture_config());
+    let script = IptablesPlan::udp_setup_script(&pod_capture_config())?;
     if script.is_empty() {
         return Err("pod-netns UDP setup produced no rules".to_string());
     }

@@ -14841,7 +14841,9 @@ async fn functional_mesh_live_source_capture_raw_tcp_mtls_round_trip() {
     capture_config.mode = ferrum_edge::capture::CaptureMode::Iptables;
     capture_config.proxy_uid = Some(1337);
     capture_config.ip6tables_mode = ferrum_edge::capture::Ip6TablesMode::Disabled;
-    let setup_script = ferrum_edge::capture::IptablesPlan::for_config(&capture_config).script();
+    let setup_script = ferrum_edge::capture::IptablesPlan::for_config(&capture_config)
+        .unwrap()
+        .script();
     netns_command(veth.pod.pid(), &setup_script).expect("install production TCP REDIRECT rules");
 
     // Gateway A runs as uid 1337 inside the pod netns. Deny that uid direct
@@ -16443,7 +16445,9 @@ impl LiveTwoClusterFixture {
             self.wrong_td_outbound,
             self.missing_sni_outbound,
         ]);
-        let script = ferrum_edge::capture::IptablesPlan::for_config(&config).script();
+        let script = ferrum_edge::capture::IptablesPlan::for_config(&config)
+            .unwrap()
+            .script();
         netns_command(self.source.pod.pid(), &script)?;
         self.tcp_capture_installed = true;
         Ok(())

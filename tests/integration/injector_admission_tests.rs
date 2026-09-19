@@ -76,6 +76,35 @@ fn pod_object() -> Value {
 }
 
 #[test]
+fn admission_rejects_direct_root_proxy_uid_in_every_capture_mode() {
+    let review = json!({
+        "request": {
+            "uid": "root-proxy",
+            "namespace": "payments",
+            "kind": {"group": "", "version": "v1", "kind": "Pod"},
+            "object": pod_object()
+        }
+    });
+    for mode in [
+        CaptureMode::Explicit,
+        CaptureMode::Iptables,
+        CaptureMode::Ebpf,
+    ] {
+        let mut config = injector_config(mode);
+        config.proxy_uid = Some(0);
+        let response = admission_response(review.to_string().as_bytes(), &config).unwrap();
+        assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+        assert!(response.pointer("/response/patch").is_none());
+        assert!(
+            response["response"]["status"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("proxy UID must be non-zero")
+        );
+    }
+}
+
+#[test]
 fn admission_webhook_injects_core_v1_pod() {
     let review = json!({
         "apiVersion": "admission.k8s.io/v1",

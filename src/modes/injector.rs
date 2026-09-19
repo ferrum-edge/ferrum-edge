@@ -487,17 +487,7 @@ fn parse_injector_proxy_uid(value: Option<String>) -> Result<Option<u32>, String
         return Ok(None);
     }
 
-    let uid = value
-        .parse::<u32>()
-        .map_err(|e| format!("Invalid FERRUM_MESH_PROXY_UID {value:?}: {e}"))?;
-    if uid == 0 {
-        return Err(
-            "Invalid FERRUM_MESH_PROXY_UID: injected sidecars set runAsNonRoot=true, so the proxy UID must be non-zero"
-                .to_string(),
-        );
-    }
-
-    Ok(Some(uid))
+    crate::capture::parse_proxy_uid(&value).map(Some)
 }
 
 fn jwt_secret_ref_from_runtime() -> Result<Option<SecretKeyRef>, String> {
@@ -1088,6 +1078,7 @@ fn build_sidecar_patch_for_namespace(
     config: &InjectorConfig,
     admission_namespace: Option<&str>,
 ) -> Result<Vec<JsonPatchOperation>, String> {
+    crate::capture::validate_proxy_uid(config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID))?;
     match injection_decision(pod, config) {
         InjectionDecision::Inject => {}
         // A node-scoped skip is the one skip an operator must be able to see:
@@ -1581,7 +1572,8 @@ fn sidecar_udp_capture_active(config: &InjectorConfig) -> bool {
 fn sidecar_capture_ipv6_active(config: &InjectorConfig, pod: &Value) -> bool {
     config.capture_mode == CaptureMode::Iptables
         && capture_config(config, pod)
-            .map(|capture| !IptablesPlan::for_config(&capture).v6_commands.is_empty())
+            .and_then(|capture| IptablesPlan::for_config(&capture))
+            .map(|plan| !plan.v6_commands.is_empty())
             .unwrap_or(false)
 }
 
@@ -1746,7 +1738,7 @@ fn sidecar_exec_health_probe(period_seconds: u64, failure_threshold: u64) -> Val
 }
 
 fn init_container(config: &InjectorConfig, pod: &Value) -> Result<Value, String> {
-    let plan = IptablesPlan::for_config(&capture_config(config, pod)?);
+    let plan = IptablesPlan::for_config(&capture_config(config, pod)?)?;
     let script = plan.script();
     Ok(json!({
         "name": "ferrum-edge-init",

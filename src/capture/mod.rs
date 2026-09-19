@@ -804,6 +804,7 @@ impl Ip6TablesMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureConfig {
     pub mode: CaptureMode,
+    /// Non-zero proxy UID to exempt; `None` disables the owner exemption.
     pub proxy_uid: Option<u32>,
     pub inbound_port: u16,
     pub outbound_port: u16,
@@ -1003,6 +1004,14 @@ impl CaptureConfig {
             // host-netns UDP suppression. Default `false`; the node-agent flips it.
             host_netns: false,
         })
+    }
+
+    /// Validate direct construction as well as environment-derived capture settings.
+    pub fn validate_proxy_uid(&self) -> Result<(), String> {
+        if let Some(uid) = self.proxy_uid {
+            validate_proxy_uid(uid)?;
+        }
+        Ok(())
     }
 
     pub fn ensure_exclude_port(&mut self, port: u16) {
@@ -1474,17 +1483,29 @@ fn parse_tproxy_mark(raw: &str) -> Result<u32, String> {
     Ok(parsed)
 }
 
-fn parse_proxy_uid(raw: &str) -> Result<u32, String> {
+pub(crate) fn validate_proxy_uid(uid: u32) -> Result<(), String> {
+    if uid == 0 {
+        return Err(
+            "Invalid FERRUM_MESH_PROXY_UID: proxy UID must be non-zero to avoid bypassing capture for all root processes"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_proxy_uid(raw: &str) -> Result<u32, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(DEFAULT_PROXY_UID);
     }
-    trimmed.parse::<u32>().map_err(|_| {
+    let uid = trimmed.parse::<u32>().map_err(|_| {
         format!(
             "Invalid FERRUM_MESH_PROXY_UID {}. Expected unsigned integer",
             quoted_config_value("FERRUM_MESH_PROXY_UID", raw)
         )
-    })
+    })?;
+    validate_proxy_uid(uid)?;
+    Ok(uid)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1495,7 +1516,9 @@ pub struct IptablesPlan {
 }
 
 impl IptablesPlan {
-    pub fn for_config(config: &CaptureConfig) -> Self {
+    /// Reject an invalid proxy UID before rendering either address family's rules.
+    pub fn for_config(config: &CaptureConfig) -> Result<Self, String> {
+        config.validate_proxy_uid()?;
         // IPv4 always emits chains because inbound capture is protocol-wide for
         // an active address family, even when only IPv6 outbound CIDRs exist.
         let v4_commands = commands_for_family("iptables", config, CidrFamily::V4, true);
@@ -1516,11 +1539,11 @@ impl IptablesPlan {
             Vec::new()
         };
 
-        Self {
+        Ok(Self {
             v4_commands,
             v6_commands,
             ip6tables_mode: config.ip6tables_mode,
-        }
+        })
     }
 
     /// Build a plan containing ONLY the UDP TPROXY capture rules — never the TCP
@@ -1541,13 +1564,14 @@ impl IptablesPlan {
     /// suppression, preserving the "no host-netns UDP rules" invariant even
     /// though the producer never runs in host netns).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn udp_only_for_config(config: &CaptureConfig) -> Self {
+    pub fn udp_only_for_config(config: &CaptureConfig) -> Result<Self, String> {
+        config.validate_proxy_uid()?;
         if !config.udp_capture_enabled {
-            return Self {
+            return Ok(Self {
                 v4_commands: Vec::new(),
                 v6_commands: Vec::new(),
                 ip6tables_mode: config.ip6tables_mode,
-            };
+            });
         }
         let v4_commands = udp_only_commands_for_family(config, CidrFamily::V4);
         let v6_enabled = config.ip6tables_mode != Ip6TablesMode::Disabled;
@@ -1561,11 +1585,11 @@ impl IptablesPlan {
         } else {
             Vec::new()
         };
-        Self {
+        Ok(Self {
             v4_commands,
             v6_commands,
             ip6tables_mode: config.ip6tables_mode,
-        }
+        })
     }
 
     /// Generate iptables commands that reverse the setup performed by
@@ -1678,12 +1702,12 @@ pub struct EbpfPlan {
 
 #[allow(dead_code)]
 impl EbpfPlan {
-    pub fn for_config(config: &CaptureConfig) -> Self {
-        Self {
+    pub fn for_config(config: &CaptureConfig) -> Result<Self, String> {
+        Ok(Self {
             enabled: config.mode == CaptureMode::Ebpf,
-            fallback: IptablesPlan::for_config(config),
+            fallback: IptablesPlan::for_config(config)?,
             required_kernel: "5.7",
-        }
+        })
     }
 
     pub fn fallback_script(&self) -> String {
@@ -1737,12 +1761,12 @@ impl IptablesPlan {
     /// the UDP v6 rules. Empty (`""`) when UDP capture is off, `host_netns` is
     /// set, or no family emitted rules.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn udp_setup_script(config: &CaptureConfig) -> String {
-        let plan = Self::udp_only_for_config(config);
+    pub fn udp_setup_script(config: &CaptureConfig) -> Result<String, String> {
+        let plan = Self::udp_only_for_config(config)?;
         if plan.v4_commands.is_empty() && plan.v6_commands.is_empty() {
-            return String::new();
+            return Ok(String::new());
         }
-        format!(
+        Ok(format!(
             "set -e\n{}",
             udp_iptables_script(
                 &plan.v4_commands,
@@ -1750,7 +1774,7 @@ impl IptablesPlan {
                 plan.ip6tables_mode,
                 true
             )
-        )
+        ))
     }
 
     /// Build the fail-closed UDP egress guard installed before the Ambient
@@ -1895,6 +1919,7 @@ impl IptablesPlan {
     /// only when `ip6tables` is enabled AND a v6 CIDR is configured.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn host_udp_for_config(config: &CaptureConfig, ifaces: &[String]) -> Result<Self, String> {
+        config.validate_proxy_uid()?;
         if !config.udp_capture_enabled {
             return Err(
                 "host-network UDP capture requires FERRUM_MESH_CAPTURE_UDP_ENABLED=true"
@@ -3753,7 +3778,7 @@ mod tests {
         config.exclude_cidrs.push("10.0.0.0/8".to_string());
         config.exclude_ports.push(15020);
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         assert!(plan.v4_commands.iter().any(|cmd| cmd.contains("-C OUTPUT")));
         assert!(
@@ -3995,7 +4020,7 @@ iptables() {{
         // body. Without `set -e` a rule that fails mid-script would still exit 0,
         // starting the pod with a partial ruleset that lets egress bypass mesh
         // capture (and mesh_authz). It must fail closed.
-        let plan = IptablesPlan::for_config(&CaptureConfig::explicit(15006, 15001));
+        let plan = IptablesPlan::for_config(&CaptureConfig::explicit(15006, 15001)).unwrap();
         let script = plan.script();
         assert!(
             script.starts_with("set -e\n"),
@@ -4021,6 +4046,7 @@ iptables() {{
         assert_eq!(config.proxy_uid, Some(DEFAULT_PROXY_UID));
         assert!(
             IptablesPlan::for_config(&config)
+                .unwrap()
                 .v4_commands
                 .iter()
                 .any(|cmd| cmd.contains("--uid-owner 1337"))
@@ -4039,7 +4065,7 @@ iptables() {{
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.mode = CaptureMode::Ebpf;
 
-        let plan = EbpfPlan::for_config(&config);
+        let plan = EbpfPlan::for_config(&config).unwrap();
 
         assert!(plan.enabled);
         assert_eq!(plan.required_kernel, "5.7");
@@ -4063,7 +4089,7 @@ iptables() {{
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.mode = CaptureMode::Ebpf;
 
-        let plan = EbpfPlan::for_config(&config);
+        let plan = EbpfPlan::for_config(&config).unwrap();
         let script = plan.fallback_script();
 
         assert!(script.contains("uname -r"));
@@ -4082,7 +4108,7 @@ iptables() {{
         config.ip6tables_mode = Ip6TablesMode::Required;
         config.include_cidrs = vec!["fd00::/8".to_string()];
 
-        let plan = EbpfPlan::for_config(&config);
+        let plan = EbpfPlan::for_config(&config).unwrap();
         let script = plan.fallback_script();
 
         assert_eq!(plan.fallback.ip6tables_mode, Ip6TablesMode::Required);
@@ -4191,7 +4217,7 @@ iptables() {{
 
     #[test]
     fn iptables_plan_waits_for_xtables_lock() {
-        let plan = IptablesPlan::for_config(&CaptureConfig::explicit(15006, 15001));
+        let plan = IptablesPlan::for_config(&CaptureConfig::explicit(15006, 15001)).unwrap();
 
         for cmd in plan.v4_commands {
             assert!(
@@ -4207,7 +4233,7 @@ iptables() {{
         config.mode = CaptureMode::Iptables;
         config.proxy_uid = Some(DEFAULT_PROXY_UID);
 
-        let setup = IptablesPlan::for_config(&config);
+        let setup = IptablesPlan::for_config(&config).unwrap();
         let cleanup = IptablesPlan::cleanup_commands(true);
 
         // Every custom chain created in setup must be deleted in cleanup
@@ -4456,7 +4482,12 @@ iptables() {{
         for (raw, expected) in [("0x1", 1), (" 0XFFFFFFFF ", u32::MAX)] {
             assert_eq!(parse_tproxy_mark(raw).unwrap(), expected);
         }
-        assert_eq!(parse_proxy_uid("0").unwrap(), 0);
+        for raw in ["0", " 000 ", "+0"] {
+            assert_eq!(
+                crate::startup::sanitize_startup_cause(parse_proxy_uid(raw).unwrap_err(), &[]),
+                "Invalid FERRUM_MESH_PROXY_UID: proxy UID must be non-zero to avoid bypassing capture for all root processes"
+            );
+        }
         assert_eq!(parse_proxy_uid(" \t ").unwrap(), DEFAULT_PROXY_UID);
         for raw in ["0", " 000 ", "0x0", "0X00"] {
             let error = parse_tproxy_mark(raw).unwrap_err();
@@ -4587,7 +4618,7 @@ iptables() {{
         config.mode = CaptureMode::Iptables;
         config.exclude_inbound_ports = vec![15090, 22];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         for port in [15090, 22] {
             assert!(
@@ -4631,7 +4662,7 @@ iptables() {{
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.mode = CaptureMode::Iptables;
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         assert!(
             !plan
@@ -4648,7 +4679,7 @@ iptables() {{
         config.mode = CaptureMode::Iptables;
         config.include_cidrs = vec!["10.0.0.0/8".to_string()];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         assert!(
             plan.v4_commands
@@ -4664,7 +4695,7 @@ iptables() {{
         config.mode = CaptureMode::Iptables;
         config.include_outbound_ports = vec![5432, 9092];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         for port in [5432, 9092] {
             assert!(
@@ -4692,7 +4723,7 @@ iptables() {{
         config.include_cidrs_explicit = true;
         config.include_outbound_ports = vec![5432];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         let scoped_port_rule = plan
             .v4_commands
@@ -4727,7 +4758,7 @@ iptables() {{
         config.include_cidrs_explicit = true;
         config.include_all_outbound_ports = true;
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         assert!(
             plan.v4_commands
@@ -4749,7 +4780,7 @@ iptables() {{
         config.mode = CaptureMode::Iptables;
         config.include_cidrs = vec!["fd00::/8".to_string()];
         config.include_cidrs_explicit = true;
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         assert!(
             plan.v4_commands
@@ -4779,7 +4810,7 @@ iptables() {{
         config.exclude_ports = vec![5432];
         config.include_outbound_ports = vec![5432];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
         let exclude_idx = plan
             .v4_commands
             .iter()
@@ -4804,7 +4835,7 @@ iptables() {{
         config.exclude_cidrs = vec!["10.0.0.0/8".to_string(), "fd00::/8".to_string()];
         config.include_cidrs = vec!["172.16.0.0/12".to_string(), "2001:db8::/32".to_string()];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         assert!(
             plan.v4_commands
@@ -4851,7 +4882,7 @@ iptables() {{
         config.ip6tables_mode = Ip6TablesMode::Disabled;
         config.include_cidrs = vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         assert!(
             plan.v4_commands
@@ -4880,7 +4911,7 @@ iptables() {{
         config.include_cidrs = vec!["fd00::/8".to_string()];
         config.include_cidrs_explicit = true;
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         assert!(
             plan.v4_commands.iter().any(|cmd| {
@@ -4911,7 +4942,7 @@ iptables() {{
         config.mode = CaptureMode::Iptables;
         config.include_cidrs = vec!["fd00::/8".to_string()];
 
-        let script = IptablesPlan::for_config(&config).script();
+        let script = IptablesPlan::for_config(&config).unwrap().script();
 
         assert!(script.contains("command -v ip6tables"));
         assert!(script.contains("ip6tables -t nat -w 5 -L"));
@@ -4927,7 +4958,7 @@ iptables() {{
         config.ip6tables_mode = Ip6TablesMode::Required;
         config.include_cidrs = vec!["fd00::/8".to_string()];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
         let script = plan.script();
 
         assert!(script.contains("ip6tables is required for IPv6 mesh capture"));
@@ -5281,7 +5312,7 @@ iptables() {{
         // Ambient TCP capture rides eBPF/HBONE, so the plan must never touch the
         // `nat` table or emit a TCP REDIRECT.
         let config = udp_enabled_iptables_config();
-        let plan = IptablesPlan::udp_only_for_config(&config);
+        let plan = IptablesPlan::udp_only_for_config(&config).unwrap();
         let cmds = &plan.v4_commands;
         assert!(!cmds.is_empty(), "UDP-only plan should emit v4 commands");
         assert!(
@@ -5326,8 +5357,10 @@ iptables() {{
         // SAME `udp_tproxy_commands_for_family`, so the producer's OUTBOUND rules
         // stay byte-identical to the injector's — only the inbound chain differs.
         let config = udp_enabled_iptables_config();
-        let producer = IptablesPlan::udp_only_for_config(&config).v4_commands;
-        let injector = IptablesPlan::for_config(&config).v4_commands;
+        let producer = IptablesPlan::udp_only_for_config(&config)
+            .unwrap()
+            .v4_commands;
+        let injector = IptablesPlan::for_config(&config).unwrap().v4_commands;
         assert!(!producer.is_empty());
 
         // Producer captures egress: OUTBOUND chain + OUTPUT MARK loop + routing.
@@ -5384,7 +5417,7 @@ iptables() {{
         // the producer never runs in host netns — the invariant is defense in depth.
         let mut config = udp_enabled_iptables_config();
         config.host_netns = true;
-        let plan = IptablesPlan::udp_only_for_config(&config);
+        let plan = IptablesPlan::udp_only_for_config(&config).unwrap();
         assert!(
             plan.v4_commands.is_empty() && plan.v6_commands.is_empty(),
             "host-netns UDP-only plan must be empty: {plan:?}"
@@ -5395,7 +5428,7 @@ iptables() {{
     fn udp_only_plan_disabled_emits_nothing() {
         let mut config = udp_enabled_iptables_config();
         config.udp_capture_enabled = false;
-        let plan = IptablesPlan::udp_only_for_config(&config);
+        let plan = IptablesPlan::udp_only_for_config(&config).unwrap();
         assert!(plan.v4_commands.is_empty() && plan.v6_commands.is_empty());
     }
 
@@ -5405,6 +5438,7 @@ iptables() {{
         let v4_only = udp_enabled_iptables_config();
         assert!(
             IptablesPlan::udp_only_for_config(&v4_only)
+                .unwrap()
                 .v6_commands
                 .is_empty(),
             "v4-only config must not emit v6 UDP rules"
@@ -5413,7 +5447,7 @@ iptables() {{
         let mut dual = udp_enabled_iptables_config();
         dual.include_cidrs = vec!["0.0.0.0/0".to_string(), "::/0".to_string()];
         dual.include_cidrs_explicit = true;
-        let dual_plan = IptablesPlan::udp_only_for_config(&dual);
+        let dual_plan = IptablesPlan::udp_only_for_config(&dual).unwrap();
         assert!(
             dual_plan
                 .v6_commands
@@ -5427,6 +5461,7 @@ iptables() {{
         disabled_v6.ip6tables_mode = Ip6TablesMode::Disabled;
         assert!(
             IptablesPlan::udp_only_for_config(&disabled_v6)
+                .unwrap()
                 .v6_commands
                 .is_empty(),
             "ip6tables disabled must drop v6 UDP rules"
@@ -5436,7 +5471,7 @@ iptables() {{
     #[test]
     fn udp_setup_script_is_fail_closed_and_udp_only() {
         let config = udp_enabled_iptables_config();
-        let script = IptablesPlan::udp_setup_script(&config);
+        let script = IptablesPlan::udp_setup_script(&config).unwrap();
         assert!(
             script.starts_with("set -e"),
             "producer UDP setup must fail closed: {script}"
@@ -5458,12 +5493,12 @@ iptables() {{
     fn udp_setup_script_empty_when_disabled_or_host_netns() {
         let mut disabled = udp_enabled_iptables_config();
         disabled.udp_capture_enabled = false;
-        assert_eq!(IptablesPlan::udp_setup_script(&disabled), "");
+        assert_eq!(IptablesPlan::udp_setup_script(&disabled).unwrap(), "");
 
         let mut host = udp_enabled_iptables_config();
         host.host_netns = true;
         assert_eq!(
-            IptablesPlan::udp_setup_script(&host),
+            IptablesPlan::udp_setup_script(&host).unwrap(),
             "",
             "host-netns must emit no UDP setup (no host-netns-safe direction split)"
         );
@@ -5476,7 +5511,7 @@ iptables() {{
         let mut dual = udp_enabled_iptables_config();
         dual.include_cidrs = vec!["0.0.0.0/0".to_string(), "::/0".to_string()];
         dual.include_cidrs_explicit = true;
-        let script = IptablesPlan::udp_setup_script(&dual);
+        let script = IptablesPlan::udp_setup_script(&dual).unwrap();
         assert!(
             script.contains("ip6tables -t mangle"),
             "v6 UDP probe must check the mangle table: {script}"
@@ -5611,7 +5646,7 @@ iptables() {{
         assert_eq!(config.udp_outbound_port, DEFAULT_UDP_OUTBOUND_PORT);
         assert_eq!(config.tproxy_mark, DEFAULT_TPROXY_MARK);
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
         for cmd in plan.v4_commands.iter().chain(plan.v6_commands.iter()) {
             assert!(
                 !cmd.contains("mangle")
@@ -5629,7 +5664,7 @@ iptables() {{
     #[test]
     fn udp_capture_enabled_emits_mangle_chains_tproxy_and_routing() {
         let config = udp_enabled_iptables_config();
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
         let cmds = &plan.v4_commands;
 
         // New mangle-table chains are created. Inbound UDP capture stays enabled
@@ -5740,7 +5775,7 @@ iptables() {{
         // appended AFTER the old one and (iptables preserves order) the stale rule
         // black-holes UDP. Setup must FLUSH each UDP chain after creating it and
         // BEFORE adding any rule to it.
-        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config()).unwrap();
         let cmds = &plan.v4_commands;
 
         for chain in [
@@ -5773,7 +5808,7 @@ iptables() {{
         // A node-agent fallback crash before cleanup then a re-run must not stack
         // a duplicate `ip rule`: setup deletes by explicit priority before adding,
         // and deletes the exact route before adding it.
-        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config()).unwrap();
         let cmds = &plan.v4_commands;
 
         let rule_del = cmds
@@ -5825,7 +5860,7 @@ iptables() {{
         // The OUTBOUND and INBOUND chains are jumped from `mangle PREROUTING`
         // (TPROXY is PREROUTING-only). The inbound jump keeps pod-destined UDP
         // from bypassing mesh identity and authorization.
-        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config()).unwrap();
         let cmds = &plan.v4_commands;
 
         assert!(
@@ -5852,7 +5887,7 @@ iptables() {{
         // destination address type (the pod-IP-agnostic mirror of the TCP chains'
         // hook separation). Outbound TPROXY = `! --dst-type LOCAL` (remote dest);
         // the inbound catch-all = `--dst-type LOCAL` (the pod's own IP).
-        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config()).unwrap();
         let cmds = &plan.v4_commands;
 
         assert!(
@@ -5875,7 +5910,7 @@ iptables() {{
         // `ip rule`/`ip route` plumbing. When UDP capture is enabled the setup
         // must (a) fatally preflight `command -v ip` BEFORE installing any UDP
         // rule, and (b) NOT `|| true` the load-bearing routing ADDs.
-        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config()).unwrap();
         let cmds = &plan.v4_commands;
         let script = plan.script();
 
@@ -5945,7 +5980,7 @@ iptables() {{
         config.exclude_ports = vec![53];
         config.exclude_inbound_ports = vec![5353];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
         let cmds = &plan.v4_commands;
 
         assert!(
@@ -6015,7 +6050,7 @@ iptables() {{
         // (pod-netns) path.
         let config = udp_enabled_iptables_config();
         assert!(!config.host_netns, "this test exercises the pod-netns path");
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
         let cmds = &plan.v4_commands;
 
         let mark_arg = format!("0x{:x}/0x{:x}", DEFAULT_TPROXY_MARK, TPROXY_MARK_MASK);
@@ -6101,7 +6136,7 @@ iptables() {{
         // wrong in the host netns (round-5 limitation, preserved).
         let mut host_config = config.clone();
         host_config.host_netns = true;
-        let host_plan = IptablesPlan::for_config(&host_config);
+        let host_plan = IptablesPlan::for_config(&host_config).unwrap();
         for cmd in host_plan
             .v4_commands
             .iter()
@@ -6128,7 +6163,7 @@ iptables() {{
         // a `-p udp -d 0.0.0.0/0 -m addrtype ! --dst-type LOCAL -j MARK` rule (same
         // `-d 0.0.0.0/0` selector AND the same `! --dst-type LOCAL` egress scope the
         // TPROXY rule carries). Only the jump differs (MARK vs TPROXY).
-        let default_plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let default_plan = IptablesPlan::for_config(&udp_enabled_iptables_config()).unwrap();
         let mark_arg = format!("0x{:x}/0x{:x}", DEFAULT_TPROXY_MARK, TPROXY_MARK_MASK);
         // The OUTBOUND TPROXY chain carries `-p udp -d 0.0.0.0/0 -m addrtype ! ...`.
         assert!(
@@ -6186,7 +6221,7 @@ iptables() {{
         // `! --dst-type LOCAL` egress scope), and NO catch-all MARK.
         let mut port_config = udp_enabled_iptables_config();
         port_config.include_outbound_ports = vec![5432, 9092];
-        let port_plan = IptablesPlan::for_config(&port_config);
+        let port_plan = IptablesPlan::for_config(&port_config).unwrap();
         for port in [5432, 9092] {
             assert!(
                 port_plan
@@ -6228,7 +6263,7 @@ iptables() {{
         let mut config = udp_enabled_iptables_config();
         config.include_outbound_ports = vec![5432, 9092];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
         for port in [5432, 9092] {
             assert!(
                 plan.v4_commands.iter().any(|c| c.contains(&format!(
@@ -6262,7 +6297,7 @@ iptables() {{
         config.include_cidrs = vec!["172.16.0.0/12".to_string(), "2001:db8::/32".to_string()];
         config.include_cidrs_explicit = true;
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         // IPv4 TPROXY rules use `iptables` + IPv4 routing; no IPv6 leakage. The
         // outbound CIDR rule carries the non-local destination scope.
@@ -6498,7 +6533,7 @@ iptables() {{
         config.ip6tables_mode = Ip6TablesMode::Disabled;
         config.include_cidrs = vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
         assert!(
             plan.v6_commands.is_empty(),
             "disabled ip6tables must suppress IPv6 UDP TPROXY rules: {:?}",
@@ -6528,7 +6563,7 @@ iptables() {{
         config.include_cidrs = vec!["fd00::/8".to_string()];
         config.include_cidrs_explicit = true;
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         // The IPv4 family must emit no OUTBOUND UDP catch-all or MARK rule when
         // only IPv6 CIDRs are selected. Inbound LOCAL capture is still emitted for
@@ -6590,7 +6625,7 @@ iptables() {{
         config.include_cidrs_explicit = true;
         config.include_outbound_ports = vec![53];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         // The IPv4 `--dport 53` outbound TPROXY rule MUST be present (the port
         // include survives the catch-all skip).
@@ -6686,7 +6721,7 @@ iptables() {{
         config.include_cidrs_explicit = true;
         config.include_outbound_ports = vec![53];
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         for cmd in plan.v4_commands.iter().chain(plan.v6_commands.iter()) {
             assert!(
@@ -6714,7 +6749,7 @@ iptables() {{
         // suppression is keyed strictly on `host_netns`.
         let mut pod_config = config.clone();
         pod_config.host_netns = false;
-        let pod_plan = IptablesPlan::for_config(&pod_config);
+        let pod_plan = IptablesPlan::for_config(&pod_config).unwrap();
         assert!(
             pod_plan
                 .v4_commands
@@ -6733,7 +6768,7 @@ iptables() {{
         // steering UDP into the chains. Otherwise an `ip rule`/`ip route` failure
         // after the jumps were appended leaves TPROXY live without policy routing —
         // a half-installed black-hole.
-        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config()).unwrap();
         let cmds = &plan.v4_commands;
 
         let route_add = cmds
@@ -6775,7 +6810,7 @@ iptables() {{
         let mut config = udp_enabled_iptables_config();
         config.tproxy_mark = 0xABCD;
 
-        let plan = IptablesPlan::for_config(&config);
+        let plan = IptablesPlan::for_config(&config).unwrap();
 
         // The DELETE must be priority+table keyed and must NOT carry a `fwmark`
         // selector (so it matches whatever mark the prior run installed).
@@ -6878,7 +6913,9 @@ iptables() {{
         // The TPROXY rules ride the same fail-closed `set -e` script as the TCP
         // rules; the raw `ip` commands must stay self-guarded so they never abort
         // it (missing `iproute2` or an already-present rule).
-        let script = IptablesPlan::for_config(&udp_enabled_iptables_config()).script();
+        let script = IptablesPlan::for_config(&udp_enabled_iptables_config())
+            .unwrap()
+            .script();
         assert!(script.starts_with("set -e\n"));
         assert!(script.contains("command -v ip >/dev/null 2>&1"));
         assert!(script.contains("FERRUM_MESH_UDP_OUTBOUND"));
