@@ -318,7 +318,10 @@ def manifest(path):
                     workers=[200, 200, 200, 100, 50], client_connections=[21, 21, 21, 11, 6],
                     measurement_seconds=30, pairs=4, main_samples=80,
                     downstream_stream_limit=100, upstream_stream_limits=[100, 4],
-                    socket_buffer_bytes=4194304, envoy_image=ENVOY, pilots_per_arm=2)
+                    socket_buffer_bytes=4194304, envoy_image=ENVOY, pilots_per_arm=2,
+                    socket_evidence_contract='socket-lifetime-v2',
+                    upstream_identity=dict(connect_address='127.0.0.1:3445', sni='localhost',
+                                           dns_san='localhost', verify_chain=True))
     if any(value.get(k) != v for k, v in expected.items()):
         raise ValueError("campaign differs from the approved finite contract")
     if value["calibration"] != dict(useful_rps_tolerance=0.02, p99_tolerance=0.05, confidence=0.95):

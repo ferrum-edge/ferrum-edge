@@ -37,11 +37,28 @@ class LiveContracts(unittest.TestCase):
         self.assertNotIn('retry_policy:', text)
         self.assertIn('timeout: 0s', text)
         self.assertEqual(text.count('int_value: 2097152'), 4)
+        tls = a['static_resources']['clusters'][0]['transport_socket']['typed_config']['upstream_tls_context']
+        self.assertEqual(tls['sni'], 'localhost')
+        self.assertEqual(tls['common_tls_context']['validation_context'],
+                         dict(trusted_ca=dict(filename='CA_PATH'),
+                              match_typed_subject_alt_names=[dict(san_type='DNS', matcher=dict(exact='localhost'))]))
         broken = copy.deepcopy(b)
         broken['static_resources']['listeners'][0]['per_connection_buffer_limit_bytes'] = 1
         with self.assertRaises(ValueError): assert_upstream_only(a, broken)
         historical = yaml.safe_load(envoy_config(source, 4, 4194304))
         with self.assertRaises(ValueError): assert_upstream_only(a, historical)
+
+    def test_ferrum_existing_identity_override_keeps_one_numeric_target(self):
+        config = yaml.safe_load((HERE.parent / 'configs/http3_perf.yaml').read_text())
+        proxy = next(p for p in config['proxies'] if p['id'] == 'h3-echo')
+        upstream = next(u for u in config['upstreams'] if u['id'] == proxy['upstream_id'])
+        self.assertEqual(upstream['targets'], [dict(host='127.0.0.1', port=3445, weight=1)])
+        self.assertEqual(upstream['backend_tls_sni'], 'localhost')
+        self.assertIs(upstream['backend_tls_verify_server_cert'], True)
+        self.assertEqual(upstream['backend_tls_server_ca_cert_path'], 'CA_PATH')
+        self.assertNotIn('retry', proxy)
+        # Structural contract supplements the actual hosted positive/negative
+        # handshakes. It cannot establish TLS behavior by itself.
 
     def test_calibration_never_passes_missing_or_uncertain_data(self):
         off = dict(rps=100, p99_us=100, traffic_issues=[], observer_ok=True)

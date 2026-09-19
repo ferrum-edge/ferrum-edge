@@ -7,6 +7,8 @@
 //!   UDP echo:       3005    DTLS echo: 3006
 //!   HTTP/3 (QUIC):  3445    H1+TLS:    3447
 //!   gRPC h2c:      50052    gRPC+TLS: 50053
+//!
+//! `--h3-only` serves only QUIC 3445 and HTTP health 3010 for the H3 proof lane.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -685,6 +687,12 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let h3_only = match args.as_slice() {
+        [] => false,
+        [flag] if flag == "--h3-only" => true,
+        _ => anyhow::bail!("usage: proto_backend [--h3-only]"),
+    };
     // Generate self-signed certs for TLS/DTLS servers
     let cert_dir = std::env::current_dir()?.join("certs");
     let (cert_path, key_path) =
@@ -695,6 +703,21 @@ async fn main() -> anyhow::Result<()> {
     // protocol mismatches can't slip through. See make_server_tls_config_*.
     let h3_cfg = tls_utils::make_h3_server_config(&cert_path, &key_path)
         .context("building H3 server config")?;
+
+    if h3_only {
+        // The proof accounts for every owned UDP socket. Do not start unrelated
+        // UDP/DTLS listeners, and fail readiness if either fixture server exits.
+        println!("H3-only Backend Server: QUIC 127.0.0.1:3445, health 127.0.0.1:3010");
+        return tokio::select! {
+            result = run_h3_server("127.0.0.1:3445".parse()?, h3_cfg) => result,
+            result = run_http1_health_server("127.0.0.1:3010".parse()?) => result,
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                println!("\nShutting down...");
+                Ok(())
+            }
+        };
+    }
 
     println!("Multi-Protocol Backend Server");
     println!("=============================");

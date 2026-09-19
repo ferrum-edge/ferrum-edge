@@ -11,6 +11,10 @@ path = "proto_backend.rs"
 name = "proto_bench"
 path = "proto_bench.rs"
 
+[[bin]]
+name = "h3_tls_fixture"
+path = "h3_proof/tls_fixture.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

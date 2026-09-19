@@ -25,7 +25,7 @@ from benchmark_plan import gateway_order, paired_comparison
 from benchmark_validity import sample_issues
 from h3_experiment import envoy_config
 from process_usage import IO_FIELDS, capture, parse_stat
-from transport_diagnostics import (backend_distribution, counter_delta,
+from transport_diagnostics import (backend_distribution,
                                    snapshot, thread_snapshot, envoy_counter_provenance)
 from live_contract import (ARMS, PAYLOADS, ENVOY, FAMILIES, assert_upstream_only, calibration,
                            manifest, owned_role, group_history, socket_lifetimes,
@@ -34,6 +34,7 @@ from live_contract import (ARMS, PAYLOADS, ENVOY, FAMILIES, assert_upstream_only
                            validate_observer_record, observer_issues, smoke_issues,
                            sample_admission_issues, envoy_protocol_evidence)
 from evidence import LOSSES
+from socket_coverage import socket_coverage
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[3]
@@ -56,7 +57,7 @@ def digest(path):
 
 def environment(action, **data):
     allowed = {'image', 'family', 'netns', 'cgroup', 'payload', 'workers', 'duration',
-               'target', 'slice', 'name', 'arm', 'cpus'}
+               'target', 'slice', 'name', 'arm', 'cpus', 'mode'}
     if data.keys() - allowed:
         raise ValueError('unknown command data')
     # No ambient FERRUM tuning or arbitrary env reaches a gateway/harness.
@@ -75,20 +76,61 @@ def launch(action, stdout, stderr, *, stdin=None, **data):
                             stdout=stdout, stderr=stderr, start_new_session=True)
 
 
+def signal_process_group(process, sig):
+    # launch() gives each owned child its own session. A concurrent exit is
+    # harmless; never use a process-name or an unrelated cgroup as the target.
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def stop_process(process, timeout=10):
+    forced = False
+    try:
+        if process.poll() is None:
+            signal_process_group(process, signal.SIGTERM)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            forced = True
+            signal_process_group(process, signal.SIGKILL)
+            process.wait(timeout=5)
+    except BaseException:
+        signal_process_group(process, signal.SIGKILL)
+        process.wait(timeout=5)
+        raise
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
+    return forced
+
+
 def command(action, output, *, timeout=30, **data):
+    # Paths are command data, not a JSON extension. Record the same path text
+    # that environment() passes to the literal launcher; retain numeric types.
+    data = {key: os.fspath(value) if isinstance(value, os.PathLike) else value
+            for key, value in data.items()}
+    status = {'action': action, 'data': data, 'start_ns': time.monotonic_ns(), 'returncode': None}
+    # Serialization or artifact I/O failure must happen before child ownership.
+    write(output.with_suffix('.json'), status)
     with output.with_suffix('.stdout').open('wb') as out, output.with_suffix('.stderr').open('wb') as err:
         process = launch(action, out, err, **data)
-        status = {'action': action, 'data': data, 'start_ns': time.monotonic_ns(), 'returncode': None}
-        write(output.with_suffix('.json'), status)
         try:
             status['returncode'] = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
             status['timeout'] = True
+            signal_process_group(process, signal.SIGKILL)
+            status['returncode'] = process.wait(timeout=5)
+        except BaseException:
+            # Includes cancellation and unexpected wait errors. Reap before the
+            # caller can remove cgroups or close the inherited output files.
+            signal_process_group(process, signal.SIGKILL)
+            process.wait(timeout=5)
+            raise
         status['end_ns'] = time.monotonic_ns()
         write(output.with_suffix('.json'), status)
-    if status['returncode'] != 0:
+    if status['returncode'] != 0 or status.get('timeout'):
         raise RuntimeError(f'{action} failed: {status}')
     return output.with_suffix('.stdout').read_text()
 
@@ -122,6 +164,8 @@ class Passive:
             start = time.monotonic_ns()
             clock = dict(before_ns=start, unix_ns=time.time_ns(), after_ns=time.monotonic_ns())
             sample = dict(unix_secs=clock['unix_ns'] / 1e9, monotonic_ns=start, clock=clock,
+                          boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                          netns=os.stat('/proc/self/ns/net').st_ino,
                           processes=[], threads=[], sockets=[])
             try:
                 inode_owners = {}
@@ -179,6 +223,7 @@ class Passive:
 class Observer:
     def __init__(self, family, scope, out):
         self.family, self.rows, self.error, self.files = family, [], None, []
+        self.invocation = scope.name
         self.out = out
         err = (out / f'{family}.stderr').open('wb')
         self.files.append(err)
@@ -265,7 +310,7 @@ class Observer:
             if sum(r.get('phase') == phase for r in self.rows) != expected:
                 self.error = self.error or f'observer_{phase}_record_count'
         for file in self.files: file.close()
-        return dict(family=self.family, ready=self.ready, returncode=self.process.returncode,
+        return dict(family=self.family, invocation=self.invocation, ready=self.ready, returncode=self.process.returncode,
                     capture_complete=not self.reader.is_alive(),
                     error=self.error, process_usage=self.cpu, peak_rss_bytes=self.peak_rss_bytes,
                     final=next((r for r in self.rows if r.get('phase') == 'final'), None),
@@ -326,11 +371,12 @@ def live_measurement_usage(usage, phases):
     return result
 
 
-def passive_roles(usage, distribution, arm, phases):
+def passive_roles(usage, distribution, arm, phases, context=None):
     timeline = usage['timeline']
     window = measurement_window(phases, timeline)
     peers = {tuple((p['peer'].rsplit(':', 1)[0], int(p['peer'].rsplit(':', 1)[1]))) for p in distribution}
     records = {}
+    population_issues = set()
     for index, row in enumerate(timeline):
         for sk in row.get('transport', {}).get('sockets', []):
             cookie = sk['cookie'][0] | sk['cookie'][1] << 32
@@ -346,6 +392,10 @@ def passive_roles(usage, distribution, arm, phases):
                 if o['role'] == 'client' and (local[0] in ('0.0.0.0', '127.0.0.1')):
                     roles.add('client')
             if len(roles) != 1 or not cookie or sk['family'] != socket.AF_INET:
+                interval = capture_interval(row)
+                if (window.get('valid') and interval[1] >= window['start_bounds_ns'][0]
+                        and interval[0] <= window['end_bounds_ns'][1]):
+                    population_issues.add('unassigned_owned_socket')
                 continue
             key = (cookie, next(iter(roles)))
             records.setdefault(key, []).append((index, sk))
@@ -360,22 +410,43 @@ def passive_roles(usage, distribution, arm, phases):
                 or capture_interval(first)[0] > window['end_bounds_ns'][1]):
             probes.append(dict(observation, disposition='outside_measurement'))
             continue
-        complete, drops = False, None
-        if bounds['complete_bracket']:
-            left, right = bounds['left_sample_index'], bounds['right_sample_index']
-            selected = [(i, sk) for i, sk in values if left <= i <= right]
-            complete = [i for i, _ in selected] == list(range(left, right + 1))
-            if complete:
-                drops = counter_delta({'socket_drops': selected[0][1]['socket_drops']}, selected[-1][1])
-        rows.append(dict(observation, complete_bracket=complete, capture_bracket=bounds,
-                         equal_buffers=all(v.get('so_rcvbuf') == v.get('so_sndbuf') == 4194304 for _, v in values),
-                         drops=drops))
+        coverage = socket_coverage(timeline, values, bounds, window, cookie, context)
+        equal = all(v.get('so_rcvbuf') == v.get('so_sndbuf') == 4194304 for _, v in values)
+        if coverage['retirement'] is not None:
+            equal = equal and coverage['retirement'].get('so_rcvbuf') == coverage['retirement'].get('so_sndbuf') == 4194304
+        if not equal:
+            coverage['issues'] = sorted(set(coverage['issues'] + ['wrong_buffer']))
+        rows.append(dict(observation, complete_bracket=bounds['complete_bracket'] and coverage['lifetime_covered'],
+                         capture_bracket=bounds, equal_buffers=equal, **coverage))
     required = {'backend', 'client'} | (set() if arm == 'direct' else {'gateway_frontend', 'gateway_upstream'})
-    return dict(sockets=rows, probe_or_retired_outside_measurement=probes, role_join='owned_process_generation_full_endpoint_and_backend_peer',
-                measurement_clock=window,
-                equal_socket_budget_verified=window.get('valid') is True and required <= {r['role'] for r in rows}
-                and all(r['complete_bracket'] and r['equal_buffers'] for r in rows),
-                uncertainty='whole_capture_intervals_bound_reads;_sockets_born/retired_between_samples_remain_unobserved')
+    missing = sorted(required - {r['role'] for r in rows})
+    if context and window.get('valid'):
+        events = [e for stream in context['observers'] for e in stream.get('events', [])]
+        bound = {(e['cookie'], (socket.inet_ntop(socket.AF_INET, struct.pack('=I', e['local_ipv4'])), e['local_port']))
+                 for e in events if e['kind'] == 19 and e['result'] == 0}
+        observed = {}
+        for event in events:
+            role = owned_role(event, usage.get('owners', []), bound, peers,
+                              ('0.0.0.0', 8443) if arm == 'ferrum' else ('127.0.0.1', 8443))
+            if role:
+                observed.setdefault(event['cookie'], []).append(event['at_ns'])
+        for cookie, times in observed.items():
+            if (min(times) <= window['end_bounds_ns'][1] and max(times) >= window['start_bounds_ns'][0]
+                    and cookie not in {r['cookie'] for r in rows}):
+                population_issues.add('lifetime_without_passive_identity')
+    issues = sorted({reason for r in rows for reason in r['issues']} | population_issues
+                    | {f'missing_role:{role}' for role in missing})
+    equal = bool(rows) and all(r['equal_buffers'] for r in rows)
+    covered = (bool(rows) and window.get('valid') is True and not missing and not population_issues
+               and all(r['lifetime_covered'] for r in rows))
+    return dict(evidence_contract='socket-lifetime-v2', sockets=rows,
+                probe_or_retired_outside_measurement=probes,
+                role_join='owned_process_generation_full_endpoint_and_backend_peer',
+                measurement_clock=window, missing_roles=missing, socket_evidence_issues=issues,
+                observed_buffer_equality_verified=equal,
+                observed_lifetime_drop_coverage_verified=covered,
+                equal_socket_budget_verified=equal and covered and not issues,
+                uncertainty='observed_socket_inventory_only;_short_unobserved_lifetimes_remain_partial;_no_exact_kernel_totals')
 
 
 def proof(observers, usage, distribution, sample, provenance, namespace_lifetime, arm):
@@ -449,7 +520,7 @@ def prepare(out):
     for path in HERE.iterdir():
         if path.is_file(): shutil.copyfile(path, target / path.name)
     (STAGE / 'build').mkdir()
-    for name in ('observer', 'observer.bpf.o', 'proto_backend', 'proto_bench', 'ferrum-edge'):
+    for name in ('observer', 'observer.bpf.o', 'proto_backend', 'proto_bench', 'ferrum-edge', 'h3_tls_fixture'):
         shutil.copyfile(build / name, STAGE / 'build' / name)
         (STAGE / 'build' / name).chmod(0o644 if name.endswith('.o') else 0o755)
         if digest(STAGE / 'build' / name) != inventory['sha256'][name]:
@@ -503,6 +574,9 @@ def prepare(out):
         btf_sha256=digest('/sys/kernel/btf/vmlinux'), kernel_notes_sha256=digest('/sys/kernel/notes'),
         runner={k: os.environ.get(k) for k in ('ImageOS', 'ImageVersion', 'GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT')},
         cpu=Path('/proc/cpuinfo').read_text(), frontend_tls_verification='existing_harness_insecure_policy',
+        upstream_tls_policy=dict(connect_address='127.0.0.1:3445', sni='localhost',
+                                 verification_name='localhost', verify_chain=True,
+                                 envoy_san_type='DNS', behavioral_fixture='h3-fairness-v1'),
         argv_environment='fixed_live_commands_inventory', stack_sampling='not_collected')
     write(out / 'provenance.json', provenance)
     shutil.copyfile('/sys/kernel/notes', out / 'kernel-notes')
@@ -514,7 +588,7 @@ def prepare(out):
     return plan, provenance
 
 
-def sample(out, arm, payload, pair, position, traced, duration, provenance):
+def sample(out, arm, payload, pair, position, traced, duration, provenance, idle_fixture=False):
     out.mkdir()
     record = dict(status='error', reason='sample_not_completed', arm=arm, payload=payload,
                   pair=pair, order_position=position, traced=traced, start_ns=time.monotonic_ns(),
@@ -562,8 +636,9 @@ def sample(out, arm, payload, pair, position, traced, duration, provenance):
         record['backend_owner'] = backend_owner
         record['ca_sha256'] = digest(STAGE / 'runtime/certs/ca.pem')
         if arm != 'direct':
-            command('create', out / 'create', slice=scope.name, name=identity, arm=arm, cpus=os.cpu_count())
+            # Own this unique name even if create succeeds but metadata fails.
             created = True
+            command('create', out / 'create', slice=scope.name, name=identity, arm=arm, cpus=os.cpu_count())
             initial = json.loads(command('inspect', out / 'container-created', name=identity))[0]
             expected = provenance['images']['ferrum' if arm == 'ferrum' else 'envoy']['Id']
             if initial['Image'] != expected: raise ValueError('container image differs from qualified artifact')
@@ -600,6 +675,24 @@ def sample(out, arm, payload, pair, position, traced, duration, provenance):
                 resource_checkpoint = time.monotonic()
             time.sleep(0.2)
         record['client_returncode'] = client.wait(timeout=5)
+        if idle_fixture:
+            # Dedicated diagnostic only: keep unchanged gateways/backend alive
+            # beyond the natural ~30 s upstream idle timeout after actual work.
+            record['idle_hold_start_ns'] = time.monotonic_ns()
+            record['idle_hold_start_unix_secs'] = time.time()
+            hold_end = time.monotonic() + 40
+            while time.monotonic() < hold_end:
+                if backend.poll() is not None:
+                    raise RuntimeError('backend died during idle fixture')
+                if sum(obs.sample_cpu() for obs in observers) > 32 * 1024 * 1024:
+                    raise RuntimeError('observer_RSS_reservation_exceeded')
+                time.sleep(0.5)
+            record['idle_hold_end_ns'] = time.monotonic_ns()
+            record['idle_hold_end_unix_secs'] = time.time()
+            if arm != 'direct':
+                current = json.loads(command('inspect', out / 'container-after-idle', name=identity))[0]
+                if not current['State']['Running']:
+                    raise RuntimeError('gateway died during idle fixture')
         stdout.flush(); stderr.flush()
         for obs in observers: obs.checkpoint()
         if arm.startswith('envoy'):
@@ -612,18 +705,21 @@ def sample(out, arm, payload, pair, position, traced, duration, provenance):
             raise ValueError('malformed_benchmark_document')
         record['status'] = 'captured'
         record.pop('reason', None)
-    except (OSError, ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
         record.update(status='error', reason=str(error))
     finally:
+        record['workload_teardown_ns'] = time.monotonic_ns()
+        record['workload_teardown_unix_secs'] = time.time()
         for child in reversed(children):
-            if child.poll() is None:
-                child.terminate()
-                try: child.wait(timeout=10)
-                except subprocess.TimeoutExpired: child.kill(); child.wait(); record['forced_workload_stop'] = True
+            try:
+                if stop_process(child): record['forced_workload_stop'] = True
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                record.setdefault('cleanup_errors', []).append(str(error))
         if created:
             for action in ('logs', 'stop', 'inspect', 'remove'):
                 try: command(action, out / f'final-{action}', name=identity)
-                except (OSError, RuntimeError) as error: record.setdefault('cleanup_errors', []).append(str(error))
+                except (OSError, ValueError, TypeError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    record.setdefault('cleanup_errors', []).append(str(error))
         # Keep tracing through workload teardown; final map reads follow detach.
         time.sleep(0.2)
         observer_results = [obs.finish() for obs in observers]
@@ -648,12 +744,18 @@ def sample(out, arm, payload, pair, position, traced, duration, provenance):
                        sample_schema=2, pair=pair, order_position=position, host_id=provenance['boot_id'])
         usage['measurement'] = live_measurement_usage(usage, raw.get('phases') or {})
         derived['process_usage'] = {k: v for k, v in usage.items() if k != 'timeline'}
-        budgets = passive_roles(usage, distribution, arm, raw.get('phases') or {})
+        context = dict(invocation=scope.name, boot_id=provenance['boot_id'], netns=provenance['netns'],
+                       namespace_lifetime=namespace_lifetime,
+                       observers=[dict(result, events=[r for r in obs.rows if r.get('phase') == 'lifecycle'])
+                                  for obs, result in zip(observers, observer_results)])
+        budgets = passive_roles(usage, distribution, arm, raw.get('phases') or {}, context)
         derived['transport_diagnostics'] = budgets
         derived['envoy_counter_provenance'] = envoy_counter_provenance(ENVOY if arm.startswith('envoy') else None)
         issues = sample_issues(derived)
         if record.get('client_returncode') != 0: issues.append('client_exit_or_timeout')
-        if not budgets['equal_socket_budget_verified']: issues.append('socket_budget_incomplete')
+        if not budgets['equal_socket_budget_verified']:
+            issues.append('socket_budget_incomplete')
+        issues.extend('socket_evidence:' + reason for reason in budgets['socket_evidence_issues'])
         if raw.get('phases', {}).get('transport_close_timed_out'): issues.append('endpoint_drain_incomplete')
         for o in usage['owners']:
             privilege = dict(line.split(':', 1) for line in o['privileges'])

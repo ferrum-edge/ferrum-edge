@@ -1,7 +1,7 @@
 # Hosted H3 proof and corrected-image comparison
 
-This directory implements the finite `corrected-v1` follow-up for #5588 in draft
-PR #5615. It changes the benchmark/observer, not production forwarding. Committing
+This directory implements the finite `corrected-v1` follow-up for #5588 after
+merged PR #5615. It changes the benchmark/observer, not production forwarding. Committing
 it does not assert a passing verifier, workload result, performance gain or issue
 closure. Execute this code only on GitHub-hosted Linux amd64 runners.
 
@@ -12,6 +12,95 @@ That report describes its original source, including preassigned fixture cookies
 excluded recvmmsg, both earlier failures, and absent classic execution helper.
 The new implementation must acquire its own hosted evidence. Do not relabel the
 old observations with these new capabilities.
+
+## Fairness repair and bounded hosted gate
+
+Run **35420498077**, source **e1407c60997670e0820d0670ae891056b6270e39**, retains
+its original verdicts: 31/240 campaign rows rejected, all Envoy upstream-limit-4;
+627 upstream sockets disappeared before the right capture, with observed 4 MiB
+buffers throughout. Of these, 539 had zero backend echo work. The traced 346 had
+actual retirements/final zero drops; the untraced 281 had **unknown final drops**.
+All 20 observer calibrations remained unaccepted. The four short smoke rows do
+not establish long-window coverage. Nothing here reprocesses those 244 rows,
+changes an old verdict, imports diagnostic proof into a baseline, or establishes
+a performance win or a causal production defect.
+
+New captures label their admission contract `socket-lifetime-v2`. Three separate
+fields describe observed buffer equality, observed lifetime/drop coverage, and
+their conjunction (`equal_socket_budget_verified`, retained for the fail-closed
+sample gate). Per-socket `complete_bracket` still means a passive full-window
+bracket; an admitted retirement instead has `lifetime_covered:true` and
+`lifetime_status:witnessed_retirement_with_final_drop`. It requires all of:
+
+- A definite initial passive boundary and continuous observations until close.
+- One actual birth and one actual `udp_destroy_sock` retirement, with the same
+  cookie, process start tick, owner cgroup, endpoint, boot and held netns lifetime.
+- Supported, finalized birth/destroy streams from this exact invocation, without
+  identity/read/map/ring loss, omitted lifecycle records or forced termination.
+- Actual final buffer sizes and a nondecreasing final socket-drop counter. The
+  drop delta spans the selected initial capture through retirement, with its
+  boundary slack retained. It is not an exact measurement-only packet total.
+
+`socket_evidence_issues` distinguishes `wrong_buffer`, `missing_role:<role>`,
+`missing_initial_boundary`, `missing_capture`, `cookie_or_owner_reuse`,
+`boot_or_namespace_changed`, `unobserved_disappearance`, `missing_final_drop`,
+and incomplete/mismatched retirement capture. A cookie seen only by tracing but
+without passive identity is a gap, not an ignored row. Sockets born during the
+measurement without the initial passive boundary still fail. Unobserved short
+lifetimes remain a population-coverage limitation even in admitted rows. No
+collector hooks, privilege grants, buffer caps or lifecycle caps are expanded.
+
+**Untraced retirement remains unresolved.** Passive disappearance, backend close
+records and Envoy idle counters do not supply a final kernel drop value. Such a
+row keeps `drops:null`, precise failure reasons and `socket_budget_incomplete`.
+Clean application traffic cannot override it. Calibration and whole-matrix
+failure propagation remain unchanged; one rejected pilot/diagnostic still fails
+the campaign. These fixtures do not authorize another full dispatch.
+
+Both gateway configurations now dial **127.0.0.1:3445**, send **localhost** SNI,
+verify the generated CA chain and require the **localhost DNS identity**. Ferrum
+uses the existing upstream `backend_tls_sni` field, resolved by
+`BackendTlsConfig::from_upstream` and consumed by both native H3 constructors'
+`backend_tls_server_name` calls. Direct proxy fields do not support that override;
+the config therefore references one numeric upstream target. There is no new
+production TLS option. Envoy retains `sni: localhost` and adds
+`match_typed_subject_alt_names: [{san_type: DNS, matcher: {exact: localhost}}]`.
+This is the pinned d7809ba2
+[CertificateValidationContext API](https://github.com/envoyproxy/envoy/blob/d7809ba2b07fd869d49bfb122b27f6a7977b4d94/api/envoy/extensions/transport_sockets/tls/v3/common.proto).
+The pinned
+[QUIC verifier](https://github.com/envoyproxy/envoy/blob/d7809ba2b07fd869d49bfb122b27f6a7977b4d94/source/common/quic/envoy_quic_proof_verifier.cc)
+also checks the leaf hostname; neither source inspection nor SNI alone substitutes
+for the following actual behavior gate. Client frontend verification remains the
+existing explicitly insecure harness policy, separately from upstream identity.
+
+The dedicated workflow's **H3 actual TLS identity and long idle-retirement
+fixtures** job runs on PRs, uses the same hashed build/image artifacts as smoke,
+and is a dependency of the manual campaign. `fairness.py` runs exactly:
+
+| Fixture | Required actual evidence |
+| --- | --- |
+| TLS, Ferrum / Envoy-100 / Envoy-4 | Each gateway first returns HTTP 200 and exact 10 KiB echo through H3. The same live backend then presents a same-CA leaf with only `wrong.invalid` DNS SAN (still with the connect IP SAN), closes its old connections and requires a new failed H3 handshake plus 502/503, no backend echo, and no TCP fallback. Observed valid-handshake SNI must be localhost. |
+| Long load, all three gateways | 200 workers, 21 client connections, 10 KiB, **40 seconds measured**, then **40 seconds** of idle observation before any workload teardown. Original stream/buffer/idle settings remain unchanged. Strict sample admission and actual role operation/birth/destruction evidence are required. |
+| Envoy-4 idle lifetime | Both actually used and actually unused backend connections must close and join to owned kernel socket retirements before teardown, with final buffers/drops. Retain actual idle-timeout and local-destroy counters, raw backend closes and all sockets. Absence fails; there is no retry-until-reproduced loop. |
+| Evidence negatives from that new invocation | Copies of real evidence inject a missing capture, wrong buffer, inode/cookie reuse, namespace change, missing initial boundary, missing final drops, missing client role, foreign invocation, and trace-off evidence. Each must reject for its precise reason. A copied client observation with an early retired worker must also reject. These are labelled evidence fault injections, not additional live kernel retirements. |
+
+Ferrum shares UDP endpoints across upstream QUIC connections. Its actual socket
+teardown is required, but a QUIC idle close is never called a socket retirement
+unless the kernel event exists. The fixture records zero or absent idle events
+without fabricating an Envoy-shaped Ferrum pool.
+
+The TLS helper is a dedicated harness binary under this directory; it uses the
+existing pinned Rust dependencies, generates two real leaves under one CA, and
+exports only public certificates plus raw request/handshake logs. It performs
+one request per identity, no retry or fallback. Its backend has a 120-second cap
+and requests a 20-second cap. Startup TCP capability probes remain visible;
+TCP attempts during the behavioral request cases fail. The whole fairness driver
+has a 900-second hosted wall cap and a 20-minute job cap. The long samples retain
+the existing 300-second observer and 64 MiB per-arm artifact bounds. Failure
+records and the full negative matrix are uploaded even when a fixture rejects.
+Build, rustfmt, targeted clippy, Python semantic tests, real verifier/collector
+fixtures, smoke and this behavioral gate run **only on GitHub-hosted CI**. Their
+registration is not a claim that this revision has passed them.
 
 ## Fixed comparison
 
@@ -36,7 +125,7 @@ old observations with these new capabilities.
 
 The new `.github/workflows/h3-live-comparison.yml` has read-only permissions and
 pinned actions. PR checks compile features, run semantic contracts and real
-fixtures, then a short real four-arm gateway smoke. Its manual job reuses that
+fixtures, a short real four-arm gateway smoke, and the bounded fairness gate. Its manual job reuses that
 same workflow's compiled and hashed Ferrum/harness/observer artifacts after the
 smoke. Ferrum is packaged once as an image; its image configuration ID, source
 revision, binary/build ID and artifact hashes are retained. The local packaged
@@ -44,7 +133,7 @@ image ID is not represented as a registry manifest digest. The approved Envoy
 manifest/config IDs, actual binary SHA/build ID, generated config and effective
 runtime response are retained separately.
 
-Root must merge/register the new workflow before dispatching it. The ordinary
+Root owns review and any future manual dispatch after the bounded gates pass. The ordinary
 `experiment.json` stays disabled; frozen workflows, gates, policies and the
 existing H1/H2 paths are unchanged. The runner's only new selector is:
 
@@ -60,6 +149,22 @@ both Docker gateways additionally use the same default seccomp, read-only root
 and host network. They have no Docker socket or writable observer maps. Only the
 provisioner/observer is privileged. Process privilege records are retained and
 checked. Socket budgets are set on the disposable runner before workload birth.
+
+The proof launcher selects `proto_backend --h3-only`: it generates the usual
+certificates and serves QUIC on UDP 3445 plus readiness on TCP 3010, with both
+listeners supervised for startup/runtime failure. No UDP echo or DTLS listener
+is started in this mode. Invoking `proto_backend` without arguments retains all
+ordinary protocol listeners. Every owned UDP socket still requires an assigned
+proof role; unexpected sockets invalidate admission rather than being ignored.
+
+Command metadata converts path arguments to their launcher text before spawning.
+Serialization or initial artifact errors therefore create no child; wait errors
+and timeouts kill and reap the owned process group before cgroup cleanup. TLS
+fixture cleanup also retains ownership of an attempted container creation through
+metadata errors and continues stop/removal if log collection fails. Hosted
+semantic regressions cover these error paths; the real smoke and TLS/idle jobs
+remain required to establish behavior at the new head. No historical failed
+sample or retirement evidence is reclassified by these fixture repairs.
 
 ## Calibration and raw retention
 

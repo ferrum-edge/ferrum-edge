@@ -29,17 +29,25 @@ case "${H3_LIVE_ACTION:?}" in
       export H3_PROFILE=4194304
       exec setpriv --reuid=65534 --regid=65534 --clear-groups \
         --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs \
-        /tmp/ferrum-h3-live/build/proto_backend
+        /tmp/ferrum-h3-live/build/proto_backend --h3-only
     fi
     case "${H3_LIVE_PAYLOAD:?}" in 10240|71680|512000|1048576|5242880) ;; *) exit 2 ;; esac
     case "${H3_LIVE_WORKERS:?}" in 200|100|50) ;; *) exit 2 ;; esac
-    case "${H3_LIVE_DURATION:?}" in 2|30) ;; *) exit 2 ;; esac
+    case "${H3_LIVE_DURATION:?}" in 2|30|40) ;; *) exit 2 ;; esac
     case "${H3_LIVE_TARGET:?}" in https://127.0.0.1:3445/echo|https://127.0.0.1:8443/echo) ;; *) exit 2 ;; esac
     exec setpriv --reuid=65534 --regid=65534 --clear-groups \
       --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs \
       /tmp/ferrum-h3-live/build/proto_bench http3 --target "$H3_LIVE_TARGET" \
       --duration "$H3_LIVE_DURATION" --concurrency "$H3_LIVE_WORKERS" \
       --payload-size "$H3_LIVE_PAYLOAD" --json ;;
+  tls-fixture)
+    [[ ${H3_LIVE_CGROUP:?} =~ ^/sys/fs/cgroup/h3live[0-9]+\.slice/(backend|client)$ ]]
+    case "${H3_LIVE_MODE:?}" in certificates|backend|request) ;; *) exit 2 ;; esac
+    printf '%s\n' "$$" > "$H3_LIVE_CGROUP/cgroup.procs"
+    cd /tmp/ferrum-h3-live/runtime
+    exec setpriv --reuid=65534 --regid=65534 --clear-groups \
+      --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs \
+      /tmp/ferrum-h3-live/build/h3_tls_fixture "$H3_LIVE_MODE" ;;
   create)
     [[ ${H3_LIVE_SLICE:?} =~ ^h3live[0-9]+\.slice$ ]]
     [[ ${H3_LIVE_NAME:?} =~ ^h3live[0-9]+$ ]]

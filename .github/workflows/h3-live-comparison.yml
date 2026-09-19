@@ -10,6 +10,8 @@ on:
       - tests/performance/multi_protocol/proto_bench.rs
       - tests/performance/multi_protocol/proto_backend.rs
       - tests/performance/multi_protocol/src/**
+      - tests/performance/multi_protocol/Cargo.toml
+      - tests/performance/multi_protocol/Cargo.lock
       - tests/performance/multi_protocol/configs/http3_perf.yaml
       - tests/performance/multi_protocol/configs/envoy/http3.yaml
       - .github/workflows/h3-live-comparison.yml
@@ -84,13 +86,13 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release --locked --bin ferrum-edge
-          cargo build --release --locked --manifest-path tests/performance/multi_protocol/Cargo.toml --bin proto_backend --bin proto_bench
+          cargo build --release --locked --manifest-path tests/performance/multi_protocol/Cargo.toml --bin proto_backend --bin proto_bench --bin h3_tls_fixture
           cargo test --locked --manifest-path tests/performance/multi_protocol/Cargo.toml --lib
           cargo fmt --manifest-path tests/performance/multi_protocol/Cargo.toml --all -- --check
-          cargo clippy --locked --manifest-path tests/performance/multi_protocol/Cargo.toml --lib -- -D warnings
+          cargo clippy --locked --manifest-path tests/performance/multi_protocol/Cargo.toml --lib --bin h3_tls_fixture -- -D warnings
           cargo test --locked --manifest-path tests/performance/multi_protocol/Cargo.toml --test metrics_tests measurement_clock_brackets_the_host_monotonic_epoch
           cp target/release/ferrum-edge "$RUNNER_TEMP/h3-build/"
-          cp tests/performance/multi_protocol/target/release/proto_backend tests/performance/multi_protocol/target/release/proto_bench "$RUNNER_TEMP/h3-build/"
+          cp tests/performance/multi_protocol/target/release/proto_backend tests/performance/multi_protocol/target/release/proto_bench tests/performance/multi_protocol/target/release/h3_tls_fixture "$RUNNER_TEMP/h3-build/"
       - name: Package compiled Ferrum and retain immutable build provenance
         run: |
           set -euo pipefail
@@ -113,7 +115,7 @@ jobs:
           source = (root / 'source.txt').read_text().strip()
           assert source == os.environ['GITHUB_SHA']
           assert not (root / 'dirty.txt').read_text().strip()
-          names = ['observer', 'observer.bpf.o', 'pmu', 'ferrum-edge', 'proto_backend', 'proto_bench', 'ferrum-image.tar']
+          names = ['observer', 'observer.bpf.o', 'pmu', 'ferrum-edge', 'proto_backend', 'proto_bench', 'h3_tls_fixture', 'ferrum-image.tar']
           value = dict(source=source, tree=(root / 'tree.txt').read_text().strip(), dirty=False,
                        sha256={name: sha(root / name) for name in names},
                        lockfiles={name: sha(Path(name)) for name in ['Cargo.lock', 'tests/performance/multi_protocol/Cargo.lock']},
@@ -175,10 +177,48 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  fairness:
+    name: H3 actual TLS identity and long idle-retirement fixtures
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: h3-live-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/h3-build/
+      - name: Prepare finite fairness fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/h3-fairness"
+          printf '%s\n' '{"status":"error","reason":"fairness_not_completed"}' > "$RUNNER_TEMP/h3-fairness/summary.json"
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-
+          sudo apt-get install -y --no-install-recommends libbpf1 python3-yaml binutils
+          docker load -i "$RUNNER_TEMP/h3-build/ferrum-image.tar"
+          docker pull docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb
+      - name: Require actual positive and negative gateway behavior and retained retirement matrix
+        env:
+          H3_LIVE_BUILD: ${{ runner.temp }}/h3-build
+        run: |
+          set -euo pipefail
+          sudo --preserve-env=H3_LIVE_BUILD,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
+            timeout --signal=TERM --kill-after=15s 900s python3 tests/performance/multi_protocol/h3_proof/fairness.py --output "$RUNNER_TEMP/h3-fairness"
+      - name: Always retain the full fairness fixture matrix and raw failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: h3-fairness-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/h3-fairness/
+          if-no-files-found: error
+          retention-days: 14
+
   campaign:
     name: H3 calibrated payload ${{ matrix.payload }}
     if: github.event_name == 'workflow_dispatch'
-    needs: [prepare, smoke]
+    needs: [prepare, smoke, fairness]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:

@@ -9,12 +9,12 @@ proxies:
     backend_scheme: https
     backend_host: "127.0.0.1"
     backend_port: 3445
+    upstream_id: "h3-backend"
     strip_listen_path: false
     preserve_host_header: false
     backend_connect_timeout_ms: 5000
     backend_read_timeout_ms: 10000
     backend_write_timeout_ms: 10000
-    backend_tls_server_ca_cert_path: "CA_PATH"
     auth_mode: single
     plugins: []
 
@@ -31,6 +31,18 @@ proxies:
     backend_write_timeout_ms: 5000
     auth_mode: single
     plugins: []
+
+upstreams:
+  - id: "h3-backend"
+    targets:
+      - host: "127.0.0.1"
+        port: 3445
+        weight: 1
+    # The existing upstream override controls both SNI and verification name;
+    # the single numeric target above remains the connect address.
+    backend_tls_sni: "localhost"
+    backend_tls_verify_server_cert: true
+    backend_tls_server_ca_cert_path: "CA_PATH"
 
 consumers: []
 plugin_configs: []

@@ -108,6 +108,12 @@ static_resources:
               validation_context:
                 trusted_ca:
                   filename: CA_PATH
+                # CertificateValidationContext API at pinned Envoy d7809ba2.
+                # SNI is retained; chain and intended DNS identity are explicit.
+                match_typed_subject_alt_names:
+                  - san_type: DNS
+                    matcher:
+                      exact: localhost
       load_assignment:
         cluster_name: backend_h3
         endpoints:
