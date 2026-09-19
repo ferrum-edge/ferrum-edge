@@ -52,6 +52,7 @@ async fn offline_bootstrap_preserves_failover_urls_and_reconnects() {
         std::slice::from_ref(&failover_url),
         fast_fail_pool_config(),
     )
+    .await
     .expect("offline store construction should succeed even with unreachable primary");
 
     // `try_failover_reconnect()` must try the failover URL because the store
@@ -98,6 +99,7 @@ async fn offline_bootstrap_runs_migrations_on_first_successful_reconnect() {
         std::slice::from_ref(&failover_url),
         fast_fail_pool_config(),
     )
+    .await
     .expect("offline store construction");
 
     // Before reconnect, the schema does not exist. A query against the lazy
@@ -200,6 +202,7 @@ async fn maybe_apply_deferred_migrations_returns_true_only_on_first_apply() {
         &[],
         fast_fail_pool_config(),
     )
+    .await
     .expect("offline store construction");
 
     // First call: migrations run, returns Ok(true).
@@ -283,6 +286,7 @@ async fn lazy_pool_direct_success_is_covered_by_polling_loop_path() {
         &[],
         fast_fail_pool_config(),
     )
+    .await
     .expect("offline store construction");
 
     // Deliberately do NOT call `reconnect()` — simulate the case where

@@ -662,13 +662,39 @@ fn validate_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), Str
 ///
 /// `effective_url` includes canonical `FERRUM_DB_TLS_*` query parameters for
 /// PostgreSQL and MySQL. Callers must never log or echo it — the value may
-/// embed credentials. `Debug` redacts the URL for the same reason.
+/// embed credentials or inline PEM. `Debug` redacts the URL for the same reason.
+/// TLS values are unresolved source references; use [`Self::connect_lazy`]
+/// rather than passing this URL directly to SQLx.
 #[derive(Clone, PartialEq, Eq)]
 // Public custom-plugin API; the binary test target may compile without opt-in plugins.
 #[allow(dead_code)]
 pub struct EffectiveSqlBackend {
     pub db_type: String,
     pub effective_url: String,
+}
+
+impl EffectiveSqlBackend {
+    /// Build a lazy SQL pool with pool-owned TLS material, without dialing.
+    /// Source reads use the shared detached-reader fence and the supplied
+    /// timeout (seconds; zero disables the bound). Errors fail closed.
+    #[allow(dead_code)] // Public custom-plugin API; examples are opt-in.
+    pub async fn connect_lazy(
+        &self,
+        options: sqlx::any::AnyPoolOptions,
+        timeout_seconds: u64,
+    ) -> Result<sqlx::AnyPool, sqlx::Error> {
+        sqlx::any::install_default_drivers();
+        let snapshot = crate::config::db_loader::await_pool_connect_with_timeout(
+            timeout_seconds,
+            crate::config::db_tls_snapshot::SqlTlsSnapshot::load_detached(
+                &self.effective_url,
+                &self.db_type,
+            ),
+        )
+        .await?;
+        let (options, url) = snapshot.pin(options);
+        options.connect_lazy(&url)
+    }
 }
 
 impl std::fmt::Debug for EffectiveSqlBackend {
@@ -6134,32 +6160,14 @@ impl EnvConfig {
                     {
                         params.push(format!(
                             "sslrootcert={}",
-                            Self::db_tls_source_param_value(
-                                cert,
-                                crate::tls::source::MaterialKind::CaBundle,
-                                "ferrum-db-ca-",
-                            )?
+                            Self::db_tls_source_param_value(cert)
                         ));
                     }
                     if let Some(ref cert) = self.db_tls_client_cert_path {
-                        params.push(format!(
-                            "sslcert={}",
-                            Self::db_tls_source_param_value(
-                                cert,
-                                crate::tls::source::MaterialKind::Cert,
-                                "ferrum-db-client-cert-",
-                            )?
-                        ));
+                        params.push(format!("sslcert={}", Self::db_tls_source_param_value(cert)));
                     }
                     if let Some(ref key) = self.db_tls_client_key_path {
-                        params.push(format!(
-                            "sslkey={}",
-                            Self::db_tls_source_param_value(
-                                key,
-                                crate::tls::source::MaterialKind::Key,
-                                "ferrum-db-client-key-",
-                            )?
-                        ));
+                        params.push(format!("sslkey={}", Self::db_tls_source_param_value(key)));
                     }
                 }
             }
@@ -6170,34 +6178,16 @@ impl EnvConfig {
                     if matches!(mode, DbTlsMode::VerifyCa | DbTlsMode::VerifyFull)
                         && let Some(ref cert) = self.db_tls_ca_cert_path
                     {
-                        params.push(format!(
-                            "ssl-ca={}",
-                            Self::db_tls_source_param_value(
-                                cert,
-                                crate::tls::source::MaterialKind::CaBundle,
-                                "ferrum-db-ca-",
-                            )?
-                        ));
+                        params.push(format!("ssl-ca={}", Self::db_tls_source_param_value(cert)));
                     }
                     if let Some(ref cert) = self.db_tls_client_cert_path {
                         params.push(format!(
                             "ssl-cert={}",
-                            Self::db_tls_source_param_value(
-                                cert,
-                                crate::tls::source::MaterialKind::Cert,
-                                "ferrum-db-client-cert-",
-                            )?
+                            Self::db_tls_source_param_value(cert)
                         ));
                     }
                     if let Some(ref key) = self.db_tls_client_key_path {
-                        params.push(format!(
-                            "ssl-key={}",
-                            Self::db_tls_source_param_value(
-                                key,
-                                crate::tls::source::MaterialKind::Key,
-                                "ferrum-db-client-key-",
-                            )?
-                        ));
+                        params.push(format!("ssl-key={}", Self::db_tls_source_param_value(key)));
                     }
                 }
             }
@@ -6207,44 +6197,16 @@ impl EnvConfig {
         Ok(Some(params))
     }
 
-    fn db_tls_source_param_value(
-        source_value: &str,
-        kind: crate::tls::source::MaterialKind,
-        temp_prefix: &str,
-    ) -> Result<String, String> {
-        let source = crate::tls::source::CertSource::parse(source_value, kind);
-        if let Some(path) = source.as_file_path() {
-            return Ok(path.display().to_string());
-        }
-
-        let source_id = source.redacted_source_id();
-        let material = crate::tls::source::load_material_blocking(&source, kind)
-            .map_err(|e| format!("Failed to load database TLS material: {e}"))?;
-        let temp_file = tempfile::Builder::new()
-            .prefix(temp_prefix)
-            .suffix(".pem")
-            .tempfile()
-            .map_err(|e| format!("Failed to create database TLS temp PEM file: {e}"))?;
-        let (_file, material_path) = temp_file.keep().map_err(|e| {
-            format!(
-                "Failed to persist database TLS temp PEM file {:?}: {}",
-                e.file.path().display(),
-                e.error
-            )
-        })?;
-        std::fs::write(&material_path, material.bytes.expose_secret()).map_err(|e| {
-            format!(
-                "Failed to write database TLS material to {:?}: {}",
-                material_path.display(),
-                e
-            )
-        })?;
-        tracing::info!(
-            "Materialized database TLS source {} into {}",
-            crate::startup::sanitize_startup_cause(format!("{source_id:?}"), &[]),
-            crate::startup::sanitize_startup_cause(format!("{material_path:?}"), &[])
-        );
-        Ok(material_path.display().to_string())
+    /// Encode a source reference, never resolve it or create an unowned PEM.
+    /// Pool construction resolves these values through `SqlTlsSnapshot`.
+    fn db_tls_source_param_value(source_value: &str) -> String {
+        // Query delimiters (including '+' and '%') must round-trip literally:
+        // provider selectors and inline PEM must not become extra SQL options.
+        // Preserve ordinary path separators for readable file-backed URLs.
+        url::form_urlencoded::byte_serialize(source_value.as_bytes())
+            .collect::<String>()
+            .replace("%2F", "/")
+            .replace("%3A", ":")
     }
 
     fn warn_on_existing_db_tls_url_params(base_url: &str, db_type: &str) {
@@ -6426,6 +6388,12 @@ impl EnvConfig {
     /// parameters appended for PostgreSQL and MySQL. SQLite and MongoDB URLs are
     /// returned unchanged: SQLite has no network TLS, and MongoDB uses driver
     /// `TlsOptions` or MongoDB URI TLS options.
+    ///
+    /// This is an I/O-free source URL, not necessarily a native SQLx URL:
+    /// TLS values retain paths, provider URIs, or inline PEM until pool creation
+    /// snapshots them. It never owns or returns temporary paths. Do not log it.
+    /// SQL consumers must use Ferrum's snapshot-aware pool constructors (for
+    /// custom plugins, [`EffectiveSqlBackend::connect_lazy`]).
     ///
     /// The `Err` path is reachable only if `validate_db_tls_config()` was not
     /// called first (defense-in-depth for invalid backend+mode combos).

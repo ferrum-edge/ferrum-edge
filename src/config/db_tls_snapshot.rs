@@ -29,7 +29,7 @@ const SNAPSHOT_SCRUB_CHUNK_BYTES: usize = 4096;
 
 pub struct SqlTlsSnapshot {
     url: String,
-    files: Vec<NamedTempFile>,
+    files: Vec<PrivatePemFile>,
 }
 
 impl SqlTlsSnapshot {
@@ -75,12 +75,16 @@ impl SqlTlsSnapshot {
             let source = CertSource::parse(value, kind);
             let material = load_material_blocking(&source, kind)
                 .map_err(|error| sqlx::Error::Configuration(error.into()))?;
-            let mut file = tempfile::Builder::new()
-                .prefix("ferrum-sql-tls-")
-                .suffix(".pem")
-                .tempfile()?;
-            file.write_all(material.bytes.expose_secret())?;
-            let path = file.path().to_str().ok_or_else(|| {
+            // Own cleanup before the first write: partial writes and failures
+            // later in this generation must scrub just like accepted snapshots.
+            let mut file = PrivatePemFile {
+                file: tempfile::Builder::new()
+                    .prefix("ferrum-sql-tls-")
+                    .suffix(".pem")
+                    .tempfile()?,
+            };
+            file.file.write_all(material.bytes.expose_secret())?;
+            let path = file.file.path().to_str().ok_or_else(|| {
                 sqlx::Error::Configuration("SQL TLS snapshot path is not UTF-8".into())
             })?;
             url.query_pairs_mut().append_pair(key, path);
@@ -109,6 +113,11 @@ impl SqlTlsSnapshot {
     /// snapshot the abandoned thread eventually produces is dropped on the
     /// spot, which unlinks any private file it created.
     pub(crate) async fn load_detached(db_url: &str, db_type: &str) -> Result<Self, sqlx::Error> {
+        // SQLite has no TLS reads. Its lazy/offline construction must not wait
+        // for an unrelated network database's stalled material reader.
+        if !matches!(db_type, "postgres" | "mysql") {
+            return Self::load(db_url, db_type);
+        }
         let db_url = db_url.to_string();
         let db_type = db_type.to_string();
         let permit = sql_tls_snapshot_read_limit()
@@ -154,36 +163,38 @@ impl SqlTlsSnapshot {
     }
 }
 
-impl Drop for SqlTlsSnapshot {
+struct PrivatePemFile {
+    file: NamedTempFile,
+}
+
+impl Drop for PrivatePemFile {
     /// Overwrite each private PEM copy before `NamedTempFile` unlinks it.
     ///
-    /// The in-memory material is already zeroizing
-    /// (`tls::source::SecretBytes`), so the temp file is the only remaining
-    /// plaintext copy of the database client key, and an unlink alone leaves
-    /// its blocks readable until the filesystem reuses them. Best effort: a
+    /// The loaded material buffer is zeroizing (`tls::source::SecretBytes`).
+    /// Scrub this file too: unlink alone leaves its blocks readable until the
+    /// filesystem reuses them. Configured inline sources may still be retained
+    /// in the caller's source URL. Best effort: a
     /// read-only or already-removed file simply skips, and the unlink still
     /// happens.
     fn drop(&mut self) {
-        for file in &mut self.files {
-            let handle = file.as_file_mut();
-            let Ok(metadata) = handle.metadata() else {
-                continue;
-            };
-            let mut remaining = metadata.len();
-            if remaining == 0 || handle.seek(SeekFrom::Start(0)).is_err() {
-                continue;
-            }
-            let zeros = [0u8; SNAPSHOT_SCRUB_CHUNK_BYTES];
-            while remaining > 0 {
-                let chunk = std::cmp::min(remaining, SNAPSHOT_SCRUB_CHUNK_BYTES as u64) as usize;
-                if handle.write_all(&zeros[..chunk]).is_err() {
-                    break;
-                }
-                remaining -= chunk as u64;
-            }
-            let _ = handle.flush();
-            let _ = handle.sync_data();
+        let handle = self.file.as_file_mut();
+        let Ok(metadata) = handle.metadata() else {
+            return;
+        };
+        let mut remaining = metadata.len();
+        if remaining == 0 || handle.seek(SeekFrom::Start(0)).is_err() {
+            return;
         }
+        let zeros = [0u8; SNAPSHOT_SCRUB_CHUNK_BYTES];
+        while remaining > 0 {
+            let chunk = std::cmp::min(remaining, SNAPSHOT_SCRUB_CHUNK_BYTES as u64) as usize;
+            if handle.write_all(&zeros[..chunk]).is_err() {
+                break;
+            }
+            remaining -= chunk as u64;
+        }
+        let _ = handle.flush();
+        let _ = handle.sync_data();
     }
 }
 

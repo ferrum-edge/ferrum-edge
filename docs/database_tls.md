@@ -88,12 +88,28 @@ identity reload retains the previously accepted material even after the
 database closes sessions or the pool evicts idle connections. New connections
 still perform the configured certificate verification using that material.
 
+URL construction itself performs no secret fetches or filesystem writes.
+The `EnvConfig::effective_db_*` helpers preserve and query-encode source
+references, including provider selectors and inline PEM, until the pool
+constructor resolves them directly into its owned snapshot. There is no
+intermediate persisted `ferrum-db-*` copy or process-wide material cache.
+Custom SQL consumers must use `EffectiveSqlBackend::connect_lazy` (or the
+`DatabaseStore` constructors), rather than handing an unresolved source URL
+to SQLx. The audit example does this on first background use. These URLs may
+contain credentials or inline PEM and must never be logged; database URL
+redaction withholds all SQL TLS material option values.
+
 Each snapshot is a private temporary file, so PostgreSQL/MySQL pools now
 require a writable temporary directory (`TMPDIR`, or `/tmp` when it is unset)
 even when all TLS material is file-backed; the files are created mode `0600`,
 overwritten with zeros before they are unlinked, and the in-memory PEM buffer
-is zeroizing. Container images with a read-only root filesystem must mount a
-writable `/tmp` (the shipped charts already do).
+is zeroizing. Partial snapshots and failed or abandoned candidates use the
+same scrub-and-unlink ownership as accepted snapshots. Cleanup only touches
+files created by that owner, never a directory sweep or another process's
+files. Abrupt termination (such as SIGKILL) cannot run destructors; this is
+best-effort cleanup, not secure erasure on every filesystem. Container images
+with a read-only root filesystem must mount a writable `/tmp` (the shipped
+charts already do).
 
 SQL reloads stage the primary and any configured replica before publishing
 either candidate. If either fails, both live pools keep their accepted
@@ -104,6 +120,24 @@ owning pools are dropped. With live reload disabled, changing the source file
 does not change an existing pool's material. Migrate snapshots its material for
 the command and does not start a watcher. URL-only paths are snapshotted but
 are not added to the env-source watcher.
+
+SQL snapshot reads run on detached OS threads behind one process-wide permit.
+The permit remains with a blocked reader after its caller times out, so retry
+loops cannot accumulate blocked threads and runtime shutdown does not wait for
+Tokio's blocking pool. The configured pool-connect timeout includes waiting
+for this permit and loading provider or file material.
+
+The offline backup-bootstrap constructor is asynchronous and uses that same
+fence. Its snapshot attempt has the configured
+`FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` budget; when network connect timeouts
+are disabled with `0`, this backup-only attempt still uses the default 10-second
+budget. On snapshot failure or timeout, only this documented degraded-bootstrap
+path warns and creates a lazy pool from the unresolved URL so cached config
+can start serving. It does not weaken the configured TLS verification mode.
+A subsequent successful reconnect must snapshot material normally before
+publication; provider references in the fallback URL become usable only after
+that reconnect. Normal startup, reload, failover, replica, migrate, and custom
+SQL snapshot failures remain errors and cannot publish a partial generation.
 
 You can force an immediate source poll with:
 
@@ -469,6 +503,15 @@ export FERRUM_DB_TLS_CA_CERT_PATH=/etc/ferrum/rds-combined-ca-bundle.pem
 **Note:** DocumentDB requires `retryWrites=false` (retryable writes not supported).
 
 ## Functional Testing
+
+Hosted unit tests in `tests/unit/config/db_tls_snapshot_tests.rs` cover source
+URL encoding/redaction, pool-clone ownership, failed generation cleanup, and
+FIFO timeout/teardown fencing. The Secret Backends lane exercises real Vault
+fetches, repeated generations, failed candidates, mode `0600`, and final-drop
+scrubbing in `vault_database_tls_snapshots_follow_pool_lifetime`. Existing
+PostgreSQL/MySQL service tests exercise retained trust across real connection
+churn and rejected primary/replica reloads; offline-bootstrap integration tests
+cover deferred migrations and failover recovery.
 
 The project includes functional tests that verify TLS database connectivity end-to-end.
 Hosted CI provisions PostgreSQL/MySQL TLS and MongoDB TLS/require/mTLS fixtures

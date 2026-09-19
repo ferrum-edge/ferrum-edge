@@ -18,9 +18,9 @@
 //! migrate mode / auto-apply maintain. MongoDB is rejected because this
 //! example is SQL-only (`sqlite` / `postgres` / `mysql`).
 //!
-//! The runtime worker opens a **lazy** SQL pool during
-//! `start_background_tasks` (construction itself does not connect). The first
-//! flush surfaces connectivity errors through the batching retry/warn path.
+//! `start_background_tasks` resolves the source configuration without I/O.
+//! The runtime worker snapshots TLS material and opens a **lazy** SQL pool on
+//! first use. Snapshot/connectivity failures use the batching retry/warn path.
 //! Supported modes for the storage path: `database`, `cp`, and standalone
 //! `migrate` (for schema). File / DP / mesh / injector / node-agent modes do
 //! not run SQL custom-plugin migrations; constructing the plugin there will
@@ -229,8 +229,28 @@ impl AuditSqlDialect {
 }
 
 struct GatewayAuditStore {
-    pool: AnyPool,
+    pool: tokio::sync::OnceCell<AnyPool>,
+    options: AnyPoolOptions,
+    backend: crate::config::EffectiveSqlBackend,
     dialect: AuditSqlDialect,
+}
+
+impl GatewayAuditStore {
+    async fn pool(&self) -> Result<&AnyPool, String> {
+        // Single-flight initialization belongs to this plugin generation.
+        // Cancellation/failure permits retry; accepted pools retain their PEMs.
+        self.pool
+            .get_or_try_init(|| async {
+                self.backend
+                    .connect_lazy(self.options.clone(), 5)
+                    .await
+                    .map_err(|_| {
+                        "example_audit_plugin: failed to snapshot TLS material or create gateway SQL pool"
+                            .to_string()
+                    })
+            })
+            .await
+    }
 }
 
 #[derive(Clone)]
@@ -664,12 +684,10 @@ fn connect_gateway_pool_lazy() -> Result<GatewayAuditStore, String> {
     let backend = crate::config::EnvConfig::resolve_effective_sql_backend()
         .map_err(|error| format!("example_audit_plugin: {error}"))?;
     let dialect = AuditSqlDialect::from_db_type(&backend.db_type)?;
-    // Use a lazy pool so `start_background_tasks` stays sync-safe on the Tokio
-    // runtime; the first flush surfaces connectivity errors through the
-    // batching retry/warn path.
-    sqlx::any::install_default_drivers();
+    // Defer snapshot I/O to the async worker: plugin admission is synchronous.
+    // The public backend helper pins material to the lazy pool on first use.
     let is_sqlite = matches!(dialect, AuditSqlDialect::Sqlite);
-    let pool = AnyPoolOptions::new()
+    let options = AnyPoolOptions::new()
         .max_connections(2)
         .min_connections(0)
         .acquire_timeout(Duration::from_secs(5))
@@ -683,13 +701,13 @@ fn connect_gateway_pool_lazy() -> Result<GatewayAuditStore, String> {
                 }
                 Ok(())
             })
-        })
-        .connect_lazy(&backend.effective_url)
-        .map_err(|_| {
-            "example_audit_plugin: failed to create gateway database pool from effective configuration"
-                .to_string()
-        })?;
-    Ok(GatewayAuditStore { pool, dialect })
+        });
+    Ok(GatewayAuditStore {
+        pool: tokio::sync::OnceCell::new(),
+        options,
+        backend,
+        dialect,
+    })
 }
 
 async fn insert_batch(
@@ -734,8 +752,8 @@ async fn insert_batch(
         .map_err(|e| format!("example_audit_plugin batch commit failed: {e}"))
 }
 
-async fn run_retention(pool: AnyPool, dialect: AuditSqlDialect, retention_days: u64) {
-    let delete_sql = dialect.retention_delete_sql();
+async fn run_retention(store: Arc<GatewayAuditStore>, retention_days: u64) {
+    let delete_sql = store.dialect.retention_delete_sql();
     // Skip the immediate first tick: plugin-cache rebuilds reconstruct this
     // worker on global-plugin changes, and an immediate full-range DELETE on
     // every rebuild would thrash the shared configuration database.
@@ -744,11 +762,21 @@ async fn run_retention(pool: AnyPool, dialect: AuditSqlDialect, retention_days: 
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
+        let pool = match store.pool().await {
+            Ok(pool) => pool,
+            Err(_) => {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    "example_audit_plugin: retention pool initialization failed"
+                );
+                continue;
+            }
+        };
         let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let mut total_deleted: u64 = 0;
         loop {
-            match sqlx::query(&delete_sql).bind(&cutoff).execute(&pool).await {
+            match sqlx::query(&delete_sql).bind(&cutoff).execute(pool).await {
                 Ok(result) => {
                     let deleted = result.rows_affected();
                     total_deleted = total_deleted.saturating_add(deleted);
@@ -829,7 +857,7 @@ impl Plugin for ExampleAuditPlugin {
         // Backend-resolution failure must not abort gateway startup / config
         // reload (OptionalFailOpen). Degrade to an un-started logger so the
         // hot path drops records with the documented best-effort contract.
-        let GatewayAuditStore { pool, dialect } = match connect_gateway_pool_lazy() {
+        let store = match connect_gateway_pool_lazy() {
             Ok(store) => store,
             Err(error) => {
                 warn!(
@@ -842,14 +870,14 @@ impl Plugin for ExampleAuditPlugin {
                 return Ok(());
             }
         };
-        let flush_pool = pool.clone();
-        let flush_dialect = dialect;
+        let store = Arc::new(store);
+        let flush_store = store.clone();
         let logger = BatchingLogger::spawn(self.batch_config, move |batch| {
-            let pool = flush_pool.clone();
-            async move { insert_batch(&pool, flush_dialect, batch).await }
+            let store = flush_store.clone();
+            async move { insert_batch(store.pool().await?, store.dialect, batch).await }
         });
 
-        let retention_pool = pool.clone();
+        let retention_store = store;
         let retention_days = self.retention_days;
         let retention_commit = logger.commit_sender().subscribe();
         let retention_task = runtime
@@ -857,7 +885,7 @@ impl Plugin for ExampleAuditPlugin {
                 if !wait_until_committed(retention_commit).await {
                     return;
                 }
-                run_retention(retention_pool, dialect, retention_days).await;
+                run_retention(retention_store, retention_days).await;
             })
             .abort_handle();
 

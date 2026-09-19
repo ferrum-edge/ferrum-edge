@@ -4317,6 +4317,7 @@ mod tests {
                     &[],
                     DbPoolConfig::default(),
                 )
+                .await
                 .unwrap();
                 // Closed pools fail immediately, with no live database or DNS.
                 store.pool().close().await;

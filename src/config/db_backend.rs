@@ -3082,6 +3082,11 @@ fn is_sensitive_url_query_key(key: &str) -> bool {
         "pass",
         "privatekey",
         "sslkey",
+        // SQL TLS options may carry provider URIs (including credentials or
+        // secret selectors) or inline PEM before pool-owned snapshotting.
+        "sslrootcert",
+        "sslca",
+        "sslcert",
         "user",
         "username",
     ];

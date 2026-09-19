@@ -2089,13 +2089,16 @@ impl DatabaseStore {
     /// TLS material is snapshotted best-effort here and ONLY here. This path
     /// exists so the gateway can come up on `FERRUM_DB_CONFIG_BACKUP_PATH`
     /// while the database environment is broken, and an unreadable CA secret
-    /// (not yet projected, unwritable `TMPDIR`) is part of that broken
-    /// environment — failing closed would defeat the one path whose purpose is
-    /// surviving it. The pool is lazy, so no connection uses this URL until a
+    /// (not yet projected, unwritable `TMPDIR`, stalled mount) is part of that
+    /// broken environment — failing closed would defeat the one path whose
+    /// purpose is surviving it. The pool is lazy, so no connection uses this URL until a
     /// query runs, and every later `reconnect*` goes through
     /// [`connect_any_pool_with_timeout`], which snapshots properly: the first
     /// successful reconnect restores the retained-material guarantee in full.
-    pub fn connect_offline_with_pool_config(
+    /// Reads use the same detached one-permit fence as eager connects and are
+    /// bounded by the configured connect timeout, or the default 10s when that
+    /// timeout is disabled. Waiting for the permit is included in the bound.
+    pub async fn connect_offline_with_pool_config(
         db_type: &str,
         db_url: &str,
         failover_urls: &[String],
@@ -2109,9 +2112,20 @@ impl DatabaseStore {
         // successful `reconnect()`. Eager reconnect/failover paths apply
         // `connect_timeout_seconds` via [`connect_any_pool_with_timeout`].
         let options = Self::build_pool_options_from_config(&pool_config, db_type);
-        let (options, snapshot_url) = match crate::config::db_tls_snapshot::SqlTlsSnapshot::load(
-            db_url, db_type,
-        ) {
+        // Backup bootstrap must remain finite even when eager network connect
+        // timeouts are explicitly disabled. That opt-out cannot make a broken
+        // material mount prevent serving the backup.
+        let snapshot_timeout_seconds = if pool_config.connect_timeout_seconds == 0 {
+            DbPoolConfig::default().connect_timeout_seconds
+        } else {
+            pool_config.connect_timeout_seconds
+        };
+        let snapshot = await_pool_connect_with_timeout(
+            snapshot_timeout_seconds,
+            crate::config::db_tls_snapshot::SqlTlsSnapshot::load_detached(db_url, db_type),
+        )
+        .await;
+        let (options, snapshot_url) = match snapshot {
             Ok(snapshot) => snapshot.pin(options),
             Err(error) => {
                 let safe_error = crate::startup::sanitize_startup_cause(&error, &[db_url]);

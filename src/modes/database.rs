@@ -1164,7 +1164,8 @@ pub async fn run(
                             &effective_url,
                             &failover_urls,
                             pool_config,
-                        )?
+                        )
+                        .await?
                     } else {
                         return Err(e);
                     }
@@ -3790,7 +3791,7 @@ pub(super) mod tests {
         );
     }
 
-    fn offline_recovery_test_store() -> (DatabaseStore, tempfile::TempDir) {
+    async fn offline_recovery_test_store() -> (DatabaseStore, tempfile::TempDir) {
         let temp_dir = tempfile::TempDir::new().expect("temporary recovery database");
         let db_path = temp_dir.path().join("plugin-recovery.db");
         let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
@@ -3800,6 +3801,7 @@ pub(super) mod tests {
             &[],
             DbPoolConfig::default(),
         )
+        .await
         .expect("offline recovery store");
         (store, temp_dir)
     }
@@ -3866,7 +3868,7 @@ pub(super) mod tests {
             return;
         }
 
-        let (store, _temp_dir) = offline_recovery_test_store();
+        let (store, _temp_dir) = offline_recovery_test_store().await;
         finish_deferred_recovery_migrations(&store).await;
         let pool = store.pool();
         sqlx::query("CREATE TABLE _ferrum_plugin_migrations (broken TEXT)")
@@ -3905,7 +3907,7 @@ pub(super) mod tests {
             return;
         }
 
-        let (store, _temp_dir) = offline_recovery_test_store();
+        let (store, _temp_dir) = offline_recovery_test_store().await;
         finish_deferred_recovery_migrations(&store).await;
         if !seed_drifted_plugin_history(&store, &plugin_migrations).await {
             return;
@@ -3939,7 +3941,7 @@ pub(super) mod tests {
             return;
         }
 
-        let (store, _temp_dir) = offline_recovery_test_store();
+        let (store, _temp_dir) = offline_recovery_test_store().await;
         finish_deferred_recovery_migrations(&store).await;
         let pool = store.pool();
         sqlx::query("CREATE TABLE _ferrum_plugin_migrations (broken TEXT)")
@@ -3975,7 +3977,7 @@ pub(super) mod tests {
             return;
         }
 
-        let (store, _temp_dir) = offline_recovery_test_store();
+        let (store, _temp_dir) = offline_recovery_test_store().await;
         let db: Arc<dyn DatabaseBackend> = Arc::new(store);
         let db_available = AtomicBool::new(false);
         let reconcile_state = AtomicU8::new(PLUGIN_MIGRATIONS_NEED_RECONCILE);
@@ -4012,7 +4014,7 @@ pub(super) mod tests {
             return;
         }
 
-        let (store, _temp_dir) = offline_recovery_test_store();
+        let (store, _temp_dir) = offline_recovery_test_store().await;
         finish_deferred_recovery_migrations(&store).await;
         if !seed_drifted_plugin_history(&store, &plugin_migrations).await {
             return;
@@ -4058,7 +4060,7 @@ pub(super) mod tests {
             return;
         }
 
-        let (store, _temp_dir) = offline_recovery_test_store();
+        let (store, _temp_dir) = offline_recovery_test_store().await;
         let db: Arc<dyn DatabaseBackend> = Arc::new(store);
         let db_available = AtomicBool::new(false);
         let reconcile_state = AtomicU8::new(PLUGIN_MIGRATIONS_NEED_RECONCILE);

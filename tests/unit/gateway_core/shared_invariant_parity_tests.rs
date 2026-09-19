@@ -113,12 +113,15 @@ fn database_tls_snapshot_and_reload_cover_all_sql_consumers() {
     // guarantee instead of the gateway failing to come up.
     let offline = item_body(
         &loader,
-        "pub fn connect_offline_with_pool_config(",
+        "pub async fn connect_offline_with_pool_config(",
         "\n    }",
     );
     assert!(offline.contains("build_pool_options_from_config(&pool_config, db_type)"));
     assert!(offline.contains("Ok(snapshot) => snapshot.pin(options)"));
     assert!(offline.contains("(options, db_url.to_string())"));
+    assert!(offline.contains("SqlTlsSnapshot::load_detached("));
+    assert!(offline.contains("await_pool_connect_with_timeout("));
+    assert!(!offline.contains("SqlTlsSnapshot::load("));
     for path in ["src/modes/database.rs", "src/modes/control_plane.rs"] {
         let mode = source(path);
         assert!(mode.contains("start_db_tls_reload_task("), "{path}");
@@ -136,6 +139,16 @@ fn database_tls_snapshot_and_reload_cover_all_sql_consumers() {
         assert!(body.contains("connect_any_pool_with_timeout("), "{caller}");
     }
     assert!(source("src/modes/db_tls_reload.rs").contains("db.reconnect_tls("));
+    let env = source("src/config/env_config.rs");
+    let source_value = item_body(&env, "fn db_tls_source_param_value(", "\n    }");
+    assert!(!source_value.contains("load_material"));
+    assert!(!source_value.contains("tempfile"));
+    let secondary = item_body(&env, "pub async fn connect_lazy(", "\n    }");
+    assert!(secondary.contains("SqlTlsSnapshot::load_detached("));
+    assert!(secondary.contains("snapshot.pin(options)"));
+    let audit = source("custom_plugins/examples/example_audit_plugin.rs");
+    assert!(audit.contains(".connect_lazy(self.options.clone(), 5)"));
+    assert!(!audit.contains(".connect_lazy(&backend.effective_url)"));
     for caller in [
         "pub async fn connect_with_pool_config(",
         "pub async fn connect_with_failover(",

@@ -405,3 +405,120 @@ async fn vault_timeout_errors() {
         "resolution should give up at ~1s, not hang"
     );
 }
+
+/// Provider material is resolved directly into pool-owned files. Rotations,
+/// rejected partial generations, and the last pool clone all exercise the
+/// same ownership path as file and inline sources in the ordinary unit lane.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn vault_database_tls_snapshots_follow_pool_lifetime() {
+    use ferrum_edge::config::{DbTlsMode, EnvConfig};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    let guard = EnvGuard::new();
+    let Some(vault) = try_vault("vault_database_tls_snapshots_follow_pool_lifetime").await else {
+        return;
+    };
+    guard.set("VAULT_ADDR", &vault.addr);
+    guard.set("VAULT_TOKEN", &vault.token);
+    let dir = tempfile::tempdir().unwrap();
+    guard.set_other("TMPDIR", dir.path().to_str().unwrap());
+    let foreign = dir.path().join("ferrum-db-client-key-foreign.pem");
+    std::fs::write(&foreign, "foreign owner").unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    for db_type in ["postgres", "mysql"] {
+        let env = EnvConfig {
+            db_type: Some(db_type.into()),
+            db_url: Some(format!("{db_type}://localhost/ferrum")),
+            db_tls_mode: Some(DbTlsMode::VerifyFull),
+            db_tls_ca_cert_path: Some("vault://secret/data/db-tls#ca".into()),
+            db_tls_client_cert_path: Some("vault://secret/data/db-tls#cert".into()),
+            db_tls_client_key_path: Some("vault://secret/data/db-tls#key".into()),
+            ..EnvConfig::default()
+        };
+        let backend = env.effective_sql_backend().unwrap();
+        let options = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .idle_timeout(None)
+            .max_lifetime(None);
+        let mut old = None;
+        let mut old_paths = Vec::<PathBuf>::new();
+        for generation in 0..3 {
+            let material = format!("provider generation {generation}");
+            client
+                .post(format!("{}/v1/secret/data/db-tls", vault.addr))
+                .header("X-Vault-Token", &vault.token)
+                .json(&serde_json::json!({
+                    "data": { "ca": material, "cert": material, "key": material }
+                }))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let pool = backend.connect_lazy(options.clone(), 10).await.unwrap();
+            let paths: Vec<PathBuf> = pool
+                .connect_options()
+                .database_url
+                .query_pairs()
+                .filter(|(key, _)| key != "sslmode" && key != "ssl-mode")
+                .map(|(_, value)| PathBuf::from(value.as_ref()))
+                .collect();
+            assert_eq!(paths.len(), 3);
+            for path in &paths {
+                assert_eq!(std::fs::read_to_string(path).unwrap(), material);
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            for path in &old_paths {
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    "provider generation 0"
+                );
+            }
+            if generation == 0 {
+                old = Some(pool.clone());
+                old_paths = paths;
+            }
+            drop(pool);
+            // Exactly the retained generation plus the foreign sentinel.
+            // An EnvConfig keep()-persisted layer would grow this on each call.
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4);
+        }
+        let mut rejected = env;
+        rejected.db_tls_client_key_path = Some("vault://secret/data/db-tls#absent".into());
+        assert!(
+            rejected
+                .effective_sql_backend()
+                .unwrap()
+                .connect_lazy(options, 10)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4);
+        let observer = dir.path().join("key-observer");
+        std::fs::hard_link(&old_paths[2], &observer).unwrap();
+        drop(old);
+        for path in old_paths {
+            assert!(!path.exists());
+        }
+        assert!(
+            std::fs::read(&observer)
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        std::fs::remove_file(observer).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "foreign owner");
+    }
+}

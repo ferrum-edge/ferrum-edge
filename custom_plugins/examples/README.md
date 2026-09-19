@@ -21,8 +21,11 @@ cargo build
 
 Runtime writes use the gateway SQL configuration database via
 `EnvConfig::resolve_effective_sql_backend` (`FERRUM_DB_TYPE` / `FERRUM_DB_URL` /
-`FERRUM_DB_TLS_*`). MongoDB is rejected. The worker pool is created lazily in
-`start_background_tasks`; construction does not open a network connection.
+`FERRUM_DB_TLS_*`). MongoDB is rejected. `start_background_tasks` resolves the
+source configuration without I/O. On first background use,
+`EffectiveSqlBackend::connect_lazy` snapshots TLS material under a five-second
+budget and creates the lazy pool; its material stays owned by that pool.
+Snapshot or connection failures follow the batching retry/warn path.
 
 ## Uninstall / leftover schema
 
