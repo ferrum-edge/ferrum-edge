@@ -58,6 +58,86 @@ fn remove_runtime_metrics_env_vars() {
 }
 
 #[test]
+fn metrics_token_admission_trims_and_preserves_disabled_defaults() {
+    use ferrum_edge::admin::MetricsAuthPolicy;
+    use ferrum_edge::config::conf_file::ConfFile;
+    use ferrum_edge::modes::startup_security::load_metrics_auth;
+
+    for raw in [None, Some("".to_string()), Some(" \t\n ".to_string())]
+        .into_iter()
+        .chain([32, 33].map(|length| Some(format!(" \t{}\n ", "a".repeat(length)))))
+    {
+        let expected = raw
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty());
+        let direct = EnvConfig {
+            metrics_bearer_token: raw.clone(),
+            metrics_allowed_cidrs: "10.0.0.0/8".to_string(),
+            ..Default::default()
+        };
+        let policy = MetricsAuthPolicy::from_env(&direct).unwrap();
+        assert_eq!(policy.bearer_token.as_deref(), expected);
+        assert!(!policy.allowed_cidrs.is_empty());
+        assert_eq!(
+            load_metrics_auth(&direct).unwrap().bearer_token,
+            policy.bearer_token
+        );
+
+        let mut vars = vec![
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+        ];
+        if let Some(token) = raw.as_deref() {
+            vars.push(("FERRUM_METRICS_BEARER_TOKEN", token));
+        }
+        with_env_vars(&vars, || {
+            let env = EnvConfig::from_env_with_conf(&ConfFile::default()).unwrap();
+            assert_eq!(env.metrics_bearer_token.as_deref(), expected);
+        });
+    }
+}
+
+#[test]
+fn metrics_token_admission_rejects_short_trimmed_values_without_disclosure() {
+    use ferrum_edge::admin::MetricsAuthPolicy;
+    use ferrum_edge::config::conf_file::ConfFile;
+    use ferrum_edge::modes::startup_security::load_metrics_auth;
+
+    const ERROR: &str = "FERRUM_METRICS_BEARER_TOKEN must be at least 32 characters after trimming";
+    for token in ["x".to_string(), "a".repeat(31), "é".repeat(16)] {
+        let padded = format!("  {token}  ");
+        let direct = EnvConfig {
+            metrics_bearer_token: Some(padded.clone()),
+            ..Default::default()
+        };
+        assert_eq!(MetricsAuthPolicy::from_env(&direct).unwrap_err(), ERROR);
+        assert_eq!(load_metrics_auth(&direct).unwrap_err().to_string(), ERROR);
+
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+                ("FERRUM_METRICS_BEARER_TOKEN", padded.as_str()),
+            ],
+            || {
+                let error = EnvConfig::from_env_with_conf(&ConfFile::default()).unwrap_err();
+                assert_eq!(error, ERROR);
+            },
+        );
+
+        with_env_vars(&[], || {
+            let conf = ConfFile::parse(&format!(
+                "FERRUM_MODE=file\nFERRUM_FILE_CONFIG_PATH=/path/to/config.yaml\n\
+                 FERRUM_METRICS_BEARER_TOKEN={padded}\n"
+            ))
+            .unwrap();
+            assert_eq!(EnvConfig::from_env_with_conf(&conf).unwrap_err(), ERROR);
+        });
+    }
+}
+
+#[test]
 fn test_operating_mode_database() {
     with_env_vars(&[("FERRUM_MODE", "database")], || {
         let mode = OperatingMode::from_env().unwrap();

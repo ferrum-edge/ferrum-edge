@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use url::Url;
 
+use crate::config::BackendEgressPolicy;
 use crate::plugins::utils::http_client::PluginHttpClient;
 use crate::plugins::utils::response_body::{BoundedReadError, measure_response_body_bounded};
 use crate::retry::{ErrorClass, classify_reqwest_error};
@@ -194,13 +195,18 @@ impl NotificationChannel {
 }
 
 /// Parse a `{ name -> ChannelDef }` JSON object into typed channels.
+/// Supply the resolved egress policy carried by the delivery client so SMTP
+/// literal admission and per-send screening enforce the same configuration.
 ///
 /// Returns an error on:
 /// - Empty map.
 /// - Channel name not matching `[A-Za-z0-9_-]+`.
 /// - Missing or unknown `"type"` discriminant.
 /// - Per-channel validation failure (URL parse, missing required fields).
-pub fn parse_channels(value: &Value) -> Result<HashMap<String, Arc<NotificationChannel>>, String> {
+pub fn parse_channels(
+    backend_allow_ips: &BackendEgressPolicy,
+    value: &Value,
+) -> Result<HashMap<String, Arc<NotificationChannel>>, String> {
     let map = value
         .as_object()
         .ok_or_else(|| "`channels` must be an object".to_string())?;
@@ -210,7 +216,7 @@ pub fn parse_channels(value: &Value) -> Result<HashMap<String, Arc<NotificationC
     let mut out = HashMap::with_capacity(map.len());
     for (name, def) in map {
         validate_channel_name(name)?;
-        let channel = build_channel(name, def)?;
+        let channel = build_channel(name, def, backend_allow_ips)?;
         out.insert(name.clone(), Arc::new(channel));
     }
     Ok(out)
@@ -231,7 +237,11 @@ fn validate_channel_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn build_channel(name: &str, def: &Value) -> Result<NotificationChannel, String> {
+fn build_channel(
+    name: &str,
+    def: &Value,
+    backend_allow_ips: &BackendEgressPolicy,
+) -> Result<NotificationChannel, String> {
     let obj = def
         .as_object()
         .ok_or_else(|| format!("channel {name:?}: definition must be an object"))?;
@@ -273,7 +283,7 @@ fn build_channel(name: &str, def: &Value) -> Result<NotificationChannel, String>
         "email" => {
             reject_unknown_keys(obj, &path, EMAIL_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Email(Box::new(EmailChannel::new(
-                name, def,
+                name, def, backend_allow_ips,
             )?)))
         }
         other => Err(format!(

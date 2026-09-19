@@ -1,14 +1,15 @@
 //! Deterministic delivery-lifecycle tests for notification dispatch +
 //! proxy_alerts pending-state / generation retirement contracts (#2448).
 
+use super::parse_channels;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use ferrum_edge::notifications::channels::NotificationChannel;
 use ferrum_edge::notifications::channels::email::{SmtpFailure, SmtpPhase};
-use ferrum_edge::notifications::channels::{NotificationChannel, parse_channels};
 use ferrum_edge::notifications::dispatch::{DeliveryRetryPolicy, dispatch_one};
 use ferrum_edge::notifications::generation::{DispatchGeneration, DispatchSettle};
 use ferrum_edge::notifications::metrics::DeliveryMetrics;

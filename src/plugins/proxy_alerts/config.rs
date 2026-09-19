@@ -13,6 +13,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde_json::{Map, Value};
 
+use crate::config::BackendEgressPolicy;
 use crate::notifications::dispatch::DeliveryRetryPolicy;
 use crate::notifications::{NotificationChannel, Severity, channels::parse_channels};
 use crate::plugins::DisconnectCause;
@@ -209,7 +210,7 @@ fn previous_weekday(day_from_sunday: u32) -> u32 {
 }
 
 impl ProxyAlertsConfig {
-    pub fn parse(config: &Value) -> Result<Self, String> {
+    pub fn parse(backend_allow_ips: &BackendEgressPolicy, config: &Value) -> Result<Self, String> {
         let obj = config
             .as_object()
             .ok_or_else(|| "proxy_alerts: config must be an object".to_string())?;
@@ -294,7 +295,8 @@ impl ProxyAlertsConfig {
         let channels_value = config
             .get("channels")
             .ok_or_else(|| "proxy_alerts: `channels` is required".to_string())?;
-        let channels = parse_channels(channels_value).map_err(|e| format!("proxy_alerts: {e}"))?;
+        let channels = parse_channels(backend_allow_ips, channels_value)
+            .map_err(|e| format!("proxy_alerts: {e}"))?;
 
         // Assign deterministic channel ids in alphabetical order so test
         // snapshots and log output are stable across runs.

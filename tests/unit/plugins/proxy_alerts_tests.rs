@@ -38,6 +38,15 @@ fn http_client() -> PluginHttpClient {
     PluginHttpClient::default()
 }
 
+fn parse_config(
+    config: &serde_json::Value,
+) -> Result<ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig, String> {
+    ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        config,
+    )
+}
+
 fn minimal_config() -> serde_json::Value {
     json!({
         "channels": {
@@ -313,7 +322,7 @@ fn error_class_rules_accept_and_observe_every_runtime_label() {
         ErrorClass::RequestError,
     ];
     let labels: Vec<&str> = classes.iter().map(ErrorClass::as_str).collect();
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -1080,7 +1089,7 @@ async fn http_only_rules_do_not_opt_into_websocket_disconnect_hook() {
 
 #[test]
 fn websocket_disconnect_context_feeds_stream_rules() {
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -1131,7 +1140,7 @@ fn websocket_disconnect_context_feeds_stream_rules() {
 
 #[test]
 fn websocket_disconnect_cause_distinguishes_client_write_failures() {
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -1189,7 +1198,7 @@ fn websocket_disconnect_cause_distinguishes_client_write_failures() {
 
 #[test]
 fn http_error_class_rules_match_body_error_class_when_request_error_is_also_set() {
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -1224,7 +1233,7 @@ fn http_error_class_rules_match_body_error_class_when_request_error_is_also_set(
 
 #[test]
 fn latency_sentinel_sample_keeps_existing_breach() {
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -1282,7 +1291,7 @@ fn latency_sentinel_sample_keeps_existing_breach() {
 
 #[test]
 fn latency_boundary_threshold_does_not_fire_previous_bucket() {
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -1337,7 +1346,7 @@ fn latency_boundary_threshold_does_not_fire_previous_bucket() {
 
 #[test]
 fn latency_non_boundary_threshold_fires_within_estimated_bucket() {
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -1392,7 +1401,7 @@ fn latency_non_boundary_threshold_fires_within_estimated_bucket() {
 
 #[test]
 fn latency_overflow_bucket_reports_configured_max_bound() {
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -2191,7 +2200,7 @@ fn stream_duration_percentile_observes_monotonic_producer_duration() {
     // End-to-end: upstream summaries carry Instant/mono-derived duration_ms
     // even when civil-clock disconnect precedes connect (wall rollback).
     // proxy_alerts must sample that duration unchanged for stream_duration_ms.
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -2373,7 +2382,7 @@ fn rejects_lowercase_other_grpc_status_selector_to_match_openapi() {
 
 #[test]
 fn grpc_status_count_keeps_http_status_distinct_across_shapes() {
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -2492,7 +2501,7 @@ fn grpc_status_count_keeps_http_status_distinct_across_shapes() {
 
 #[test]
 fn grpc_status_rate_uses_grpc_only_denominator_and_respects_min_count() {
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -2556,7 +2565,7 @@ fn grpc_status_rate_uses_grpc_only_denominator_and_respects_min_count() {
 
 #[test]
 fn grpc_status_count_zero_ok_can_be_selected_explicitly() {
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },
@@ -2603,7 +2612,7 @@ fn grpc_status_count_zero_ok_can_be_selected_explicitly() {
 
 #[test]
 fn grpc_status_rules_ignore_stream_and_websocket_samples() {
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+    let parsed = parse_config(&json!({
         "channels": {
             "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
         },

@@ -8,6 +8,7 @@
 //! Every credential used here is a fixture-local literal; the redaction
 //! assertions check that it never escapes into an error string.
 
+use super::parse_channels;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -15,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use chrono::{TimeZone, Utc};
-use ferrum_edge::notifications::channels::{EmailChannel, NotificationChannel, parse_channels};
+use ferrum_edge::notifications::channels::{EmailChannel, NotificationChannel};
 use ferrum_edge::notifications::{EventAction, Notification, NotificationField, Severity};
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use serde_json::{Value, json};
@@ -136,6 +137,115 @@ fn email_channel_parses_through_the_common_channel_map_with_defaults() {
     assert!(!channel.has_credentials());
     assert_eq!(channel.subject_template(), "[${severity}] ${title}");
     assert_eq!(channel.body_template(), "${body}\n\n${fields}");
+}
+
+#[test]
+fn email_literal_egress_admission_uses_the_resolved_policy() {
+    use ferrum_edge::config::BackendAllowIps::{Both, Public};
+    use ferrum_edge::config::BackendEgressPolicy;
+    use ferrum_edge::plugins::proxy_alerts::ProxyAlerts;
+    use ferrum_edge::plugins::validate_plugin_config_with_policy;
+
+    let cases = [
+        (Both, "", "", true, "169.254.169.254", false),
+        (Both, "", "", true, "[fe80::1]", false),
+        (Both, "", "", true, "[::ffff:169.254.169.254]", false),
+        (Public, "", "", true, "127.0.0.1", false),
+        (Public, "", "", true, "[::1]", false),
+        (Public, "", "", true, "10.1.2.3", false),
+        (Both, "", "10.0.0.0/8", true, "10.1.2.3", false),
+        (Both, "", "", true, "10.1.2.3", true),
+        (Public, "", "", true, "8.8.8.8", true),
+        (Public, "10.0.0.0/8", "", true, "10.1.2.3", true),
+        (Both, "169.254.169.254/32", "", true, "169.254.169.254", true),
+        (Both, "", "", false, "169.254.169.254", true),
+        // Construction must not resolve DNS, even with every address denied.
+        (Both, "", "0.0.0.0/0,::/0", true, "smtp.invalid", true),
+    ];
+    for (mode, allow, deny, baseline, host, accepted) in cases {
+        let policy = BackendEgressPolicy::from_env(mode.clone(), allow, deny, baseline).unwrap();
+        let mut channel = minimal_def(587);
+        channel["smtp_host"] = json!(host);
+        let direct = EmailChannel::new("ops", &channel, &policy);
+        assert_eq!(direct.is_ok(), accepted, "{mode}: {host}");
+        if let Err(error) = direct {
+            assert!(error.contains("`smtp_host`"), "{error}");
+            assert!(error.contains("backend egress policy"), "{error}");
+            assert!(!error.contains(host), "{error}");
+        }
+        let channels = json!({"ops": channel});
+        assert_eq!(
+            ferrum_edge::notifications::channels::parse_channels(&policy, &channels).is_ok(),
+            accepted
+        );
+        let config = json!({
+            "channels": channels,
+            "rules": [{
+                "name": "errors", "type": "status_code_count", "status_codes": [500],
+                "threshold_count": 1, "channels": ["ops"]
+            }]
+        });
+        assert_eq!(
+            validate_plugin_config_with_policy("proxy_alerts", &config, &policy).is_ok(),
+            accepted,
+            "config admission: {mode}: {host}"
+        );
+        let http = PluginHttpClient::default_with_backend_allow_ips(policy);
+        assert_eq!(ProxyAlerts::new(&config, http).is_ok(), accepted);
+    }
+}
+
+#[tokio::test]
+async fn email_send_rechecks_literals_and_resolved_hostnames_before_connecting() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    let listener = crate::port_registry::bind_tcp_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (ca_file, _acceptor) = tls_materials("localhost");
+    // Deliberately allow the DNS result so the SMTP per-send IP check, rather
+    // than the cache's own policy, must refuse the connection.
+    let dns = DnsCache::new(DnsConfig {
+        global_overrides: HashMap::from([("smtp.invalid".to_string(), "127.0.0.1".to_string())]),
+        ..Default::default()
+    });
+    let http = PluginHttpClient::new(
+        &PoolConfig::default(),
+        dns,
+        1000,
+        0,
+        100,
+        false,
+        ca_file.path().to_str(),
+        Arc::new(Vec::new()),
+        ferrum_edge::config::types::DEFAULT_NAMESPACE,
+        BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+        Arc::new(Vec::new()),
+        0,
+    );
+    for host in ["127.0.0.1", "smtp.invalid"] {
+        let mut def = minimal_def(listener.local_addr().unwrap().port());
+        def["smtp_host"] = json!(host);
+        def["command_timeout_ms"] = json!(100);
+        let channel = EmailChannel::new(
+            "ops",
+            &def,
+            &BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both),
+        )
+        .unwrap();
+        let error = channel
+            .dispatch(&notification(EventAction::Trigger), &http)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("blocked by the backend egress policy"),
+            "{error}"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 }
 
 #[test]

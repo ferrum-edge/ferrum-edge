@@ -590,6 +590,18 @@ pub fn tls_acme_terminal_order_history_from_env() -> Result<usize, String> {
     )
 }
 
+/// Normalize and validate the dedicated observability credential. Blank values
+/// disable token auth; diagnostics never include the credential or its length.
+pub(crate) fn normalized_metrics_bearer_token(token: Option<&str>) -> Result<Option<&str>, String> {
+    let token = token.map(str::trim).filter(|token| !token.is_empty());
+    if token.is_some_and(|token| token.chars().count() < 32) {
+        return Err(
+            "FERRUM_METRICS_BEARER_TOKEN must be at least 32 characters after trimming".to_string(),
+        );
+    }
+    Ok(token)
+}
+
 /// Reject a `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` that is too short to be an
 /// HMAC-SHA-256 key (issue #3289).
 ///
@@ -3364,7 +3376,8 @@ pub struct EnvConfig {
     /// Dedicated bearer token that authorizes `/metrics` scraping (and the
     /// detailed `/health` / `/overload` views) without a full admin JWT.
     /// When set, a request whose `Authorization: Bearer <token>` matches this
-    /// value (constant-time compare) is allowed. Empty/unset disables this path.
+    /// trimmed value (constant-time compare) is allowed. A nonempty trimmed
+    /// token must contain at least 32 characters. Blank/unset disables this path.
     /// Use this for Prometheus deployments that cannot mint admin JWTs.
     pub metrics_bearer_token: Option<String>,
 
@@ -4951,6 +4964,9 @@ impl EnvConfig {
                 )
             );
         }
+
+        let metrics_bearer_token =
+            normalized_metrics_bearer_token(metrics_bearer_token.as_deref())?.map(str::to_owned);
 
         // Keep this hand-written: the value is pre-lowercased at load time so
         // request handling can avoid allocating on every lookup.

@@ -1,11 +1,12 @@
 //! Tests for `crate::notifications::dispatch`.
 
+use super::parse_channels;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ferrum_edge::notifications::channels::{NotificationChannel, parse_channels};
+use ferrum_edge::notifications::channels::NotificationChannel;
 use ferrum_edge::notifications::{
     EventAction, Notification, NotificationField, Severity, dispatch,
 };

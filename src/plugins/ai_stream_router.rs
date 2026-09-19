@@ -220,7 +220,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 use url::{Host, Url};
 
-use super::utils::ai_model_glob::matches_model_glob;
+use super::utils::ai_model_glob::{
+    MAX_MODEL_PATTERNS_PER_PROVIDER, is_valid_model_pattern, matches_model_glob,
+};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::content_encoding::{
     DecodeLimits, decode_content_encoding, parse_content_codings,
@@ -846,6 +848,15 @@ impl AiStreamRouter {
             if model_patterns.is_empty() {
                 return Err(format!(
                     "ai_stream_router: provider {name:?} requires a non-empty `model_patterns` array"
+                ));
+            }
+            if model_patterns.len() > MAX_MODEL_PATTERNS_PER_PROVIDER
+                || model_patterns
+                    .iter()
+                    .any(|pattern| !is_valid_model_pattern(pattern))
+            {
+                return Err(format!(
+                    "ai_stream_router: provider {name:?} `model_patterns` must contain at most {MAX_MODEL_PATTERNS_PER_PROVIDER} bounded model globs"
                 ));
             }
 

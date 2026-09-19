@@ -7596,7 +7596,9 @@ components:
       scheme: bearer
       bearerFormat: token
       description: |
-        Dedicated `FERRUM_METRICS_BEARER_TOKEN` accepted only by observability
+        Dedicated `FERRUM_METRICS_BEARER_TOKEN` (at least 32 characters after
+        trimming when nonempty; unset or blank disables token auth). Startup
+        and validation reject shorter tokens. Accepted only by observability
         scrape/detail surfaces such as exact `/metrics` and detailed
         `/health`/`/status`/`/overload`. CIDR-based metrics access is configured
         separately with `FERRUM_METRICS_ALLOWED_CIDRS` and cannot be represented
@@ -20473,7 +20475,7 @@ components:
               - pattern: "://"
               - pattern: "[/?#@\\s]"
               - pattern: "^[^\\[\\]:]+:[^:]+$"
-          description: SMTP relay hostname or IP literal. No scheme, port, path, or credentials.
+          description: SMTP relay hostname or IP literal. No scheme, port, path, or credentials. Literal IPs must pass the resolved backend egress policy at admission (including allow/deny CIDRs and dangerous-range overrides). Construction does not resolve DNS; every send rechecks the resolved IP before connecting.
         smtp_port:
           type: integer
           minimum: 1
@@ -34054,10 +34056,14 @@ components:
               model_patterns:
                 type: array
                 minItems: 1
+                maxItems: 128
                 items:
                   type: string
                   minLength: 1
-                description: "Non-empty glob patterns matched against the request `model`. `*` is the only wildcard, matches any run of characters except URL-structural separators (`/ ? # & \\`) and whitespace, and the pattern is anchored at both ends — so `*mini` matches `model-mini` and `mini-mini` alike, and never matches `mini-pro`. Example: ['gpt-*', 'o*'] or ['claude-*']."
+                  maxLength: 256
+                  pattern: '^[A-Za-z0-9._:/+*-]+$'
+                  not: { pattern: '\.\.' }
+                description: "1–128 glob patterns matched against the request `model`; each is 1–256 ASCII bytes using letters, digits, dot, underscore, colon, slash, plus, hyphen, or star, with no `..` sequence. `*` is the only wildcard, matches any run of characters except URL-structural separators (`/ ? # & \\`) and whitespace, and the pattern is anchored at both ends — so `*mini` matches `model-mini` and `mini-mini` alike, and never matches `mini-pro`. Example: ['gpt-*', 'o*'] or ['claude-*']."
               priority:
                 type: [integer, "null"]
                 minimum: 1

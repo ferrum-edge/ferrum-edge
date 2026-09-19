@@ -27,6 +27,11 @@ The whole admin listener can additionally be restricted at the TCP layer with `F
 
 Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`), and `nbf`/`exp` are validated. The `FERRUM_ADMIN_JWT_MAX_TTL` cap (default `3600` seconds) is enforced against verifier time, not just the claims, and counts the accepted clock-skew leeway (60 seconds) exactly once: `exp - iat` must be positive and within the maximum, `iat` must not be later than verifier time plus the leeway, `exp - now` must stay within the maximum plus that same leeway, and `exp` must still be in the future at verifier time (the cap path applies no expiry grace, so the skew allowance is not counted a second time at expiration). Effective maximum real validity is therefore `FERRUM_ADMIN_JWT_MAX_TTL + 60s`, and shifting `iat` and `exp` together into the future cannot extend a token's real lifetime beyond that bound. Setting `FERRUM_ADMIN_JWT_MAX_TTL=0` intentionally disables the lifetime cap; a configured value above `9223372036854775807` is rejected at startup as invalid rather than treated as unlimited. When `FERRUM_ADMIN_JWT_AUDIENCE` is set, tokens must also carry a matching `aud` claim. When unset (default), tokens without an `aud` claim are accepted, but tokens that carry `aud` are rejected per RFC 7519 §4.1.3 (no acceptable audience is configured) — if your token minter stamps `aud`, set `FERRUM_ADMIN_JWT_AUDIENCE` to that value.
 
+`FERRUM_METRICS_BEARER_TOKEN` must contain at least 32 characters after trimming.
+Startup and `ferrum-edge validate` reject shorter nonempty values without
+disclosing the token. Unset, empty, and whitespace-only values disable this
+authentication path. Use a long random token; it does not grant admin roles.
+
 ### Per-namespace tenancy (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`)
 
 Only an absent `X-Ferrum-Namespace` header selects the default namespace

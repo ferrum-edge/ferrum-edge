@@ -163,7 +163,7 @@ thread_local! {
 
 impl ProxyAlerts {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let parsed = ProxyAlertsConfig::parse(config)?;
+        let parsed = ProxyAlertsConfig::parse(http_client.backend_allow_ips(), config)?;
 
         let rule_specs = parsed
             .rules

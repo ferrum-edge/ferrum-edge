@@ -8,7 +8,7 @@ Reusable, plugin-agnostic notification infrastructure. Lives at `src/notificatio
 |------|------|---------|
 | `Notification` | `src/notifications/notification.rs` | Generic payload: title, body, severity, k/v fields, lifecycle action. No alert-specific fields. |
 | `NotificationChannel` | `src/notifications/channels/mod.rs` | Enum over Slack / Teams / Discord / Webhook / Email. Uniform `dispatch` surface. |
-| `parse_channels(json)` | `src/notifications/channels/mod.rs` | JSON → typed channel map with validation. |
+| `parse_channels(egress_policy, json)` | `src/notifications/channels/mod.rs` | JSON → typed channel map with validation. |
 | `dispatch(...)` | `src/notifications/dispatch.rs` | Bounded-concurrency fan-out helper. |
 | `templating::render_template` | `src/notifications/templating.rs` | `${var}` substitution + dry-run validation. |
 
@@ -132,7 +132,7 @@ Security notes:
 - Delivery errors are structured and carry only a phase plus the numeric SMTP reply code — server reply text is always withheld because it is untrusted and can be attacker-influenced. A reply that echoes the configured password, or either credential in its on-the-wire base64 form, aborts the session with a dedicated error. The plaintext AUTH username is deliberately not watched: it is usually the mailbox address and relays legitimately echo addresses in `MAIL FROM` / `RCPT TO` replies.
 - Multiline replies are parsed strictly: every line must repeat the same 3-digit code with a `-`/space separator, and a malformed, oversized, or truncated reply fails the send.
 - Every templated value that reaches a header has its control characters folded to spaces, and the body is base64-encoded, so neither header injection nor premature `DATA` termination is reachable from template variables.
-- The resolved SMTP address is screened against `FERRUM_BACKEND_ALLOW_IPS` / `FERRUM_BACKEND_DENY_CIDRS` before connecting, so a hostname that resolves into a denied range is refused.
+- Literal `smtp_host` addresses are screened at construction/admission against the same resolved backend egress policy used for delivery and socket log sinks: `FERRUM_BACKEND_ALLOW_IPS`, `FERRUM_BACKEND_ALLOW_CIDRS`, `FERRUM_BACKEND_DENY_CIDRS`, and `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES`. Explicit allowlists and baseline overrides retain their normal precedence. Construction performs no DNS lookups. Every send still resolves and rechecks the resulting IP before connecting, so hostnames cannot bypass the policy. Direct channel/parser callers must supply the resolved policy used by their delivery client.
 - `smtp_host` participates in startup warmup/preflight DNS resolution (`NotificationChannel::warmup_hostnames`).
 
 ### Template variables provided by the notifications layer
@@ -248,7 +248,7 @@ use ferrum_edge::notifications::{
     channels::parse_channels,
 };
 
-let channels = parse_channels(&serde_json::json!({
+let channels = parse_channels(http_client.backend_allow_ips(), &serde_json::json!({
     "ops": {
         "type": "slack",
         "webhook_url": "https://hooks.slack.com/services/T/B/X"

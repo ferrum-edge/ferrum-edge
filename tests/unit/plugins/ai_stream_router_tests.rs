@@ -9697,6 +9697,45 @@ async fn test_model_repeating_its_pattern_suffix_selects_the_configured_provider
     assert_eq!(reject_status(&res), Some(404));
 }
 
+#[tokio::test]
+async fn test_bounded_patterns_preserve_anchoring_and_first_match() {
+    let plugin = build(json!({
+        "providers": [
+            {
+                "name": "first", "provider_type": "openai", "priority": 1,
+                "endpoint": "https://first.example.com/v1", "api_key": "fixture-first",
+                "model_patterns": ["*mini", "Org/model.v1_2:chat+fast-*"]
+            },
+            {
+                "name": "second", "provider_type": "openai", "priority": 2,
+                "endpoint": "https://second.example.com/v1", "api_key": "fixture-second",
+                "model_patterns": ["*mini"]
+            },
+            {
+                "name": "catchall", "provider_type": "openai", "priority": 3,
+                "endpoint": "https://catchall.example.com/v1", "api_key": "fixture-catchall",
+                "model_patterns": ["*"]
+            }
+        ]
+    }));
+    for (model, expected) in [
+        ("mini-mini", "first"),
+        ("Org/model.v1_2:chat+fast-v3", "first"),
+        ("mini-pro", "catchall"),
+    ] {
+        let mut ctx = post_ctx(&json!({"model": model, "stream": true, "messages": []}));
+        let result = plugin.before_proxy(&mut ctx, &mut json_headers()).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata
+                .get("ai_stream_router.provider")
+                .map(String::as_str),
+            Some(expected),
+            "{model}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Provider admission (issues #5300, #5301, #5302)
 // ---------------------------------------------------------------------------

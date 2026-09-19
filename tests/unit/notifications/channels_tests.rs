@@ -4,12 +4,13 @@
 //! shape via `build_payload()` / `render_body()` so we don't need a live
 //! HTTP server to assert wire format.
 
+use super::parse_channels;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use chrono::{TimeZone, Utc};
 use ferrum_edge::notifications::channels::{
-    DiscordChannel, NotificationChannel, SlackChannel, TeamsChannel, WebhookChannel, parse_channels,
+    DiscordChannel, NotificationChannel, SlackChannel, TeamsChannel, WebhookChannel,
 };
 use ferrum_edge::notifications::{EventAction, Notification, NotificationField, Severity};
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;

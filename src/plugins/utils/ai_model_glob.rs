@@ -1,8 +1,8 @@
 //! Anchored `*`-only glob matching for AI provider `model_patterns`.
 //!
 //! `ai_stream_router` (and, historically, `ai_federation`) route a request by
-//! matching the client's `model` against operator-configured globs. Both halves
-//! of that contract live here so the plugins that consume it cannot drift:
+//! matching the client's `model` against operator-configured globs. Matching
+//! and admission live here so the plugins that consume them cannot drift:
 //!
 //! 1. **Anchoring.** A pattern matches the WHOLE model name. There is no
 //!    "starts-with" mode.
@@ -10,6 +10,9 @@
 //!    separator or whitespace, so a permissive `gemini-*` cannot smuggle
 //!    `gemini-../foo:streamGenerateContent` past selection and into a provider
 //!    path.
+//! 3. **Admission.** Each provider admits at most 128 patterns, each a restricted
+//!    1–256-byte ASCII glob without `..`. Callers decide whether an empty array
+//!    is meaningful (federation's catch-all) or invalid (stream routing).
 //!
 //! Issue #5255 (`ai_federation`) and issues #5297 / #5392 (`ai_stream_router`)
 //! were one defect in two copies: the matcher consumed the FIRST occurrence of
@@ -17,6 +20,21 @@
 //! the end of the input, so `*mini` rejected `mini-mini` — an ordinary model
 //! name answered with a `404`, or handed to a different provider by a catch-all
 //! fallback.
+
+/// Admission bounds shared by federation and streaming provider routing.
+pub const MAX_MODEL_PATTERNS_PER_PROVIDER: usize = 128;
+const MAX_MODEL_PATTERN_BYTES: usize = 256;
+
+/// Restricted operator-configured model glob; only `*` is a wildcard.
+pub fn is_valid_model_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern.len() <= MAX_MODEL_PATTERN_BYTES
+        && !pattern.contains("..")
+        && pattern.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/' | b'+' | b'*')
+        })
+}
 
 /// Bytes a `*` window may never consume.
 ///

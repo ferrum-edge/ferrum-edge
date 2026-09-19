@@ -113,7 +113,9 @@ use super::ai_stream_router::{
     next_provider_claim_owner_id, remove_header_ci, strip_client_credentials,
     strip_gateway_identity_assertions,
 };
-use super::utils::ai_model_glob::matches_model_glob;
+use super::utils::ai_model_glob::{
+    MAX_MODEL_PATTERNS_PER_PROVIDER, is_valid_model_pattern, matches_model_glob,
+};
 use super::utils::aws_sigv4;
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::openai_error::openai_error_body;
@@ -135,7 +137,6 @@ const MAX_STOP_SEQUENCES: usize = 4;
 const MAX_STOP_SEQUENCE_CHARS: usize = 1024;
 const MAX_MODEL_IDENTIFIER_BYTES: usize = 256;
 const MAX_PROVIDERS: usize = 128;
-const MAX_MODEL_PATTERNS_PER_PROVIDER: usize = 128;
 const MAX_MODEL_MAPPINGS_PER_PROVIDER: usize = 1024;
 const MAX_FORWARDED_PROVIDER_HEADERS: usize = 32;
 const MAX_FORWARDED_PROVIDER_HEADER_VALUE_BYTES: usize = 1024;
@@ -1997,16 +1998,6 @@ fn is_valid_model_identifier(model: &str) -> bool {
         && !model.contains("..")
         && model.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/' | b'+')
-        })
-}
-
-fn is_valid_model_pattern(pattern: &str) -> bool {
-    !pattern.is_empty()
-        && pattern.len() <= MAX_MODEL_IDENTIFIER_BYTES
-        && !pattern.contains("..")
-        && pattern.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/' | b'+' | b'*')
         })
 }
 

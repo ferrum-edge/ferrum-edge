@@ -379,20 +379,51 @@ async fn malformed_namespace_claim_does_not_authorize_observability_detail() {
 
 #[tokio::test]
 async fn metrics_accepts_dedicated_bearer_token() {
-    let policy = MetricsAuthPolicy {
-        allowed_cidrs: TrustedProxies::none(),
-        bearer_token: Some("super-secret-scrape-token".to_string()),
+    let env = ferrum_edge::config::EnvConfig {
+        metrics_bearer_token: Some("  fixture-only-scrape-token-at-least-32-chars  ".to_string()),
+        ..Default::default()
     };
+    let policy = MetricsAuthPolicy::from_env(&env).unwrap();
     let (base, _sd) = start_admin(admin_state(policy)).await;
 
     // Correct metrics token → 200.
     let resp = reqwest::Client::new()
         .get(format!("{base}/metrics"))
-        .header("Authorization", "Bearer super-secret-scrape-token")
+        .bearer_auth("fixture-only-scrape-token-at-least-32-chars")
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
+
+    // The admitted token unlocks health detail, but never admin-only routes.
+    let client = reqwest::Client::new();
+    let health: Value = client
+        .get(format!("{base}/health"))
+        .bearer_auth("fixture-only-scrape-token-at-least-32-chars")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["mode"], "file");
+    for path in ["/metrics/runtime", "/proxies"] {
+        let response = client
+            .get(format!("{base}{path}"))
+            .bearer_auth("fixture-only-scrape-token-at-least-32-chars")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 401, "{path}");
+    }
+    let response = client
+        .post(format!("{base}/proxies"))
+        .bearer_auth("fixture-only-scrape-token-at-least-32-chars")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
 
     // Wrong token → 401.
     let resp = reqwest::Client::new()
@@ -442,7 +473,7 @@ async fn trust_generation_requires_admin_jwt_not_metrics_only_auth() {
 
     let bearer_policy = MetricsAuthPolicy {
         allowed_cidrs: TrustedProxies::none(),
-        bearer_token: Some("health-scrape-token".to_string()),
+        bearer_token: Some("fixture-only-health-token-at-least-32-chars".to_string()),
     };
     let (bearer_base, _bearer_sd) = start_admin(admin_state(bearer_policy)).await;
     let cidr_policy = MetricsAuthPolicy {
@@ -455,7 +486,10 @@ async fn trust_generation_requires_admin_jwt_not_metrics_only_auth() {
 
     for (base, authorization) in [
         (&cidr_base, None),
-        (&bearer_base, Some("Bearer health-scrape-token")),
+        (
+            &bearer_base,
+            Some("Bearer fixture-only-health-token-at-least-32-chars"),
+        ),
     ] {
         let mut request = client.get(format!("{base}/health"));
         if let Some(value) = authorization {

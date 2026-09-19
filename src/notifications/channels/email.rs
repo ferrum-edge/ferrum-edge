@@ -42,6 +42,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{OnceCell, Semaphore};
 use tokio_rustls::TlsConnector;
 
+use crate::config::BackendEgressPolicy;
 use crate::plugins::utils::http_client::PluginHttpClient;
 use crate::plugins::utils::{parse_socket_host, resolve_tcp_endpoint};
 
@@ -256,13 +257,22 @@ impl fmt::Debug for EmailChannel {
 
 #[allow(dead_code)] // Accessors are part of the reusable channel surface.
 impl EmailChannel {
-    pub fn new(name: &str, value: &Value) -> Result<Self, String> {
-        Self::new_with_env_lookup(name, value, &|name| std::env::var(name))
+    /// Admit SMTP literals using the resolved policy of the delivery client.
+    /// Hostnames are left unresolved until warmup or delivery.
+    pub fn new(
+        name: &str,
+        value: &Value,
+        backend_allow_ips: &BackendEgressPolicy,
+    ) -> Result<Self, String> {
+        Self::new_with_env_lookup(name, value, backend_allow_ips, &|name| {
+            std::env::var(name)
+        })
     }
 
     pub(crate) fn new_with_env_lookup(
         name: &str,
         value: &Value,
+        backend_allow_ips: &BackendEgressPolicy,
         env_lookup: EnvVarLookup<'_>,
     ) -> Result<Self, String> {
         let raw_host = value
@@ -274,6 +284,9 @@ impl EmailChannel {
         let socket_host =
             parse_socket_host(&format!("channel {name:?} (email)"), "smtp_host", raw_host)
                 .map_err(|error| format!("`channels` (email): {error}"))?;
+        socket_host
+            .screen_egress_ip(CHANNEL_LABEL, "smtp_host", backend_allow_ips)
+            .map_err(|error| format!("`channels` (email): {error}"))?;
 
         let tls_mode = match value.get("tls_mode") {
             Some(v) => {
