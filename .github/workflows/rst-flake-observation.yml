@@ -10,6 +10,12 @@
 # that first fails an RST cell. Unrelated failures in a shard that size are
 # counted separately so they cannot masquerade as a reproduction.
 #
+# Sizing, from run 35498088132: ~13.2 minutes per repetition, so 8 shards at
+# 24 repetitions is ~190 full-shard executions. Against the ~1/100 per-execution
+# rate the two field occurrences imply, that is roughly an 85% chance of one
+# capture, at a cost of ~46 job-hours. Dial `repetitions` down if that is too
+# much for the answer it buys.
+#
 # Delete this workflow once #5575 has a root cause.
 name: RST Flake Observation
 
@@ -26,7 +32,7 @@ on:
         description: "Repetitions of the full protocols shard per lane shard"
         type: string
         required: true
-        default: "14"
+        default: "24"
 
 permissions:
   contents: read
@@ -35,7 +41,13 @@ jobs:
   observe:
     name: RST cells shard ${{ matrix.shard }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # Measured: one full protocols-shard repetition costs ~13.2 minutes
+    # (shard 3 of run 35498088132 completed 7 between 08:25 and 09:44), plus
+    # ~20 minutes of build. The first attempt sized this at 120 and lost every
+    # shard to the ceiling mid-repetition. 350 leaves room for ~25 repetitions
+    # under GitHub's 360-minute hosted maximum. The timeout is only a ceiling:
+    # cost follows the repetitions actually requested, not this number.
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
@@ -71,7 +83,9 @@ jobs:
       - name: Repeat the protocols shard
         id: repeat
         env:
-          REPETITIONS: ${{ github.event.inputs.repetitions || '14' }}
+          # A dispatch asks for the full campaign; an ordinary push to the
+          # matrix files gets a cheap smoke pass instead of ~46 job-hours.
+          REPETITIONS: ${{ github.event.inputs.repetitions || '4' }}
           # Match the real `test-functional` job exactly. Without this the
           # harness shells out to `cargo build` from EVERY nextest process
           # (they are process-per-test), which both dominates the runtime and
@@ -219,7 +233,7 @@ jobs:
           {
             echo "### RST flake observation — shard ${{ matrix.shard }}"
             echo
-            echo "- repetitions requested: ${{ github.event.inputs.repetitions || '14' }}"
+            echo "- repetitions requested: ${{ github.event.inputs.repetitions || '4' }}"
             echo "- RST captures: ${{ steps.repeat.outputs.captured }}"
             echo "- unrelated shard failures: ${{ steps.repeat.outputs.unrelated }}"
           } >> "$GITHUB_STEP_SUMMARY"
