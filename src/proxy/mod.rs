@@ -45753,10 +45753,23 @@ async fn proxy_to_backend(
         } else {
             ("backend_read_timeout_ms", proxy.backend_read_timeout_ms)
         };
+        // Issue #5575. On the accept-then-RST matrix cells the backend has
+        // already reset the socket microseconds in, and a standalone reqwest
+        // against the same fixture always resolves that as an error, so the
+        // open question is which part of THIS dispatch never resolved.
+        // `upload_pump` says whether the pumped arm — and therefore the #4411
+        // backend-socket scope wrapping the send — was in play at all, and the
+        // handoff counters say whether the connector ever reported a socket
+        // into this dispatch's slot or landed out of scope. Both are cold
+        // reads on a request that is already failing. The handoff counters are
+        // debug-build only, so this renders as `[]` in a release binary.
+        let socket_handoff = backend_send_queue::diagnostics::snapshot();
         warn!(
             proxy_id = %proxy.id,
             watermark,
             watermark_ms,
+            upload_pump = upload_pump.is_some(),
+            socket_handoff = ?socket_handoff,
             "reqwest dispatch: per-direction watermark expired before response headers"
         );
         return backend_dispatch_response(

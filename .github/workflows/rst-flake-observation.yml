@@ -1,0 +1,127 @@
+# Temporary #5575 flake observation. No production graph or frozen job edits.
+#
+# `backend_accepts_then_rst_returns_502__*` fails roughly once per several
+# thousand hosted cell executions and never on macOS (6000 local executions,
+# zero failures), so the only way to study it is to force the iterations on
+# Linux. This lane runs the nine RST cells in a loop across parallel shards
+# under the same nextest process-per-test shape the real functional shards
+# use, and keeps the full captured output of the first failing repetition.
+#
+# Delete this workflow once #5575 has a root cause.
+name: RST Flake Observation
+
+on:
+  pull_request:
+    paths:
+      - tests/functional/scripted_backend_matrix_tests.rs
+      - tests/scaffolding/matrix.rs
+      - tests/scaffolding/backends/tcp.rs
+      - .github/workflows/rst-flake-observation.yml
+  workflow_dispatch:
+    inputs:
+      repetitions:
+        description: "Repetitions of the RST cell set per shard"
+        type: string
+        required: true
+        default: "60"
+      test_threads:
+        description: "nextest test-threads per repetition (contention knob)"
+        type: string
+        required: true
+        default: "4"
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    name: RST cells shard ${{ matrix.shard }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    env:
+      # Shared `ci-debug` rust-cache lane: every member must compile with
+      # identical profile settings so restored dependency artifacts stay
+      # fingerprint-compatible.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-debug"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          tool: cargo-nextest
+
+      - name: Build functional tests
+        run: cargo test --no-run --test functional_tests
+
+      - name: Repeat the accept-then-RST cells
+        id: repeat
+        env:
+          # `workflow_dispatch` supplies these; a pull_request run uses a
+          # smaller budget so the lane stays cheap on ordinary pushes.
+          REPETITIONS: ${{ github.event.inputs.repetitions || '40' }}
+          TEST_THREADS: ${{ github.event.inputs.test_threads || '4' }}
+        run: |
+          set -uo pipefail
+          evidence="$RUNNER_TEMP/rst-evidence"
+          mkdir -p "$evidence"
+          rustc --version --verbose > "$evidence/rustc.txt"
+
+          failures=0
+          for i in $(seq 1 "$REPETITIONS"); do
+            log="$evidence/run-current.log"
+            if ! cargo nextest run \
+                --test functional_tests \
+                --run-ignored all \
+                --no-fail-fast \
+                --test-threads "$TEST_THREADS" \
+                -E 'test(backend_accepts_then_rst_returns_502)' \
+                > "$log" 2>&1; then
+              failures=$((failures + 1))
+              cp "$log" "$evidence/FAILED-shard${{ matrix.shard }}-rep${i}.log"
+              echo "::warning::Reproduced #5575 on shard ${{ matrix.shard }} repetition $i"
+              # One clean capture is the whole point; stop so the evidence is
+              # not diluted by later repetitions on a warmed-up runner.
+              break
+            fi
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "shard ${{ matrix.shard }}: $i repetitions, $failures failures"
+            fi
+          done
+
+          echo "shard ${{ matrix.shard }}: finished with $failures failure(s)"
+          echo "failures=$failures" >> "$GITHUB_OUTPUT"
+          # This lane OBSERVES; it must not turn a known flake into a red
+          # required check. The artifact and the ::warning:: carry the signal.
+          exit 0
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### RST flake observation — shard ${{ matrix.shard }}"
+            echo
+            echo "- repetitions requested: ${{ github.event.inputs.repetitions || '40' }}"
+            echo "- test-threads: ${{ github.event.inputs.test_threads || '4' }}"
+            echo "- failures captured: ${{ steps.repeat.outputs.failures }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: rst-flake-evidence-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/rst-evidence
+          if-no-files-found: warn
+          retention-days: 14

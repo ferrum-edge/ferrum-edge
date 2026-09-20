@@ -44,8 +44,13 @@ fn init_rst_diagnostics() {
         // this process's output on failure, including spawned transport tasks.
         if let Err(error) = tracing_subscriber::fmt()
             .with_env_filter(
+                // `hyper::client::conn` is what says whether the request was
+                // ever handed to the dispatcher and whether the pending
+                // response callback was answered when the connection failed —
+                // the step #5575 still cannot account for between the RST and
+                // the read-timeout watermark.
                 "off,ferrum_edge::proxy=debug,hyper_util::client::legacy=trace,\
-                 hyper::proto::h1=trace,reqwest=debug,\
+                 hyper::proto::h1=trace,hyper::client::conn=trace,reqwest=debug,\
                  functional_tests::scaffolding::backends::tcp=debug",
             )
             .with_test_writer()
