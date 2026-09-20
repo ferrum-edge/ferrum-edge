@@ -27,11 +27,6 @@ on:
         type: string
         required: true
         default: "14"
-      test_threads:
-        description: "nextest test-threads per repetition (contention knob)"
-        type: string
-        required: true
-        default: "4"
 
 permissions:
   contents: read
@@ -77,7 +72,13 @@ jobs:
         id: repeat
         env:
           REPETITIONS: ${{ github.event.inputs.repetitions || '14' }}
-          TEST_THREADS: ${{ github.event.inputs.test_threads || '4' }}
+          # Match the real `test-functional` job exactly. Without this the
+          # harness shells out to `cargo build` from EVERY nextest process
+          # (they are process-per-test), which both dominates the runtime and
+          # replaces the network/runtime contention being reproduced with
+          # cargo-lock contention.
+          FERRUM_SKIP_GATEWAY_BUILD: "1"
+          RUST_BACKTRACE: "1"
         run: |
           set -uo pipefail
           evidence="$RUNNER_TEMP/rst-evidence"
@@ -185,7 +186,7 @@ jobs:
               --test functional_tests \
               --run-ignored all \
               --no-fail-fast \
-              --test-threads "$TEST_THREADS" \
+              -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)' \
               "${filters[@]}" \
               > "$log" 2>&1 || true
 
@@ -219,7 +220,6 @@ jobs:
             echo "### RST flake observation — shard ${{ matrix.shard }}"
             echo
             echo "- repetitions requested: ${{ github.event.inputs.repetitions || '14' }}"
-            echo "- test-threads: ${{ github.event.inputs.test_threads || '4' }}"
             echo "- RST captures: ${{ steps.repeat.outputs.captured }}"
             echo "- unrelated shard failures: ${{ steps.repeat.outputs.unrelated }}"
           } >> "$GITHUB_STEP_SUMMARY"
