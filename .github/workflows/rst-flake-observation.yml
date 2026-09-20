@@ -1,11 +1,14 @@
 # Temporary #5575 flake observation. No production graph or frozen job edits.
 #
-# `backend_accepts_then_rst_returns_502__*` fails roughly once per several
-# thousand hosted cell executions and never on macOS (6000 local executions,
-# zero failures), so the only way to study it is to force the iterations on
-# Linux. This lane runs the nine RST cells in a loop across parallel shards
-# under the same nextest process-per-test shape the real functional shards
-# use, and keeps the full captured output of the first failing repetition.
+# `backend_accepts_then_rst_returns_502__*` never fails on macOS (6000 local
+# executions) and — as this lane's first run established — does NOT fail when
+# the nine RST cells are repeated on Linux in isolation either (2160 hosted
+# cell executions, zero failures). Both real occurrences happened inside the
+# 500+ test `protocols` functional shard, so the surrounding concurrent load
+# is part of the trigger. This lane therefore repeats that WHOLE shard, using
+# its exact filter list from ci.yml, and keeps the output of the repetition
+# that first fails an RST cell. Unrelated failures in a shard that size are
+# counted separately so they cannot masquerade as a reproduction.
 #
 # Delete this workflow once #5575 has a root cause.
 name: RST Flake Observation
@@ -20,10 +23,10 @@ on:
   workflow_dispatch:
     inputs:
       repetitions:
-        description: "Repetitions of the RST cell set per shard"
+        description: "Repetitions of the full protocols shard per lane shard"
         type: string
         required: true
-        default: "60"
+        default: "14"
       test_threads:
         description: "nextest test-threads per repetition (contention knob)"
         type: string
@@ -37,11 +40,11 @@ jobs:
   observe:
     name: RST cells shard ${{ matrix.shard }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
       # Shared `ci-debug` rust-cache lane: every member must compile with
       # identical profile settings so restored dependency artifacts stay
@@ -66,12 +69,14 @@ jobs:
       - name: Build functional tests
         run: cargo test --no-run --test functional_tests
 
-      - name: Repeat the accept-then-RST cells
+      - name: Build gateway binary
+        # The protocols shard's functional tests launch this binary.
+        run: cargo build --bin ferrum-edge
+
+      - name: Repeat the protocols shard
         id: repeat
         env:
-          # `workflow_dispatch` supplies these; a pull_request run uses a
-          # smaller budget so the lane stays cheap on ordinary pushes.
-          REPETITIONS: ${{ github.event.inputs.repetitions || '40' }}
+          REPETITIONS: ${{ github.event.inputs.repetitions || '14' }}
           TEST_THREADS: ${{ github.event.inputs.test_threads || '4' }}
         run: |
           set -uo pipefail
@@ -79,32 +84,132 @@ jobs:
           mkdir -p "$evidence"
           rustc --version --verbose > "$evidence/rustc.txt"
 
-          failures=0
+          # The exact `protocols` shard filter list from ci.yml. Running the
+          # nine RST cells ALONE does not reproduce #5575 (2160 hosted cell
+          # executions, zero failures), while both real occurrences happened
+          # inside this 500+ test shard -- so the surrounding concurrent load
+          # is part of the trigger and has to be reproduced too.
+          mapfile -t raw_filters <<'FILTERS'
+            functional_cors_protocol_test
+            functional_grpc_message_metrics_test
+            functional_grpc_test
+            functional_h3_soap_utf16_test
+            functional_http3_connect_udp_test
+            functional_key_auth_query_test
+            functional_max_forwards_test
+            functional_request_mirror_admission_test
+            functional_request_mirror_query_parity_test
+            functional_request_transformer_query_test
+            functional_ai_stream_router_boundary_test
+            functional_openapi_client_contract_test
+            functional_load_testing_replay_test
+            functional_passthrough_test
+            functional_sse_test
+            functional_mcp_aggregate_sse_test
+            functional_stream_listener_failure_test
+            functional_tcp_proxy_test
+            functional_tcp_splice_backend_timeout_test
+            functional_udp_proxy_test
+            functional_unix_backend_test
+            functional_websocket_test
+            scripted_backend_h2_tests
+            scripted_backend_h3_tests
+            scripted_backend_matrix_tests
+            scripted_backend_network_sim_tests
+            scripted_backend_streaming_latency_tests
+            scripted_backend_tests
+            scripted_backend_udp_tests
+            functional_query_param_limits_test
+            functional_streaming_request_body_limits_test
+            functional_streaming_response_body_limits_test
+            functional_tcp_idle_timeout_env_test
+            functional_websocket_frame_limit_test
+            functional_websocket_connection_limit_test
+            functional_header_read_timeout_test
+            functional_injector_serving_test
+            functional_response_body_limits_test
+            functional_request_body_limits_test
+            functional_request_buffer_budget_test
+            functional_header_limits_test
+            functional_early_data_test
+            functional_ws_origin_test
+            functional_allowed_methods_test
+            functional_allowed_methods_logging_test
+            functional_transaction_debugger_body_capture_test
+            functional_forwarded_via_headers_test
+            functional_streaming_latency_tracking_test
+            functional_streaming_outcome_accounting_test
+            functional_chunked_request_size_limits_test
+            functional_chunked_response_size_limits_test
+            functional_body_size_limits_test
+            functional_url_query_limits_test
+            functional_header_size_limits_test
+            functional_protocol_h3_request_body_test
+            functional_protocol_h3_body_limit_config_test
+            functional_protocol_h2_body_limit_config_test
+            functional_protocol_body_limit_config_test
+            functional_early_upload_deadline_test
+            functional_h1_h2_auth_lifetime_test
+            functional_h3_auth_lifetime_test
+            functional_h3_authority_validation_test
+            functional_h3_local_policy_test
+            functional_subset_http_policy_test
+            functional_destination_active_requests_test
+            functional_destination_active_requests_grpc_test
+            functional_destination_active_requests_h3_test
+            functional_h3_grpc_web_test
+            functional_h3_grpc_streaming_test
+            functional_h3_mtls_early_data_test
+            functional_request_termination_h3_test
+            functional_policy_path_canonicalization_test
+            functional_response_caching_conditional_test
+            functional_response_mock_grpc_exclusion_test
+            functional_response_mock_semantics_test
+            functional_response_protocol_managed_headers_test
+            functional_websocket_limits_test
+          FILTERS
+          # The heredoc body carries the YAML block's indentation; nextest
+          # filters are whitespace-free test-path substrings, so strip it.
+          filters=()
+          for raw in "${raw_filters[@]}"; do
+            trimmed="${raw// /}"
+            [ -n "$trimmed" ] && filters+=("$trimmed")
+          done
+          echo "protocols shard filters: ${#filters[@]}"
+
+          captured=0
+          unrelated=0
           for i in $(seq 1 "$REPETITIONS"); do
             log="$evidence/run-current.log"
-            if ! cargo nextest run \
-                --test functional_tests \
-                --run-ignored all \
-                --no-fail-fast \
-                --test-threads "$TEST_THREADS" \
-                -E 'test(backend_accepts_then_rst_returns_502)' \
-                > "$log" 2>&1; then
-              failures=$((failures + 1))
-              cp "$log" "$evidence/FAILED-shard${{ matrix.shard }}-rep${i}.log"
+            cargo nextest run \
+              --test functional_tests \
+              --run-ignored all \
+              --no-fail-fast \
+              --test-threads "$TEST_THREADS" \
+              "${filters[@]}" \
+              > "$log" 2>&1 || true
+
+            # Only an RST-cell failure is the signal. Unrelated flakes in a
+            # 500-test shard must not masquerade as a reproduction.
+            if grep -qE "(FAIL|TIMEOUT).*backend_accepts_then_rst_returns_502" "$log"; then
+              captured=$((captured + 1))
+              cp "$log" "$evidence/CAPTURED-shard${{ matrix.shard }}-rep${i}.log"
               echo "::warning::Reproduced #5575 on shard ${{ matrix.shard }} repetition $i"
-              # One clean capture is the whole point; stop so the evidence is
-              # not diluted by later repetitions on a warmed-up runner.
               break
             fi
-            if [ $((i % 10)) -eq 0 ]; then
-              echo "shard ${{ matrix.shard }}: $i repetitions, $failures failures"
+            if grep -qE "^\s+(FAIL|TIMEOUT)" "$log"; then
+              unrelated=$((unrelated + 1))
+              if [ "$unrelated" -le 2 ]; then
+                cp "$log" "$evidence/unrelated-shard${{ matrix.shard }}-rep${i}.log"
+              fi
             fi
+            echo "shard ${{ matrix.shard }}: repetition $i done (captured=$captured unrelated=$unrelated)"
           done
 
-          echo "shard ${{ matrix.shard }}: finished with $failures failure(s)"
-          echo "failures=$failures" >> "$GITHUB_OUTPUT"
-          # This lane OBSERVES; it must not turn a known flake into a red
-          # required check. The artifact and the ::warning:: carry the signal.
+          echo "shard ${{ matrix.shard }}: finished captured=$captured unrelated=$unrelated"
+          echo "captured=$captured" >> "$GITHUB_OUTPUT"
+          echo "unrelated=$unrelated" >> "$GITHUB_OUTPUT"
+          # Observation only: never turn a known flake into a red check.
           exit 0
 
       - name: Summarize
@@ -113,9 +218,10 @@ jobs:
           {
             echo "### RST flake observation — shard ${{ matrix.shard }}"
             echo
-            echo "- repetitions requested: ${{ github.event.inputs.repetitions || '40' }}"
+            echo "- repetitions requested: ${{ github.event.inputs.repetitions || '14' }}"
             echo "- test-threads: ${{ github.event.inputs.test_threads || '4' }}"
-            echo "- failures captured: ${{ steps.repeat.outputs.failures }}"
+            echo "- RST captures: ${{ steps.repeat.outputs.captured }}"
+            echo "- unrelated shard failures: ${{ steps.repeat.outputs.unrelated }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
