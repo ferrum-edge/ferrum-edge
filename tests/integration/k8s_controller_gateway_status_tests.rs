@@ -2614,16 +2614,29 @@ fn unsupported_http_and_grpc_route_features_are_refused_before_materialization()
     });
     let unsupported = [
         (
-            json!({"filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-secret"]}}]}),
-            "IncompatibleFilters",
-        ),
-        (
-            json!({"filters": [{"type": "URLRewrite", "urlRewrite": {"hostname": "rewritten.test"}}]}),
-            "IncompatibleFilters",
-        ),
-        (
             json!({"filters": [{"type": "ExtensionRef", "extensionRef": {"group": "example.test", "kind": "Filter", "name": "missing"}}]}),
             "IncompatibleFilters",
+        ),
+        (
+            json!({"filters": [{"type": "CORS", "cors": {"allowOrigins": [{"exact": "https://example.test"}]}}]}),
+            "IncompatibleFilters",
+        ),
+        // A repeated at-most-once filter is a conflicting declaration, not a
+        // stackable one.
+        (
+            json!({"filters": [
+                {"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-one"]}},
+                {"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-two"]}},
+            ]}),
+            "IncompatibleFilters",
+        ),
+        // Ferrum strips protocol-managed response headers by design; a route
+        // filter may not put one back.
+        (
+            json!({"filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                "set": [{"name": "Transfer-Encoding", "value": "chunked"}]
+            }}]}),
+            "UnsupportedValue",
         ),
         (
             json!({"filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "mirror", "port": 8080}}}]}),
@@ -2652,8 +2665,37 @@ fn unsupported_http_and_grpc_route_features_are_refused_before_materialization()
             "IncompatibleFilters",
         ),
     ];
+    // `URLRewrite` and `RequestRedirect` are HTTPRoute-only upstream, so a
+    // GRPCRoute asking for either keeps the fail-closed refusal.
+    let grpc_only_unsupported = [
+        (
+            json!({"filters": [{"type": "URLRewrite", "urlRewrite": {"hostname": "rewritten.test"}}]}),
+            "IncompatibleFilters",
+        ),
+        (
+            json!({"filters": [{"type": "RequestRedirect", "requestRedirect": {"statusCode": 302}}]}),
+            "IncompatibleFilters",
+        ),
+    ];
+    // An HTTPRoute may use either, but never both in one rule: a redirect
+    // answers the request itself, so the rewrite could never be honored.
+    let http_only_unsupported = [(
+        json!({"filters": [
+            {"type": "URLRewrite", "urlRewrite": {"hostname": "rewritten.test"}},
+            {"type": "RequestRedirect", "requestRedirect": {"statusCode": 302}},
+        ]}),
+        "IncompatibleFilters",
+    )];
     for kind in ["HTTPRoute", "GRPCRoute"] {
-        for (case_index, (patch, reason)) in unsupported.iter().enumerate() {
+        let kind_cases: Vec<_> = unsupported
+            .iter()
+            .chain(if kind == "GRPCRoute" {
+                grpc_only_unsupported.iter()
+            } else {
+                http_only_unsupported.iter()
+            })
+            .collect();
+        for (case_index, (patch, reason)) in kind_cases.iter().enumerate() {
             let mut bad_rule = supported_rule.clone();
             bad_rule
                 .as_object_mut()
@@ -2819,7 +2861,7 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
         .as_array_mut()
         .unwrap()
         .push(json!({
-            "type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-secret"]}
+            "type": "RequestMirror", "requestMirror": {"backendRef": {"name": "mirror", "port": 8080}}
         }));
     let objects = vec![
         gateway_class(),
@@ -2907,4 +2949,539 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
         1,
         "rejected route must not reach backend"
     );
+}
+
+/// Shared fixture for the rule-filter data-plane tests: a `Service` +
+/// `EndpointSlice` pair pointing at a locally spawned backend, plus the
+/// `GatewayClass`/`Gateway` the routes attach to.
+fn route_filter_cluster_objects(
+    backend_port: u16,
+) -> Vec<ferrum_edge::config_sources::k8s::K8sObject> {
+    let service = object(
+        "v1",
+        "Service",
+        "api",
+        "default",
+        json!({
+            "clusterIP": "10.96.0.11",
+            "ports": [{"name": "http", "port": 8080, "targetPort": backend_port}]
+        }),
+    );
+    let mut endpoints = object(
+        "discovery.k8s.io/v1",
+        "EndpointSlice",
+        "api-manual",
+        "default",
+        json!({
+            "addressType": "IPv4",
+            "ports": [{"name": "http", "port": backend_port}],
+            "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
+        }),
+    );
+    endpoints
+        .metadata
+        .labels
+        .insert("kubernetes.io/service-name".to_string(), "api".to_string());
+    vec![
+        gateway_class(),
+        cross_kind_gateway(json!([{"name": "web", "port": 80, "protocol": "HTTP"}])),
+        service,
+        endpoints,
+    ]
+}
+
+/// Translate `route` and hand the result to a running gateway.
+///
+/// The harness owns an ephemeral listener instead of binding Gateway port 80,
+/// so every generated proxy's `listen_port` is cleared; everything else —
+/// routes, destinations, dispatch rules and generated plugins — is exactly what
+/// the translator produced.
+async fn spawn_translated_route_gateway(
+    objects: &[ferrum_edge::config_sources::k8s::K8sObject],
+    extra_plugins: Vec<ferrum_edge::config::types::PluginConfig>,
+) -> crate::scaffolding::harness::GatewayHarness {
+    use crate::scaffolding::harness::GatewayHarness;
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+
+    let opts = options().with_pod_discovery_enabled(true);
+    let (mut translation, skipped) =
+        translate_k8s_objects_collecting_skips(objects, opts.clone()).expect("translate route");
+    assert!(skipped.is_empty(), "route must be accepted: {skipped:?}");
+    let updates = plan_gateway_api_status_updates(objects, opts, &translation.route_conflicts);
+    for update in updates
+        .iter()
+        .filter(|update| matches!(update.kind.as_str(), "HTTPRoute" | "GRPCRoute"))
+    {
+        assert_eq!(
+            accepted_condition(update)["status"],
+            "True",
+            "{}/{} must be Accepted: {update:?}",
+            update.kind,
+            update.name
+        );
+    }
+    // Every emitted plugin must construct, or an "Accepted" route would carry
+    // configuration no data plane can load.
+    for plugin in &translation.config.plugin_configs {
+        ferrum_edge::plugins::validate_plugin_config(&plugin.plugin_name, &plugin.config)
+            .unwrap_or_else(|error| panic!("{}: {error}", plugin.plugin_name));
+    }
+    for proxy in &mut translation.config.proxies {
+        proxy.listen_port = None;
+    }
+    translation.config.plugin_configs.extend(extra_plugins);
+    translation.config.version = ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string();
+    let yaml = serde_yaml::to_string(&translation.config).expect("serialize translated config");
+    GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .env("FERRUM_NAMESPACE", "default")
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("start translated gateway")
+}
+
+fn global_response_transformer(
+    rules: serde_json::Value,
+) -> ferrum_edge::config::types::PluginConfig {
+    use ferrum_edge::config::types::{PluginConfig, PluginScope};
+    let now = chrono::Utc::now();
+    PluginConfig {
+        labels: Default::default(),
+        id: "operator-global-response-transformer".to_string(),
+        plugin_name: "response_transformer".to_string(),
+        namespace: "default".to_string(),
+        config: json!({ "rules": rules }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// `ResponseHeaderModifier` must reach the CLIENT through the real data plane,
+/// apply only to the rule that declared it, and compose with — not suppress —
+/// an operator's global `response_transformer`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_response_header_modifier_reaches_the_client_through_the_data_plane() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+    use crate::scaffolding::ports::reserve_port;
+    use std::time::Duration;
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "x-set".into(),
+            value: "origin".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "x-remove".into(),
+            value: "leaked".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "headers",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["headers.test"],
+            "rules": [
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/modified"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                        "set": [{"name": "x-set", "value": "route"}],
+                        "add": [{"name": "x-added", "value": "route"}],
+                        "remove": ["x-remove"]
+                    }}]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/plain"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }
+            ]
+        }),
+    ));
+
+    // An operator's global response transformer must keep running its own
+    // static rules; the route filter is applied last and wins on a shared name.
+    let global = global_response_transformer(json!([
+        {"operation": "add", "target": "header", "key": "x-global", "value": "on"},
+        {"operation": "update", "target": "header", "key": "x-set", "value": "global"}
+    ]));
+    let harness = spawn_translated_route_gateway(&objects, vec![global]).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("client");
+
+    let modified = client
+        .get(harness.proxy_url("/modified/thing"))
+        .header("host", "headers.test")
+        .send()
+        .await
+        .expect("filtered route response");
+    assert_eq!(modified.status(), reqwest::StatusCode::OK);
+    let headers = modified.headers().clone();
+    assert_eq!(headers.get("x-set").unwrap(), "route", "set must overwrite");
+    assert_eq!(headers.get("x-added").unwrap(), "route", "add must apply");
+    assert!(headers.get("x-remove").is_none(), "remove must apply");
+    assert_eq!(
+        headers.get("x-global").unwrap(),
+        "on",
+        "a route filter must not suppress the global transformer"
+    );
+    assert_eq!(modified.text().await.unwrap(), "pong");
+
+    // The sibling rule declared no filter and must observe the backend's own
+    // headers, with only the global transformer applied.
+    let plain = client
+        .get(harness.proxy_url("/plain/thing"))
+        .header("host", "headers.test")
+        .send()
+        .await
+        .expect("sibling route response");
+    assert_eq!(plain.status(), reqwest::StatusCode::OK);
+    let headers = plain.headers().clone();
+    assert_eq!(
+        headers.get("x-set").unwrap(),
+        "global",
+        "the sibling rule must not inherit the route filter"
+    );
+    assert!(headers.get("x-added").is_none());
+    assert_eq!(headers.get("x-remove").unwrap(), "leaked");
+    assert_eq!(headers.get("x-global").unwrap(), "on");
+
+    backend.assert_no_matcher_mismatches().await;
+    assert_eq!(backend.received_requests().await.len(), 2);
+}
+
+/// `URLRewrite` must change what the BACKEND observes — path, preserved query
+/// and authority — for the rule that declared it and for no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_url_rewrite_reaches_the_backend_through_the_data_plane() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+    use crate::scaffolding::ports::reserve_port;
+    use std::time::Duration;
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "rewrites",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["rewrite.test"],
+            "rules": [
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": [{"type": "URLRewrite", "urlRewrite": {
+                        "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/v2"}
+                    }}]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/full"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": [{"type": "URLRewrite", "urlRewrite": {
+                        "hostname": "internal.example.test",
+                        "path": {"type": "ReplaceFullPath", "replaceFullPath": "/one"}
+                    }}]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/plain"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }
+            ]
+        }),
+    ));
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("client");
+    for path in ["/api/users?q=1", "/full/deep/path", "/plain/thing"] {
+        let response = client
+            .get(harness.proxy_url(path))
+            .header("host", "rewrite.test")
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+    }
+
+    backend.assert_no_matcher_mismatches().await;
+    let observed = backend.received_requests().await;
+    let seen: Vec<(String, String)> = observed
+        .iter()
+        .map(|request| {
+            (
+                request.path.clone(),
+                request.header("host").unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            // ReplacePrefixMatch replaces the matched prefix and keeps the
+            // untouched suffix and query string.
+            ("/v2/users?q=1".to_string(), "rewrite.test".to_string()),
+            // ReplaceFullPath discards the whole path; hostname rebases the
+            // backend-facing authority.
+            ("/one".to_string(), "internal.example.test".to_string()),
+            // The sibling rule declared no rewrite.
+            ("/plain/thing".to_string(), "rewrite.test".to_string()),
+        ]
+    );
+}
+
+/// A GRPCRoute `ResponseHeaderModifier` must reach the client as response
+/// metadata over a real gRPC call, preserving the message and the terminal
+/// `grpc-status`.
+///
+/// It also pins the cost operators must know about: a response-header policy on
+/// a proxy publishes an unbounded response-TRAILER policy (a route override can
+/// name any field at request time), so that proxy's non-reserved backend
+/// trailers are governed away. The filter does not modify trailers — it
+/// suppresses them. The sibling rule on the same route, which declares no
+/// filter, keeps its application trailers, which is what proves the drop comes
+/// from attaching the policy rather than from gRPC translation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_route_response_header_modifier_reaches_the_client_and_preserves_status() {
+    use crate::scaffolding::backends::grpc::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+    use crate::scaffolding::clients::grpc::GrpcClient;
+    use crate::scaffolding::ports::reserve_port;
+    use bytes::Bytes;
+
+    let rpc_script = || {
+        vec![
+            GrpcStep::AcceptRpc(MatchRpc::any()),
+            GrpcStep::SendInitialHeadersOverride(vec![
+                ("content-type", "application/grpc".to_string()),
+                ("x-set", "origin".to_string()),
+                ("x-remove", "leaked".to_string()),
+            ]),
+            GrpcStep::RespondMessage(Bytes::from_static(b"pong")),
+            GrpcStep::RespondStatusWithTrailers {
+                code: 0,
+                message: "",
+                trailers: vec![("x-trailer", "kept".to_string())],
+            },
+        ]
+    };
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .steps(rpc_script())
+        .steps(rpc_script())
+        .spawn()
+        .expect("spawn grpc backend");
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "GRPCRoute",
+        "metadata",
+        "default",
+        json!({
+            // No `hostnames`: the h2c client's `:authority` is the harness's
+            // ephemeral loopback address, and an added `host` header that
+            // disagreed with it would be refused by protocol validation before
+            // routing ever ran.
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [
+                {
+                    "matches": [{"method": {"service": "echo.Echo", "method": "Filtered"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                        "set": [{"name": "x-set", "value": "route"}],
+                        "add": [{"name": "x-added", "value": "route"}],
+                        "remove": ["x-remove"]
+                    }}]
+                },
+                {
+                    "matches": [{"method": {"service": "echo.Echo", "method": "Plain"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }
+            ]
+        }),
+    ));
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let target = harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .to_string();
+    let client = GrpcClient::h2c(target);
+
+    let filtered = client
+        .unary("/echo.Echo/Filtered", Bytes::from_static(b"ping"))
+        .await
+        .expect("filtered grpc call");
+    assert_eq!(filtered.http_status, 200);
+    assert_eq!(
+        filtered.headers.get("x-set").unwrap(),
+        "route",
+        "set must overwrite gRPC response metadata"
+    );
+    assert_eq!(filtered.headers.get("x-added").unwrap(), "route");
+    assert!(
+        filtered.headers.get("x-remove").is_none(),
+        "remove must apply to the initial metadata"
+    );
+    assert_eq!(filtered.grpc_status(), Some(0), "status must be preserved");
+    assert_eq!(
+        filtered.messages,
+        vec![Bytes::from_static(b"pong")],
+        "the message must be preserved"
+    );
+    let trailers = filtered.trailers.as_ref().expect("terminal trailers");
+    assert!(
+        trailers.get("x-trailer").is_none(),
+        "a response-header policy governs this proxy's non-reserved trailers away: {trailers:?}"
+    );
+
+    let plain = client
+        .unary("/echo.Echo/Plain", Bytes::from_static(b"ping"))
+        .await
+        .expect("unfiltered grpc call");
+    assert_eq!(plain.http_status, 200);
+    assert_eq!(
+        plain.headers.get("x-set").unwrap(),
+        "origin",
+        "the sibling rule must not inherit the route filter"
+    );
+    assert_eq!(plain.headers.get("x-remove").unwrap(), "leaked");
+    assert!(plain.headers.get("x-added").is_none());
+    assert_eq!(plain.grpc_status(), Some(0));
+    assert_eq!(
+        plain
+            .trailers
+            .as_ref()
+            .and_then(|trailers| trailers.get("x-trailer")),
+        Some(&"kept".parse().unwrap()),
+        "a rule with no response-header filter keeps its application trailers"
+    );
+
+    assert_eq!(backend.received_stream_count(), 2);
+    assert_eq!(backend.matcher_mismatches(), 0);
+}
+
+/// Removing a rule filter must withdraw everything it generated — the dispatch
+/// action AND the auto-emitted consumer plugin — rather than leaving a stale
+/// resource behind.
+#[test]
+fn removing_a_rule_filter_withdraws_its_generated_resources() {
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+
+    let route_with = |filters: serde_json::Value| {
+        object(
+            "gateway.networking.k8s.io/v1",
+            "HTTPRoute",
+            "withdrawn",
+            "default",
+            json!({
+                "parentRefs": [{"name": "edge", "sectionName": "web"}],
+                "hostnames": ["withdraw.test"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": filters
+                }]
+            }),
+        )
+    };
+    let translate = |filters: serde_json::Value| {
+        let mut objects = route_filter_cluster_objects(19_999);
+        objects.push(route_with(filters));
+        let (translation, skipped) =
+            translate_k8s_objects_collecting_skips(&objects, options()).expect("translate route");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        translation.config
+    };
+
+    let with_filters = translate(json!([
+        {"type": "URLRewrite", "urlRewrite": {
+            "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/v2"}
+        }},
+        {"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-secret"]}}
+    ]));
+    let dispatch = |config: &ferrum_edge::config::types::GatewayConfig| {
+        config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .map(|plugin| plugin.config.clone())
+    };
+    let rules = dispatch(&with_filters).expect("dispatch plugin");
+    assert_eq!(rules["rules"][0]["rewrite"]["uri"], "/v2");
+    assert!(rules["rules"][0]["response_transform"].is_array());
+    assert!(
+        with_filters
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.plugin_name == "response_transformer")
+    );
+
+    let without_filters = translate(json!([]));
+    assert!(
+        without_filters
+            .plugin_configs
+            .iter()
+            .all(|plugin| plugin.plugin_name != "response_transformer"),
+        "the auto-emitted consumer must be withdrawn with its filter"
+    );
+    match dispatch(&without_filters) {
+        // A filter-less single-prefix rule needs no dispatch rule at all.
+        None => {}
+        Some(config) => {
+            let rule = &config["rules"][0];
+            assert!(rule.get("rewrite").is_none(), "{config}");
+            assert!(rule.get("response_transform").is_none(), "{config}");
+        }
+    }
 }
