@@ -287,16 +287,10 @@ silently discarded while the route could report success.
 acceptable, or use a supported Ferrum configuration surface that enforces the
 required behavior. RequestHeaderModifier and HTTPRoute RequestRedirect remain
 supported. A valid rule does not partially rescue an unsupported sibling in the
-same route; independently valid routes continue to be programmed.
-
-> **Superseded (issue [#5646](https://github.com/ferrum-edge/ferrum-edge/issues/5646)):**
-> `ResponseHeaderModifier` (HTTPRoute and GRPCRoute) and HTTPRoute `URLRewrite`
-> are now implemented and accepted. `RequestMirror`, `ExtensionRef`, `CORS`,
-> `ExternalAuth`, backend-reference filters, and rule-level `timeouts` / `retry`
-> are still refused exactly as described above. See
-> [gateway_api_conformance.md](gateway_api_conformance.md#rule-filter-admission)
-> for the current admission table, including the response-trailer cost of
-> attaching a `ResponseHeaderModifier`.
+same route; independently valid routes continue to be programmed. Gateway API
+response-header modification remains deferred; the earlier support claim in
+this guide was incorrect. This remains a documented conformance gap, including
+the GRPCRoute filter-type contract that lists response-header modification as Core.
 
 ### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
 
@@ -304,10 +298,9 @@ Auto-emitted `istio-vs-req-xform-*` / `istio-vs-resp-xform-*` consumers no
 longer shadow global `request_transformer` / `response_transformer` instances.
 Global static rules now run first, followed by the matched route rules. This
 changes existing Gateway API `HTTPRoute` deployments using
-`RequestHeaderModifier`. Newly supported Istio VirtualService header transforms
-follow the same composition contract, as does Gateway API
-`ResponseHeaderModifier` since issue
-[#5646](https://github.com/ferrum-edge/ferrum-edge/issues/5646) implemented it.
+`RequestHeaderModifier`; Gateway API `ResponseHeaderModifier` is not yet
+implemented and is rejected during translation. Newly supported Istio
+VirtualService header transforms follow the same composition contract.
 
 **Operator action:** audit HTTPRoute-backed proxies that relied on the former
 accidental suppression, then scope or remove global static transformer rules

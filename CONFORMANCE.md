@@ -164,8 +164,11 @@ request itself, so the rewrite could never fire), and the four upstream
 at-most-once filter types — `RequestHeaderModifier`, `ResponseHeaderModifier`,
 `RequestRedirect`, `URLRewrite` — are refused when repeated in one rule.
 `URLRewrite` `path.type: ReplacePrefixMatch` requires every match in the rule to
-use a `PathPrefix` path match (upstream enforces the same with a CRD CEL rule);
-anything else is `UnsupportedValue`. A `ResponseHeaderModifier` naming a
+use a `PathPrefix` path match; anything else is `Invalid`, because the shape is
+outside the CRD's own bounds. Upstream's CEL rule is stricter (exactly one
+`PathPrefix` match); Ferrum also accepts several `PathPrefix` matches and a
+match-less rule (the implicit `PathPrefix: /`), each rebased against its own
+prefix. A `ResponseHeaderModifier` naming a
 protocol-managed response field (hop-by-hop or framing) is `UnsupportedValue`:
 Ferrum strips those from backend responses by design and a route filter may not
 put one back. Malformed header names/values and malformed rewrite hostnames or
@@ -191,7 +194,7 @@ checks translator/status agreement for both route kinds, all six reported gaps,
 future fields, and a supported RequestHeaderModifier control (issue #4816).
 `supported_gateway_request_headers_reach_backend_beside_rejected_route` also
 drives the translated HTTPRoute through the gateway to a real backend and
-checks header set/add/remove plus no traffic for the refused sibling. Four more
+checks header set/add/remove plus no traffic for the refused sibling. Three more
 data-plane regressions in the same file cover the newly supported filters:
 `gateway_response_header_modifier_reaches_the_client_through_the_data_plane`
 (client-observed set/add/remove, sibling-rule isolation, and composition with an
@@ -200,8 +203,13 @@ operator's global `response_transformer`),
 (backend-observed `ReplacePrefixMatch` path plus preserved query,
 `ReplaceFullPath`, hostname rewrite, and sibling-rule isolation),
 `grpc_route_response_header_modifier_reaches_the_client_and_preserves_status`
-(gRPC response metadata, message, terminal status, and the trailer cost above),
-and `removing_a_rule_filter_withdraws_its_generated_resources`. Default
+(gRPC response metadata, message, terminal status, and the trailer cost above).
+The translator-level `removing_a_rule_filter_withdraws_its_generated_resources`
+checks that dropping a filter emits no rewrite, response transform, or consumer
+plugin; the live reconciler replaces those generated ids on every compose
+because `istio-vs-resp-xform-` is a managed plugin-id prefix. The upstream
+`HTTPRouteResponseHeaderModifier`, `HTTPRouteRewritePath` and
+`HTTPRouteRewriteHost` conformance tests run and pass in the hosted lab. Default
 HTTPRoute matches use the same internal predicate conversion as explicit
 matches, so supported actions do not emit an invalid raw Gateway API path field.
 The pinned [HTTPRoute v1.5.1 schema](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/httproute_types.go)

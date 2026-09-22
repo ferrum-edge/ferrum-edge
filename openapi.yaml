@@ -24239,9 +24239,12 @@ components:
                       `match_prefix: /prefix/old` and `uri: /new`,
                       `/prefix/oldtail` forwards as `/newtail`. A separator is
                       never synthesized; a doubled one is collapsed when both
-                      sides carry a `/`. An empty string is normalized to
-                      "no prefix" (whole-path replacement). Normally set by
-                      the VirtualService translator, not hand-authored.
+                      sides carry a `/`. An empty string strips nothing and
+                      prepends `uri` (the Gateway API root `PathPrefix: /`
+                      case); omit the field for whole-path replacement. A
+                      `match_prefix` with no `uri` is inert and dropped.
+                      Normally set by the VirtualService or Gateway API
+                      translator, not hand-authored.
               redirect:
                 type: [object, "null"]
                 additionalProperties: false
@@ -24283,9 +24286,10 @@ components:
                       Literal matched path prefix replaced by `uri`; the
                       unmatched suffix is appended verbatim, exactly as for
                       `rewrite.match_prefix` (no separator is synthesized at a
-                      boundary that had none). An empty string is normalized
-                      to "no prefix". Normally emitted by the VirtualService
-                      translator.
+                      boundary that had none). An empty string strips nothing
+                      and prepends `uri`; omit the field for whole-path
+                      replacement. Normally emitted by the VirtualService or
+                      Gateway API translator.
                   authority:
                     type: [string, "null"]
                     minLength: 1

@@ -5804,6 +5804,13 @@ const SINGLETON_ROUTE_FILTER_TYPES: [&str; 4] = [
 /// `PathPrefix` match to rebase against — upstream's CRD enforces that with a
 /// CEL rule, and Ferrum re-checks it because a file/CP-delivered object never
 /// passed through the API server's validation.
+///
+/// Both of those shapes are outside the pinned CRD's own bounds (a `Pattern`
+/// and an `XValidation` rule respectively), so they report `Invalid` rather
+/// than `UnsupportedValue`: the latter is reserved for CRD-valid input Ferrum
+/// declines to implement. An unknown `path.type` keeps `UnsupportedValue`, for
+/// the same forward-compatibility reason an unknown filter type does — a newer
+/// channel can add an enum member Ferrum has not implemented yet.
 fn ensure_url_rewrite_filter(
     object: &K8sObject,
     rule: &serde_json::Map<String, Value>,
@@ -5823,7 +5830,7 @@ fn ensure_url_rewrite_filter(
             return Err(invalid_resource(
                 object,
                 format!(
-                    "{location}.urlRewrite.hostname {UNSUPPORTED_SHAPE_MARKER}: expected a precise hostname without a wildcard or port"
+                    "{location}.urlRewrite.hostname must be a precise hostname without a wildcard or port"
                 ),
             ));
         }
@@ -5886,7 +5893,7 @@ fn ensure_url_rewrite_filter(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "rules[{rule_index}] {UNSUPPORTED_SHAPE_MARKER}: urlRewrite path.type ReplacePrefixMatch requires every match in the rule to use a PathPrefix path match"
+                        "rules[{rule_index}] urlRewrite path.type ReplacePrefixMatch requires every match in the rule to use a PathPrefix path match"
                     ),
                 ));
             }
@@ -12202,17 +12209,25 @@ mod tests {
     #[test]
     fn repeated_singleton_route_filter_is_refused() {
         for filter_type in SINGLETON_ROUTE_FILTER_TYPES {
-            if filter_type == "RequestRedirect" || filter_type == "URLRewrite" {
-                continue;
-            }
-            let payload = match filter_type {
-                "RequestHeaderModifier" => "requestHeaderModifier",
-                _ => "responseHeaderModifier",
+            let filter = match filter_type {
+                "RequestHeaderModifier" => serde_json::json!({
+                    "type": filter_type,
+                    "requestHeaderModifier": {"set": [{"name": "x-dup", "value": "one"}]}
+                }),
+                "ResponseHeaderModifier" => serde_json::json!({
+                    "type": filter_type,
+                    "responseHeaderModifier": {"set": [{"name": "x-dup", "value": "one"}]}
+                }),
+                "RequestRedirect" => serde_json::json!({
+                    "type": filter_type,
+                    "requestRedirect": {"statusCode": 302}
+                }),
+                "URLRewrite" => serde_json::json!({
+                    "type": filter_type,
+                    "urlRewrite": {"hostname": "internal.example.com"}
+                }),
+                other => panic!("unclassified singleton filter type {other}"),
             };
-            let filter = serde_json::json!({
-                "type": filter_type,
-                payload: {"set": [{"name": "x-dup", "value": "one"}]}
-            });
             let message = translate_route_error(
                 "HTTPRoute",
                 serde_json::json!([{
@@ -12241,8 +12256,12 @@ mod tests {
                 }),
             ),
         );
+        // Upstream's CRD forbids this shape with an `XValidation` rule, so it is
+        // `Invalid`, not a CRD-valid `UnsupportedValue`.
         assert!(
-            message.contains(UNSUPPORTED_SHAPE_MARKER) && message.contains("PathPrefix"),
+            !message.contains(UNSUPPORTED_SHAPE_MARKER)
+                && !message.contains(INCOMPATIBLE_FILTERS_MARKER)
+                && message.contains("PathPrefix"),
             "{message}"
         );
     }
@@ -12274,6 +12293,18 @@ mod tests {
             assert!(
                 message.contains("urlRewrite"),
                 "{rewrite}: expected a urlRewrite-scoped diagnostic, got {message}"
+            );
+            // A hostname outside upstream's `PreciseHostname` pattern is
+            // CRD-invalid, so it must report `Invalid` (no marker); only an
+            // unknown `path.type` keeps the forward-compatible marker.
+            let unknown_path_type = rewrite
+                .pointer("/path/type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "ReplaceFullPath" && kind != "ReplacePrefixMatch");
+            assert_eq!(
+                message.contains(UNSUPPORTED_SHAPE_MARKER),
+                unknown_path_type,
+                "{rewrite}: wrong status classification for {message}"
             );
         }
     }
