@@ -12268,21 +12268,47 @@ mod tests {
 
     #[test]
     fn http_route_url_rewrite_rejects_unsupported_shapes() {
+        // Status reason each shape must map to (see `status.rs`): CRD-invalid
+        // input is `Invalid` (no marker); an unknown enum member upstream may
+        // add later is `UnsupportedValue`; unhandled fields are
+        // `IncompatibleFilters`, checked before the type is interpreted.
+        const INVALID: &str = "Invalid";
+        const UNSUPPORTED: &str = "UnsupportedValue";
+        const INCOMPATIBLE: &str = "IncompatibleFilters";
         let cases = [
-            serde_json::json!({"hostname": "*.example.com"}),
-            serde_json::json!({"hostname": "example.com:8443"}),
-            serde_json::json!({"hostname": ""}),
-            serde_json::json!({"path": {"type": "ReplaceQuery", "replaceQuery": "a=b"}}),
-            serde_json::json!({"path": {"type": "ReplaceFullPath"}}),
-            serde_json::json!({"path": {"type": "ReplaceFullPath", "replaceFullPath": "v2"}}),
-            serde_json::json!({
-                "path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2?a=b"}
-            }),
-            serde_json::json!({
-                "path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2/../etc"}
-            }),
+            (serde_json::json!({"hostname": "*.example.com"}), INVALID),
+            (serde_json::json!({"hostname": "example.com:8443"}), INVALID),
+            (serde_json::json!({"hostname": ""}), INVALID),
+            (
+                serde_json::json!({"path": {"type": "ReplaceQuery"}}),
+                UNSUPPORTED,
+            ),
+            (
+                serde_json::json!({"path": {"type": "ReplaceQuery", "replaceQuery": "a=b"}}),
+                INCOMPATIBLE,
+            ),
+            (
+                serde_json::json!({"path": {"type": "ReplaceFullPath"}}),
+                INVALID,
+            ),
+            (
+                serde_json::json!({"path": {"type": "ReplaceFullPath", "replaceFullPath": "v2"}}),
+                INVALID,
+            ),
+            (
+                serde_json::json!({
+                    "path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2?a=b"}
+                }),
+                INVALID,
+            ),
+            (
+                serde_json::json!({
+                    "path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2/../etc"}
+                }),
+                INVALID,
+            ),
         ];
-        for rewrite in cases {
+        for (rewrite, expected) in cases {
             let message = translate_route_error(
                 "HTTPRoute",
                 url_rewrite_rule(
@@ -12294,18 +12320,14 @@ mod tests {
                 message.contains("urlRewrite"),
                 "{rewrite}: expected a urlRewrite-scoped diagnostic, got {message}"
             );
-            // A hostname outside upstream's `PreciseHostname` pattern is
-            // CRD-invalid, so it must report `Invalid` (no marker); only an
-            // unknown `path.type` keeps the forward-compatible marker.
-            let unknown_path_type = rewrite
-                .pointer("/path/type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| kind != "ReplaceFullPath" && kind != "ReplacePrefixMatch");
-            assert_eq!(
-                message.contains(UNSUPPORTED_SHAPE_MARKER),
-                unknown_path_type,
-                "{rewrite}: wrong status classification for {message}"
-            );
+            let actual = if message.contains(INCOMPATIBLE_FILTERS_MARKER) {
+                INCOMPATIBLE
+            } else if message.contains(UNSUPPORTED_SHAPE_MARKER) {
+                UNSUPPORTED
+            } else {
+                INVALID
+            };
+            assert_eq!(actual, expected, "{rewrite}: {message}");
         }
     }
 
