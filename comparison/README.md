@@ -66,6 +66,13 @@ The script will:
 4. Run baseline → Ferrum → Kong → Tyk → KrakenD → Envoy tests sequentially
 5. Generate an HTML comparison report in `comparison/results/`
 
+Before building or starting the benchmark, the runner checks ports 3001, 3443, 8000, and 8443
+and the fixed Docker container and network names it uses. If a port is occupied, it exits with
+the port and an `lsof` command to inspect the listener. If a fixed Docker name already exists,
+it exits with instructions to remove or rename that resource. During the run, cleanup stops and
+removes only containers and the network created by that run; it sends SIGTERM to the backend
+process, waits up to five seconds, and sends SIGKILL only to that tracked process if needed.
+
 Open `comparison/results/comparison_report.html` in a browser to view the results.
 
 ## Configuration
