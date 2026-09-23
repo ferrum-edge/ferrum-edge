@@ -3938,7 +3938,7 @@ async fn gateway_route_timeouts_reach_the_data_plane() {
         {
             "matches": [{"path": {"type": "PathPrefix", "value": "/stream"}}],
             "backendRefs": [{"name": "trickle", "port": 8080}],
-            "timeouts": {"request": "800ms", "backendRequest": "5s"}
+            "timeouts": {"request": "800ms", "backendRequest": "800ms"}
         }
     ]));
     objects.push(route);
