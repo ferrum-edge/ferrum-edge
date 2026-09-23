@@ -4693,9 +4693,17 @@ async fn handle_h3_request(
     // HTTP relays write the response head and body from inside the dispatch,
     // so they cannot yet turn this deadline into a `504` or a mid-body reset:
     // refuse such a request before any target selection, breaker admission, or
-    // dial rather than serve it without the policy it was routed under.
+    // dial rather than serve it without the policy it was routed under. The
+    // H1/H2 frontends withhold `Alt-Svc` on every port that serves such a rule
+    // (`ProxyState::route_timeout_alt_svc`), so the gateway never steers a
+    // client here; only a client that reaches HTTP/3 on its own sees this.
     // Upgraded tunnels (RFC 9220 WebSocket, RFC 9298 CONNECT-UDP) are not HTTP
     // response bodies and are exempt, exactly as on the H1/H2 frontends.
+    //
+    // Ordering differs from H1/H2 in one documented case: this runs before the
+    // DEFERRED `before_proxy` pass, so a `response_mock` or `fault_injection`
+    // abort that defers behind a backend-path policy plugin is answered with
+    // this `503` over HTTP/3, where H1/H2 would return the mock or abort.
     ctx.arm_route_request_deadline(matches!(http_flavor, HttpFlavor::Grpc));
     if matches!(http_flavor, HttpFlavor::Plain)
         && !is_connect_udp_request

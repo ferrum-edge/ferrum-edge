@@ -830,7 +830,8 @@ pub struct RouteRule {
     /// gRPC request folds it into its RPC deadline and ends with
     /// `DEADLINE_EXCEEDED`. Native HTTP/3 cannot bound a non-gRPC request by
     /// it yet, so such a request is refused with `503` rather than served
-    /// without the deadline.
+    /// without the deadline, and HTTP/3 is not advertised (`Alt-Svc`) on any
+    /// frontend port that serves a rule carrying it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_ms: Option<u64>,
     /// Override the proxy's retry policy for this rule.
@@ -946,6 +947,24 @@ impl RouteRule {
     fn carries_timeout_policy(&self) -> bool {
         self.timeout_ms.is_some() || self.timeout_disabled || self.request_timeout_ms.is_some()
     }
+}
+
+/// Whether a `mesh_route_dispatch` config document carries any rule with a
+/// total request deadline (`request_timeout_ms`).
+///
+/// Read once per published configuration generation to withhold the HTTP/3
+/// `Alt-Svc` advertisement on the frontend ports that serve such a rule
+/// (`crate::proxy::RouteTimeoutAltSvc`). Deliberately conservative: any
+/// non-null value counts, since a document the plugin later rejects never
+/// serves at all.
+pub(crate) fn config_sets_request_timeout(config: &Value) -> bool {
+    let Some(rules) = config.get("rules").and_then(Value::as_array) else {
+        return false;
+    };
+    rules
+        .iter()
+        .filter_map(|rule| rule.get("request_timeout_ms"))
+        .any(|value| !value.is_null())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

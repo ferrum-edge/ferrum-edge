@@ -40,10 +40,10 @@ citations):
   `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute` plus the Extended filter features
   `HTTPRouteResponseHeaderModification`, `HTTPRoutePathRewrite` and
   `HTTPRouteHostRewrite` and the rule-timeout features `HTTPRouteRequestTimeout`
-  and `HTTPRouteBackendTimeout`, GatewayClass `ferrum`,
-  controller `ferrum.io/gateway-controller`. Live `TCPRoute` and `TLSRoute`
-  data-plane behavior is release-gated by Ferrum black-box checks in the same
-  workflow. `UDPRoute` is release-gated by the required `Tests` aggregate
+  and `HTTPRouteBackendTimeout` (two known deviations, below), GatewayClass
+  `ferrum`, controller `ferrum.io/gateway-controller`. Live `TCPRoute` and
+  `TLSRoute` data-plane behavior is release-gated by Ferrum black-box checks in
+  the same workflow. `UDPRoute` is release-gated by the required `Tests` aggregate
   rather than by a black-box step in this workflow:
   translation/status/update/delete by CI Unit Tests
   (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`), and the
@@ -175,10 +175,32 @@ before the response head a non-gRPC request gets a gateway `504`
 reset (HTTP/2) or its connection closed (HTTP/1.1), and a gRPC request folds the
 budget into its RPC deadline and ends with `DEADLINE_EXCEEDED`. Both values stay
 on the rule's own dispatch entry, so sibling and merged rules keep the proxy
-defaults. **Known gap:** native HTTP/3 cannot yet enforce `request` on a
-non-gRPC request, so such a request is refused with `503` before any dial rather
-than served without its deadline; the same request over HTTP/1.1 or HTTP/2 is
-bounded. Upgraded WebSocket / CONNECT-UDP tunnels are not bounded by `request`.
+defaults. A `request` expiry is charged to a backend's health (circuit
+breaker, passive health / outlier detection, latency samples) only when that
+backend held the request: expiry while the gateway is still collecting a
+buffered client upload, running request-body hooks, resolving DNS or taking
+admission, in retry backoff, or after the response head is health-neutral. A
+body cut by `request` keeps a backend `Content-Length` advertised.
+
+**Known deviations in the declared rule-timeout features:**
+
+- **`HTTPRouteBackendTimeout`:** upstream v1.5.1 defines `backendRequest` as the
+  time from when a request starts being sent to the backend until its full
+  response is received, per attempt. Ferrum bounds each attempt's wait for the
+  response head and every idle gap between response frames, not the attempt's
+  total duration, so a backend trickling its body inside the idle gap is not cut
+  per attempt; only `request` cuts it, and a rule without a non-zero `request`
+  has no total bound. The upstream test delays only the response head.
+- **`HTTPRouteRequestTimeout` over HTTP/3:** native HTTP/3 cannot yet enforce
+  `request` on a non-gRPC request, so such a request is refused with `503`
+  before any dial rather than served without its deadline. Because browsers
+  cache `Alt-Svc` origin-wide and do not fall back to TCP on an HTTP error, the
+  H1/H2 frontends withhold `Alt-Svc` on every listener port that serves such a
+  rule (every port for a port-agnostic route), so the gateway never steers a
+  client onto the refusal; a client that reaches HTTP/3 another way still gets
+  the `503`. HTTP/1.1 and HTTP/2 enforce `request` fully.
+
+Upgraded WebSocket / CONNECT-UDP tunnels are not bounded by `request`.
 
 Filter shapes are refused rather than partially honored, and the status reason
 follows what is wrong rather than which CRD mechanism forbids it:
@@ -257,14 +279,17 @@ because `istio-vs-resp-xform-` is a managed plugin-id prefix. The upstream
 `HTTPRouteResponseHeaderModifier`, `HTTPRouteRewritePath` and
 `HTTPRouteRewriteHost` conformance tests run and pass in the hosted lab. The
 upstream `HTTPRouteTimeoutRequest` and `HTTPRouteTimeoutBackendRequest` tests
-now run too (their features are declared). Four more data-plane regressions
-cover rule timeouts:
+now run too (their features are declared). Data-plane regressions cover rule
+timeouts:
 `gateway_route_timeouts_reach_the_data_plane` (pre-head `504`, mid-body cut,
 `backendRequest` inside a larger `request` budget, `0s`, sibling isolation),
 `gateway_route_request_timeout_spans_retry_attempts_and_backoff` (one budget
 across attempts and backoff under an operator-configured proxy retry),
-`gateway_route_request_timeout_ends_grpc_calls_with_deadline_exceeded` and
-`removing_rule_timeouts_withdraws_the_deadline`. Default
+`gateway_route_request_timeout_ends_grpc_calls_with_deadline_exceeded`,
+`removing_rule_timeouts_withdraws_the_deadline`, and three backend-health
+attribution regressions through a live circuit breaker (a stalled client upload
+and a mid-body cut are not charged; a backend stalling its response head is).
+Default
 HTTPRoute matches use the same internal predicate conversion as explicit
 matches, so supported actions do not emit an invalid raw Gateway API path field.
 The pinned [HTTPRoute v1.5.1 schema](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/httproute_types.go)

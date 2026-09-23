@@ -261,7 +261,10 @@ pub const REQUEST_ID_METADATA_KEY: &str = "request_id";
 /// Transaction-log metadata key set when the matched route rule's total
 /// request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway API
 /// `HTTPRoute.rules[].timeouts.request`) produced the gateway-authored `504`.
-/// Its value is a fixed phase literal (`dispatch`, `retry_backoff`).
+/// Its value is a fixed phase literal: `before_dispatch` (the attempt had not
+/// yet been handed to a backend — health-neutral), `dispatch` (the backend
+/// held the cancelled attempt — charged to it), or `retry_backoff`
+/// (health-neutral).
 pub const ROUTE_REQUEST_TIMEOUT_METADATA_KEY: &str = "route_request_timeout";
 
 /// Parser-level limits contributed by a WebSocket size-policy plugin.

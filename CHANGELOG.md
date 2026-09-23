@@ -17,11 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response body still streaming at the deadline is reset (HTTP/2) or its
   connection closed (HTTP/1.1). gRPC calls end with `DEADLINE_EXCEEDED`. The
   timeouts apply only to the rule that declares them. `mesh_route_dispatch`
-  rules gain the matching `request_timeout_ms` field. Native HTTP/3 cannot
-  enforce the total deadline for non-gRPC requests yet, so it refuses those
-  requests with `503` instead of serving them without the deadline. CI now
-  declares `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`.
-  `rules[].retry` is still refused.
+  rules gain the matching `request_timeout_ms` field. A `request` expiry counts
+  against a backend's health only when that backend held the request; expiry
+  while the gateway is still buffering a client upload, in retry backoff, or
+  after the response head does not. A body cut by the deadline keeps its
+  `Content-Length`. Native HTTP/3 cannot enforce the total deadline for
+  non-gRPC requests yet, so it refuses those requests with `503` instead of
+  serving them without the deadline, and HTTP/3 is no longer advertised
+  (`Alt-Svc`) on a listener port that serves such a rule. CI now declares
+  `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`; `backendRequest`
+  bounds an attempt's response-head wait and idle gaps rather than its total
+  duration, a documented deviation. `rules[].retry` is still refused.
 
 - Conditional full-replacement writes (#5659). `GET` on proxies, upstreams,
   consumers, and plugin configs returns a strong `ETag`; `PUT`/`DELETE` with a

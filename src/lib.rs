@@ -11716,6 +11716,52 @@ pub mod _test_support {
         body.with_route_request_deadline(deadline)
     }
 
+    /// Drive one backend attempt through the route request deadline wrapper
+    /// exactly as proxy core does. `Err` names how the deadline ended it:
+    /// `"not_started"` (refused without polling the attempt) or `"in_flight"`
+    /// (the attempt was polled and then cancelled).
+    pub async fn await_route_request_deadline_for_test<F: std::future::Future>(
+        deadline: Option<tokio::time::Instant>,
+        attempt: F,
+    ) -> Result<F::Output, &'static str> {
+        crate::proxy::await_route_request_deadline(deadline, attempt)
+            .await
+            .map_err(|expiry| match expiry {
+                crate::proxy::RouteDeadlineExpiry::BeforeDispatch => "not_started",
+                crate::proxy::RouteDeadlineExpiry::InFlight => "in_flight",
+            })
+    }
+
+    /// The transaction-log phase and dispatch error class proxy core records
+    /// for a route request deadline expiry. `in_flight` selects a cancelled
+    /// (rather than never-started) attempt; `handed_to_backend` is that
+    /// attempt's dispatch marker.
+    pub fn route_request_deadline_outcome_for_test(
+        in_flight: bool,
+        handed_to_backend: bool,
+    ) -> (&'static str, crate::retry::ErrorClass) {
+        let expiry = if in_flight {
+            crate::proxy::RouteDeadlineExpiry::InFlight
+        } else {
+            crate::proxy::RouteDeadlineExpiry::BeforeDispatch
+        };
+        (
+            expiry.phase(handed_to_backend),
+            expiry.error_class(handed_to_backend),
+        )
+    }
+
+    /// Whether `config` withholds the HTTP/3 `Alt-Svc` advertisement on
+    /// `frontend_port` because a route rule reachable there carries a total
+    /// request deadline — the rule `ProxyState::alt_svc_for_frontend_port`
+    /// applies to every response.
+    pub fn route_timeout_withholds_alt_svc_for_test(
+        config: &crate::config::types::GatewayConfig,
+        frontend_port: Option<u16>,
+    ) -> bool {
+        crate::proxy::RouteTimeoutAltSvc::for_config(1, config).withholds(frontend_port)
+    }
+
     pub fn proxy_body_into_grpc_web_streaming_for_test(
         body: crate::proxy::ProxyBody,
         content_type: &str,

@@ -8870,9 +8870,27 @@ unaffected.
 
 | Request | Expiry before the response head | Expiry while the body streams |
 |---|---|---|
-| HTTP/1.1 / HTTP/2, not gRPC | The in-flight attempt or retry backoff is cancelled, no new attempt starts once the budget is spent, and the client gets `504` `{"error":"Request timeout"}` (`X-Gateway-Error: backend_timeout`). It is never retried. Transaction-log metadata `route_request_timeout` names the phase (`dispatch`, `before_dispatch`, `retry_backoff`); only a cancelled in-flight attempt is error class `read_write_timeout` (a backend-health signal), while a budget spent before an attempt or in backoff is the health-neutral `dispatch_policy_rejected` | The body ends with a timeout error: the HTTP/2 stream is reset and the HTTP/1.1 connection is closed, never a clean end of message. `body_error_class` is `read_write_timeout` |
+| HTTP/1.1 / HTTP/2, not gRPC | The in-flight attempt or retry backoff is cancelled, no new attempt starts once the budget is spent, and the client gets `504` `{"error":"Request timeout"}` (`X-Gateway-Error: backend_timeout`). It is never retried. Transaction-log metadata `route_request_timeout` names the phase, which also decides backend-health attribution (see below): `dispatch` — the backend held the cancelled attempt — is error class `read_write_timeout`, charged to that backend; `before_dispatch` (the attempt had not been handed to a backend) and `retry_backoff` are the health-neutral `dispatch_policy_rejected` | The body ends with a timeout error: the HTTP/2 stream is reset and the HTTP/1.1 connection is closed, never a clean end of message. A backend `Content-Length` stays advertised, so the cut reads as a short body. `body_error_class` is `read_write_timeout`, but the cut is **not** charged to the backend (see below) |
 | gRPC / gRPC-Web on any frontend | The budget is folded into the request's RPC deadline (the earlier of it and any client `grpc-timeout` / `grpc_deadline` budget wins), so the existing deadline machinery answers `DEADLINE_EXCEEDED` and forwards the remaining budget as `grpc-timeout` | `DEADLINE_EXCEEDED` trailers before response DATA; a stream reset after it |
-| HTTP/3, not gRPC | Refused with `503` `{"error":"Route request timeout is not supported over HTTP/3"}` before target selection, breaker admission, or any dial: the native HTTP/3 relays write the response from inside the dispatch and cannot yet turn the deadline into a `504` or a mid-body reset, so the request is not served without its policy | — |
+| HTTP/3, not gRPC | Refused with `503` `{"error":"Route request timeout is not supported over HTTP/3"}` before target selection, breaker admission, or any dial: the native HTTP/3 relays write the response from inside the dispatch and cannot yet turn the deadline into a `504` or a mid-body reset, so the request is not served without its policy. The H1/H2 frontends withhold `Alt-Svc` on every frontend port that serves such a rule, so the gateway never steers a client here (see [docs/http3.md](http3.md#route-request-deadline-request_timeout_ms-gateway-api-timeoutsrequest)) | — |
+
+**Backend-health attribution.** The deadline is charged to a backend (circuit
+breaker, passive health / outlier detection, least-latency and adaptive
+concurrency samples) only when that backend held the request. An attempt counts
+as handed to the backend once every gateway- and client-side step is done —
+buffered client-body collection, request-body hooks, DNS, and backend admission
+— and the dial, stream open, or send has begun; it is the same point where the
+attempt's latency sample starts. A retry attempt is handed over from its start,
+because the retry planner has already admitted it and replays the retained,
+already-transformed body. Expiry before that point — a client that stalls its
+upload while the gateway buffers it, for example — is recorded
+`before_dispatch` / `dispatch_policy_rejected` and feeds no failure and no
+latency sample. A streaming (unbuffered) upload is relayed as part of the
+backend exchange, so after the handoff it is attributed like the per-attempt
+header wait (`backend_read_timeout_ms`) already is. A cut **after** the response
+head is never charged: the backend has answered, and the total budget ends a
+long healthy download or a slow-reading client exactly as it ends a slow
+backend, so deferred accounting treats it like an expired client RPC deadline.
 
 Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
 not bounded by `request_timeout_ms`. Gateway-local plugin hooks are not
