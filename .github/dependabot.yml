@@ -16,6 +16,21 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # Frozen action pins rotate with their trusted contracts; see
+    # docs/dependency-policy.md#rotating-frozen-actions.
+    ignore:
+      - dependency-name: "actions/cache/restore"
+      - dependency-name: "actions/cache/save"
+      - dependency-name: "actions/checkout"
+      - dependency-name: "actions/download-artifact"
+      - dependency-name: "actions/setup-python"
+      - dependency-name: "actions/upload-artifact"
+      - dependency-name: "docker/build-push-action"
+      - dependency-name: "docker/login-action"
+      - dependency-name: "docker/setup-buildx-action"
+      - dependency-name: "dtolnay/rust-toolchain"
+      - dependency-name: "Swatinem/rust-cache"
+      - dependency-name: "taiki-e/install-action"
     commit-message:
       prefix: "ci"
     labels:

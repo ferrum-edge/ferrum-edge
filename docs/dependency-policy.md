@@ -576,6 +576,29 @@ When reviewing an actions Dependabot PR:
    to.
 3. Do not accept a PR that reintroduces a mutable tag ref.
 
+Dependabot version updates are ignored for the external actions whose exact
+invocations are covered by the trusted Cross build and CI runtime-cache
+contracts: `actions/cache/restore`, `actions/cache/save`,
+`actions/checkout`, `actions/download-artifact`, `actions/setup-python`,
+`actions/upload-artifact`, `docker/build-push-action`, `docker/login-action`,
+`docker/setup-buildx-action`, `dtolnay/rust-toolchain`, `Swatinem/rust-cache`,
+and `taiki-e/install-action`. A SHA or version-comment change in these frozen
+jobs can fail the trusted checks on `main`, while `CI Plan` intentionally
+rejects direct edits to the frozen policy scripts. The `ignore` entries suppress
+version-update PRs; Dependabot security updates remain allowed.
+
+#### Rotating frozen actions
+
+Schedule a periodic review of the ignored actions for upstream releases and
+security fixes. When an update is due, prepare one coordinated rotation PR,
+modeled on [#5675](https://github.com/ferrum-edge/ferrum-edge/pull/5675): update
+the affected workflow pins and version comments, the corresponding trusted
+contracts, and the action pin records in this document together. The PR is
+expected to fail `CI Plan` and trusted checks that use policy from `main`; this
+is by design. A maintainer override is needed after `Candidate policy
+self-test` and the CI aggregate wiring check pass. Do not land a partial action
+bump and defer the contract update.
+
 The setup-python v7.0.0 pin (`5fda3b95…`) now covers every use, including the
 previously frozen compiler-store `produce` and platform-study `study` jobs.
 Those two jobs were rotated in a coordinated trusted-policy update because their
