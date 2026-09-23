@@ -193,6 +193,14 @@ pub struct ResponseTransformer {
     /// buffer/stream selection and the later header/body hooks are guaranteed to
     /// agree (GHSA-83rc-23c9-3g9x).
     rules_enabled: bool,
+    /// `true` for a rules-free `apply_route_overrides` consumer: no static
+    /// header rules and no body rules, so its only response-header policy is
+    /// the matched route override `mesh_route_dispatch` publishes. That is the
+    /// instance the K8s translators auto-emit, and one proxy can carry it on
+    /// behalf of several merged Gateway API routes / rules of which only some
+    /// declare a `ResponseHeaderModifier`. Its unbounded trailer policy is
+    /// therefore request-conditional — see [`Self::response_trailer_policy`].
+    route_override_consumer_only: bool,
     /// Content-derived digest of this instance's whole accepted static config.
     ///
     /// Computed once at construction from the canonical form of the validated
@@ -698,10 +706,12 @@ impl ResponseTransformer {
         // `apply_route_overrides` is parsed and validated above so the
         // K8s VirtualService translator can auto-emit a `response_transformer`
         // with zero static rules that still participates in the chain-level
-        // route-header finalization phase. The flag is config-time only — an
-        // enabled instance is eligible for that phase regardless — so we drop
-        // it after construction.
-        let _ = apply_route_overrides;
+        // route-header finalization phase. An enabled instance is eligible for
+        // that phase regardless of the flag; what the flag adds is the
+        // rules-free consumer shape whose response-trailer policy follows the
+        // route override rather than applying to every request.
+        let route_override_consumer_only =
+            apply_route_overrides && header_rules.is_empty() && body_rules.is_empty();
 
         let runtime_overlay_scope = match config.get("runtime_overlay_scope") {
             Some(Value::String(s)) => {
@@ -766,6 +776,7 @@ impl ResponseTransformer {
             static_update_keys,
             body_rules,
             rules_enabled,
+            route_override_consumer_only,
             static_policy_digest,
         })
     }
@@ -1258,16 +1269,43 @@ impl Plugin for ResponseTransformer {
     /// invisible to this declaration and invisible to observed-mutation
     /// reconciliation, so a buffered path that forwards backend trailers drops
     /// the whole trailer section instead of guessing which names are governed.
+    ///
+    /// The rules-free `apply_route_overrides` consumer declares the
+    /// REQUEST-CONDITIONAL form instead: it has no static rules, so the route
+    /// override is its entire response-header policy, and a request whose
+    /// matched dispatch rule published none is one this instance never
+    /// modifies. Same-kind Gateway API routes that share a host, listener and
+    /// path merge onto one proxy (and one consumer), so an unconditional drop
+    /// would strip application trailers from a sibling rule — possibly another
+    /// team's route — that never declared a `ResponseHeaderModifier`. Any static
+    /// rule keeps the unconditional arm, so operator-authored instances are
+    /// unchanged.
     fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
-        if self.rules_enabled {
-            super::ResponseTrailerPolicy::Unbounded
-        } else {
+        if !self.rules_enabled {
             // A fully disabled generation runs no response-header rules,
             // including request-time route overrides. Publishing an unbounded
             // policy here would still drop every backend trailer even though
             // the transformer is supposed to be a complete no-op.
             super::ResponseTrailerPolicy::None
+        } else if self.route_override_consumer_only {
+            super::ResponseTrailerPolicy::RequestConditionalUnbounded
+        } else {
+            super::ResponseTrailerPolicy::Unbounded
         }
+    }
+
+    /// Whether the matched dispatch rule published a response route override
+    /// for THIS request — the only response-header policy a rules-free consumer
+    /// applies.
+    ///
+    /// Reads the publication flag, not just the override slot: proxy core
+    /// `take()`s `route_override_response_transform` when it finalizes route
+    /// headers, and a later resolution must not read that as "nothing
+    /// governed". The live slot is OR-ed in so an override placed without the
+    /// flag still fails closed. Two field loads; no allocation or lock.
+    fn request_applies_unbounded_response_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        ctx.route_override_response_transform_published
+            || ctx.route_override_response_transform.is_some()
     }
 
     async fn after_proxy(

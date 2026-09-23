@@ -158,32 +158,48 @@ filter types and unimplemented rule fields, including timeouts and retry, report
 `UnsupportedValue`. Both cases report `Programmed=False`, while independently
 valid routes remain available.
 
-Filter combinations are refused rather than partially honored. `URLRewrite` and
+Filter shapes are refused rather than partially honored, and the status reason
+follows what is wrong rather than which CRD mechanism forbids it:
+`IncompatibleFilters` when the rule's filter set cannot be honored as declared
+(conflicting filters, a filter type the kind does not carry, an unimplemented
+filter type or field), `Invalid` for a bad value inside one filter, and
+`UnsupportedValue` for a CRD-valid value Ferrum declines. So `URLRewrite` and
 `RequestRedirect` in one rule are `IncompatibleFilters` (a redirect answers the
-request itself, so the rewrite could never fire), and the four upstream
-at-most-once filter types — `RequestHeaderModifier`, `ResponseHeaderModifier`,
-`RequestRedirect`, `URLRewrite` — are refused when repeated in one rule.
-`URLRewrite` `path.type: ReplacePrefixMatch` requires every match in the rule to
-use a `PathPrefix` path match; anything else is `Invalid`, because the shape is
-outside the CRD's own bounds. Upstream's CEL rule is stricter (exactly one
-`PathPrefix` match); Ferrum also accepts several `PathPrefix` matches and a
-match-less rule (the implicit `PathPrefix: /`), each rebased against its own
-prefix. A `ResponseHeaderModifier` naming a
-protocol-managed response field (hop-by-hop or framing) is `UnsupportedValue`:
-Ferrum strips those from backend responses by design and a route filter may not
-put one back. Malformed header names/values and malformed rewrite hostnames or
-replacement paths are `Invalid`.
+request itself, so the rewrite could never fire — upstream's own example of the
+reason), and the four upstream at-most-once filter types —
+`RequestHeaderModifier`, `ResponseHeaderModifier`, `RequestRedirect`,
+`URLRewrite` — are refused when repeated in one rule. `URLRewrite`
+`path.type: ReplacePrefixMatch` requires every match in the rule to use a
+`PathPrefix` path match; anything else is `Invalid`, as is a `URLRewrite.path`
+carrying the modifier field of the type it did not select. Upstream's CEL rule
+is stricter (exactly one `PathPrefix` match); Ferrum also accepts several
+`PathPrefix` matches and a match-less rule (the implicit `PathPrefix: /`), each
+rebased against its own prefix. A `PathPrefix` match with no `value`, or a match
+with no or a null `path`, rebases against `/`, matching upstream's default and
+Ferrum's routing. A `ResponseHeaderModifier` naming a protocol-managed response
+field (hop-by-hop or framing) is `UnsupportedValue`: Ferrum strips those from
+backend responses by design and a route filter may not put one back. So is a
+response-side `set` / `add` / `remove` of `grpc-status`, `grpc-message` or
+`grpc-status-details-bin` on either kind, because a Trailers-Only gRPC error
+carries its status in the headers the filter edits. Malformed header
+names/values and malformed rewrite hostnames or replacement paths are `Invalid`.
+An HTTPRoute rule with no `backendRefs` and no `RequestRedirect` whose only
+filters are header modifiers and/or `URLRewrite` answers HTTP 500, as upstream
+requires for a rule that forwards nowhere.
 
-**Response-trailer cost of `ResponseHeaderModifier`.** The generated
-`response_transformer` consumer publishes an unbounded response-trailer policy,
-because a route override can name any field at request time. On a proxy carrying
-that filter, non-reserved backend trailers are therefore dropped by the gateway's
-response-trailer governance boundary. The gRPC terminal fields (`grpc-status`,
-`grpc-message`, `grpc-status-details-bin`), the response message and streaming
-are preserved; application trailers on that route are not. Rules that declare no
-response-header filter keep their trailers. The filter does not modify trailers
-in either case — `ResponseHeaderModifier` governs response headers only, which
-for a native gRPC call is the initial metadata.
+**Response-trailer cost of `ResponseHeaderModifier`.** A route override can name
+any field at request time, so the requests a filtered rule matches have their
+non-reserved backend trailers dropped by the gateway's response-trailer
+governance boundary. The generated `response_transformer` consumer carries no
+rules of its own and declares a request-conditional policy, so the drop applies
+only when the matched dispatch rule published a response transform. Same-kind
+routes that share a hostname, listener and path merge onto one proxy and one
+consumer; a merged sibling rule or route that declares no response-header filter
+keeps its trailers. The gRPC terminal fields (`grpc-status`, `grpc-message`,
+`grpc-status-details-bin`), the response message and streaming are preserved;
+application trailers on the filtered rule are not. The filter does not modify
+trailers in either case — `ResponseHeaderModifier` governs response headers
+only, which for a native gRPC call is the initial metadata.
 
 The field inventory admits rule name, matches, backendRefs, filters and
 sessionPersistence, each subject to its existing validation. Empty backend
@@ -194,7 +210,7 @@ checks translator/status agreement for both route kinds, all six reported gaps,
 future fields, and a supported RequestHeaderModifier control (issue #4816).
 `supported_gateway_request_headers_reach_backend_beside_rejected_route` also
 drives the translated HTTPRoute through the gateway to a real backend and
-checks header set/add/remove plus no traffic for the refused sibling. Three more
+checks header set/add/remove plus no traffic for the refused sibling. Five more
 data-plane regressions in the same file cover the newly supported filters:
 `gateway_response_header_modifier_reaches_the_client_through_the_data_plane`
 (client-observed set/add/remove, sibling-rule isolation, and composition with an
@@ -204,6 +220,13 @@ operator's global `response_transformer`),
 `ReplaceFullPath`, hostname rewrite, and sibling-rule isolation),
 `grpc_route_response_header_modifier_reaches_the_client_and_preserves_status`
 (gRPC response metadata, message, terminal status, and the trailer cost above).
+`merged_grpc_route_sibling_without_response_header_modifier_keeps_trailers` and
+`merged_http_route_sibling_without_response_header_modifier_keeps_trailers`
+first prove two routes merged onto one proxy and one consumer, then show the
+filtered rule pays the trailer cost while the merged sibling keeps its
+application trailers. The response-header test also asserts that `add` appends
+to a header the backend already sent and that a filter-only rule with no
+`backendRefs` answers `500`.
 The translator-level `removing_a_rule_filter_withdraws_its_generated_resources`
 checks that dropping a filter emits no rewrite, response transform, or consumer
 plugin; the live reconciler replaces those generated ids on every compose

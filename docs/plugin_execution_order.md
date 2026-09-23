@@ -1485,7 +1485,11 @@ applies to contextless response-trailer declarations (`Names`,
 `NamesAndPrefixes`, or `Unbounded`), which are folded per generation and applied
 without asking the instance again. `RequestConditionalUnbounded` remains
 supported because its per-request predicate is evaluated through the triggered
-wrapper.
+wrapper — except on a response route-header finalizer (the rules-free
+`response_transformer` consumer with `apply_route_overrides: true`). Proxy core
+selects that finalizer and applies the matched route override without consulting
+a trigger, so a skipped instance would still see the override applied while its
+request-conditional trailer policy stood down; such a trigger is refused.
 
 An **authentication** plugin may not carry an identity predicate: `authenticate`
 is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so such a

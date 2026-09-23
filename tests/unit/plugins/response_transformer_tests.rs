@@ -1422,6 +1422,93 @@ async fn test_response_transformer_apply_route_overrides_no_static_rules_applies
     assert!(!response_headers.contains_key("x-origin"));
 }
 
+/// The rules-free consumer the K8s translators emit carries no policy of its
+/// own, so its unbounded trailer arm must follow the route override the matched
+/// dispatch rule published — not fire for every request on the proxy. Merged
+/// Gateway API routes share one proxy and one consumer, and a sibling rule
+/// without a `ResponseHeaderModifier` must keep its application trailers.
+#[tokio::test]
+async fn test_route_override_consumer_trailer_policy_is_request_conditional() {
+    let consumer = ResponseTransformer::new(&json!({
+        "rules": [],
+        "apply_route_overrides": true,
+    }))
+    .unwrap();
+    assert!(
+        matches!(
+            consumer.response_trailer_policy(),
+            ferrum_edge::plugins::ResponseTrailerPolicy::RequestConditionalUnbounded
+        ),
+        "a rules-free consumer governs trailers only when a route override applies"
+    );
+
+    let unmatched = make_ctx();
+    assert!(
+        !consumer.request_applies_unbounded_response_trailer_policy(&unmatched),
+        "a request whose dispatch rule published no response transform keeps its trailers"
+    );
+
+    let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "remove", "target": "header", "key": "x-internal"}
+    ]))
+    .unwrap();
+    let route_rules = Arc::new(parse_route_header_transforms(&raw, "route_override").unwrap());
+
+    // An override placed on the context without the publication flag still
+    // fails closed.
+    let mut slot_only = make_ctx();
+    slot_only.route_override_response_transform = Some(Arc::clone(&route_rules));
+    assert!(consumer.request_applies_unbounded_response_trailer_policy(&slot_only));
+
+    // The flag must outlive the chain-level finalizer's `take()`: trailer
+    // governance resolved after the route headers were applied still has to
+    // see that a route-level policy ran.
+    let mut published = make_ctx();
+    published.route_override_response_transform = Some(route_rules);
+    published.route_override_response_transform_published = true;
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    response_headers.insert("x-internal".to_string(), "secret".to_string());
+    let _ = consumer
+        .after_proxy(&mut published, 200, &mut response_headers)
+        .await;
+    finalize_route_override_response_headers(&mut published, &mut response_headers);
+    assert!(published.route_override_response_transform.is_none());
+    assert!(!response_headers.contains_key("x-internal"));
+    assert!(
+        consumer.request_applies_unbounded_response_trailer_policy(&published),
+        "the finalizer's take() must not stand the trailer policy down"
+    );
+}
+
+/// Any static rule makes the instance an operator-authored policy whose own
+/// governed set applies to every request, so it keeps the unconditional arm
+/// even with `apply_route_overrides` set.
+#[tokio::test]
+async fn test_transformer_with_static_rules_keeps_unconditional_trailer_policy() {
+    for config in [
+        json!({
+            "rules": [{"operation": "add", "target": "header", "key": "x-note", "value": "on"}],
+            "apply_route_overrides": true,
+        }),
+        json!({
+            "rules": [{"operation": "add", "target": "header", "key": "x-note", "value": "on"}],
+        }),
+        json!({
+            "rules": [{"operation": "update", "target": "body", "key": "a", "value": "b"}],
+            "apply_route_overrides": true,
+        }),
+    ] {
+        let plugin = ResponseTransformer::new(&config).unwrap();
+        assert!(
+            matches!(
+                plugin.response_trailer_policy(),
+                ferrum_edge::plugins::ResponseTrailerPolicy::Unbounded
+            ),
+            "{config}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_response_transformer_apply_route_overrides_invalid_type_rejected() {
     let err = ResponseTransformer::new(&json!({

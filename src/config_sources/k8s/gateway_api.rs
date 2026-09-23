@@ -5700,6 +5700,13 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
 /// backend responses by design, so reintroducing one from a route filter would
 /// punch a hole in the proxy boundary; the route is refused rather than
 /// silently dropping that one entry.
+///
+/// Response-side `set` / `add` / `remove` also refuse the gRPC terminal status
+/// fields ([`GRPC_TERMINAL_STATUS_FIELDS`]). In a Trailers-Only response —
+/// how a gRPC server reports most errors — those fields travel in the one
+/// HEADERS frame the transform edits, so a route filter could rewrite a failed
+/// RPC into `grpc-status: 0` or strip its status altogether. HTTPRoute is
+/// covered too, because an HTTPRoute can carry gRPC traffic.
 fn ensure_header_modifier_filter(
     object: &K8sObject,
     location: &str,
@@ -5750,6 +5757,9 @@ fn ensure_header_modifier_filter(
                     ),
                 ));
             }
+            if response_side {
+                ensure_not_grpc_terminal_status_field(object, &format!("{where_}.name"), name)?;
+            }
         }
     }
     let Some(remove) = modifier.get("remove") else {
@@ -5770,6 +5780,32 @@ fn ensure_header_modifier_filter(
             ));
         };
         ensure_valid_header_name(object, &where_, name)?;
+        if response_side {
+            ensure_not_grpc_terminal_status_field(object, &where_, name)?;
+        }
+    }
+    Ok(())
+}
+
+/// gRPC terminal status fields a response-side route filter may not touch.
+const GRPC_TERMINAL_STATUS_FIELDS: [&str; 3] =
+    ["grpc-status", "grpc-message", "grpc-status-details-bin"];
+
+fn ensure_not_grpc_terminal_status_field(
+    object: &K8sObject,
+    where_: &str,
+    name: &str,
+) -> Result<(), K8sTranslateError> {
+    if GRPC_TERMINAL_STATUS_FIELDS
+        .iter()
+        .any(|field| field.eq_ignore_ascii_case(name))
+    {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{where_} {UNSUPPORTED_SHAPE_MARKER}: gRPC terminal status fields are protocol-managed and cannot be modified by a route filter"
+            ),
+        ));
     }
     Ok(())
 }
@@ -5800,17 +5836,23 @@ const SINGLETON_ROUTE_FILTER_TYPES: [&str; 4] = [
 ///
 /// `hostname` is an upstream `PreciseHostname` (no wildcard, no port) and lands
 /// on the backend-facing `Host` / `:authority`; `path` carries exactly one of
-/// the two supported modifier shapes. `ReplacePrefixMatch` additionally needs a
-/// `PathPrefix` match to rebase against — upstream's CRD enforces that with a
-/// CEL rule, and Ferrum re-checks it because a file/CP-delivered object never
-/// passed through the API server's validation.
+/// the two supported modifier shapes, and only that shape's field. A
+/// `ReplacePrefixMatch` additionally needs a `PathPrefix` match to rebase
+/// against. Upstream's CRD enforces all of these with a `Pattern` or an
+/// `XValidation` rule; Ferrum re-checks them because a file/CP-delivered object
+/// never passed through the API server's validation.
 ///
-/// Both of those shapes are outside the pinned CRD's own bounds (a `Pattern`
-/// and an `XValidation` rule respectively), so they report `Invalid` rather
-/// than `UnsupportedValue`: the latter is reserved for CRD-valid input Ferrum
-/// declines to implement. An unknown `path.type` keeps `UnsupportedValue`, for
-/// the same forward-compatibility reason an unknown filter type does — a newer
-/// channel can add an enum member Ferrum has not implemented yet.
+/// Status reasons follow WHAT is wrong, never which CRD mechanism forbids it
+/// (see "Rule-filter admission" in `docs/gateway_api_conformance.md`):
+///
+/// * a bad VALUE inside this one filter — a malformed hostname or path, a
+///   missing required field, a modifier field the selected `type` does not
+///   use, `ReplacePrefixMatch` under a non-prefix match — is `Invalid`;
+/// * a CRD-valid value Ferrum declines — an unknown `path.type` a newer channel
+///   may add — is `UnsupportedValue`;
+/// * a filter FIELD Ferrum does not implement (an unknown key inside `path`) is
+///   `IncompatibleFilters`, like every other unimplemented filter field or type
+///   and every conflict between filters of one rule.
 fn ensure_url_rewrite_filter(
     object: &K8sObject,
     rule: &serde_json::Map<String, Value>,
@@ -5858,7 +5900,26 @@ fn ensure_url_rewrite_filter(
             ),
         ));
     }
-    match path.get("type").and_then(Value::as_str) {
+    let path_type = path.get("type").and_then(Value::as_str);
+    // Upstream's CEL rules tie each modifier field to its own `type`. A stray
+    // field for the OTHER type would otherwise be silently dropped, so the
+    // operator's second replacement would never take effect.
+    let stray_field = match path_type {
+        Some("ReplaceFullPath") => Some("replacePrefixMatch"),
+        Some("ReplacePrefixMatch") => Some("replaceFullPath"),
+        _ => None,
+    };
+    if let (Some(path_type), Some(stray_field)) = (path_type, stray_field)
+        && path.contains_key(stray_field)
+    {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{location}.urlRewrite.path.{stray_field} must not be set for type {path_type}"
+            ),
+        ));
+    }
+    match path_type {
         Some("ReplaceFullPath") => {
             let Some(replacement) = path.get("replaceFullPath").and_then(Value::as_str) else {
                 return Err(invalid_resource(
@@ -6091,6 +6152,27 @@ fn http_route_resources(
                 &backend_resolution.backends,
                 acc,
             )?;
+            // Upstream `HTTPRouteRule.backendRefs`: with no backend to forward
+            // to and no filter that answers the request itself
+            // (`RequestRedirect`), every matching request MUST receive a 500.
+            // Header modifiers and `URLRewrite` shape a forwarded request or
+            // its response; alone they would otherwise send traffic to the
+            // unresolvable blackhole backend. GRPCRoute keeps the blackhole,
+            // exactly as its all-zero-weight rule does.
+            if object.kind == "HTTPRoute"
+                && backend_resolution.backends.is_empty()
+                && backend_resolution.fault_reason.is_none()
+                && redirect.is_none()
+                && (!request_transform.is_empty()
+                    || !response_transform.is_empty()
+                    || rewrite.is_some())
+            {
+                backend_resolution.fault_reason = Some(BackendRefFaultReason::NoServiceableBackend);
+                acc.warnings.push(
+                    "HTTPRoute rule forwards to no backendRefs; materializing HTTP 500 fail-closed route action"
+                        .to_string(),
+                );
+            }
             let backend_ref_fault = backend_resolution.fault_reason.map(|reason| {
                 backend_ref_fault_value_with_percentage(
                     reason,
@@ -7234,8 +7316,18 @@ fn gateway_redirect_value_for_match(redirect: &Value, match_entry: &Value) -> Va
     value
 }
 
+/// The `PathPrefix` a match entry selects on, as `ReplacePrefixMatch` rebases
+/// it, or `None` for a non-prefix path match.
+///
+/// Upstream defaults an omitted `path` to `PathPrefix: /`, and an omitted
+/// `path.value` to `/`. A file/CP-delivered object never passed through the API
+/// server's defaulting, so an absent or null `path` and a value-less
+/// `PathPrefix` are that same omission — and routing
+/// (`route_match_descriptor_for_entry`) already places such an entry on `/`.
+/// Resolving the rewrite/redirect prefix any other way would rebase a request
+/// routing matched as the root prefix as if it were a whole-path replacement.
 fn gateway_match_path_prefix(match_entry: &Value) -> Option<&str> {
-    let Some(path) = match_entry.get("path") else {
+    let Some(path) = match_entry.get("path").filter(|path| !path.is_null()) else {
         return Some("/");
     };
     let path = path.as_object()?;
@@ -7247,7 +7339,7 @@ fn gateway_match_path_prefix(match_entry: &Value) -> Option<&str> {
     {
         return None;
     }
-    path.get("value").and_then(Value::as_str)
+    Some(path.get("value").and_then(Value::as_str).unwrap_or("/"))
 }
 
 fn backend_ref_fault_value_with_percentage(
@@ -12097,6 +12189,50 @@ mod tests {
     }
 
     #[test]
+    fn replace_prefix_match_defaults_an_omitted_path_value_to_root() {
+        // Upstream defaults `path.value` (and a missing `path`) to
+        // `PathPrefix: /`, and routing places these entries on `/`. A
+        // file/CP-delivered object never saw API-server defaulting, so the
+        // rewrite and redirect prefix must resolve the same way: the root
+        // prefix strips nothing and prepends (`/bar` -> `/xyz/bar`), rather
+        // than replacing the whole path.
+        for matches in [
+            serde_json::json!([{"path": {"type": "PathPrefix"}, "method": "GET"}]),
+            serde_json::json!([{"path": null, "method": "GET"}]),
+        ] {
+            let rewrite = translate_route_plugins(
+                "HTTPRoute",
+                url_rewrite_rule(
+                    matches.clone(),
+                    serde_json::json!({
+                        "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/xyz"}
+                    }),
+                ),
+            );
+            assert_eq!(
+                dispatch_rules(&rewrite)[0]["rewrite"]["match_prefix"],
+                "",
+                "rewrite under {matches}"
+            );
+
+            let redirect = translate_route_plugins(
+                "HTTPRoute",
+                serde_json::json!([{
+                    "matches": matches.clone(),
+                    "filters": [{"type": "RequestRedirect", "requestRedirect": {
+                        "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/xyz"}
+                    }}]
+                }]),
+            );
+            assert_eq!(
+                dispatch_rules(&redirect)[0]["redirect"]["match_prefix"],
+                "",
+                "redirect under {matches}"
+            );
+        }
+    }
+
+    #[test]
     fn http_route_url_rewrite_empty_replace_prefix_normalizes_to_root() {
         // Upstream's table maps an empty replacement to a bare `/`
         // (`/api` + prefix `/api` + "" -> `/`).
@@ -12256,8 +12392,9 @@ mod tests {
                 }),
             ),
         );
-        // Upstream's CRD forbids this shape with an `XValidation` rule, so it is
-        // `Invalid`, not a CRD-valid `UnsupportedValue`.
+        // A bad value inside this one filter (it has no prefix to rebase) is
+        // `Invalid`, not a CRD-valid `UnsupportedValue` or a filter-set
+        // `IncompatibleFilters`.
         assert!(
             !message.contains(UNSUPPORTED_SHAPE_MARKER)
                 && !message.contains(INCOMPATIBLE_FILTERS_MARKER)
@@ -12268,10 +12405,10 @@ mod tests {
 
     #[test]
     fn http_route_url_rewrite_rejects_unsupported_shapes() {
-        // Status reason each shape must map to (see `status.rs`): CRD-invalid
-        // input is `Invalid` (no marker); an unknown enum member upstream may
-        // add later is `UnsupportedValue`; unhandled fields are
-        // `IncompatibleFilters`, checked before the type is interpreted.
+        // Status reason each shape must map to (see `status.rs`): a bad value
+        // inside this filter is `Invalid` (no marker); an unknown enum member
+        // upstream may add later is `UnsupportedValue`; an unimplemented field
+        // is `IncompatibleFilters`, checked before the type is interpreted.
         const INVALID: &str = "Invalid";
         const UNSUPPORTED: &str = "UnsupportedValue";
         const INCOMPATIBLE: &str = "IncompatibleFilters";
@@ -12305,6 +12442,24 @@ mod tests {
                 serde_json::json!({
                     "path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2/../etc"}
                 }),
+                INVALID,
+            ),
+            // A modifier field the selected type does not use would be
+            // silently dropped.
+            (
+                serde_json::json!({"path": {
+                    "type": "ReplaceFullPath",
+                    "replaceFullPath": "/a",
+                    "replacePrefixMatch": "/b"
+                }}),
+                INVALID,
+            ),
+            (
+                serde_json::json!({"path": {
+                    "type": "ReplacePrefixMatch",
+                    "replacePrefixMatch": "/a",
+                    "replaceFullPath": "/b"
+                }}),
                 INVALID,
             ),
         ];
@@ -12345,6 +12500,104 @@ mod tests {
                 "{name}: {message}"
             );
         }
+    }
+
+    #[test]
+    fn http_route_filter_only_rule_without_backend_refs_answers_500() {
+        // Upstream `HTTPRouteRule.backendRefs`: no backend and no filter that
+        // answers the request itself means every matching request gets a 500.
+        // A header modifier or rewrite alone must not forward to the blackhole.
+        for filter in [
+            serde_json::json!({"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                "set": [{"name": "x-set", "value": "one"}]
+            }}),
+            serde_json::json!({"type": "RequestHeaderModifier", "requestHeaderModifier": {
+                "set": [{"name": "x-set", "value": "one"}]
+            }}),
+            serde_json::json!({"type": "URLRewrite", "urlRewrite": {
+                "path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2"}
+            }}),
+        ] {
+            let plugins = translate_route_plugins(
+                "HTTPRoute",
+                serde_json::json!([{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "filters": [filter.clone()]
+                }]),
+            );
+            let abort = &dispatch_rules(&plugins)[0]["fault"]["abort"];
+            assert_eq!(abort["status_code"], 500, "{filter}");
+            assert_eq!(abort["percentage"], 100.0, "{filter}");
+            assert!(
+                abort["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("no serviceable backendRefs")),
+                "{filter}: {abort}"
+            );
+        }
+    }
+
+    #[test]
+    fn backendless_redirect_and_grpc_rules_carry_no_fault() {
+        // A redirect answers the request itself, so it needs no backend.
+        let redirect = translate_route_plugins(
+            "HTTPRoute",
+            serde_json::json!([{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                "filters": [{"type": "RequestRedirect", "requestRedirect": {"statusCode": 301}}]
+            }]),
+        );
+        assert!(dispatch_rules(&redirect)[0].get("fault").is_none());
+
+        // GRPCRoute keeps the blackhole backend, exactly as its all-zero-weight
+        // rule does.
+        let grpc = translate_route_plugins(
+            "GRPCRoute",
+            serde_json::json!([{
+                "filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                    "set": [{"name": "x-set", "value": "one"}]
+                }}]
+            }]),
+        );
+        assert!(dispatch_rules(&grpc)[0].get("fault").is_none());
+    }
+
+    #[test]
+    fn response_header_modifier_rejects_grpc_terminal_status_fields() {
+        // A Trailers-Only gRPC error carries its status in the HEADERS frame the
+        // response transform edits, so these names could turn a failed RPC
+        // into a success. Refused on both kinds, for every verb and casing.
+        for kind in ["GRPCRoute", "HTTPRoute"] {
+            for name in ["grpc-status", "Grpc-Message", "GRPC-STATUS-DETAILS-BIN"] {
+                for modifier in [
+                    serde_json::json!({"set": [{"name": name, "value": "0"}]}),
+                    serde_json::json!({"add": [{"name": name, "value": "0"}]}),
+                    serde_json::json!({"remove": [name]}),
+                ] {
+                    let message = translate_route_error(
+                        kind,
+                        response_header_modifier_rule(modifier.clone()),
+                    );
+                    assert!(
+                        message.contains(UNSUPPORTED_SHAPE_MARKER)
+                            && message.contains("gRPC terminal status"),
+                        "{kind} {modifier}: {message}"
+                    );
+                }
+            }
+        }
+
+        // The request side is untouched: a request header of that name reaches
+        // no client-visible status.
+        translate_route_plugins(
+            "GRPCRoute",
+            serde_json::json!([{
+                "backendRefs": [{"name": "api", "port": 8080}],
+                "filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {
+                    "remove": ["grpc-status"]
+                }}]
+            }]),
+        );
     }
 
     #[test]

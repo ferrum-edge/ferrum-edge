@@ -624,6 +624,14 @@ them against the response-header policy actually in force for the request:
   | --- | --- |
   | `response_transformer` | `after_proxy` also applies `mesh_route_dispatch` route overrides whose field names do not exist until the request runs |
 
+  The rules-free `response_transformer` route-override consumer
+  (`apply_route_overrides: true`, no static rules) and an enforcing `waf`
+  declare `ResponseTrailerPolicy::RequestConditionalUnbounded` instead: the same
+  drop, resolved per request against the finalized request context. The
+  consumer governs only requests whose matched dispatch rule published a
+  response route override; `waf` governs every request its `global_exemptions`
+  do not exempt.
+
   `ai_stream_router` does not need this arm: Anthropic SSE normalization
   declares the shared finite representation-metadata inventory plus the
   `x-amz-checksum-*` / `x-checksum-*` prefixes through

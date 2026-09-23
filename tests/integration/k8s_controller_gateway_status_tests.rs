@@ -2638,6 +2638,14 @@ fn unsupported_http_and_grpc_route_features_are_refused_before_materialization()
             }}]}),
             "UnsupportedValue",
         ),
+        // A Trailers-Only gRPC error carries its status in the response
+        // headers, so a route filter may not rewrite or strip it.
+        (
+            json!({"filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                "remove": ["grpc-status"]
+            }}]}),
+            "UnsupportedValue",
+        ),
         (
             json!({"filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "mirror", "port": 8080}}}]}),
             "IncompatibleFilters",
@@ -3090,6 +3098,10 @@ async fn gateway_response_header_modifier_reaches_the_client_through_the_data_pl
             value: "leaked".into(),
         })
         .step(HttpStep::RespondHeader {
+            name: "x-appended".into(),
+            value: "origin".into(),
+        })
+        .step(HttpStep::RespondHeader {
             name: "Content-Length".into(),
             value: "4".into(),
         })
@@ -3113,13 +3125,24 @@ async fn gateway_response_header_modifier_reaches_the_client_through_the_data_pl
                     "backendRefs": [{"name": "api", "port": 8080}],
                     "filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
                         "set": [{"name": "x-set", "value": "route"}],
-                        "add": [{"name": "x-added", "value": "route"}],
+                        "add": [
+                            {"name": "x-added", "value": "route"},
+                            {"name": "x-appended", "value": "route"}
+                        ],
                         "remove": ["x-remove"]
                     }}]
                 },
                 {
                     "matches": [{"path": {"type": "PathPrefix", "value": "/plain"}}],
                     "backendRefs": [{"name": "api", "port": 8080}]
+                },
+                // No backendRefs and no RequestRedirect: upstream requires a
+                // 500, not a forward to an unresolvable backend.
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/nobackend"}}],
+                    "filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                        "set": [{"name": "x-set", "value": "route"}]
+                    }}]
                 }
             ]
         }),
@@ -3148,6 +3171,11 @@ async fn gateway_response_header_modifier_reaches_the_client_through_the_data_pl
     let headers = modified.headers().clone();
     assert_eq!(headers.get("x-set").unwrap(), "route", "set must overwrite");
     assert_eq!(headers.get("x-added").unwrap(), "route", "add must apply");
+    assert_eq!(
+        headers.get("x-appended").unwrap(),
+        "origin,route",
+        "add must append to a header the backend already sent, not replace it"
+    );
     assert!(headers.get("x-remove").is_none(), "remove must apply");
     assert_eq!(
         headers.get("x-global").unwrap(),
@@ -3172,11 +3200,28 @@ async fn gateway_response_header_modifier_reaches_the_client_through_the_data_pl
         "the sibling rule must not inherit the route filter"
     );
     assert!(headers.get("x-added").is_none());
+    assert_eq!(headers.get("x-appended").unwrap(), "origin");
     assert_eq!(headers.get("x-remove").unwrap(), "leaked");
     assert_eq!(headers.get("x-global").unwrap(), "on");
 
+    let backendless = client
+        .get(harness.proxy_url("/nobackend/thing"))
+        .header("host", "headers.test")
+        .send()
+        .await
+        .expect("backendless rule response");
+    assert_eq!(
+        backendless.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "a filter-only rule with no backendRefs must answer 500"
+    );
+
     backend.assert_no_matcher_mismatches().await;
-    assert_eq!(backend.received_requests().await.len(), 2);
+    assert_eq!(
+        backend.received_requests().await.len(),
+        2,
+        "the backendless rule must never reach a backend"
+    );
 }
 
 /// `URLRewrite` must change what the BACKEND observes — path, preserved query
@@ -3283,13 +3328,15 @@ async fn gateway_url_rewrite_reaches_the_backend_through_the_data_plane() {
 /// metadata over a real gRPC call, preserving the message and the terminal
 /// `grpc-status`.
 ///
-/// It also pins the cost operators must know about: a response-header policy on
-/// a proxy publishes an unbounded response-TRAILER policy (a route override can
-/// name any field at request time), so that proxy's non-reserved backend
-/// trailers are governed away. The filter does not modify trailers — it
+/// It also pins the cost operators must know about: a rule-level response-header
+/// policy governs the response TRAILERS of the requests it applies to (a route
+/// override can name any field at request time), so that rule's non-reserved
+/// backend trailers are governed away. The filter does not modify trailers — it
 /// suppresses them. The sibling rule on the same route, which declares no
 /// filter, keeps its application trailers, which is what proves the drop comes
-/// from attaching the policy rather than from gRPC translation.
+/// from attaching the policy rather than from gRPC translation. The merged-proxy
+/// variant of that guarantee is
+/// `merged_grpc_route_sibling_without_response_header_modifier_keeps_trailers`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grpc_route_response_header_modifier_reaches_the_client_and_preserves_status() {
     use crate::scaffolding::backends::grpc::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
@@ -3382,7 +3429,7 @@ async fn grpc_route_response_header_modifier_reaches_the_client_and_preserves_st
     let trailers = filtered.trailers.as_ref().expect("terminal trailers");
     assert!(
         trailers.get("x-trailer").is_none(),
-        "a response-header policy governs this proxy's non-reserved trailers away: {trailers:?}"
+        "a response-header policy governs this rule's non-reserved trailers away: {trailers:?}"
     );
 
     let plain = client
@@ -3484,4 +3531,229 @@ fn removing_a_rule_filter_withdraws_its_generated_resources() {
             assert!(rule.get("response_transform").is_none(), "{config}");
         }
     }
+}
+
+/// Drive one filtered and one unfiltered gRPC call through translated routes
+/// that MERGE onto a single proxy, and prove the response-trailer cost of
+/// `ResponseHeaderModifier` stays on the rule that declared it.
+///
+/// Same-kind routes sharing a host, listener and path collapse into one proxy,
+/// one `mesh_route_dispatch`, and one rules-free `response_transformer`
+/// consumer. The consumer's unbounded trailer policy is request-conditional:
+/// it applies only when the matched dispatch rule published a response
+/// transform. The filtered call is selected by the `x-variant: filtered`
+/// request header; the plain call matches the sibling that declared no filter.
+async fn assert_merged_sibling_keeps_trailers(
+    filtered_route: ferrum_edge::config_sources::k8s::K8sObject,
+    plain_route: ferrum_edge::config_sources::k8s::K8sObject,
+    call_path: &str,
+) {
+    use crate::scaffolding::backends::grpc::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+    use crate::scaffolding::clients::grpc::GrpcClient;
+    use crate::scaffolding::ports::reserve_port;
+    use bytes::Bytes;
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+
+    let rpc_script = || {
+        vec![
+            GrpcStep::AcceptRpc(MatchRpc::any()),
+            GrpcStep::SendInitialHeadersOverride(vec![
+                ("content-type", "application/grpc".to_string()),
+                ("x-set", "origin".to_string()),
+            ]),
+            GrpcStep::RespondMessage(Bytes::from_static(b"pong")),
+            GrpcStep::RespondStatusWithTrailers {
+                code: 0,
+                message: "",
+                trailers: vec![("x-trailer", "kept".to_string())],
+            },
+        ]
+    };
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .steps(rpc_script())
+        .steps(rpc_script())
+        .spawn()
+        .expect("spawn grpc backend");
+
+    let kind = filtered_route.kind.clone();
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(filtered_route);
+    objects.push(plain_route);
+
+    // Premise: both routes really did merge onto ONE proxy that carries ONE
+    // consumer, and only the filtered rule publishes a response transform.
+    // Without this, two separate proxies would pass the traffic assertions
+    // below vacuously.
+    let (translation, skipped) = translate_k8s_objects_collecting_skips(
+        &objects,
+        options().with_pod_discovery_enabled(true),
+    )
+    .expect("translate merged routes");
+    assert!(skipped.is_empty(), "{kind}: {skipped:?}");
+    assert_eq!(
+        translation.config.proxies.len(),
+        1,
+        "{kind}: the two routes must merge onto one proxy: {:?}",
+        translation.config.proxies
+    );
+    let consumers: Vec<_> = translation
+        .config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "response_transformer")
+        .collect();
+    assert_eq!(consumers.len(), 1, "{kind}: one shared consumer");
+    assert_eq!(
+        consumers[0].proxy_id.as_deref(),
+        Some(translation.config.proxies[0].id.as_str())
+    );
+    let dispatch = translation
+        .config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .expect("merged dispatch plugin");
+    let transformed_rules = dispatch.config["rules"]
+        .as_array()
+        .expect("dispatch rules")
+        .iter()
+        .filter(|rule| rule.get("response_transform").is_some())
+        .count();
+    assert_eq!(transformed_rules, 1, "{kind}: {}", dispatch.config);
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let target = harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .to_string();
+    let client = GrpcClient::h2c(target);
+
+    let filtered = client
+        .unary_with_headers(
+            call_path,
+            Bytes::from_static(b"ping"),
+            &[("x-variant", "filtered".to_string())],
+        )
+        .await
+        .expect("filtered grpc call");
+    assert_eq!(filtered.http_status, 200, "{kind}");
+    assert_eq!(
+        filtered.headers.get("x-set").unwrap(),
+        "route",
+        "{kind}: the header-gated rule's filter must apply"
+    );
+    assert_eq!(filtered.grpc_status(), Some(0), "{kind}");
+    assert_eq!(filtered.messages, vec![Bytes::from_static(b"pong")]);
+    assert!(
+        filtered
+            .trailers
+            .as_ref()
+            .expect("terminal trailers")
+            .get("x-trailer")
+            .is_none(),
+        "{kind}: the rule that declared the filter pays the trailer cost"
+    );
+
+    let plain = client
+        .unary(call_path, Bytes::from_static(b"ping"))
+        .await
+        .expect("sibling grpc call");
+    assert_eq!(plain.http_status, 200, "{kind}");
+    assert_eq!(
+        plain.headers.get("x-set").unwrap(),
+        "origin",
+        "{kind}: the merged sibling must not inherit the filter"
+    );
+    assert_eq!(plain.grpc_status(), Some(0), "{kind}");
+    assert_eq!(plain.messages, vec![Bytes::from_static(b"pong")]);
+    assert_eq!(
+        plain
+            .trailers
+            .as_ref()
+            .and_then(|trailers| trailers.get("x-trailer")),
+        Some(&"kept".parse().unwrap()),
+        "{kind}: a merged sibling rule without the filter keeps its application trailers"
+    );
+
+    assert_eq!(backend.received_stream_count(), 2);
+    assert_eq!(backend.matcher_mismatches(), 0);
+}
+
+fn x_set_response_header_filter() -> serde_json::Value {
+    json!([{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+        "set": [{"name": "x-set", "value": "route"}]
+    }}])
+}
+
+/// Two GRPCRoutes — possibly owned by different teams — on one listener with no
+/// hostnames: a header-only match and a match-less rule both materialize on
+/// `/`, so they merge onto one proxy. Only the header-gated rule declares a
+/// `ResponseHeaderModifier`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merged_grpc_route_sibling_without_response_header_modifier_keeps_trailers() {
+    let filtered = object(
+        "gateway.networking.k8s.io/v1",
+        "GRPCRoute",
+        "team-a",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{
+                "matches": [{"headers": [{"name": "x-variant", "value": "filtered"}]}],
+                "backendRefs": [{"name": "api", "port": 8080}],
+                "filters": x_set_response_header_filter()
+            }]
+        }),
+    );
+    let plain = object(
+        "gateway.networking.k8s.io/v1",
+        "GRPCRoute",
+        "team-b",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+        }),
+    );
+    assert_merged_sibling_keeps_trailers(filtered, plain, "/echo.Echo/Ping").await;
+}
+
+/// The HTTPRoute shape of the same merge: two routes on one shared `PathPrefix`,
+/// one of them header-gated with the filter. gRPC calls carry the traffic
+/// because they are the HTTP flavor whose application trailers reach a client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merged_http_route_sibling_without_response_header_modifier_keeps_trailers() {
+    let filtered = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "team-a",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{
+                "matches": [{
+                    "path": {"type": "PathPrefix", "value": "/echo.Echo"},
+                    "headers": [{"name": "x-variant", "value": "filtered"}]
+                }],
+                "backendRefs": [{"name": "api", "port": 8080}],
+                "filters": x_set_response_header_filter()
+            }]
+        }),
+    );
+    let plain = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "team-b",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/echo.Echo"}}],
+                "backendRefs": [{"name": "api", "port": 8080}]
+            }]
+        }),
+    );
+    assert_merged_sibling_keeps_trailers(filtered, plain, "/echo.Echo/Ping").await;
 }

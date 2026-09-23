@@ -27070,7 +27070,14 @@ components:
             chain-level route-header finalization phase. Auto-emitted by the
             Istio VirtualService translator on routes carrying
             `headers.response.{set,add,remove}` that have no operator-configured
-            `response_transformer`. Explicit `null` is accepted and treated as
+            `response_transformer`, and by the Gateway API translator on rules
+            carrying `ResponseHeaderModifier`. With no
+            static `rules`, the instance's fail-closed response-trailer policy
+            applies only to requests whose matched `mesh_route_dispatch` rule
+            published a `response_transform`, so other requests on the same
+            proxy keep their backend trailers; any static rule makes that policy
+            apply to every response. Such a rules-free instance cannot carry a
+            per-instance `trigger`. Explicit `null` is accepted and treated as
             `false`.
         runtime_overlay_scope:
           type: [string, "null"]

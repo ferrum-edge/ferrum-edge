@@ -3220,6 +3220,17 @@ pub struct RequestContext {
     /// every eligible `response_transformer` has run its static header rules.
     pub route_override_response_transform:
         Option<Arc<Vec<utils::route_header_transform::RouteHeaderTransformRule>>>,
+    /// Whether the matched `mesh_route_dispatch` rule published a
+    /// `route_override_response_transform` for this request.
+    ///
+    /// Unlike the override slot itself, this survives
+    /// `finalize_route_override_response_headers`' `take()`, so response-trailer
+    /// governance resolved at any point of the response can still tell that a
+    /// route-level response-header policy applied. The rules-free
+    /// `response_transformer` consumer keys its request-conditional unbounded
+    /// trailer policy on it. Set and cleared together with the override slot
+    /// by every matching dispatch instance.
+    pub route_override_response_transform_published: bool,
     /// Plugin-set override for the request path forwarded to the backend.
     /// Set by `mesh_route_dispatch` when a matching rule carries an Istio
     /// `VirtualService.http[].rewrite.uri`. The proxy dispatch path rebases the
@@ -3873,6 +3884,7 @@ impl RequestContext {
             route_override_retry: None,
             route_override_request_transform: None,
             route_override_response_transform: None,
+            route_override_response_transform_published: false,
             route_override_path: None,
             authorized_backend_path: None,
             route_override_path_is_absolute: false,
@@ -5257,6 +5269,8 @@ impl RequestContext {
             route_override_retry: self.route_override_retry.clone(),
             route_override_request_transform: self.route_override_request_transform.clone(),
             route_override_response_transform: self.route_override_response_transform.clone(),
+            route_override_response_transform_published: self
+                .route_override_response_transform_published,
             route_override_path: self.route_override_path.clone(),
             authorized_backend_path: self.authorized_backend_path.clone(),
             route_override_path_is_absolute: self.route_override_path_is_absolute,

@@ -2126,6 +2126,8 @@ impl Plugin for MeshRouteDispatch {
                     rule.request_transform_compiled.as_ref().map(Arc::clone);
                 ctx.route_override_response_transform =
                     rule.response_transform_compiled.as_ref().map(Arc::clone);
+                ctx.route_override_response_transform_published =
+                    ctx.route_override_response_transform.is_some();
                 // Per-rule rewrite (Istio `http[].rewrite`): rebase the path /
                 // authority forwarded to the backend. A non-matching later
                 // instance must not stomp this, so — like the destination
@@ -3371,6 +3373,10 @@ mod tests {
             .expect("request_transform must be published on match");
         assert_eq!(arc.len(), 3);
         assert!(ctx.route_override_response_transform.is_none());
+        assert!(
+            !ctx.route_override_response_transform_published,
+            "a request-only rule must not arm response-trailer governance"
+        );
     }
 
     #[tokio::test]
@@ -3389,6 +3395,7 @@ mod tests {
         let mut headers = HashMap::new();
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert!(ctx.route_override_request_transform.is_none());
+        assert!(ctx.route_override_response_transform_published);
         let arc = ctx
             .route_override_response_transform
             .expect("response_transform must be published on match");
@@ -5825,21 +5832,26 @@ mod tests {
     #[test]
     fn rewrite_request_path_reproduces_gateway_api_replace_prefix_table() {
         // github.com/kubernetes-sigs/gateway-api v1.5.1 `HTTPPathModifier`
-        // `ReplacePrefixMatch` documentation table. The translator trims a
-        // trailing separator from the matched prefix and maps an empty
-        // replacement to `/`, so both prefix spellings land on one row here.
+        // `ReplacePrefixMatch` documentation table, in upstream's own prefix
+        // spelling. The Gateway API translator trims a trailing separator from
+        // the matched prefix before it becomes `match_prefix`
+        // (`gateway_prefix_rewrite_match_prefix`) and maps an empty
+        // replacement to `/`; `canonical` below mirrors that trim so the
+        // `/foo/` rows exercise the same composed behavior.
         for (path, prefix, replacement, expected) in [
             ("/foo/bar", "/foo", "/xyz", "/xyz/bar"),
             ("/foo/bar", "/foo", "/xyz/", "/xyz/bar"),
-            ("/foo/bar", "/foo", "/xyz", "/xyz/bar"),
+            ("/foo/bar", "/foo/", "/xyz", "/xyz/bar"),
+            ("/foo/bar", "/foo/", "/xyz/", "/xyz/bar"),
             ("/foo", "/foo", "/xyz", "/xyz"),
             ("/foo/", "/foo", "/xyz", "/xyz/"),
             ("/foo/bar", "/foo", "/", "/bar"),
             ("/foo/", "/foo", "/", "/"),
             ("/foo", "/foo", "/", "/"),
         ] {
+            let canonical = prefix.strip_suffix('/').unwrap_or(prefix);
             assert_eq!(
-                rewrite_request_path(path, replacement, Some(prefix)),
+                rewrite_request_path(path, replacement, Some(canonical)),
                 expected,
                 "{path} + prefix {prefix} + replacement {replacement}"
             );

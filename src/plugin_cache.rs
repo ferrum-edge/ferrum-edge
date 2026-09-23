@@ -835,6 +835,12 @@ pub(crate) fn validate_plugin_security_composition(
 ///   that do not call back into the instance with a request context. The
 ///   request-conditional unbounded variant is safe because its predicate is
 ///   evaluated through the wrapped plugin for each request.
+/// * **Response route-header finalizers.** Proxy core picks the last
+///   `participates_in_route_response_header_finalization()` instance and
+///   applies the matched route override there without consulting the trigger.
+///   A trigger-skipped rules-free `response_transformer` would then still see
+///   the override applied while its request-conditional trailer policy
+///   answered "not governed", forwarding a trailer a route `remove` targets.
 /// * **An identity-reading trigger on an authentication plugin.** `authenticate`
 ///   is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so
 ///   such a trigger could only ever read another mechanism's committed identity,
@@ -886,6 +892,11 @@ fn trigger_composition_error(
     ) {
         return Some(
             "the plugin publishes contextless response-trailer ownership into the per-generation policy; use a plugin whose trailer policy is absent or request-conditional",
+        );
+    }
+    if plugin.participates_in_route_response_header_finalization() {
+        return Some(
+            "the plugin is a response route-header finalizer, which proxy core selects without a request context; a skipped instance would still apply the route override while its request-conditional trailer policy stood down",
         );
     }
     if gate.reads_authenticated_identity() && plugin.is_auth_plugin() {
@@ -4764,7 +4775,10 @@ pub struct PluginPhaseData {
     /// `ai_stream_router` declares its bounded representation-metadata names
     /// plus the open-ended checksum prefixes; `response_transformer` declares
     /// `Unbounded` because route-override transforms are published at request
-    /// time; `waf` declares `RequestConditionalUnbounded` because an enforcing
+    /// time (its rules-free route-override consumer declares
+    /// `RequestConditionalUnbounded`, governing only requests whose matched
+    /// dispatch rule published one); `waf` declares
+    /// `RequestConditionalUnbounded` because an enforcing
     /// response-header configuration governs every field name it cannot inspect,
     /// but only for requests its `global_exemptions` do not exempt.
     pub response_trailer_policy_names: Arc<Vec<String>>,
