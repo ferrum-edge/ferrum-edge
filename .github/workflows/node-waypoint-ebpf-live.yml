@@ -217,7 +217,7 @@ jobs:
         run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Record registry cache policy
         if: github.event.inputs.force_cold_cache != 'true'
@@ -240,7 +240,7 @@ jobs:
 
       - name: Build ordinary production runtime with registry cache
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
@@ -254,7 +254,7 @@ jobs:
 
       - name: Build ordinary production runtime (cold cache)
         if: github.event.inputs.force_cold_cache == 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
@@ -337,7 +337,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Record registry cache policy
         if: github.event.inputs.force_cold_cache != 'true'
@@ -360,7 +360,7 @@ jobs:
 
       - name: Build ordinary production runtime with registry cache
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
@@ -375,7 +375,7 @@ jobs:
 
       - name: Build ordinary production runtime (cold cache)
         if: github.event.inputs.force_cold_cache == 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
@@ -447,7 +447,7 @@ jobs:
         run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       # Ambient's trusted main writer exports this identical Dockerfile target.
       # Every NodeWaypoint event is an anonymous reader; there is no cache export.
@@ -470,7 +470,7 @@ jobs:
 
       - name: Build eBPF production runtime (anonymous registry reader)
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
@@ -485,7 +485,7 @@ jobs:
 
       - name: Build eBPF production runtime (cold cache)
         if: github.event.inputs.force_cold_cache == 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile

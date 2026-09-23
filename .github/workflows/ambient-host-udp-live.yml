@@ -327,7 +327,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       # Registry cache leaves the Actions cache allowance for compiler data.
       # Each target has its own cache graph. Missing cache still builds cold.
@@ -337,7 +337,7 @@ jobs:
       # the full target is smoked below; running it first surfaces a broken tool
       # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
       - name: Build the capture tool base stage
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
@@ -349,7 +349,7 @@ jobs:
 
       # The exact target the mesh chart's `-ebpf-tools` tag publishes.
       - name: Build the production Ambient UDP lifecycle runtime
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
@@ -395,7 +395,7 @@ jobs:
       # distroless. Proving the tools image alone would let a later change
       # "fix" this finding by quietly adding a shell to `-ebpf` instead.
       - name: Build the distroless eBPF runtime
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
@@ -459,7 +459,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       # Registry cache leaves the Actions cache allowance for compiler data.
       # Each target has its own cache graph. Missing cache still builds cold.
@@ -469,7 +469,7 @@ jobs:
       # the full target is smoked below; running it first surfaces a broken tool
       # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
       - name: Build the capture tool base stage
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
@@ -482,7 +482,7 @@ jobs:
 
       # The exact target the mesh chart's `-ebpf-tools` tag publishes.
       - name: Build the production Ambient UDP lifecycle runtime
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
@@ -529,7 +529,7 @@ jobs:
       # distroless. Proving the tools image alone would let a later change
       # "fix" this finding by quietly adding a shell to `-ebpf` instead.
       - name: Build the distroless eBPF runtime
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile

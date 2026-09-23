@@ -840,7 +840,7 @@ jobs:
           shared-key: "ci-debug"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-nextest
 
@@ -899,7 +899,7 @@ jobs:
           shared-key: "ci-debug"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-nextest
 
@@ -1037,7 +1037,7 @@ jobs:
           shared-key: "ci-debug"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-nextest
 
@@ -1305,7 +1305,7 @@ jobs:
         # Same prebuilt-binary install action as `test-functional`. Nextest
         # gives us per-test process isolation, OR'd substring filters via
         # positional args, and a much nicer progress UI than libtest.
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-nextest
 
@@ -1427,7 +1427,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           # Pinned to the version the deny.toml schema was validated against, so
           # a future cargo-deny release can't silently change gate behavior.
@@ -1507,7 +1507,7 @@ jobs:
           shared-key: "ci-vendor-patches"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-nextest
 
@@ -1758,7 +1758,7 @@ jobs:
         # Nextest's process-per-test model isolates port/process contention
         # and ships built-in slow-test + retry support, which fits this E2E
         # suite better than libtest's shared-process scheduler.
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-nextest
 
@@ -2323,7 +2323,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-nextest
 
