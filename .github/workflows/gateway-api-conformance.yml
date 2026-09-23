@@ -138,9 +138,13 @@ jobs:
     env:
       KIND_CLUSTER_NAME: ferrum-gwapi
       GATEWAY_API_LAB_CONTEXT: kind-ferrum-gwapi
-      GATEWAY_API_LAB_OWNERSHIP_FILE: ${{ runner.temp }}/gateway-api-gatewayclass-ownership.tsv
 
     steps:
+      # `runner.temp` is not available to job-level `env`, so the lab's
+      # ownership record path is exported from the first step instead.
+      - name: Select the GatewayClass ownership record path
+        run: echo "GATEWAY_API_LAB_OWNERSHIP_FILE=$RUNNER_TEMP/gateway-api-gatewayclass-ownership.tsv" >> "$GITHUB_ENV"
+
       - name: Checkout Ferrum Edge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
