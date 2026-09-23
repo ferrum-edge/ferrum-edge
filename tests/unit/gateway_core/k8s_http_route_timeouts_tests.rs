@@ -125,7 +125,7 @@ fn http_route_timeouts_project_onto_the_selected_dispatch_rule_only() {
             {
                 "matches": [{"path": {"type": "PathPrefix", "value": "/timed"}}],
                 "backendRefs": [{"name": "api", "port": 8080}],
-                "timeouts": {"request": "10s", "backendRequest": "1m500ms"}
+                "timeouts": {"request": "2m", "backendRequest": "1m500ms"}
             },
             {
                 "matches": [{"path": {"type": "PathPrefix", "value": "/disabled"}}],
@@ -147,7 +147,7 @@ fn http_route_timeouts_project_onto_the_selected_dispatch_rule_only() {
         .filter(|rule| rule.get("request_timeout_ms").is_some())
         .collect();
     assert_eq!(timed.len(), 1, "{rules:?}");
-    assert_eq!(timed[0]["request_timeout_ms"], 10_000);
+    assert_eq!(timed[0]["request_timeout_ms"], 120_000);
     assert_eq!(timed[0]["timeout_ms"], 60_500);
     assert!(timed[0].get("timeout_disabled").is_none());
 

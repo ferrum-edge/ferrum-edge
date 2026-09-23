@@ -37942,9 +37942,12 @@ async fn handle_proxy_request_inner(
             }
         };
 
-        while route_request_timeout_phase.is_none()
-            && retry::should_retry(retry_config, &method, &result, attempt)
-        {
+        while retry::should_retry(retry_config, &method, &result, attempt) {
+            // The route's total request deadline already expired: no further
+            // attempt may start, and the gateway-authored 504 stands.
+            if route_request_timeout_phase.is_some() {
+                break;
+            }
             ctx.record_backend_dispatch_outcome(result.error_class, !result.connection_error);
             // Re-check the CURRENT target's DestinationRule maxRetries before
             // authorizing another retry. Use the original route ceiling (not a
