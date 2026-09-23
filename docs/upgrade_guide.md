@@ -292,15 +292,26 @@ response-header modification remains deferred; the earlier support claim in
 this guide was incorrect. This remains a documented conformance gap, including
 the GRPCRoute filter-type contract that lists response-header modification as Core.
 
+**Update (issue [#5646](https://github.com/ferrum-edge/ferrum-edge/issues/5646)):**
+rule-level `ResponseHeaderModifier` (HTTPRoute and GRPCRoute) and HTTPRoute
+`URLRewrite` are now translated and enforced, and HTTPRoute `rules[].timeouts`
+(`request`, `backendRequest`) is now enforced. `rules[].retry`, `RequestMirror`,
+`ExtensionRef`, `CORS`, `ExternalAuth` and backend-reference filters are still
+refused as described above. The current admission contract, including the
+remaining refusals and the HTTP/3 `request`-timeout limitation, is
+[`docs/gateway_api_conformance.md`](gateway_api_conformance.md).
+
 ### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
 
 Auto-emitted `istio-vs-req-xform-*` / `istio-vs-resp-xform-*` consumers no
 longer shadow global `request_transformer` / `response_transformer` instances.
 Global static rules now run first, followed by the matched route rules. This
 changes existing Gateway API `HTTPRoute` deployments using
-`RequestHeaderModifier`; Gateway API `ResponseHeaderModifier` is not yet
-implemented and is rejected during translation. Newly supported Istio
-VirtualService header transforms follow the same composition contract.
+`RequestHeaderModifier`. Gateway API `ResponseHeaderModifier` was not yet
+implemented at that point; it is now (issue
+[#5646](https://github.com/ferrum-edge/ferrum-edge/issues/5646)) and follows the
+same composition contract, as do the supported Istio VirtualService header
+transforms.
 
 **Operator action:** audit HTTPRoute-backed proxies that relied on the former
 accidental suppression, then scope or remove global static transformer rules
