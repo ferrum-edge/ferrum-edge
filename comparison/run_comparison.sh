@@ -177,7 +177,9 @@ register_owned_container() {
 stop_owned_container() {
     local name="$1"
     local index
-    for index in "${!OWNED_CONTAINER_NAMES[@]}"; do
+    # `${arr[@]+...}` keeps an empty array safe under `set -u` on bash 3.2
+    # (macOS /bin/bash), where a bare "${arr[@]}" is an unbound variable.
+    for index in ${OWNED_CONTAINER_NAMES[@]+"${!OWNED_CONTAINER_NAMES[@]}"}; do
         if [[ "${OWNED_CONTAINER_NAMES[$index]}" == "$name" ]]; then
             docker stop --time 5 "${OWNED_CONTAINER_IDS[$index]}" >/dev/null 2>&1 || true
             docker rm -f "${OWNED_CONTAINER_IDS[$index]}" >/dev/null 2>&1 || true
@@ -185,6 +187,18 @@ stop_owned_container() {
             return 0
         fi
     done
+}
+
+ensure_owned_network() {
+    local name="$1"
+    local network
+    # Redis starts once per Tyk phase; reuse the network this run already
+    # created instead of failing on a second `docker network create`.
+    for network in ${OWNED_NETWORKS[@]+"${OWNED_NETWORKS[@]}"}; do
+        [[ "$network" == "$name" ]] && return 0
+    done
+    docker network create "$name" >/dev/null || return 1
+    OWNED_NETWORKS+=("$name")
 }
 
 stop_backend() {
@@ -247,12 +261,12 @@ cleanup() {
 
     stop_backend
 
-    for c in "${OWNED_CONTAINER_NAMES[@]}"; do
+    for c in ${OWNED_CONTAINER_NAMES[@]+"${OWNED_CONTAINER_NAMES[@]}"}; do
         stop_owned_container "$c"
     done
 
     # Clean up Docker network and temporary config files
-    for network in "${OWNED_NETWORKS[@]}"; do
+    for network in ${OWNED_NETWORKS[@]+"${OWNED_NETWORKS[@]}"}; do
         docker network rm "$network" 2>/dev/null || true
     done
     if [[ "$CLEANUP_READY" == "true" ]]; then
@@ -791,8 +805,7 @@ start_redis() {
             redis:7-alpine) || return 1
         register_owned_container "$REDIS_CONTAINER" "$redis_id"
     else
-        docker network create "$TYK_NETWORK" >/dev/null
-        OWNED_NETWORKS+=("$TYK_NETWORK")
+        ensure_owned_network "$TYK_NETWORK" || return 1
         local redis_id
         redis_id=$(docker run -d --name "$REDIS_CONTAINER" \
             --network "$TYK_NETWORK" \
