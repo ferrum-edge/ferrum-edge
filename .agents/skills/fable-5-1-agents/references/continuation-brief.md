@@ -15,7 +15,7 @@ inspection are allowed. Report pending CI honestly and preserve the assigned sto
 Complete the assigned continuation work and validation yourself in this session. Do not stop at
 partial work or hand unfinished implementation back to the controller. Perform commit, push, PR,
 review handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke
-any agent-dispatch skill or script, including `astra-agents`, `opus-agents`, `fable-5-1-agents`,
+any agent-dispatch skill or script, including `astra-agents`, `sol-agents`, `luna-agents`, `opus-agents`, `fable-5-1-agents`,
 `grok-agents`,
 `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not spawn
 nested workers. The orchestrator selected this model and effort deliberately.

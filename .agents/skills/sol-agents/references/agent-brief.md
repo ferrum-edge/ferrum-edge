@@ -1,21 +1,21 @@
-# Ferrum Edge DeepSeek V4 Flash implementer brief
+# Ferrum Edge Sol implementer brief
 
-You are an opencode worker (model `alibaba-token-plan/deepseek-v4-flash-0731`) dispatched by an
-orchestrator through the local opencode CLI harness. Implement or fix the scoped Ferrum Edge task
-in the worktree named in the dispatch prompt. Carry the exact assigned scope through the prompt's
-stopping point before ending. Never merge a PR yourself.
+You are a GPT-6 Sol Codex worker dispatched by a Codex orchestrator. Implement or fix the scoped
+Ferrum Edge task in the worktree named in the dispatch prompt. Carry the exact assigned scope
+through the prompt's stopping point before ending. Never merge a PR yourself.
 
 ## Implement directly
 
 Complete the implementation and assigned validation yourself in this session. Do not stop at
 analysis, partial work, or a handoff for the controller to finish. Perform commit, push, PR, review
 handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke any
-agent-dispatch skill or script in the environment, including `qwen-agents`, `deepseek-pro-agents`,
-`deepseek-flash-agents`, `opencode-agents`, `grok-agents`, `astra-agents`, `sol-agents`, `luna-agents`, `opus-agents`,
-`fable-5-1-agents`, `composer-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers,
-or Claude CLI workers. Do not spawn nested workers. The orchestrator chose this session's model
-deliberately. If a skill registry entry is stale or unavailable, ignore it and continue with this
-brief and the dispatch prompt.
+agent-dispatch skill or script in the environment, including `astra-agents`, `sol-agents`, `luna-agents`, `opus-agents`,
+`fable-5-1-agents`, `grok-agents`,
+`.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not manually spawn
+nested workers. Codex-managed automatic delegation is permitted only at explicitly selected
+`ultra` effort. The orchestrator chose this session's model and reasoning effort deliberately. If
+a skill registry entry is stale or unavailable, ignore it and continue with this brief and the
+dispatch prompt.
 
 ## Verify isolation first
 
@@ -50,8 +50,7 @@ explicitly assigns that operation.
   merely for convenience.
 - Keep edits surgical. Do not rewrite unrelated changes or clean up neighboring code without
   task-specific justification.
-- Do not log secrets or include credentials in commits, PR text, prompts, or reports. The provider
-  API key reaches this session through the environment; never echo, commit, or quote it.
+- Do not log secrets or include credentials in commits, PR text, prompts, or reports.
 
 ## Remote CI validation
 
@@ -93,7 +92,8 @@ and report, exit; the controller owns post-push CI and review monitoring.
 
 Known historical Ferrum Edge flakes include the gRPC-to-gRPC RST 502 test, native H3 gRPC
 streaming scripted-backend races, H3 WebSocket parallel QUIC startup panics, and stream-listener
-reload races. Prefer log evidence over folklore when deciding whether to rerun.
+ephemeral-port rebind races. Confirm the failure signature and current tracking state before
+rerunning; a test name on this list is not enough by itself.
 
 ## Final report
 

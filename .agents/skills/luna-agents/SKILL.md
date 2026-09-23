@@ -1,26 +1,21 @@
 ---
-name: deepseek-flash-agents
-description: Dispatch and orchestrate local opencode DeepSeek V4 Flash agents via the opencode CLI harness for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. DeepSeek V4 Flash is the fast tier, suited to mechanical, well-scoped edits and breadth-first fan-out. Use when the user asks GPT, Codex, or Claude to delegate to DeepSeek Flash or deepseek-v4-flash workers, run multiple DeepSeek Flash agents, resume interrupted runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+name: luna-agents
+description: Dispatch and orchestrate external GPT-6 Luna Codex CLI agents for Ferrum Edge issues, PRs, review-feedback fixes, CI repair, and shepherding, with optional fast mode only when the user explicitly requests it. Use when the user asks Codex or GPT to delegate to Luna or Codex CLI workers, run multiple GPT-6 Luna agents, select low/medium/high/xhigh/max reasoning effort, resume interrupted Luna runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
 ---
 
-# DeepSeek V4 Flash agents
+# Luna agents
 
-Act as the orchestrator. Treat local opencode processes running
-`alibaba-token-plan/deepseek-v4-flash-0731` as implementation workers. Own task decomposition,
-worktree isolation, liveness, independent diff review, and the final merge recommendation. Require
-each worker to carry its assigned scope through the stopping point in the prompt. Never accept a
-worker's report without checking the repository and GitHub state yourself.
-
-DeepSeek V4 Flash is the fast tier of this fleet. Prefer it for mechanical, well-scoped work —
-docs and config parity, rename and lint sweeps, single-finding fix rounds, and breadth-first fan-out
-across many small issues. Escalate to a deeper tier when a task turns out to need invariant
-reasoning rather than mechanical edits.
+Act as the Codex orchestrator. Treat external GPT-6 Luna Codex CLI processes as implementation
+workers. Own task decomposition, worktree isolation, effort selection, liveness, independent diff
+review, and the final merge recommendation. Require each worker to carry its assigned scope through
+the stopping point in the prompt. Never accept a worker's report without checking the repository
+and GitHub state yourself.
 
 **Guard: do not use this skill when you are yourself a dispatched worker.** If the session prompt
 references this skill's `agent-brief.md` or `continuation-brief.md`, says "YOU are the implementer,"
 or assigns an existing worktree and findings to fix, implement directly in the current session.
-Do not recursively dispatch another DeepSeek V4 Flash, opencode, Grok, Sol, Opus, Fable, or Composer
-worker. The orchestrator selected this session's model deliberately.
+Do not recursively dispatch another Luna or Opus worker. The orchestrator selected this session's
+model and reasoning effort deliberately.
 
 ## Remote CI validation
 
@@ -45,35 +40,26 @@ prompt, including continuation prompts and any permitted nested delegation.
 ## Preflight
 
 1. Read `AGENTS.md`, the relevant `.claude/rules/*.md`, and the issue or PR before dispatching.
-2. Confirm the standalone opencode CLI is resolvable. The launcher resolves it in this order and
-   refuses any candidate under `com.conductor.app`, because Conductor's bundled ACP-provider copy
-   lags the standalone release:
-   - `OPENCODE_BIN` if it points at an executable absolute path,
-   - `~/.opencode/bin/opencode`, `/opt/homebrew/bin/opencode`, `/usr/local/bin/opencode`,
-   - `opencode` on `PATH`.
-3. Confirm the model resolves: `<opencode> models` must list
-   `alibaba-token-plan/deepseek-v4-flash-0731`.
-   The model is served by the `alibaba-token-plan` provider block in the operator's
-   `opencode.json`. Stop and report the exact error if the model list or a run is rejected.
-4. Confirm the credential. That provider block resolves
-   `{env:ALIBABA_TOKEN_PLAN_API_KEY}` from the process environment, and a non-interactive dispatch
-   session does not source the operator's shell profile. Export `ALIBABA_TOKEN_PLAN_API_KEY`, or
-   set `ALIBABA_TOKEN_PLAN_API_KEY_FILE` to a readable absolute path holding it, before
-   dispatching. The launcher fails closed on a missing key rather than letting opencode surface a
-   bare `No API-key provided` mid-run. Never echo, log, or commit the key.
-5. Use the pinned model `alibaba-token-plan/deepseek-v4-flash-0731`. This is a **hard pin**:
-   the launcher refuses `--model` (exit 2) unless it names exactly that model, so no other
-   DeepSeek variant and no rolling alias is dispatchable from this skill. Do not substitute
-   a different provider or model.
-6. The pin is the **dated snapshot**, not the rolling `deepseek-v4-flash` alias. On the Singapore
-   token plan the rolling alias returns `Access to model denied` on every attempt while
-   `-0731` serves normally, so the snapshot is the only working flash tier today. If the rolling
-   alias is later entitled, re-pin here and in `scripts/dispatch-agent.sh` together and re-validate
-   before claiming it works.
+2. Confirm the standalone codex CLI is resolvable, then run `codex --version`, `codex login status`,
+   and `codex exec --help` against it. The launcher resolves the binary in this order and refuses
+   any candidate under `com.conductor.app`, because Conductor's bundled copy lags the standalone
+   release:
+   - `CODEX_BIN` if it points at an executable absolute path,
+   - `/opt/homebrew/bin/codex`, `/usr/local/bin/codex`, `~/.local/bin/codex`,
+   - `codex` on `PATH`.
+3. Confirm that the installed CLI supports `--model`, `--config`, `--sandbox`, `--cd`, and reading
+   a prompt from stdin with `-`. If the user explicitly requests fast mode, also confirm the
+   bundled model catalog lists the `priority` service tier for `gpt-6-luna`.
+4. Use the pinned model `gpt-6-luna`. Stop and report the exact error if authentication, model
+   access, requested effort, or requested service tier is rejected. Do not silently substitute
+   another model, effort, or service tier. Confirm the installed model catalog advertises the
+   selected effort before dispatch.
+5. Use `danger-full-access` only for a trusted repository task where the user's requested workflow
+   authorizes implementation. Worktree isolation prevents git collisions; it is not a host sandbox.
 
 ## Isolate every worker
 
-Create or locate the worker's git worktree before launching opencode. Never launch a write-enabled
+Create or locate the worker's git worktree before launching Codex. Never launch a write-enabled
 worker in the orchestrator's checkout or another worker's worktree.
 
 - Fresh issue: fetch `origin/main`, create a purpose-named branch from `origin/main`, and add a
@@ -82,8 +68,23 @@ worker in the orchestrator's checkout or another worker's worktree.
 - Follow-up round: reuse the PR's existing worktree after verifying its branch and state.
 
 Include the absolute worktree path, branch, base branch, and current head SHA in every prompt.
-`--auto` bypasses opencode's permission prompts, so worktree isolation is the safety boundary; it
-is not a host sandbox.
+Do not discard unexplained changes in an existing worktree; reconstruct and preserve valid work.
+
+## Select effort deliberately
+
+- `low`: use for simple, mechanical work with minimal reasoning needs.
+- `medium`: use for easier tasks and quick singular code fixes — a single-file change, a mechanical
+  refactor, a documentation correction, or a review finding with an obvious and contained fix.
+- `high`: default. Use for challenging multi-step coding across interconnected components, where the
+  change touches several modules and the worker must reason about how they fit together.
+- `xhigh`: reserve for very high-stakes tasks that need lots of thinking — security boundaries,
+  concurrency and lifecycle bugs, protocol correctness, difficult root-cause analysis, or repeated
+  failure at `high`. Prefer one focused `xhigh` worker over a fleet of them.
+
+- `max`: use for the hardest problems requiring more reasoning than `xhigh`.
+
+Honor an explicit user choice and record the selected level beside each worker. Keep the effort
+stable across initial and continuation rounds unless evidence or the user justifies changing it.
 
 ## Dispatch with the exact model contract
 
@@ -100,22 +101,25 @@ one long-lived execution session:
 ```bash
 <ABS_SKILL_DIR>/scripts/dispatch-agent.sh \
   --worktree <ABS_WORKTREE> \
-  --prompt-file <ABS_PROMPT_FILE>
+  --prompt-file <ABS_PROMPT_FILE> \
+  --effort <low|medium|high|xhigh|max>
 ```
 
-`--effort medium|high|xhigh|max` is accepted for CLI parity with sibling skills but is ignored —
-this provider exposes no documented effort tiers. Do not claim an effort level was applied.
+`--fast` is an opt-in controller flag. Append it only when the user explicitly requests fast mode
+for the dispatch or fleet. Never infer it from urgency, deadlines, task size, or available credits.
+Omit it for every other run, including continuations unless they remain within the same explicit
+request. Record the selected mode beside each worker.
 
-The launcher resolves the opencode binary, verifies the credential, verifies the worktree root,
-pins `alibaba-token-plan/deepseek-v4-flash-0731` on the write-enabled `build` agent, and runs
-`opencode run --auto` with the prompt fed on stdin. Delete the temporary prompt after the worker
-exits.
+The launcher pins `gpt-6-luna`, the reasoning effort, `danger-full-access`, the verified worktree
+root, and stdin prompt mode. It pins `service_tier="default"` normally and selects the model's Fast
+`priority` tier only with `--fast`. The prompt file reaches EOF cleanly, avoiding the non-TTY hang
+caused by a prompt argument with open stdin. Delete the temporary prompt after the worker exits.
 
 Start each worker in its own long-lived execution session and retain its exact session handle or
-PID. Prefer one tool call per worker so completions and failures remain attributable. Never wrap
-the fleet in a single shell command, use `killall opencode`, or use `pkill opencode`; the user may
-have unrelated opencode sessions. Cap this workflow at 7 concurrent workers unless the user
-sets a lower limit.
+PID. One worker per tool call keeps completion and failure attributable. Use `pgrep -x codex` only
+as a fleet-wide cross-check because it can include unrelated Codex sessions. Never kill processes
+by name. Cap this workflow at seven concurrent workers unless the user explicitly sets a different
+cap.
 
 ## Pin the worker role
 
@@ -127,12 +131,11 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
-opencode-agents, grok-agents, astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents, composer-agents, or any
-.agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
+skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents, grok-agents, or any
+.agents/skills/*/scripts/dispatch-agent.sh), and do not manually spawn nested workers.
 ```
 
-This prevents a worker from replacing the selected model through nested delegation.
+This prevents a worker from replacing the selected model or effort through nested delegation.
 
 ## Construct prompts by mode
 
@@ -161,9 +164,7 @@ actionable work appears. Do not add a review trigger unless the controller expli
 ## Control and verify the fleet
 
 1. Poll retained execution sessions separately. Tell the user when a worker launches, finishes,
-   fails, or needs a decision. Use `pgrep -f 'opencode run'` only as a secondary fleet-wide
-   cross-check, never as the identity of a particular worker — sibling opencode skills share that
-   process name.
+   fails, or needs a decision.
 2. On completion, verify the claims relevant to the prompt, such as the branch, pushed head, PR,
    requested validation, and any explicitly assigned review or CI actions.
 3. Fetch `origin/main` and independently inspect `git diff origin/main...HEAD` in the worker's
@@ -176,7 +177,8 @@ actionable work appears. Do not add a review trigger unless the controller expli
    infrastructure failures or repository-known flakes, and dispatch bounded repair work for
    deterministic failures.
 6. If a worker dies, inspect its worktree, local commits, upstream, and remote branch before
-   relaunching. Preserve useful work and launch a continuation round.
+   relaunching. Preserve useful work and launch a continuation round at the same effort unless the
+   evidence justifies escalation.
 7. Merge only when the user authorized it, your independent review is complete, and every
    completion gate the user assigned is satisfied.
 
@@ -184,21 +186,24 @@ When review handling is explicitly in scope, a worker's rebuttal is not by itsel
 Require a recognized clean verdict on the current head, reviewer acceptance, resolved threads, or
 an explicit repository policy permitting the orchestrator to close a proven false positive.
 
-Never put credentials, tokens, cookies, or secrets in prompts or worker logs.
+Treat the model context window as headroom, not a reason to paste the repository or whole CI logs
+into prompts. Never put credentials, tokens, cookies, or secrets in prompts or worker logs.
 
 ## Failure handling
 
-- Missing or empty `ALIBABA_TOKEN_PLAN_API_KEY`: the launcher exits 2 before spawning opencode.
-  Export the key (or point `ALIBABA_TOKEN_PLAN_API_KEY_FILE` at a file holding it) and relaunch.
-  Report the failure without quoting the key.
 - Capacity or transport failure: verify local and remote state before retrying; useful work may
   already be committed or pushed.
-- Missing opencode binary or an unresolved model: stop and report the exact binary path or
-  `opencode models` failure. Do not fall back to another model provider.
 - Worker exits after its completed push and report: continue post-push review and CI monitoring as
   the controller. If it exits before its assigned implementation or validation stopping point,
   inspect the state and launch a continuation round; do not accept unfinished work as complete.
 - An explicitly requested review receives no response: verify the trigger, bot identity,
   availability, and head SHA before posting another trigger.
-- Model mismatch: stop the worker, record the exact diagnostic, correct the launch contract, and
-  relaunch. Never claim `alibaba-token-plan/deepseek-v4-flash-0731` without launch evidence.
+- Model, effort, or service-tier mismatch: stop the worker, record the exact diagnostic, correct
+  the launch contract, and relaunch. Never claim a selected effort, `gpt-6-luna`, or fast mode without launch evidence.
+
+## Model contract source
+
+The installed Codex `models_cache.json` entry for `gpt-6-luna` advertises
+`low`, `medium`, `high`, `xhigh`, and `max` (verified 2026-09-23); it does not offer `ultra`.
+The [API model page](https://developers.openai.com/api/docs/models/gpt-6-luna)
+lists the same API efforts through `max`.

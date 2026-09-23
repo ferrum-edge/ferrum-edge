@@ -1,4 +1,4 @@
-# Ferrum Edge Astra continuation brief
+# Ferrum Edge Luna continuation brief
 
 Resume the existing worktree and branch named in the dispatch prompt. Follow every rule in
 `agent-brief.md`, especially isolation, direct implementation, the
@@ -18,8 +18,7 @@ review handling, and CI repair actions only when the dispatch prompt assigns the
 any agent-dispatch skill or script, including `astra-agents`, `sol-agents`, `luna-agents`, `opus-agents`, `fable-5-1-agents`,
 `grok-agents`,
 `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not manually spawn
-nested workers. Codex-managed automatic delegation is permitted only at explicitly selected
-`ultra` effort. The orchestrator selected this model and reasoning effort deliberately.
+nested workers. The orchestrator selected this model and reasoning effort deliberately.
 
 ## Reconstruct state before editing
 

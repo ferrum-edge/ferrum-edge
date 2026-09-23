@@ -5,16 +5,14 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
-    '                         --effort low|medium|high|xhigh|max' \
-    '                         [--fast]' \
-    "                         [--model 'claude-opus-5-5[1m]'|'opus[1m]']" >&2
+    '                         --effort low|medium|high|xhigh|max|ultra' \
+    '                         [--fast]' >&2
 }
 
 worktree=''
 prompt_file=''
 effort=''
 fast='false'
-model='claude-opus-5-5[1m]'
 
 while (($#)); do
   case "$1" in
@@ -49,15 +47,6 @@ while (($#)); do
       fast='true'
       shift
       ;;
-    --model)
-      if (($# < 2)); then
-        printf 'Missing value for --model\n' >&2
-        usage
-        exit 2
-      fi
-      model=${2-}
-      shift 2
-      ;;
     -h|--help)
       usage
       exit 0
@@ -71,7 +60,7 @@ while (($#)); do
 done
 
 case "$effort" in
-  low|medium|high|xhigh|max) ;;
+  low|medium|high|xhigh|max|ultra) ;;
   *)
     printf 'Invalid effort: %s\n' "${effort:-<empty>}" >&2
     usage
@@ -79,14 +68,10 @@ case "$effort" in
     ;;
 esac
 
-case "$model" in
-  'claude-opus-5-5[1m]'|'opus[1m]') ;;
-  *)
-    printf 'Invalid model: %s\n' "$model" >&2
-    usage
-    exit 2
-    ;;
-esac
+service_tier='default'
+if [[ "$fast" == 'true' ]]; then
+  service_tier='priority'
+fi
 
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
   printf 'Worktree must be an existing absolute directory: %s\n' "${worktree:-<empty>}" >&2
@@ -102,10 +87,10 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 # shellcheck source=../../_lib/resolve-agent-bin.sh
 . "$script_dir/../../_lib/resolve-agent-bin.sh"
 
-claude_bin=$(resolve_agent_bin claude CLAUDE_BIN \
-  "${HOME}/.local/bin/claude" \
-  /opt/homebrew/bin/claude \
-  /usr/local/bin/claude)
+codex_bin=$(resolve_agent_bin codex CODEX_BIN \
+  /opt/homebrew/bin/codex \
+  /usr/local/bin/codex \
+  "${HOME}/.local/bin/codex")
 
 repo_root=$(git -C "$worktree" rev-parse --show-toplevel)
 physical_worktree=$(cd "$worktree" && pwd -P)
@@ -118,24 +103,13 @@ fi
 
 cd "$physical_worktree"
 
-unset CLAUDE_CODE_EFFORT_LEVEL
-unset CLAUDE_CODE_DISABLE_1M_CONTEXT
-unset CLAUDE_CODE_DISABLE_THINKING
-unset MAX_THINKING_TOKENS
+printf '[sol-agents] dispatch model=gpt-6-sol effort=%s fast=%s service_tier=%s worktree=%s bin=%s\n' \
+  "$effort" "$fast" "$service_tier" "$physical_worktree" "$codex_bin" >&2
 
-fast_settings='{"fastMode":false}'
-if [[ "$fast" == 'true' ]]; then
-  fast_settings='{"fastMode":true}'
-fi
-
-printf '[opus-agents] dispatch model=%s effort=%s fast=%s worktree=%s bin=%s\n' \
-  "$model" "$effort" "$fast" "$physical_worktree" "$claude_bin" >&2
-
-exec "$claude_bin" -p \
-  --model "$model" \
-  --effort "$effort" \
-  --settings "$fast_settings" \
-  --permission-mode bypassPermissions \
-  --output-format text \
-  --verbose \
-  < "$prompt_file"
+exec "$codex_bin" exec \
+  --model gpt-6-sol \
+  --config "model_reasoning_effort=\"$effort\"" \
+  --config "service_tier=\"$service_tier\"" \
+  --sandbox danger-full-access \
+  --cd "$physical_worktree" \
+  - < "$prompt_file"
