@@ -19222,6 +19222,51 @@ where
     }
 }
 
+/// Forward the backend bytes a WebSocket tunnel recovered at the frame-codec
+/// boundary — the ones the backend coalesced with its `101` — to the client,
+/// and flush them before the raw relay starts (issue #5588).
+///
+/// `offset` advances as the writer accepts bytes, so a caller that cancels this
+/// future on a policy stop still reports exactly what was handed over.
+///
+/// **Why the flush.** The relay that follows flushes a writer only for bytes
+/// *it* handed over (`tcp_proxy::CopyDirectionState::needs_flush` starts
+/// `false`). A buffering client writer — `tokio-rustls` on a WSS frontend, which
+/// returns `Ok(n)` for plaintext whose ciphertext it could not push — would
+/// otherwise keep this server-first message while the relay parks on a client
+/// that is waiting for it. Nothing is written when there is no residual, so
+/// that case performs no flush and keeps its previous behaviour exactly.
+pub(crate) async fn forward_ws_tunnel_residual<W>(
+    writer: &mut W,
+    residual: &[u8],
+    offset: &mut usize,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    use tokio::io::AsyncWriteExt;
+    if residual.is_empty() {
+        return Ok(());
+    }
+    while *offset < residual.len() {
+        match writer.write(&residual[*offset..]).await {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "client accepted zero bytes while forwarding WebSocket backend residual bytes",
+                ));
+            }
+            Ok(n) => {
+                *offset = offset.saturating_add(n);
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        }
+    }
+    writer.flush().await
+}
+
 /// Generic over the client transport type `C`. The H1/H2 frontend passes
 /// `TokioIo::new(upgraded)` (hyper's `Upgraded` adapted to tokio AsyncRead+AsyncWrite);
 /// the H3 frontend (RFC 9220 Extended CONNECT) passes a `tokio::io::DuplexStream`
@@ -19309,7 +19354,6 @@ where
         let residual_write_timeout =
             websocket_idle_timeout.unwrap_or(websocket_tunnel_idle_disabled_safety_cap);
         let pre_relay_failure = {
-            use tokio::io::AsyncWriteExt;
             let mut offset = 0usize;
             let write_result = tokio::select! {
                 biased;
@@ -19335,25 +19379,10 @@ where
                     .await;
                     return Ok(());
                 }
-                result = tokio::time::timeout(residual_write_timeout, async {
-                    while offset < backend_read_buffer.len() {
-                        match client_io.write(&backend_read_buffer[offset..]).await {
-                            Ok(0) => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::WriteZero,
-                                    "client accepted zero bytes while forwarding WebSocket backend residual bytes",
-                                ));
-                            }
-                            Ok(n) => {
-                                offset = offset.saturating_add(n);
-                            }
-                            Err(err) => {
-                                return Err(err);
-                            }
-                        }
-                    }
-                    Ok(())
-                }) => result,
+                result = tokio::time::timeout(
+                    residual_write_timeout,
+                    forward_ws_tunnel_residual(&mut client_io, &backend_read_buffer, &mut offset),
+                ) => result,
             };
             recovered_backend_bytes_written = offset as u64;
             match write_result {

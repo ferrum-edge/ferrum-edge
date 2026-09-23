@@ -4307,6 +4307,22 @@ pub mod _test_support {
         .await
     }
 
+    /// The production WebSocket tunnel-mode residual forward
+    /// (`proxy::forward_ws_tunnel_residual`): the backend bytes recovered at
+    /// the frame-codec boundary are written to the client and flushed before
+    /// the raw relay starts. `offset` reports how many bytes the writer
+    /// accepted.
+    pub async fn forward_ws_tunnel_residual_for_test<W>(
+        writer: &mut W,
+        residual: &[u8],
+        offset: &mut usize,
+    ) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
+        crate::proxy::forward_ws_tunnel_residual(writer, residual, offset).await
+    }
+
     /// Connect to a WebSocket backend using production dialer settings that
     /// are relevant to unit tests.
     pub async fn connect_websocket_backend_for_test(

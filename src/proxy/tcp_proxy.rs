@@ -763,6 +763,14 @@ pub(crate) enum PrefixForwardReject {
 /// The fence latch — not a re-read of the session — decides attribution, so a
 /// genuine backend write failure that merely coincided with a withdrawal is
 /// still reported as backend evidence.
+///
+/// The prefix is flushed before this returns (issue #5588). The relay that
+/// follows owes a flush only for bytes it handed over itself
+/// (`CopyDirectionState::needs_flush` starts `false`), so a TLS backend leg
+/// whose `tokio-rustls` writer accepted the prefix but kept its ciphertext
+/// would otherwise hold the client's opening request while the relay parks on
+/// a client waiting for the answer. The flush runs through the same fence, so
+/// a withdrawal observed there is still reported as the withdrawal.
 pub(crate) async fn forward_inspected_prefix_under_trust_fence<W>(
     writer: &mut W,
     prefix: &[u8],
@@ -774,7 +782,11 @@ where
     use tokio::io::AsyncWriteExt;
 
     let mut fenced = crate::tls::TrustFencedStream::new(writer, client_trust);
-    match fenced.write_all(prefix).await {
+    let forwarded = match fenced.write_all(prefix).await {
+        Ok(()) => fenced.flush().await,
+        Err(error) => Err(error),
+    };
+    match forwarded {
         Ok(()) => Ok(()),
         Err(error) => {
             if fenced.fence_fired() {

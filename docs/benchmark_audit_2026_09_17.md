@@ -893,6 +893,29 @@ records the first measured H1 experiment and its limits.
    bytes reach the peer through the inbound mTLS `TlsStream`. That writer's
    behaviour is what the rustls-backpressure test covers.
 
+   **Sibling sweep (2026-09-23).** Every userspace byte relay was re-read for
+   the same "accepted, never flushed" state. The pump itself holds: a reader
+   `Pending` with `needs_flush` set always reaches `poll_flush`; a `Pending`
+   flush returns with the writer's waker registered; EOF flushes through
+   `poll_shutdown`; and tokio's `copy_bidirectional` fast path flushes on its
+   own. No writer outside the pump buffers: `H2ConnectTunnel` and hyper's
+   `H2Upgraded` hand DATA frames to the h2 driver, the H3 WebSocket bridge
+   writes a `DuplexStream` and `send_data`, frame-mode WebSocket sends through
+   `SinkExt::send` (which flushes), and the mesh UDP datagram tunnels write
+   `H2ConnectTunnel`. Two writes that run **before** the relay did have the
+   defect: the TCP+TLS first-bytes prefix forward and WebSocket tunnel mode's
+   forward of backend bytes that arrived with the `101`. Both wrote into a
+   possibly-`tokio-rustls` writer without flushing, and the relay starts with
+   `needs_flush` clear, so a retained tail stayed put until the next relay
+   write in that direction. Both now flush inside their existing bounds.
+   Neither is expected to explain the benchmark timeouts: the WSS echo workload
+   is client-first, so its backend sends nothing with the `101`, and the stall
+   needs a transport that refuses ciphertext at connection setup.
+   Tracker-requested coverage also added: a pending flush parks on the
+   writer's waker instead of re-polling (no busy loop), the backend→client
+   direction through a rustls *server* writer (the WSS reply path), and a
+   rustls half-close that delivers retained ciphertext ahead of `close_notify`.
+
    **Hosted corroboration (2026-09-18).** Two scoped
    `gateways-protocol-benchmark` runs with identical inputs — ferrum only,
    http2 + grpcs + wss, 70 KiB and 5 MiB, `iterations=2` — on

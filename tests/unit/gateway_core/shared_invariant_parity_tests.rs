@@ -2557,3 +2557,47 @@ fn every_tunnelled_relay_path_shares_one_flushing_byte_pump() {
         );
     }
 }
+
+/// The shared relay flushes only what it handed to a writer itself, so a write
+/// that runs just before a relay starts has to flush on its own (issue #5588).
+/// `relay_flush_progress_tests.rs` proves each helper's behaviour; this pins
+/// that the production paths still reach the relay through those helpers
+/// rather than through a re-inlined write loop that skips the flush.
+#[test]
+fn every_pre_relay_write_flushes_before_the_relay_starts() {
+    let proxy = admission_source_without_line_comments(&source("src/proxy/mod.rs"));
+    let residual = item_body(&proxy, "async fn forward_ws_tunnel_residual<", "\n}");
+    assert!(
+        residual.contains("writer.flush().await"),
+        "the WebSocket tunnel residual forward must flush what the client writer accepted"
+    );
+    let websocket = item_body(&proxy, "async fn run_websocket_proxy<", "\n}");
+    assert!(
+        websocket.contains("forward_ws_tunnel_residual(&mut client_io"),
+        "WebSocket tunnel mode must forward recovered backend bytes through the flushing helper"
+    );
+    assert!(
+        !websocket.contains("client_io.write("),
+        "WebSocket tunnel mode must not write recovered backend bytes around the helper"
+    );
+
+    let tcp_proxy = admission_source_without_line_comments(&source("src/proxy/tcp_proxy.rs"));
+    let prefix = item_body(
+        &tcp_proxy,
+        "async fn forward_inspected_prefix_under_trust_fence<",
+        "\n}",
+    );
+    assert!(
+        prefix.contains("fenced.flush().await"),
+        "the inspected TCP+TLS prefix must be flushed to the backend before the relay starts"
+    );
+    let outbound_proxy_header = item_body(
+        &tcp_proxy,
+        "async fn write_outbound_proxy_v2_header(",
+        "\n}",
+    );
+    assert!(
+        outbound_proxy_header.contains("stream.flush().await"),
+        "the outbound PROXY v2 header must be flushed before the relay starts"
+    );
+}

@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Flush the two writes that run just before a byte relay starts (#5588): the
+  TCP+TLS first-bytes prefix forwarded to the backend, and WebSocket tunnel
+  mode's forward of backend bytes that arrived with the `101`. The relay only
+  flushes bytes it handed over itself, so a `tokio-rustls` leg that accepted
+  either write but kept its ciphertext could hold it until the next relay write
+  in that direction. Each flush runs inside the existing bounds of its write,
+  and neither path does anything new when it has no bytes to forward.
 - Withhold supplied configuration values in early startup and reload diagnostics
   (#5591), including SQL/Mongo quarantine, mesh consumers and revisions, capture
   settings, CP trust identifiers, and listener conflicts. WAF regex failures keep

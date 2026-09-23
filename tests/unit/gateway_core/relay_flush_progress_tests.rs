@@ -28,19 +28,28 @@
 //! * `bidirectional_copy_with_authorization_for_test` — the authorization
 //!   lifetime bound.
 //!
+//! The relay flushes only what it handed to a writer itself, so the two writes
+//! that run just before it starts are covered as well, through their production
+//! helpers: the TCP+TLS inspected-prefix forward
+//! (`tcp_forward_prefix_under_trust_fence_for_test`) and the WebSocket
+//! tunnel-mode forward of backend bytes recovered with the `101`
+//! (`forward_ws_tunnel_residual_for_test`).
+//!
 //! The structural sibling inventory lives in `shared_invariant_parity_tests.rs`
-//! (`every_tunnelled_relay_path_shares_one_flushing_byte_pump`).
+//! (`every_tunnelled_relay_path_shares_one_flushing_byte_pump` and
+//! `every_pre_relay_write_flushes_before_the_relay_starts`).
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     StreamIoSide, bidirectional_copy_for_fenced_relay_for_test,
     bidirectional_copy_for_test_with_timeouts, bidirectional_copy_with_authorization_for_test,
+    forward_ws_tunnel_residual_for_test, tcp_forward_prefix_under_trust_fence_for_test,
 };
 use ferrum_edge::plugins::Direction;
 use ferrum_edge::retry::ErrorClass;
@@ -538,27 +547,9 @@ async fn the_fenced_relay_entry_point_shares_the_flushing_pump() {
 /// parked on a still-open client and neither side ever moved again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rustls_writer_holding_ciphertext_is_flushed_while_the_reader_is_pending() {
-    // Smaller than the ~8 KiB record the payload below produces, so the first
-    // `write_io` fills it and rustls retains the remainder.
-    const TLS_TRANSPORT_WINDOW: usize = 4 * 1024;
-    const PAYLOAD_LEN: usize = 8 * 1024;
+    let (tls_backend, mut tls_peer) = tls_session(RUSTLS_TRANSPORT_WINDOW).await;
 
-    let (server_config, client_config) = test_tls_configs();
-    let (client_io, server_io) = tokio::io::duplex(TLS_TRANSPORT_WINDOW);
-
-    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
-    let server_handshake = tokio::spawn(async move {
-        let accepted = acceptor.accept(server_io).await;
-        accepted.expect("server handshake")
-    });
-    let connector = tokio_rustls::TlsConnector::from(client_config);
-    let host = "localhost".to_string();
-    let name = rustls::pki_types::ServerName::try_from(host).expect("server name");
-    let connect = connector.connect(name, client_io);
-    let tls_backend = connect.await.expect("client handshake");
-    let mut tls_peer = server_handshake.await.expect("server handshake task");
-
-    let payload = vec![0x5au8; PAYLOAD_LEN];
+    let payload = vec![0x5au8; RUSTLS_PAYLOAD_LEN];
     let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
     client_peer.write_all(&payload).await.expect("payload");
 
@@ -572,7 +563,7 @@ async fn a_rustls_writer_holding_ciphertext_is_flushed_while_the_reader_is_pendi
         RELAY_BUFFER,
     ));
 
-    let mut seen = vec![0u8; PAYLOAD_LEN];
+    let mut seen = vec![0u8; RUSTLS_PAYLOAD_LEN];
     tokio::time::timeout(DELIVERY_WINDOW, tls_peer.read_exact(&mut seen))
         .await
         .expect("rustls kept the ciphertext; the relay must flush it, not park")
@@ -587,7 +578,39 @@ async fn a_rustls_writer_holding_ciphertext_is_flushed_while_the_reader_is_pendi
         .await
         .expect("the relay must finish once both legs close")
         .expect("relay task");
-    assert_eq!(result.bytes_client_to_backend, PAYLOAD_LEN as u64);
+    assert_eq!(result.bytes_client_to_backend, RUSTLS_PAYLOAD_LEN as u64);
+}
+
+/// Smaller than the ~8 KiB record [`RUSTLS_PAYLOAD_LEN`] produces, so the first
+/// `write_io` fills the transport and rustls retains the remainder.
+const RUSTLS_TRANSPORT_WINDOW: usize = 4 * 1024;
+const RUSTLS_PAYLOAD_LEN: usize = 8 * 1024;
+
+/// A completed TLS session over an in-memory transport that buffers `window`
+/// bytes per direction, as `(client, server)`. A window smaller than one
+/// encrypted record is what makes `tokio-rustls` accept plaintext and return
+/// `Ok(n)` while keeping ciphertext it could not push.
+async fn tls_session(
+    window: usize,
+) -> (
+    tokio_rustls::client::TlsStream<DuplexStream>,
+    tokio_rustls::server::TlsStream<DuplexStream>,
+) {
+    let (server_config, client_config) = test_tls_configs();
+    let (client_io, server_io) = tokio::io::duplex(window);
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+    let server_handshake = tokio::spawn(async move {
+        let accepted = acceptor.accept(server_io).await;
+        accepted.expect("server handshake")
+    });
+    let connector = tokio_rustls::TlsConnector::from(client_config);
+    let host = "localhost".to_string();
+    let name = rustls::pki_types::ServerName::try_from(host).expect("server name");
+    let connect = connector.connect(name, client_io);
+    let client = connect.await.expect("client handshake");
+    let server = server_handshake.await.expect("server handshake task");
+    (client, server)
 }
 
 fn test_tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
@@ -1260,4 +1283,349 @@ async fn the_authorization_deadline_still_fires_with_a_buffering_writer() {
     );
     assert_eq!(result.bytes_client_to_backend, REQUEST.len() as u64);
     drop(client_peer);
+}
+
+// ---------------------------------------------------------------------------
+// No busy loop: a pending flush parks on the writer's waker
+// ---------------------------------------------------------------------------
+
+/// How long the relay is watched while its flush is pending. Far below the
+/// relay watchdog's first tick (five seconds for the 300 s bounds above), so a
+/// well-behaved relay polls the flush zero more times in this window.
+const SPIN_OBSERVATION_WINDOW: Duration = Duration::from_millis(250);
+
+/// Extra `poll_flush` calls tolerated during [`SPIN_OBSERVATION_WINDOW`]. A
+/// relay that re-polls a pending flush instead of parking produces thousands;
+/// this only absorbs a stray wake-up.
+const SPURIOUS_FLUSH_POLL_ALLOWANCE: usize = 2;
+
+/// Shared state of a [`GatedFlushWriter`], observed and released by the test.
+#[derive(Default)]
+struct FlushGate {
+    open: AtomicBool,
+    flush_polls: AtomicUsize,
+    parked: Mutex<Option<Waker>>,
+    held: Mutex<Vec<u8>>,
+    delivered: Mutex<Vec<u8>>,
+}
+
+impl FlushGate {
+    /// Let the flush complete, then wake the task parked on it — the way a
+    /// transport reports write readiness. Nothing else wakes the relay.
+    fn open(&self) {
+        self.open.store(true, Ordering::SeqCst);
+        let parked = self.parked.lock().expect("flush gate waker").take();
+        if let Some(waker) = parked {
+            waker.wake();
+        }
+    }
+
+    fn delivered(&self) -> Vec<u8> {
+        self.delivered.lock().expect("flush gate delivery").clone()
+    }
+}
+
+/// A buffering writer whose flush stays `Pending` until the test opens its
+/// gate. A pending flush registers the waker it was polled with, exactly as a
+/// real transport registers write interest, and a completed flush moves what
+/// the writer held to `delivered`. The read half never produces anything: a
+/// backend that is waiting for the request.
+struct GatedFlushWriter(Arc<FlushGate>);
+
+impl AsyncRead for GatedFlushWriter {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for GatedFlushWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut held = self.0.held.lock().expect("flush gate buffer");
+        held.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let gate = &self.0;
+        gate.flush_polls.fetch_add(1, Ordering::SeqCst);
+        if !gate.open.load(Ordering::SeqCst) {
+            *gate.parked.lock().expect("flush gate waker") = Some(cx.waker().clone());
+            // Re-check after publishing the waker, so an `open()` that ran
+            // between the first check and the store is not lost.
+            if !gate.open.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+        }
+        let held = std::mem::take(&mut *gate.held.lock().expect("flush gate buffer"));
+        let mut delivered = gate.delivered.lock().expect("flush gate delivery");
+        delivered.extend_from_slice(&held);
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Flush progress must not turn into a busy loop. A writer whose flush is
+/// `Pending` has registered the task's waker with whatever will drain it, so
+/// the relay has to park on that rather than re-poll the flush until it
+/// happens to succeed. It then has to resume on that waker alone: the client
+/// sends nothing further and the backend never answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_flush_parks_on_the_writer_waker_instead_of_spinning() {
+    let gate = Arc::new(FlushGate::default());
+    let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
+
+    let relay = tokio::spawn(bidirectional_copy_for_test_with_timeouts(
+        client,
+        GatedFlushWriter(Arc::clone(&gate)),
+        RELAY_IDLE_TIMEOUT,
+        RELAY_HALF_CLOSE_CAP,
+        None,
+        None,
+        RELAY_BUFFER,
+    ));
+
+    wait_until_at_least(&gate.flush_polls, 1, "flush polls").await;
+    let parked_at = gate.flush_polls.load(Ordering::SeqCst);
+    tokio::time::sleep(SPIN_OBSERVATION_WINDOW).await;
+    let polled_while_parked = gate.flush_polls.load(Ordering::SeqCst) - parked_at;
+    assert!(
+        polled_while_parked <= SPURIOUS_FLUSH_POLL_ALLOWANCE,
+        "a pending flush must park the relay, not spin on it: {polled_while_parked} more \
+         flush polls in {SPIN_OBSERVATION_WINDOW:?}"
+    );
+    assert!(
+        gate.delivered().is_empty(),
+        "nothing may reach the peer while the flush is still pending"
+    );
+
+    gate.open();
+    let delivered = async {
+        while gate.delivered().len() < REQUEST.len() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
+    tokio::time::timeout(DELIVERY_WINDOW, delivered)
+        .await
+        .expect("the flush's own waker must resume the relay without further input");
+    assert_eq!(
+        gate.delivered(),
+        REQUEST,
+        "the flushed bytes must be the request, verbatim"
+    );
+
+    // The backend never answers, so the backend→client half would wait for
+    // the 300 s idle bound; this test is about the flush, not the teardown.
+    relay.abort();
+    drop(client_peer);
+}
+
+// ---------------------------------------------------------------------------
+// Real rustls backpressure: the reply direction and the half-close
+// ---------------------------------------------------------------------------
+
+/// The reply direction of a TLS-terminated frontend — WSS in tunnel mode and
+/// TCP+TLS — where the relay's writer is the frontend's `tokio-rustls` SERVER
+/// stream. The transport window is again smaller than one record, so rustls
+/// accepts the backend's reply and keeps ciphertext the client cannot decrypt
+/// yet, while the relay's reader is a backend waiting for the client's next
+/// message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rustls_frontend_writer_holding_ciphertext_is_flushed_toward_the_client() {
+    let (mut tls_client, tls_frontend) = tls_session(RUSTLS_TRANSPORT_WINDOW).await;
+
+    let reply = vec![0xa5u8; RUSTLS_PAYLOAD_LEN];
+    let (backend, mut backend_peer) = tokio::io::duplex(PEER_BUFFER);
+    backend_peer.write_all(&reply).await.expect("reply");
+
+    let relay = tokio::spawn(bidirectional_copy_for_test_with_timeouts(
+        tls_frontend,
+        backend,
+        RELAY_IDLE_TIMEOUT,
+        RELAY_HALF_CLOSE_CAP,
+        None,
+        None,
+        RELAY_BUFFER,
+    ));
+
+    let mut seen = vec![0u8; RUSTLS_PAYLOAD_LEN];
+    tokio::time::timeout(DELIVERY_WINDOW, tls_client.read_exact(&mut seen))
+        .await
+        .expect("rustls kept the reply's ciphertext; the relay must flush it, not park")
+        .expect("TLS client read");
+    assert_eq!(seen, reply, "the TLS client must see the reply verbatim");
+
+    drop(tls_client);
+    drop(backend_peer);
+    let result = tokio::time::timeout(DELIVERY_WINDOW, relay)
+        .await
+        .expect("the relay must finish once both legs close")
+        .expect("relay task");
+    assert_eq!(result.bytes_backend_to_client, RUSTLS_PAYLOAD_LEN as u64);
+}
+
+/// A client that sends its payload and half-closes while `tokio-rustls` still
+/// holds part of the ciphertext. The half-close has to push that ciphertext
+/// out ahead of `close_notify`, so the TLS peer reads the whole payload and
+/// then a clean end of stream rather than a truncation — and the relay reports
+/// an orderly completion with exact counters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rustls_half_close_delivers_retained_ciphertext_before_close_notify() {
+    let (tls_backend, mut tls_peer) = tls_session(RUSTLS_TRANSPORT_WINDOW).await;
+
+    let payload = vec![0x3cu8; RUSTLS_PAYLOAD_LEN];
+    let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
+    client_peer.write_all(&payload).await.expect("payload");
+    client_peer.shutdown().await.expect("client half-close");
+
+    let relay = tokio::spawn(bidirectional_copy_for_test_with_timeouts(
+        client,
+        tls_backend,
+        RELAY_IDLE_TIMEOUT,
+        RELAY_HALF_CLOSE_CAP,
+        None,
+        None,
+        RELAY_BUFFER,
+    ));
+
+    let mut received = Vec::new();
+    tokio::time::timeout(DELIVERY_WINDOW, tls_peer.read_to_end(&mut received))
+        .await
+        .expect("the half-close must deliver the retained ciphertext")
+        .expect("the TLS peer must end on close_notify, not on a truncated record");
+    assert_eq!(
+        received, payload,
+        "every byte must arrive before close_notify"
+    );
+
+    // The peer answers the half-close with its own close_notify, which ends the
+    // backend→client half through the Phase 2 drain.
+    tls_peer.shutdown().await.expect("TLS peer close_notify");
+    let result = tokio::time::timeout(DELIVERY_WINDOW, relay)
+        .await
+        .expect("the relay must finish after both half-closes")
+        .expect("relay task");
+    assert!(
+        result.first_failure.is_none(),
+        "an orderly TLS half-close must report no failure, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(result.bytes_client_to_backend, RUSTLS_PAYLOAD_LEN as u64);
+    assert_eq!(result.bytes_backend_to_client, 0);
+    drop(client_peer);
+}
+
+// ---------------------------------------------------------------------------
+// Writes that run before the relay starts
+// ---------------------------------------------------------------------------
+//
+// The relay owes a flush only for bytes it handed to a writer itself, so a
+// write that runs just before it starts has to flush on its own. Two do:
+// the TCP+TLS inspected-prefix forward, and the WebSocket tunnel-mode forward
+// of backend bytes recovered at the frame-codec boundary. The third, the
+// outbound PROXY v2 header, goes to a raw `TcpStream` and already flushes.
+// `shared_invariant_parity_tests.rs`
+// (`every_pre_relay_write_flushes_before_the_relay_starts`) pins that the
+// production paths use these helpers.
+
+/// The decrypted opening bytes first-bytes inspection consumed are the
+/// client's request. Written into a TLS backend leg whose transport is
+/// backpressured, they must still leave the rustls writer before the forward
+/// returns — otherwise the relay starts owing nothing, parks on a client that
+/// is waiting for the answer, and the backend never sees the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_inspected_prefix_is_flushed_through_rustls_before_the_relay_starts() {
+    let (mut tls_backend, mut tls_peer) = tls_session(RUSTLS_TRANSPORT_WINDOW).await;
+    let prefix = vec![0x47u8; RUSTLS_PAYLOAD_LEN];
+
+    let forward = tokio::spawn(async move {
+        let outcome =
+            tcp_forward_prefix_under_trust_fence_for_test(&mut tls_backend, &prefix, None).await;
+        // Hand the writer back so it is not dropped before the peer has read.
+        (outcome.is_ok(), tls_backend)
+    });
+
+    let mut seen = vec![0u8; RUSTLS_PAYLOAD_LEN];
+    tokio::time::timeout(DELIVERY_WINDOW, tls_peer.read_exact(&mut seen))
+        .await
+        .expect("the forwarded prefix must not stay in the rustls writer")
+        .expect("TLS peer read");
+    assert_eq!(seen, vec![0x47u8; RUSTLS_PAYLOAD_LEN]);
+
+    let (forwarded, _tls_backend) = tokio::time::timeout(DELIVERY_WINDOW, forward)
+        .await
+        .expect("the prefix forward must complete once the peer drains it")
+        .expect("forward task");
+    assert!(forwarded, "a live, unfenced backend forwards its prefix");
+}
+
+/// WebSocket tunnel mode forwards the backend bytes that arrived with the
+/// `101` — a server-first message — to the client before the raw relay starts.
+/// Written into the WSS frontend's rustls writer under backpressure, they must
+/// still reach the client: the relay starts owing nothing, and the client and
+/// backend may each be waiting for the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_tunnel_residual_bytes_are_flushed_through_rustls_before_the_relay_starts() {
+    let (mut tls_client, mut tls_frontend) = tls_session(RUSTLS_TRANSPORT_WINDOW).await;
+    let residual = vec![0x81u8; RUSTLS_PAYLOAD_LEN];
+
+    let forward = tokio::spawn(async move {
+        let mut offset = 0usize;
+        let outcome =
+            forward_ws_tunnel_residual_for_test(&mut tls_frontend, &residual, &mut offset).await;
+        // Hand the writer back so it is not dropped before the client has read.
+        (outcome, offset, tls_frontend)
+    });
+
+    let mut seen = vec![0u8; RUSTLS_PAYLOAD_LEN];
+    tokio::time::timeout(DELIVERY_WINDOW, tls_client.read_exact(&mut seen))
+        .await
+        .expect("the recovered backend bytes must not stay in the rustls writer")
+        .expect("TLS client read");
+    assert_eq!(seen, vec![0x81u8; RUSTLS_PAYLOAD_LEN]);
+
+    let (outcome, offset, _tls_frontend) = tokio::time::timeout(DELIVERY_WINDOW, forward)
+        .await
+        .expect("the residual forward must complete once the client drains it")
+        .expect("forward task");
+    outcome.expect("residual forward");
+    assert_eq!(
+        offset, RUSTLS_PAYLOAD_LEN,
+        "every residual byte the writer accepted is reported"
+    );
+}
+
+/// No residual, no write and no flush: a tunnel whose backend sent nothing
+/// with its `101` keeps its previous behaviour exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_ws_tunnel_residual_writes_and_flushes_nothing() {
+    let flushes = Arc::new(AtomicUsize::new(0));
+    let (buffered, _client_peer) = buffered_leg(PEER_BUFFER);
+    let mut client = FlushCounting::new(buffered, Arc::clone(&flushes));
+
+    let mut offset = 0usize;
+    forward_ws_tunnel_residual_for_test(&mut client, &[], &mut offset)
+        .await
+        .expect("an empty residual forward");
+
+    assert_eq!(offset, 0);
+    assert_eq!(
+        flushes.load(Ordering::SeqCst),
+        0,
+        "an empty residual must not add a flush"
+    );
 }
