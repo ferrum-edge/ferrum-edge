@@ -103,7 +103,7 @@ WORKFLOW_CONTRACTS = (
     (
         "release workflow",
         "build-release-arm64-cross",
-        "7e0ac3d9ab746a091c9e5460e114421663461722e964a261a6a3d9608aedaa52",
+        "e51d7ba7ea0199481f11e816010051e0546af158857c4129b2002ea95866a17b",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
@@ -160,7 +160,7 @@ DOCKER_PUBLISH_STEPS_MIDDLE = (
 DOCKER_PUBLISH_STEPS_TAIL = (
     "\n"
     "      - name: Set up Docker Buildx\n"
-    "        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4\n"
+    "        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4\n"
     "\n"
     "      - name: Log in to GitHub Container Registry\n"
     "        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4\n"
@@ -177,7 +177,7 @@ DOCKER_PUBLISH_STEPS_TAIL = (
     "\n"
     "      - name: Build and push per-platform digest\n"
     "        id: build\n"
-    "        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7\n"
+    "        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7\n"
     "        with:\n"
     "          context: docker-context\n"
     "          platforms: ${{ matrix.platform }}\n"
@@ -255,7 +255,7 @@ DOCKER_EBPF_TOOLS_BUILD_STEP = (
     "      - name: Build and push per-platform eBPF tools digest\n"
     "        id: build_tools\n"
     "        uses: docker/build-push-action"
-    "@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7\n"
+    "@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7\n"
     "        with:\n"
     "          context: .\n"
     "          file: Dockerfile\n"
@@ -534,7 +534,7 @@ CI_DOCKER_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -770,7 +770,7 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
 
 RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -1167,7 +1167,7 @@ RELEASE_DOCKER_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -1247,7 +1247,7 @@ RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -1564,7 +1564,7 @@ RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -1628,7 +1628,7 @@ RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -1645,7 +1645,7 @@ RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
 
       - name: Build and push per-platform eBPF digest
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -1672,7 +1672,7 @@ RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
 
 RELEASE_DOCKER_EBPF_BUILD_STEP = r"""      - name: Build and push per-platform eBPF digest
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -2602,7 +2602,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       # GitHub Actions cache is a 10 GB repository quota with LRU eviction
       # across every ref. `type=gha,mode=max` exports multi-gigabyte BuildKit
@@ -2618,7 +2618,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
       # the full target is smoked below; running it first surfaces a broken tool
       # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
       - name: Build the capture tool base stage
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -2631,7 +2631,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
 
       # The exact target the mesh chart's `-ebpf-tools` tag publishes.
       - name: Build the production Ambient UDP lifecycle runtime
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -2678,7 +2678,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
       # distroless. Proving the tools image alone would let a later change
       # "fix" this finding by quietly adding a shell to `-ebpf` instead.
       - name: Build the distroless eBPF runtime
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -2739,7 +2739,7 @@ AMBIENT_REGISTRY_IMAGE_READ_JOB = r"""  ambient-host-udp-image-read:
           persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       # Registry cache leaves the Actions cache allowance for compiler data.
       # Each target has its own cache graph. Missing cache still builds cold.
@@ -2749,7 +2749,7 @@ AMBIENT_REGISTRY_IMAGE_READ_JOB = r"""  ambient-host-udp-image-read:
       # the full target is smoked below; running it first surfaces a broken tool
       # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
       - name: Build the capture tool base stage
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -2761,7 +2761,7 @@ AMBIENT_REGISTRY_IMAGE_READ_JOB = r"""  ambient-host-udp-image-read:
 
       # The exact target the mesh chart's `-ebpf-tools` tag publishes.
       - name: Build the production Ambient UDP lifecycle runtime
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -2807,7 +2807,7 @@ AMBIENT_REGISTRY_IMAGE_READ_JOB = r"""  ambient-host-udp-image-read:
       # distroless. Proving the tools image alone would let a later change
       # "fix" this finding by quietly adding a shell to `-ebpf` instead.
       - name: Build the distroless eBPF runtime
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -2872,7 +2872,7 @@ AMBIENT_REGISTRY_IMAGE_WRITE_JOB = r"""  ambient-host-udp-image-write:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       # Registry cache leaves the Actions cache allowance for compiler data.
       # Each target has its own cache graph. Missing cache still builds cold.
@@ -2882,7 +2882,7 @@ AMBIENT_REGISTRY_IMAGE_WRITE_JOB = r"""  ambient-host-udp-image-write:
       # the full target is smoked below; running it first surfaces a broken tool
       # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
       - name: Build the capture tool base stage
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -2895,7 +2895,7 @@ AMBIENT_REGISTRY_IMAGE_WRITE_JOB = r"""  ambient-host-udp-image-write:
 
       # The exact target the mesh chart's `-ebpf-tools` tag publishes.
       - name: Build the production Ambient UDP lifecycle runtime
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -2942,7 +2942,7 @@ AMBIENT_REGISTRY_IMAGE_WRITE_JOB = r"""  ambient-host-udp-image-write:
       # distroless. Proving the tools image alone would let a later change
       # "fix" this finding by quietly adding a shell to `-ebpf` instead.
       - name: Build the distroless eBPF runtime
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -3375,7 +3375,7 @@ NODE_DEFAULT_REGISTRY_READ_JOB = r"""  production-dockerfile-smoke-default:
         run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Record registry cache policy
         if: github.event.inputs.force_cold_cache != 'true'
@@ -3398,7 +3398,7 @@ NODE_DEFAULT_REGISTRY_READ_JOB = r"""  production-dockerfile-smoke-default:
 
       - name: Build ordinary production runtime with registry cache
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -3412,7 +3412,7 @@ NODE_DEFAULT_REGISTRY_READ_JOB = r"""  production-dockerfile-smoke-default:
 
       - name: Build ordinary production runtime (cold cache)
         if: github.event.inputs.force_cold_cache == 'true'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -3496,7 +3496,7 @@ NODE_DEFAULT_REGISTRY_WRITE_JOB = r"""  production-dockerfile-smoke-default-writ
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Record registry cache policy
         if: github.event.inputs.force_cold_cache != 'true'
@@ -3519,7 +3519,7 @@ NODE_DEFAULT_REGISTRY_WRITE_JOB = r"""  production-dockerfile-smoke-default-writ
 
       - name: Build ordinary production runtime with registry cache
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
@@ -3534,7 +3534,7 @@ NODE_DEFAULT_REGISTRY_WRITE_JOB = r"""  production-dockerfile-smoke-default-writ
 
       - name: Build ordinary production runtime (cold cache)
         if: github.event.inputs.force_cold_cache == 'true'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
