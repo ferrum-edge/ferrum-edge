@@ -577,10 +577,12 @@ unauthenticated caller still receives `401`.
 
 ```bash
 # Get the first 50 proxies
-curl http://localhost:9000/proxies?limit=50
+curl -s "http://localhost:9000/proxies?limit=50" \
+  -H "Authorization: Bearer $TOKEN"
 
 # Get the next 50
-curl http://localhost:9000/proxies?limit=50&offset=50
+curl -s "http://localhost:9000/proxies?limit=50&offset=50" \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 ### Response Format
