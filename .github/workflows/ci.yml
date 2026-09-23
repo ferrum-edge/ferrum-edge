@@ -1151,6 +1151,7 @@ jobs:
               integration::file_mode_admin_jwt_tests
               integration::file_mode_reload_observability_tests
               integration::admin_cached_config_tests
+              integration::admin_conditional_write_tests
               integration::admin_cross_namespace_refs_tests
               integration::upstream_name_uniqueness_tests
               integration::admin_mesh_config_drift_tests
