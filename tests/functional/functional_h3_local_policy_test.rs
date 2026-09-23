@@ -8,7 +8,7 @@ use crate::scaffolding::clients::{Http3Client, Http3Response};
 use crate::scaffolding::{reserve_colocated_tcp_udp, reserve_port};
 
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
-use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::config::types::{GatewayConfig, PluginAssociation};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::ServeOptions;
 use ferrum_edge::modes::mesh::{MeshRuntimeConfig, prepare_gateway_config_for_mesh};
@@ -244,6 +244,11 @@ async fn functional_h3_route_request_timeout_refuses_plain_http_before_dispatch(
         }))
         .expect("route deadline plugin config is valid"),
     );
+    // A proxy-scoped plugin runs only when its proxy lists it; without this
+    // association the rule never matches and no deadline is ever published.
+    config.proxies[0].plugins.push(PluginAssociation {
+        plugin_config_id: "h3-route-request-deadline".to_string(),
+    });
     let gateway = start_h3_policy_gateway(config)
         .await
         .expect("start h3 route-deadline gateway");
