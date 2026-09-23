@@ -595,16 +595,18 @@ request cannot normalize those comments. Correct them only as part of an
 authorized, coordinated rotation of the trusted policy; do not copy the legacy
 annotation onto new uses.
 
-The install-action v2.87.11 pin (`9534c846…`) now covers `ci.yml`,
+The install-action v2.87.15 pin (`4076c08d…`) covers `ci.yml`,
 `dependency-audit.yml`, the coverage workflow, and the ARM64 release producer.
-The previously frozen coverage and `build-release-arm64-cross` uses were
-rotated in the same trusted-policy update, and `WORKFLOW_CONTRACTS` job digests
-for `main-linux-image` and `build-release-arm64-cross` were recomputed over the
-resulting text (the Linux CI image job also moved onto the current distroless
-digest). The v2.87.11 action retains the composite runtime, checksum verification
-default, and existing `tool`/`fallback` inputs. Dependabot updates that retarget
-already-rotated uses can land via ordinary PR; a SHA change inside a Cross-frozen
-job still requires a coordinated trusted-policy rotation.
+The release producer's `WORKFLOW_CONTRACTS` job digest was rotated with the pin;
+the action retains the existing `tool`/`fallback` inputs.
+
+The docker/setup-buildx-action v4.4.1 pin (`f87e5991…`) and
+docker/build-push-action v7.4.0 pin (`c3c9e263…`) cover the release publication
+jobs and the image build workflows. The trusted ARM64 publication exact-job,
+step, and artifact-selection contracts, along with the NodeWaypoint and Ambient
+registry-cache jobs and the CI runtime-cache pin checks, were rotated to those
+same SHAs. Future SHA changes inside a frozen job require a coordinated
+trusted-policy rotation even when the action inputs stay the same.
 
 #### Scope of the repository-script (automation) freeze
 
