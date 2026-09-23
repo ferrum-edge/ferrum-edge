@@ -39,7 +39,8 @@ citations):
   `GATEWAY-HTTP,GATEWAY-GRPC`, supported features
   `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute` plus the Extended filter features
   `HTTPRouteResponseHeaderModification`, `HTTPRoutePathRewrite` and
-  `HTTPRouteHostRewrite`, GatewayClass `ferrum`,
+  `HTTPRouteHostRewrite` and the rule-timeout features `HTTPRouteRequestTimeout`
+  and `HTTPRouteBackendTimeout`, GatewayClass `ferrum`,
   controller `ferrum.io/gateway-controller`. Live `TCPRoute` and `TLSRoute`
   data-plane behavior is release-gated by Ferrum black-box checks in the same
   workflow. `UDPRoute` is release-gated by the required `Tests` aggregate
@@ -150,13 +151,34 @@ reviewers can compare the generated matrix to the declared product promise.
 HTTPRoute and GRPCRoute support rule-level `RequestHeaderModifier` and
 `ResponseHeaderModifier`; HTTPRoute also supports `RequestRedirect` and
 `URLRewrite` (both HTTPRoute-only upstream — a GRPCRoute asking for either is
-still refused). RequestMirror, ExtensionRef, CORS, ExternalAuth and
-backend-reference filters remain deferred. Translation rejects a route
-containing these unimplemented filter actions with `Accepted=False` /
-`IncompatibleFilters`; it does not emit partially interpreted rules. Unknown
-filter types and unimplemented rule fields, including timeouts and retry, report
+still refused) and rule-level `timeouts` (below). RequestMirror, ExtensionRef,
+CORS, ExternalAuth and backend-reference filters remain deferred. Translation
+rejects a route containing these unimplemented filter actions with
+`Accepted=False` / `IncompatibleFilters`; it does not emit partially interpreted
+rules. Unknown filter types and unimplemented rule fields — `retry` on either
+kind, and `timeouts` on a GRPCRoute, which upstream does not define — report
 `UnsupportedValue`. Both cases report `Programmed=False`, while independently
 valid routes remain available.
+
+**Rule `timeouts` (HTTPRoute).** `timeouts.request` and
+`timeouts.backendRequest` are validated exactly as the pinned standard-channel
+CRD does: each must match the GEP-2257 duration grammar, and a non-zero
+`request` must not be shorter than `backendRequest` (the CRD's CEL rule).
+Violations, a non-string value and a non-object `timeouts` are `Invalid`; an
+undefined `timeouts` sub-field is `UnsupportedValue`. `0s` disables either
+bound. `backendRequest` bounds one backend attempt (its wait for response
+headers and the idle gap between response frames) and answers the ordinary
+backend-timeout `504`. `request` is one absolute budget, anchored at request
+receipt, covering every attempt, retry backoff and the streaming response body:
+before the response head a non-gRPC request gets a gateway `504`
+(`{"error":"Request timeout"}`), a body still streaming at the deadline is
+reset (HTTP/2) or its connection closed (HTTP/1.1), and a gRPC request folds the
+budget into its RPC deadline and ends with `DEADLINE_EXCEEDED`. Both values stay
+on the rule's own dispatch entry, so sibling and merged rules keep the proxy
+defaults. **Known gap:** native HTTP/3 cannot yet enforce `request` on a
+non-gRPC request, so such a request is refused with `503` before any dial rather
+than served without its deadline; the same request over HTTP/1.1 or HTTP/2 is
+bounded. Upgraded WebSocket / CONNECT-UDP tunnels are not bounded by `request`.
 
 Filter shapes are refused rather than partially honored, and the status reason
 follows what is wrong rather than which CRD mechanism forbids it:
@@ -202,7 +224,8 @@ trailers in either case — `ResponseHeaderModifier` governs response headers
 only, which for a native gRPC call is the initial metadata.
 
 The field inventory admits rule name, matches, backendRefs, filters and
-sessionPersistence, each subject to its existing validation. Empty backend
+sessionPersistence, plus `timeouts` on HTTPRoute, each subject to its existing
+validation. Empty backend
 filter lists have no action and remain accepted. Extra fields on a supported
 filter or its payload are refused. The integration regression
 `unsupported_http_and_grpc_route_features_are_refused_before_materialization`
@@ -232,7 +255,16 @@ checks that dropping a filter emits no rewrite, response transform, or consumer
 plugin; the live reconciler replaces those generated ids on every compose
 because `istio-vs-resp-xform-` is a managed plugin-id prefix. The upstream
 `HTTPRouteResponseHeaderModifier`, `HTTPRouteRewritePath` and
-`HTTPRouteRewriteHost` conformance tests run and pass in the hosted lab. Default
+`HTTPRouteRewriteHost` conformance tests run and pass in the hosted lab. The
+upstream `HTTPRouteTimeoutRequest` and `HTTPRouteTimeoutBackendRequest` tests
+now run too (their features are declared). Four more data-plane regressions
+cover rule timeouts:
+`gateway_route_timeouts_reach_the_data_plane` (pre-head `504`, mid-body cut,
+`backendRequest` inside a larger `request` budget, `0s`, sibling isolation),
+`gateway_route_request_timeout_spans_retry_attempts_and_backoff` (one budget
+across attempts and backoff under an operator-configured proxy retry),
+`gateway_route_request_timeout_ends_grpc_calls_with_deadline_exceeded` and
+`removing_rule_timeouts_withdraws_the_deadline`. Default
 HTTPRoute matches use the same internal predicate conversion as explicit
 matches, so supported actions do not emit an invalid raw Gateway API path field.
 The pinned [HTTPRoute v1.5.1 schema](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/httproute_types.go)

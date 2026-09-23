@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Gateway API HTTPRoute rule-level `timeouts` (#5646). `timeouts.backendRequest`
+  bounds each backend attempt and `timeouts.request` is one total deadline for
+  the whole request, including retries, retry backoff and the streaming response
+  body. Both are validated like the pinned v1.5.1 CRD, and `0s` disables either.
+  A request that runs out of time before the response head gets a `504`. A
+  response body still streaming at the deadline is reset (HTTP/2) or its
+  connection closed (HTTP/1.1). gRPC calls end with `DEADLINE_EXCEEDED`. The
+  timeouts apply only to the rule that declares them. `mesh_route_dispatch`
+  rules gain the matching `request_timeout_ms` field. Native HTTP/3 cannot
+  enforce the total deadline for non-gRPC requests yet, so it refuses those
+  requests with `503` instead of serving them without the deadline. CI now
+  declares `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`.
+  `rules[].retry` is still refused.
+
 - Conditional full-replacement writes (#5659). `GET` on proxies, upstreams,
   consumers, and plugin configs returns a strong `ETag`; `PUT`/`DELETE` with a
   non-matching `If-Match` is refused with `412` and writes nothing, so a draft

@@ -11701,6 +11701,21 @@ pub mod _test_support {
         body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
     }
 
+    /// Parse a Gateway API Duration (GEP-2257) exactly as the HTTPRoute
+    /// `timeouts` admission does.
+    pub fn parse_gateway_api_duration_ms_for_test(value: &str) -> Option<u64> {
+        crate::config_sources::k8s::parse_gateway_api_duration_ms(value)
+    }
+
+    /// Apply a route rule's total request deadline to a NON-gRPC response
+    /// body, exactly as the H1/H2 response funnel does.
+    pub fn proxy_body_with_route_request_deadline_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: tokio::time::Instant,
+    ) -> crate::proxy::ProxyBody {
+        body.with_route_request_deadline(deadline)
+    }
+
     pub fn proxy_body_into_grpc_web_streaming_for_test(
         body: crate::proxy::ProxyBody,
         content_type: &str,

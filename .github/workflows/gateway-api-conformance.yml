@@ -21,7 +21,7 @@ on:
       supported_features:
         description: Comma-separated Gateway API conformance features
         required: false
-        default: Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,HTTPRouteResponseHeaderModification,HTTPRoutePathRewrite,HTTPRouteHostRewrite
+        default: Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,HTTPRouteResponseHeaderModification,HTTPRoutePathRewrite,HTTPRouteHostRewrite,HTTPRouteRequestTimeout,HTTPRouteBackendTimeout
       skip_tests:
         description: Optional space-separated upstream conformance tests to skip
         required: false
@@ -163,11 +163,11 @@ jobs:
             conformance_profile="GATEWAY-HTTP,GATEWAY-GRPC"
           fi
           if [ -z "$supported_features" ]; then
-            # Extended feature names are declared only for filters Ferrum
-            # implements end to end (issue #5646). Adding a name here makes
+            # Extended feature names are declared only for filters and rule
+            # fields Ferrum implements end to end (issue #5646). Adding a name here makes
             # the upstream suite RUN that feature's tests, so never declare
             # one ahead of the implementation.
-            supported_features="Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,HTTPRouteResponseHeaderModification,HTTPRoutePathRewrite,HTTPRouteHostRewrite"
+            supported_features="Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,HTTPRouteResponseHeaderModification,HTTPRoutePathRewrite,HTTPRouteHostRewrite,HTTPRouteRequestTimeout,HTTPRouteBackendTimeout"
           fi
           {
             echo "gateway_api_version=$gateway_api_version"

@@ -1011,6 +1011,54 @@ impl ProxyBody {
         self
     }
 
+    /// Bound a NON-gRPC streaming response by the matched route rule's total
+    /// request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway API
+    /// `HTTPRoute.rules[].timeouts.request`).
+    ///
+    /// The instant is absolute and armed once, so a backend that streams
+    /// continuously or trickles frames under the per-frame idle bound is still
+    /// cut at the deadline. HTTP has no legal terminal metadata once the head
+    /// is committed, so expiry ends the body with a `TimedOut` transport error
+    /// before or after response DATA alike: hyper resets the HTTP/2 stream and
+    /// closes the HTTP/1.1 connection rather than presenting a clean EOF a
+    /// client could mistake for a complete response. The deferred logger and
+    /// dispatch accounting classify that error as `ReadWriteTimeout`.
+    ///
+    /// A buffered (`Full`) body is already complete and is returned unchanged,
+    /// as is a body already at end of stream under a deadline that has not
+    /// elapsed, so a finished response keeps its framing.
+    pub(crate) fn with_route_request_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        if http_body::Body::is_end_stream(&self) && tokio::time::Instant::now() < deadline {
+            return self;
+        }
+        let placeholder = ProxyBodyKind::Full(Full::default());
+        let previous = std::mem::replace(&mut self.kind, placeholder);
+        self.kind = match previous {
+            ProxyBodyKind::Stream(body) => {
+                ProxyBodyKind::Stream(Box::pin(TotalDeadlineBody::with_terminal(
+                    body,
+                    Some(deadline),
+                    None,
+                    Arc::new(AtomicBool::new(false)),
+                    DeadlineTerminal::ROUTE_REQUEST_TIMEOUT,
+                    None,
+                )))
+            }
+            ProxyBodyKind::Tracked(body) => {
+                ProxyBodyKind::Stream(Box::pin(TotalDeadlineBody::with_terminal(
+                    body,
+                    Some(deadline),
+                    None,
+                    Arc::new(AtomicBool::new(false)),
+                    DeadlineTerminal::ROUTE_REQUEST_TIMEOUT,
+                    None,
+                )))
+            }
+            full @ ProxyBodyKind::Full(_) => full,
+        };
+        self
+    }
+
     fn with_client_grpc_deadline_fired_flag(mut self, fired: Arc<AtomicBool>) -> Self {
         self.client_grpc_deadline_fired = Some(fired);
         self
@@ -4553,6 +4601,20 @@ impl DeadlineTerminal {
         // requests, so native trailers are the correct terminal here.
         native_grpc_trailers: true,
         pre_data_message: "gRPC streaming response exceeded the client grpc-timeout deadline",
+        auth_termination: None,
+    };
+
+    /// The matched route rule's total request deadline on a NON-gRPC response
+    /// (Gateway API `HTTPRoute.rules[].timeouts.request`). A gRPC request folds
+    /// that deadline into its client RPC deadline instead, so this terminal
+    /// never carries gRPC metadata: both arms end the body with a `TimedOut`
+    /// transport error, and the `grpc-*` fields are never emitted.
+    const ROUTE_REQUEST_TIMEOUT: Self = Self {
+        grpc_status_header: GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+        grpc_message_header: GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+        post_data_message: "response exceeded the route request timeout after response data",
+        native_grpc_trailers: false,
+        pre_data_message: "response exceeded the route request timeout",
         auth_termination: None,
     };
 }

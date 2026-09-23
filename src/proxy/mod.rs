@@ -32790,6 +32790,11 @@ async fn handle_proxy_request_inner(
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
         .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
+    // `before_proxy` has selected the route rule, so arm its total request
+    // deadline (Gateway API `timeouts.request`). gRPC folds it into the RPC
+    // deadline; every other request carries `route_request_deadline_at`, which
+    // bounds the dispatch attempts, retry backoff, and response body below.
+    ctx.arm_route_request_deadline(is_grpc_request);
 
     // Istio `VirtualService.http[].rewrite.uri`: `mesh_route_dispatch` set
     // `ctx.route_override_path` for the matched route. Rebase the request path
@@ -33042,6 +33047,9 @@ async fn handle_proxy_request_inner(
         // accounting well beyond the destinations this rebind exists to honor.
         let previous_proxy = Arc::clone(&proxy);
         proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
+        // A deferred hook may have re-published route overrides; re-arming is
+        // idempotent (the gRPC fold only ever shortens the budget).
+        ctx.arm_route_request_deadline(is_grpc_request);
         // `apply_route_overrides_with_upstreams` is idempotent: it hands back
         // the SAME `Arc` when the already-baked proxy reflects every override,
         // so pointer identity against the retained pre-pass `Arc` is an exact,
@@ -37820,6 +37828,12 @@ async fn handle_proxy_request_inner(
     // backend served this response, so the sticky-affinity reissue below must
     // not pin the client to it.
     let mut sticky_dispatch_refused = false;
+    // The matched rule's total request deadline for this NON-gRPC request
+    // (`None` for gRPC, which folded it into `grpc_deadline_at`). It bounds
+    // every dispatch attempt and retry backoff below; expiry ends the request
+    // with the gateway-authored 504 and is never retried.
+    let route_request_deadline = ctx.route_request_deadline_at();
+    let mut route_request_timeout_phase: Option<&'static str> = None;
     // `mut`: the pre-commitment authorization terminal below neutralizes the
     // health inputs of a dispatch the gateway itself cancelled (#3815).
     let (mut backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
@@ -37831,35 +37845,45 @@ async fn handle_proxy_request_inner(
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
         let mut body_hook_ctx = deferred_body_hook_ctx.take();
-        let initial_dispatch = proxy_to_backend(
-            &state,
-            &proxy,
-            &current_url,
-            &method,
-            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
-            client_request_body,
-            upstream_target.as_deref(),
-            &plugins,
-            backend_admission_plugins.as_ref(),
-            std::mem::take(&mut preacquired_backend_admission),
-            body_hook_ctx.as_mut(),
-            &ctx,
-            should_stream,
-            requires_request_body_buffering,
-            stream_request_body,
-            has_retry,
-            request_body_prepared,
-            &request_client_ip,
-            &request_xff_append_ip,
-            ctx.request_is_secure,
-            current_dispatch_hbone,
-            current_dispatch_mesh_mtls,
-            current_dispatch_h3,
-            &bytes_sent_observed,
-            inbound_version,
-            &mut backend_admission_started_at,
+        let initial_dispatch = match await_route_request_deadline(
+            route_request_deadline,
+            proxy_to_backend(
+                &state,
+                &proxy,
+                &current_url,
+                &method,
+                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                client_request_body,
+                upstream_target.as_deref(),
+                &plugins,
+                backend_admission_plugins.as_ref(),
+                std::mem::take(&mut preacquired_backend_admission),
+                body_hook_ctx.as_mut(),
+                &ctx,
+                should_stream,
+                requires_request_body_buffering,
+                stream_request_body,
+                has_retry,
+                request_body_prepared,
+                &request_client_ip,
+                &request_xff_append_ip,
+                ctx.request_is_secure,
+                current_dispatch_hbone,
+                current_dispatch_mesh_mtls,
+                current_dispatch_h3,
+                &bytes_sent_observed,
+                inbound_version,
+                &mut backend_admission_started_at,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(dispatch) => dispatch,
+            Err(expiry) => {
+                route_request_timeout_phase = Some(expiry.phase());
+                route_request_timeout_dispatch_result(expiry)
+            }
+        };
         if let Some(mut body_hook_ctx) = body_hook_ctx.take() {
             if body_hook_ctx.gateway_deadline_response_selected() {
                 ctx.mark_gateway_deadline_response_selected();
@@ -37918,7 +37942,9 @@ async fn handle_proxy_request_inner(
             }
         };
 
-        while retry::should_retry(retry_config, &method, &result, attempt) {
+        while route_request_timeout_phase.is_none()
+            && retry::should_retry(retry_config, &method, &result, attempt)
+        {
             ctx.record_backend_dispatch_outcome(result.error_class, !result.connection_error);
             // Re-check the CURRENT target's DestinationRule maxRetries before
             // authorizing another retry. Use the original route ceiling (not a
@@ -38084,6 +38110,21 @@ async fn handle_proxy_request_inner(
                         owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                         result.backend_resolved_ip.clone(),
                     );
+                    break;
+                }
+            } else if let Some(deadline) = route_request_deadline {
+                if tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+                    .await
+                    .is_err()
+                {
+                    // The attempt that led into this backoff was already
+                    // charged above; the deadline expired in the gateway's own
+                    // backoff, so the terminal is health-neutral.
+                    result = route_request_timeout_response(
+                        result.backend_resolved_ip.clone(),
+                        retry::ErrorClass::DispatchPolicyRejected,
+                    );
+                    route_request_timeout_phase = Some(ROUTE_REQUEST_TIMEOUT_PHASE_RETRY_BACKOFF);
                     break;
                 }
             } else {
@@ -38438,8 +38479,9 @@ async fn handle_proxy_request_inner(
             // `current_dispatch_h3` was either kept from the prior attempt
             // (same target → same protocol) or recomputed above for the
             // new target (rotation → match the new target's capability).
-            result = if retry_dispatch_hbone || retry_dispatch_mesh_mtls {
-                let (response, request_body_exceeded, read_timeout_ms) =
+            let attempt_result = if retry_dispatch_hbone || retry_dispatch_mesh_mtls {
+                match await_route_request_deadline(
+                    route_request_deadline,
                     proxy_to_backend_mesh_retry(
                         &state,
                         &proxy,
@@ -38457,47 +38499,72 @@ async fn handle_proxy_request_inner(
                         &request_xff_append_ip,
                         ctx.request_is_secure,
                         &bytes_sent_observed,
-                    )
-                    .await;
-                mesh_request_body_exceeded = request_body_exceeded;
-                streaming_h2_read_timeout_ms = Some(read_timeout_ms);
-                response
+                    ),
+                )
+                .await
+                {
+                    Ok((response, request_body_exceeded, read_timeout_ms)) => {
+                        mesh_request_body_exceeded = request_body_exceeded;
+                        streaming_h2_read_timeout_ms = Some(read_timeout_ms);
+                        Ok(response)
+                    }
+                    Err(expiry) => {
+                        mesh_request_body_exceeded = None;
+                        Err(expiry)
+                    }
+                }
             } else if current_dispatch_h3 {
-                proxy_to_backend_http3_retry(
-                    &state,
-                    &proxy,
-                    &current_url,
-                    &method,
-                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
-                    current_target.as_deref(),
-                    retained_body.as_deref(),
-                    should_stream,
-                    &plugins,
-                    &ctx,
-                    &ctx.client_ip,
-                    &request_xff_append_ip,
-                    ctx.request_is_secure,
-                    inbound_version,
+                await_route_request_deadline(
+                    route_request_deadline,
+                    proxy_to_backend_http3_retry(
+                        &state,
+                        &proxy,
+                        &current_url,
+                        &method,
+                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        current_target.as_deref(),
+                        retained_body.as_deref(),
+                        should_stream,
+                        &plugins,
+                        &ctx,
+                        &ctx.client_ip,
+                        &request_xff_append_ip,
+                        ctx.request_is_secure,
+                        inbound_version,
+                    ),
                 )
                 .await
             } else {
-                proxy_to_backend_retry(
-                    &state,
-                    &proxy,
-                    &current_url,
-                    &method,
-                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
-                    current_target.as_deref(),
-                    retained_body.as_deref(),
-                    should_stream,
-                    &plugins,
-                    &ctx,
-                    &ctx.client_ip,
-                    &request_xff_append_ip,
-                    ctx.request_is_secure,
-                    inbound_version,
+                await_route_request_deadline(
+                    route_request_deadline,
+                    proxy_to_backend_retry(
+                        &state,
+                        &proxy,
+                        &current_url,
+                        &method,
+                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        current_target.as_deref(),
+                        retained_body.as_deref(),
+                        should_stream,
+                        &plugins,
+                        &ctx,
+                        &ctx.client_ip,
+                        &request_xff_append_ip,
+                        ctx.request_is_secure,
+                        inbound_version,
+                    ),
                 )
                 .await
+            };
+            // A cancelled attempt was dialed at `current_target`, so it still
+            // names the backend that failed to answer within the deadline; the
+            // loop guard then stops the retry planner.
+            result = match attempt_result {
+                Ok(response) => response,
+                Err(expiry) => {
+                    route_request_timeout_phase = Some(expiry.phase());
+                    route_request_timeout_response(None, expiry.error_class())
+                }
             };
             // Retry helpers can reject the selected target before dialing it
             // (most notably when the egress policy blocks its resolved
@@ -38530,35 +38597,45 @@ async fn handle_proxy_request_inner(
         (result, current_cb_target_key, final_upstream_target)
     } else {
         let mut body_hook_ctx = deferred_body_hook_ctx.take();
-        let dispatch = proxy_to_backend(
-            &state,
-            &proxy,
-            &backend_url,
-            &method,
-            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
-            client_request_body,
-            upstream_target.as_deref(),
-            &plugins,
-            backend_admission_plugins.as_ref(),
-            std::mem::take(&mut preacquired_backend_admission),
-            body_hook_ctx.as_mut(),
-            &ctx,
-            should_stream,
-            requires_request_body_buffering,
-            stream_request_body,
-            false, // no retry — don't retain body
-            request_body_prepared,
-            &request_client_ip,
-            &request_xff_append_ip,
-            ctx.request_is_secure,
-            current_dispatch_hbone,
-            current_dispatch_mesh_mtls,
-            current_dispatch_h3,
-            &bytes_sent_observed,
-            inbound_version,
-            &mut backend_admission_started_at,
+        let dispatch = match await_route_request_deadline(
+            route_request_deadline,
+            proxy_to_backend(
+                &state,
+                &proxy,
+                &backend_url,
+                &method,
+                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                client_request_body,
+                upstream_target.as_deref(),
+                &plugins,
+                backend_admission_plugins.as_ref(),
+                std::mem::take(&mut preacquired_backend_admission),
+                body_hook_ctx.as_mut(),
+                &ctx,
+                should_stream,
+                requires_request_body_buffering,
+                stream_request_body,
+                false, // no retry — don't retain body
+                request_body_prepared,
+                &request_client_ip,
+                &request_xff_append_ip,
+                ctx.request_is_secure,
+                current_dispatch_hbone,
+                current_dispatch_mesh_mtls,
+                current_dispatch_h3,
+                &bytes_sent_observed,
+                inbound_version,
+                &mut backend_admission_started_at,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(dispatch) => dispatch,
+            Err(expiry) => {
+                route_request_timeout_phase = Some(expiry.phase());
+                route_request_timeout_dispatch_result(expiry)
+            }
+        };
         if let Some(mut body_hook_ctx) = body_hook_ctx {
             if body_hook_ctx.gateway_deadline_response_selected() {
                 ctx.mark_gateway_deadline_response_selected();
@@ -38615,6 +38692,12 @@ async fn handle_proxy_request_inner(
         };
         (resp, cb_target_key.clone(), upstream_target.clone())
     };
+    if let Some(phase) = route_request_timeout_phase {
+        ctx.mark_route_request_timeout_exceeded(phase);
+        // No backend answered within the rule deadline, so the response below
+        // is gateway-authored and must not mint session affinity.
+        sticky_dispatch_refused = true;
+    }
     // Re-derive the Gateway API session-persistence decision now that dispatch
     // is final. Selection made its call BEFORE any backend was dialed, so an
     // honored binding carried `false` even when the retry loop above then
@@ -40668,6 +40751,16 @@ async fn handle_proxy_request_inner(
     //
     // Installed out of line for the same stack-budget reason as the native-gRPC
     // funnel above; see `install_response_authorization_deadline`.
+    //
+    // The matched route rule's total request deadline wraps INSIDE the
+    // authorization bound for the same reason the client `grpc-timeout`
+    // wrapper does: whichever instant is earlier fires first and ends the
+    // body, so the two can never both complete. Only NON-gRPC requests carry
+    // it (gRPC folded it into its RPC deadline above), and a buffered body is
+    // returned unchanged.
+    if let Some(deadline) = route_request_deadline {
+        body = body.with_route_request_deadline(deadline);
+    }
     body = install_response_authorization_deadline(
         body,
         &ctx,
@@ -48592,6 +48685,159 @@ fn client_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry:
     response.error_class = Some(retry::ErrorClass::ClientDisconnect);
     response.connection_error = false;
     response
+}
+
+/// Transaction-log phase for a route deadline that expired while a backend
+/// attempt was in flight.
+pub(crate) const ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH: &str = "dispatch";
+/// Transaction-log phase for a route deadline that had already expired when a
+/// backend attempt was about to start, so none was started.
+pub(crate) const ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH: &str = "before_dispatch";
+/// Transaction-log phase for a route deadline that expired in retry backoff.
+pub(crate) const ROUTE_REQUEST_TIMEOUT_PHASE_RETRY_BACKOFF: &str = "retry_backoff";
+/// Fixed client-visible body for a route-deadline `504`. It names no backend,
+/// target, or configured duration.
+pub(crate) const ROUTE_REQUEST_TIMEOUT_BODY: &str = r#"{"error":"Request timeout"}"#;
+
+/// How a route rule's total request deadline ended one backend attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteDeadlineExpiry {
+    /// The deadline had already elapsed, so the attempt was never started:
+    /// nothing was dialed and no request byte left the gateway.
+    BeforeDispatch,
+    /// The deadline elapsed while the attempt was in flight, and the attempt
+    /// was cancelled.
+    InFlight,
+}
+
+impl RouteDeadlineExpiry {
+    fn phase(self) -> &'static str {
+        match self {
+            Self::BeforeDispatch => ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH,
+            Self::InFlight => ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH,
+        }
+    }
+
+    /// Only an attempt the backend actually failed to answer in time is a
+    /// backend-health signal. A deadline spent before the attempt started is
+    /// the gateway's own policy refusing to dispatch, and stays neutral to the
+    /// circuit breaker, passive health, and adaptive concurrency.
+    fn error_class(self) -> retry::ErrorClass {
+        match self {
+            Self::BeforeDispatch => retry::ErrorClass::DispatchPolicyRejected,
+            Self::InFlight => retry::ErrorClass::ReadWriteTimeout,
+        }
+    }
+}
+
+/// Await one backend attempt under a route rule's total request deadline.
+///
+/// `None` is the unbounded fast path: the attempt is polled directly and no
+/// timer exists. A deadline that has already elapsed on the first poll refuses
+/// the attempt WITHOUT polling it, so a request whose budget was spent in
+/// gateway-local phases never reaches a backend. Otherwise the attempt is
+/// cancelled at the deadline; dropping it releases its admission permits,
+/// upload, and pooled stream exactly as a client disconnect would.
+pub(crate) fn await_route_request_deadline<F>(
+    deadline: Option<tokio::time::Instant>,
+    attempt: F,
+) -> RouteDeadlineAttempt<F>
+where
+    F: std::future::Future,
+{
+    RouteDeadlineAttempt {
+        attempt,
+        sleep: None,
+        deadline,
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Future returned by [`await_route_request_deadline`].
+    ///
+    /// Hand-written rather than an `async fn` so the (large) backend attempt
+    /// future is stored inline exactly once and the request handler's frame
+    /// does not grow on every request: the deadline-free path adds one
+    /// `Option` check per poll, and the timer is armed only when a deadline
+    /// exists and the attempt first returns `Pending`.
+    pub(crate) struct RouteDeadlineAttempt<F> {
+        #[pin]
+        attempt: F,
+        #[pin]
+        sleep: Option<tokio::time::Sleep>,
+        deadline: Option<tokio::time::Instant>,
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for RouteDeadlineAttempt<F> {
+    type Output = Result<F::Output, RouteDeadlineExpiry>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let Some(deadline) = *this.deadline else {
+            return this.attempt.poll(cx).map(Ok);
+        };
+        // No timer yet means the attempt has never returned `Pending`: this is
+        // its first poll, so a spent budget refuses it before any work starts.
+        if this.sleep.is_none() && deadline <= tokio::time::Instant::now() {
+            return Poll::Ready(Err(RouteDeadlineExpiry::BeforeDispatch));
+        }
+        if let Poll::Ready(output) = this.attempt.poll(cx) {
+            return Poll::Ready(Ok(output));
+        }
+        if this.sleep.is_none() {
+            this.sleep.set(Some(tokio::time::sleep_until(deadline)));
+        }
+        if let Some(sleep) = this.sleep.as_pin_mut()
+            && sleep.poll(cx).is_ready()
+        {
+            return Poll::Ready(Err(RouteDeadlineExpiry::InFlight));
+        }
+        Poll::Pending
+    }
+}
+
+/// Gateway-authored `504` for a NON-gRPC request whose matched route rule's
+/// total request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway
+/// API `HTTPRoute.rules[].timeouts.request`) expired before a response head was
+/// available — before or during a backend attempt, or in retry backoff.
+///
+/// It carries the `backend_timeout` `X-Gateway-Error` token like every `504`,
+/// and `error_class` attributes it: `ReadWriteTimeout` when an in-flight
+/// attempt was cancelled, the health-neutral `DispatchPolicyRejected` when the
+/// budget ran out before an attempt started or in backoff. `should_retry` is
+/// never consulted for it — the retry planner stops on the typed expiry,
+/// because the whole budget is spent. The transaction log additionally names
+/// the expired phase under [`crate::plugins::ROUTE_REQUEST_TIMEOUT_METADATA_KEY`].
+pub(crate) fn route_request_timeout_response(
+    resolved_ip: Option<String>,
+    error_class: retry::ErrorClass,
+) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+        body: ResponseBody::buffered(ROUTE_REQUEST_TIMEOUT_BODY.as_bytes().to_vec()),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
+/// [`route_request_timeout_response`] in the shape a cancelled
+/// `proxy_to_backend` would have returned. Dropping that future released any
+/// admission permit, upload, and pooled stream it held, so none is carried.
+fn route_request_timeout_dispatch_result(expiry: RouteDeadlineExpiry) -> BackendDispatchResult {
+    BackendDispatchResult::Response {
+        response: Box::new(route_request_timeout_response(None, expiry.error_class())),
+        retained_body: None,
+        backend_admission_permits: None,
+        request_body_exceeded: None,
+        streaming_h2_read_timeout_ms: None,
+        passthrough_request_bytes: None,
+    }
 }
 
 pub(crate) fn client_grpc_deadline_exceeded_response_for_request(
