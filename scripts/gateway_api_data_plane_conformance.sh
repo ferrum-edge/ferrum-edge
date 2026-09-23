@@ -283,10 +283,11 @@ setup() {
 }
 
 run_upstream_conformance() {
-  rm -rf /tmp/gateway-api
+  gateway_api_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/gateway-api.XXXXXX")"
+  trap 'rm -rf "$gateway_api_dir"' EXIT
   git clone --depth 1 --branch "$GATEWAY_API_VERSION" \
-    https://github.com/kubernetes-sigs/gateway-api.git /tmp/gateway-api
-  cd /tmp/gateway-api
+    https://github.com/kubernetes-sigs/gateway-api.git "$gateway_api_dir"
+  cd "$gateway_api_dir"
   local args=(
     ./conformance
     -run TestConformance
