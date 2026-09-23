@@ -1,7 +1,7 @@
 # Ferrum Edge Fable continuation brief
 
 Resume the existing worktree and branch named in the dispatch prompt. Follow all rules in
-`agent-brief.md`, especially isolation, direct implementation, host discipline, the
+`agent-brief.md`, especially isolation, direct implementation, the
 controller-defined stopping point, final reporting, safeguard notices, and the prohibition on
 merging.
 

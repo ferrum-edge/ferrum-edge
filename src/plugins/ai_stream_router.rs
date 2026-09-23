@@ -1818,6 +1818,7 @@ fn validate_anthropic_translation(openai_body: &Value) -> Result<(), String> {
     }
     let tool_choice = resolve_anthropic_tool_choice(openai_body)?;
     resolve_anthropic_thinking(openai_body, tool_choice.as_ref().map(|(kind, _)| *kind))?;
+    resolve_anthropic_effort(openai_body)?;
     Ok(())
 }
 
@@ -1985,10 +1986,25 @@ fn resolve_anthropic_thinking(
             json!({ "type": "enabled", "budget_tokens": budget })
         }
         "adaptive" => {
-            if object.len() != 1 {
+            // `display` is the only optional key. Current models default to
+            // `omitted`, so a caller that streams reasoning must be able to ask
+            // for `summarized`.
+            let display = match object.get("display") {
+                None => None,
+                Some(Value::String(display))
+                    if matches!(display.as_str(), "summarized" | "omitted") =>
+                {
+                    Some(display.as_str())
+                }
+                Some(_) => return Err("unsupported or malformed thinking".to_string()),
+            };
+            if object.len() != 1 + usize::from(display.is_some()) {
                 return Err("unsupported or malformed thinking".to_string());
             }
-            json!({ "type": "adaptive" })
+            match display {
+                Some(display) => json!({ "type": "adaptive", "display": display }),
+                None => json!({ "type": "adaptive" }),
+            }
         }
         "disabled" => {
             if object.len() != 1 {
@@ -2000,6 +2016,26 @@ fn resolve_anthropic_thinking(
     };
 
     Ok(Some(forwarded))
+}
+
+/// Map OpenAI `reasoning_effort` onto Anthropic `output_config.effort`. Only
+/// levels with an exact Anthropic counterpart are admitted; OpenAI `none` and
+/// `minimal` have none and are rejected rather than silently rounded.
+fn resolve_anthropic_effort(openai_body: &Value) -> Result<Option<&'static str>, String> {
+    let Some(effort) = openai_body.get("reasoning_effort") else {
+        return Ok(None);
+    };
+    if effort.is_null() {
+        return Ok(None);
+    }
+    match effort.as_str() {
+        Some("low") => Ok(Some("low")),
+        Some("medium") => Ok(Some("medium")),
+        Some("high") => Ok(Some("high")),
+        Some("xhigh") => Ok(Some("xhigh")),
+        Some("max") => Ok(Some("max")),
+        _ => Err("unsupported reasoning_effort".to_string()),
+    }
 }
 
 /// Translate an OpenAI Chat Completions streaming request into an Anthropic
@@ -2198,6 +2234,9 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
         resolve_anthropic_thinking(openai_body, tool_choice.as_ref().map(|(kind, _)| *kind))?
     {
         body["thinking"] = thinking;
+    }
+    if let Some(effort) = resolve_anthropic_effort(openai_body)? {
+        body["output_config"] = json!({ "effort": effort });
     }
 
     serde_json::to_vec(&body)
@@ -2962,6 +3001,8 @@ impl Plugin for AiStreamRouter {
         {
             let (param, code) = if message.contains("thinking") {
                 (Some("thinking"), Some("invalid_thinking"))
+            } else if message.contains("reasoning_effort") {
+                (Some("reasoning_effort"), Some("invalid_reasoning_effort"))
             } else if message.contains("tool_choice") || message.contains("tools") {
                 (Some("tool_choice"), Some("invalid_tool_choice"))
             } else {

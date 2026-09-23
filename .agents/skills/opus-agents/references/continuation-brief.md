@@ -1,7 +1,7 @@
 # Ferrum Edge Opus continuation brief
 
 Resume the existing worktree and branch named in the dispatch prompt. Follow all rules in
-`agent-brief.md`, especially isolation, direct implementation, host discipline, the
+`agent-brief.md`, especially isolation, direct implementation, the
 controller-defined stopping point, final reporting, and the prohibition on merging.
 
 Do not run local builds, tests, benchmarks, `cargo check`, or `cargo clippy`, including through

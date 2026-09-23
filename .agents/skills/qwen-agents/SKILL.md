@@ -155,8 +155,8 @@ actionable work appears. Do not add a review trigger unless the controller expli
 
 ## Control and verify the fleet
 
-1. Poll retained execution sessions separately and keep the user updated at least once a minute
-   while workers are active. Use `pgrep -f 'opencode run'` only as a secondary fleet-wide
+1. Poll retained execution sessions separately. Tell the user when a worker launches, finishes,
+   fails, or needs a decision. Use `pgrep -f 'opencode run'` only as a secondary fleet-wide
    cross-check, never as the identity of a particular worker — sibling opencode skills share that
    process name.
 2. On completion, verify the claims relevant to the prompt, such as the branch, pushed head, PR,

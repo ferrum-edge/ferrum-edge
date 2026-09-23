@@ -12,7 +12,7 @@ point in the prompt. Never accept a worker's report without checking the reposit
 state yourself.
 
 **Guard: do NOT use this skill when you are yourself a dispatched worker.** If your session
-prompt says you were dispatched by an orchestrator — it references the `astra-agents` briefs
+prompt says you were dispatched by an orchestrator — it references the `opus-agents` briefs
 (`agent-brief.md` / `continuation-brief.md`), says "YOU are the implementer", or hands you an
 existing worktree and findings to fix — then this skill does not apply: implement directly in
 your session. Your model and reasoning effort were chosen deliberately by the dispatching
@@ -171,7 +171,7 @@ actionable work appears. Do not add a review trigger unless the controller expli
 
 1. Poll each retained execution session separately. Use `pgrep -x claude` only as a secondary
    fleet-wide cross-check, never as the identity of a particular worker.
-2. Give the user a concise progress update at least once a minute while workers are active.
+2. Tell the user when a worker launches, finishes, fails, or needs a decision.
 3. On completion, verify the claims relevant to the prompt, such as the branch, pushed head, PR,
    requested validation, and any explicitly assigned review or CI actions.
 4. Fetch `origin/main` and independently inspect `git diff origin/main...HEAD` in the worker's

@@ -12,6 +12,15 @@ name: Prune Stale PRs and Branches
 # - Policy: merged-PR branches are deleted immediately; closed-but-unmerged PR
 #   branches are deleted once the PR has been closed for `days_stale` days (grace
 #   window so an accidentally-closed PR's branch can still be reopened/reused).
+# - Orphan branches (never the head of ANY PR) are invisible to the two PR-driven
+#   jobs, and with delete-on-merge enabled they are the bulk of what lingers
+#   (agent scratch/staging pushes, abandoned experiments, stale merge-queue refs).
+#   An orphan whose tip is already contained in the default branch has no unique
+#   commits and is deleted once its tip is ORPHAN_MERGED_GRACE_DAYS old. An orphan
+#   with unmerged commits is deleted once its tip is `orphan_days_stale` days old;
+#   its tip SHA is logged so it can be restored with
+#   `git push origin <sha>:refs/heads/<branch>`.
+# - Branches GitHub reports as protected are always skipped.
 
 on:
   schedule:
@@ -28,6 +37,11 @@ on:
           - 'false'
       days_stale:
         description: 'Days a closed (unmerged) PR must be closed before its branch is pruned (0 = immediate)'
+        required: false
+        default: '30'
+        type: string
+      orphan_days_stale:
+        description: 'Days since the last commit before a never-PR branch with unmerged commits is pruned'
         required: false
         default: '30'
         type: string
@@ -200,10 +214,122 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  prune-orphan-branches:
+    name: Delete stale branches that never had a PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete stale orphan branches
+        id: delete_orphans
+        run: |
+          set -euo pipefail
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          ORPHAN_DAYS_STALE="${{ github.event.inputs.orphan_days_stale || '30' }}"
+          if ! [[ "$ORPHAN_DAYS_STALE" =~ ^[0-9]+$ ]]; then
+            echo "::error::orphan_days_stale must be a non-negative integer, got '$ORPHAN_DAYS_STALE'"
+            exit 1
+          fi
+          echo "Dry run mode: $DRY_RUN"
+          echo "Default branch: $DEFAULT_BRANCH"
+          echo "Merged-orphan grace: $ORPHAN_MERGED_GRACE_DAYS days; unmerged-orphan threshold: $ORPHAN_DAYS_STALE days"
+
+          NOW=$(date -u +%s)
+          MERGED_CUTOFF=$((NOW - ORPHAN_MERGED_GRACE_DAYS * 86400))
+          UNMERGED_CUTOFF=$((NOW - ORPHAN_DAYS_STALE * 86400))
+
+          # Fresh remote-tracking refs for every branch so ancestry and tip dates
+          # reflect the live remote, not the checkout's snapshot.
+          git fetch --quiet --prune origin '+refs/heads/*:refs/remotes/origin/*'
+
+          # Every head ref this repo has EVER opened a PR from (any state). Those
+          # branches belong to the two PR-driven jobs above; an open PR always wins.
+          # --limit is mandatory (gh defaults to 30 and would skip older PRs).
+          PR_BRANCHES=$(gh pr list --state all --limit "$PR_LIST_LIMIT" \
+            --json headRefName --jq '.[].headRefName' | sort -u)
+
+          # Branches GitHub protects (branch protection / rulesets).
+          PROTECTED_BRANCHES=$(gh api --paginate "repos/$GITHUB_REPOSITORY/branches?protected=true&per_page=100" \
+            --jq '.[].name' | sort -u)
+
+          DELETED_COUNT=0
+          KEPT_COUNT=0
+          SUMMARY="$RUNNER_TEMP/orphan_summary.md"
+          {
+            echo "### Orphan branches pruned"
+            echo ""
+            echo "| Branch | Tip | Last commit | Reason |"
+            echo "|---|---|---|---|"
+          } > "$SUMMARY"
+
+          while IFS= read -r branch; do
+            [[ -z "$branch" ]] && continue
+
+            if [[ "$branch" == "$DEFAULT_BRANCH" || "$branch" == "main" || "$branch" == "master" || "$branch" == "develop" || "$branch" == release/* ]]; then
+              continue
+            fi
+            if grep -Fxq "$branch" <<< "$PROTECTED_BRANCHES"; then
+              echo "⏭️ Skipping protected branch: $branch"
+              continue
+            fi
+            if grep -Fxq "$branch" <<< "$PR_BRANCHES"; then
+              continue
+            fi
+
+            ref="refs/remotes/origin/$branch"
+            tip=$(git rev-parse --verify --quiet "$ref^{commit}") || continue
+            tip_ts=$(git log -1 --format=%ct "$tip")
+            tip_date=$(git log -1 --format=%cs "$tip")
+
+            if git merge-base --is-ancestor "$tip" "refs/remotes/origin/$DEFAULT_BRANCH"; then
+              if (( tip_ts >= MERGED_CUTOFF )); then
+                echo "⏳ Keeping recent merged orphan: $branch ($tip_date)"
+                KEPT_COUNT=$((KEPT_COUNT + 1))
+                continue
+              fi
+              reason="fully contained in $DEFAULT_BRANCH"
+            else
+              ahead=$(git rev-list --count "refs/remotes/origin/$DEFAULT_BRANCH..$tip")
+              if (( tip_ts >= UNMERGED_CUTOFF )); then
+                echo "⏳ Keeping active orphan: $branch ($ahead unmerged commit(s), last $tip_date)"
+                KEPT_COUNT=$((KEPT_COUNT + 1))
+                continue
+              fi
+              reason="$ahead unmerged commit(s), idle > $ORPHAN_DAYS_STALE days"
+            fi
+
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "🧪 [DRY RUN] Would delete orphan branch: $branch @ $tip ($tip_date; $reason)"
+            else
+              echo "🗑️ Deleting orphan branch: $branch @ $tip ($tip_date; $reason)"
+              if ! git push origin --delete "refs/heads/$branch"; then
+                echo "⚠️ Failed to delete $branch"
+                continue
+              fi
+            fi
+            echo "| \`$branch\` | \`$tip\` | $tip_date | $reason |" >> "$SUMMARY"
+            DELETED_COUNT=$((DELETED_COUNT + 1))
+          done < <(git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/origin/ | grep -vx 'HEAD')
+
+          cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+          echo "deleted_count=$DELETED_COUNT" >> "$GITHUB_OUTPUT"
+          echo "kept_count=$KEPT_COUNT" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "📊 Orphan branches: $DELETED_COUNT processed, $KEPT_COUNT kept as recent"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ORPHAN_MERGED_GRACE_DAYS: '1'
+
   cleanup-local-refs:
     name: Prune remote-tracking branches
     runs-on: ubuntu-latest
-    needs: [prune-merged-branches, prune-stale-closed-prs]
+    needs: [prune-merged-branches, prune-stale-closed-prs, prune-orphan-branches]
     if: github.event.inputs.dry_run != 'true'
     steps:
       - name: Checkout repository
