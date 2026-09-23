@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    canonical_header_content_length_from_map_for_test, preserved_response_content_length_for_test,
-    run_after_proxy_hooks_for_test, should_bypass_h2_coalesce_for_large_response_for_test,
+    canonical_header_content_length_from_map_for_test, coalesce_flush_window_for_test,
+    preserved_response_content_length_for_test, run_after_proxy_hooks_for_test,
+    should_bypass_h2_coalesce_for_large_response_for_test,
     streaming_response_requires_size_limit_for_test,
+    streaming_response_takes_direct_fast_path_for_test,
 };
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -419,4 +421,63 @@ async fn rewritten_small_backend_content_length_cannot_select_h2_passthrough() {
     assert!(!streaming_response_requires_size_limit_for_test(
         max, trusted
     ));
+}
+
+/// Issue #5588. The window must stay well inside the idle read deadline: with
+/// one configured the coalescer parks holding a sub-target frame, and
+/// `IdleReadTimeoutBody` would otherwise read that as a stalled backend.
+#[test]
+fn coalesce_flush_window_is_clamped_to_half_the_idle_read_timeout() {
+    use std::time::Duration;
+
+    // Disabled is the shipped default and survives any timeout.
+    assert_eq!(coalesce_flush_window_for_test(0, 5_000), None);
+    assert_eq!(coalesce_flush_window_for_test(0, 0), None);
+
+    // Comfortably inside the deadline: taken as configured.
+    assert_eq!(
+        coalesce_flush_window_for_test(2, 5_000),
+        Some(Duration::from_millis(2))
+    );
+
+    // At or past half the deadline: clamped, never adopted whole.
+    assert_eq!(
+        coalesce_flush_window_for_test(1_000, 100),
+        Some(Duration::from_millis(50))
+    );
+    assert_eq!(
+        coalesce_flush_window_for_test(60, 100),
+        Some(Duration::from_millis(50))
+    );
+
+    // No timeout configured means no deadline to protect.
+    assert_eq!(
+        coalesce_flush_window_for_test(1_000, 0),
+        Some(Duration::from_millis(1_000))
+    );
+}
+
+/// Issue #5588 regression guard. In the shipped default configuration the
+/// fast path skips the coalescing adapter entirely, so a window that did not
+/// count as a reason to coalesce would be silently inert — which it was.
+#[test]
+fn a_configured_flush_window_keeps_the_body_off_the_direct_fast_path() {
+    use std::time::Duration;
+
+    let takes_fast_path = streaming_response_takes_direct_fast_path_for_test;
+    let window = Some(Duration::from_millis(2));
+
+    // Shipped default: cutoff disabled, no size limit, no window. The fast
+    // path is the whole point here — nothing needs per-frame buffering.
+    assert!(takes_fast_path(0, 0, None));
+
+    // In exactly that default configuration, a window is the ONLY thing asking
+    // for aggregation, so it alone must keep the body on the coalescing path.
+    assert!(!takes_fast_path(0, 0, window));
+
+    // The pre-existing reasons to coalesce still hold on their own, with or
+    // without a window.
+    assert!(!takes_fast_path(1, 0, None));
+    assert!(!takes_fast_path(0, 1, None));
+    assert!(!takes_fast_path(1, 1, window));
 }

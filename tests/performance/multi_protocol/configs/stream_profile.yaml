@@ -1,0 +1,40 @@
+---
+version: "1"
+# Low-rate streaming profile: TLS frontend on the HTTPS port, which negotiates
+# HTTP/1.1 or HTTP/2 by ALPN (the lane runs both), plain HTTP/1.1 upstream.
+#
+# `/trickle` is the workload a response-aggregation window can penalise: small
+# frames spaced far apart, where holding one to wait for a sibling that is not
+# coming adds latency no throughput gain offsets. Routed on its own so the
+# throughput configs keep their exact shape.
+proxies:
+  - id: "tls-trickle"
+    name: "TLS Trickle"
+    listen_path: "/trickle"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 3001
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 30000
+    backend_write_timeout_ms: 30000
+    auth_mode: single
+    plugins: []
+
+  - id: "h1-tls-health"
+    name: "HTTP/1.1+TLS Health Check"
+    listen_path: "/health"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 3010
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    auth_mode: single
+    plugins: []
+
+consumers: []
+plugin_configs: []

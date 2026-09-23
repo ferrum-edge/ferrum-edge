@@ -12,7 +12,8 @@ Ferrum Edge is in active build-out with no deployed-user compatibility obligatio
 
 ## Read Before Touching
 
-- Mesh behavior: `docs/mesh.md`, `src/modes/mesh/`, `.claude/rules/mesh.md`
+- Mesh behavior: `docs/mesh.md`, `src/modes/mesh/`, `.claude/rules/mesh.md` (plus `mesh-hbone-waypoint.md`,
+  `mesh-capture-cni.md`, `mesh-k8s-controller.md`)
 - HTTP/3, WebSocket, QUIC, TCP/UDP: `docs/http3.md`, `docs/tcp_udp_proxy.md`, `src/proxy/`, `src/http3/`, `.claude/rules/proxy-protocols.md`
 - Plugin ordering/hooks: `docs/plugin_execution_order.md`, `src/plugins/mod.rs`, `.claude/rules/plugins.md`
 - Config/env/database: `docs/configuration.md`, `ferrum.conf`, `src/config/env_config.rs`, `.claude/rules/config-database.md`
@@ -33,9 +34,9 @@ ferrum-edge health [-p PORT] [--host H] [--tls] [--tls-no-verify] [--live]
 ferrum-edge ambient-udp-preflight [-s PATH] [--timeout-seconds N] [-v]
 ```
 
-`ambient-udp-preflight` is the privileged one-shot Ambient UDP node preflight
-(issue #3809): it retires both predecessor UDP placements on this node and
-publishes the node-scoped cleanup proof the settled host placement requires.
+`ambient-udp-preflight` is the privileged one-shot Ambient UDP node preflight: it removes
+superseded UDP capture placements on this node and publishes the node-scoped cleanup proof the
+host placement requires before it serves.
 
 `run`/`validate` flags: `-s/--settings <PATH>`, `-c/--spec <PATH>`, `-m/--mode <MODE>`, `-v/--verbose`. Precedence is CLI > env > conf file > smart defaults > hardcoded. CLI flags become env vars through `apply_run_overrides()` / `apply_validate_overrides()` before `CONF_FILE_CACHE` reads in `main.rs`.
 

@@ -2083,6 +2083,53 @@ pub(crate) fn streaming_response_requires_size_limit(
     max_response_body_size_bytes > 0 && trusted_backend_content_length.is_none()
 }
 
+/// Resolve the configured response-coalescing window against the proxy's
+/// per-frame idle read timeout (issue #5588).
+///
+/// `0` disables the window, which is the shipped default and keeps
+/// `Coalescing` flushing on the first `Pending` — it never holds a byte the
+/// backend has already delivered.
+///
+/// A configured window is clamped to half `read_timeout_ms`, the same bound
+/// `h3_effective_flush_interval` applies. With a window the coalescer reports
+/// `Pending` while still holding a sub-target frame, so the
+/// `IdleReadTimeoutBody` wrapped around it can no longer treat every `Pending`
+/// as a genuine backend-read wait. Staying well inside that deadline is what
+/// keeps a held frame from being read as a stalled backend. `0` disables the
+/// timeout entirely, so there is nothing to clamp against.
+#[inline]
+pub(crate) fn coalesce_flush_window(
+    flush_ms: u64,
+    read_timeout_ms: u64,
+) -> Option<std::time::Duration> {
+    let window = match flush_ms {
+        0 => return None,
+        ms => std::time::Duration::from_millis(ms),
+    };
+    if read_timeout_ms == 0 {
+        return Some(window);
+    }
+    Some(window.min(std::time::Duration::from_millis(read_timeout_ms) / 2))
+}
+
+/// Decide whether a streaming reqwest response body may skip the coalescing
+/// adapter entirely and stream frame-for-frame through [`direct_streaming_body`].
+///
+/// The fast path exists to avoid per-frame `BytesMut` buffering when nothing
+/// needs it. An operator-configured aggregation window IS something that needs
+/// it: without this term the window would be silently inert in the default
+/// configuration (cutoff disabled, no size limit), because that configuration
+/// never constructs a `Coalescing` adapter for the window to apply to.
+pub(crate) fn streaming_response_takes_direct_fast_path(
+    response_buffer_cutoff_bytes: usize,
+    max_response_body_size_bytes: usize,
+    coalesce_flush: Option<std::time::Duration>,
+) -> bool {
+    response_buffer_cutoff_bytes == 0
+        && max_response_body_size_bytes == 0
+        && coalesce_flush.is_none()
+}
+
 /// Fix 5: decide whether a plain-HTTPS direct-H2 response body should skip
 /// the `CoalescingH2Body` adapter and stream through hyper's `Incoming`
 /// directly.
@@ -6674,6 +6721,10 @@ pub struct ProxyState {
     pub max_response_body_size_bytes: usize,
     pub response_buffer_cutoff_bytes: usize,
     pub h2_coalesce_target_bytes: usize,
+    /// Bounded aggregation window for response coalescing on the
+    /// reqwest-backed streaming path, in milliseconds. 0 disables it and keeps
+    /// the flush-on-first-`Pending` behaviour (issue #5588).
+    pub response_coalesce_flush_ms: u64,
     pub max_url_length_bytes: usize,
     pub max_query_params: usize,
     pub max_grpc_recv_size_bytes: usize,
@@ -7902,6 +7953,32 @@ fn spawn_backend_svid_rotation_task(
 }
 
 impl ProxyState {
+    /// The bounded aggregation window for response coalescing on the
+    /// reqwest-backed streaming path, or `None` when the operator has not
+    /// enabled one (issue #5588).
+    ///
+    /// `None` keeps `Coalescing`'s flush-on-first-`Pending` behaviour, which is
+    /// the shipped default: it never holds a byte the backend has already
+    /// delivered. A configured window trades that for larger writes, so the
+    /// conversion lives here rather than at the call site — the hot path reads
+    /// one field and this stays the single place the `0 == disabled` contract
+    /// is spelled.
+    ///
+    /// Clamped to half the per-frame idle read timeout, exactly as
+    /// `h3_effective_flush_interval` does for HTTP/3. With a window the
+    /// coalescer reports `Pending` while still holding a sub-target frame, so
+    /// the `IdleReadTimeoutBody` wrapped around it can no longer assume every
+    /// `Pending` means a genuine backend-read wait. Keeping the window well
+    /// inside that deadline is what stops a held frame from being mistaken for
+    /// a stalled backend.
+    #[inline]
+    pub(crate) fn response_coalesce_flush(
+        &self,
+        read_timeout_ms: u64,
+    ) -> Option<std::time::Duration> {
+        coalesce_flush_window(self.response_coalesce_flush_ms, read_timeout_ms)
+    }
+
     /// Apply a full snapshot on Tokio's blocking pool, carrying the CP-delivered
     /// gateway trust decision for this snapshot.
     ///
@@ -9623,6 +9700,7 @@ impl ProxyState {
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
         let response_buffer_cutoff_bytes = env_config.response_buffer_cutoff_bytes;
         let h2_coalesce_target_bytes = env_config.h2_coalesce_target_bytes;
+        let response_coalesce_flush_ms = env_config.response_coalesce_flush_ms;
         let max_url_length_bytes = env_config.max_url_length_bytes;
         let max_query_params = env_config.max_query_params;
         let max_grpc_recv_size_bytes = env_config.max_grpc_recv_size_bytes;
@@ -10231,6 +10309,7 @@ impl ProxyState {
             max_response_body_size_bytes,
             response_buffer_cutoff_bytes,
             h2_coalesce_target_bytes,
+            response_coalesce_flush_ms,
             max_url_length_bytes,
             max_query_params,
             max_grpc_recv_size_bytes,
@@ -40083,12 +40162,19 @@ async fn handle_proxy_request_inner(
                 // default streaming path — we have one source of truth for body
                 // construction across the H1/H2-via-reqwest hot paths.
                 //
+                // Resolve the aggregation window first: an operator-configured
+                // window is itself a reason to take the coalescing path, so the
+                // gate below and the value handed to the adapter cannot drift.
+                let coalesce_flush = state.response_coalesce_flush(proxy.backend_read_timeout_ms);
                 // Fast path: skip coalescing when no plugins need body buffering,
-                // no size limits apply, and response buffer cutoff is disabled.
+                // no size limits apply, the response buffer cutoff is disabled,
+                // and no aggregation window was configured.
                 // This eliminates per-frame BytesMut buffering and branch overhead.
-                let base = if state.response_buffer_cutoff_bytes == 0
-                    && effective_max_response_body_size_bytes == 0
-                {
+                let base = if streaming_response_takes_direct_fast_path(
+                    state.response_buffer_cutoff_bytes,
+                    effective_max_response_body_size_bytes,
+                    coalesce_flush,
+                ) {
                     crate::proxy::body::direct_streaming_body(
                         response,
                         advertised_cl,
@@ -40113,6 +40199,7 @@ async fn handle_proxy_request_inner(
                         response,
                         advertised_cl,
                         proxy.backend_read_timeout_ms,
+                        coalesce_flush,
                     )
                 };
                 let base = if let Some(guard) = reqwest_backend_guard {

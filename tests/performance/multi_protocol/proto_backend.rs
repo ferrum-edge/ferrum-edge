@@ -18,8 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use bytes::Bytes;
-use http_body_util::Full;
-use hyper::body::Incoming;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::{TcpListener, UdpSocket};
@@ -93,20 +94,46 @@ impl BenchService for BenchServiceImpl {
 
 // ── HTTP handler (shared by HTTP/2 + HTTP/3) ─────────────────────────────────
 
-async fn handle_http(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+/// Response body for the HTTP handler.
+///
+/// Boxed rather than `Full<Bytes>` because `/trickle` must emit its frames over
+/// time; every other route still answers with a one-shot `Full`.
+type BackendBody = BoxBody<Bytes, Infallible>;
+
+fn one_shot(bytes: Bytes) -> BackendBody {
+    Full::new(bytes).boxed()
+}
+
+/// Bytes reserved at the head of every `/trickle` frame for its emission
+/// timestamp: `TS:` + 16 digits of microseconds-since-epoch + `;`.
+pub const TRICKLE_STAMP_LEN: usize = 20;
+
+/// Parse a bounded unsigned query parameter, falling back to `default`.
+fn query_param(query: Option<&str>, key: &str, default: u64, max: u64) -> u64 {
+    query
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+        .unwrap_or(default)
+        .min(max)
+}
+
+async fn handle_http(req: Request<Incoming>) -> Result<Response<BackendBody>, Infallible> {
     let resp = match (req.method().clone(), req.uri().path()) {
         (_, "/health") => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
-            .body(Full::new(Bytes::from_static(b"{\"status\":\"healthy\"}")))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))),
+            .body(one_shot(Bytes::from_static(b"{\"status\":\"healthy\"}")))
+            .unwrap_or_else(|_| Response::new(one_shot(Bytes::new()))),
         (ref m, "/api/users") if m == hyper::Method::GET => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
-            .body(Full::new(Bytes::from_static(
+            .body(one_shot(Bytes::from_static(
                 b"{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}",
             )))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))),
+            .unwrap_or_else(|_| Response::new(one_shot(Bytes::new()))),
         (_, "/echo") => {
             use http_body_util::BodyExt;
             let body = req
@@ -117,13 +144,60 @@ async fn handle_http(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, In
                 .unwrap_or_default();
             Response::builder()
                 .status(StatusCode::OK)
-                .body(Full::new(body))
-                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+                .body(one_shot(body))
+                .unwrap_or_else(|_| Response::new(one_shot(Bytes::new())))
+        }
+        // Trickle: emit `frames` frames of `size` bytes, `gap_ms` apart. This is
+        // the shape a response-aggregation window can actually hurt — an SSE or
+        // long-poll stream whose frames are small and far apart, where holding
+        // one back to wait for a sibling adds latency no throughput gain offsets.
+        // The emission schedule is deterministic, so a client can compare each
+        // frame's arrival against when it is known to have been sent.
+        (_, "/trickle") => {
+            let query = req.uri().query().map(str::to_string);
+            let frames = query_param(query.as_deref(), "frames", 20, 10_000);
+            let size = query_param(query.as_deref(), "size", 1024, 1 << 20) as usize;
+            let gap_ms = query_param(query.as_deref(), "gap_ms", 10, 60_000);
+            // Each frame opens with its own emission timestamp. A client that
+            // subtracts the NOMINAL schedule instead measures the accumulated
+            // overshoot of `sleep` rather than anything the gateway did: the
+            // residual grows linearly with frame index and swamps a hold of a
+            // millisecond or two. Stamping the real emission time makes each
+            // frame's latency a direct measurement. Both processes are on one
+            // host, so a shared wall clock is the right reference.
+            let size = size.max(TRICKLE_STAMP_LEN);
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(1);
+            tokio::spawn(async move {
+                for index in 0..frames {
+                    // Gap BEFORE every frame but the first, so frame k is sent at
+                    // k * gap_ms and the first byte is not itself delayed.
+                    if index > 0 && gap_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+                    }
+                    let micros = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_micros() as u64)
+                        .unwrap_or(0);
+                    let mut frame = vec![b'x'; size];
+                    frame[..TRICKLE_STAMP_LEN]
+                        .copy_from_slice(format!("TS:{micros:016};").as_bytes());
+                    if tx.send(Ok(Frame::data(Bytes::from(frame)))).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-store")
+                .body(StreamBody::new(stream).boxed())
+                .unwrap_or_else(|_| Response::new(one_shot(Bytes::new())))
         }
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::from_static(b"not found")))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))),
+            .body(one_shot(Bytes::from_static(b"not found")))
+            .unwrap_or_else(|_| Response::new(one_shot(Bytes::new()))),
     };
     Ok(resp)
 }

@@ -2721,6 +2721,32 @@ pub struct EnvConfig {
     /// per-frame overhead on gRPC and HTTP/2 direct pool paths.
     /// Default: 131072 (128 KiB). Minimum: 16384 (16 KiB). Maximum: 1048576 (1 MiB).
     pub h2_coalesce_target_bytes: usize,
+    /// Bounded aggregation window (milliseconds) for response body coalescing
+    /// on the reqwest-backed streaming path. That path serves H1, H2 and H3
+    /// frontends alike; only the direct HTTP/2 pool and the H3 client, which
+    /// carry their own flush handling, are outside it.
+    ///
+    /// The `Coalescing` adapter aggregates backend body frames toward
+    /// `COALESCE_TARGET`, but with no window configured it flushes whatever it
+    /// holds the moment the backend stream returns `Pending`. On a TLS backend
+    /// leg the source goes `Pending` after every record, so the target is
+    /// unreachable. On an HTTP/1.1 frontend, where a streaming response is
+    /// chunked, every emitted chunk is then charged its own chunked-framing TLS
+    /// record (issue #5588).
+    ///
+    /// A non-zero value lets the adapter wait up to this long for the next
+    /// frame before flushing, trading tail latency for larger writes. HTTP/3
+    /// already runs this shape with its own flush interval.
+    ///
+    /// Clamped at use to half the proxy's `backend_read_timeout_ms`, the same
+    /// bound HTTP/3 applies, because a window makes the coalescer report
+    /// `Pending` while holding a sub-target frame and the idle read deadline
+    /// wrapped around it must not read that as a stalled backend.
+    ///
+    /// 0 = disabled (flush on the first `Pending`) and is the default, so this
+    /// is inert until an operator or a benchmark arm opts in.
+    /// Maximum: 1000 (1 second).
+    pub response_coalesce_flush_ms: u64,
     /// Maximum URL length in bytes (path + query string). 0 = unlimited.
     pub max_url_length_bytes: usize,
     /// Maximum number of query parameters allowed. 0 = unlimited.
@@ -4020,6 +4046,7 @@ impl Default for EnvConfig {
                 crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES,
             response_buffer_cutoff_bytes: 65_536,
             h2_coalesce_target_bytes: 131_072,
+            response_coalesce_flush_ms: 0,
             max_url_length_bytes: 8_192,
             max_query_params: 100,
             max_grpc_recv_size_bytes: 4_194_304,
@@ -4632,6 +4659,7 @@ impl EnvConfig {
             request_decode_max_total_bytes: usize = "FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES;
             response_buffer_cutoff_bytes: usize = "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES" => 65_536usize;
             h2_coalesce_target_bytes: usize = "FERRUM_H2_COALESCE_TARGET_BYTES" => 131_072usize, clamp(16_384usize, 1_048_576usize);
+            response_coalesce_flush_ms: u64 = "FERRUM_RESPONSE_COALESCE_FLUSH_MS" => 0u64, clamp(0u64, 1_000u64);
             max_url_length_bytes: usize = "FERRUM_MAX_URL_LENGTH_BYTES" => 8_192usize;
             max_query_params: usize = "FERRUM_MAX_QUERY_PARAMS" => 100usize;
             max_grpc_recv_size_bytes: usize = "FERRUM_MAX_GRPC_RECV_SIZE_BYTES" => 4_194_304usize;
@@ -5493,6 +5521,7 @@ impl EnvConfig {
             request_decode_max_total_bytes,
             response_buffer_cutoff_bytes,
             h2_coalesce_target_bytes,
+            response_coalesce_flush_ms,
             max_url_length_bytes,
             max_query_params,
             max_grpc_recv_size_bytes,

@@ -1,3 +1,21 @@
+---
+paths:
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "deny.toml"
+  - "vendor/**"
+  - "ebpf/Cargo.*"
+  - "fuzz/**"
+  - ".github/**"
+  - "scripts/**"
+  - "docs/dependency-policy.md"
+  - "docs/vendored-patch-lifecycle.json"
+  - "docs/upstream-*-patches/**"
+  - "docs/ci_cd.md"
+  - "tests/integration/vendor_integrity_tests.rs"
+  - "tests/performance/multi_protocol/Cargo.*"
+---
+
 # Dependency & Vendored-Crate Rules
 
 Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
@@ -101,7 +119,7 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   outright.
 - The `fuzz-smoke` job carries TWO admitted generations
   (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first): `CI_FUZZ_SMOKE_RETIRED_JOB`
-  is #4442's shape (the seven-target bounded budget, always scheduled in full
+  is the previous shape (the seven-target bounded budget, always scheduled in full
   mode, sccache store persisted in the lane); `CI_FUZZ_SMOKE_JOB` is the
   PR-gated shape from the CI plan rework — identical except that the job
   `if:` also requires the planner's `run_fuzz_smoke` gate (the fuzz crate, its
@@ -135,26 +153,9 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   two-family a PR may leave the workflow byte-identical or adopt the whole
   three-family shape, and once the base is three-family a revert is refused. See
   `docs/ci_cd.md` → "Admitted release image-family adoption".
-- The temporary `fips-build.yml` whole-file generation admission (first used
-  for #3889, retired by #3943; re-armed for #3950 and spent when #3950 landed)
-  is **re-armed for exactly one transition**: the issue #4018 FIPS
-  test-binary memory mitigation, pair
-  `17bfb40f…e5e9e1` → `7d995d79…2ca401` (`CARGO_BUILD_JOBS=3`,
-  `line-tables-only` on the `dev` AND `test` profiles, and a best-effort
-  additive Ferrum-owned swapfile on `fips-test-build`; recompute if the
-  workflow bytes change).
-  One-way, retire again once the mitigation lands. Every other
-  `fips-build.yml` edit is compared by the normal fail-closed Cross surface
-  scan. See `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
-  transition".
 - `Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the
-  trusted revision before `uses:`. Issue #3904 admits exactly one extracted
-  checker generation: current `action.yml`
-  `6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08` moving to
-  PR #3910 `41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9`.
-  Source and destination are bound inside `verify_trusted_local_action.py`; the
-  candidate cannot supply a digest. Retire the pair after #3910 is the trusted
-  base.
+  trusted revision before `uses:`; the admitted checker generation is bound
+  inside `verify_trusted_local_action.py`, never supplied by the candidate.
 - The published x86_64 GNU producers — `ci.yml`'s `build-binaries` and
   `release.yml`'s `build-release-binaries` — build their ONE x86_64 GNU matrix
   cell in the digest-pinned AlmaLinux 8.10 sysroot rather than natively on a
@@ -195,34 +196,14 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   deliberate image or protoc bump therefore moves the constants, both `env:`
   blocks, and the TOML in one direct-to-`main` commit. See `docs/ci_cd.md` →
   "GNU sysroot identity pins".
-- Cross-sensitive `ci.yml` jobs `ci-plan`, `test`, and `performance-regression`
-  carry temporary SHA-256 generation pairs (`CI_JOB_GENERATION_TRANSITIONS`)
-  for PRs #3913 and #3911, the three per-suite live gates (`ebpf-live`,
-  `netns-capture-live`, `two-cluster-mesh-live`) carry pairs for PR #3915's
-  planner-gate split (adopted digests pinned against #3915's latest-main merge
-  `d95ea4796`). The `build-binaries` / `build-release-binaries` pairs (PRs
-  #3916 and #4355) are all retired; those two jobs carry no transition pair.
-  `setup-rust-ci/action.yml` carries a two-step
-  trusted-base chain (`LOCAL_ACTION_GENERATION_TRANSITIONS`): #3889's landed
-  `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to
-  the cache-budget generation
-  `b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924`
-  (rust-cache `save-if` gated to trusted `refs/heads/main`), which may then
-  move to the rebased combined #3911 destination
-  `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`
-  (adds the optional `workspaces` input/pass-through on top). The former
-  direct #3889→#3911 pair is superseded; #3911 must rebase to the combined
-  text. Each step is exact, path-bound, one-way, no candidate allowlist. See
+- Frozen `ci.yml` jobs, local actions (`setup-rust-ci`), and non-protected
+  workflow jobs (`WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS`) may carry
+  temporary SHA-256 generation pairs. Each pair is exact, path-bound, and
+  one-way (the reverse pair is refused); on the admitted pair only that job's
+  `job:<name>:*` surfaces are withheld. The live pairs, their digests, and
+  their retirement conditions are whatever `verify_cross_build_policy.py`
+  holds on `main` — read them there, never from this file. Background:
   `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
-- Non-protected workflows get the same mechanism through
-  `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS`, keyed by workflow filename
-  AND job name: `coverage.yml`'s `coverage-merge` carries a pair for PR
-  #3917's shard-scoped coverage-merge reshape (issue #3907; adopted digest
-  pinned against #3917's latest-main merge). On the exact admitted pair only
-  that job's `job:<name>:*` surfaces are withheld; everything else in the file
-  is scanned as before, and the reverse pair is refused. Retire each tuple
-  once its destination is on `main`. See `docs/ci_cd.md` → "Admitted
-  workflow-directory job SHA-256 generation transitions".
 
 ## Drift Guard
 

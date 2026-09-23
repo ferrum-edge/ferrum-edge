@@ -5,6 +5,7 @@ mod admin_backup_audit_tests;
 mod admin_batch_atomicity_tests;
 mod admin_batch_reference_check_tests;
 mod admin_cached_config_tests;
+mod admin_conditional_write_tests;
 mod admin_cross_namespace_refs_tests;
 mod admin_db_api_specs_tests;
 mod admin_db_live_apply_tests;

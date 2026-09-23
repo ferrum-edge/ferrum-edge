@@ -1408,6 +1408,118 @@ async fn test_anthropic_extended_thinking_tool_choice_combinations() {
     }
 }
 
+#[tokio::test]
+async fn test_anthropic_adaptive_thinking_display_and_reasoning_effort() {
+    let plugin = build(openai_and_anthropic_config());
+
+    // Adaptive thinking forwards an explicit `display`.
+    for display in ["summarized", "omitted"] {
+        let body = json!({
+            "model": "claude-opus-5",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive", "display": display}
+        });
+        let parsed = translate_anthropic_body(&body)
+            .await
+            .expect("adaptive thinking with a supported display must translate");
+        assert_eq!(
+            parsed["thinking"],
+            json!({"type": "adaptive", "display": display})
+        );
+    }
+
+    // `reasoning_effort` maps onto `output_config.effort`; absent or null
+    // leaves `output_config` unset.
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let body = json!({
+            "model": "claude-opus-5",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"},
+            "reasoning_effort": effort
+        });
+        let parsed = translate_anthropic_body(&body)
+            .await
+            .expect("supported reasoning_effort must translate");
+        assert_eq!(parsed["output_config"], json!({"effort": effort}));
+    }
+    for body in [
+        json!({
+            "model": "claude-opus-5",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+        json!({
+            "model": "claude-opus-5",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": null
+        }),
+    ] {
+        let parsed = translate_anthropic_body(&body)
+            .await
+            .expect("request without reasoning_effort must translate");
+        assert!(parsed.get("output_config").is_none());
+    }
+
+    // Unsupported display values and extra keys are rejected.
+    for thinking in [
+        json!({"type": "adaptive", "display": "updates"}),
+        json!({"type": "adaptive", "display": "SUMMARIZED"}),
+        json!({"type": "adaptive", "display": true}),
+        json!({"type": "adaptive", "display": "summarized", "budget_tokens": 1024}),
+        json!({"type": "enabled", "budget_tokens": 1024, "display": "summarized"}),
+        json!({"type": "disabled", "display": "omitted"}),
+    ] {
+        let body = json!({
+            "model": "claude-opus-5",
+            "stream": true,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": thinking
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        assert_eq!(
+            reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+            Some(400)
+        );
+    }
+
+    // Efforts with no Anthropic counterpart are rejected without echoing the
+    // supplied value.
+    for effort in [
+        json!("none"),
+        json!("minimal"),
+        json!("HIGH"),
+        json!("secret-effort-value"),
+        json!(3),
+        json!({"level": "high"}),
+    ] {
+        let body = json!({
+            "model": "claude-opus-5",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(reject_status(&result), Some(400));
+        if let PluginResult::Reject { body, .. } = result {
+            assert!(
+                body.contains("invalid_reasoning_effort"),
+                "rejection must carry the reasoning_effort code: {body}"
+            );
+            assert!(
+                !body.contains("secret-effort-value"),
+                "client error must not echo the supplied effort: {body}"
+            );
+        }
+    }
+}
+
 const ANTHROPIC_TOOL_USE_SSE: &str = concat!(
     "event: message_start\n",
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tool\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",

@@ -1,6 +1,6 @@
 ---
 name: opus-agents
-description: Dispatch and orchestrate external Claude Code Opus 5 1M agents from Codex for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks GPT or Codex to delegate to Claude or Opus agents, run multiple Claude Code workers, select low/medium/high/xhigh/max effort, resume interrupted Claude runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents or ordinary single-agent edits.
+description: Dispatch and orchestrate external Claude Code Opus 5.5 1M agents from Codex for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks GPT or Codex to delegate to Claude or Opus agents, run multiple Claude Code workers, select low/medium/high/xhigh/max effort, resume interrupted Claude runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents or ordinary single-agent edits.
 ---
 
 # Opus agents
@@ -12,7 +12,7 @@ point in the prompt. Never accept a worker's report without checking the reposit
 state yourself.
 
 **Guard: do NOT use this skill when you are yourself a dispatched worker.** If your session
-prompt says you were dispatched by an orchestrator — it references the `astra-agents` briefs
+prompt says you were dispatched by an orchestrator — it references the `opus-agents` briefs
 (`agent-brief.md` / `continuation-brief.md`), says "YOU are the implementer", or hands you an
 existing worktree and findings to fix — then this skill does not apply: implement directly in
 your session. Your model and reasoning effort were chosen deliberately by the dispatching
@@ -50,7 +50,7 @@ prompt, including continuation prompts and any permitted nested delegation.
    - `~/.local/bin/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude`,
    - `claude` on `PATH`.
 3. Confirm that the installed CLI exposes `--effort` with `low`, `medium`, `high`, `xhigh`, and `max`.
-4. Use the pinned model `claude-opus-5[1m]`. Use `opus[1m]` only when the user explicitly asks
+4. Use the pinned model `claude-opus-5-5[1m]`. Use `opus[1m]` only when the user explicitly asks
    for the rolling latest Opus rather than Opus 5.
 5. If the user explicitly requests fast mode, confirm the CLI accepts the `fastMode` setting and
    that the account and selected Opus model are eligible. Fast mode requires separate usage-credit
@@ -115,7 +115,7 @@ for the dispatch or fleet. Never infer it from urgency, deadlines, task size, or
 Omit it for every other run, including continuations unless they remain within the same explicit
 request. Record the selected mode beside each worker.
 
-The launcher pins `claude-opus-5[1m]`, clears environment variables that can override effort,
+The launcher pins `claude-opus-5-5[1m]`, clears environment variables that can override effort,
 context, or thinking, omits fallback models, enables verbose text output, and closes stdin at the
 prompt file's EOF. It passes `fastMode: false` by default so user-level settings cannot enable Fast
 implicitly, and passes `fastMode: true` only with `--fast`. Pass `--model 'opus[1m]'` only for an
@@ -137,7 +137,7 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including astra-agents, opus-agents, fable-agents, grok-agents, or any
+skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents, grok-agents, or any
 .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 
@@ -171,7 +171,7 @@ actionable work appears. Do not add a review trigger unless the controller expli
 
 1. Poll each retained execution session separately. Use `pgrep -x claude` only as a secondary
    fleet-wide cross-check, never as the identity of a particular worker.
-2. Give the user a concise progress update at least once a minute while workers are active.
+2. Tell the user when a worker launches, finishes, fails, or needs a decision.
 3. On completion, verify the claims relevant to the prompt, such as the branch, pushed head, PR,
    requested validation, and any explicitly assigned review or CI actions.
 4. Fetch `origin/main` and independently inspect `git diff origin/main...HEAD` in the worker's

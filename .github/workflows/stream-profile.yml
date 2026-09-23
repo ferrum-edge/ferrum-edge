@@ -1,0 +1,133 @@
+# Low-rate streaming latency profile for the response-aggregation window
+# (issue #5588).
+#
+# The throughput benchmark measures the window where it helps and cannot
+# measure where it hurts: at saturation a millisecond hold is invisible against
+# a p50 of hundreds of milliseconds. This lane runs the opposite workload — an
+# idle proxy carrying small frames spaced far apart, the SSE / long-poll shape —
+# and is the evidence any change to the shipped default depends on.
+#
+# Arms differ in one variable. Both run the coalescing adapter; only the window
+# changes, so a difference cannot be attributed to enabling coalescing.
+name: Stream Profile
+
+on:
+  # A workflow_dispatch entry is only offered once the file is on the default
+  # branch, so this lane also triggers on its own investigation branches. Push
+  # events run the workflow from the pushed commit, which is what lets the lane
+  # be exercised before it merges.
+  push:
+    branches:
+      - 'bench/5588-stream-**'
+  workflow_dispatch:
+    inputs:
+      window_ms:
+        description: Aggregation window under test (ms)
+        type: choice
+        default: '2'
+        options: ['1', '2', '5', '10']
+      gap_ms:
+        description: Backend inter-frame gap (ms). Must exceed the window for the hold to be the dominant term.
+        type: choice
+        default: '10'
+        options: ['5', '10', '25', '100']
+      frames:
+        description: Frames per response
+        type: choice
+        default: '20'
+        options: ['10', '20', '50']
+      repeats:
+        description: Counterbalanced repeats per arm
+        type: choice
+        default: '5'
+        options: ['3', '5', '8']
+
+permissions:
+  contents: read
+
+jobs:
+  stream-profile:
+    name: stream profile / ${{ matrix.alpn }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both frontend protocols every run. H1 frames a streaming response with
+        # chunked transfer-coding and is where the window's benefit was measured;
+        # H2 frames with END_STREAM and was left unmeasured by the throughput
+        # run, so it is exactly the axis this lane exists to close.
+        alpn: [h1, h2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      # `.cargo/config.toml` hardcodes `rustc-wrapper = "sccache"`, so a lane
+      # that skips this action fails immediately with "could not execute
+      # process `sccache`". The action also clears the wrapper itself if the
+      # install fails, so the build degrades rather than breaking.
+      - uses: ./.github/actions/setup-sccache
+      - uses: ./.github/actions/setup-fast-linker
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: "stream-profile"
+          # Same guards as the sibling benchmark lanes. The Actions cache is a
+          # shared 10 GB quota, and saving a fat-LTO release target/ from every
+          # investigation branch evicts the caches the required lanes depend
+          # on. Only a push to main may save; everything else restores.
+          cache-targets: "false"
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Hosted prerequisites
+        run: |
+          sudo apt-get update
+          # Matches the package set the sibling benchmark lanes use to build
+          # this same image: rdkafka-sys compiles librdkafka from source and
+          # needs curl/curl.h, which is not on the hosted image by default.
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev libssl-dev clang lsof sysstat
+      - name: Retain source and runner identity
+        run: |
+          mkdir -p stream-profile-results
+          git rev-parse HEAD > stream-profile-results/revision.txt
+          git status --porcelain > stream-profile-results/source-status.txt
+          uname -a > stream-profile-results/kernel.txt
+          lscpu > stream-profile-results/cpu.txt
+      - name: Build gateway image
+        run: |
+          set -euo pipefail
+          mkdir -p bin/amd64
+          cargo build --locked --release --bin ferrum-edge --bin ferrum-cni
+          cp target/release/ferrum-edge target/release/ferrum-cni bin/amd64/
+          sha256sum bin/amd64/* > stream-profile-results/binaries.sha256
+          docker build -f Dockerfile.release --build-arg TARGETARCH=amd64 \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t ferrum-edge:bench .
+          docker image inspect ferrum-edge:bench > stream-profile-results/image.json
+      - name: Run the stream profile
+        env:
+          WINDOW_MS: ${{ inputs.window_ms || '2' }}
+          GAP_MS: ${{ inputs.gap_ms || '10' }}
+          FRAMES: ${{ inputs.frames || '20' }}
+          ALPN: ${{ matrix.alpn }}
+          REPEATS: ${{ inputs.repeats || '5' }}
+          OUTPUT_DIR: ${{ github.workspace }}/stream-profile-results
+          FERRUM_IMAGE: ferrum-edge:bench
+        run: |
+          set -euo pipefail
+          # The window only binds when it is shorter than the backend's gap;
+          # otherwise the next frame arrives first and the aggregator flushes on
+          # size or stream end, measuring nothing.
+          test "$WINDOW_MS" -lt "$GAP_MS"
+          ./tests/performance/multi_protocol/run_stream_profile.sh \
+            2>&1 | tee stream-profile-results/run.log
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: stream-profile-${{ github.sha }}-${{ matrix.alpn }}
+          path: stream-profile-results
+          retention-days: 14

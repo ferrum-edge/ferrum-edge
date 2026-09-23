@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
+use crate::admin::preconditions::{self, IfMatch};
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
     PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_admission_unavailable,
@@ -2446,6 +2447,11 @@ pub(crate) trait AdminResource:
     const NOT_FOUND_MESSAGE: &'static str;
     const ID_CONFLICT_LABEL: &'static str = Self::RESOURCE_LABEL;
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = false;
+    /// Issue a strong `ETag` on `GET` and honour `If-Match` on `PUT`/`DELETE`
+    /// (see `crate::admin::preconditions`). Only sound for a resource whose
+    /// writers all serialize on the namespace config admission lease, because
+    /// that lease is what makes the comparison and the write atomic.
+    const SUPPORTS_IF_MATCH: bool = false;
 
     fn id(&self) -> &str;
     fn set_id(&mut self, id: String);
@@ -2499,6 +2505,14 @@ pub(crate) trait AdminResource:
 
     fn response_body(resource: &Self) -> Value {
         json!(resource)
+    }
+
+    /// The representation an `ETag` is derived from: the full stored resource,
+    /// not a role projection, so a change to a redacted field still changes
+    /// the tag. Override to normalize arrays whose stored order is not
+    /// meaningful and may differ between two reads of the same state.
+    fn etag_representation(resource: &Self) -> Result<Value, serde_json::Error> {
+        serde_json::to_value(resource)
     }
 
     fn response_body_for_role(resource: &Self, _role: AdminRole) -> Value {
@@ -2827,7 +2841,19 @@ pub(crate) async fn handle_get<R: AdminResource>(
         match R::db_get(db.as_ref(), namespace, id).await {
             Ok(Some(resource)) => {
                 let body = R::response_body_for_role(&resource, role);
-                return Ok(super::json_response(StatusCode::OK, &body));
+                let mut response = super::json_response(StatusCode::OK, &body);
+                // Tags are issued only for a read from the store. The cached
+                // fallback below may lag the store, and a tag for a
+                // representation the store no longer holds would only ever
+                // produce a 412, so it gets none.
+                if R::SUPPORTS_IF_MATCH
+                    && let Some(tag) = current_etag(state, &resource)
+                    && let Ok(value) =
+                        hyper::header::HeaderValue::from_str(&preconditions::quoted(&tag))
+                {
+                    response.headers_mut().insert(hyper::header::ETAG, value);
+                }
+                return Ok(response);
             }
             Ok(None) => {
                 return Ok(not_found_response::<R>());
@@ -2876,6 +2902,7 @@ pub(crate) async fn handle_create<R: AdminResource>(
         WriteAction::Create,
         apply_mode,
         provisioner,
+        None,
     )
     .await
 }
@@ -2887,6 +2914,7 @@ pub(crate) async fn handle_update<R: AdminResource>(
     body: &[u8],
     namespace: &str,
     apply_mode: LiveApplyMode,
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     handle_write::<R>(
         state,
@@ -2896,8 +2924,59 @@ pub(crate) async fn handle_update<R: AdminResource>(
         WriteAction::Update { id },
         apply_mode,
         None,
+        if_match,
     )
     .await
+}
+
+/// The current strong tag for a stored resource, or `None` when no tag key is
+/// configured or the resource cannot be rendered.
+fn current_etag<R: AdminResource>(state: &AdminState, resource: &R) -> Option<String> {
+    let key = state.jwt_manager.resource_etag_key()?;
+    let representation = R::etag_representation(resource).ok()?;
+    Some(preconditions::resource_etag(
+        &key,
+        R::RESOURCE_NAME,
+        resource.namespace(),
+        resource.id(),
+        &representation,
+    ))
+}
+
+/// Evaluate `If-Match` against the resource the write path read while holding
+/// the namespace config admission lease. `Some(response)` refuses the write.
+///
+/// `existing` is `None` only for an in-band repair of an undecodable row: the
+/// row exists but has no computable tag, so `*` passes and a specific tag
+/// cannot be verified.
+fn if_match_refusal<R: AdminResource>(
+    state: &AdminState,
+    if_match: Option<&IfMatch>,
+    id: &str,
+    existing: Option<&R>,
+) -> Option<Response<Full<Bytes>>> {
+    let if_match = if_match?;
+    if !R::SUPPORTS_IF_MATCH {
+        // The router refuses If-Match for these resources before dispatch;
+        // fail closed rather than write unconditionally if that ever regresses.
+        return Some(super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": super::IF_MATCH_UNSUPPORTED_MESSAGE}),
+        ));
+    }
+    let current = existing.and_then(|resource| current_etag(state, resource));
+    if if_match.matches(current.as_deref()) {
+        return None;
+    }
+    Some(super::json_response(
+        StatusCode::PRECONDITION_FAILED,
+        &json!({"error": format!(
+            "{} '{}' has changed since the supplied If-Match entity-tag was issued; \
+             re-read it and reapply your changes",
+            R::RESOURCE_LABEL,
+            id
+        )}),
+    ))
 }
 
 /// Parse `cleanup_orphaned_upstream` from `DELETE /proxies/{id}`.
@@ -2941,6 +3020,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     namespace: &str,
     query: Option<&str>,
     apply_mode: LiveApplyMode,
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -2987,6 +3067,9 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             return Ok(not_found_response::<R>());
         }
         Err(error) if is_row_decode_rejection(&error) => {
+            if let Some(response) = if_match_refusal::<R>(state, if_match, id, None) {
+                return Ok(response);
+            }
             // Issue #2997: the target row exists but cannot be decoded. Skip
             // namespace-snapshot recovery (that load fails for the same row) and
             // delete by id so admin remains the in-band repair path.
@@ -3028,6 +3111,9 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
         Ok(Some(resource)) => resource,
     };
+    if let Some(response) = if_match_refusal(state, if_match, id, Some(&existing)) {
+        return Ok(response);
+    }
     let previous_snapshot = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
         match db.load_namespace_snapshot(namespace).await {
             Ok(snapshot) => Some(snapshot),
@@ -3503,6 +3589,7 @@ impl AdminResource for Upstream {
     // unique `(namespace, name)` indexes remain the cross-process persistence
     // backstop when a writer bypasses this path.
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
+    const SUPPORTS_IF_MATCH: bool = true;
 
     fn id(&self) -> &str {
         &self.id
@@ -3926,6 +4013,7 @@ impl AdminResource for PluginConfig {
     const VALIDATION_ERROR_LABEL: &'static str = "plugin config fields";
     const NOT_FOUND_MESSAGE: &'static str = "Plugin config not found";
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
+    const SUPPORTS_IF_MATCH: bool = true;
     const ID_CONFLICT_LABEL: &'static str = "PluginConfig";
 
     /// `PUT` is a full replace and `enabled` carries `#[serde(default =
@@ -4418,6 +4506,18 @@ impl AdminResource for Proxy {
     const VALIDATION_ERROR_LABEL: &'static str = "proxy fields";
     const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
+    const SUPPORTS_IF_MATCH: bool = true;
+
+    fn etag_representation(resource: &Self) -> Result<Value, serde_json::Error> {
+        // SQL backends read `proxy_plugins` without an ORDER BY, so two reads
+        // of the same associations may list them differently. Association
+        // order is not part of the proxy's meaning; sort it so the tag is not.
+        let mut resource = resource.clone();
+        resource
+            .plugins
+            .sort_by(|a, b| a.plugin_config_id.cmp(&b.plugin_config_id));
+        serde_json::to_value(&resource)
+    }
 
     /// `plugins` is `#[serde(default)]`, so a `PUT` body that omits the key
     /// would silently detach every association — including an authentication
@@ -5127,6 +5227,7 @@ impl AdminResource for Consumer {
     const VALIDATION_ERROR_LABEL: &'static str = "consumer fields";
     const NOT_FOUND_MESSAGE: &'static str = "Consumer not found";
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
+    const SUPPORTS_IF_MATCH: bool = true;
 
     fn id(&self) -> &str {
         &self.id
@@ -5358,6 +5459,7 @@ fn config_update_target_was_not_found(error: &anyhow::Error) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_write<R: AdminResource>(
     state: &AdminState,
     actor: &AuditActor,
@@ -5366,6 +5468,7 @@ async fn handle_write<R: AdminResource>(
     action: WriteAction<'_>,
     apply_mode: LiveApplyMode,
     provisioner: Option<&str>,
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -5453,6 +5556,14 @@ async fn handle_write<R: AdminResource>(
         && let Err(error) = guard.ensure_held()
     {
         return Ok(R::map_precheck_db_error(&error));
+    }
+    // `existing` was read under the admission lease this write keeps until it
+    // commits, so a match here cannot be invalidated by another admin writer
+    // before the write lands.
+    if let WriteAction::Update { id } = action
+        && let Some(response) = if_match_refusal(state, if_match, id, existing.as_ref())
+    {
+        return Ok(response);
     }
     match action {
         WriteAction::Create => {

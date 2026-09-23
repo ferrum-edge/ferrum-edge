@@ -4841,6 +4841,7 @@ pub(crate) fn coalescing_body(
     response: reqwest::Response,
     content_length: Option<u64>,
     read_timeout_ms: u64,
+    flush_after: Option<Duration>,
 ) -> ProxyBody {
     use futures_util::StreamExt;
 
@@ -4849,10 +4850,16 @@ pub(crate) fn coalescing_body(
         .map(|r| r.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
     #[cfg(feature = "bench-h1-profile")]
     let stream = crate::h1_profile::ObservedStream::new(stream, 1);
-    let body = Coalescing::new(
+    // `flush_after: None` makes the adapter flush on the first `Pending`, so on
+    // a backend leg that yields one frame per read it never reaches
+    // `COALESCE_TARGET`. On an HTTP/1.1 frontend every such chunk is charged its
+    // own chunked-framing TLS record (issue #5588). A window lets it aggregate,
+    // at a per-frame latency cost on low-rate streams — hence off by default.
+    let body = Coalescing::with_flush_after(
         ReqwestFrameSource { inner: stream },
         COALESCE_TARGET,
         content_length,
+        flush_after,
     );
     wrap_idle_read_timeout(body, read_timeout_ms)
 }
@@ -5910,6 +5917,78 @@ mod tests {
         let first = frames[0].as_ref().unwrap().data_ref().unwrap().len();
         assert_eq!(first, 12);
         assert!(first >= 10);
+    }
+
+    /// Issue #5588: with no window the adapter emits a short chunk the moment
+    /// the source has nothing more ready, so a backend leg that yields one
+    /// frame per read can never reach the coalescing target. This is the
+    /// shipped default — it never holds a delivered byte — and the test exists
+    /// so a change to that trade-off is deliberate rather than incidental.
+    #[test]
+    fn coalescing_without_flush_window_flushes_on_first_pending() {
+        let mut body = Coalescing::new(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from(vec![1u8; 4])))),
+                MockStep::Pending,
+                MockStep::Frame(Ok(Frame::data(Bytes::from(vec![2u8; 4])))),
+                MockStep::End,
+            ]),
+            // Far above the 8 bytes the source will ever produce, so any flush
+            // here is the Pending path rather than the target being met.
+            64,
+            None,
+        );
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(
+                    frame.data_ref().expect("data frame").len(),
+                    4,
+                    "the first frame is flushed alone when the source parks"
+                );
+            }
+            other => panic!("expected an early flush on Pending, got {other:?}"),
+        }
+    }
+
+    /// Issue #5588: a configured window makes the adapter hold a short buffer
+    /// across a `Pending` and aggregate the next frame, which is what lets it
+    /// reach the coalescing target on a backend leg that delivers one frame at
+    /// a time. Time is paused, so the window never elapses during the test and
+    /// the aggregation is what is being observed, not a timer race.
+    #[tokio::test(start_paused = true)]
+    async fn coalescing_with_flush_window_aggregates_across_a_pending() {
+        let mut body = Coalescing::with_flush_after(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from(vec![1u8; 4])))),
+                MockStep::Pending,
+                MockStep::Frame(Ok(Frame::data(Bytes::from(vec![2u8; 4])))),
+                MockStep::End,
+            ]),
+            // Reached only by combining both frames.
+            6,
+            None,
+            Some(Duration::from_secs(30)),
+        );
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Pending),
+            "a buffered short chunk must be held while the window is open"
+        );
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(
+                    frame.data_ref().expect("data frame").len(),
+                    8,
+                    "both frames must be delivered as one aggregated chunk"
+                );
+            }
+            other => panic!("expected one aggregated chunk, got {other:?}"),
+        }
     }
 
     #[test]

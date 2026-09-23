@@ -44,16 +44,21 @@ fn init_rst_diagnostics() {
         // this process's output on failure, including spawned transport tasks.
         if let Err(error) = tracing_subscriber::fmt()
             .with_env_filter(
-                // `hyper::client::conn` is what says whether a request was ever
-                // handed to the dispatcher and whether the pending response
-                // callback was answered when the connection failed — the step
-                // #5575 could never account for between the RST and the
-                // read-timeout watermark. Nextest retains this process's output
-                // on failure, so a recurrence arrives with that trace already in
-                // hand instead of needing another instrumented round trip.
+                // No `hyper::*` target: hyper 1.x emits no tracing events at all
+                // unless it is built with its unstable `tracing` feature AND
+                // `--cfg hyper_unstable_tracing`, and this build enables neither
+                // (hyper resolves to client/http1/http2/server only). A hyper
+                // target here would match nothing and imply visibility that
+                // does not exist — the dispatcher handoff and the pending
+                // response callback inside hyper are NOT observable in this
+                // output, which is the step #5575 could never account for.
+                //
+                // The deepest layer that does report is hyper-util's legacy
+                // client (its `tracing` feature is on): connect errors, ALPN,
+                // pool checkout, and the "unstarted request canceled, trying
+                // again" retry decision. Nextest retains this output on failure.
                 "off,ferrum_edge::proxy=debug,hyper_util::client::legacy=trace,\
-                 hyper::proto::h1=trace,hyper::client::conn=trace,reqwest=debug,\
-                 functional_tests::scaffolding::backends::tcp=debug",
+                 reqwest=debug,functional_tests::scaffolding::backends::tcp=debug",
             )
             .with_test_writer()
             .with_ansi(false)

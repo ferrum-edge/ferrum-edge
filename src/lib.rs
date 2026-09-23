@@ -13573,6 +13573,30 @@ pub mod _test_support {
         )
     }
 
+    /// Whether a streaming reqwest response may skip the coalescing adapter
+    /// entirely (issue #5588). A configured aggregation window must count as a
+    /// reason to coalesce, or the window is inert in the default configuration.
+    pub fn streaming_response_takes_direct_fast_path_for_test(
+        response_buffer_cutoff_bytes: usize,
+        max_response_body_size_bytes: usize,
+        coalesce_flush: Option<std::time::Duration>,
+    ) -> bool {
+        crate::proxy::streaming_response_takes_direct_fast_path(
+            response_buffer_cutoff_bytes,
+            max_response_body_size_bytes,
+            coalesce_flush,
+        )
+    }
+
+    /// The response-coalescing window after the idle-read-timeout clamp
+    /// (issue #5588).
+    pub fn coalesce_flush_window_for_test(
+        flush_ms: u64,
+        read_timeout_ms: u64,
+    ) -> Option<std::time::Duration> {
+        crate::proxy::coalesce_flush_window(flush_ms, read_timeout_ms)
+    }
+
     /// Direct-H2 large-response passthrough predicate. Callers must pass the
     /// trusted backend-observed length, never a post-hook header.
     pub fn should_bypass_h2_coalesce_for_large_response_for_test(

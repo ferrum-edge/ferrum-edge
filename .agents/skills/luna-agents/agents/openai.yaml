@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT-6 Luna Agents"
+  short_description: "Orchestrate GPT-6 Luna coding agents"
+  default_prompt: "Use $luna-agents to dispatch GPT-6 Luna Codex agents for this Ferrum Edge task."

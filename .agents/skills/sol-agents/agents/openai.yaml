@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT-6 Sol Agents"
+  short_description: "Orchestrate GPT-6 Sol coding agents"
+  default_prompt: "Use $sol-agents to dispatch GPT-6 Sol Codex agents for this Ferrum Edge task."
