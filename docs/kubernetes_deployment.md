@@ -75,12 +75,12 @@ bind (which the binary hard-fails on in database/cp modes).
 Both `charts/ferrum-gateway` and `charts/ferrum-mesh` default an empty
 `image.tag` to `Chart.appVersion`. That tag must exist in the container
 registry before install. Override with a published tag on the command line or in
-your values file (for example `--set image.tag=<published-tag>`). The mutable
-`latest` tag exists for evaluation but must not be used in production.
+your values file (for example `--set image.tag=<published-tag>`). The registry's
+`latest` tag is retired; existing images are historical artifacts and do not
+receive fixes. Always use a published version or digest.
 
-Because that override is mandatory, a mirrored or private registry is the
-common case. Both charts expose `image.pullSecrets` as a list of Secret
-**names** in the release namespace; each Secret must already exist (type
+For mirrored or private registries, both charts expose `image.pullSecrets` as a
+list of Secret **names** in the release namespace; each Secret must already exist (type
 `kubernetes.io/dockerconfigjson`) — neither chart creates one:
 
 ```bash
@@ -819,7 +819,7 @@ spec:
       terminationGracePeriodSeconds: 110
       containers:
         - name: ferrum-edge
-          image: docker.io/ferrumedge/ferrum-edge:latest
+          image: docker.io/ferrumedge/ferrum-edge:0.9.5
           imagePullPolicy: IfNotPresent
           args: ["run"]
           env:

@@ -7,9 +7,6 @@
 #     -f charts/ferrum-gateway/examples/file-values.yaml
 mode: file
 
-image:
-  tag: latest  # evaluation only; pin an immutable release tag in production
-
 replicaCount: 2
 
 file:

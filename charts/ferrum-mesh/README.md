@@ -22,8 +22,8 @@ Example value overlays live under [`examples/`](examples/).
 When `image.tag` is empty the chart defaults to `Chart.appVersion`. That tag
 must exist in the container registry before install. Override with a published
 tag from `docker.io/ferrumedge/ferrum-edge` or `ghcr.io/ferrum-edge/ferrum-edge`
-(for example `--set image.tag=<published-tag>`). The mutable `latest` tag exists
-for evaluation but must not be used in production.
+(for example `--set image.tag=<published-tag>`). The registry's `latest` tag is
+retired; existing images are historical artifacts and do not receive fixes.
 
 ## Private registries
 

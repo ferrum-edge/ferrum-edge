@@ -152,6 +152,28 @@ def validate_chart_mode_messages(results_dir: Path) -> None:
     print("chart mode messages ok")
 
 
+def validate_published_image_tags(root: Path) -> None:
+    stale_registry_image = re.compile(
+        r"(?:docker\.io/)?ferrumedge/ferrum-edge:latest(?:\s|[\"'`]|$)"
+    )
+    stale_chart_tag = re.compile(r"(?m)^\s*tag:\s*latest\s*(?:#.*)?$")
+    scanned = [*sorted((root / "docs").glob("*.md"))]
+    scanned.extend(
+        path
+        for path in sorted((root / "charts").rglob("*"))
+        if path.is_file() and path.suffix in {".md", ".yaml", ".yml", ".json"}
+    )
+    for path in scanned:
+        text = path.read_text(encoding="utf-8")
+        if stale_registry_image.search(text) or stale_chart_tag.search(text):
+            fail(
+                "Retired registry image tag",
+                f"{path.relative_to(root)} references latest; use a published version "
+                "or chart appVersion fallback",
+            )
+    print("published image tags ok")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -173,6 +195,7 @@ def main(argv: list[str]) -> int:
     validate_chart_mode_messages(results_dir)
     validate_migrate_examples(root)
     validate_mode_contract_docs(root)
+    validate_published_image_tags(root)
     return 0
 
 

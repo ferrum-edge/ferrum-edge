@@ -39,7 +39,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: ferrum-edge
-          image: ferrumedge/ferrum-edge:latest  # pin the same published tag as the gateway Deployment
+          image: ferrumedge/ferrum-edge:0.9.5  # pin the same published tag as the gateway Deployment
           imagePullPolicy: IfNotPresent
           args: ["run"]
           securityContext:
