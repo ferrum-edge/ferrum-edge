@@ -1113,6 +1113,57 @@ Every other field on these three resources replaces normally: a `GET`-modify-`PU
 round trip is safe because the response serializes them, but a hand-authored or
 templated partial body will reset anything it leaves out to the schema default.
 
+
+### Conditional writes (`ETag` / `If-Match`)
+
+Because a `PUT` is a full replace, a client that submits an editor opened
+before someone else's accepted change does not merely omit that change — it
+reverts it. `GET /proxies/{id}`, `/upstreams/{id}`, `/consumers/{id}`, and
+`/plugins/config/{id}` return a strong `ETag`; send it back as `If-Match` on
+`PUT` or `DELETE` of the same resource and the write is refused with
+`412 Precondition Failed` — writing nothing — unless the stored resource still
+has that representation.
+
+```bash
+ETAG=$(curl -si -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9000/proxies/orders | awk 'tolower($1)=="etag:"{print $2}' | tr -d '\r')
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
+  -H 'Content-Type: application/json' -d @orders.json \
+  http://localhost:9000/proxies/orders
+# 200 if nobody changed the proxy since the GET; 412 if anyone did.
+```
+
+- **Atomic across every admin writer.** The comparison runs against the row
+  the write path reads *after* acquiring the namespace config admission
+  lease, and the write commits under that same lease. Every admin writer of
+  these resources — CRUD, `/batch`, `/restore`, API-spec imports, consumer
+  credential endpoints, namespace operations, and those same paths on another
+  control-plane replica — takes the lease, so none can commit between the
+  comparison and the write. A lease lost mid-write is handled by the existing
+  late-write compensation, exactly as for every other admission invariant.
+- **What the tag covers.** A keyed MAC over the full stored resource, bound to
+  its kind, namespace, and id. It changes when any stored field changes,
+  including fields redacted from the caller's view and plugin associations
+  (which are compared order-independently). It is keyed by a subkey of
+  `FERRUM_ADMIN_JWT_SECRET` so it cannot be used to test guesses of a redacted
+  value; replicas sharing that secret issue identical tags, and rotating it
+  invalidates outstanding tags (writes then return `412` until re-read).
+- **Strict parsing.** `*` requires only that the resource exists. Comparison
+  is strong, so a weak `W/"…"` tag never matches. A comma-separated list
+  matches if any member does. A malformed or empty `If-Match` is `400`, never
+  treated as absent, and `If-Match` on any other mutating route (including
+  `POST` creates, `/batch`, and `/gateway-trust-bundles/{id}`, which keeps its
+  own body `revision` contract) is `400` rather than applied unconditionally.
+  A request that would be `404` without the header is still `404`.
+- **After a `412`,** re-read the resource and reapply the intended edits to
+  the current representation. Resending the same body with the fresh tag
+  would revert the change that caused the refusal.
+- **Write responses carry no tag.** Re-read to obtain the tag for the accepted
+  state. The cached-config `GET` fallback (`X-Data-Source: cached`) also
+  carries none, because it may lag the database.
+- **Unconditional writes are unchanged.** Omitting `If-Match` keeps today's
+  last-writer-wins behavior.
+
 ## Plugin Configs
 
 `plugin_name` must be non-empty (whitespace-only names are rejected).

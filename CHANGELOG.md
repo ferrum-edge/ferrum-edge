@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Conditional full-replacement writes (#5659). `GET` on proxies, upstreams,
+  consumers, and plugin configs returns a strong `ETag`; `PUT`/`DELETE` with a
+  non-matching `If-Match` is refused with `412` and writes nothing, so a draft
+  opened before another administrator's accepted change can no longer revert
+  it. The comparison runs under the namespace config admission lease the write
+  commits under, making it atomic against every admin writer, including other
+  control-plane replicas. Tags are keyed by the admin JWT secret so they reveal
+  nothing about redacted fields. A malformed `If-Match`, or one sent to a
+  mutating route that does not evaluate it, is `400` rather than ignored.
+  Requests without `If-Match` are unchanged.
+
 ### Fixed
 
 - Withhold supplied configuration values in early startup and reload diagnostics

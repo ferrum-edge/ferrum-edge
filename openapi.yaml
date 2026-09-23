@@ -5015,6 +5015,8 @@ paths:
         "200":
           description: Proxy object
           headers:
+            ETag:
+              $ref: "#/components/headers/ResourceETag"
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
@@ -5054,6 +5056,7 @@ paths:
               $ref: "#/components/schemas/ProxyCreate"
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -5078,6 +5081,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -5131,6 +5136,7 @@ paths:
       tags: [Proxies]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/CleanupOrphanedUpstream"
       responses:
         "202":
@@ -5154,6 +5160,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           $ref: "#/components/responses/Conflict"
         "501":
@@ -5273,6 +5281,8 @@ paths:
         "200":
           description: Consumer object
           headers:
+            ETag:
+              $ref: "#/components/headers/ResourceETag"
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
@@ -5310,6 +5320,7 @@ paths:
               $ref: "#/components/schemas/ConsumerUpdate"
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -5332,6 +5343,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -5357,6 +5370,7 @@ paths:
       tags: [Consumers]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -5373,6 +5387,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           description: |
             Conflict — mTLS DNS identity repair cannot proceed, or an
@@ -5868,6 +5884,8 @@ paths:
         "200":
           description: Plugin configuration object
           headers:
+            ETag:
+              $ref: "#/components/headers/ResourceETag"
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
@@ -5920,6 +5938,7 @@ paths:
               $ref: "#/components/schemas/PluginConfigReplace"
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -5942,6 +5961,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -5961,6 +5982,7 @@ paths:
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -5983,6 +6005,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
@@ -6083,6 +6107,8 @@ paths:
         "200":
           description: Upstream object
           headers:
+            ETag:
+              $ref: "#/components/headers/ResourceETag"
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
@@ -6115,6 +6141,7 @@ paths:
               $ref: "#/components/schemas/UpstreamCreate"
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -6137,6 +6164,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -6160,6 +6189,7 @@ paths:
       tags: [Upstreams]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -6176,6 +6206,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           description: |
             The upstream is still referenced by a proxy or by a
@@ -7606,6 +7638,34 @@ components:
 
   # ── Reusable parameters ────────────────────────────────────────────
   parameters:
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      schema:
+        type: string
+      description: |
+        Makes this full-replacement write conditional (RFC 9110 §13.1.1). Send
+        the `ETag` from `GET` on the same resource; the write is refused with
+        `412` unless the stored resource still has that representation, so a
+        draft opened before someone else's accepted change can never revert
+        it. `*` requires only that the resource exists. Comparison is strong:
+        a weak (`W/`) tag never matches. A comma-separated list matches when
+        any member does.
+
+        The comparison and the write are atomic with respect to every admin
+        writer of this namespace — including another control-plane replica
+        and `/batch`, `/restore`, API-spec imports, and credential endpoints —
+        because all of them serialize on the namespace config admission lease
+        the comparison runs under.
+
+        Omitting the header keeps the write unconditional. A malformed or
+        empty header is `400`, never treated as absent. `If-Match` is only
+        evaluated on `PUT`/`DELETE` of `/proxies/{id}`, `/upstreams/{id}`,
+        `/consumers/{id}`, and `/plugins/config/{id}`; any other `POST`,
+        `PUT`, `PATCH`, or `DELETE` carrying it is refused with `400` rather
+        than applied unconditionally. As RFC 9110 §13.2.1 requires, a request
+        that would otherwise be `404` is `404` regardless of the precondition.
     ProvisionedBy:
       name: X-Ferrum-Provisioned-By
       in: header
@@ -7759,6 +7819,21 @@ components:
 
   # ── Reusable headers ───────────────────────────────────────────────
   headers:
+    ResourceETag:
+      description: |
+        Strong entity-tag for the stored resource, for use in `If-Match`.
+        Present only when the resource was read from the database (absent on a
+        `X-Data-Source: cached` fallback). Opaque: it is a keyed MAC over the
+        full stored representation, bound to the resource kind, namespace, and
+        id, and it changes whenever any stored field changes — including
+        fields redacted from this caller's view. Replicas configured with the
+        same `FERRUM_ADMIN_JWT_SECRET` issue identical tags; rotating that
+        secret invalidates outstanding tags. Write responses do not carry a
+        tag: re-read the resource to obtain the tag for the accepted state.
+      required: false
+      schema:
+        type: string
+        example: '"3f0c8a1e9b2d4c6f8a0e1b3d5c7f9a2e"'
     X-Data-Source:
       description: |
         Present with value `cached` when the response was served from the
@@ -7824,6 +7899,17 @@ components:
 
   # ── Reusable responses ─────────────────────────────────────────────
   responses:
+    PreconditionFailed:
+      description: |
+        `If-Match` did not match: the resource changed after the supplied tag
+        was issued. Nothing was written. Re-read the resource, reapply the
+        intended changes to the current representation, and retry with its
+        new `ETag`; resending the same body with a fresh tag would revert the
+        change that caused this refusal.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     BadRequest:
       description: Invalid request body
       content:
