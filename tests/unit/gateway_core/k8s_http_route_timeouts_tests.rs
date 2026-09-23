@@ -189,8 +189,8 @@ fn http_route_timeouts_are_never_promoted_onto_the_generated_proxy() {
             "timeouts": {"request": "2s", "backendRequest": "250ms"}
         }]),
     );
-    let translation = translate_k8s_objects(&[object], options())
-        .expect("route should materialize");
+    let translation =
+        translate_k8s_objects(&[object], options()).expect("route should materialize");
     assert!(!translation.config.proxies.is_empty());
     for proxy in &translation.config.proxies {
         assert_eq!(

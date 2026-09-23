@@ -4258,9 +4258,9 @@ async fn removing_rule_timeouts_withdraws_the_deadline() {
     let mut timed = route_filter_cluster_objects(slow_port);
     timed.push(timeouts_route(json!([timed_rule])));
     let rules = emitted_dispatch_rules(timed.as_slice());
-    let projected = rules.iter().any(|rule| {
-        rule["request_timeout_ms"] == json!(300) && rule["timeout_ms"] == json!(250)
-    });
+    let projected = rules
+        .iter()
+        .any(|rule| rule["request_timeout_ms"] == json!(300) && rule["timeout_ms"] == json!(250));
     assert!(projected, "{rules:?}");
 
     let mut untimed = route_filter_cluster_objects(slow_port);

@@ -5746,9 +5746,7 @@ fn ensure_http_route_timeouts(
     {
         return Err(invalid_resource(
             object,
-            format!(
-                "{location}.backendRequest timeout cannot be longer than request timeout"
-            ),
+            format!("{location}.backendRequest timeout cannot be longer than request timeout"),
         ));
     }
     Ok(())

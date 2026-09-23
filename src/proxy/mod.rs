@@ -48772,10 +48772,7 @@ pin_project_lite::pin_project! {
 impl<F: std::future::Future> std::future::Future for RouteDeadlineAttempt<F> {
     type Output = Result<F::Output, RouteDeadlineExpiry>;
 
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Self::Output> {
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         let Some(deadline) = *this.deadline else {
             return this.attempt.poll(cx).map(Ok);

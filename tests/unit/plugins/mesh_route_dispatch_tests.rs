@@ -2801,7 +2801,10 @@ fn route_request_timeout_is_request_scoped_and_never_clones_the_proxy() {
     assert!(!request.has_route_overrides());
     let applied = request.apply_route_overrides(Arc::clone(&proxy));
     assert!(Arc::ptr_eq(&proxy, &applied));
-    assert_eq!(applied.backend_read_timeout_ms, proxy.backend_read_timeout_ms);
+    assert_eq!(
+        applied.backend_read_timeout_ms,
+        proxy.backend_read_timeout_ms
+    );
 }
 
 #[test]
