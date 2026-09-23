@@ -204,7 +204,7 @@ install_gateway_api_crds() {
   fetch_gateway_api_crd_bundle "$bundle" \
     "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml" \
     "$expected"
-  kubectl apply --server-side=true -f "$bundle"
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" apply --server-side=true -f "$bundle"
   for crd in \
     gatewayclasses.gateway.networking.k8s.io \
     gateways.gateway.networking.k8s.io \
@@ -213,7 +213,7 @@ install_gateway_api_crds() {
     tcproutes.gateway.networking.k8s.io \
     tlsroutes.gateway.networking.k8s.io \
     referencegrants.gateway.networking.k8s.io; do
-    kubectl wait --for=condition=Established "crd/${crd}" --timeout=120s
+    kubectl --context "$GATEWAY_API_LAB_CONTEXT" wait --for=condition=Established "crd/${crd}" --timeout=120s
   done
 }
 
@@ -228,10 +228,10 @@ create_tls_secret() {
     -subj "/CN=*.example.com" \
     -addext "subjectAltName=DNS:*.example.com,DNS:example.com,DNS:second-example.org,DNS:*.wildcard.org,DNS:fourth-example.wildcard.org,DNS:tls.blackbox.example" \
     >/dev/null 2>&1
-  kubectl -n "$namespace" create secret tls "$name" \
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" -n "$namespace" create secret tls "$name" \
     --cert="$tmpdir/tls.crt" \
     --key="$tmpdir/tls.key" \
-    --dry-run=client -o yaml | kubectl apply -f -
+    --dry-run=client -o yaml | kubectl --context "$GATEWAY_API_LAB_CONTEXT" apply -f -
 }
 
 create_frontend_tls_secret() {
@@ -248,9 +248,9 @@ deploy_control_plane() {
     "$DP_GATEWAY_NAMESPACE" \
     "$BACKEND_NAMESPACE" \
     "$APP_BACKEND_NAMESPACE"; do
-    kubectl create namespace "$watched_namespace" --dry-run=client -o yaml | kubectl apply -f -
+    kubectl --context "$GATEWAY_API_LAB_CONTEXT" create namespace "$watched_namespace" --dry-run=client -o yaml | kubectl --context "$GATEWAY_API_LAB_CONTEXT" apply -f -
   done
-  kubectl create namespace "$CP_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" create namespace "$CP_NAMESPACE" --dry-run=client -o yaml | kubectl --context "$GATEWAY_API_LAB_CONTEXT" apply -f -
   create_frontend_tls_secret
   # FERRUM_K8S_WATCH_IDLE_RELIST_SECS, not FERRUM_K8S_FULL_SYNC_INTERVAL_SECS, is
   # the bound on watch staleness: a full sync re-reconciles the SAME reflector
@@ -267,6 +267,7 @@ deploy_control_plane() {
   # not claim or recreate the cluster-scoped object (chart default is create=true).
   helm upgrade --install ferrum "$ROOT_DIR/charts/ferrum-mesh" \
     --namespace "$CP_NAMESPACE" \
+    --kube-context "$GATEWAY_API_LAB_CONTEXT" \
     --set image.repository=ferrum-edge \
     --set image.tag=gateway-api-conformance \
     --set image.pullPolicy=IfNotPresent \
@@ -305,11 +306,11 @@ deploy_control_plane() {
     --set controlPlane.env.FERRUM_GATEWAY_API_STATUS_ADDRESS="$GATEWAY_API_STATUS_ADDRESS" \
     --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
 
-  kubectl -n "$CP_NAMESPACE" rollout status deployment/ferrum-mesh-control-plane --timeout=180s
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" -n "$CP_NAMESPACE" rollout status deployment/ferrum-mesh-control-plane --timeout=180s
 }
 
 deploy_data_plane() {
-  cat <<YAML | kubectl apply -f -
+  cat <<YAML | kubectl --context "$GATEWAY_API_LAB_CONTEXT" apply -f -
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -455,7 +456,7 @@ spec:
       targetPort: ${TLS_BLACKBOX_PORT_DELETE}
       nodePort: ${TLS_BLACKBOX_NODEPORT_DELETE}
 YAML
-  kubectl -n "$CP_NAMESPACE" rollout status "deployment/${DP_SERVICE_NAME}" --timeout=240s
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" -n "$CP_NAMESPACE" rollout status "deployment/${DP_SERVICE_NAME}" --timeout=240s
 }
 
 create_gateway_class() {
