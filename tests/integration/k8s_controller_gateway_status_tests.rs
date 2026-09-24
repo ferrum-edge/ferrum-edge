@@ -4709,9 +4709,7 @@ async fn gateway_route_retry_reaches_the_data_plane() {
 
     let mut objects = route_filter_cluster_objects(api_port);
     objects.extend(scripted_service_objects("flaky", "10.96.0.12", flaky_port));
-    let retry = |codes: Value, attempts: u32, backoff: &str| {
-        json!({"codes": codes, "attempts": attempts, "backoff": backoff})
-    };
+    let retry = |codes: Value, attempts: u32, backoff: &str| json!({"codes": codes, "attempts": attempts, "backoff": backoff});
     let rule = |path: &str, service: &str, policy: Option<Value>| {
         let mut rule = json!({
             "matches": [{"path": {"type": "PathPrefix", "value": path}}],
