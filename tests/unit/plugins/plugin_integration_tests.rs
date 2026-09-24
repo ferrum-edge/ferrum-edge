@@ -1682,6 +1682,108 @@ async fn test_response_cache_hit_lifecycle_skips_non_idempotent_transforms() {
     );
 }
 
+/// A route-only reload can retain a global response-cache instance. The
+/// effective route response policy must therefore be part of the replay key,
+/// even though the rules-free response_transformer consumer itself is
+/// unchanged across the reload.
+#[tokio::test]
+async fn response_cache_misses_after_route_response_header_policy_changes() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    use ferrum_edge::_test_support::finalized_response_replay_for_test;
+    use ferrum_edge::plugins::utils::route_header_transform::{
+        RawRouteHeaderTransformRule, parse_route_header_transforms,
+    };
+
+    let plugins = sort_plugins(vec![
+        create_plugin(
+            "response_caching",
+            &json!({
+                "ttl_seconds": 60,
+                "add_cache_status_header": true,
+                "cache_key_include_consumer": true,
+            }),
+        )
+        .unwrap()
+        .unwrap(),
+        create_plugin(
+            "response_transformer",
+            &json!({"rules": [], "apply_route_overrides": true}),
+        )
+        .unwrap()
+        .unwrap(),
+    ]);
+
+    let old_raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "add", "target": "header", "key": "x-benign", "value": "old"}
+    ]))
+    .unwrap();
+    let old_rules = Arc::new(parse_route_header_transforms(&old_raw, "test.old").unwrap());
+
+    // Miss: store the representation finalized under the old route policy.
+    let mut miss_ctx = create_response_context("/route-policy-update");
+    miss_ctx.route_override_response_transform = Some(old_rules.clone());
+    let mut miss_headers = HashMap::new();
+    miss_headers.insert("content-type".to_string(), "text/plain".to_string());
+    miss_headers.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    miss_headers.insert("x-internal-token".to_string(), "secret".to_string());
+    let (status, headers, _) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut miss_ctx,
+        200,
+        miss_headers,
+        b"cached".to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("x-benign").map(String::as_str), Some("old"));
+
+    // Control: the unchanged route policy still addresses the stored entry, so
+    // the miss below is caused by the policy change rather than a failed store.
+    let mut hit_ctx = create_response_context("/route-policy-update");
+    hit_ctx.route_override_response_transform = Some(old_rules);
+    let mut proxy_headers = hit_ctx.headers.clone();
+    let mut cache_hit = false;
+    for plugin in &plugins {
+        match plugin.before_proxy(&mut hit_ctx, &mut proxy_headers).await {
+            PluginResult::Continue => {}
+            PluginResult::Reject { .. } | PluginResult::RejectBinary { .. } => {
+                cache_hit = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        cache_hit,
+        "the unchanged route response policy must replay the stored representation"
+    );
+    assert!(finalized_response_replay_for_test(&hit_ctx));
+
+    let new_raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "remove", "target": "header", "key": "x-internal-token"}
+    ]))
+    .unwrap();
+    let new_rules = Arc::new(parse_route_header_transforms(&new_raw, "test.new").unwrap());
+    let mut updated_ctx = create_response_context("/route-policy-update");
+    updated_ctx.route_override_response_transform = Some(new_rules);
+    let mut request_headers = updated_ctx.headers.clone();
+
+    for plugin in &plugins {
+        assert!(
+            matches!(
+                plugin
+                    .before_proxy(&mut updated_ctx, &mut request_headers)
+                    .await,
+                PluginResult::Continue
+            ),
+            "the retained representation must miss after its route response policy changes"
+        );
+    }
+    assert!(!finalized_response_replay_for_test(&updated_ctx));
+}
+
 /// #2381: REVALIDATED keeps validators-only headers and skips representation
 /// transforms (body rewrite would have stripped ETag, so this path is
 /// header-focused).

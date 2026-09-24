@@ -142,6 +142,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RUSTSEC-2026-0286: `Session::get_attributes` could build an out-of-bounds slice when
   decoding `CKA_ALLOWED_MECHANISMS` (crash or adjacent heap disclosure). Lockfile-only
   change; the manifest's `0.12` requirement already admits the patch release.
+- **Route response-header policy is now part of the replay key** (PR #5709).
+  `response_caching`, `request_deduplication`, and `ai_semantic_cache` replay a
+  response whose headers were finalized when it was stored, so they skip the
+  matched route's response-header transforms. A route-only reload that changed
+  those transforms (for example, a new `ResponseHeaderModifier` removing a
+  sensitive header) could still replay entries finalized under the old rule.
+  The ordered transform list is now bound into the shared destination
+  partition, so such entries miss. Existing replay keys rotate once after
+  upgrading.
 
 ### Changed
 
