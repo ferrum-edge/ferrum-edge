@@ -13982,7 +13982,9 @@ components:
         http_path:
           type: string
           default: /health
-          description: HTTP path to probe
+          maxLength: 2048
+          pattern: "^/"
+          description: HTTP path to probe; must start with `/`
         interval_seconds:
           type: integer
           format: uint64
@@ -14033,6 +14035,8 @@ components:
             `grpc` — gRPC health check using `grpc.health.v1.Health/Check`.
         udp_probe_payload:
           type: [string, "null"]
+          maxLength: 2048
+          pattern: "^([0-9a-fA-F]{2})*$"
           description: |
             Hex-encoded payload to send for UDP probes (e.g., "0000").
             If omitted, a single zero byte is sent.
