@@ -43,6 +43,41 @@ for limits, PUT semantics, and `X-Ferrum-Provisioned-By` behavior.
   before clients begin emitting labels, including `labels.provisioned-by`.
   Existing unlabeled resources remain valid and are not automatically attributed.
 
+## Upgrading to 0.9.6
+
+v0.9.6 adds Gateway API `ResponseHeaderModifier` and `URLRewrite` filters, plus
+HTTPRoute rule-level `timeouts`. `timeouts.request` bounds the full request,
+including retries and the streaming response body; `timeouts.backendRequest`
+bounds each backend attempt. Native HTTP/3 refuses non-gRPC requests governed by
+a total request timeout with `503` until that deadline can be enforced, and the
+gateway does not advertise HTTP/3 on listener ports serving such rules.
+
+- **Admin writes:** proxies, upstreams, consumers, and plugin configs now expose
+  strong `ETag` values on `GET`. Send the returned `If-Match` on `PUT` or
+  `DELETE` to reject stale drafts with `412`; requests without `If-Match` retain
+  their previous behavior.
+- **Mesh listeners:** inbound and outbound TCP listeners may not share a
+  nonzero port number, even on different addresses. Choose distinct ports before
+  restarting affected mesh deployments; UDP capture and port `0` are excluded.
+- **MCP routes:** the single trailing-slash alias is no longer rewritten. Set
+  clients to the exact configured `endpoint.path`, or configure that path with
+  the slash clients use.
+- **Rate limiting:** `rate_limiting.redis_failure_policy` now defaults to
+  `local_fallback`, applying the configured quota independently in each pod
+  during Redis outages. Set `fail_closed` if centralized enforcement is
+  required. Redis-backed request quotas (`rate_limiting`, `graphql`, and
+  `grpc_method_router`) also require Redis `TIME` permission (`+time` or a
+  category that includes it). Their counter key layout changed, so expect up to
+  one window of reduced enforcement while new counters fill and separate old/new
+  counters during a rolling upgrade.
+- **Redis URLs:** database selectors must be canonical decimal integers from
+  `0` through `2147483647`, without signs, leading zeroes, or extra path
+  segments.
+- **TCP/TLS relays:** pending buffered writes are flushed before a relay parks
+  on its reader. With nonzero `backend_write_timeout_ms`, a TLS backend whose
+  pending write or half-close stalls can now hit the backend write inactivity
+  timeout.
+
 ## Breaking changes in 0.9.0
 
 ### ConfigSync subscription identity binding

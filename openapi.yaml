@@ -158,7 +158,7 @@ info:
     unbounded header block per stream. A connection that neither delivers a new
     request nor holds one in flight for a whole
     `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` window is closed.
-  version: 0.2.0
+  version: 0.9.6
   license:
     name: PolyForm Noncommercial 1.0.0
     url: https://polyformproject.org/licenses/noncommercial/1.0.0

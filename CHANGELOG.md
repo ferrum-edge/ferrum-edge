@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-09-24
+
 ### Added
 
 - Gateway API HTTPRoute rule-level `timeouts` (#5646). `timeouts.backendRequest`
@@ -3946,7 +3948,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.6...HEAD
+[0.9.6]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.3...v0.9.4
 [0.9.0]: https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.0
