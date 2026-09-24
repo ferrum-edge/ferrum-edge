@@ -174,9 +174,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `aws-sdk-secretsmanager`'s legacy `rustls` feature, so hyper 0.14, rustls 0.21
   with rustls-webpki 0.101.7 (RUSTSEC-2026-0098, -0099, -0104) and h2 0.3.27
   (RUSTSEC-2026-0258) leave the tree. The client already used the SDK's
-  hyper 1.x HTTPS client. PEM parsing moves from the unmaintained
-  `rustls-pemfile` (RUSTSEC-2025-0134) to the `rustls-pki-types` PEM API, with the
-  same record handling. Only the wording of the underlying parse error in admin
+  hyper 1.x HTTPS client. PEM parsing, in the gateway and in the standalone
+  performance harnesses, moves from the unmaintained `rustls-pemfile`
+  (RUSTSEC-2025-0134) to the `rustls-pki-types` PEM API, with the same record
+  handling. Only the wording of the underlying parse error in admin
   API and TLS inventory messages changes. `rsa` (RUSTSEC-2023-0071) and `paste`
   (RUSTSEC-2024-0436) still have no upstream fix and are re-affirmed until
   2026-12-31.

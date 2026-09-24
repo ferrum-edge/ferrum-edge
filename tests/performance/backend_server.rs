@@ -141,7 +141,8 @@ fn load_tls_config(
     let cert_file = fs::File::open(cert_path)?;
     let key_file = fs::File::open(key_path)?;
 
-    let certs: Vec<_> = CertificateDer::pem_reader_iter(cert_file).collect::<Result<Vec<_>, _>>()?;
+    let certs: Vec<_> =
+        CertificateDer::pem_reader_iter(cert_file).collect::<Result<Vec<_>, _>>()?;
     let key = PrivateKeyDer::from_pem_reader(key_file)?;
 
     let config = ServerConfig::builder()

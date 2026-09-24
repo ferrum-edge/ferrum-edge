@@ -619,8 +619,8 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
         .next()
         .ok_or_else(|| anyhow::anyhow!("No cert in PEM"))?
         .map_err(|e| anyhow::anyhow!("cert parse: {e}"))?;
-    let key_der =
-        PrivateKeyDer::from_pem_slice(&key_pem[..]).map_err(|e| anyhow::anyhow!("key parse: {e}"))?;
+    let key_der = PrivateKeyDer::from_pem_slice(&key_pem[..])
+        .map_err(|e| anyhow::anyhow!("key parse: {e}"))?;
 
     let certificate = DtlsCertificate {
         certificate: cert_der.to_vec(),
