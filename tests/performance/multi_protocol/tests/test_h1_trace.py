@@ -1215,7 +1215,10 @@ class H1TeardownTests(unittest.TestCase):
         main = source.split('for size in $PAYLOAD_SIZES; do', 1)[1]
         self.assertLess(main.index('run_bench'), main.index('stop_gateway'))
         stop = source.split('stop_gateway() {', 1)[1].split('# ── Bench runner', 1)[0]
-        self.assertLess(stop.index('docker rm -f'), stop.index('h1_trace_stop'))
+        self.assertLess(stop.index('stop_container "$GATEWAY_CID"'), stop.index('h1_trace_stop'))
+        # stop_container removes only the container this run recorded (#5702).
+        helper = source.split('stop_container() {', 1)[1].split('\n}', 1)[0]
+        self.assertIn('docker rm -f "$cid"', helper)
 
 
 class H1BindingTests(unittest.TestCase):

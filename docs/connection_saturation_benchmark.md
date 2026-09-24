@@ -6,7 +6,7 @@ Measures the maximum number of concurrent long-lived HTTP/1.1+TLS connections a 
 
 The `proto_bench saturate` harness opens N simultaneous TLS connections to the gateway, ramps over a configurable window, holds them open, and sends periodic heartbeat requests (POST /echo with payload validation) on each connection. A level passes when ≥99% of connections establish, ≥99% survive the hold window, and ≥99% of heartbeats succeed.
 
-All gateways run with `--ulimit nofile=1048576:1048576`. The benchmark script is at `tests/performance/multi_protocol/run_connection_saturation_bench.sh`.
+All gateways run with `--ulimit nofile=1048576:1048576`. The benchmark script is at `tests/performance/multi_protocol/run_connection_saturation_bench.sh`. It refuses to start if any of its fixed ports is already bound, and on exit it stops only the backend PID and Docker container IDs that run recorded — never an unrelated listener on those ports.
 
 ## Results
 
