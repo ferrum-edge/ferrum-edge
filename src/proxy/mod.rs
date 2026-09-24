@@ -51025,11 +51025,10 @@ async fn proxy_to_backend_hbone_after_ready(
             let send_bound =
                 compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
             let send_fut = checkout.sender.try_send_request(backend_req);
-            let send_fut = h1_send_release::await_h1_response_or_release(
-                send_fut,
-                checkout,
-                |lease, cx| lease.sender.poll_ready(cx).map_err(|_| ()),
-            );
+            let send_fut =
+                h1_send_release::await_h1_response_or_release(send_fut, checkout, |lease, cx| {
+                    lease.sender.poll_ready(cx).map_err(|_| ())
+                });
             if let Some(send_deadline) = send_bound.at {
                 let bounded = await_upload_write_watermark_first(
                     crate::plugins::await_deadline_first(Some(send_deadline), send_fut),
@@ -52004,11 +52003,10 @@ async fn proxy_to_backend_unix(
         // idle-race arm below replaces `checkout` as for any pre-wire handback.
         let send_result = {
             let send_fut = checkout.sender.try_send_request(backend_req);
-            let send_fut = h1_send_release::await_h1_response_or_release(
-                send_fut,
-                checkout,
-                |lease, cx| lease.sender.poll_ready(cx).map_err(|_| ()),
-            );
+            let send_fut =
+                h1_send_release::await_h1_response_or_release(send_fut, checkout, |lease, cx| {
+                    lease.sender.poll_ready(cx).map_err(|_| ())
+                });
             let send_bound =
                 compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
             if let Some(send_deadline) = send_bound.at {
