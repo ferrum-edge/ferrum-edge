@@ -151,6 +151,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The ordered transform list is now bound into the shared destination
   partition, so such entries miss. Existing replay keys rotate once after
   upgrading.
+- **Route-override backend TLS and DNS policy are now part of the replay key**
+  (issue #5710). Two dispatch rules can send the same request target to the
+  same backend host and port under different backend TLS, for example
+  per-tenant client certificates or one rule that verifies the origin and one
+  that does not. A `response_caching`, `request_deduplication`, or
+  `ai_semantic_cache` entry stored under one rule could be replayed to a
+  request routed under the other. The route-override TLS identity (client
+  certificate and key references, CA bundle, verification mode, SNI, and SAN
+  allow-list) and the route-override DNS policy are now bound into the shared
+  destination partition. Only identities are hashed, never key material.
+  Existing replay keys rotate once after upgrading.
 
 ### Changed
 

@@ -4989,6 +4989,14 @@ pub mod _test_support {
         ctx.finalized_response_replay
     }
 
+    /// Stand in for a provider claim that states `ClearInherited` DNS intent,
+    /// which only crate-internal route dispatchers may set.
+    pub fn set_route_override_dns_policy_clear_inherited_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.route_override_dns_policy = crate::plugins::RouteOverrideDnsPolicy::ClearInherited;
+    }
+
     /// Stand in for the protocol entry paths, which copy this digest from the
     /// request's plugin-cache view before any plugin runs.
     pub fn set_response_presentation_policy_digest_for_test(
