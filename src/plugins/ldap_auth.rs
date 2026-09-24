@@ -1636,6 +1636,7 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
 ///
 /// Characters that have special meaning in a DN — `,`, `+`, `"`, `\`, `<`, `>`, `;`
 /// — are backslash-escaped. Leading/trailing spaces and a leading `#` are also escaped.
+/// NUL has no single-character escape and must be hex-escaped as `\00`.
 pub fn escape_dn_value(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 8);
     // `input.len()` is a *byte* length but `enumerate()` yields a *character*
@@ -1646,6 +1647,10 @@ pub fn escape_dn_value(input: &str) -> String {
     let total_chars = input.chars().count();
     for (i, ch) in input.chars().enumerate() {
         let is_last = i + 1 == total_chars;
+        if ch == '\0' {
+            out.push_str("\\00");
+            continue;
+        }
         let needs_escape = matches!(ch, ',' | '+' | '"' | '\\' | '<' | '>' | ';')
             || (i == 0 && (ch == ' ' || ch == '#'))
             || (is_last && ch == ' ');

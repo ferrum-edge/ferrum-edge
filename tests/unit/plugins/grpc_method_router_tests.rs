@@ -929,6 +929,35 @@ async fn test_rate_limiting_by_authenticated_identity() {
 }
 
 #[tokio::test]
+async fn test_consumer_identity_equal_to_ip_does_not_share_ip_budget() {
+    // An authenticated identity that happens to equal an IP must not drain
+    // the anonymous budget of the caller at that IP (and vice versa).
+    let config = json!({
+        "method_rate_limits": {
+            "/pkg.Svc/Create": { "max_requests": 1, "window_seconds": 60 }
+        },
+        "limit_by": "consumer"
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    let mut ctx = create_grpc_context("/pkg.Svc/Create");
+    ctx.client_ip = "203.0.113.7".to_string();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("203.0.113.7".to_string());
+    let _ = plugin.on_request_received(&mut ctx).await;
+    assert_continue(enforce_effective_path(plugin.as_ref(), &mut ctx).await);
+
+    let mut ctx = create_grpc_context("/pkg.Svc/Create");
+    ctx.client_ip = "203.0.113.7".to_string();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = None;
+    let _ = plugin.on_request_received(&mut ctx).await;
+    assert_continue(enforce_effective_path(plugin.as_ref(), &mut ctx).await);
+}
+
+#[tokio::test]
 async fn test_consumer_takes_precedence_over_authenticated_identity() {
     let config = json!({
         "method_rate_limits": {

@@ -5,7 +5,7 @@ in database mode, including the required CI backend × behavior matrix.
 
 ## Backend × behavior matrix
 
-Hosted CI owns these cells in the `Functional Tests (data-plane)` job
+Hosted CI owns these cells in the `Functional Tests (data-plane)` and `Functional Tests (data-plane-runtime)` jobs
 (`.github/workflows/ci.yml`). That job provisions Redis, MongoDB (plaintext +
 TLS/mTLS), PostgreSQL, and MySQL (plaintext + TLS), sets explicit
 `FERRUM_TEST_*_URL` values, and enables fail-closed mode via
@@ -60,7 +60,7 @@ diff in one place. The replica-set cells are opt-in through
 
 | Hosted job | Required backends | Required behaviors |
 |---|---|---|
-| `Functional Tests (data-plane)` | sqlite, postgres, mysql, mongodb, redis | admin-crud, polling-delete, namespace-isolation, migrate-idempotent, concurrent-mutations, connectivity-recovery, tls-modes, gateway-trust-bundle acceptance + two-replica CP convergence |
+| `Functional Tests (data-plane)` / `(data-plane-runtime)` | sqlite, postgres, mysql, mongodb, redis | admin-crud, polling-delete, namespace-isolation, migrate-idempotent, concurrent-mutations, connectivity-recovery, tls-modes, gateway-trust-bundle acceptance + two-replica CP convergence |
 | `Functional Tests (application)` | sqlite (migrate/file/admin) | migrate baseline on SQLite; no network DB URLs |
 | `Plugin Hardening Redis Regression` | redis (`FERRUM_REDIS_REQUIRED=1`) | request-dedup cross-instance; shared single-use replay authority across two gateway replicas (`hmac_v2`, DPoP, `replay_scope: shared`); the whole `test_rate_limiting_redis` suite — centralized admission, previous-bucket decay, sustained single- and multi-window admission at the configured rate, multi-window refusals that leave every counter untouched (issue #5517), the database selector handshake, namespace/key-prefix isolation, a shared budget across two gateway instances, and the default `local_fallback` per-pod outage plus live recovery (issue #5519) alongside explicit `fail_closed` |
 
