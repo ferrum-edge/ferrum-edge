@@ -2562,9 +2562,9 @@ mod tests {
 
         let active = || {
             balancer
-                .active_connections
+                .active_connection_counts()
                 .iter()
-                .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
+                .map(|(_, count)| count)
                 .sum::<i64>()
         };
 
@@ -2900,10 +2900,8 @@ mod tests {
         );
 
         let samples = balancer
-            .latency_sample_count
-            .get("10.0.0.1:8080")
-            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0);
+            .target_runtime_state(&target)
+            .map_or(0, |state| state.latency_sample_count());
         assert!(
             samples >= 1,
             "passive TTFB must sample until active probes are actually running, got {samples}"
@@ -2943,10 +2941,8 @@ mod tests {
             Duration::from_micros(2500),
         );
         let samples_after = balancer
-            .latency_sample_count
-            .get("10.0.0.1:8080")
-            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0);
+            .target_runtime_state(&target)
+            .map_or(0, |state| state.latency_sample_count());
         assert_eq!(
             samples_after, samples,
             "running active probes must suppress passive TTFB sampling"

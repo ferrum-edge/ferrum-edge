@@ -12070,9 +12070,9 @@ mod tests {
 
         let active = || {
             balancer
-                .active_connections
+                .active_connection_counts()
                 .iter()
-                .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
+                .map(|(_, count)| count)
                 .sum::<i64>()
         };
 

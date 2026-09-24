@@ -42,6 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Service-discovery target updates, modified upstreams, and full load-balancer
+  rebuilds no longer reset the live state of targets that stay in the set
+  (#5693). Each surviving `host:port` keeps its active-connection count, latency
+  EWMA, and latency sample count. The new balancer shares these counters with
+  the old one, so connections opened before the update are still counted and
+  release the same counter when they close. Previously a scale-up made a target
+  with 1,000 open sessions look idle to `least_connections`, sent
+  `least_latency` back into round-robin warm-up, and dropped those connections
+  from the per-target connection metrics. A removed target's state is dropped;
+  if the target is added again, it starts clean.
 - Reject a health-check `active.http_path` that does not start with `/`
   (#5683). The probe URL is `scheme://host:port` + path, so a path like
   `@169.254.169.254/` turned the target into userinfo and sent the probe to a
@@ -114,6 +124,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ws_frame_logging` builds its payload-fingerprint HMAC key once per plugin
   instead of once per frame (#5690).
 - Circuit-breaker cache hits no longer allocate a key string (#5691).
+- `least_connections` and `least_latency` selection read each candidate's
+  counters by index instead of doing one or more `DashMap<String, _>` lookups
+  per candidate per request (#5693). Each balancer also no longer allocates
+  three default-sharded `DashMap`s.
 
 ### Security
 

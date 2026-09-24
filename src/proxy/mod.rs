@@ -5010,7 +5010,7 @@ impl PerIpStreamAdmission {
 /// Build the synthetic [`UpstreamTarget`] that keys stream load-balancer
 /// accounting for an already-resolved backend (issue #4514).
 ///
-/// `LoadBalancer::find_target_key` resolves a target purely by the `host:port`
+/// `LoadBalancer::find_target_index` resolves a target purely by the `host:port`
 /// string `write_target_host_port_key` builds, so a target carrying only the
 /// dialled host/port keys exactly the same active-connection counter and
 /// latency EWMA slot the real selected target does. This is the same

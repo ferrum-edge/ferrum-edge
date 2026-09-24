@@ -21,7 +21,6 @@ fn active_health_ctx(active: &ActiveUnhealthyTargets) -> HealthContext<'_> {
         max_ejection_percent: None,
     }
 }
-use std::sync::atomic::{AtomicI64, Ordering};
 
 fn make_targets(n: usize) -> Vec<UpstreamTarget> {
     (0..n)
@@ -134,10 +133,7 @@ fn test_least_connections_prefers_least_loaded() {
 
     // Simulate 5 connections to host0
     for _ in 0..5 {
-        lb.active_connections
-            .entry(target_host_port_key(&targets[0]))
-            .or_insert_with(|| AtomicI64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
+        lb.record_connection_start(&targets[0]);
     }
 
     // Next selection should prefer host1
@@ -488,17 +484,15 @@ fn test_least_latency_record_latency_first_sample_seeds_ewma() {
     lb.record_latency(&targets[0], 5_000); // 5ms
 
     let ewma = lb
-        .latency_ewma
-        .get("host0:8080")
-        .unwrap()
-        .load(Ordering::Relaxed);
+        .target_runtime_state(&targets[0])
+        .and_then(|state| state.latency_ewma_us())
+        .unwrap();
     assert_eq!(ewma, 5_000, "First sample should seed EWMA directly");
 
     let count = lb
-        .latency_sample_count
-        .get("host0:8080")
+        .target_runtime_state(&targets[0])
         .unwrap()
-        .load(Ordering::Relaxed);
+        .latency_sample_count();
     assert_eq!(count, 1, "Sample count should be 1 after first record");
 }
 
@@ -522,10 +516,9 @@ fn test_least_latency_ewma_smoothing() {
     lb.record_latency(&targets[0], 20_000);
 
     let ewma = lb
-        .latency_ewma
-        .get("host0:8080")
-        .unwrap()
-        .load(Ordering::Relaxed);
+        .target_runtime_state(&targets[0])
+        .and_then(|state| state.latency_ewma_us())
+        .unwrap();
     assert_eq!(ewma, 13_000, "EWMA should be 13000μs after second sample");
 
     // Third sample: 10000μs
@@ -533,10 +526,9 @@ fn test_least_latency_ewma_smoothing() {
     lb.record_latency(&targets[0], 10_000);
 
     let ewma = lb
-        .latency_ewma
-        .get("host0:8080")
-        .unwrap()
-        .load(Ordering::Relaxed);
+        .target_runtime_state(&targets[0])
+        .and_then(|state| state.latency_ewma_us())
+        .unwrap();
     assert_eq!(ewma, 12_100, "EWMA should be 12100μs after third sample");
 }
 
@@ -560,10 +552,9 @@ fn test_least_latency_reset_recovered_target() {
 
     // Verify host0 has a high EWMA
     let host0_ewma_before = lb
-        .latency_ewma
-        .get("host0:8080")
-        .unwrap()
-        .load(Ordering::Relaxed);
+        .target_runtime_state(&targets[0])
+        .and_then(|state| state.latency_ewma_us())
+        .unwrap();
     assert!(
         host0_ewma_before > 40_000,
         "host0 EWMA should be high before reset: {}",
@@ -575,15 +566,13 @@ fn test_least_latency_reset_recovered_target() {
 
     // host0's EWMA should now be near host1's (the minimum)
     let host0_ewma_after = lb
-        .latency_ewma
-        .get("host0:8080")
-        .unwrap()
-        .load(Ordering::Relaxed);
+        .target_runtime_state(&targets[0])
+        .and_then(|state| state.latency_ewma_us())
+        .unwrap();
     let host1_ewma = lb
-        .latency_ewma
-        .get("host1:8080")
-        .unwrap()
-        .load(Ordering::Relaxed);
+        .target_runtime_state(&targets[1])
+        .and_then(|state| state.latency_ewma_us())
+        .unwrap();
     assert_eq!(
         host0_ewma_after, host1_ewma,
         "Recovered target EWMA should match the current minimum"
@@ -593,10 +582,9 @@ fn test_least_latency_reset_recovered_target() {
     // target immediately participates in latency-based selection without forcing
     // the entire upstream back into round-robin warm-up mode.
     let count = lb
-        .latency_sample_count
-        .get("host0:8080")
+        .target_runtime_state(&targets[0])
         .unwrap()
-        .load(Ordering::Relaxed);
+        .latency_sample_count();
     assert_eq!(
         count, 5,
         "Sample count should be set to warm-up threshold after recovery"
@@ -913,33 +901,36 @@ fn test_least_latency_target_unhealthy_at_startup_then_recovers() {
 
 #[test]
 fn test_least_latency_late_joiner_does_not_disrupt_routing() {
-    // When a new target joins (e.g., added via config reload or recovered from
-    // unhealthy), the existing latency-based routing should continue uninterrupted.
+    // When a new target joins (e.g., added via service discovery or config
+    // reload), the existing latency-based routing should continue uninterrupted.
     // The new target receives bounded exploration, not an unconditional preference.
     let targets = make_targets(2);
-    let lb = LoadBalancer::new(
+    let before = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets[1..],
+        None,
+    );
+
+    // Complete warm-up for host1 (5ms) before host0 exists.
+    for _ in 0..10 {
+        before.record_latency(&targets[1], 5_000);
+    }
+    let sel = before.select("", None).unwrap();
+    assert_eq!(sel.target.host, "host1");
+
+    // host0 joins: the rebuilt balancer keeps host1's warmed state and starts
+    // host0 unsampled.
+    let mut lb = LoadBalancer::new(
         TEST_UPSTREAM,
         LoadBalancerAlgorithm::LeastLatency,
         &targets,
         None,
     );
-
-    // Complete warm-up: host0: 20ms, host1: 5ms
-    for _ in 0..10 {
-        lb.record_latency(&targets[0], 20_000);
-        lb.record_latency(&targets[1], 5_000);
-    }
-
-    // Verify latency-based selection works (host1 preferred)
-    let sel = lb.select("", None).unwrap();
-    assert_eq!(sel.target.host, "host1");
-
-    // Now simulate host0's sample count being reset (as if it were a late joiner)
-    // by directly setting it below the threshold
-    lb.latency_sample_count
-        .get("host0:8080")
-        .unwrap()
-        .store(0, Ordering::Relaxed);
+    lb.inherit_runtime_state(&before);
+    let joiner = lb.target_runtime_state(&targets[0]).unwrap();
+    assert_eq!(joiner.latency_sample_count(), 0);
+    assert_eq!(joiner.latency_ewma_us(), None);
 
     let n = 200;
     let mut host0_hits = 0usize;
@@ -1011,10 +1002,9 @@ fn test_least_latency_unsampled_target_gets_bounded_exploration_not_pin() {
     );
 
     let host0_ewma = lb
-        .latency_ewma
-        .get("host0:8080")
-        .unwrap()
-        .load(Ordering::Relaxed);
+        .target_runtime_state(&targets[0])
+        .and_then(|state| state.latency_ewma_us())
+        .unwrap();
     assert!(
         host0_ewma >= 1_000,
         "host0 EWMA should be at least 1000 us, got {}",
@@ -1111,10 +1101,9 @@ fn test_least_latency_record_for_nonexistent_target() {
     // Original target should still work fine
     lb.record_latency(&targets[0], 1_000);
     let ewma = lb
-        .latency_ewma
-        .get("host0:8080")
-        .unwrap()
-        .load(Ordering::Relaxed);
+        .target_runtime_state(&targets[0])
+        .and_then(|state| state.latency_ewma_us())
+        .unwrap();
     assert_eq!(ewma, 1_000);
 }
 
@@ -2754,10 +2743,9 @@ fn subset_traffic_policy_overrides_parent_algorithm() {
         Some(&subsets),
     );
 
-    lb.active_connections
-        .entry(target_host_port_key(&targets[2]))
-        .or_insert_with(|| AtomicI64::new(0))
-        .store(10, Ordering::Relaxed);
+    for _ in 0..10 {
+        lb.record_connection_start(&targets[2]);
+    }
 
     for _ in 0..20 {
         let sel = lb.select_from_subset("", "canary", None).unwrap();

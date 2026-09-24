@@ -7051,9 +7051,8 @@ mod backend_target_selection_tests {
             .expect("synthetic target must correspond to a configured target");
         let expected_key = crate::load_balancer::target_host_port_key(selected);
         let counted = balancer
-            .active_connections
-            .get(expected_key.as_str())
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+            .target_runtime_state(selected)
+            .map(|state| state.active_connections());
         assert_eq!(
             counted,
             Some(1),
@@ -7063,9 +7062,8 @@ mod backend_target_selection_tests {
 
         balancer.record_connection_end(&synthetic);
         let counted = balancer
-            .active_connections
-            .get(expected_key.as_str())
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+            .target_runtime_state(selected)
+            .map(|state| state.active_connections());
         assert_eq!(counted, Some(0), "guard drop must return the gauge to zero");
     }
 

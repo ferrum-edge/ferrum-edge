@@ -40,6 +40,19 @@ The load balancing architecture consists of:
 
 Load balancers are rebuilt atomically on configuration changes (file reload via SIGHUP, database polling, or control plane push) — no requests are dropped during reconfiguration. `TargetSelection.target` is `Arc<UpstreamTarget>`, so callers access fields via auto-deref without cloning.
 
+### Runtime State Across Rebuilds
+
+An upstream whose configuration did not change keeps its balancer instance, and with it every counter. An upstream that is rebuilt gets a new balancer. That happens when service discovery publishes a changed target set, when the upstream is modified, or on a full rebuild. The new balancer still keeps the **live per-target state** of every target that survives the change:
+
+- the active-connection count (`least_connections`, and the per-target connection metrics),
+- the latency EWMA and its sample count (`least_latency`).
+
+A target is the same target when it has the same `host:port` in the same namespace-qualified upstream. This is the key the balancer has always used for this state. Two entries of one upstream that share a `host:port` (the same endpoint under different Services, subsets, or port-policy lanes) share one count. The same endpoint listed in two different upstreams has separate state in each.
+
+The new balancer shares these counters with the old one; nothing is copied. A connection that was opened before the rebuild still holds the old balancer, so when it closes it decrements the counter the new balancer reads. For example, if target `A` holds 1,000 long-lived WebSocket sessions and a scale-up adds target `C`, `A` still shows 1,000 connections and new connections go to the idle targets. A known-slow target also keeps its EWMA, so the upstream does not go back to round-robin warm-up.
+
+Round-robin counters, weighted round-robin schedules, and consistent-hash rings are rebuilt from the new target set. A removed target's state is dropped with the old balancer, so state does not grow over time. If the target is added again later, it starts clean: zero connections and no latency samples. Connections that were opened to it before it was removed close against their old, detached counter and never change the count of the re-added target. Counts saturate at zero and never go negative.
+
 ### DNS Integration
 
 Upstream target hostnames are automatically resolved through the gateway's [central DNS cache](dns_resolver.md). This means:
@@ -232,7 +245,7 @@ Subset and port WRR lanes remain isolated from each other and from the parent la
 
 **Algorithm:** `least_connections`
 
-Routes each request to the target with the fewest active connections. Connection counts are tracked per target and updated atomically as connections open and close.
+Routes each request to the target with the fewest active connections. Connection counts are tracked per target and updated atomically as connections open and close. A target's count survives service-discovery updates and upstream changes as long as the target stays in the set (see [Runtime State Across Rebuilds](#runtime-state-across-rebuilds)).
 
 ```yaml
 upstreams:
@@ -293,7 +306,7 @@ upstreams:
 
 **How it works:**
 
-1. **Warm-up phase**: When the upstream is first loaded (or after a config reload), the algorithm uses round-robin to distribute traffic evenly across all healthy targets. Each healthy target must accumulate at least 5 latency samples before latency-based selection begins for that target. Successful responses record real TTFB/probe RTT; **failed dispatches** (connection errors and 5xx, when passive latency recording is active) also count toward the warm-up threshold using a synthetic high-latency penalty sample so a target that fails every request exits warm-up instead of remaining permanently preferred. If a target is unhealthy at startup, warm-up proceeds with the healthy targets only — the unhealthy target does not block the algorithm from advancing.
+1. **Warm-up phase**: When the upstream is first loaded, the algorithm uses round-robin to distribute traffic evenly across all healthy targets. A config reload or service-discovery update does not restart warm-up: targets that stay in the set keep their EWMA and sample count (see [Runtime State Across Rebuilds](#runtime-state-across-rebuilds)), and only newly added targets start unsampled, as late joiners (step 4). Each healthy target must accumulate at least 5 latency samples before latency-based selection begins for that target. Successful responses record real TTFB/probe RTT; **failed dispatches** (connection errors and 5xx, when passive latency recording is active) also count toward the warm-up threshold using a synthetic high-latency penalty sample so a target that fails every request exits warm-up instead of remaining permanently preferred. If a target is unhealthy at startup, warm-up proceeds with the healthy targets only — the unhealthy target does not block the algorithm from advancing.
 
 2. **Steady-state**: After warm-up, each request is routed to the target with the lowest EWMA latency. The EWMA is updated after every successful backend response using the formula:
 
