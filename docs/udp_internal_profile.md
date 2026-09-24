@@ -80,7 +80,7 @@ queue, retry, or notification ownership rule is relaxed.
 ## Hosted checks and bounded campaign
 
 The `UDP Internal Profile` workflow has a feature-on lane (pull requests that
-edit the UDP profiler itself, and pushes to `main` on the shared UDP surface; see
+edit the UDP profiler itself, and a daily run on the `main` tip; see
 `docs/ci_cd.md` -> "Optional PR lanes and post-merge validation") for
 formatting, clippy, build, attribution/publication/batch tests, and existing
 setup/FIFO/auth/source/amplification/generation regressions. It also checks the

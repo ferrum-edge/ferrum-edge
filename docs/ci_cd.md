@@ -71,9 +71,9 @@ adding, removing, or materially changing a workflow.
 | `comparison-benchmark.yml` | Gateway Comparison Benchmark | Manual | Cross-gateway comparison benchmarks. |
 | `gateways-protocol-benchmark.yml` | Gateways Protocol Benchmark | Manual | Gateway/protocol benchmark harness. |
 | `benchmark-harness-tests.yml` | Benchmark Harness Tests | PRs and push to `main` on `tests/performance/multi_protocol/**`, manual | Runs the multi-protocol benchmark harness's own tests: `cargo test --test metrics_tests` for worker/error accounting and `python3 -m unittest` for the `benchmark_validity.py` sample and scenario rules. That package is not a workspace member, so the `Tests` aggregate never builds it. Not a required check. |
-| `pool-internal-profile.yml` | Pool Internal Profile | PRs on the pool profiler's own paths, push to `main` on the shared pool/proxy surface, manual | Observer-feature lint/contract checks; manual same-host measurement campaign. Optional. See [Optional PR lanes](#optional-pr-lanes-and-post-merge-validation). |
-| `h1-internal-profile.yml` | H1 Internal Profile | PRs on the H1 profiler's own paths, push to `main` on the shared H1/proxy surface, manual | Observer-feature lint/cadence/trace-fixture checks; manual measurement campaign. Optional. |
-| `udp-internal-profile.yml` | UDP Internal Profile | PRs on the UDP profiler's own paths, push to `main` on the shared UDP surface, manual | Observer-feature lint/contract checks; manual measurement campaign. Optional. |
+| `pool-internal-profile.yml` | Pool Internal Profile | PRs on the pool profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/contract checks; manual same-host measurement campaign. Optional. See [Optional PR lanes](#optional-pr-lanes-and-post-merge-validation). |
+| `h1-internal-profile.yml` | H1 Internal Profile | PRs on the H1 profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/cadence/trace-fixture checks; manual measurement campaign. Optional. |
+| `udp-internal-profile.yml` | UDP Internal Profile | PRs on the UDP profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/contract checks; manual measurement campaign. Optional. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
 | `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
@@ -670,21 +670,23 @@ it does not cost every unrelated pull request a Kind cluster or a FIPS build.
 
 Only the nine required checks gate a merge. Every other workflow that runs on
 a pull request is advisory, so its PR trigger is limited to the files that
-workflow exists to test. Broader coverage for those workflows moves to the
-push to `main`. A red post-merge run marks that commit for revert. It is also
-evidence against cutting a release from that commit, though it is not part of
-the machine-enforced publication gate
+workflow exists to test. Broader coverage for those workflows moves to a
+daily run on the `main` tip: one run instead of one per merge (about 20 merges
+a day). A red daily run points at that day's merges for revert or bisect. It is
+also evidence against cutting a release from those commits, though it is not
+part of the machine-enforced publication gate
 (`.github/required-publication-checks.json`).
 
 | Workflow | Pull-request trigger | Post-merge trigger |
 |---|---|---|
-| `pool-internal-profile.yml` | `src/pool_profile/**`, its macros, `tests/unit/gateway_core/pool_profile*`, its harness script/manifests/doc, the workflow | push to `main` on the full shared surface (`src/pool/**`, `src/proxy/**`, `src/lib.rs`, `src/main.rs`, `src/admin/mod.rs`, `Cargo.*`, `tests/unit/gateway_core/**`, the multi-protocol harness, ...) |
-| `h1-internal-profile.yml` | `src/h1_profile/**`, `tests/unit/gateway_core/h1_profile*`, `tests/functional/h1_cadence_tests.rs`, its harness scripts/doc, the workflow | push to `main` on the full shared surface (`src/proxy/{mod,body}.rs`, `src/lib.rs`, `src/main.rs`, `Cargo.toml`, `tests/scaffolding/**`, ...) |
-| `udp-internal-profile.yml` | `src/udp_profile/**`, its macros, `tests/unit/gateway_core/udp_profile*`, its harness script/manifests/doc, the workflow | push to `main` on the full shared surface (`src/proxy/udp_{proxy,batch}.rs`, `src/lib.rs`, `Cargo.toml`, ...) |
+| `pool-internal-profile.yml` | `src/pool_profile/**`, its macros, `tests/unit/gateway_core/pool_profile*`, its harness script/manifests/doc, the workflow | daily schedule on the `main` tip, covering every shared surface the observers hook into |
+| `h1-internal-profile.yml` | `src/h1_profile/**`, `tests/unit/gateway_core/h1_profile*`, `tests/functional/h1_cadence_tests.rs`, its harness scripts/doc, the workflow | daily schedule on the `main` tip, covering every shared surface the observers hook into |
+| `udp-internal-profile.yml` | `src/udp_profile/**`, its macros, `tests/unit/gateway_core/udp_profile*`, its harness script/manifests/doc, the workflow | daily schedule on the `main` tip, covering every shared surface the observers hook into |
 
 In the 30 days before this change (646 merged pull requests), these three
-workflows ran on 281, 203 and 131 pull requests; about 95% of those runs came
-from the shared paths rather than from the profiler. See
+workflows ran on 281, 203 and 131 pull requests. Only 5 of those 615 runs
+would still trigger on the narrowed paths. The rest, at least 30,000
+runner-minutes a month net of the daily runs, came from shared paths. See
 [ci_pr_validation_review_2026_09_24.md](ci_pr_validation_review_2026_09_24.md).
 
 **Auxiliary workflow concurrency.** Each path-filtered auxiliary workflow that
@@ -1237,12 +1239,16 @@ stripped of newlines and backticks before they are written.
 - The `CI Plan` job diffs `ls tests/integration/*.rs` against the union of
   declared shard filters in `ci.yml`. Adding a new `mod foo_tests` without
   wiring it into a shard fails this silent-skip guard.
-- Functional tests split across three shards (`application`, `protocols`,
-  `data-plane`). `build-test-artifacts` compiles the gateway, CNI binary, and
+- Functional tests split across four shards (`application`, `protocols`,
+  `data-plane`, `data-plane-runtime`). `build-test-artifacts` compiles the gateway, CNI binary, and
   both nextest archives in one job/cache; each functional shard downloads the
   existing OS/architecture-keyed artifacts with
-  `FERRUM_SKIP_GATEWAY_BUILD=1`. The data-plane shard remains serialized with
-  `nextest_jobs: 1` and is the only shard that starts Redis/MongoDB containers.
+  `FERRUM_SKIP_GATEWAY_BUILD=1`. The two data-plane shards (`data_services:
+  true`) remain serialized with `nextest_jobs: 1` and are the only shards that
+  start the Redis/MongoDB/PostgreSQL/MySQL containers; each runner owns its own
+  set. They were one shard until September 2026, when that shard was the
+  functional critical path (see
+  [ci_pr_validation_review_2026_09_24.md](ci_pr_validation_review_2026_09_24.md)).
 
 **Output**:
 - Test pass/fail status

@@ -86,7 +86,7 @@ Ferrum's mesh subsystem is in active build-out. The paths below ship in one bina
 | Native `MeshSubscribe` (Ferrum CP → Ferrum DP) | **Stable** | Default protocol. Full slice (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, telemetry, multi-cluster) is pushed directly. The most mature and recommended config path. Enrolled in the conformance GA contract as `mesh.config_transport.native_subscribe` (semantics: `tests/conformance/mesh_config_transport.rs`; live: `sidecar.config.native_subscribe_delivered` plus mTLS omit-client / foreign-client / untrusted-server-CA / wrong-SAN / invalid-JWT negatives and projected-Secret rotation via the `mesh-e2e-sidecar` CP + native-subscribe leg). |
 | xDS ADS (Ferrum CP → Ferrum DP) | **Beta** | Functionally equivalent to native via Ferrum-specific ECDS carriers (`ferrum.config.extension.v3.*`), including `ProxyConfig` on `ProxyConfigsCarrier`. **NOT stock-Envoy / third-party-Istio interop** — a non-Ferrum CP emits only name-only CDS/EDS/LDS/RDS and no carriers, so it cannot drive a protected Ferrum mesh and may be NACKed. RTDS layers are authored by the operator's CP (Ferrum's xDS server does not originate Runtime resources). |
 | Localized file source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) | **Beta** | No control plane: the DP builds its slice locally from `FERRUM_MESH_FILE_CONFIG_PATH` through the same materialization path as native/xDS, so enforcement parity is structural. Fail-closed initial load via the shared bounded stable-file reader (64 MiB, regular-file open target, dual-read spanning a 20ms settle interval) on a blocking worker. SIGHUP reload (Unix) runs off Tokio core workers, coalesces repeated signals (generation advances when the signal is observed), keeps the last good slice on error, and raises authenticated `/health` `config_rejected` until a later accepted reload. Watcher shutdown stops accepting candidates without awaiting a started (non-cancellable) `spawn_blocking` job. Sharp edges: reload is signal-driven only (no file watching), and there is no CP heartbeat — `/mesh/config-drift` staleness reflects the last SIGHUP, not a sync failure. |
-| Stock Envoy / third-party Istio xDS interop (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`) | **Beta** | Issue #3317. A **separate protocol** from `xds`: consumes standard v3 CDS/EDS/LDS/RDS from a stock Envoy / third-party Istio control plane and projects it onto `MeshService` / `Workload` for **discovery only**. Enforcement policy comes from the mandatory local `FERRUM_MESH_FILE_CONFIG_PATH` document, so a third-party CP can change reachability but never Ferrum's security posture. Everything Ferrum does not model is refused per-resource with a field-specific diagnostic and contributes no route, endpoint, or identity. Live data-path coverage (a scripted third-party ADS server driving a real sidecar through update / deletion / NACK / refusal) runs in the hosted `data-plane` functional shard. See [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability). |
+| Stock Envoy / third-party Istio xDS interop (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`) | **Beta** | Issue #3317. A **separate protocol** from `xds`: consumes standard v3 CDS/EDS/LDS/RDS from a stock Envoy / third-party Istio control plane and projects it onto `MeshService` / `Workload` for **discovery only**. Enforcement policy comes from the mandatory local `FERRUM_MESH_FILE_CONFIG_PATH` document, so a third-party CP can change reachability but never Ferrum's security posture. Everything Ferrum does not model is refused per-resource with a field-specific diagnostic and contributes no route, endpoint, or identity. Live data-path coverage (a scripted third-party ADS server driving a real sidecar through update / deletion / NACK / refusal) runs in the hosted `data-plane-runtime` functional shard. See [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability). |
 
 ### Topology maturity
 
@@ -735,7 +735,7 @@ accepted service keeps serving (semantic coverage that those constructs
 contribute no listener or virtual host lives in the unit/integration suites;
 the live phase does not claim a widening proof for a host that was never
 dialable), and that re-pinning the peer identity to an impostor SPIFFE fails
-the dial closed. It runs in the hosted `data-plane` functional shard.
+the dial closed. It runs in the hosted `data-plane-runtime` functional shard.
 
 #### Transport admission (issue #3853)
 
@@ -3256,7 +3256,7 @@ The CONNECT remap is deliberately narrow and fails closed before any dial:
 #### Live datapath coverage
 
 Two `#[ignore]`d functional tests in `tests/functional/functional_mesh_mode_test.rs`
-drive the shipped `ferrum-edge` binary over this lane (data-plane CI shard):
+drive the shipped `ferrum-edge` binary over this lane (data-plane-runtime CI shard):
 
 - `functional_mesh_sidecar_ingress_stream_connect_relays_declared_listener_port`
   — a Sidecar consuming a slice with one already-resolved stream

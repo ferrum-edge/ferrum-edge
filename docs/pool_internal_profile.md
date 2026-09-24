@@ -143,7 +143,7 @@ disposition. No failed repetition is silently removed from a favorable average.
 No project code, formatter, lint, compiler, test, benchmark or container was run
 locally. Only static inspection, data/text edits and `git diff --check` are local
 validation. `.github/workflows/pool-internal-profile.yml` runs on PRs that edit the pool
-profiler itself and on pushes to `main` that touch the shared pool/proxy surface
+profiler itself and daily on the `main` tip
 (see `docs/ci_cd.md` -> "Optional PR lanes and post-merge validation"),
 with pinned external actions, the shared Rust build setup and native prerequisites
 including `libcurl4-openssl-dev`. It registers feature-on formatting/lint/binary
