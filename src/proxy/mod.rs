@@ -51,6 +51,9 @@ pub mod gateway_listener;
 pub mod gateway_listener_status;
 pub mod grpc_proxy;
 mod h1_framing_guard;
+/// Releases a pooled HTTP/1.1 sender whose connection stopped reading
+/// requests while one was being queued (issue #5720).
+pub mod h1_send_release;
 
 // `tests/` is a separate crate, so these are unreachable from the
 // `ferrum-edge` binary target and would otherwise be reported as dead code
@@ -51006,14 +51009,27 @@ async fn proxy_to_backend_hbone_after_ready(
     } else {
         None
     };
-    let response = loop {
-        // `send_fut` borrows `checkout.sender` mutably, so it lives in an inner
-        // scope: the idle-race arm below REPLACES `checkout`, which cannot
-        // compile while that borrow is still live.
+    let (response, checkout) = loop {
+        let reused = checkout.reused();
+        // The response wait OWNS the lease (issue #5720). If the inner
+        // connection stops reading requests while this one may still be queued
+        // on it — the destination reset or closed it at the moment tokio's
+        // two-step channel send was publishing the request — the wait drops the
+        // lease, which drops the connection's only sender and fails the
+        // stranded request as unsent (`take_message()` is `Some`) instead of
+        // leaving it to `backend_read_timeout_ms`, or to no bound at all when
+        // that is `0`. The lease comes back as `None` in that case; the
+        // idle-race arm below then REPLACES `checkout` exactly as it does for
+        // any other pre-wire handback.
         let send_result = {
             let send_bound =
                 compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
             let send_fut = checkout.sender.try_send_request(backend_req);
+            let send_fut = h1_send_release::await_h1_response_or_release(
+                send_fut,
+                checkout,
+                |lease, cx| lease.sender.poll_ready(cx).map_err(|_| ()),
+            );
             if let Some(send_deadline) = send_bound.at {
                 let bounded = await_upload_write_watermark_first(
                     crate::plugins::await_deadline_first(Some(send_deadline), send_fut),
@@ -51073,7 +51089,7 @@ async fn proxy_to_backend_hbone_after_ready(
                     .ok()
             }
         };
-        let Some(send_result) = send_result else {
+        let Some((send_result, lease)) = send_result else {
             if let Some(pump) = upload_pump.take() {
                 pump.cancel_and_join().await;
             }
@@ -51104,7 +51120,7 @@ async fn proxy_to_backend_hbone_after_ready(
             );
         };
         match send_result {
-            Ok(response) => break response,
+            Ok(response) => break (response, lease),
             Err(mut try_err) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
@@ -51118,7 +51134,7 @@ async fn proxy_to_backend_hbone_after_ready(
                         None,
                     );
                 }
-                if checkout.reused()
+                if reused
                     && !replayed_idle_race
                     && let Some(plan) = inner_plan
                     && let Some(unsent) = try_err.take_message()
@@ -51166,12 +51182,18 @@ async fn proxy_to_backend_hbone_after_ready(
                     };
                     continue;
                 }
+                // A handed-back request is typed proof that no byte of it —
+                // head or body — reached the destination, whatever the body
+                // shape: hyper polls the body only after dequeuing the request.
+                // That makes it a pre-wire `ConnectionPoolError` on a fresh
+                // lease too (issue #5720).
+                let never_sent = try_err.take_message().is_some();
                 return (
                     hbone_hyper_error_response(
                         proxy,
                         try_err.into_error(),
                         resolved_ip,
-                        request_body_replayable,
+                        request_body_replayable || never_sent,
                     ),
                     None,
                     None,
@@ -51227,7 +51249,7 @@ async fn proxy_to_backend_hbone_after_ready(
     // fence keeps byte-for-byte today's streaming behaviour: reuse may change
     // how this gateway buffers only where reuse is actually in effect.
     let stream_response = if stream_response
-        && checkout.poolable()
+        && checkout.as_ref().is_some_and(|lease| lease.poolable())
         && state.response_buffer_cutoff_bytes > 0
         && content_length.is_some_and(|len| len <= state.response_buffer_cutoff_bytes)
         && !is_streaming_content_type(&resp_headers)
@@ -51256,20 +51278,26 @@ async fn proxy_to_backend_hbone_after_ready(
         // disconnect, an early drop, a fired deadline, or shutdown. If the
         // response never reaches the body builder, the extension drops with it
         // and the connection is retired. Every direction is fail-closed.
+        //
+        // No lease at all means the response wait released it because the
+        // connection had stopped reading requests (issue #5720): that
+        // connection is closing, so there is nothing to pool or to anchor.
         let mut response = response;
-        if http_body::Body::is_end_stream(response.body()) {
-            hbone_inner_pool::HboneInnerConnectionPool::checkin_h1_when_idle(
-                state.hbone_pool.inner_pool(),
-                checkout,
-            );
-        } else {
-            let lease = hbone_inner_pool::HboneInnerConnectionPool::streaming_lease(
-                state.hbone_pool.inner_pool(),
-                checkout,
-            );
-            response
-                .extensions_mut()
-                .insert(body::PooledBackendLeaseSlot::new(lease));
+        if let Some(checkout) = checkout {
+            if http_body::Body::is_end_stream(response.body()) {
+                hbone_inner_pool::HboneInnerConnectionPool::checkin_h1_when_idle(
+                    state.hbone_pool.inner_pool(),
+                    checkout,
+                );
+            } else {
+                let lease = hbone_inner_pool::HboneInnerConnectionPool::streaming_lease(
+                    state.hbone_pool.inner_pool(),
+                    checkout,
+                );
+                response
+                    .extensions_mut()
+                    .insert(body::PooledBackendLeaseSlot::new(lease));
+            }
         }
         (
             retry::BackendResponse {
@@ -51373,11 +51401,14 @@ async fn proxy_to_backend_hbone_after_ready(
         // that hung up, a fence sweep that cut the tunnel, and a credential
         // that expired while this exchange was in flight. Every error arm above
         // returns WITHOUT checking in, so a truncated or failed body read drops
-        // the lease and retires the tunnel.
-        hbone_inner_pool::HboneInnerConnectionPool::checkin_h1_when_idle(
-            state.hbone_pool.inner_pool(),
-            checkout,
-        );
+        // the lease and retires the tunnel. A lease the response wait already
+        // released (issue #5720) is not there to check in.
+        if let Some(checkout) = checkout {
+            hbone_inner_pool::HboneInnerConnectionPool::checkin_h1_when_idle(
+                state.hbone_pool.inner_pool(),
+                checkout,
+            );
+        }
         (
             retry::BackendResponse {
                 status_code: status,
@@ -51961,9 +51992,23 @@ async fn proxy_to_backend_unix(
     } else {
         None
     };
-    let response = loop {
+    let (response, checkout) = loop {
+        let reused = checkout.reused();
+        // The response wait OWNS the lease (issue #5720): if the connection
+        // stops reading requests while this one may still be queued on it — the
+        // app reset or closed it at the moment tokio's two-step channel send
+        // was publishing the request — the wait drops the lease, which drops
+        // the connection's only sender and fails the stranded request as unsent
+        // instead of leaving it to `backend_read_timeout_ms`, or to no bound at
+        // all when that is `0`. The lease then comes back as `None`, and the
+        // idle-race arm below replaces `checkout` as for any pre-wire handback.
         let send_result = {
             let send_fut = checkout.sender.try_send_request(backend_req);
+            let send_fut = h1_send_release::await_h1_response_or_release(
+                send_fut,
+                checkout,
+                |lease, cx| lease.sender.poll_ready(cx).map_err(|_| ()),
+            );
             let send_bound =
                 compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
             if let Some(send_deadline) = send_bound.at {
@@ -52026,7 +52071,7 @@ async fn proxy_to_backend_unix(
                     .ok()
             }
         };
-        let Some(send_result) = send_result else {
+        let Some((send_result, lease)) = send_result else {
             if let Some(pump) = upload_pump.take() {
                 pump.cancel_and_join().await;
             }
@@ -52056,7 +52101,7 @@ async fn proxy_to_backend_unix(
             );
         };
         match send_result {
-            Ok(response) => break response,
+            Ok(response) => break (response, lease),
             Err(mut try_err) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
@@ -52069,7 +52114,7 @@ async fn proxy_to_backend_unix(
                         None,
                     );
                 }
-                if checkout.reused()
+                if reused
                     && !replayed_idle_race
                     && let Some(unsent) = try_err.take_message()
                 {
@@ -52097,12 +52142,18 @@ async fn proxy_to_backend_unix(
                     };
                     continue;
                 }
+                // A handed-back request is typed proof that no byte of it —
+                // head or body — reached the app, whatever the body shape: hyper
+                // polls the body only after dequeuing the request. That makes it
+                // a pre-wire `ConnectionPoolError` on a fresh lease too (issue
+                // #5720).
+                let never_sent = try_err.take_message().is_some();
                 return (
                     unix_hyper_error_response(
                         proxy,
                         try_err.into_error(),
                         resolved_ip,
-                        request_body_replayable,
+                        request_body_replayable || never_sent,
                     ),
                     None,
                     None,
@@ -52164,7 +52215,7 @@ async fn proxy_to_backend_unix(
     // response-buffer budget, and eagerly collect an SSE stream that declared a
     // length. Reuse is a performance property; none of those are worth it.
     let stream_response = if stream_response
-        && checkout.keep_alive()
+        && checkout.as_ref().is_some_and(|lease| lease.keep_alive())
         && state.response_buffer_cutoff_bytes > 0
         && content_length.is_some_and(|len| len <= state.response_buffer_cutoff_bytes)
         && !is_streaming_content_type(&resp_headers)
@@ -52200,20 +52251,26 @@ async fn proxy_to_backend_unix(
         // If the response never reaches the body builder (an `after_proxy`
         // reject replaces it, say), the extension drops with the response and
         // the connection is retired. Every failure direction is fail-closed.
+        //
+        // No lease at all means the response wait released it because the
+        // connection had stopped reading requests (issue #5720): that
+        // connection is closing, so there is nothing to pool or to anchor.
         let mut response = response;
-        if http_body::Body::is_end_stream(response.body()) {
-            unix_backend_pool::UnixBackendConnectionPool::checkin_h1_when_idle(
-                &state.unix_backend_pool,
-                checkout,
-            );
-        } else {
-            let lease = unix_backend_pool::UnixBackendConnectionPool::streaming_lease(
-                &state.unix_backend_pool,
-                checkout,
-            );
-            response
-                .extensions_mut()
-                .insert(body::PooledBackendLeaseSlot::new(lease));
+        if let Some(checkout) = checkout {
+            if http_body::Body::is_end_stream(response.body()) {
+                unix_backend_pool::UnixBackendConnectionPool::checkin_h1_when_idle(
+                    &state.unix_backend_pool,
+                    checkout,
+                );
+            } else {
+                let lease = unix_backend_pool::UnixBackendConnectionPool::streaming_lease(
+                    &state.unix_backend_pool,
+                    checkout,
+                );
+                response
+                    .extensions_mut()
+                    .insert(body::PooledBackendLeaseSlot::new(lease));
+            }
         }
         (
             retry::BackendResponse {
@@ -52318,11 +52375,14 @@ async fn proxy_to_backend_unix(
         // hung up, an errored exchange, and a config withdrawal that landed
         // while this exchange was in flight. Every error arm above returns
         // without checking in, so a partial or failed body read retires the
-        // connection.
-        unix_backend_pool::UnixBackendConnectionPool::checkin_h1_when_idle(
-            &state.unix_backend_pool,
-            checkout,
-        );
+        // connection. A lease the response wait already released (issue
+        // #5720) is not there to check in.
+        if let Some(checkout) = checkout {
+            unix_backend_pool::UnixBackendConnectionPool::checkin_h1_when_idle(
+                &state.unix_backend_pool,
+                checkout,
+            );
+        }
         (
             retry::BackendResponse {
                 status_code: status,

@@ -2601,3 +2601,51 @@ fn every_pre_relay_write_flushes_before_the_relay_starts() {
         "the outbound PROXY v2 header must be flushed before the relay starts"
     );
 }
+
+/// Every direct hyper HTTP/1.1 dispatch that holds its connection's only
+/// `SendRequest` across the response wait (issue #5720): the HBONE inner pool
+/// and the Unix-socket pool, both in `src/proxy/mod.rs`. A request tokio
+/// publishes just after the connection task drained its queue stays stranded
+/// until that sender drops, so each site must await its response through the
+/// release helper. The reqwest HTTP/1.1 path carries the same fix inside the
+/// vendored hyper-util (issue #5714). HTTP/2 senders are clones shared with
+/// their pool, so dropping one cannot release the channel, and they are not
+/// sites of this invariant.
+const DIRECT_H1_DISPATCH_SITES: &[(&str, usize)] = &[("src/proxy/mod.rs", 2)];
+
+#[test]
+fn every_direct_h1_dispatch_awaits_through_the_sender_release() {
+    let mut found = Vec::new();
+    for (path, text) in production_sources() {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut sites = 0;
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !line.contains(".try_send_request(") {
+                continue;
+            }
+            sites += 1;
+            let next = lines[index + 1..]
+                .iter()
+                .find(|line| !line.trim().is_empty())
+                .copied()
+                .unwrap_or_default();
+            assert!(
+                next.contains("h1_send_release::await_h1_response_or_release("),
+                "{path}:{}: a direct HTTP/1.1 dispatch must await its response through \
+                 `h1_send_release::await_h1_response_or_release` (issue #5720)",
+                index + 1
+            );
+        }
+        if sites > 0 {
+            found.push((path, sites));
+        }
+    }
+    let expected: Vec<(String, usize)> = DIRECT_H1_DISPATCH_SITES
+        .iter()
+        .map(|(path, sites)| ((*path).to_string(), *sites))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the direct HTTP/1.1 dispatch sites changed; list the new site above"
+    );
+}

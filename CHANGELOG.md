@@ -62,6 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#5683). The probe URL is `scheme://host:port` + path, so a path like
   `@169.254.169.254/` turned the target into userinfo and sent the probe to a
   different host that the egress screen never inspected.
+- A request on an HBONE inner HTTP/1.1 connection or a Unix-socket HTTP/1.1
+  backend connection no longer waits for `backend_read_timeout_ms` (`504`), or
+  forever when that timeout is `0`, when the pooled connection is reset or
+  closed at the moment the request is queued (#5720). The request never reached
+  the backend, so it now fails straight away: a reused connection is retried
+  once on a new one, and a fresh connection returns `502`
+  (`connection_pool_error`, pre-wire). Both dispatches watch the connection
+  while they wait for the response and release its only request sender once it
+  stops accepting requests, so the request stranded by tokio's two-step channel
+  send fails as unsent. A request handed back unsent on a fresh connection is
+  now `connection_pool_error` for a streaming request body too, not only for a
+  buffered one.
 - Reject non-finite (`NaN`, `inf`) floating-point env values (#5684). A `NaN`
   `FERRUM_OVERLOAD_*_THRESHOLD` passed validation and silently disabled load
   shedding.
