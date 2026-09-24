@@ -7868,6 +7868,16 @@ impl EnvConfig {
         // The datagram client-address envelope's MAC key (issue #3289).
         self.validate_datagram_proxy_protocol_secret()?;
 
+        // `0` is not "unlimited": every credential array must be non-empty and
+        // at most this long, so 0 would reject every consumer credential.
+        if self.max_credentials_per_type == 0 {
+            return Err(
+                "FERRUM_MAX_CREDENTIALS_PER_TYPE must be at least 1; 0 would reject \
+                 every consumer credential"
+                    .to_string(),
+            );
+        }
+
         // ACME auto-renewal that can never reach the listener (issue #4506).
         self.validate_acme_renewal_reachability()?;
 
