@@ -3326,23 +3326,41 @@ does not change the binaries that ship to consumers:
   crates concurrently once the shared library is done, instead of in two
   sequential archive builds.
 
-Baseline: 160 full-mode PR runs from 2026-09-18 to 2026-09-24, medians.
+"Before" is the median of 160 full-mode PR runs from 2026-09-18 to 2026-09-24.
+"After" is PR run
+[35974584845](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35974584845),
+the first run of this change. Milestones are minutes from run creation.
 
-| Step or milestone | Before |
-|---|---:|
-| `setup-rust-ci` (`ci-debug` restore, full key match) | 50 s |
-| Build gateway binary | 402 s |
-| Build ferrum-cni binary | 3 s |
-| Build integration tests archive | 413 s |
-| Build functional tests archive | 80 s |
-| Four artifact uploads | 46 s |
-| `Build Test Artifacts` job | 16.7 min |
-| `Build Test Artifacts` done, from run creation | 19.0 min |
-| Functional shards start, from run creation | 20.2–21.1 min |
-| `Tests` done, from run creation | 35.9 min |
+| Step or milestone | Before | After |
+|---|---:|---:|
+| `setup-rust-ci` (`ci-debug` restore, full key match) | 50 s | 67 s |
+| Build gateway + ferrum-cni binaries | 405 s | — |
+| Build test targets and binaries | — | 490 s |
+| Build integration tests archive | 413 s | 7 s |
+| Build functional tests archive | 80 s | 4 s |
+| Four artifact uploads | 46 s | 50 s |
+| `Build Test Artifacts` job | 16.7 min | 10.5 min |
+| `Build Test Artifacts` done | 19.0 | 11.6 |
+| Integration / functional / Redis shards start | 20.2–21.1 | 11.6–11.7 |
+| `Functional Tests (data-plane)` done | 36.0 | 27.7 |
+| `Tests` done | 35.9 | 28.0 |
 
-The vendored `[patch.crates-io]` path crates are local packages, which
-rust-cache does not keep, so every producer rebuilds them (about 12 s).
+In the "after" run, no registry dependency recompiled: the `ci-debug` restore
+covers the whole test-feature graph. Only local path packages rebuild: the
+vendored `[patch.crates-io]` crates, `ferrum-ebpf-common`, and `ferrum-edge`.
+rust-cache does not keep local packages, so every producer spends about 18 s
+on the vendored crates before the library starts. Both archive steps find
+every unit fresh and only package it.
+
+**Split producer, evaluated and not adopted.** Building the functional archive
+in its own job would not help the critical path. A local `cargo --timings` run
+of this build (4 cores, `CARGO_BUILD_JOBS=3`) spends 539 s on the `ferrum-edge`
+library. After that, the test crates compile concurrently:
+`functional_tests` takes 169 s and `integration_tests` takes 188 s. A
+functional-only producer would finish at most about 25 s sooner, but each PR
+would pay for a second full library compile on another runner.
+Integration shards are also not on the critical path: they finish in about
+4 minutes, while `data-plane` takes 16.
 
 
 ### Ambient registry cache migration (#4643)
