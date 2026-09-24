@@ -110,6 +110,20 @@ merged PRs. It reads Git objects only. Its `--self-test` (glob translation,
 merge-subject parsing, trigger semantics) runs inside `verify_required_ci.py`
 in the `Tests` aggregate.
 
+### 6. Stale pin in an optional lane (found while validating this PR)
+
+This PR's own CI turned `H2 pinned guard regressions` (`h2-guard-observation.yml`)
+red. The workflow pins the SHA-256 of `src/admin/mod.rs` so its diagnostic
+metrics hook is applied only to a reviewed context. #5661 changed that file on
+`main` on 2026-09-23. The pin went stale on `main`, and nothing noticed: the
+workflow has no push trigger and ran again only because this PR edited its
+YAML. The pin was refreshed here. The anchor still occurs once and the hook
+bytes are unchanged.
+
+Optional lanes that pin source hashes need a post-merge trigger on the pinned
+file, or they fail on whichever unrelated PR happens to touch them next. See
+the follow-ups below.
+
 ## Unchanged by design
 
 - **Required set and release gate:** the nine required checks and
