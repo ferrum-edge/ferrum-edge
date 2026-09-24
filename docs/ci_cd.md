@@ -1041,9 +1041,10 @@ cargo nextest run --archive-file integration-tests-*.tar.zst \
   --no-fail-fast \
   <shard filters>
 
-# build-test-artifacts (one job/cache for both archives and both binaries)
-cargo build --bin ferrum-edge
-cargo build --bin ferrum-cni
+# build-test-artifacts (one job/cache for both archives and both binaries).
+# The test build also produces target/debug/ferrum-edge and ferrum-cni;
+# see "Test artifact producer: one test-feature build".
+cargo test --no-run --test integration_tests --test functional_tests
 cargo nextest archive --test integration_tests ...
 cargo nextest archive --test functional_tests ...
 
@@ -1181,9 +1182,10 @@ stripped of newlines and backticks before they are written.
   declared shard filters in `ci.yml`. Adding a new `mod foo_tests` without
   wiring it into a shard fails this silent-skip guard.
 - Functional tests split across three shards (`application`, `protocols`,
-  `data-plane`). `build-test-artifacts` compiles the gateway, CNI binary, and
-  both nextest archives in one job/cache; each functional shard downloads the
-  existing OS/architecture-keyed artifacts with
+  `data-plane`). `build-test-artifacts` compiles both test targets in one
+  Cargo invocation, which also builds the gateway and CNI binaries, then
+  packages both nextest archives in the same job/cache. Each functional shard
+  downloads the existing OS/architecture-keyed artifacts with
   `FERRUM_SKIP_GATEWAY_BUILD=1`. The data-plane shard remains serialized with
   `nextest_jobs: 1` and is the only shard that starts Redis/MongoDB containers.
 
@@ -3295,6 +3297,52 @@ The expected saving is dependency reuse in the second binary build, not removal
 of tests. Dev-dependency feature unification can still require recompilation
 when the archive build starts. Repository-wide cache capacity is tracked in
 [#4643](https://github.com/ferrum-edge/ferrum-edge/issues/4643).
+
+### Test artifact producer: one test-feature build
+
+`Build Test Artifacts` gates every integration shard, functional shard, the
+Redis regression, and Helm Chart. It now runs one
+`cargo test --no-run --test integration_tests --test functional_tests`, then
+packages each nextest archive from the already-fresh units.
+
+Removing the separate `cargo build --bin ferrum-edge` / `--bin ferrum-cni` steps
+does not change the binaries that ship to consumers:
+
+- **Two feature sets.** Dev-dependencies change the resolved features of
+  `tokio` (`test-util`), `rustls` / `rustls-webpki` (`aws-lc-rs`,
+  `prefer-post-quantum`), `time`, `rand`, `rcgen`, `num`, `serde_with`, and
+  `deranged`. Compare `cargo tree -e normal,build` with
+  `cargo tree -e normal,build,dev`. A bin-only build therefore compiled about
+  100 dependencies and the whole `ferrum-edge` library in a second feature
+  set. The `ci-debug` lane holds only the test-feature set, because Unit Tests
+  produces it.
+- **Test build wins.** Integration tests need `CARGO_BIN_EXE_*`, so Cargo also
+  builds every package bin in the test-feature set and uplifts it to
+  `target/debug/`. The archive step ran after the bin-only step and
+  overwrote `target/debug/ferrum-edge` and `target/debug/ferrum-cni`. The
+  uploaded binaries were already test-feature builds; the bin-only build was
+  discarded work.
+- **Concurrent test crates.** One Cargo invocation compiles the two test
+  crates concurrently once the shared library is done, instead of in two
+  sequential archive builds.
+
+Baseline: 160 full-mode PR runs from 2026-09-18 to 2026-09-24, medians.
+
+| Step or milestone | Before |
+|---|---:|
+| `setup-rust-ci` (`ci-debug` restore, full key match) | 50 s |
+| Build gateway binary | 402 s |
+| Build ferrum-cni binary | 3 s |
+| Build integration tests archive | 413 s |
+| Build functional tests archive | 80 s |
+| Four artifact uploads | 46 s |
+| `Build Test Artifacts` job | 16.7 min |
+| `Build Test Artifacts` done, from run creation | 19.0 min |
+| Functional shards start, from run creation | 20.2–21.1 min |
+| `Tests` done, from run creation | 35.9 min |
+
+The vendored `[patch.crates-io]` path crates are local packages, which
+rust-cache does not keep, so every producer rebuilds them (about 12 s).
 
 
 ### Ambient registry cache migration (#4643)

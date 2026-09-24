@@ -1041,23 +1041,27 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Build gateway binary
-        # Match ferrum-cni and the nextest archives below: a separate pr-build
-        # directory compiles the dependency graph again before shards can run.
-        # This binary is used only for tests; release producers keep their
-        # shipping profile and all consumers keep the target/debug contract.
-        run: cargo build --bin ferrum-edge
-
-      - name: Build ferrum-cni binary
+      - name: Build test targets and binaries
+        # One Cargo invocation compiles both nextest targets, so the two test
+        # crates build concurrently once the shared library is done. Cargo
+        # also builds every package bin for integration tests (for
+        # `CARGO_BIN_EXE_*`) and uplifts them to target/debug/ferrum-edge and
+        # target/debug/ferrum-cni, the paths the upload steps below publish.
+        # The archive steps then find every unit fresh and only package it.
+        #
+        # Do not add a separate `cargo build --bin` step. Without
+        # dev-dependencies Cargo resolves a different feature set (tokio
+        # `test-util`, rustls `aws-lc-rs`), which misses the test-built
+        # `ci-debug` lane and compiles the dependency graph and the library a
+        # second time. The test build then overwrote that binary anyway.
+        #
         # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, which
         # Cargo bakes in as target/debug/ferrum-cni under the workspace path
         # used to build the archive. Keep archive builders and shard runners on
         # matching OS/arch + checkout layout, or update this artifact/path with
-        # any future runner/workspace/target-dir change.
-        #
-        # This debug-path binary is transferred to every integration shard;
-        # omit DWARF from the transfer-only build to keep the artifact small.
-        run: cargo build --bin ferrum-cni
+        # any future runner/workspace/target-dir change. These binaries are
+        # used only for tests; release producers keep their shipping profile.
+        run: cargo test --no-run --test integration_tests --test functional_tests
 
       - name: Build integration tests archive
         # Nextest archives are native binaries, so the file and artifact names
@@ -1070,8 +1074,7 @@ jobs:
             --archive-file "$archive_file"
 
       - name: Build functional tests archive
-        # Build the second test target in the same job and shared Cargo cache,
-        # reusing the leaf-crate compilation from the integration archive.
+        # Packages the functional target compiled by the step above.
         run: |
           archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
