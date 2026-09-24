@@ -58,6 +58,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Benchmark runners no longer `SIGKILL` unrelated host listeners on fixed ports
+  (#5702). `run_protocol_test.sh`, `run_gateway_protocol_bench.sh`,
+  `run_connection_saturation_bench.sh`, `run_perf_test.sh`, `run_payload_test.sh`,
+  and the `mesh-dns-e2e` / `mesh-hbone-e2e` `run.sh` harnesses now refuse to
+  start when any of their ports is already bound (printing the port and an
+  `lsof` command to inspect the listener), and on exit terminate only the PIDs
+  and Docker container IDs the current run recorded, with a graceful `SIGTERM`,
+  a bounded wait, and `SIGKILL` only as a last resort. Their `EXIT` traps also
+  stop deleting shared certificates/results unless the run created the exact
+  paths, so an early failure cannot kill another process or remove another run's
+  artifacts. A static contract test in the `Benchmark Harness Tests` lane fails
+  if any of these runners, or a CI workflow invoking them, regresses to a
+  port-wide kill.
 - Rust tests no longer write the gateway's TLS store into the checkout
   (#5706). Only the `ferrum-edge` binary resolves an unconfigured
   `FERRUM_TLS_MANAGED_STORE_PATH` to `./ferrum-managed-tls`; other processes

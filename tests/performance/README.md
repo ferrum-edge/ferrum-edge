@@ -64,6 +64,17 @@ direct backend, then writes raw wrk output plus an optional
 This smoke test intentionally covers a narrow HTTP/1.1 path. Use
 `multi_protocol/` or `payload_size/` for headline protocol claims.
 
+## Port conflicts and cleanup ownership
+
+Every runner in this tree (`run_perf_test.sh`, `multi_protocol/run_*`,
+`payload_size/run_payload_test.sh`, and the `mesh-dns-e2e` / `mesh-hbone-e2e`
+`run.sh` harnesses) checks its fixed ports before starting and exits with a
+clear diagnostic if one is already bound, rather than terminating the listener.
+On exit they stop only the PIDs and Docker container IDs that run recorded,
+with a graceful `SIGTERM`, a bounded wait, and `SIGKILL` only as a last resort.
+They delete certificates and results only when that run created them, so a
+failed start cannot kill or remove an unrelated local service's resources.
+
 ## Requirements
 
 - `wrk` for `run_perf_test.sh`.
