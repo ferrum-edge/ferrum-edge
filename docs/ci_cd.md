@@ -528,25 +528,58 @@ run expensive jobs only on `relevant == 'true'`, and fail closed when planning
 succeeds but the output is blank or malformed (neither exact `true` nor exact
 `false`).
 
-NodeWaypoint retains its prior live-suite scheduling scope; the production-image trigger is broader.
+### NodeWaypoint relevance
 
 The same trusted plan job emits a second exact boolean,
 `node_waypoint_relevant`, from the `node-waypoint-ebpf-live` planner suite.
-That suite is the pre-#3888 NodeWaypoint path scope (eBPF, node-agent,
-mesh/HBONE, chart, harness, and specific `src/` files) plus the NodeWaypoint
-datapath modules that landed after the historical list was written: every
-`src/proxy/node_waypoint_*` module, `src/proxy/stream_listener.rs`,
-`src/proxy/udp_proxy.rs`, and `src/proxy/mesh_tcp_inbound.rs`. The
-`src/proxy/node_waypoint_` entry is a **prefix**, not a file list, because
-that historical set enumerated `src/proxy/` file by file and was already
-stale when it was frozen: `node_waypoint_ingress_capture.rs` and the four
+On a pull request that suite is scoped to **NodeWaypoint-owned paths only**:
+
+- the BPF program tree and its userspace side: `ebpf/`, `src/ebpf/`,
+  `src/capture/`;
+- every `src/proxy/node_waypoint_*` module;
+- the live harness, `tests/k8s/node_waypoint_ebpf_live/`;
+- the workflow and the image/toolchain inputs it executes:
+  `node-waypoint-ebpf-live.yml`, `Dockerfile`, `Dockerfile.release`,
+  `Dockerfile.iproute2-layer`, `Dockerfile.ebpf-tools-layer`, `.dockerignore`,
+  `.github/scripts/stage_iproute2_runtime.sh`, and the local actions
+  `package-ferrum-runtime-image`, `setup-kubernetes-tools`, `setup-rust-ci`,
+  `setup-sccache`, `setup-fast-linker`, and `setup-bpf-linker`.
+
+The `src/proxy/node_waypoint_` entry is a **prefix**, not a file list. The
+historical scope enumerated `src/proxy/` file by file and was already stale
+when it was frozen: `node_waypoint_ingress_capture.rs` and the four
 `node_waypoint_udp_*.rs` modules were the only gate for the
-`node_waypoint.udp.*` and `node_waypoint.dtls.*` live assertions and were
-skipping it. A new NodeWaypoint proxy module is now sensitive by
-construction. Ordinary `src/**`, `vendor/**`, `.cargo/**`,
-`rust-toolchain.toml`, and `custom_plugins/**` changes still start the
-workflow for production-image smoke, but skip the 120-minute Kind/eBPF live
-job unless they also match that scope. The live job uses `if: ${{ !cancelled() &&
+`node_waypoint.udp.*` and `node_waypoint.dtls.*` live assertions, yet they
+were skipping it. A new NodeWaypoint proxy module is now sensitive by
+construction.
+
+Broad mesh surfaces are **not** NodeWaypoint-sensitive on a pull request. This
+covers `src/modes/mesh/`, `src/plugins/mesh/`, `src/k8s_controller/`,
+`charts/ferrum-mesh/`, `src/modes/node_agent.rs`, the HBONE and mesh TCP proxy
+files (`hbone_pool.rs`, `hbone_proxy.rs`, `mesh_tcp_egress.rs`,
+`mesh_tcp_inbound.rs`), `src/proxy/netns_capture.rs`, and the shared
+`tests/k8s/lib/`. A pull request that changes them is still validated by:
+
+- the ordinary unit, integration, and functional shards;
+- the branch-protection-required mesh live suites whose trusted filters own
+  those paths: Mesh E2E Sidecar Live, Multicluster Federation Live, Gateway
+  API Conformance, and Ambient Host UDP Live (which covers `node_agent.rs`,
+  `netns_capture.rs`, `src/capture/`, and the chart);
+- this suite in full on every push to `main`.
+
+`NodeWaypoint eBPF Live` is not branch-protection-required, so a
+NodeWaypoint-only regression from a shared mesh change turns up on `main` and
+is reverted before a release cut. A replay of 656 merged pull requests
+(2026-08-24 to 2026-09-23) through `decide_relevance` moved the live job from
+128 PRs (19.5%) to 41 (6.2%). That is 87 fewer runs of about 28.7 minutes
+each, or roughly 2,500 runner-minutes per 30 days. The old scope's top
+triggers were `src/modes/mesh/` (43), `src/plugins/mesh/` (25),
+`charts/ferrum-mesh/` (21), and `src/k8s_controller/` (17).
+
+Ordinary `src/**`, `vendor/**`, `.cargo/**`, `rust-toolchain.toml`, and
+`custom_plugins/**` changes still start the workflow for the production-image
+smoke. They skip the 120-minute Kind/eBPF live job unless they also match the
+scope above. The live job uses `if: ${{ !cancelled() &&
 needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false' }}`:
 `!cancelled()` defeats implicit success-based skip propagation while allowing
 superseded runs to stop. On an active run, a trustworthy exact `false` is the
@@ -1262,13 +1295,14 @@ commit, so relevance has to be re-evaluated there, and a `paths:` list supplied
 by the pull request could exclude the very change that broke the datapath.
 
 Relevance is decided entirely by the trusted-base `production-dockerfile-plan`
-job. `node-waypoint-ebpf-live` runs on its planner scope: eBPF, node-agent,
-NodeWaypoint identity, netns capture, socket option, TCP/HBONE mesh, chart,
-live harness files, `Dockerfile.ebpf-tools-layer`, the local composite actions
-the job executes, the specific `src/` paths from the pre-#3888 trigger, and the
-NodeWaypoint datapath modules added since (the `src/proxy/node_waypoint_`
-prefix, `src/proxy/stream_listener.rs`, `src/proxy/udp_proxy.rs`,
-`src/proxy/mesh_tcp_inbound.rs`, PR #3953). The expensive Kind/eBPF job is
+job. On a pull request `node-waypoint-ebpf-live` runs only on NodeWaypoint-owned
+paths: `ebpf/`, `src/ebpf/`, `src/capture/`, the `src/proxy/node_waypoint_`
+prefix, `tests/k8s/node_waypoint_ebpf_live/`, and the workflow with its
+Dockerfiles and local composite actions. Broad mesh surfaces
+(`src/modes/mesh/`, `src/plugins/mesh/`, `src/k8s_controller/`,
+`charts/ferrum-mesh/`, the HBONE/mesh TCP proxy files) are validated on the
+push to `main` instead. See "NodeWaypoint relevance" above. The expensive
+Kind/eBPF job is
 gated by `node_waypoint_relevant` from that planner:
 `if: ${{ !cancelled() &&
 needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false' }}`.
@@ -1830,6 +1864,16 @@ consumer jobs keep only their binding frozen, because their bodies are ordinary
 build and live-test recipes that must stay editable. Deleting the workflow is
 rejected too: a contract a `git rm` retires is the same weaker-than-it-looks
 coverage issue #3908 was filed for.
+
+The contract freezes **how** relevance is decided, not **which paths** are
+relevant. The frozen planner job has no path list of its own. It reads
+`ci_runtime_plan.py` from the trusted base and runs
+`emit_suite_verdict node-waypoint-ebpf-live node_waypoint_relevant`. The
+`node-waypoint-ebpf-live` patterns in `SUITE_PATTERNS` therefore change through
+an ordinary pull request, with no edit to `verify_cross_build_policy.py`. The
+change applies to pull requests opened against the base after it merges. The
+pull request that edits the patterns is itself planned by the old base copy.
+The narrowing described under "NodeWaypoint relevance" landed this way.
 
 With both contracts in place, issue #3908 is durably complete: neither new
 `changes` job nor the NodeWaypoint planner-to-live-to-aggregate posture can be

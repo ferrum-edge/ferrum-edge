@@ -99,7 +99,18 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   freezes `needs`/`if` only on `production-dockerfile-smoke-default`,
   `production-dockerfile-smoke-ebpf`, and `node-waypoint-ebpf-live`; deleting
   the workflow is rejected. Editing any of this is a direct-to-`main` change:
-  no pull request may modify `verify_cross_build_policy.py`. The temporary
+  no pull request may modify `verify_cross_build_policy.py`. The contract
+  freezes the planner job, not the path list: the `node-waypoint-ebpf-live`
+  patterns live in `ci_runtime_plan.py` `SUITE_PATTERNS`, change by ordinary PR,
+  and take effect once on the trusted base. On a PR that suite is scoped to
+  NodeWaypoint-owned paths only (`ebpf/`, `src/ebpf/`, `src/capture/`,
+  `src/proxy/node_waypoint_*`, `tests/k8s/node_waypoint_ebpf_live/`, the
+  workflow and its Dockerfiles/local actions). Broad mesh trees
+  (`src/modes/mesh/`, `src/plugins/mesh/`, `src/k8s_controller/`,
+  `charts/ferrum-mesh/`, HBONE/mesh TCP proxy files, `node_agent.rs`,
+  `tests/k8s/lib/`) are PR-gated by the required mesh live suites and
+  validated by NodeWaypoint on push to `main`. Do not widen it back without a
+  replay (`ci_runtime_plan.decide_relevance` over merged PRs). The temporary
   `--list-suites` bootstrap handshake is deleted from
   `live_suite_path_filter.py`. The classifier refuses to classify
   any change-set record that is not a normal repository-relative pathname and
