@@ -18,6 +18,7 @@ from test_unit_ci import (
 )
 
 from check_markdown_links import check_repository, run_self_test
+from ci_gate_replay import self_test as ci_gate_replay_self_test
 from check_node_agent_chart_runtime import (
     check_repository as check_node_agent_chart_runtime,
     main as node_agent_chart_runtime_main,
@@ -2228,6 +2229,8 @@ def main() -> int:
     # influence which jobs the trusted scheduler selected.
     if planner_self_test() != 0:
         planner_errors.append("proposed PR CI planner self-test failed")
+    if ci_gate_replay_self_test() != 0:
+        planner_errors.append("CI gate replay self-test failed")
     try:
         run_self_test()
     except AssertionError as error:

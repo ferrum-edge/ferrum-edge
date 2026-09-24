@@ -71,6 +71,9 @@ adding, removing, or materially changing a workflow.
 | `comparison-benchmark.yml` | Gateway Comparison Benchmark | Manual | Cross-gateway comparison benchmarks. |
 | `gateways-protocol-benchmark.yml` | Gateways Protocol Benchmark | Manual | Gateway/protocol benchmark harness. |
 | `benchmark-harness-tests.yml` | Benchmark Harness Tests | PRs and push to `main` on `tests/performance/multi_protocol/**`, manual | Runs the multi-protocol benchmark harness's own tests: `cargo test --test metrics_tests` for worker/error accounting and `python3 -m unittest` for the `benchmark_validity.py` sample and scenario rules. That package is not a workspace member, so the `Tests` aggregate never builds it. Not a required check. |
+| `pool-internal-profile.yml` | Pool Internal Profile | PRs on the pool profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/contract checks; manual same-host measurement campaign. Optional. See [Optional PR lanes](#optional-pr-lanes-and-post-merge-validation). |
+| `h1-internal-profile.yml` | H1 Internal Profile | PRs on the H1 profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/cadence/trace-fixture checks; manual measurement campaign. Optional. |
+| `udp-internal-profile.yml` | UDP Internal Profile | PRs on the UDP profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/contract checks; manual measurement campaign. Optional. |
 | `h2-guard-observation.yml` | H2 Guard Observation | PRs on its own paths, push to `main` on its own paths plus the repository files it pins, manual | Temporary [#5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588) patched-`h2` guard regressions; manual dispatch can add the H2/gRPC campaign. `prepare.py` fails closed on pin drift, so a main push that stales a pin turns red on that commit; see [Optional PR lanes and post-merge validation](#optional-pr-lanes-and-post-merge-validation). Not a required check. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
@@ -663,7 +666,7 @@ aggregate accepts a skipped job only when its gate was `false`:
 
 | Gate | Schedules | Pull-request trigger surface |
 |---|---|---|
-| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/`), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `ci.yml`, the Rust setup actions |
+| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/` and the standalone benchmark workspaces under `tests/performance/`, other than the `PERFORMANCE_TREE_WORKSPACE_INPUTS` fixtures root-crate tests embed), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `ci.yml`, the Rust setup actions |
 | `run_artifacts` | Build Test Artifacts | `run_rust` or `run_helm` |
 | `run_acme` | ACME Feature Tests (`--features acme`, own job) | `src/tls/`, `tests/acme_dns01/`, `tests/unit/tls/`, build graph |
 | `run_conformance` | Mesh Conformance Tests | `tests/conformance/`, mesh/xDS/k8s translation modules, build graph |
@@ -685,6 +688,10 @@ workflow/scripts); `coverage.yml` skips every instrumented shard on a pull
 request unless the coverage controllers themselves change; the Kind live
 suites (`live_suite_path_filter.py`, `ci_runtime_plan.py`) fire only for their
 own harness, tooling, and the Kubernetes-facing modules they exist to test.
+Editing `.github/workflows/ci.yml` no longer schedules the Gateway API,
+multicluster, sidecar, or Ambient Host UDP Kind suites: they are separate
+workflows that never execute `ci.yml`, and each still runs in full on every
+push to `main`. Their own workflow file remains a trigger.
 The performance regression check is fully out of band: `performance-regression.yml`
 runs once a day against the tip of `main` (and on manual dispatch), never on a
 pull request or a main push.
@@ -692,6 +699,59 @@ A regression in any of these on an ordinary source change turns `main` red
 for that commit, which makes the commit ineligible for a production release
 (see [Publish-blocking required checks](#publish-blocking-required-checks));
 it does not cost every unrelated pull request a Kind cluster or a FIPS build.
+
+### Optional PR lanes and post-merge validation
+
+Only the nine required checks gate a merge. Every other workflow that runs on
+a pull request is advisory, so its PR trigger is limited to the files that
+workflow exists to test. Broader coverage for those workflows moves to a
+daily run on the `main` tip: one run instead of one per merge (about 20 merges
+a day). A red daily run points at that day's merges for revert or bisect. It is
+also evidence against cutting a release from those commits, though it is not
+part of the machine-enforced publication gate
+(`.github/required-publication-checks.json`).
+
+| Workflow | Pull-request trigger | Post-merge trigger |
+|---|---|---|
+| `pool-internal-profile.yml` | `src/pool_profile/**`, its macros, `tests/unit/gateway_core/pool_profile*`, its harness script/manifests/doc, the workflow | daily schedule on the `main` tip, covering every shared surface the observers hook into |
+| `h1-internal-profile.yml` | `src/h1_profile/**`, `tests/unit/gateway_core/h1_profile*`, `tests/functional/h1_cadence_tests.rs`, its harness scripts/doc, the workflow | daily schedule on the `main` tip, covering every shared surface the observers hook into |
+| `udp-internal-profile.yml` | `src/udp_profile/**`, its macros, `tests/unit/gateway_core/udp_profile*`, its harness script/manifests/doc, the workflow | daily schedule on the `main` tip, covering every shared surface the observers hook into |
+
+In the 30 days before this change (646 merged pull requests), these three
+workflows ran on 281, 203 and 131 pull requests. Only 5 of those 615 runs
+would still trigger on the narrowed paths. The rest, at least 30,000
+runner-minutes a month net of the daily runs, came from shared paths. See
+[ci_pr_validation_review_2026_09_24.md](ci_pr_validation_review_2026_09_24.md).
+
+**Auxiliary workflow concurrency.** Each path-filtered auxiliary workflow that
+runs on pull requests declares a concurrency group:
+
+```yaml
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+```
+
+A new push to a pull request cancels that PR's superseded run. Pushes to
+`main`, dispatches, and schedules get a unique `run-<id>` group, so they are
+never cancelled and never displace a queued dispatch. `h3-live-comparison.yml`
+and `h2-guard-observation.yml` keep their own named groups but likewise cancel
+only on `pull_request`. The required
+workflows keep their own event-aware groups (see below).
+
+**Measuring gate changes.** `.github/scripts/ci_gate_replay.py` replays merged
+pull requests through two revisions of `pr_ci_plan.py`,
+`live_suite_path_filter.py`, and every workflow's `on.pull_request.paths`. It
+reports what each revision would have scheduled. It reads only Git objects and
+dispatches nothing:
+
+```bash
+git fetch --shallow-since=2026-08-01 origin main   # enough history for the sample
+python3 .github/scripts/ci_gate_replay.py --since 2026-08-24 --json /tmp/replay.json
+```
+
+Multiply the per-gate counts by hosted job durations to estimate the
+runner-minutes a gate change saves.
 
 ### Main-push concurrency
 
@@ -1241,12 +1301,16 @@ stripped of newlines and backticks before they are written.
 - The `CI Plan` job diffs `ls tests/integration/*.rs` against the union of
   declared shard filters in `ci.yml`. Adding a new `mod foo_tests` without
   wiring it into a shard fails this silent-skip guard.
-- Functional tests split across three shards (`application`, `protocols`,
-  `data-plane`). `build-test-artifacts` compiles the gateway, CNI binary, and
+- Functional tests split across four shards (`application`, `protocols`,
+  `data-plane`, `data-plane-runtime`). `build-test-artifacts` compiles the gateway, CNI binary, and
   both nextest archives in one job/cache; each functional shard downloads the
   existing OS/architecture-keyed artifacts with
-  `FERRUM_SKIP_GATEWAY_BUILD=1`. The data-plane shard remains serialized with
-  `nextest_jobs: 1` and is the only shard that starts Redis/MongoDB containers.
+  `FERRUM_SKIP_GATEWAY_BUILD=1`. The two data-plane shards (`data_services:
+  true`) remain serialized with `nextest_jobs: 1` and are the only shards that
+  start the Redis/MongoDB/PostgreSQL/MySQL containers; each runner owns its own
+  set. They were one shard until September 2026, when that shard was the
+  functional critical path (see
+  [ci_pr_validation_review_2026_09_24.md](ci_pr_validation_review_2026_09_24.md)).
 
 **Output**:
 - Test pass/fail status
