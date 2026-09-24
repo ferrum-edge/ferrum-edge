@@ -58,6 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Rust tests no longer write the gateway's TLS store into the checkout
+  (#5706). Only the `ferrum-edge` binary resolves an unconfigured
+  `FERRUM_TLS_MANAGED_STORE_PATH` to `./ferrum-managed-tls`; other processes
+  that link the library, including every test harness, use a private
+  per-process temporary directory. An empty value now counts as unset. The
+  accidentally committed `ferrum-managed-tls/` store is removed and ignored,
+  and the Unit and Integration Tests jobs fail when a test run changes or adds
+  files in the checkout. `basic_auth` tests no longer race env-isolated tests
+  for `FERRUM_BASIC_AUTH_HMAC_SECRET` (#5705).
 - Reject a health-check `active.http_path` that does not start with `/`
   (#5683). The probe URL is `scheme://host:port` + path, so a path like
   `@169.254.169.254/` turned the target into userinfo and sent the probe to a
@@ -179,9 +188,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The ordered transform list is now bound into the shared destination
   partition, so such entries miss. Existing replay keys rotate once after
   upgrading.
+- **Route-override backend TLS and DNS policy are now part of the replay key**
+  (issue #5710). Two dispatch rules can send the same request target to the
+  same backend host and port under different backend TLS, for example
+  per-tenant client certificates or one rule that verifies the origin and one
+  that does not. A `response_caching`, `request_deduplication`, or
+  `ai_semantic_cache` entry stored under one rule could be replayed to a
+  request routed under the other. The route-override TLS identity (client
+  certificate and key references, CA bundle, verification mode, SNI, and SAN
+  allow-list) and the route-override DNS policy are now bound into the shared
+  destination partition. Only identities are hashed, never key material.
+  Existing replay keys rotate once after upgrading.
 
 ### Changed
 
+- **BREAKING — malformed secret-fetch timeout and mesh DNS limits refuse to
+  start** (issues #5699 / #5700). `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` must be
+  a whole number of seconds from 1 to 600. Previously `0` made every secret
+  fetch that waited on I/O time out immediately, and a malformed or negative
+  value silently became 30. The same rule applies to startup secret resolution
+  (environment only), to later runtime fetches, and to the `ferrum.conf` value
+  when settings load. `FERRUM_MESH_DNS_TTL_SECONDS` (0–86400),
+  `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` (1–16384) and
+  `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` (1–262144) no longer fall back to
+  their defaults on a malformed, blank or overflowing value (or, for the two
+  capacity settings, zero). `run` and `validate` now fail with an error naming
+  the variable and its range, without echoing the value. Unset variables keep
+  their documented defaults. See
+  [docs/upgrade_guide.md](docs/upgrade_guide.md).
 - **MCP trailing-slash alias withdrawn** (#5582). The single-trailing-slash
   alias introduced for #5536 is no longer accepted. Authorization plugins
   evaluate the raw request path before MCP dispatch, so admitting and rewriting

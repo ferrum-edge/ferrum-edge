@@ -21,6 +21,11 @@ fn main() {
     #[cfg(all(not(windows), feature = "bench-h1-profile"))]
     h1_profile::register_global_allocator();
 
+    // Only the gateway process resolves an unconfigured managed-TLS store to
+    // the documented `./ferrum-managed-tls`; library consumers such as the
+    // test harnesses get a private per-process directory instead.
+    config::env_config::use_working_directory_tls_managed_store_default();
+
     // SAFETY: this is the process entry point. No application worker or runtime
     // has started; the shared pipeline owns initialization and thread startup.
     unsafe {

@@ -18,8 +18,7 @@ use ferrum_edge::xds::translator::translate_mesh_slice_to_snapshot;
 
 fn build_slice(n_workloads: usize) -> MeshSlice {
     let mut config = GatewayConfig::default();
-    let trust_domain =
-        TrustDomain::new("cluster.local").expect("static trust-domain must parse");
+    let trust_domain = TrustDomain::new("cluster.local").expect("static trust-domain must parse");
     let mut mesh = MeshConfig::default();
 
     for i in 0..n_workloads {

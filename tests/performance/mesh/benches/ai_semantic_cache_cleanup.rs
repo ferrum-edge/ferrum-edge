@@ -40,10 +40,7 @@ fn request_context(body: String) -> (RequestContext, HashMap<String, String>) {
         "/v1/chat/completions".to_string(),
     );
     context.metadata.insert("request_body".to_string(), body);
-    let headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/json".to_string(),
-    )]);
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     (context, headers)
 }
 
@@ -58,10 +55,8 @@ fn populated_cache(entry_count: usize) -> AiSemanticCache {
         PluginHttpClient::default(),
     )
     .expect("benchmark config must be valid");
-    let response_headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/json".to_string(),
-    )]);
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     for index in 0..entry_count {
         let body = format!(

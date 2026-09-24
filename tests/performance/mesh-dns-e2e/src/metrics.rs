@@ -193,8 +193,7 @@ pub fn selected_reports_failure(
             let matches = reports
                 .iter()
                 .filter(|report| {
-                    report.name_class == class.as_str()
-                        && report.transport == transport.as_str()
+                    report.name_class == class.as_str() && report.transport == transport.as_str()
                 })
                 .count();
             if matches == 0 {

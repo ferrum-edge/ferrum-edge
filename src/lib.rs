@@ -2506,6 +2506,16 @@ pub mod _test_support {
         crate::plugins::basic_auth::BasicAuth::new_with_hmac_secret(config, secret).map(|_| ())
     }
 
+    /// Build `basic_auth` with an explicit HMAC secret, so a test never has to
+    /// publish `FERRUM_BASIC_AUTH_HMAC_SECRET` into the shared process
+    /// environment that env-isolated tests clear concurrently (issue #5705).
+    pub fn basic_auth_with_secret_for_test(
+        config: &serde_json::Value,
+        secret: &str,
+    ) -> Result<crate::plugins::basic_auth::BasicAuth, String> {
+        crate::plugins::basic_auth::BasicAuth::new_with_hmac_secret(config, Some(secret))
+    }
+
     pub fn validate_admin_plugin_config_for_test(
         plugin_config: &crate::config::types::PluginConfig,
     ) -> Result<(), String> {
@@ -4987,6 +4997,14 @@ pub mod _test_support {
 
     pub fn finalized_response_replay_for_test(ctx: &crate::plugins::RequestContext) -> bool {
         ctx.finalized_response_replay
+    }
+
+    /// Stand in for a provider claim that states `ClearInherited` DNS intent,
+    /// which only crate-internal route dispatchers may set.
+    pub fn set_route_override_dns_policy_clear_inherited_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.route_override_dns_policy = crate::plugins::RouteOverrideDnsPolicy::ClearInherited;
     }
 
     /// Stand in for the protocol entry paths, which copy this digest from the

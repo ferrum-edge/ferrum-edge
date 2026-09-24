@@ -613,26 +613,36 @@ pub fn install_interest_floor() {
     );
 }
 
-/// Guarantee `FERRUM_BASIC_AUTH_HMAC_SECRET` is set for tests that construct
-/// every registered plugin (`basic_auth` refuses to start without it). The
-/// monolithic unit binary used to inherit the value from `basic_auth_tests`
-/// running earlier in the same process; each split binary must set it itself.
-/// Sets only when absent, under the shared env lock, so env-scoped tests that
-/// deliberately clear the variable are not raced.
+/// Hold the shared env lock with `FERRUM_BASIC_AUTH_HMAC_SECRET` set, for
+/// tests that construct every registered plugin through `create_plugin` or a
+/// `PluginCache` (`basic_auth` refuses to start without the secret, and that
+/// path reads it from the process environment).
+///
+/// Bind the guard for the WHOLE construction phase. [`EnvGuard`] clears every
+/// `FERRUM_*` variable while a sibling test holds `ENV_LOCK`, so a setter that
+/// released the lock before the plugins were built let a parallel test clear
+/// the secret in between (issue #5705). The guard restores the ambient
+/// environment on drop.
+///
+/// Take it BEFORE [`log_schema_registry_guard`]: a `PluginCache` build enters
+/// the registry serializer while its env-guarded test already holds
+/// `ENV_LOCK`, so `ENV_LOCK` must always be the outer lock or the two
+/// deadlock. Tests that build `BasicAuth` directly should pass the
+/// secret explicitly through
+/// `ferrum_edge::_test_support::basic_auth_with_secret_for_test` instead.
+///
+/// [`EnvGuard`]: crate::unit::env_lock::EnvGuard
 #[allow(dead_code)]
-pub fn ensure_basic_auth_test_secret() {
-    const KEY: &str = "FERRUM_BASIC_AUTH_HMAC_SECRET";
-    let _guard = crate::unit::env_lock::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if std::env::var_os(KEY).is_none() {
-        // SAFETY: serialized by ENV_LOCK with every env-mutating unit test, and
-        // the value is a fixed test constant set once for the process.
-        unsafe {
-            std::env::set_var(KEY, "unit-test-basic-auth-hmac-secret-0123456789abcdef");
-        }
-    }
+#[must_use = "bind the guard so the secret stays set while plugins are constructed"]
+pub fn basic_auth_test_secret_guard() -> crate::unit::env_lock::EnvGuard {
+    let env = crate::unit::env_lock::EnvGuard::new(&[]);
+    env.set("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
+    env
 }
+
+/// The fixed `basic_auth` HMAC secret used by the shared plugin helpers.
+#[allow(dead_code)]
+pub const BASIC_AUTH_TEST_SECRET: &str = "unit-test-basic-auth-hmac-secret-0123456789abcdef";
 
 /// Hold the named log-schema registry's reload-bracket serializer for the
 /// guard's lifetime, so a bare `create_plugin("transaction_log_schema", ..)`
