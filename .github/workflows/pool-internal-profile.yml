@@ -1,7 +1,23 @@
 name: Pool Internal Profile
 
 on:
+  # Observer-feature contracts are optional (not required, not release
+  # gating). A pull request runs them only when it edits the profiler itself;
+  # the shared proxy/pool/runtime surfaces the observers hook into are
+  # re-validated after merge on every matching push to main, where a red
+  # run flags that commit for revert before the next release cut.
   pull_request:
+    paths:
+      - src/pool_profile/**
+      - src/pool_profile_macros.rs
+      - tests/unit/gateway_core/pool_profile*
+      - tests/performance/multi_protocol/pool_internal_profile.py
+      - tests/performance/multi_protocol/pool_profile_*.json
+      - docs/pool_internal_profile.md
+      - .github/workflows/pool-internal-profile.yml
+  push:
+    branches:
+      - main
     paths:
       - src/pool/**
       - src/pool_profile/**
@@ -21,6 +37,13 @@ on:
 
 permissions:
   contents: read
+
+# A newer push to the same pull request cancels the superseded run. Every
+# other event (push to main, dispatch, schedule) gets a unique group so it
+# always runs to completion and never displaces another dispatch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   checks:

@@ -134,7 +134,10 @@ coalescer and mixed-wire counters must not be relabeled H1 under mixed traffic.
 No repository code, build, formatter, lint, test, benchmark, container or server
 was executed locally for this implementation. Static inspection and
 `git diff --check` are the only local validation. The new
-`.github/workflows/h1-internal-profile.yml` registers a PR/manual hosted lane for
+`.github/workflows/h1-internal-profile.yml` registers a hosted lane (PRs that
+edit the H1 profiler itself, pushes to `main` on the shared H1/proxy surface, and
+manual dispatch; see `docs/ci_cd.md` -> "Optional PR lanes and post-merge
+validation") for
 feature-enabled clippy/binary compilation, registered external observer tests,
 private publication-seam tests located under `tests/unit/gateway_core/`, existing
 coalescer contracts with observers on/off, existing live functional streaming

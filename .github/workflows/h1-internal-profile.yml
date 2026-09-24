@@ -1,7 +1,22 @@
 name: H1 Internal Profile
 
 on:
+  # Observer-feature contracts are optional (not required, not release
+  # gating). A pull request runs them only when it edits the profiler itself;
+  # the shared proxy/pool/runtime surfaces the observers hook into are
+  # re-validated after merge on every matching push to main, where a red
+  # run flags that commit for revert before the next release cut.
   pull_request:
+    paths:
+      - src/h1_profile/**
+      - tests/unit/gateway_core/h1_profile*
+      - tests/functional/h1_cadence_tests.rs
+      - tests/performance/multi_protocol/h1_*
+      - docs/h1_internal_profile.md
+      - .github/workflows/h1-internal-profile.yml
+  push:
+    branches:
+      - main
     paths:
       - src/h1_profile/**
       - src/main.rs
@@ -42,6 +57,13 @@ env:
   RUSTC_WRAPPER: ""
   CARGO_BUILD_RUSTC_WRAPPER: ""
   RUSTFLAGS: ""
+
+# A newer push to the same pull request cancels the superseded run. Every
+# other event (push to main, dispatch, schedule) gets a unique group so it
+# always runs to completion and never displaces another dispatch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   checks:

@@ -71,6 +71,9 @@ adding, removing, or materially changing a workflow.
 | `comparison-benchmark.yml` | Gateway Comparison Benchmark | Manual | Cross-gateway comparison benchmarks. |
 | `gateways-protocol-benchmark.yml` | Gateways Protocol Benchmark | Manual | Gateway/protocol benchmark harness. |
 | `benchmark-harness-tests.yml` | Benchmark Harness Tests | PRs and push to `main` on `tests/performance/multi_protocol/**`, manual | Runs the multi-protocol benchmark harness's own tests: `cargo test --test metrics_tests` for worker/error accounting and `python3 -m unittest` for the `benchmark_validity.py` sample and scenario rules. That package is not a workspace member, so the `Tests` aggregate never builds it. Not a required check. |
+| `pool-internal-profile.yml` | Pool Internal Profile | PRs on the pool profiler's own paths, push to `main` on the shared pool/proxy surface, manual | Observer-feature lint/contract checks; manual same-host measurement campaign. Optional. See [Optional PR lanes](#optional-pr-lanes-and-post-merge-validation). |
+| `h1-internal-profile.yml` | H1 Internal Profile | PRs on the H1 profiler's own paths, push to `main` on the shared H1/proxy surface, manual | Observer-feature lint/cadence/trace-fixture checks; manual measurement campaign. Optional. |
+| `udp-internal-profile.yml` | UDP Internal Profile | PRs on the UDP profiler's own paths, push to `main` on the shared UDP surface, manual | Observer-feature lint/contract checks; manual measurement campaign. Optional. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
 | `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
@@ -629,7 +632,7 @@ aggregate accepts a skipped job only when its gate was `false`:
 
 | Gate | Schedules | Pull-request trigger surface |
 |---|---|---|
-| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/`), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `ci.yml`, the Rust setup actions |
+| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/` and the standalone benchmark workspaces under `tests/performance/`, other than the `PERFORMANCE_TREE_WORKSPACE_INPUTS` fixtures root-crate tests embed), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `ci.yml`, the Rust setup actions |
 | `run_artifacts` | Build Test Artifacts | `run_rust` or `run_helm` |
 | `run_acme` | ACME Feature Tests (`--features acme`, own job) | `src/tls/`, `tests/acme_dns01/`, `tests/unit/tls/`, build graph |
 | `run_conformance` | Mesh Conformance Tests | `tests/conformance/`, mesh/xDS/k8s translation modules, build graph |
@@ -651,6 +654,10 @@ workflow/scripts); `coverage.yml` skips every instrumented shard on a pull
 request unless the coverage controllers themselves change; the Kind live
 suites (`live_suite_path_filter.py`, `ci_runtime_plan.py`) fire only for their
 own harness, tooling, and the Kubernetes-facing modules they exist to test.
+Editing `.github/workflows/ci.yml` no longer schedules the Gateway API,
+multicluster, sidecar, or Ambient Host UDP Kind suites: they are separate
+workflows that never execute `ci.yml`, and each still runs in full on every
+push to `main`. Their own workflow file remains a trigger.
 The performance regression check is fully out of band: `performance-regression.yml`
 runs once a day against the tip of `main` (and on manual dispatch), never on a
 pull request or a main push.
@@ -658,6 +665,56 @@ A regression in any of these on an ordinary source change turns `main` red
 for that commit, which makes the commit ineligible for a production release
 (see [Publish-blocking required checks](#publish-blocking-required-checks));
 it does not cost every unrelated pull request a Kind cluster or a FIPS build.
+
+### Optional PR lanes and post-merge validation
+
+Only the nine required checks gate a merge. Every other workflow that runs on
+a pull request is advisory, so its PR trigger is limited to the files that
+workflow exists to test. Broader coverage for those workflows moves to the
+push to `main`. A red post-merge run marks that commit for revert. It is also
+evidence against cutting a release from that commit, though it is not part of
+the machine-enforced publication gate
+(`.github/required-publication-checks.json`).
+
+| Workflow | Pull-request trigger | Post-merge trigger |
+|---|---|---|
+| `pool-internal-profile.yml` | `src/pool_profile/**`, its macros, `tests/unit/gateway_core/pool_profile*`, its harness script/manifests/doc, the workflow | push to `main` on the full shared surface (`src/pool/**`, `src/proxy/**`, `src/lib.rs`, `src/main.rs`, `src/admin/mod.rs`, `Cargo.*`, `tests/unit/gateway_core/**`, the multi-protocol harness, ...) |
+| `h1-internal-profile.yml` | `src/h1_profile/**`, `tests/unit/gateway_core/h1_profile*`, `tests/functional/h1_cadence_tests.rs`, its harness scripts/doc, the workflow | push to `main` on the full shared surface (`src/proxy/{mod,body}.rs`, `src/lib.rs`, `src/main.rs`, `Cargo.toml`, `tests/scaffolding/**`, ...) |
+| `udp-internal-profile.yml` | `src/udp_profile/**`, its macros, `tests/unit/gateway_core/udp_profile*`, its harness script/manifests/doc, the workflow | push to `main` on the full shared surface (`src/proxy/udp_{proxy,batch}.rs`, `src/lib.rs`, `Cargo.toml`, ...) |
+
+In the 30 days before this change (646 merged pull requests), these three
+workflows ran on 281, 203 and 131 pull requests; about 95% of those runs came
+from the shared paths rather than from the profiler. See
+[ci_pr_validation_review_2026_09_24.md](ci_pr_validation_review_2026_09_24.md).
+
+**Auxiliary workflow concurrency.** Each path-filtered auxiliary workflow that
+runs on pull requests declares a concurrency group:
+
+```yaml
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+```
+
+A new push to a pull request cancels that PR's superseded run. Pushes to
+`main`, dispatches, and schedules get a unique `run-<id>` group, so they are
+never cancelled and never displace a queued dispatch. `h3-live-comparison.yml`
+keeps its shared group but cancels only on `pull_request`. The required
+workflows keep their own event-aware groups (see below).
+
+**Measuring gate changes.** `.github/scripts/ci_gate_replay.py` replays merged
+pull requests through two revisions of `pr_ci_plan.py`,
+`live_suite_path_filter.py`, and every workflow's `on.pull_request.paths`. It
+reports what each revision would have scheduled. It reads only Git objects and
+dispatches nothing:
+
+```bash
+git fetch --shallow-since=2026-08-01 origin main   # enough history for the sample
+python3 .github/scripts/ci_gate_replay.py --since 2026-08-24 --json /tmp/replay.json
+```
+
+Multiply the per-gate counts by hosted job durations to estimate the
+runner-minutes a gate change saves.
 
 ### Main-push concurrency
 

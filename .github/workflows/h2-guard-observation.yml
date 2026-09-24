@@ -25,6 +25,13 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request cancels the superseded run. Every
+# other event (push to main, dispatch, schedule) gets a unique group so it
+# always runs to completion and never displaces another dispatch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   guard-checks:
     name: H2 pinned guard regressions
