@@ -93,6 +93,15 @@ bash run_payload_test.sh all-protocols --envoy
 | `--json` | false | Machine-readable JSON output |
 | `--results-dir <DIR>` | ./results | Where to write JSON results |
 
+## Port conflicts and cleanup
+
+`run_payload_test.sh` refuses to start if any of its fixed ports (8000, 8443,
+5010, 5003, the backend/admin ports, and the Envoy admin port) is already
+bound, printing the port and an `lsof` command to inspect the listener. Cleanup
+stops only the gateway/backend/Envoy PIDs this run started (graceful `SIGTERM`,
+bounded wait, then `SIGKILL`), never whatever else happens to be listening on
+those ports.
+
 ## Architecture
 
 ```
