@@ -1177,6 +1177,11 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins
 # List plugin configs (first page)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins/config
 
+# List only the plugin configs whose `proxy_id` equals `my-proxy` (paginated
+# over the filtered set)
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9000/plugins/config?proxy_id=my-proxy"
+
 # Create plugin config
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -1188,6 +1193,17 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   }' \
   http://localhost:9000/plugins/config
 ```
+
+`GET /plugins/config` accepts an optional `proxy_id` query parameter that
+narrows the list to configs whose `proxy_id` field matches exactly (the
+proxy-scoped association). The pagination envelope is unchanged, and
+`pagination.total` counts the filtered set, so a caller paging one proxy's
+configs never has to page the whole namespace and filter client-side. The
+value follows the same identifier rules as every other resource id and returns
+`400` when invalid. An unknown `proxy_id` (one no config targets) returns an
+empty page, not `404`, matching every other empty list. The filter is enforced
+in every backend (SQL, MongoDB, and the in-memory/file path) and respects the
+caller's namespace and role exactly as the unfiltered list does.
 
 ### Proxy-scoped configs attach the proxy association
 

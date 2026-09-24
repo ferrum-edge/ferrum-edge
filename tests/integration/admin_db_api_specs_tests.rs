@@ -267,7 +267,7 @@ async fn submit_bundle_happy_path_all_resources_tagged() {
 
     // --- Verify plugin count (2 spec-owned + 0 hand-added = 2) ---
     let all_plugins = store
-        .list_plugin_configs_paginated(ns, 100, 0)
+        .list_plugin_configs_paginated(ns, None, 100, 0)
         .await
         .expect("list_plugin_configs_paginated failed");
     let spec_plugins: Vec<_> = all_plugins
@@ -276,6 +276,68 @@ async fn submit_bundle_happy_path_all_resources_tagged() {
         .filter(|pc| pc.proxy_id.as_deref() == Some(&proxy_id))
         .collect();
     assert_eq!(spec_plugins.len(), 2, "expected 2 plugins for proxy");
+}
+
+#[tokio::test]
+async fn list_plugin_configs_paginated_filters_by_proxy_id() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_a = uid("proxy-a");
+    let proxy_b = uid("proxy-b");
+    store
+        .create_proxy(&make_proxy(&proxy_a, ns))
+        .await
+        .expect("seed proxy-a failed");
+    store
+        .create_proxy(&make_proxy(&proxy_b, ns))
+        .await
+        .expect("seed proxy-b failed");
+
+    let pa1 = uid("plugin");
+    let pa2 = uid("plugin");
+    let pb1 = uid("plugin");
+    store
+        .create_plugin_config(&make_plugin(&pa1, &proxy_a, ns, None))
+        .await
+        .expect("seed plugin pa1 failed");
+    store
+        .create_plugin_config(&make_plugin(&pa2, &proxy_a, ns, None))
+        .await
+        .expect("seed plugin pa2 failed");
+    store
+        .create_plugin_config(&make_plugin(&pb1, &proxy_b, ns, None))
+        .await
+        .expect("seed plugin pb1 failed");
+
+    let filtered = store
+        .list_plugin_configs_paginated(ns, Some(&proxy_a), 100, 0)
+        .await
+        .expect("filtered list failed");
+    assert_eq!(filtered.total, 2);
+    let ids: Vec<&str> = filtered.items.iter().map(|pc| pc.id.as_str()).collect();
+    assert!(ids.contains(&pa1.as_str()) && ids.contains(&pa2.as_str()));
+
+    let single = store
+        .list_plugin_configs_paginated(ns, Some(&proxy_b), 100, 0)
+        .await
+        .expect("single filtered list failed");
+    assert_eq!(single.total, 1);
+    assert_eq!(single.items[0].id, pb1);
+
+    let unknown = store
+        .list_plugin_configs_paginated(ns, Some("no-such-proxy"), 100, 0)
+        .await
+        .expect("unknown filtered list failed");
+    assert_eq!(unknown.total, 0);
+    assert!(unknown.items.is_empty());
+
+    let all = store
+        .list_plugin_configs_paginated(ns, None, 100, 0)
+        .await
+        .expect("unfiltered list failed");
+    assert_eq!(all.total, 3);
 }
 
 #[tokio::test]
@@ -1718,7 +1780,7 @@ async fn replace_bundle_spec_owned_replaced_hand_added_survives() {
 
     // Verify both plugins exist before replace.
     let before = store
-        .list_plugin_configs_paginated(ns, 100, 0)
+        .list_plugin_configs_paginated(ns, None, 100, 0)
         .await
         .expect("list failed");
     let proxy_plugins_before: Vec<_> = before
