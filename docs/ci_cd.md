@@ -1177,6 +1177,20 @@ cargo nextest run --archive-file functional-tests-*.tar.zst \
   -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)'
 ```
 
+Every Unit Tests shard and every Integration Tests shard ends with **Check the
+test run left the checkout clean** (issue #5706), a step in the existing job
+rather than a new lane. After the suite, `git status --porcelain
+--untracked-files=all` must be empty (an integration shard excludes only its
+downloaded nextest archive), and the gateway's working-directory TLS store
+`./ferrum-managed-tls` — ignored by `.gitignore` — must not exist. Build output
+stays in the ignored `target/` and `.cache/` trees. The step prints file names
+only, never contents, because a leaked store can hold private keys. Tests keep
+runtime state in temporary directories: only the `ferrum-edge` binary resolves
+an unconfigured `FERRUM_TLS_MANAGED_STORE_PATH` to `./ferrum-managed-tls`; any
+other process linking the library (every Rust test harness) gets a private
+per-process temp directory, and `TestGateway` gives each spawned gateway a store
+inside its own temp dir.
+
 The ACME DNS hook tests live unchanged in `tests/acme_dns01/mod.rs`, explicitly
 registered as `acme_dns01_tests` with `required-features = ["acme"]`. The default
 suite still discovers every default-feature external test; the optional pass

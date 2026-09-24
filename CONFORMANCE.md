@@ -151,12 +151,12 @@ reviewers can compare the generated matrix to the declared product promise.
 HTTPRoute and GRPCRoute support rule-level `RequestHeaderModifier` and
 `ResponseHeaderModifier`; HTTPRoute also supports `RequestRedirect` and
 `URLRewrite` (both HTTPRoute-only upstream — a GRPCRoute asking for either is
-still refused) and rule-level `timeouts` (below). RequestMirror, ExtensionRef,
-CORS, ExternalAuth and backend-reference filters remain deferred. Translation
-rejects a route containing these unimplemented filter actions with
+still refused) and rule-level `timeouts` and `retry` (below). RequestMirror,
+ExtensionRef, CORS, ExternalAuth and backend-reference filters remain deferred.
+Translation rejects a route containing these unimplemented filter actions with
 `Accepted=False` / `IncompatibleFilters`; it does not emit partially interpreted
-rules. Unknown filter types and unimplemented rule fields — `retry` on either
-kind, and `timeouts` on a GRPCRoute, which upstream does not define — report
+rules. Unknown filter types and unimplemented rule fields — `timeouts` and
+`retry` on a GRPCRoute, which upstream does not define — report
 `UnsupportedValue`. Both cases report `Programmed=False`, while independently
 valid routes remain available.
 
@@ -201,6 +201,31 @@ body cut by `request` keeps a backend `Content-Length` advertised.
   the `503`. HTTP/1.1 and HTTP/2 enforce `request` fully.
 
 Upgraded WebSocket / CONNECT-UDP tunnels are not bounded by `request`.
+
+**Rule `retry` (HTTPRoute, experimental channel).** The field is present in the
+pinned `v1.5.1` experimental CRD bundle the Gateway API lab installs; upstream
+`v1.5.1` defines no retry conformance feature or test, so none is declared and
+the behavior is pinned by Ferrum's own data-plane regressions. Admission
+re-checks the CRD: `codes` must be integers from 400 to 599, `attempts` an
+integer and `backoff` a GEP-2257 duration, otherwise `Invalid`; a negative
+`attempts`, one above 100, a `backoff` above `5m`, or an undefined sub-field is
+`UnsupportedValue`. The policy lands on the rule's own dispatch entry through
+the same per-rule retry override the Istio VirtualService translator uses, never
+on the shared proxy or upstream, so sibling and merged rules are not retried.
+`attempts` counts retries after the initial attempt (at most `attempts + 1`
+backend requests; `0` disables retry), `codes` are the retried statuses, and
+`backoff` is a fixed minimum wait. Retries stay replay-safe: a listed status is
+retried only for `GET`, `HEAD`, `OPTIONS`, `PUT` and `DELETE`; a failure before
+any byte reached the backend is retried for every method from the bounded
+buffered body; a response whose head reached the client is never replayed.
+Every attempt and backoff spends the rule's `timeouts.request` budget.
+
+**Known deviation in rule `retry`:** upstream says implementations SHOULD retry
+connection errors (disconnect, reset, timeout) whenever `retry` is configured.
+Ferrum retries a failure that happened after the request reached the backend
+only when the resulting gateway status (`502` / `504`) is listed in `codes`, and
+only for the replay-safe methods, so a request the backend may already have
+processed is never replayed.
 
 Filter shapes are refused rather than partially honored, and the status reason
 follows what is wrong rather than which CRD mechanism forbids it:
@@ -289,6 +314,13 @@ across attempts and backoff under an operator-configured proxy retry),
 `removing_rule_timeouts_withdraws_the_deadline`, and three backend-health
 attribution regressions through a live circuit breaker (a stalled client upload
 and a mid-body cut are not charged; a backend stalling its response head is).
+Rule `retry` is covered by `gateway_route_retry_reaches_the_data_plane` (exact
+backend attempt counts for a listed status, one attempt for an unlisted status,
+a `POST`, `attempts: 0` and a sibling rule, a recovering retry, and `backoff` as
+the minimum wait), `gateway_route_retry_backoff_stays_inside_the_request_budget`,
+`gateway_route_retry_never_replays_after_response_commitment`,
+`merged_http_route_sibling_without_retry_is_never_retried`, and
+`removing_rule_retry_withdraws_the_policy`.
 Default
 HTTPRoute matches use the same internal predicate conversion as explicit
 matches, so supported actions do not emit an invalid raw Gateway API path field.

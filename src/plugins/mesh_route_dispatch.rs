@@ -148,16 +148,16 @@ impl MeshRouteDispatchConfig {
             // `rule_matches` treats empty match as "match all" only when
             // route-local actions are present, so this stays a no-op for any other
             // operator config.
-            // Rule-scoped timeouts count as route-local actions too: the
-            // Gateway API translator emits a path-only rule whose only effect
-            // is its `timeouts`, and that rule must still select the policy
-            // for exactly the requests it matches.
+            // Rule-scoped timeouts and retry count as route-local actions too:
+            // the Gateway API translator emits a path-only rule whose only
+            // effect is its `timeouts` or `retry`, and that rule must still
+            // select the policy for exactly the requests it matches.
             let has_route_actions = !rule.request_transform.is_empty()
                 || !rule.response_transform.is_empty()
                 || rule.fault.is_some()
                 || rule.rewrite.is_some()
                 || rule.redirect.is_some()
-                || rule.carries_timeout_policy();
+                || rule.carries_attempt_policy();
             if rule.match_.is_empty() && !has_route_actions {
                 return Err(format!(
                     "`mesh_route_dispatch.rules[{idx}].match` requires at least one of \
@@ -942,10 +942,15 @@ pub struct RouteRule {
 }
 
 impl RouteRule {
-    /// Whether this rule carries its own backend-attempt or total request
-    /// timeout policy (including an explicit `timeout_disabled`).
-    fn carries_timeout_policy(&self) -> bool {
-        self.timeout_ms.is_some() || self.timeout_disabled || self.request_timeout_ms.is_some()
+    /// Whether this rule carries its own backend-attempt policy: a per-attempt
+    /// or total request timeout, or a retry policy (including an explicit
+    /// `timeout_disabled` / `retry_disabled`).
+    fn carries_attempt_policy(&self) -> bool {
+        self.timeout_ms.is_some()
+            || self.timeout_disabled
+            || self.request_timeout_ms.is_some()
+            || self.retry.is_some()
+            || self.retry_disabled
     }
 }
 
@@ -2659,7 +2664,7 @@ fn rule_matches(
             || rule.fault.is_some()
             || rule.rewrite.is_some()
             || rule.redirect.is_some()
-            || rule.carries_timeout_policy();
+            || rule.carries_attempt_policy();
     }
     // URI predicate (when set): evaluate first because it cheaply rejects
     // requests that the broader (case-insensitive) `listen_path` lets
