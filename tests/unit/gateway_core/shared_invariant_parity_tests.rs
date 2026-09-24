@@ -2657,9 +2657,8 @@ fn every_direct_h1_dispatch_awaits_through_the_sender_release() {
                 "{site}: a direct HTTP/1.1 dispatch must not await `try_send_request` directly \
                  (issue #5720)"
             );
-            let release = format!(
-                "let{binding}=h1_send_release::await_h1_response_or_release({binding},"
-            );
+            let release =
+                format!("let{binding}=h1_send_release::await_h1_response_or_release({binding},");
             assert!(
                 rest.starts_with(&release),
                 "{site}: a direct HTTP/1.1 dispatch must await its response through \
