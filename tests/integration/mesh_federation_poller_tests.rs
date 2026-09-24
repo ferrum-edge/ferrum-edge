@@ -28,6 +28,8 @@ use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::proxy::ProxyState;
 use jsonwebtoken::{EncodingKey, Header, encode};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -83,12 +85,10 @@ fn generate_mock_federation_tls() -> (String, String, String) {
 }
 
 fn mock_federation_server_config(cert_pem: &str, key_pem: &str) -> rustls::ServerConfig {
-    let cert_chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+    let cert_chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(|cert| cert.ok())
         .collect();
-    let private_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .expect("parse private key")
-        .expect("private key");
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("parse private key");
 
     let provider = rustls::crypto::ring::default_provider();
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))

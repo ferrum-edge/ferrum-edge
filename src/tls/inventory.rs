@@ -23,10 +23,11 @@
 //! ([`crate::tls::inventory_cache::TlsInventoryCache::snapshot`]) and performs zero source I/O.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Cursor;
 
 use crate::fips::approved::Sha256;
 use chrono::{DateTime, Utc};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
 use serde::Serialize;
 use serde_json::Value;
 use x509_parser::prelude::*;
@@ -894,7 +895,7 @@ fn populate_certificate_metadata(
     entry: &mut TlsInventoryEntry,
     bytes: &crate::tls::source::SecretBytes,
 ) -> Result<(), String> {
-    let certs = rustls_pemfile::certs(&mut Cursor::new(bytes.expose_secret()))
+    let certs = CertificateDer::pem_slice_iter(bytes.expose_secret())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("failed to parse PEM certificates: {error}"))?;
     if certs.is_empty() {
@@ -923,7 +924,7 @@ fn populate_certificate_metadata(
 }
 
 fn validate_private_key(bytes: &crate::tls::source::SecretBytes) -> Result<(), String> {
-    rustls_pemfile::private_key(&mut Cursor::new(bytes.expose_secret()))
+    crate::tls::first_pem_private_key(bytes.expose_secret())
         .map_err(|error| format!("failed to parse PEM private key: {error}"))?
         .ok_or_else(|| "no PEM private key found".to_string())
         .map(|_| ())
@@ -940,7 +941,7 @@ fn populate_crl_metadata(
     entry: &mut TlsInventoryEntry,
     bytes: &crate::tls::source::SecretBytes,
 ) -> Result<(), String> {
-    let crls = rustls_pemfile::crls(&mut Cursor::new(bytes.expose_secret()))
+    let crls = CertificateRevocationListDer::pem_slice_iter(bytes.expose_secret())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("failed to parse PEM CRLs: {error}"))?;
     if crls.is_empty() {

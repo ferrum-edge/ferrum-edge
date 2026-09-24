@@ -2,15 +2,15 @@
 //! owns its registry so capacity pressure cannot retire another test's staples.
 
 use super::*;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ResolvesServerCert;
-use std::io::Cursor;
 
 fn resolver() -> Arc<AcmeTlsAlpnResolver> {
-    let certs = rustls_pemfile::certs(&mut Cursor::new(include_bytes!("../../certs/server.crt")))
+    let certs = CertificateDer::pem_slice_iter(include_bytes!("../../certs/server.crt"))
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let mut key_pem = Cursor::new(include_bytes!("../../certs/server.key"));
-    let key = rustls_pemfile::private_key(&mut key_pem).unwrap().unwrap();
+    let key = PrivateKeyDer::from_pem_slice(include_bytes!("../../certs/server.key")).unwrap();
     let key = rustls::crypto::ring::default_provider()
         .key_provider
         .load_private_key(key)

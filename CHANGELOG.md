@@ -158,6 +158,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RUSTSEC-2026-0286: `Session::get_attributes` could build an out-of-bounds slice when
   decoding `CKA_ALLOWED_MECHANISMS` (crash or adjacent heap disclosure). Lockfile-only
   change; the manifest's `0.12` requirement already admits the patch release.
+- Re-evaluate the time-boxed `deny.toml` advisory exceptions before their
+  2026-09-30 expiry (#5721). `mongodb` now requires 3.7 or later, the first
+  release on hickory 0.26, which drops hickory-proto 0.25.2 (RUSTSEC-2026-0118,
+  RUSTSEC-2026-0119). The optional `secrets-aws` build no longer enables
+  `aws-sdk-secretsmanager`'s legacy `rustls` feature, so hyper 0.14, rustls 0.21
+  with rustls-webpki 0.101.7 (RUSTSEC-2026-0098, -0099, -0104) and h2 0.3.27
+  (RUSTSEC-2026-0258) leave the tree. The client already used the SDK's
+  hyper 1.x HTTPS client. PEM parsing moves from the unmaintained
+  `rustls-pemfile` (RUSTSEC-2025-0134) to the `rustls-pki-types` PEM API, with the
+  same record handling. Only the wording of the underlying parse error in admin
+  API and TLS inventory messages changes. `rsa` (RUSTSEC-2023-0071) and `paste`
+  (RUSTSEC-2024-0436) still have no upstream fix and are re-affirmed until
+  2026-12-31.
 - **Route response-header policy is now part of the replay key** (PR #5709).
   `response_caching`, `request_deduplication`, and `ai_semantic_cache` replay a
   response whose headers were finalized when it was stored, so they skip the

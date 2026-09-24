@@ -26,6 +26,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -189,12 +191,11 @@ fn frontend_tls_pair() -> (Arc<rustls::ServerConfig>, String) {
         .signed_by(&leaf_key, &issuer)
         .expect("sign admission test leaf");
 
-    let certs = rustls_pemfile::certs(&mut leaf_cert.pem().as_bytes())
+    let certs = CertificateDer::pem_slice_iter(leaf_cert.pem().as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse admission test leaf certificate");
-    let key = rustls_pemfile::private_key(&mut leaf_key.serialize_pem().as_bytes())
-        .expect("parse admission test leaf key")
-        .expect("admission test leaf key present");
+    let key = PrivateKeyDer::from_pem_slice(leaf_key.serialize_pem().as_bytes())
+        .expect("parse admission test leaf key");
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
@@ -214,7 +215,7 @@ async fn tls_connect(
     alpn: &[u8],
 ) -> tokio_rustls::client::TlsStream<TcpStream> {
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
         let cert = cert.expect("parse admission test CA certificate");
         roots.add(cert).expect("add admission test CA to roots");
     }

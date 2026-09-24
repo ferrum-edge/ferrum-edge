@@ -24,6 +24,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -266,13 +268,10 @@ async fn start_h2_tls_header_echo_backend(
     let cert_pem = include_str!("../certs/server.crt");
     let key_pem = include_str!("../certs/server.key");
 
-    let mut cert_reader = cert_pem.as_bytes();
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(|cert| cert.ok())
         .collect();
-    let mut key_reader = key_pem.as_bytes();
-    let private_key =
-        rustls_pemfile::private_key(&mut key_reader)?.ok_or("missing private key in test cert")?;
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
 
     let provider = rustls::crypto::ring::default_provider();
     let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))

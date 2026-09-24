@@ -9,6 +9,8 @@ use ferrum_edge::tls::{
     check_cert_expiry, check_cert_expiry_for_validation, load_crls,
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
 use std::sync::Once;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -533,7 +535,7 @@ fn test_build_server_verifier_empty_crls_with_roots() {
     ensure_crypto_provider();
     // Need at least one root cert for WebPki verifier to succeed
     let (cert_pem, _) = generate_self_signed_cert(&["localhost"]);
-    let der_certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+    let der_certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(|r| r.ok())
         .collect();
     let mut root_store = rustls::RootCertStore::empty();
@@ -916,8 +918,6 @@ fn test_enable_early_data_zero_is_noop() {
 fn test_no_verifier_accepts_any_cert() {
     use rustls::client::danger::ServerCertVerifier;
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls_pemfile::certs;
-    use std::io::BufReader;
 
     ensure_crypto_provider();
 
@@ -925,9 +925,9 @@ fn test_no_verifier_accepts_any_cert() {
 
     // Create a dummy certificate (self-signed, doesn't matter — verifier should accept anything)
     let (cert_pem, _) = generate_self_signed_cert(&["example.com"]);
-    let mut reader = BufReader::new(cert_pem.as_bytes());
-    let cert_der: Vec<CertificateDer<'static>> =
-        certs(&mut reader).filter_map(|r| r.ok()).collect();
+    let cert_der: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .filter_map(|r| r.ok())
+        .collect();
     assert!(!cert_der.is_empty(), "Should parse at least one cert");
 
     let server_name = ServerName::try_from("example.com").unwrap();
@@ -1027,7 +1027,7 @@ fn test_build_client_cert_verifier_with_crls_succeeds() {
     };
     let crl_pem = params.signed_by(&ca_issuer).unwrap().pem().unwrap();
     let crl_der: Vec<rustls::pki_types::CertificateRevocationListDer<'static>> =
-        rustls_pemfile::crls(&mut crl_pem.as_bytes())
+        CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
             .filter_map(|r| r.ok())
             .collect();
     assert!(
@@ -1081,7 +1081,7 @@ fn test_h3_client_verifier_rejects_revoked_cert() {
     let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer).unwrap();
     let leaf_der: CertificateDer<'static> = {
         let pem = leaf_cert.pem();
-        let parsed: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut pem.as_bytes())
+        let parsed: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
             .filter_map(|r| r.ok())
             .collect();
         parsed.into_iter().next().expect("leaf DER")
@@ -1104,7 +1104,7 @@ fn test_h3_client_verifier_rejects_revoked_cert() {
     };
     let crl_pem = crl_params.signed_by(&ca_issuer).unwrap().pem().unwrap();
     let crl_der: Vec<rustls::pki_types::CertificateRevocationListDer<'static>> =
-        rustls_pemfile::crls(&mut crl_pem.as_bytes())
+        CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
             .filter_map(|r| r.ok())
             .collect();
     assert!(!crl_der.is_empty(), "should parse CRL from PEM");

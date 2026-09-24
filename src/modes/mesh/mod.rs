@@ -21707,6 +21707,8 @@ mod tests {
         ServiceEntry, ServiceEntryLocation, ServicePort, ServiceTargetPort, TracingProvider,
         Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
     };
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
 
@@ -21752,11 +21754,11 @@ mod tests {
             let key_path = env.gateway_svid_key_path.as_deref()?;
             let cert_pem = std::fs::read(cert_path).ok()?;
             let key_pem = std::fs::read(key_path).ok()?;
-            let cert_chain_der: Vec<Vec<u8>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+            let cert_chain_der: Vec<Vec<u8>> = CertificateDer::pem_slice_iter(&cert_pem)
                 .filter_map(|c| c.ok())
                 .map(|c| c.as_ref().to_vec())
                 .collect();
-            let key = rustls_pemfile::private_key(&mut key_pem.as_slice()).ok()??;
+            let key = PrivateKeyDer::from_pem_slice(&key_pem).ok()?;
             let trust_domain = crate::identity::spiffe::TrustDomain::new("cluster.local").unwrap();
             Some(crate::identity::SvidBundle {
                 spiffe_id: SpiffeId::from_parts(&trust_domain, "ns/test/sa/test").unwrap(),
