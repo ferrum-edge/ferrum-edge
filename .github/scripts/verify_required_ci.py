@@ -109,6 +109,7 @@ REQUIRED_JOBS = {
     "netns-capture-live",
     "two-cluster-mesh-live",
     "build-binaries",
+    "standalone-cargo",
 }
 
 # Every compile-based job is now path-gated by the PR planner: a job runs on
@@ -141,6 +142,7 @@ PATH_GATED_JOBS = {
     "build-binaries": "run_platform_build",
     "test-vendor-patches": "run_vendor_patches",
     "dependency-audit": "run_dependency_audit",
+    "standalone-cargo": "run_standalone_cargo",
 }
 
 # Every path-gated job keeps this exact event set: PRs, merge-queue checks,

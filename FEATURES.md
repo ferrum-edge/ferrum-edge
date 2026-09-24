@@ -499,7 +499,7 @@ cargo build --release --features secrets-vault,secrets-aws
 
 ### Timeouts and Resilience
 
-Every backend fetch is wrapped in the same per-fetch timeout envelope — the cloud backends (Vault, AWS, GCP, Azure) **and** local `_FILE` sources, so a blocked mount or FIFO cannot hang startup either. The bound is `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` (default 30 seconds); if a source is unreachable or slow, the gateway fails startup with a clear timeout error rather than hanging indefinitely. A non-regular `_FILE` source (FIFO, socket, device, or directory) is refused before any read, so it fails immediately instead of after the timeout. See [docs/configuration.md](docs/configuration.md) for the knob.
+Every backend fetch is wrapped in the same per-fetch timeout envelope — the cloud backends (Vault, AWS, GCP, Azure) **and** local `_FILE` sources, so a blocked mount or FIFO cannot hang startup either. The bound is `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` (default 30 seconds, accepted range 1–600; a malformed or zero value fails startup rather than timing every fetch out or falling back to the default); if a source is unreachable or slow, the gateway fails startup with a clear timeout error rather than hanging indefinitely. A non-regular `_FILE` source (FIFO, socket, device, or directory) is refused before any read, so it fails immediately instead of after the timeout. See [docs/configuration.md](docs/configuration.md) for the knob.
 
 ## Deployment
 

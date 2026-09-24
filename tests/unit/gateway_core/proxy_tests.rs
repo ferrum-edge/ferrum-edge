@@ -959,6 +959,15 @@ struct ExternalIdentityAuth;
 
 const BASIC_AUTH_TEST_SECRET: &str = "test-hmac-secret-for-basic-auth-unit-tests";
 
+/// `basic_auth` built with an explicit HMAC secret. Publishing the secret into
+/// the process environment raced env-isolated tests in this binary, which
+/// clear every `FERRUM_*` variable while they hold `ENV_LOCK` (issue #5705).
+fn basic_auth_plugin() -> BasicAuth {
+    let config = json!({});
+    ferrum_edge::_test_support::basic_auth_with_secret_for_test(&config, BASIC_AUTH_TEST_SECRET)
+        .expect("basic_auth builds with the explicit test secret")
+}
+
 fn basic_auth_dispatch_consumer() -> Consumer {
     use hmac::{KeyInit, Mac};
 
@@ -1645,10 +1654,7 @@ async fn test_single_auth_missing_credentials_rejects_before_backend() {
 
 #[tokio::test]
 async fn test_single_basic_auth_missing_credentials_uses_basic_challenge() {
-    unsafe {
-        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
-    }
-    let basic_auth: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let basic_auth: Arc<dyn Plugin> = Arc::new(basic_auth_plugin());
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -1673,11 +1679,8 @@ async fn test_single_basic_auth_missing_credentials_uses_basic_challenge() {
 
 #[tokio::test]
 async fn test_multi_auth_missing_credentials_uses_first_available_challenge() {
-    unsafe {
-        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
-    }
     let jwt: Arc<dyn Plugin> = Arc::new(JwtAuth::new(&json!({})).unwrap());
-    let basic: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let basic: Arc<dyn Plugin> = Arc::new(basic_auth_plugin());
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -1704,11 +1707,8 @@ async fn test_multi_auth_missing_credentials_uses_first_available_challenge() {
 async fn test_single_auth_valid_basic_skips_earlier_jwt_scheme() {
     use base64::Engine;
 
-    unsafe {
-        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
-    }
     let jwt: Arc<dyn Plugin> = Arc::new(JwtAuth::new(&json!({})).unwrap());
-    let basic: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let basic: Arc<dyn Plugin> = Arc::new(basic_auth_plugin());
     let auth_plugins = vec![jwt, basic];
     let consumer_index = ConsumerIndex::new(&[basic_auth_dispatch_consumer()]);
     let encoded = base64::engine::general_purpose::STANDARD.encode("alice:password");

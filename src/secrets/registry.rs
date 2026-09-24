@@ -18,6 +18,7 @@ use super::gcp;
 #[cfg(feature = "secrets-vault")]
 use super::vault;
 use super::{env, file};
+use crate::config::env_config::{SECRET_FETCH_TIMEOUT_SECONDS_KEY, parse_secret_fetch_timeout};
 
 /// Only scan environment variables with this prefix.
 const FERRUM_PREFIX: &str = "FERRUM_";
@@ -165,16 +166,19 @@ fn source_reference_candidates(reference: &str) -> Vec<String> {
     candidates
 }
 
-/// Default timeout (seconds) for individual secret fetch operations from cloud backends.
-const DEFAULT_SECRET_FETCH_TIMEOUT_SECS: u64 = 30;
-
 /// Read the secret fetch timeout for the *runtime* single-key paths
 /// ([`resolve_secret`], [`resolve_external_reference`]), which run long after
 /// settings are loaded and where the conf file is a legitimate source.
-fn secret_fetch_timeout() -> Duration {
-    parse_fetch_timeout(crate::config::conf_file::resolve_ferrum_var(
-        "FERRUM_SECRET_FETCH_TIMEOUT_SECONDS",
-    ))
+///
+/// A configured value that is malformed, zero, or above the documented maximum
+/// is an error, never a silent fallback to the default: see
+/// [`parse_secret_fetch_timeout`]. `EnvConfig` validates the same
+/// conf-file-aware value at startup, so this only fails here if the settings
+/// changed underneath a running process.
+fn secret_fetch_timeout() -> Result<Duration, String> {
+    parse_secret_fetch_timeout(
+        crate::config::conf_file::resolve_ferrum_var(SECRET_FETCH_TIMEOUT_SECONDS_KEY).as_deref(),
+    )
 }
 
 /// Read the secret fetch timeout for startup resolution, from the process
@@ -196,15 +200,14 @@ fn secret_fetch_timeout() -> Duration {
 /// set `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` in the environment. A `ferrum.conf`
 /// value still applies to the runtime single-key fetches above. See
 /// `docs/configuration.md`.
-fn startup_secret_fetch_timeout() -> Duration {
-    parse_fetch_timeout(std::env::var("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS").ok())
-}
-
-fn parse_fetch_timeout(raw: Option<String>) -> Duration {
-    let secs = raw
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_SECRET_FETCH_TIMEOUT_SECS);
-    Duration::from_secs(secs)
+///
+/// The value is validated by the same [`parse_secret_fetch_timeout`] rule as
+/// the runtime path. Bytes that are not valid Unicode are not a whole number of
+/// seconds either, so they are reported by that rule without being echoed.
+fn startup_secret_fetch_timeout() -> Result<Duration, String> {
+    let raw = std::env::var_os(SECRET_FETCH_TIMEOUT_SECONDS_KEY)
+        .map(|value| value.to_string_lossy().into_owned());
+    parse_secret_fetch_timeout(raw.as_deref())
 }
 
 /// A successfully resolved secret value with its source for logging.
@@ -795,7 +798,7 @@ async fn resolve_env_secrets(keys: Option<&[&str]>) -> Result<ResolvedEnvSecrets
         ));
     }
 
-    let fetch_timeout = startup_secret_fetch_timeout();
+    let fetch_timeout = startup_secret_fetch_timeout()?;
 
     let mut results = ResolvedEnvSecrets {
         vars: Vec::new(),
@@ -887,9 +890,10 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
         return Ok(None);
     };
 
-    let value = tokio::time::timeout(secret_fetch_timeout(), backend.resolve_one(&reference, key))
+    let fetch_timeout = secret_fetch_timeout()?;
+    let value = tokio::time::timeout(fetch_timeout, backend.resolve_one(&reference, key))
         .await
-        .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))?
+        .map_err(|_| timeout_error(key, backend.display_name(), fetch_timeout))?
         .map_err(|error| redact_source_reference(error, &reference, key))?;
 
     if backend.log_loaded() {
@@ -930,16 +934,17 @@ pub async fn resolve_external_reference(
         return Err(format!("Unsupported secret provider scheme '{}'", provider));
     };
 
+    let fetch_timeout = secret_fetch_timeout()?;
+
     // Azure reports the version actually returned by Key Vault. Take the
     // richer fetch path so TLS inventory / materialization can stamp that
     // version rather than a configured query label that was never sent.
     #[cfg(feature = "secrets-azure")]
     if provider == "azure" {
-        let secret =
-            tokio::time::timeout(secret_fetch_timeout(), azure::fetch_secret(reference, key))
-                .await
-                .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))?
-                .map_err(|error| redact_source_reference(error, reference, key))?;
+        let secret = tokio::time::timeout(fetch_timeout, azure::fetch_secret(reference, key))
+            .await
+            .map_err(|_| timeout_error(key, backend.display_name(), fetch_timeout))?
+            .map_err(|error| redact_source_reference(error, reference, key))?;
 
         if backend.log_loaded() {
             info!("Loaded {} from {}", key, backend.display_name());
@@ -952,9 +957,9 @@ pub async fn resolve_external_reference(
         });
     }
 
-    let value = tokio::time::timeout(secret_fetch_timeout(), backend.resolve_one(reference, key))
+    let value = tokio::time::timeout(fetch_timeout, backend.resolve_one(reference, key))
         .await
-        .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))?
+        .map_err(|_| timeout_error(key, backend.display_name(), fetch_timeout))?
         .map_err(|error| redact_source_reference(error, reference, key))?;
 
     if backend.log_loaded() {

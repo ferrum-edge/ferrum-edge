@@ -249,8 +249,10 @@ async fn test_all_plugins_available() {
 
 #[tokio::test]
 async fn test_plugin_creation_all_plugins() {
+    // ENV_LOCK first: `PluginCache` builds take the registry serializer while
+    // env-guarded tests hold ENV_LOCK, so ENV_LOCK is always the outer lock.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     let _registry = super::plugin_utils::log_schema_registry_guard();
-    super::plugin_utils::ensure_basic_auth_test_secret();
     for plugin_name in available_plugins() {
         // Some plugins now require specific config fields
         let config = match plugin_name {
@@ -532,7 +534,7 @@ async fn test_plugin_error_handling() {
 
 #[tokio::test]
 async fn test_plugin_configuration_validation() {
-    super::plugin_utils::ensure_basic_auth_test_secret();
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     // Test that plugins handle missing config gracefully
     let empty_config = json!({});
 
@@ -1782,6 +1784,170 @@ async fn response_cache_misses_after_route_response_header_policy_changes() {
         );
     }
     assert!(!finalized_response_replay_for_test(&updated_ctx));
+}
+
+fn route_override_replay_plugins() -> Vec<Arc<dyn Plugin>> {
+    let caching = create_plugin(
+        "response_caching",
+        &json!({
+            "ttl_seconds": 60,
+            "add_cache_status_header": true,
+            "cache_key_include_consumer": true,
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    vec![caching]
+}
+
+/// Store a cacheable `200` through the full buffered lifecycle under `ctx`'s
+/// route overrides.
+async fn store_route_override_entry(plugins: &[Arc<dyn Plugin>], ctx: &mut RequestContext) {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    headers.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    let (status, _, _) =
+        run_buffered_response_lifecycle(plugins, ctx, 200, headers, b"cached".to_vec()).await;
+    assert_eq!(status, 200);
+}
+
+/// Run the `before_proxy` chain and report whether a retained entry answered.
+async fn route_override_replay_hit(plugins: &[Arc<dyn Plugin>], ctx: &mut RequestContext) -> bool {
+    let mut proxy_headers = ctx.headers.clone();
+    for plugin in plugins {
+        match plugin.before_proxy(ctx, &mut proxy_headers).await {
+            PluginResult::Continue => {}
+            PluginResult::Reject { .. } | PluginResult::RejectBinary { .. } => return true,
+        }
+    }
+    false
+}
+
+/// #5710: two dispatch rules can send one request target to the same backend
+/// host and port under different backend TLS (a per-tenant client certificate,
+/// or one rule that verifies the origin and one that does not). A replay stored
+/// under one rule's TLS identity must not answer a request routed under another.
+#[tokio::test]
+async fn response_cache_misses_when_route_override_backend_tls_differs() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    use ferrum_edge::_test_support::finalized_response_replay_for_test;
+    use ferrum_edge::config::types::BackendTlsConfig;
+
+    let plugins = route_override_replay_plugins();
+    let tls_a = BackendTlsConfig {
+        client_cert_path: Some("/certs/tenant-a.crt".to_string()),
+        client_key_path: Some("/certs/tenant-a.key".to_string()),
+        server_ca_cert_path: Some("/certs/origin-ca.pem".to_string()),
+        sni: Some("origin.internal".to_string()),
+        ..BackendTlsConfig::default_verify()
+    };
+    let path = "/route-override-backend-tls";
+
+    let mut store_ctx = create_response_context(path);
+    store_ctx.route_override_resolved_tls = Some(tls_a.clone());
+    store_route_override_entry(&plugins, &mut store_ctx).await;
+
+    // Control: the unchanged TLS identity still addresses the stored entry, so
+    // each miss below is caused by the TLS difference rather than a failed store.
+    let mut hit_ctx = create_response_context(path);
+    hit_ctx.route_override_resolved_tls = Some(tls_a.clone());
+    assert!(
+        route_override_replay_hit(&plugins, &mut hit_ctx).await,
+        "the unchanged backend TLS override must replay the stored representation"
+    );
+    assert!(finalized_response_replay_for_test(&hit_ctx));
+
+    let variants = [
+        (
+            "different client certificate",
+            Some(BackendTlsConfig {
+                client_cert_path: Some("/certs/tenant-b.crt".to_string()),
+                client_key_path: Some("/certs/tenant-b.key".to_string()),
+                ..tls_a.clone()
+            }),
+        ),
+        (
+            "server verification disabled",
+            Some(BackendTlsConfig {
+                verify_server_cert: false,
+                ..tls_a.clone()
+            }),
+        ),
+        (
+            "different CA bundle",
+            Some(BackendTlsConfig {
+                server_ca_cert_path: Some("/certs/other-ca.pem".to_string()),
+                ..tls_a.clone()
+            }),
+        ),
+        (
+            "different SNI",
+            Some(BackendTlsConfig {
+                sni: Some("other.internal".to_string()),
+                ..tls_a.clone()
+            }),
+        ),
+        (
+            "different SAN allow-list",
+            Some(BackendTlsConfig {
+                san_allow_list: vec!["spiffe://cluster.local/ns/a/sa/b".to_string()],
+                ..tls_a.clone()
+            }),
+        ),
+        ("no TLS override", None),
+    ];
+    for (label, tls) in variants {
+        let mut miss_ctx = create_response_context(path);
+        miss_ctx.route_override_resolved_tls = tls;
+        assert!(
+            !route_override_replay_hit(&plugins, &mut miss_ctx).await,
+            "the retained representation must miss under a {label}"
+        );
+        assert!(!finalized_response_replay_for_test(&miss_ctx));
+    }
+}
+
+/// #5710: `ClearInherited` DNS intent makes a same-host direct override dial a
+/// freshly resolved address instead of the proxy's pinned one, so an entry
+/// stored under one DNS policy must not answer a request routed under the other.
+#[tokio::test]
+async fn response_cache_misses_when_route_override_dns_policy_differs() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    use ferrum_edge::_test_support::{
+        finalized_response_replay_for_test, set_route_override_dns_policy_clear_inherited_for_test,
+    };
+
+    let plugins = route_override_replay_plugins();
+    let path = "/route-override-dns-policy";
+    let direct_override = |ctx: &mut RequestContext| {
+        ctx.route_override_backend_host = Some("api.example.com".to_string());
+        ctx.route_override_backend_port = Some(443);
+    };
+
+    let mut store_ctx = create_response_context(path);
+    direct_override(&mut store_ctx);
+    store_route_override_entry(&plugins, &mut store_ctx).await;
+
+    // Control: the unchanged DNS policy still addresses the stored entry.
+    let mut hit_ctx = create_response_context(path);
+    direct_override(&mut hit_ctx);
+    assert!(
+        route_override_replay_hit(&plugins, &mut hit_ctx).await,
+        "the unchanged route override DNS policy must replay the stored representation"
+    );
+    assert!(finalized_response_replay_for_test(&hit_ctx));
+
+    let mut miss_ctx = create_response_context(path);
+    direct_override(&mut miss_ctx);
+    set_route_override_dns_policy_clear_inherited_for_test(&mut miss_ctx);
+    assert!(
+        !route_override_replay_hit(&plugins, &mut miss_ctx).await,
+        "the retained representation must miss after the route override DNS policy changes"
+    );
+    assert!(!finalized_response_replay_for_test(&miss_ctx));
 }
 
 /// #2381: REVALIDATED keeps validators-only headers and skips representation

@@ -8169,3 +8169,43 @@ fn test_env_config_shutdown_predrain_seconds_rejects_values_above_the_maximum() 
         );
     }
 }
+
+/// Issue #5706: a process that has not opted into the gateway binary's
+/// working-directory default — every Rust test harness, which Cargo runs from
+/// the repository root — must not resolve the managed-TLS store (and the TLS
+/// event log beside it) into the checkout. An explicit path still wins.
+#[test]
+fn test_unconfigured_tls_managed_store_path_is_private_to_the_process() {
+    use ferrum_edge::config::env_config::{
+        DEFAULT_TLS_MANAGED_STORE_PATH, tls_managed_store_path_from_env,
+    };
+
+    for configured in [None, Some("")] {
+        let vars: Vec<(&str, &str)> = configured
+            .map(|value| ("FERRUM_TLS_MANAGED_STORE_PATH", value))
+            .into_iter()
+            .collect();
+        with_env_vars(&vars, || {
+            let resolved = tls_managed_store_path_from_env();
+            assert_ne!(resolved, DEFAULT_TLS_MANAGED_STORE_PATH);
+            assert_eq!(
+                resolved,
+                tls_managed_store_path_from_env(),
+                "the private default must be stable for the life of the process"
+            );
+            let resolved = std::path::Path::new(&resolved);
+            assert!(resolved.is_absolute(), "{}", resolved.display());
+            assert!(
+                !resolved.starts_with(env!("CARGO_MANIFEST_DIR")),
+                "the private default must stay outside the checkout: {}",
+                resolved.display()
+            );
+        });
+    }
+
+    const EXPLICIT: &str = "/srv/ferrum/managed-tls";
+    let explicit = [("FERRUM_TLS_MANAGED_STORE_PATH", EXPLICIT)];
+    with_env_vars(&explicit, || {
+        assert_eq!(tls_managed_store_path_from_env(), EXPLICIT);
+    });
+}

@@ -4,6 +4,7 @@ mod aws_tests;
 mod azure_tests;
 mod credential_file_tests;
 mod env_tests;
+mod fetch_timeout_tests;
 mod file_tests;
 #[cfg(feature = "secrets-gcp")]
 mod gcp_tests;

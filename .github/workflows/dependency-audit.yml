@@ -71,6 +71,31 @@ jobs:
           cargo deny --manifest-path ebpf/Cargo.toml
           check --allow advisory-not-detected --config deny.toml advisories bans sources licenses
 
+      - name: cargo-deny advisories (standalone Cargo workspaces)
+        # Every standalone Cargo workspace (fuzz/, tests/performance/**, and any
+        # crate added later) carries its own Cargo.lock that the root and eBPF
+        # steps cannot see (issues #5704, #5708). The manifest inventory is the
+        # same script the per-PR ci.yml gate uses. Advisories only: these
+        # harnesses never ship. `always()` so an earlier failure can't hide it.
+        if: always()
+        run: |
+          set -euo pipefail
+          inventory="$RUNNER_TEMP/standalone-cargo-manifests.txt"
+          python3 .github/scripts/standalone_cargo_manifests.py --self-test
+          python3 .github/scripts/standalone_cargo_manifests.py > "$inventory"
+          mapfile -t manifests < "$inventory"
+          failed=0
+          for manifest in "${manifests[@]}"; do
+            echo "::group::cargo deny advisories ${manifest}"
+            if ! cargo deny --manifest-path "$manifest" \
+              check --allow advisory-not-detected --config deny.toml advisories; then
+              echo "::error file=${manifest}::cargo-deny advisories failed for ${manifest}"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+
       - name: Advisory-exception expiry self-test
         # Proves the checker still rejects a missing/expired [expires:] token —
         # for [advisories.ignore] AND [licenses.exceptions] — against synthetic
@@ -103,9 +128,16 @@ jobs:
       - name: cargo-audit (second opinion)
         # Belt-and-suspenders: cargo-audit's advisory matching occasionally
         # differs from cargo-deny's. Informational — the blocking signal is the
-        # cargo-deny step above.
+        # cargo-deny step above. Covers every committed standalone lockfile too.
         if: always()
-        run: cargo audit || true
+        run: |
+          cargo audit || true
+          while IFS= read -r manifest; do
+            lockfile="$(dirname "$manifest")/Cargo.lock"
+            echo "::group::cargo audit ${lockfile}"
+            cargo audit --file "$lockfile" || true
+            echo "::endgroup::"
+          done < <(python3 .github/scripts/standalone_cargo_manifests.py)
 
   upstream-patch-status:
     name: Vendored patch upstream status
