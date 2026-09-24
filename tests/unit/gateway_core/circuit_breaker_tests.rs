@@ -648,6 +648,41 @@ fn test_per_target_does_not_share_with_direct_backend() {
 }
 
 #[test]
+fn test_interleaved_lookups_resolve_distinct_keys() {
+    // Hit-path lookups reuse a thread-local key buffer; interleaving
+    // namespaces, proxies, and target/no-target keys on one thread must still
+    // resolve each key to its own breaker, and `peek` must agree.
+    let cache = CircuitBreakerCache::new();
+    let config = default_config();
+    let tk = target_key("10.0.0.1", 8080);
+    let keys: [(&str, &str, Option<&str>); 4] = [
+        ("ferrum", "proxy-1", Some(tk.as_str())),
+        ("tenant-b", "proxy-1", Some(tk.as_str())),
+        ("ferrum", "proxy-1", None),
+        ("ferrum", "proxy-12", Some(tk.as_str())),
+    ];
+    let created: Vec<_> = keys
+        .iter()
+        .map(|(ns, id, target)| cache.get_or_create(ns, id, *target, &config))
+        .collect();
+    for (i, a) in created.iter().enumerate() {
+        for b in &created[i + 1..] {
+            assert!(!Arc::ptr_eq(a, b));
+        }
+    }
+    for _ in 0..2 {
+        for ((ns, id, target), cb) in keys.iter().zip(&created) {
+            assert!(Arc::ptr_eq(
+                &cache.get_or_create(ns, id, *target, &config),
+                cb
+            ));
+            assert!(Arc::ptr_eq(&cache.peek(ns, id, *target).unwrap(), cb));
+        }
+    }
+    assert!(cache.peek("ferrum", "proxy-2", None).is_none());
+}
+
+#[test]
 fn test_per_target_same_instance_reuse() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();
