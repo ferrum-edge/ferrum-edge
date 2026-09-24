@@ -1162,9 +1162,10 @@ cargo nextest run --archive-file integration-tests-*.tar.zst \
   --no-fail-fast \
   <shard filters>
 
-# build-test-artifacts (one job/cache for both archives and both binaries)
-cargo build --bin ferrum-edge
-cargo build --bin ferrum-cni
+# build-test-artifacts (one job/cache for both archives and both binaries).
+# The test build also produces target/debug/ferrum-edge and ferrum-cni;
+# see "Test artifact producer: one test-feature build".
+cargo test --no-run --test integration_tests --test functional_tests
 cargo nextest archive --test integration_tests ...
 cargo nextest archive --test functional_tests ...
 
@@ -1302,9 +1303,10 @@ stripped of newlines and backticks before they are written.
   declared shard filters in `ci.yml`. Adding a new `mod foo_tests` without
   wiring it into a shard fails this silent-skip guard.
 - Functional tests split across four shards (`application`, `protocols`,
-  `data-plane`, `data-plane-runtime`). `build-test-artifacts` compiles the gateway, CNI binary, and
-  both nextest archives in one job/cache; each functional shard downloads the
-  existing OS/architecture-keyed artifacts with
+  `data-plane`, `data-plane-runtime`). `build-test-artifacts` compiles both
+  test targets in one Cargo invocation, which also builds the gateway and CNI
+  binaries, then packages both nextest archives in the same job/cache. Each
+  functional shard downloads the existing OS/architecture-keyed artifacts with
   `FERRUM_SKIP_GATEWAY_BUILD=1`. The two data-plane shards (`data_services:
   true`) remain serialized with `nextest_jobs: 1` and are the only shards that
   start the Redis/MongoDB/PostgreSQL/MySQL containers; each runner owns its own
@@ -3431,6 +3433,72 @@ The expected saving is dependency reuse in the second binary build, not removal
 of tests. Dev-dependency feature unification can still require recompilation
 when the archive build starts. Repository-wide cache capacity is tracked in
 [#4643](https://github.com/ferrum-edge/ferrum-edge/issues/4643).
+
+### Test artifact producer: one test-feature build
+
+`Build Test Artifacts` gates every integration shard, functional shard, the
+Redis regression, and Helm Chart. It now runs one
+`cargo test --no-run --test integration_tests --test functional_tests`, then
+packages each nextest archive from the already-fresh units.
+
+Removing the separate `cargo build --bin ferrum-edge` / `--bin ferrum-cni` steps
+does not change the binaries that ship to consumers:
+
+- **Two feature sets.** Dev-dependencies change the resolved features of
+  `tokio` (`test-util`), `rustls` / `rustls-webpki` (`aws-lc-rs`,
+  `prefer-post-quantum`), `time`, `rand`, `rcgen`, `num`, `serde_with`, and
+  `deranged`. Compare `cargo tree -e normal,build` with
+  `cargo tree -e normal,build,dev`. A bin-only build therefore compiled about
+  100 dependencies and the whole `ferrum-edge` library in a second feature
+  set. The `ci-debug` lane holds only the test-feature set, because Unit Tests
+  produces it.
+- **Test build wins.** Integration tests need `CARGO_BIN_EXE_*`, so Cargo also
+  builds every package bin in the test-feature set and uplifts it to
+  `target/debug/`. The archive step ran after the bin-only step and
+  overwrote `target/debug/ferrum-edge` and `target/debug/ferrum-cni`. The
+  uploaded binaries were already test-feature builds; the bin-only build was
+  discarded work.
+- **Concurrent test crates.** One Cargo invocation compiles the two test
+  crates concurrently once the shared library is done, instead of in two
+  sequential archive builds.
+
+"Before" is the median of 160 full-mode PR runs from 2026-09-18 to 2026-09-24.
+"After" is PR run
+[35974584845](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35974584845),
+the first run of this change. Milestones are minutes from run creation.
+
+| Step or milestone | Before | After |
+|---|---:|---:|
+| `setup-rust-ci` (`ci-debug` restore, full key match) | 50 s | 67 s |
+| Build gateway + ferrum-cni binaries | 405 s | — |
+| Build test targets and binaries | — | 490 s |
+| Build integration tests archive | 413 s | 7 s |
+| Build functional tests archive | 80 s | 4 s |
+| Four artifact uploads | 46 s | 50 s |
+| `Build Test Artifacts` job | 16.7 min | 10.5 min |
+| `Build Test Artifacts` done | 19.0 | 11.6 |
+| Integration / functional / Redis shards start | 20.2–21.1 | 11.6–11.7 |
+| `Functional Tests (data-plane)` done | 36.0 | 27.7 |
+| `Tests` done | 35.9 | 28.0 |
+
+In the "after" run, no registry dependency recompiled: the `ci-debug` restore
+covers the whole test-feature graph. Only local path packages rebuild: the
+vendored `[patch.crates-io]` crates, `ferrum-ebpf-common`, and `ferrum-edge`.
+rust-cache does not keep local packages, so every producer spends about 18 s
+on the vendored crates before the library starts. Both archive steps find
+every unit fresh and only package it.
+
+**Split producer, evaluated and not adopted.** Building the functional archive
+in its own job would not help the critical path. A local `cargo --timings` run
+of this build (4 cores, `CARGO_BUILD_JOBS=3`) spends 539 s on the `ferrum-edge`
+library. After that, the test crates compile concurrently:
+`functional_tests` takes 169 s and `integration_tests` takes 188 s. A
+functional-only producer would finish at most about 25 s sooner, but each PR
+would pay for a second full library compile on another runner.
+Integration shards are also not on the critical path: they finish in about
+4 minutes, while the slowest functional shard takes about 14. These runs
+predate the `data-plane` / `data-plane-runtime` split, so `data-plane` was
+one 16-minute shard then.
 
 
 ### Ambient registry cache migration (#4643)

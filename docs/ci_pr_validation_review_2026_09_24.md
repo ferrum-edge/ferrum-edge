@@ -265,11 +265,13 @@ This PR's own CI turned `H2 pinned guard regressions`
 
 ## Follow-ups (not in this PR)
 
-- **Faster `Build Test Artifacts`:** the next critical-path lever after the
-  shard split (16.5 min). It builds the gateway, the CNI binary, and both
-  nextest archives in sequence. Splitting the functional archive build from
-  the integration archive, or starting integration shards on a separate
-  producer, would shorten the path further.
+- **Faster `Build Test Artifacts`:** done in #5701. The job built the
+  gateway and CNI binaries in a feature set without dev-dependencies, then
+  rebuilt them in the test feature set for the archives. Now one
+  `cargo test --no-run` over both test targets produces everything: the job
+  dropped from 16.7 to about 10.4 minutes. A separate integration producer was
+  evaluated and not adopted. See `docs/ci_cd.md` → "Test artifact producer:
+  one test-feature build".
 - **Landed on `main` while this PR was open:**
   - #5697: `main`-push trigger for the H2 guard's pinned files.
   - #5698: NodeWaypoint eBPF Live PR relevance narrowed to NodeWaypoint-owned
