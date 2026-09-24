@@ -20863,7 +20863,9 @@ where
     };
     match raw.trim().parse::<T>() {
         Ok(value) if (min..=max).contains(&value) => Ok(value),
-        _ => Err(format!("{key} must be a whole number between {min} and {max}")),
+        _ => Err(format!(
+            "{key} must be a whole number between {min} and {max}"
+        )),
     }
 }
 
