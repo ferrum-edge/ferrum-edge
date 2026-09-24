@@ -27,7 +27,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`Alt-Svc`) on a listener port that serves such a rule. CI now declares
   `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`; `backendRequest`
   bounds an attempt's response-head wait and idle gaps rather than its total
-  duration, a documented deviation. `rules[].retry` is still refused.
+  duration, a documented deviation.
+
+- Gateway API HTTPRoute rule-level `retry` (#5646). The experimental-channel
+  field, present in the pinned v1.5.1 experimental CRD bundle, is validated like
+  that CRD and projected onto the rule's own `mesh_route_dispatch` retry
+  override, the same one the Istio VirtualService translator uses, so sibling
+  and merged rules are never retried. `attempts` counts retries after the
+  initial attempt (`0` disables them), `codes` are the retried statuses, and
+  `backoff` is a fixed minimum wait. Out-of-range `attempts` (negative or above
+  100) and a `backoff` above `5m` are `UnsupportedValue`. A listed status is
+  retried only for `GET`, `HEAD`, `OPTIONS`, `PUT` and `DELETE`. A failure
+  before any byte reached the backend is retried for every method. A response
+  whose head reached the client is never replayed. Every attempt and backoff
+  spends the rule's `timeouts.request` budget. Upstream v1.5.1 has no retry
+  conformance feature, so none is declared. GRPCRoute `retry` stays refused.
+  An empty-match `mesh_route_dispatch` rule carrying only `retry` or
+  `retry_disabled: true` is now accepted as a route-action catch-all.
 
 - Conditional full-replacement writes (#5659). `GET` on proxies, upstreams,
   consumers, and plugin configs returns a strong `ETag`; `PUT`/`DELETE` with a

@@ -23751,6 +23751,10 @@ components:
                     properties: {timeout_disabled: {const: true}}
                   - required: [request_timeout_ms]
                     properties: {request_timeout_ms: {type: integer}}
+                  - required: [retry]
+                    properties: {retry: {type: object}}
+                  - required: [retry_disabled]
+                    properties: {retry_disabled: {const: true}}
               - if:
                   required: [timeout_disabled]
                   properties:
@@ -23779,7 +23783,9 @@ components:
                   `query_params`/`authority`/`source_namespace`/`uri` must be
                   configured, UNLESS the rule carries a route action
                   (`request_transform`, `response_transform`, `fault`,
-                  `rewrite`, or `redirect`), which makes an empty match the
+                  `rewrite`, `redirect`, `timeout_ms`,
+                  `timeout_disabled: true`, `request_timeout_ms`, `retry`, or
+                  `retry_disabled: true`), which makes an empty match the
                   translator's deliberate action-only catch-all. An empty
                   match with no route action is rejected at load time because
                   it would silently shadow every later rule. `ignore_uri_case`
@@ -24121,7 +24127,16 @@ components:
                   - type: "null"
                 description: |
                   Optional route-local retry policy. Mutually exclusive with
-                  `retry_disabled: true`.
+                  `retry_disabled: true`. Request-scoped: it replaces the
+                  selected proxy's retry policy only for requests this rule
+                  matches. Istio `VirtualService.http[].retries` and Gateway
+                  API `HTTPRoute.rules[].retry` are projected here; the Gateway
+                  API translator emits `max_retries` = `attempts` (retries
+                  after the initial attempt), `retryable_status_codes` =
+                  `codes`, a `fixed` backoff of `backoff`, the default
+                  replay-safe `retryable_methods`, and
+                  `retry_on_connect_failure: true`. Backoff and every attempt
+                  stay inside the rule's `request_timeout_ms` budget.
               retry_disabled:
                 type: boolean
                 default: false
