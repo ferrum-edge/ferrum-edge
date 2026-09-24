@@ -4919,7 +4919,7 @@ config:
   cache_ttl_seconds: 0
 ```
 
-**Content-Type handling:** Without an explicit override, the media type (case-insensitive, before any `;` parameters) must be one of `application/json`, `application/openapi+json`, `application/openapi+yaml`, `application/vnd.oai.openapi`, `application/vnd.oai.openapi+json`, `application/yaml`, `application/x-yaml`, `application/wsdl+xml`, `application/vnd.sun.wadl+xml`, `application/xml`, `text/yaml`, `text/xml`, or `text/plain`. Matching values are preserved verbatim, including parameters; all other or missing values become `application/octet-stream`. An explicit `content_type` is operator-trusted and bypasses this upstream allow-list. Every successful response includes `X-Content-Type-Options: nosniff`.
+**Content-Type handling:** Without an explicit override, the media type (case-insensitive, before any `;` parameters) must be one of `application/json`, `application/openapi+json`, `application/openapi+yaml`, `application/vnd.oai.openapi`, `application/vnd.oai.openapi+json`, `application/yaml`, `application/x-yaml`, `application/wsdl+xml`, `application/vnd.sun.wadl+xml`, `application/xml`, `text/yaml`, `text/xml`, or `text/plain`. Matching values are preserved verbatim, including parameters; all other or missing values become `application/octet-stream`. An explicit `content_type` is operator-trusted and bypasses this upstream allow-list. Every successful response includes `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'; sandbox`, so an allowed XML type cannot run XHTML-namespaced script on the gateway origin.
 
 **Error handling and admission:** If the upstream spec URL is unreachable, oversized, unreadable, returns a non-2xx status, or uses an unsupported/malformed `Content-Encoding`, the plugin returns a `502` JSON error with `Retry-After`. One outbound fetch is active per plugin instance, failed completions are negatively cached with exponential backoff from 1 to 30 seconds, and cached failures report the whole seconds remaining in that window. At most 32 cache-miss callers (including the fetcher) are admitted. Excess callers receive `503` with `Retry-After` immediately rather than accumulating behind the fetch. The `spec_url` hostname is pre-warmed via DNS; logs include only its credential-free origin, never the configured path, query, fragment, or URL userinfo.
 
@@ -8729,10 +8729,11 @@ type column says so. Unknown keys are rejected at every level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `match` | Object | `{}` | Predicates, all-of across the fields below. An empty match is rejected **unless** the rule carries a route action (`request_transform`, `response_transform`, `fault`, `rewrite`, `redirect`), which makes it the deliberate action-only catch-all; otherwise it would silently shadow every later rule |
+| `match` | Object | `{}` | Predicates, all-of across the fields below. An empty match is rejected **unless** the rule carries a route action (`request_transform`, `response_transform`, `fault`, `rewrite`, `redirect`, `timeout_ms`, `timeout_disabled: true`, `request_timeout_ms`), which makes it the deliberate action-only catch-all; otherwise it would silently shadow every later rule |
 | `destination` | Object | `{}` | Route override applied on match. At least one field must be set unless the rule carries a `redirect` |
 | `timeout_ms` | u64 \| null | omitted | Route-local backend response/read timeout. `0` means "no timeout". Cannot be combined with `timeout_disabled: true` |
 | `timeout_disabled` | bool | `false` | Clear the selected proxy's inherited backend read timeout for this route (resolves to `0`). Cannot be combined with `timeout_ms` |
+| `request_timeout_ms` | u64 \| null | omitted | Route-local **total** request deadline in milliseconds from request receipt (Gateway API `timeouts.request`). Spans every backend attempt, retry backoff, and the streaming response body; never re-armed by a retry and never promoted onto the proxy. `0` is rejected — omit it for no deadline. See [Route request deadline](#route-request-deadline) |
 | `retry` | Object \| null | omitted | Route-local retry policy (below). Cannot be combined with `retry_disabled: true` |
 | `retry_disabled` | bool | `false` | Clear the selected proxy's inherited retry policy for this route. Cannot be combined with `retry` |
 | `request_transform` | Object[] | `[]` | Route-level request header transforms (below). Requires an eligible consumer — see [Route transforms need a consumer](#route-transforms-need-a-consumer) |
@@ -8855,6 +8856,49 @@ still rejected at admission.
   way to clear a timeout or retry policy the selected proxy carries; leaving the
   field unset inherits it, which is the opposite of the operator's intent for a
   collapsed route.
+
+##### Route request deadline
+
+`timeout_ms` bounds ONE backend attempt: the wait for its response head and the
+idle gap between response frames (a steadily trickling body is not cut by it).
+`request_timeout_ms` is the rule's TOTAL budget. Proxy core arms it once, after
+`before_proxy` has selected the rule, as one absolute instant anchored to request
+receipt, so request-phase time already spent counts against it and a retry can
+never re-arm it. It is request-scoped: it never changes the selected proxy,
+upstream, or pool key, and a request matching another rule (or none) is
+unaffected.
+
+| Request | Expiry before the response head | Expiry while the body streams |
+|---|---|---|
+| HTTP/1.1 / HTTP/2, not gRPC | The in-flight attempt or retry backoff is cancelled, no new attempt starts once the budget is spent, and the client gets `504` `{"error":"Request timeout"}` (`X-Gateway-Error: backend_timeout`). It is never retried. Transaction-log metadata `route_request_timeout` names the phase, which also decides backend-health attribution (see below): `dispatch` — the backend held the cancelled attempt — is error class `read_write_timeout`, charged to that backend; `before_dispatch` (the attempt had not been handed to a backend) and `retry_backoff` are the health-neutral `dispatch_policy_rejected` | The body ends with a timeout error: the HTTP/2 stream is reset and the HTTP/1.1 connection is closed, never a clean end of message. A backend `Content-Length` stays advertised, so the cut reads as a short body. `body_error_class` is `read_write_timeout`, but the cut is **not** charged to the backend (see below) |
+| gRPC / gRPC-Web on any frontend | The budget is folded into the request's RPC deadline (the earlier of it and any client `grpc-timeout` / `grpc_deadline` budget wins), so the existing deadline machinery answers `DEADLINE_EXCEEDED` and forwards the remaining budget as `grpc-timeout` | `DEADLINE_EXCEEDED` trailers before response DATA; a stream reset after it |
+| HTTP/3, not gRPC | Refused with `503` `{"error":"Route request timeout is not supported over HTTP/3"}` before target selection, breaker admission, or any dial: the native HTTP/3 relays write the response from inside the dispatch and cannot yet turn the deadline into a `504` or a mid-body reset, so the request is not served without its policy. The H1/H2 frontends withhold `Alt-Svc` on every frontend port that serves such a rule, so the gateway never steers a client here (see [docs/http3.md](http3.md#route-request-deadline-request_timeout_ms-gateway-api-timeoutsrequest)) | — |
+
+**Backend-health attribution.** The deadline is charged to a backend (circuit
+breaker, passive health / outlier detection, least-latency and adaptive
+concurrency samples) only when that backend held the request. An attempt counts
+as handed to the backend once every gateway- and client-side step is done —
+buffered client-body collection, request-body hooks, DNS, and backend admission
+— and the dial, stream open, or send has begun; it is the same point where the
+attempt's latency sample starts. A retry attempt is handed over from its start,
+because the retry planner has already admitted it and replays the retained,
+already-transformed body. Expiry before that point — a client that stalls its
+upload while the gateway buffers it, for example — is recorded
+`before_dispatch` / `dispatch_policy_rejected` and feeds no failure and no
+latency sample. A streaming (unbuffered) upload is relayed as part of the
+backend exchange, so after the handoff it is attributed like the per-attempt
+header wait (`backend_read_timeout_ms`) already is. A cut **after** the response
+head is never charged: the backend has answered, and the total budget ends a
+long healthy download or a slow-reading client exactly as it ends a slow
+backend, so deferred accounting treats it like an expired client RPC deadline.
+
+Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
+not bounded by `request_timeout_ms`. Gateway-local plugin hooks are not
+cancelled mid-hook on a non-gRPC request: their time counts against the budget,
+which is enforced when each backend attempt starts, while it is awaited, in
+retry backoff, and while the response body streams. A client that stops reading
+a streamed response is not forced off by this deadline until the transport next
+polls the body.
 
 ##### Route transforms need a consumer
 

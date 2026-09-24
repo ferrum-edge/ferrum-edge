@@ -8,6 +8,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [Graceful shutdown and GOAWAY](#graceful-shutdown-and-goaway)
   - [GOAWAY under overload keepalive pressure (issue #4542)](#goaway-under-overload-keepalive-pressure-issue-4542)
 - [Dispatch model](#dispatch-model)
+  - [Route request deadline (`request_timeout_ms`, Gateway API `timeouts.request`)](#route-request-deadline-request_timeout_ms-gateway-api-timeoutsrequest)
 - [Native H3 fast path](#native-h3-fast-path)
 - [Cross-protocol bridge](#cross-protocol-bridge)
   - [Mesh transport dispatch for the H3→gRPC bridge](#mesh-transport-dispatch-for-the-h3grpc-bridge)
@@ -64,6 +65,13 @@ keeps the HTTPS TCP/H1/H2 listener and disables only QUIC/H3 for that port —
 `Alt-Svc` is omitted until a live QUIC task exists again. See
 [gateway_api_conformance.md](gateway_api_conformance.md) (HTTP/3 on Gateway
 listener ports).
+
+`Alt-Svc` is also withheld on every frontend port that serves a route rule with
+a total request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway
+API `timeouts.request`), because the HTTP/3 frontend refuses a non-gRPC request
+under such a rule — see
+[Route request deadline](#route-request-deadline-request_timeout_ms-gateway-api-timeoutsrequest)
+below.
 
 ## Graceful shutdown and GOAWAY
 
@@ -159,6 +167,22 @@ The original wire `HttpFlavor` is computed once per request by `detect_http_flav
 The strict gRPC-Web media-type classifier recognizes only `application/grpc-web` and `application/grpc-web-text`, with an optional `+subtype` and optional media-type parameters. The shared wire classifier deliberately leaves those requests `Plain` so the `grpc_web` plugin retains ownership of binary/text request-body translation. The H3 frontend immediately promotes a recognized gRPC-Web request to an effective `Grpc` **policy** flavor while retaining both its `Http` plugin-cache key and original gRPC-Web response content type. Its precomputed request view contains the ordinary priority-ordered HTTP chain plus only `grpc_method_router` and `grpc_deadline` from the native-gRPC chain, without duplicate instances. POST validation, request limits, and fail-closed method/deadline policy consume the effective flavor; early and later rejections use the retained content type to emit the browser-facing gRPC-Web trailer-frame representation. Backend transport is promoted to native gRPC only when the `grpc_web` plugin stamps its trusted translation marker after rewriting the request. Without that plugin, the original `Plain` transport and gRPC-Web content type pass through to the backend, preserving existing deployments while policy recognition remains fail closed. When that pass-through request has an absolute RPC deadline, both H3 frontends and H1/H2 frontends bypass the native backend-H3 pool and use the deadline-aware reqwest bridge; the deadline covers client-pool acquisition, dispatch, upload, response headers, and response-body collection so the browser can receive the canonical status-4 trailer frame. Extended CONNECT classification takes precedence, so a WebSocket request cannot be promoted by a spoofed gRPC-Web content type.
 
 The native-gRPC composition is limited to the deadline and method-policy parity described here; it does not opt every gRPC-only plugin into gRPC-Web. Issue #2499 and advisory GHSA-m7x6-wqw2-3mvm remain the broader protocol-classification follow-up, and this deadline work does not claim or close either one.
+
+### Route request deadline (`request_timeout_ms`, Gateway API `timeouts.request`)
+
+A matched `mesh_route_dispatch` rule's total request deadline is armed right after `before_proxy`, before target selection. A gRPC or promoted gRPC-Web request folds it into its absolute RPC deadline, which the H3 dispatch paths above already enforce. A `Plain` request cannot be bounded by it yet: the native-H3 and cross-protocol relays write the response head and body from inside the dispatch, so they could turn the deadline into neither a `504` nor a mid-body reset. Such a request is therefore refused with `503` (`{"error":"Route request timeout is not supported over HTTP/3"}`) before any target selection, breaker admission, or dial, instead of being served without the deadline. RFC 9220 WebSocket and RFC 9298 CONNECT-UDP tunnels are exempt, as on the H1/H2 frontends. A rule's per-attempt `timeout_ms` is unaffected and applies on every H3 path.
+
+**The gateway never steers a client onto that refusal.** Browsers learn HTTP/3 from `Alt-Svc`, cache it for the whole origin (`ma=86400`), and do not fall back to TCP on an HTTP error status, so advertising HTTP/3 next to such a rule would send every later request for the origin to the `503`. The H1/H2 frontends therefore omit `Alt-Svc` from **every** response on a frontend port that serves a rule carrying `request_timeout_ms` — not only from that rule's own responses, since any sibling response on the same origin would otherwise advertise it:
+
+| Where the timed rule is attached | `Alt-Svc` withheld on |
+|---|---|
+| A proxy with `listen_port` (a Gateway API listener) | That listener port only |
+| A port-agnostic proxy (no `listen_port`) | Every frontend port |
+| A global `mesh_route_dispatch` instance | Every frontend port |
+
+The decision is derived from the published configuration once per reload generation and read lock-free per response; removing the deadline restores the advertisement on the next response. A gRPC route on the same port loses the advertisement too, even though its folded deadline works over HTTP/3 — the withholding is per port, not per request flavor. Two consequences remain and are documented rather than hidden: a client that already cached `Alt-Svc` before a rule gained a deadline keeps using HTTP/3 until its entry expires, and a client that reaches HTTP/3 without `Alt-Svc` (a DNS `HTTPS`/`SVCB` record, or explicit client configuration) still gets the `503`. Over HTTP/1.1 and HTTP/2 the same request is bounded normally.
+
+One ordering difference from H1/H2: the refusal runs before the **deferred** `before_proxy` pass. When a backend-path policy plugin makes `response_mock` or a `fault_injection` abort defer to that pass, such a route answers this `503` over HTTP/3, where H1/H2 would return the mock or the abort.
 
 ## Native H3 fast path
 

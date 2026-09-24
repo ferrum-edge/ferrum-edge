@@ -193,7 +193,10 @@ absence, complete histories, or the cause of every client error.
 
 ## Hosted validation and dispatch
 
-Pull requests touching the assets run `H2 pinned guard regressions`. The job
+Pull requests touching the assets run `H2 pinned guard regressions`, and so
+does every push to `main` that touches the assets or a pinned repository file
+(`src/admin/mod.rs`, `Cargo.toml`, `Cargo.lock`, `Dockerfile`), so pin drift
+fails on the commit that causes it. The job
 verifies/prepares the source, formats the generated dependency on the runner,
 compiles/lints it, exercises its real receive/poll/clear paths and existing
 budget tests, checks both dependency chains, and runs the harness tests.

@@ -148,11 +148,16 @@ impl MeshRouteDispatchConfig {
             // `rule_matches` treats empty match as "match all" only when
             // route-local actions are present, so this stays a no-op for any other
             // operator config.
+            // Rule-scoped timeouts count as route-local actions too: the
+            // Gateway API translator emits a path-only rule whose only effect
+            // is its `timeouts`, and that rule must still select the policy
+            // for exactly the requests it matches.
             let has_route_actions = !rule.request_transform.is_empty()
                 || !rule.response_transform.is_empty()
                 || rule.fault.is_some()
                 || rule.rewrite.is_some()
-                || rule.redirect.is_some();
+                || rule.redirect.is_some()
+                || rule.carries_timeout_policy();
             if rule.match_.is_empty() && !has_route_actions {
                 return Err(format!(
                     "`mesh_route_dispatch.rules[{idx}].match` requires at least one of \
@@ -181,6 +186,12 @@ impl MeshRouteDispatchConfig {
             if rule.timeout_ms.is_some() && rule.timeout_disabled {
                 return Err(format!(
                     "`mesh_route_dispatch.rules[{idx}]` cannot set both `timeout_ms` and `timeout_disabled`"
+                ));
+            }
+            if rule.request_timeout_ms == Some(0) {
+                return Err(format!(
+                    "`mesh_route_dispatch.rules[{idx}].request_timeout_ms` must be greater than zero; \
+                     omit it to leave the rule without a total request deadline"
                 ));
             }
             if let Some(retry) = &rule.retry
@@ -807,6 +818,22 @@ pub struct RouteRule {
     /// timeout-disabled and the selected fallback proxy may carry a timeout.
     #[serde(default, skip_serializing_if = "is_false")]
     pub timeout_disabled: bool,
+    /// Total request deadline for this rule, in milliseconds from request
+    /// receipt. Spans every backend attempt, retry backoff, and the streaming
+    /// response body — unlike `timeout_ms`, which bounds one attempt's wait for
+    /// response headers and the idle gap between response frames. Gateway API
+    /// `HTTPRoute.rules[].timeouts.request` is projected here. Must be greater
+    /// than zero when set; omit it for no route deadline.
+    ///
+    /// Expiry before a non-gRPC response head is a gateway `504`; expiry
+    /// mid-body resets the HTTP/2 stream or closes the HTTP/1.1 connection. A
+    /// gRPC request folds it into its RPC deadline and ends with
+    /// `DEADLINE_EXCEEDED`. Native HTTP/3 cannot bound a non-gRPC request by
+    /// it yet, so such a request is refused with `503` rather than served
+    /// without the deadline, and HTTP/3 is not advertised (`Alt-Svc`) on any
+    /// frontend port that serves a rule carrying it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
     /// Override the proxy's retry policy for this rule.
     #[serde(
         default,
@@ -912,6 +939,32 @@ pub struct RouteRule {
     /// `ctx.path`.
     #[serde(skip)]
     uri_compiled: Option<UriMatcher>,
+}
+
+impl RouteRule {
+    /// Whether this rule carries its own backend-attempt or total request
+    /// timeout policy (including an explicit `timeout_disabled`).
+    fn carries_timeout_policy(&self) -> bool {
+        self.timeout_ms.is_some() || self.timeout_disabled || self.request_timeout_ms.is_some()
+    }
+}
+
+/// Whether a `mesh_route_dispatch` config document carries any rule with a
+/// total request deadline (`request_timeout_ms`).
+///
+/// Read once per published configuration generation to withhold the HTTP/3
+/// `Alt-Svc` advertisement on the frontend ports that serve such a rule
+/// (`crate::proxy::RouteTimeoutAltSvc`). Deliberately conservative: any
+/// non-null value counts, since a document the plugin later rejects never
+/// serves at all.
+pub(crate) fn config_sets_request_timeout(config: &Value) -> bool {
+    let Some(rules) = config.get("rules").and_then(Value::as_array) else {
+        return false;
+    };
+    rules
+        .iter()
+        .filter_map(|rule| rule.get("request_timeout_ms"))
+        .any(|value| !value.is_null())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2112,6 +2165,9 @@ impl Plugin for MeshRouteDispatch {
                     } else {
                         None
                     };
+                // The total request deadline is request-scoped policy for the
+                // matched rule only; proxy core arms it after `before_proxy`.
+                ctx.route_override_request_timeout_ms = rule.request_timeout_ms;
                 ctx.route_override_retry = if rule.retry.is_some() || rule.retry_disabled {
                     Some(rule.retry.clone())
                 } else {
@@ -2602,7 +2658,8 @@ fn rule_matches(
             || rule.response_transform_compiled.is_some()
             || rule.fault.is_some()
             || rule.rewrite.is_some()
-            || rule.redirect.is_some();
+            || rule.redirect.is_some()
+            || rule.carries_timeout_policy();
     }
     // URI predicate (when set): evaluate first because it cheaply rejects
     // requests that the broader (case-insensitive) `listen_path` lets

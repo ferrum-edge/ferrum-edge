@@ -235,10 +235,12 @@ This PR's own CI turned `H2 pinned guard regressions`
 - **What the pin is for:** the workflow pins the SHA-256 of `src/admin/mod.rs`
   so its diagnostic metrics hook is applied only to a reviewed context.
 - **How it went stale:** #5661 changed that file on `main` on 2026-09-23.
-  Nothing noticed, because the workflow has no `main` trigger and only ran
+  Nothing noticed, because the workflow had no `main` trigger and only ran
   again because this PR edited its YAML.
-- **Fix in this PR:** the pin is refreshed. The anchor still occurs once and
-  the hook bytes are unchanged.
+- **Fix:** the pin was refreshed on this branch and, in parallel, on `main` by
+  #5694 with the same hashes. The anchor still occurs once and the hook bytes
+  are unchanged. #5697 then added a `main`-push trigger on the pinned files,
+  so pin drift now fails on the commit that causes it.
 
 ## Unchanged by design
 
@@ -268,18 +270,10 @@ This PR's own CI turned `H2 pinned guard regressions`
   nextest archives in sequence. Splitting the functional archive build from
   the integration archive, or starting integration shards on a separate
   producer, would shorten the path further.
-- **Pinned-hash optional lanes:** give `h2-guard-observation.yml` (and any lane
-  that pins a `src/` file hash) a `push: main` trigger on the pinned files.
-  Pin drift then surfaces on the commit that caused it, not on an unrelated PR.
-- **NodeWaypoint eBPF Live on PRs:** this check isn't required.
-  - **Current cost:** it runs on 128 of 646 PRs (20%), about 28.7 min per run,
-    triggered by `src/modes/mesh/`, `src/plugins/mesh/`, `charts/ferrum-mesh/`,
-    and `src/k8s_controller/`.
-  - **Proposal:** narrow it to NodeWaypoint-owned paths and rely on the `main`
-    run. That would save roughly 3,000 runner-minutes a month.
-  - **Constraint:** `NODE_WAYPOINT_RELEVANCE_CONTRACT` in
-    `verify_cross_build_policy.py` freezes its relevance job, so this is a
-    direct-to-`main` policy change.
+- **Landed on `main` while this PR was open:**
+  - #5697: `main`-push trigger for the H2 guard's pinned files.
+  - #5698: NodeWaypoint eBPF Live PR relevance narrowed to NodeWaypoint-owned
+    paths (it previously ran on 128 of 646 PRs, about 28.7 min each).
 - **Merge-queue cost:** `ci_runtime_plan.py` force-runs FIPS, the production
   images, and NodeWaypoint on `merge_group`. If the merge queue comes back into
   use, give those suites the same path gating `pull_request` gets.

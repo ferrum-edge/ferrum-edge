@@ -8,7 +8,7 @@ use crate::scaffolding::clients::{Http3Client, Http3Response};
 use crate::scaffolding::{reserve_colocated_tcp_udp, reserve_port};
 
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
-use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::config::types::{GatewayConfig, PluginAssociation};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::ServeOptions;
 use ferrum_edge::modes::mesh::{MeshRuntimeConfig, prepare_gateway_config_for_mesh};
@@ -209,6 +209,67 @@ async fn functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_d
         "no dispatch-policy rejection is expected on a plaintext backend"
     );
     wait_for_hits(&backend_hits, 1, Duration::from_secs(10)).await;
+
+    gateway.shutdown().await;
+    backend_task.abort();
+}
+
+/// A matched route rule's total request deadline (`request_timeout_ms`,
+/// Gateway API `timeouts.request`) cannot yet be enforced by the native H3
+/// HTTP relays, which write the response from inside the dispatch. A plain
+/// HTTP/3 request routed under one must therefore be refused fail closed —
+/// before target selection, admission, or any dial — rather than served
+/// without the deadline it was routed under.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_route_request_timeout_refuses_plain_http_before_dispatch() {
+    let (backend_port, backend_hits, release_backend, backend_task) = spawn_holding_backend().await;
+    release_backend.release();
+    let mut config = plaintext_backend_tls_sni_config(backend_port);
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "h3-route-request-deadline",
+            "namespace": H3_POLICY_NAMESPACE,
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "proxy",
+            "proxy_id": "h3-local-policy",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": H3_POLICY_UPSTREAM_ID},
+                    "request_timeout_ms": 5000
+                }]
+            }
+        }))
+        .expect("route deadline plugin config is valid"),
+    );
+    // A proxy-scoped plugin runs only when its proxy lists it; without this
+    // association the rule never matches and no deadline is ever published.
+    config.proxies[0].plugins.push(PluginAssociation {
+        plugin_config_id: "h3-route-request-deadline".to_string(),
+    });
+    let gateway = start_h3_policy_gateway(config)
+        .await
+        .expect("start h3 route-deadline gateway");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/timed",
+        gateway.https_port
+    );
+    let resp = retry_h3_get(&client, &url).await;
+    assert_eq!(
+        resp.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a plain H3 request under a route deadline must be refused, got {resp:?}"
+    );
+    let body = resp.body_text();
+    assert!(
+        body.contains("Route request timeout is not supported over HTTP/3"),
+        "unexpected refusal body: {body:?}"
+    );
+    assert_backend_hits_eq(&backend_hits, 0, Duration::from_millis(250)).await;
 
     gateway.shutdown().await;
     backend_task.abort();

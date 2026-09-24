@@ -2726,3 +2726,152 @@ fn mesh_route_rendered_action_errors_keep_fields_bounds_and_fixed_suggestions() 
         assert_rendered_route_diagnostic(json!({"rules": [rule]}), &expected);
     }
 }
+
+#[tokio::test]
+async fn mesh_route_dispatch_publishes_request_timeout_for_the_matched_rule_only() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [
+            {
+                "match": {"headers": {"x-variant": "timed"}},
+                "destination": {"upstream_id": "timed"},
+                "request_timeout_ms": 750
+            },
+            {
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "plain"}
+            }
+        ]
+    }))
+    .expect("request_timeout_ms is a valid rule field");
+
+    let mut timed = ctx();
+    let mut headers = HashMap::from([("x-variant".to_string(), "timed".to_string())]);
+    let result = plugin.before_proxy(&mut timed, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(timed.route_override_request_timeout_ms, Some(750));
+
+    // A request matching the sibling rule carries no route deadline.
+    let mut plain = ctx();
+    let result = plugin.before_proxy(&mut plain, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plain.route_override_upstream_id.as_deref(), Some("plain"));
+    assert_eq!(plain.route_override_request_timeout_ms, None);
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_timeout_only_rule_is_an_action_catch_all() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {},
+            "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+            "request_timeout_ms": 500,
+            "timeout_ms": 200
+        }]
+    }))
+    .expect("a timeout-only rule is a route-action catch-all");
+
+    let mut request = ctx();
+    let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(request.route_override_request_timeout_ms, Some(500));
+    assert_eq!(request.route_override_backend_read_timeout_ms, Some(200));
+}
+
+#[test]
+fn mesh_route_dispatch_rejects_a_zero_request_timeout() {
+    let error = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "request_timeout_ms": 0
+        }]
+    }))
+    .expect_err("a zero total deadline is refused");
+    assert!(
+        error.contains("`mesh_route_dispatch.rules[0].request_timeout_ms`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn route_request_timeout_is_request_scoped_and_never_clones_the_proxy() {
+    let proxy = test_proxy();
+    let mut request = ctx();
+    request.route_override_request_timeout_ms = Some(1_000);
+    assert!(!request.has_route_overrides());
+    let applied = request.apply_route_overrides(Arc::clone(&proxy));
+    assert!(Arc::ptr_eq(&proxy, &applied));
+    assert_eq!(
+        applied.backend_read_timeout_ms,
+        proxy.backend_read_timeout_ms
+    );
+}
+
+#[test]
+fn arming_a_route_request_timeout_anchors_a_non_grpc_deadline_at_receipt() {
+    let mut request = ctx();
+    let before = tokio::time::Instant::now();
+    request.route_override_request_timeout_ms = Some(2_000);
+    request.arm_route_request_deadline(false);
+    let deadline = request
+        .route_request_deadline_at()
+        .expect("a non-gRPC request carries the route deadline");
+    assert!(deadline <= before + std::time::Duration::from_millis(2_000));
+    assert!(deadline > before + std::time::Duration::from_millis(1_000));
+    // The gRPC deadline stays untouched for a non-gRPC request.
+    assert_eq!(request.grpc_deadline_at(), None);
+
+    // A request whose rule carries no deadline is unbounded.
+    let mut untimed = ctx();
+    untimed.arm_route_request_deadline(false);
+    assert_eq!(untimed.route_request_deadline_at(), None);
+}
+
+#[test]
+fn arming_a_route_request_timeout_folds_into_the_grpc_deadline() {
+    // No client `grpc-timeout`: the route budget becomes the RPC deadline.
+    let mut request = ctx();
+    request.route_override_request_timeout_ms = Some(2_000);
+    request.arm_route_request_deadline(true);
+    assert_eq!(request.route_request_deadline_at(), None);
+    let route_deadline = request
+        .grpc_deadline_at()
+        .expect("the route budget becomes the RPC deadline");
+
+    // A tighter client deadline wins; the fold only ever shortens it.
+    let mut tighter_client = ctx();
+    tighter_client
+        .headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    tighter_client
+        .headers
+        .insert("grpc-timeout".to_string(), "100m".to_string());
+    let prepared =
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&[], &mut tighter_client);
+    assert!(matches!(prepared, PluginResult::Continue));
+    let client_deadline = tighter_client.grpc_deadline_at().expect("client deadline");
+    tighter_client.route_override_request_timeout_ms = Some(2_000);
+    tighter_client.arm_route_request_deadline(true);
+    assert_eq!(tighter_client.grpc_deadline_at(), Some(client_deadline));
+
+    // A looser client deadline is shortened to the route budget, and re-arming
+    // is idempotent.
+    let mut looser_client = ctx();
+    looser_client
+        .headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    looser_client
+        .headers
+        .insert("grpc-timeout".to_string(), "60S".to_string());
+    let prepared =
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&[], &mut looser_client);
+    assert!(matches!(prepared, PluginResult::Continue));
+    let client_deadline = looser_client.grpc_deadline_at().expect("client deadline");
+    looser_client.route_override_request_timeout_ms = Some(2_000);
+    looser_client.arm_route_request_deadline(true);
+    let folded = looser_client.grpc_deadline_at().expect("folded deadline");
+    assert!(folded < client_deadline);
+    looser_client.arm_route_request_deadline(true);
+    assert_eq!(looser_client.grpc_deadline_at(), Some(folded));
+    assert!(route_deadline > tokio::time::Instant::now());
+}

@@ -4687,6 +4687,62 @@ async fn handle_h3_request(
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
         .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
+    // Arm the matched route rule's total request deadline (Gateway API
+    // `timeouts.request`). A gRPC request folds it into its RPC deadline, which
+    // the native-H3 gRPC relays already enforce end to end. The native-H3
+    // HTTP relays write the response head and body from inside the dispatch,
+    // so they cannot yet turn this deadline into a `504` or a mid-body reset:
+    // refuse such a request before any target selection, breaker admission, or
+    // dial rather than serve it without the policy it was routed under. The
+    // H1/H2 frontends withhold `Alt-Svc` on every port that serves such a rule
+    // (`ProxyState::route_timeout_alt_svc`), so the gateway never steers a
+    // client here; only a client that reaches HTTP/3 on its own sees this.
+    // Upgraded tunnels (RFC 9220 WebSocket, RFC 9298 CONNECT-UDP) are not HTTP
+    // response bodies and are exempt, exactly as on the H1/H2 frontends.
+    //
+    // Ordering differs from H1/H2 in one documented case: this runs before the
+    // DEFERRED `before_proxy` pass, so a `response_mock` or `fault_injection`
+    // abort that defers behind a backend-path policy plugin is answered with
+    // this `503` over HTTP/3, where H1/H2 would return the mock or abort.
+    ctx.arm_route_request_deadline(matches!(http_flavor, HttpFlavor::Grpc));
+    if matches!(http_flavor, HttpFlavor::Plain)
+        && !is_connect_udp_request
+        && ctx.route_request_deadline_at().is_some()
+    {
+        // Heap-pinned like the other reject ladders in this handler: its state
+        // machine is already close to the worker stack budget of a debug
+        // build, and the branch runs only for a refused request.
+        Box::pin(async {
+            crate::warn_sampled!(
+                proxy_id = %proxy.id,
+                "Refusing HTTP/3 request: its route rule sets a total request timeout that the native HTTP/3 relay cannot enforce"
+            );
+            record_h3_flavor_aware_reject(&state, http_flavor, 503);
+            log_rejected_request(
+                &plugins,
+                &ctx,
+                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                start_time,
+                H3_ROUTE_REQUEST_TIMEOUT_REJECTION_PHASE,
+                plugin_execution_ns,
+            )
+            .await;
+            send_h3_error_flavor_aware_with_policy(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::SERVICE_UNAVAILABLE,
+                H3_ROUTE_REQUEST_TIMEOUT_UNSUPPORTED_BODY,
+                crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
+                "Route request timeout is not supported over HTTP/3",
+                initial_response_header_policy_plugins.as_ref(),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
+        return Ok(());
+    }
 
     // Preserve the client's original request path for access logging — the
     // transaction summaries below source `request_path` from this, not the
@@ -18202,6 +18258,14 @@ fn record_request(state: &ProxyState, status: u16) {
     }
     crate::runtime_metrics::global_ref().record_http_status(status);
 }
+
+/// Transaction-log rejection phase for a native-H3 request refused because its
+/// route rule's total request deadline cannot be enforced on this transport.
+const H3_ROUTE_REQUEST_TIMEOUT_REJECTION_PHASE: &str = "route_request_timeout_unsupported";
+/// Fixed client-visible body for that refusal. It names no route, rule, or
+/// configured duration.
+const H3_ROUTE_REQUEST_TIMEOUT_UNSUPPORTED_BODY: &str =
+    r#"{"error":"Route request timeout is not supported over HTTP/3"}"#;
 
 /// Record the HTTP status actually emitted by a flavor-aware H3 rejection.
 /// Native gRPC and gRPC-Web errors carry their status in trailers (or a

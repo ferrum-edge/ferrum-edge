@@ -13982,7 +13982,9 @@ components:
         http_path:
           type: string
           default: /health
-          description: HTTP path to probe
+          maxLength: 2048
+          pattern: "^/"
+          description: HTTP path to probe; must start with `/`
         interval_seconds:
           type: integer
           format: uint64
@@ -14033,6 +14035,8 @@ components:
             `grpc` — gRPC health check using `grpc.health.v1.Health/Check`.
         udp_probe_payload:
           type: [string, "null"]
+          maxLength: 2048
+          pattern: "^([0-9a-fA-F]{2})*$"
           description: |
             Hex-encoded payload to send for UDP probes (e.g., "0000").
             If omitted, a single zero byte is sent.
@@ -23741,6 +23745,12 @@ components:
                     properties: {rewrite: {type: object}}
                   - required: [redirect]
                     properties: {redirect: {type: object}}
+                  - required: [timeout_ms]
+                    properties: {timeout_ms: {type: integer}}
+                  - required: [timeout_disabled]
+                    properties: {timeout_disabled: {const: true}}
+                  - required: [request_timeout_ms]
+                    properties: {request_timeout_ms: {type: integer}}
               - if:
                   required: [timeout_disabled]
                   properties:
@@ -24079,6 +24089,32 @@ components:
                 description: |
                   Explicitly clear the selected proxy's inherited backend
                   response/read timeout. Cannot be true when `timeout_ms` is set.
+              request_timeout_ms:
+                type: [integer, "null"]
+                format: uint64
+                minimum: 1
+                description: |
+                  Optional TOTAL request deadline for this rule, in
+                  milliseconds from request receipt (Gateway API
+                  `HTTPRoute.rules[].timeouts.request`). Unlike `timeout_ms`,
+                  which bounds one backend attempt's wait for response headers
+                  and the idle gap between response frames, it spans every
+                  attempt, retry backoff, and the streaming response body, and
+                  is never re-armed by a retry. Request-scoped: it never changes
+                  the selected proxy or upstream. Expiry before a non-gRPC
+                  response head answers `504`; expiry mid-body resets the
+                  HTTP/2 stream or closes the HTTP/1.1 connection; a gRPC
+                  request folds it into its RPC deadline and ends with
+                  `DEADLINE_EXCEEDED`. Expiry is charged to a backend's health
+                  only when that backend held the cancelled attempt; expiry
+                  before the attempt was handed to a backend, in retry backoff,
+                  or after the response head is health-neutral. A non-gRPC
+                  request on the native HTTP/3 frontend is refused with `503`
+                  because that relay cannot yet enforce it, and HTTP/3 is not
+                  advertised (`Alt-Svc`) on any frontend port that serves a
+                  rule carrying this field. Upgraded WebSocket / CONNECT-UDP
+                  tunnels are not bounded by it. `0` is rejected; omit the field
+                  for no route deadline.
               retry:
                 oneOf:
                   - $ref: "#/components/schemas/MeshRouteRetryConfig"

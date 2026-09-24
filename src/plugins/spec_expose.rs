@@ -724,6 +724,9 @@ impl SpecExpose {
     }
 }
 
+/// `Content-Security-Policy` attached to every served spec document.
+pub const SPEC_RESPONSE_CSP: &str = "default-src 'none'; sandbox";
+
 /// Media types `spec_expose` will forward verbatim from an upstream response.
 ///
 /// `/specz` is served unauthenticated and short-circuits before the auth
@@ -1012,7 +1015,7 @@ impl Plugin for SpecExpose {
 }
 
 fn spec_response(entry: CachedSpec) -> PluginResult {
-    let mut headers = HashMap::with_capacity(3);
+    let mut headers = HashMap::with_capacity(4);
     headers.insert("content-type".to_string(), entry.content_type);
     headers.insert("content-length".to_string(), entry.body.len().to_string());
     // `/specz` is unauthenticated and serves an upstream-influenced body, so
@@ -1021,6 +1024,14 @@ fn spec_response(entry: CachedSpec) -> PluginResult {
     // The cached body is always identity-coded; origin Content-Encoding was
     // decoded at fetch time and is never forwarded.
     headers.insert("x-content-type-options".to_string(), "nosniff".to_string());
+    // `nosniff` does not stop scripts in an allowed XML type: a browser runs
+    // `<x:script xmlns:x="http://www.w3.org/1999/xhtml">` inside
+    // `application/xml`/`text/xml`/`+xml` documents. A spec document never
+    // needs script or subresources, so sandbox it into an opaque origin.
+    headers.insert(
+        "content-security-policy".to_string(),
+        SPEC_RESPONSE_CSP.to_string(),
+    );
     PluginResult::RejectBinary {
         status_code: 200,
         body: entry.body,

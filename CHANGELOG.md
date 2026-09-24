@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Gateway API HTTPRoute rule-level `timeouts` (#5646). `timeouts.backendRequest`
+  bounds each backend attempt and `timeouts.request` is one total deadline for
+  the whole request, including retries, retry backoff and the streaming response
+  body. Both are validated like the pinned v1.5.1 CRD, and `0s` disables either.
+  A request that runs out of time before the response head gets a `504`. A
+  response body still streaming at the deadline is reset (HTTP/2) or its
+  connection closed (HTTP/1.1). gRPC calls end with `DEADLINE_EXCEEDED`. The
+  timeouts apply only to the rule that declares them. `mesh_route_dispatch`
+  rules gain the matching `request_timeout_ms` field. A `request` expiry counts
+  against a backend's health only when that backend held the request; expiry
+  while the gateway is still buffering a client upload, in retry backoff, or
+  after the response head does not. A body cut by the deadline keeps its
+  `Content-Length`. Native HTTP/3 cannot enforce the total deadline for
+  non-gRPC requests yet, so it refuses those requests with `503` instead of
+  serving them without the deadline, and HTTP/3 is no longer advertised
+  (`Alt-Svc`) on a listener port that serves such a rule. CI now declares
+  `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`; `backendRequest`
+  bounds an attempt's response-head wait and idle gaps rather than its total
+  duration, a documented deviation. `rules[].retry` is still refused.
+
 - Conditional full-replacement writes (#5659). `GET` on proxies, upstreams,
   consumers, and plugin configs returns a strong `ETag`; `PUT`/`DELETE` with a
   non-matching `If-Match` is refused with `412` and writes nothing, so a draft
@@ -21,6 +41,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Requests without `If-Match` are unchanged.
 
 ### Fixed
+
+- Reject a health-check `active.http_path` that does not start with `/`
+  (#5683). The probe URL is `scheme://host:port` + path, so a path like
+  `@169.254.169.254/` turned the target into userinfo and sent the probe to a
+  different host that the egress screen never inspected.
+- Reject non-finite (`NaN`, `inf`) floating-point env values (#5684). A `NaN`
+  `FERRUM_OVERLOAD_*_THRESHOLD` passed validation and silently disabled load
+  shedding.
+- `bot_detection` `allow_list` entries whose first or last character is
+  punctuation now match (#5685). Word-boundary anchors are applied only to
+  word-character edges, so embedded-token smuggling stays blocked.
+- `spec_expose` serves specs with `Content-Security-Policy: default-src 'none';
+  sandbox` (#5686), so an upstream-supplied `application/xml` document cannot
+  run XHTML-namespaced script on the gateway origin.
+- `ldap_auth` escapes NUL in bind DN values as `\00` (RFC 4514) (#5687).
+- Reject an `active.udp_probe_payload` that is not an even-length hex string
+  (#5688) instead of silently probing with a single zero byte.
+- `FERRUM_MAX_CREDENTIALS_PER_TYPE=0` now fails startup, and the enforced value
+  is parsed exactly as startup validated it (#5689).
+- `graphql` and `grpc_method_router` tag `limit_by: consumer` rate keys as
+  `consumer:` or `ip:` (#5692), so an identity that equals an IP no longer
+  shares the anonymous budget of that IP. Existing local and Redis counters for
+  these two plugins restart once after upgrading.
 
 - Flush the two writes that run just before a byte relay starts (#5588): the
   TCP+TLS first-bytes prefix forwarded to the backend, and WebSocket tunnel
@@ -65,6 +108,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header elements and remaining constructor scalar/type diagnostics follow the
   same withholding convention. Version and credential schema names remain
   visible in backticks. Real-binary regressions inspect both output streams.
+
+### Performance
+
+- `ws_frame_logging` builds its payload-fingerprint HMAC key once per plugin
+  instead of once per frame (#5690).
+- Circuit-breaker cache hits no longer allocate a key string (#5691).
 
 ### Security
 

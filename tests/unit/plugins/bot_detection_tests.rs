@@ -328,6 +328,37 @@ async fn test_allow_list_word_boundary_blocks_embedded_token_smuggling() {
     plugin_utils::assert_continue(result);
 }
 
+#[tokio::test]
+async fn test_allow_list_entries_with_punctuation_edges_match() {
+    // `\b` next to a punctuation edge needs a word character outside the
+    // entry, so full-UA fragments like these previously never matched.
+    let plugin = BotDetection::new(&json!({
+        "blocked_patterns": ["bot"],
+        "allow_list": [
+            "(compatible; UptimeRobot/2.0; http://www.uptimerobot.com/)",
+            "+http://www.google.com/bot.html)",
+            "Slackbot/"
+        ]
+    }))
+    .unwrap();
+
+    for ua in [
+        "Mozilla/5.0+(compatible; UptimeRobot/2.0; http://www.uptimerobot.com/)",
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "Slackbot/ 1.0",
+    ] {
+        let mut ctx = make_ctx_with_ua(ua);
+        let result = plugin.on_request_received(&mut ctx).await;
+        plugin_utils::assert_continue(result);
+    }
+
+    // Word-character edges stay anchored: `Slackbot/` must not match when
+    // embedded after another word character.
+    let mut ctx = make_ctx_with_ua("evilSlackbot/ 1.0");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
 // ── Missing user-agent header ───────────────────────────────────────────
 // Default behavior: allow missing User-Agent (for health checks / LB probes)
 

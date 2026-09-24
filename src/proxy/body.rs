@@ -80,6 +80,12 @@ pub struct ProxyBody {
     /// terminal deadline frame (or abort after partial DATA). Deferred backend
     /// accounting uses this signal to keep a client-chosen expiry neutral.
     client_grpc_deadline_fired: Option<Arc<AtomicBool>>,
+    /// Set by the NON-gRPC route request deadline wrapper
+    /// ([`Self::with_route_request_deadline`]) when it cuts the body. The cut
+    /// is the route's own total-duration policy, not evidence about the
+    /// backend: deferred backend accounting stays health-neutral, while the
+    /// deferred logger keeps the timeout class and records no disconnect.
+    route_request_deadline_fired: Option<Arc<AtomicBool>>,
     /// Set by the authorization-lifetime wrapper when the accepted credential's
     /// deadline (or the finite authenticated-stream maximum) fired. Deferred
     /// backend accounting treats it exactly like a client-chosen expiry —
@@ -656,6 +662,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
             logger: None,
@@ -686,6 +693,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
             logger: None,
@@ -1011,6 +1019,67 @@ impl ProxyBody {
         self
     }
 
+    /// Bound a NON-gRPC streaming response by the matched route rule's total
+    /// request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway API
+    /// `HTTPRoute.rules[].timeouts.request`).
+    ///
+    /// The instant is absolute and armed once, so a backend that streams
+    /// continuously or trickles frames under the per-frame idle bound is still
+    /// cut at the deadline. HTTP has no legal terminal metadata once the head
+    /// is committed, so expiry ends the body with a `TimedOut` transport error
+    /// before or after response DATA alike: hyper resets the HTTP/2 stream and
+    /// closes the HTTP/1.1 connection rather than presenting a clean EOF a
+    /// client could mistake for a complete response. Because that terminal
+    /// never substitutes bytes, the wrapper keeps the inner body's exact size
+    /// hint, so a response with a known length keeps `Content-Length` framing
+    /// and a cut shows up as a short body rather than a silently chunked one.
+    ///
+    /// A cut here is NOT a backend-health signal: the backend already answered
+    /// with a response head, and the route's total budget ends a long healthy
+    /// download or a slow-reading client exactly as it ends a slow backend.
+    /// Deferred backend accounting therefore records it health-neutrally (as
+    /// the client RPC deadline does), while the deferred logger keeps
+    /// `body_error_class: read_write_timeout` without claiming a disconnect.
+    ///
+    /// A buffered (`Full`) body is already complete and is returned unchanged,
+    /// as is a body already at end of stream under a deadline that has not
+    /// elapsed, so a finished response keeps its framing.
+    pub(crate) fn with_route_request_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        if matches!(self.kind, ProxyBodyKind::Full(_))
+            || (http_body::Body::is_end_stream(&self) && tokio::time::Instant::now() < deadline)
+        {
+            return self;
+        }
+        let fired = Arc::new(AtomicBool::new(false));
+        let placeholder = ProxyBodyKind::Full(Full::default());
+        let previous = std::mem::replace(&mut self.kind, placeholder);
+        self.kind = match previous {
+            ProxyBodyKind::Stream(body) => {
+                ProxyBodyKind::Stream(Box::pin(TotalDeadlineBody::with_terminal(
+                    body,
+                    Some(deadline),
+                    None,
+                    Arc::clone(&fired),
+                    DeadlineTerminal::ROUTE_REQUEST_TIMEOUT,
+                    None,
+                )))
+            }
+            ProxyBodyKind::Tracked(body) => {
+                ProxyBodyKind::Stream(Box::pin(TotalDeadlineBody::with_terminal(
+                    body,
+                    Some(deadline),
+                    None,
+                    Arc::clone(&fired),
+                    DeadlineTerminal::ROUTE_REQUEST_TIMEOUT,
+                    None,
+                )))
+            }
+            full @ ProxyBodyKind::Full(_) => full,
+        };
+        self.route_request_deadline_fired = Some(fired);
+        self
+    }
+
     fn with_client_grpc_deadline_fired_flag(mut self, fired: Arc<AtomicBool>) -> Self {
         self.client_grpc_deadline_fired = Some(fired);
         self
@@ -1273,6 +1342,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
             logger: None,
@@ -1668,8 +1738,18 @@ impl http_body::Body for ProxyBody {
                             .with_authorization_termination(auth_deadline_termination),
                     );
                 }
-                this.record_deferred_backend_admission(Some(class), disconnected);
-                this.record_deferred_backend_dispatch(Some(class), disconnected);
+                // A route request deadline cut is the route's own policy, not
+                // a backend fault (see `with_route_request_deadline`): keep the
+                // logged timeout class above but settle backend accounting as
+                // neutrally as a client RPC deadline. Read only on this error
+                // arm, so the frame hot path pays nothing for it.
+                let health_neutral = disconnected
+                    || this
+                        .route_request_deadline_fired
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Acquire));
+                this.record_deferred_backend_admission(Some(class), health_neutral);
+                this.record_deferred_backend_dispatch(Some(class), health_neutral);
                 // A body error leaves the backend carrier in an unknown framing
                 // state. Drop the lease so the connection is retired, never
                 // pooled (issue #3731).
@@ -4555,6 +4635,20 @@ impl DeadlineTerminal {
         pre_data_message: "gRPC streaming response exceeded the client grpc-timeout deadline",
         auth_termination: None,
     };
+
+    /// The matched route rule's total request deadline on a NON-gRPC response
+    /// (Gateway API `HTTPRoute.rules[].timeouts.request`). A gRPC request folds
+    /// that deadline into its client RPC deadline instead, so this terminal
+    /// never carries gRPC metadata: both arms end the body with a `TimedOut`
+    /// transport error, and the `grpc-*` fields are never emitted.
+    const ROUTE_REQUEST_TIMEOUT: Self = Self {
+        grpc_status_header: GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+        grpc_message_header: GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+        post_data_message: "response exceeded the route request timeout after response data",
+        native_grpc_trailers: false,
+        pre_data_message: "response exceeded the route request timeout",
+        auth_termination: None,
+    };
 }
 
 impl<B> TotalDeadlineBody<B> {
@@ -4614,6 +4708,15 @@ impl<B> TotalDeadlineBody<B> {
 
     fn deadline_fired_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.deadline_fired)
+    }
+
+    /// Whether this adapter's own deadline can only END the body with a
+    /// transport error — no body-framed terminal, no native trailers, and no
+    /// authorization regime — so it never changes how many bytes are sent.
+    fn deadline_only_errors(&self) -> bool {
+        self.deadline_frame.is_none()
+            && !self.terminal.native_grpc_trailers
+            && self.terminal.auth_termination.is_none()
     }
 
     /// Emit this regime's protocol-correct terminal for a bound that has been
@@ -4783,7 +4886,9 @@ where
     fn size_hint(&self) -> http_body::SizeHint {
         if self.done {
             http_body::SizeHint::with_exact(0)
-        } else if self.deadline.is_some() || self.authorization_terminal.is_some() {
+        } else if (self.deadline.is_some() && !self.deadline_only_errors())
+            || self.authorization_terminal.is_some()
+        {
             // The deadline may replace the remaining body with native trailers
             // or a differently-sized gRPC-Web terminal DATA frame. Do not let
             // hyper reconstruct the stripped backend Content-Length from an
@@ -4791,6 +4896,11 @@ where
             // bound lives here or in the gateway-owned pump.
             http_body::SizeHint::default()
         } else {
+            // No deadline, or one whose only terminal is a transport error (the
+            // route request deadline): that terminal adds no bytes, so the
+            // inner hint stays exact and a known length keeps its framing. A
+            // cut then ends the body short of the advertised length, which
+            // every client detects as an incomplete response.
             self.inner
                 .as_ref()
                 .map(http_body::Body::size_hint)

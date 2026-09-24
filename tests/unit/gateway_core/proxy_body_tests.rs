@@ -1035,3 +1035,73 @@ fn test_direct_h2_request_body_is_send_sync_unpin() {
     must_be_sync::<DirectH2RequestBody>();
     must_be_unpin::<DirectH2RequestBody>();
 }
+
+// ── Route rule total request deadline (Gateway API `timeouts.request`) ─────
+
+#[tokio::test]
+async fn route_request_deadline_ends_a_pending_http_body_with_a_timeout_error() {
+    use ferrum_edge::_test_support::proxy_body_with_route_request_deadline_for_test;
+    use futures_util::stream;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let inner = StreamBody::new(stream::pending::<Result<Frame<Bytes>, ProxyBodyError>>());
+    let body = proxy_body_streaming_for_test(Box::pin(inner));
+    let deadline = tokio::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("one second before now is representable");
+    let mut body = proxy_body_with_route_request_deadline_for_test(body, deadline);
+
+    // An ordinary HTTP response has no legal terminal metadata, so the expiry
+    // is a transport error (H2/H3 reset, H1 close) — never gRPC trailers and
+    // never a clean end of stream.
+    let error = body
+        .frame()
+        .await
+        .expect("the deadline must end the body")
+        .expect_err("the terminal must be an error, not a frame");
+    assert!(
+        error.to_string().contains("route request timeout"),
+        "unexpected terminal: {error}"
+    );
+}
+
+#[tokio::test]
+async fn route_request_deadline_cuts_a_body_after_response_data() {
+    use ferrum_edge::_test_support::proxy_body_with_route_request_deadline_for_test;
+    use futures_util::{StreamExt, stream};
+    use http_body_util::{BodyExt, StreamBody};
+
+    let first = Bytes::from_static(b"partial");
+    let source = stream::iter(vec![Ok::<_, ProxyBodyError>(Frame::data(first.clone()))])
+        .chain(stream::pending());
+    let body = proxy_body_streaming_for_test(Box::pin(StreamBody::new(source)));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+    let mut body = proxy_body_with_route_request_deadline_for_test(body, deadline);
+
+    let data = body
+        .frame()
+        .await
+        .expect("first frame")
+        .expect("first frame is readable")
+        .into_data()
+        .expect("DATA");
+    assert_eq!(data, first);
+    let error = body
+        .frame()
+        .await
+        .expect("the deadline must end the body")
+        .expect_err("a body cut after DATA must not end cleanly");
+    assert!(
+        error.to_string().contains("route request timeout"),
+        "unexpected terminal: {error}"
+    );
+}
+
+#[test]
+fn route_request_deadline_leaves_a_complete_buffered_body_unchanged() {
+    use ferrum_edge::_test_support::proxy_body_with_route_request_deadline_for_test;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let body = proxy_body_with_route_request_deadline_for_test(ProxyBody::full("done"), deadline);
+    assert_eq!(body.size_hint().exact(), Some(4));
+}

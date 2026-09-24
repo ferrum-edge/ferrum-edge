@@ -192,9 +192,25 @@ fn compile_word_boundary_pattern_set(
         return Ok(None);
     }
 
-    let anchored_patterns = patterns
-        .iter()
-        .map(|pattern| format!(r"\b{}\b", regex::escape(pattern)));
+    // `\b` only matches between a word and a non-word character, so anchoring a
+    // punctuation edge (e.g. `(compatible; UptimeRobot/2.0; ...)`) would require
+    // a word character outside the entry and the entry could never match. A
+    // non-word edge already delimits the token, so anchor word-character edges
+    // only.
+    let is_word = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let anchored_patterns = patterns.iter().map(|pattern| {
+        let lead = if pattern.starts_with(is_word) {
+            r"\b"
+        } else {
+            ""
+        };
+        let trail = if pattern.ends_with(is_word) {
+            r"\b"
+        } else {
+            ""
+        };
+        format!("{lead}{}{trail}", regex::escape(pattern))
+    });
     let mut builder = RegexSetBuilder::new(anchored_patterns);
     builder.case_insensitive(true);
     builder.build().map(Some).map_err(|_| {

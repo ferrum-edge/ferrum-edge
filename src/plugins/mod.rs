@@ -258,6 +258,15 @@ pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
 /// metadata value an earlier custom plugin may have stored under this key.
 pub const REQUEST_ID_METADATA_KEY: &str = "request_id";
 
+/// Transaction-log metadata key set when the matched route rule's total
+/// request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway API
+/// `HTTPRoute.rules[].timeouts.request`) produced the gateway-authored `504`.
+/// Its value is a fixed phase literal: `before_dispatch` (the attempt had not
+/// yet been handed to a backend — health-neutral), `dispatch` (the backend
+/// held the cancelled attempt — charged to it), or `retry_backoff`
+/// (health-neutral).
+pub const ROUTE_REQUEST_TIMEOUT_METADATA_KEY: &str = "route_request_timeout";
+
 /// Parser-level limits contributed by a WebSocket size-policy plugin.
 ///
 /// The relay combines every applicable instance before either peer is read,
@@ -2506,6 +2515,13 @@ pub struct RequestContext {
     /// Single monotonic absolute deadline shared by request phases, backend
     /// attempts, retry backoff, and streaming response bodies.
     pub(crate) grpc_deadline_at: Option<tokio::time::Instant>,
+    /// Route-scoped total request deadline for a NON-gRPC request, armed once
+    /// by [`Self::arm_route_request_deadline`] from the matched rule's
+    /// [`Self::route_override_request_timeout_ms`] and anchored to the same
+    /// receipt instant as `grpc_deadline_at`. gRPC-flavored requests never set
+    /// this: their route deadline is folded into `grpc_deadline_at` instead, so
+    /// the existing absolute-deadline machinery owns their terminals.
+    pub(crate) route_request_deadline_at: Option<tokio::time::Instant>,
     /// Once any `grpc_deadline` instance requests gateway-time subtraction,
     /// every later instance forwards the same remaining budget instead of
     /// subtracting receipt-to-hook elapsed time again.
@@ -3192,6 +3208,18 @@ pub struct RequestContext {
     /// effective value is non-zero), which is how a long-running streamed
     /// generation opts out of the placeholder proxy's default.
     pub route_override_backend_read_timeout_ms: Option<u64>,
+    /// Plugin-set TOTAL request deadline for the matched rule, in
+    /// milliseconds from request receipt (Gateway API
+    /// `HTTPRoute.rules[].timeouts.request`).
+    ///
+    /// Unlike [`Self::route_override_backend_read_timeout_ms`], which bounds
+    /// one backend attempt, this spans every attempt, retry backoff, and the
+    /// streaming response body. It is request-scoped policy only: it never
+    /// changes the effective `Proxy` and is not part of
+    /// [`Self::has_route_overrides`]. `None` means no route deadline; a
+    /// matching `mesh_route_dispatch` rule replaces it like every other
+    /// override field.
+    pub route_override_request_timeout_ms: Option<u64>,
     /// Plugin-set override for the proxy's backend connect timeout.
     ///
     /// Counterpart to [`Self::route_override_backend_read_timeout_ms`] for
@@ -3787,6 +3815,7 @@ impl RequestContext {
             grpc_deadline_preflight_complete: false,
             grpc_deadline_budget_ms: None,
             grpc_deadline_at: None,
+            route_request_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
@@ -3880,6 +3909,7 @@ impl RequestContext {
             route_override_backend_port: None,
             route_override_resolved_tls: None,
             route_override_backend_read_timeout_ms: None,
+            route_override_request_timeout_ms: None,
             route_override_backend_connect_timeout_ms: None,
             route_override_retry: None,
             route_override_request_transform: None,
@@ -4266,6 +4296,64 @@ impl RequestContext {
             self.grpc_deadline_received_at
                 .checked_add(Duration::from_millis(budget))
         });
+    }
+
+    /// The matched route rule's total request deadline for this NON-gRPC
+    /// request, armed by [`Self::arm_route_request_deadline`]. Always `None`
+    /// for a gRPC-flavored request, whose route deadline lives in
+    /// [`Self::grpc_deadline_at`] instead.
+    pub fn route_request_deadline_at(&self) -> Option<tokio::time::Instant> {
+        self.route_request_deadline_at
+    }
+
+    /// Arm the matched rule's total request deadline (Gateway API
+    /// `HTTPRoute.rules[].timeouts.request`) once `before_proxy` has selected
+    /// the rule and published [`Self::route_override_request_timeout_ms`].
+    ///
+    /// The deadline is anchored to the same monotonic receipt instant as the
+    /// gRPC budget, so it spans request phases, every backend attempt, retry
+    /// backoff, and the streaming response body, and a retry can never re-arm
+    /// it.
+    ///
+    /// A gRPC-flavored request folds the route budget into its ONE absolute
+    /// RPC deadline (the earlier of the client `grpc-timeout`/policy budget and
+    /// the route budget wins), so the existing gRPC deadline machinery owns its
+    /// dispatch, backoff, response-body, and `DEADLINE_EXCEEDED` terminals and
+    /// the remaining budget is what is forwarded upstream as `grpc-timeout`.
+    /// Folding only ever shortens the budget, so re-arming is idempotent. Every
+    /// other request carries the instant in [`Self::route_request_deadline_at`].
+    ///
+    /// Public only for external contract tests; proxy core is the only
+    /// production caller.
+    #[doc(hidden)]
+    pub fn arm_route_request_deadline(&mut self, grpc_flavored: bool) {
+        let Some(timeout_ms) = self
+            .route_override_request_timeout_ms
+            .filter(|timeout_ms| *timeout_ms > 0)
+        else {
+            self.route_request_deadline_at = None;
+            return;
+        };
+        if grpc_flavored {
+            self.route_request_deadline_at = None;
+            let budget_ms = self
+                .grpc_deadline_budget_ms
+                .map_or(timeout_ms, |current| current.min(timeout_ms));
+            self.set_grpc_deadline_budget(Some(budget_ms));
+            return;
+        }
+        self.route_request_deadline_at = self
+            .grpc_deadline_received_at
+            .checked_add(Duration::from_millis(timeout_ms));
+    }
+
+    /// Attribute a gateway-authored route-deadline terminal in the transaction
+    /// log. The value is a compiled-in literal naming the phase that expired.
+    pub(crate) fn mark_route_request_timeout_exceeded(&mut self, phase: &'static str) {
+        self.metadata.insert(
+            ROUTE_REQUEST_TIMEOUT_METADATA_KEY.to_string(),
+            phase.to_string(),
+        );
     }
 
     /// Correlation id for the concrete response-stream inspector chain, when
@@ -5069,6 +5157,7 @@ impl RequestContext {
             grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
             grpc_deadline_at: self.grpc_deadline_at,
+            route_request_deadline_at: self.route_request_deadline_at,
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             backend_dispatch_state: self.backend_dispatch_state,
@@ -5264,6 +5353,7 @@ impl RequestContext {
             route_override_backend_port: self.route_override_backend_port,
             route_override_resolved_tls: self.route_override_resolved_tls.clone(),
             route_override_backend_read_timeout_ms: self.route_override_backend_read_timeout_ms,
+            route_override_request_timeout_ms: self.route_override_request_timeout_ms,
             route_override_backend_connect_timeout_ms: self
                 .route_override_backend_connect_timeout_ms,
             route_override_retry: self.route_override_retry.clone(),

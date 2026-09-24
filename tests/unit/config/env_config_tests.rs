@@ -503,6 +503,66 @@ fn test_env_config_rejects_oversized_admin_jwt_max_ttl() {
 }
 
 #[test]
+fn test_env_config_rejects_non_finite_overload_thresholds() {
+    // `"NaN".parse::<f64>()` succeeds and NaN passes through `clamp`; every
+    // `ratio >= NaN` comparison is then false, silently disabling shedding.
+    for raw in ["NaN", "nan", "inf", "-inf", "infinity"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+                ("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD", raw),
+            ],
+            || {
+                let err = EnvConfig::from_env().expect_err("non-finite threshold must fail");
+                assert!(
+                    err.contains("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD"),
+                    "startup must name the offending setting for {raw:?}: {err}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_rejects_zero_max_credentials_per_type() {
+    // 0 is not "unlimited": credential arrays must be non-empty and at most
+    // this long, so 0 would make every consumer credential inadmissible.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_MAX_CREDENTIALS_PER_TYPE", "0"),
+        ],
+        || {
+            let err = EnvConfig::from_env().expect_err("zero limit must fail startup");
+            assert!(err.contains("FERRUM_MAX_CREDENTIALS_PER_TYPE"), "{err}");
+        },
+    );
+}
+
+#[test]
+fn test_max_credentials_per_type_runtime_parse_matches_env_config() {
+    // Startup trims the value; the runtime resolver must enforce the same
+    // number rather than silently falling back to the default.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_MAX_CREDENTIALS_PER_TYPE", " 5\n"),
+        ],
+        || {
+            let config = EnvConfig::from_env().expect("trimmed value is valid");
+            assert_eq!(config.max_credentials_per_type, 5);
+            assert_eq!(
+                ferrum_edge::config::types::max_credentials_per_type(),
+                config.max_credentials_per_type
+            );
+        },
+    );
+}
+
+#[test]
 fn test_env_config_accepts_admin_jwt_max_ttl_disable_sentinel() {
     with_env_vars(
         &[

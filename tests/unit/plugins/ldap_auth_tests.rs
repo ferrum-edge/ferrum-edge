@@ -2697,6 +2697,14 @@ fn test_dn_escape_backslash_angle_semi() {
 }
 
 #[test]
+fn test_dn_escape_nul_is_hex_escaped() {
+    // RFC 4514 §2.4: NUL must be escaped as `\00`; a raw NUL from a decoded
+    // Basic username would otherwise produce a malformed bind DN.
+    assert_eq!(escape_dn_value("a\0b"), "a\\00b");
+    assert_eq!(escape_dn_value("\0"), "\\00");
+}
+
+#[test]
 fn test_dn_escape_leading_space() {
     assert_eq!(escape_dn_value(" alice"), "\\ alice");
 }

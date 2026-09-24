@@ -5537,18 +5537,31 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
         let rule = rule.as_object().ok_or_else(|| {
             invalid_resource(object, format!("rules[{rule_index}] must be an object"))
         })?;
-        if rule.keys().any(|key| {
-            !matches!(
-                key.as_str(),
+        // `timeouts` is an HTTPRoute rule field on the pinned standard channel;
+        // GRPCRoute defines no such field and keeps refusing it. `retry`
+        // (experimental channel) is not implemented and stays refused.
+        let timeouts_supported = object.kind == "HTTPRoute";
+        let field_supported = |key: &str| {
+            matches!(
+                key,
                 "name" | "matches" | "backendRefs" | "filters" | "sessionPersistence"
-            )
-        }) {
+            ) || (timeouts_supported && key == "timeouts")
+        };
+        if rule.keys().any(|key| !field_supported(key.as_str())) {
+            let supported = if timeouts_supported {
+                "name, matches, backendRefs, filters, sessionPersistence and timeouts"
+            } else {
+                "name, matches, backendRefs, filters and sessionPersistence"
+            };
             return Err(invalid_resource(
                 object,
                 format!(
-                    "rules[{rule_index}] contains a field that {UNSUPPORTED_SHAPE_MARKER}; supported fields are name, matches, backendRefs, filters and sessionPersistence"
+                    "rules[{rule_index}] contains a field that {UNSUPPORTED_SHAPE_MARKER}; supported fields are {supported}"
                 ),
             ));
+        }
+        if timeouts_supported && let Some(timeouts) = rule.get("timeouts") {
+            ensure_http_route_timeouts(object, rule_index, timeouts)?;
         }
         if let Some(backends) = rule.get("backendRefs").and_then(Value::as_array) {
             for (backend_index, backend) in backends.iter().enumerate() {
@@ -5686,6 +5699,135 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
         }
     }
     Ok(())
+}
+
+/// Validate one admitted `HTTPRoute.rules[].timeouts` exactly as the pinned
+/// v1.5.1 CRD does. A file/CP-delivered object never passed through the API
+/// server's validation, so Ferrum re-checks it rather than guessing.
+///
+/// * `request` and `backendRequest` are each a Gateway API Duration (GEP-2257;
+///   CRD pattern `^([0-9]{1,5}(h|m|s|ms)){1,4}$`). A value outside that
+///   grammar is `Invalid`.
+/// * The CRD's CEL rule: when both are set and `request` is not the zero
+///   duration, `backendRequest` may not exceed it. A violation is `Invalid`.
+/// * A sub-field this CRD does not define — one a newer channel might add — is
+///   `UnsupportedValue`, like an unknown rule field.
+///
+/// Zero (`0s`) is accepted for both and means "disabled", as the CRD says.
+fn ensure_http_route_timeouts(
+    object: &K8sObject,
+    rule_index: usize,
+    timeouts: &Value,
+) -> Result<(), K8sTranslateError> {
+    let location = format!("rules[{rule_index}].timeouts");
+    let Some(timeouts) = timeouts.as_object() else {
+        return Err(invalid_resource(
+            object,
+            format!("{location} must be an object"),
+        ));
+    };
+    if timeouts
+        .keys()
+        .any(|key| !matches!(key.as_str(), "request" | "backendRequest"))
+    {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{location} contains a field that {UNSUPPORTED_SHAPE_MARKER}; supported fields are request and backendRequest"
+            ),
+        ));
+    }
+    let request_ms = http_route_timeout_field_ms(object, &location, timeouts, "request")?;
+    let backend_request_ms =
+        http_route_timeout_field_ms(object, &location, timeouts, "backendRequest")?;
+    if let (Some(request_ms), Some(backend_request_ms)) = (request_ms, backend_request_ms)
+        && request_ms != 0
+        && backend_request_ms > request_ms
+    {
+        return Err(invalid_resource(
+            object,
+            format!("{location}.backendRequest timeout cannot be longer than request timeout"),
+        ));
+    }
+    Ok(())
+}
+
+fn http_route_timeout_field_ms(
+    object: &K8sObject,
+    location: &str,
+    timeouts: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, K8sTranslateError> {
+    let Some(value) = timeouts.get(field) else {
+        return Ok(None);
+    };
+    // The value is never echoed: a status message must not reflect arbitrary
+    // manifest bytes back to readers of the route status.
+    value
+        .as_str()
+        .and_then(parse_gateway_api_duration_ms)
+        .map(Some)
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "{location}.{field} must be a Gateway API duration (GEP-2257) such as 500ms, 10s or 1h30m"
+                ),
+            )
+        })
+}
+
+/// Parse a Gateway API Duration (GEP-2257) exactly as the pinned CRD admits
+/// it — `^([0-9]{1,5}(h|m|s|ms)){1,4}$` — into whole milliseconds.
+///
+/// Components are summed the way Go's `time.ParseDuration` (and therefore the
+/// CRD's CEL `duration()`) sums them, so a repeated unit such as `1s1s` is two
+/// seconds. `ms` is matched before `m`: a component always starts with a
+/// digit, so `m` followed by `s` can only be milliseconds. Returns `None` for
+/// anything outside the grammar, including the empty string and more than four
+/// components. The largest admissible value (four `99999h` components) is far
+/// below `u64::MAX` milliseconds; the arithmetic is still checked.
+pub(crate) fn parse_gateway_api_duration_ms(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    let mut components = 0usize;
+    let mut total_ms: u64 = 0;
+    while index < bytes.len() {
+        if components == 4 {
+            return None;
+        }
+        let digits_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        let digits = index - digits_start;
+        if digits == 0 || digits > 5 {
+            return None;
+        }
+        let amount: u64 = value.get(digits_start..index)?.parse().ok()?;
+        let unit_ms: u64 = match bytes.get(index..) {
+            Some([b'm', b's', ..]) => {
+                index += 2;
+                1
+            }
+            Some([b'h', ..]) => {
+                index += 1;
+                3_600_000
+            }
+            Some([b'm', ..]) => {
+                index += 1;
+                60_000
+            }
+            Some([b's', ..]) => {
+                index += 1;
+                1_000
+            }
+            _ => return None,
+        };
+        total_ms = total_ms.checked_add(amount.checked_mul(unit_ms)?)?;
+        components += 1;
+    }
+    (components > 0).then_some(total_ms)
 }
 
 /// Validate one admitted header-modifier payload before any rule materializes.
@@ -6119,6 +6261,7 @@ fn http_route_resources(
             let response_transform = gateway_response_header_modifier_rules(rule);
             let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
             let rewrite = gateway_url_rewrite_value(rule);
+            let timeouts = gateway_route_rule_timeouts(rule);
             let mut backend_resolution = route_backends(object, rule, acc)?;
             let backend_tls_policy = super::backend_tls_policy::resolve_backends_tls_policy(
                 acc,
@@ -6155,17 +6298,18 @@ fn http_route_resources(
             // Upstream `HTTPRouteRule.backendRefs`: with no backend to forward
             // to and no filter that answers the request itself
             // (`RequestRedirect`), every matching request MUST receive a 500.
-            // Header modifiers and `URLRewrite` shape a forwarded request or
-            // its response; alone they would otherwise send traffic to the
-            // unresolvable blackhole backend. GRPCRoute keeps the blackhole,
-            // exactly as its all-zero-weight rule does.
+            // Header modifiers, `URLRewrite`, and `timeouts` shape a forwarded
+            // request or its response; alone they would otherwise send traffic
+            // to the unresolvable blackhole backend. GRPCRoute keeps the
+            // blackhole, exactly as its all-zero-weight rule does.
             if object.kind == "HTTPRoute"
                 && backend_resolution.backends.is_empty()
                 && backend_resolution.fault_reason.is_none()
                 && redirect.is_none()
                 && (!request_transform.is_empty()
                     || !response_transform.is_empty()
-                    || rewrite.is_some())
+                    || rewrite.is_some()
+                    || !timeouts.is_empty())
             {
                 backend_resolution.fault_reason = Some(BackendRefFaultReason::NoServiceableBackend);
                 acc.warnings.push(
@@ -6188,6 +6332,7 @@ fn http_route_resources(
                 redirect: redirect.as_ref(),
                 rewrite: rewrite.as_ref(),
                 fault: backend_ref_fault.as_ref(),
+                timeouts,
             };
             let has_route_actions = !rule_actions.is_empty();
 
@@ -6710,18 +6855,69 @@ struct RouteRuleActions<'a> {
     redirect: Option<&'a Value>,
     rewrite: Option<&'a Value>,
     fault: Option<&'a Value>,
+    timeouts: RouteRuleTimeouts,
 }
 
 impl RouteRuleActions<'_> {
     /// Whether this rule does something on its own, independent of a backend.
     /// A rule with only actions still materializes a dispatch rule so the
     /// action fires; a rule with none can fall through to the proxy default.
+    ///
+    /// Rule `timeouts` count: they must select their policy for exactly the
+    /// requests this rule matches, so a path-only rule carrying them still
+    /// emits its own dispatch rule instead of falling through to a proxy that
+    /// a sibling rule may share.
     fn is_empty(&self) -> bool {
         self.request_transform.is_empty()
             && self.response_transform.is_empty()
             && self.redirect.is_none()
             && self.rewrite.is_none()
             && self.fault.is_none()
+            && self.timeouts.is_empty()
+    }
+}
+
+/// An admitted HTTPRoute rule's `timeouts`, in milliseconds.
+///
+/// Both stay on the emitted `mesh_route_dispatch` rule — request-scoped policy
+/// for the requests that rule matches — and are never promoted onto the shared
+/// proxy or upstream, so a merged sibling rule without `timeouts` keeps the
+/// proxy defaults.
+#[derive(Clone, Copy, Default)]
+struct RouteRuleTimeouts {
+    /// `timeouts.request`: the rule's total request deadline, projected as
+    /// `request_timeout_ms`. `None` when absent or the zero duration, which
+    /// the CRD defines as disabled (Ferrum has no default total deadline).
+    request_ms: Option<u64>,
+    /// `timeouts.backendRequest`: the per-attempt backend bound, projected as
+    /// `timeout_ms`. `Some(0)` is the zero duration and projects as
+    /// `timeout_disabled`, clearing the proxy's default read bound for this
+    /// rule. `None` when absent.
+    backend_request_ms: Option<u64>,
+}
+
+impl RouteRuleTimeouts {
+    fn is_empty(&self) -> bool {
+        self.request_ms.is_none() && self.backend_request_ms.is_none()
+    }
+}
+
+/// Project an HTTPRoute rule's `timeouts`. Shape, grammar, and the CRD's
+/// `backendRequest <= request` rule were already enforced by
+/// [`ensure_http_route_timeouts`]; GRPCRoute never reaches here with one.
+fn gateway_route_rule_timeouts(rule: &Value) -> RouteRuleTimeouts {
+    let Some(timeouts) = rule.get("timeouts") else {
+        return RouteRuleTimeouts::default();
+    };
+    let field_ms = |field: &str| {
+        timeouts
+            .get(field)
+            .and_then(Value::as_str)
+            .and_then(parse_gateway_api_duration_ms)
+    };
+    RouteRuleTimeouts {
+        request_ms: field_ms("request").filter(|request_ms| *request_ms > 0),
+        backend_request_ms: field_ms("backendRequest"),
     }
 }
 
@@ -6984,6 +7180,24 @@ fn gateway_api_dispatch_route_rule(
     }
     if let Some(fault) = actions.fault {
         route_rule.insert("fault".to_string(), fault.clone());
+    }
+    if let Some(request_ms) = actions.timeouts.request_ms {
+        route_rule.insert(
+            "request_timeout_ms".to_string(),
+            serde_json::json!(request_ms),
+        );
+    }
+    match actions.timeouts.backend_request_ms {
+        Some(0) => {
+            route_rule.insert("timeout_disabled".to_string(), Value::Bool(true));
+        }
+        Some(backend_request_ms) => {
+            route_rule.insert(
+                "timeout_ms".to_string(),
+                serde_json::json!(backend_request_ms),
+            );
+        }
+        None => {}
     }
     route_rule.insert(
         GATEWAY_API_DISPATCH_PRECEDENCE_KEY.to_string(),

@@ -21,7 +21,8 @@ pub(crate) use core::secret_object_is_valid_tls_certificate;
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
     backend_lb_policy_conflict_losers, backend_lb_policy_status, gateway_api_section_name_is_valid,
-    merge_backend_lb_policy_status, namespace_selector_matches, parse_reference_grant_permissions,
+    merge_backend_lb_policy_status, namespace_selector_matches, parse_gateway_api_duration_ms,
+    parse_reference_grant_permissions,
 };
 pub use gateway_class::{FERRUM_GATEWAY_CONTROLLER_NAME, GatewayClassAuthority};
 // Re-exported for the integration suite's at-cap/over-cap L4 candidate and

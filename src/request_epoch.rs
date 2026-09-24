@@ -1849,6 +1849,14 @@ impl RequestEpochStore {
         self.current.load_full()
     }
 
+    /// Configuration generation of the published epoch, read through the
+    /// `ArcSwap` guard without cloning the epoch. Per-response callers compare
+    /// it against a memoized derivation before paying for [`Self::load`].
+    #[inline]
+    pub(crate) fn config_generation(&self) -> u64 {
+        self.current.load().config_generation
+    }
+
     /// Allocation-free gateway-to-mesh admission read.
     ///
     /// Dispatch classification and mesh egress capture ask this per request or
