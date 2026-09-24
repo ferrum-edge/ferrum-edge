@@ -76,7 +76,7 @@ surface drifts.
 | `tungstenite-004-fragment-accounting` | `tungstenite` | 0.29.0 | `FragmentMeter` + `max_incomplete_message_frames` / `max_incomplete_message_duration` (physical-fragment accounting and bounds) | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | The reader only sees reassembled messages, so fragmented (including zero-length continuation) frames bypass per-message admission policy and are unbounded in count and duration | Upstream ships an equivalent pre-reassembly fragment hook **and** independent incomplete-message count/duration bounds | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
 | `tokio-tungstenite-004-fragment-accounting-delegator` | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::set_fragment_accounting()` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Same accounting gap on the async wrapper, which hides the codec behind `SplitStream` after `split()` | Upstream ships the equivalent delegator alongside the tungstenite hook | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
 | `dimpl-001-certificate-chain-and-key-zeroization` | `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
-| `hyper-util-001-release-h1-sender-on-dispatch-close` | `hyper-util` | 0.1.20 | Legacy client releases an HTTP/1 connection's only request sender once its dispatcher stops reading, so a request stranded by a close during enqueue fails as unsent | **Filed** — [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) (hyper-util has issues disabled; filed on hyper, where the stranding dispatcher lives) | Ferrum Edge maintainers | tokio's unbounded `send` checks for closure and publishes in two steps; a backend RST/FIN on the pooled connection between them strands the request in a channel nobody reads, and hyper-util holds the last sender, so reqwest's `send()` hung until `backend_read_timeout_ms` (504) instead of failing fast (#5714) | A hyper-util release stops holding the only HTTP/1 sender after its dispatcher closes, or a hyper release stops stranding a racing send | [docs/upstream-hyper-util-patches/001-…](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md) |
+| `hyper-util-001-release-h1-sender-on-dispatch-close` | `hyper-util` | 0.1.20 | Legacy client releases an HTTP/1 connection's only request sender once its dispatcher stops reading, so a request stranded by a close during enqueue fails as unsent | **Deliberate fork** — no upstream PR; upstream issue [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) (hyper-util has issues disabled; filed on hyper, where the stranding dispatcher lives) ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | tokio's unbounded `send` checks for closure and publishes in two steps; a backend RST/FIN on the pooled connection between them strands the request in a channel nobody reads, and hyper-util holds the last sender, so reqwest's `send()` hung until `backend_read_timeout_ms` (504) instead of failing fast (#5714) | A hyper-util release stops holding the only HTTP/1 sender after its dispatcher closes, or a hyper release stops stranding a racing send | [docs/upstream-hyper-util-patches/001-…](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md) |
 
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/vendored-patch-lifecycle.json`,
 > `docs/upstream-*-patches/`, and the vendored-patch scripts are owned via
@@ -105,8 +105,9 @@ unfiled with `fork_ref: null` pending maintainer handoff — plus the tungstenit
 frame-limit origin and stray-continuation ordering extensions, **tungstenite `auto_pong`** (transparent Ping
 relay), **tungstenite / tokio-tungstenite 004** (fragment accounting and
 incomplete-message bounds), **dimpl 001** (DTLS certificate chains and private-key
-zeroization), and **hyper-util 001** (release a closed HTTP/1 sender; the
-upstream issue draft is in its patch directory). They are not untracked TODOs; they are carried as
+zeroization), and **hyper-util 001** (release a closed HTTP/1 sender; upstream
+issue [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202), no
+upstream PR yet). They are not untracked TODOs; they are carried as
 **deliberate, time-boxed forks** and are governed as follows:
 
 - **Owner.** The dependency-governance owner in
@@ -382,7 +383,9 @@ of the vendor copy and must keep passing after retirement:
   plus hyper-util's own `--test legacy_client` suite for ordinary keep-alive,
   reuse, and close behavior through the patched send path. The race sits
   between two instructions inside tokio's `send`, so the regressions build the
-  state it leaves behind rather than scheduling it.
+  state it leaves behind rather than scheduling it. The `pooled_http1` tests in
+  that module run the step `Client::try_send_request` takes after queuing a
+  request (`await_pooled_response`) against a real pooled HTTP/1 connection.
 
 CI gates these vendored-patch contracts in the `Vendored Patch Regressions`
 job in `.github/workflows/ci.yml`. Keep that job in sync with this list when

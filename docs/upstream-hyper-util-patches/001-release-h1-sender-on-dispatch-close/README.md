@@ -6,11 +6,14 @@
 
 ## Status
 
-Filed upstream as [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202)
+Deliberate fork with no upstream PR, governed by the
+[deliberate fork policy](../../dependency-policy.md#deliberate-fork-policy-and-sla).
+The bug is reported upstream as
+[hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202)
 (`hyperium/hyper-util` has issues disabled, and the stranding happens in
 hyper's HTTP/1 dispatcher). Owner: Ferrum Edge maintainers. This patch fixes
 Ferrum issue [#5714](https://github.com/ferrum-edge/ferrum-edge/issues/5714)
-(first seen as the #5575 flake). The filed text is kept in
+(first seen as the #5575 flake). The filed issue text is kept in
 [`issue.md`](issue.md).
 
 ## The bug
@@ -63,13 +66,16 @@ The crate's `.github/`, `Cargo.lock`, `Cargo.toml.orig`, `.gitignore` and
 `.cargo_vcs_info.json` are not vendored. `examples/` and `tests/` are kept
 because the published manifest names them as explicit targets.
 
-`try_send_request` now awaits the response through
-`await_response_or_release`. On every wake that helper polls the response
-first. For an HTTP/1 connection it then polls the pooled sender's
-`poll_ready` (hyper's `want::Giver::poll_want`):
+`try_send_request` now hands the queued request's response future and the
+pooled connection to `await_pooled_response`, which waits through
+`await_response_or_release` and maps the outcome back to `try_send_request`'s
+result. On every wake `await_response_or_release` polls the response first.
+Then, through `poll_h1_dispatch_open`, it polls an HTTP/1 connection's pooled
+sender's `poll_ready` (hyper's `want::Giver::poll_want`):
 
 - `Ready(Err)`: the dispatcher closed its queue or is gone. The helper records
-  `is_reused()` and `conn_info`, then drops the pooled connection. That drop
+  `is_reused()` and `conn_info` (`release_pool_conn`), then drops the pooled
+  connection. That drop
   releases the last sender, so tokio drops the stranded envelope and hyper
   fails the callback with `Canceled` plus the unsent request. The pool does not
   reinsert it, because a closed sender is not `is_open()`. The helper then
@@ -86,7 +92,9 @@ callback: through the channel destructor if the request was stranded, through
 the receiver drain if it was queued in time, or through the dispatcher's own
 error or `dispatch_gone` if it had been dequeued. A response delivered before
 the close is polled first, so it always wins. HTTP/2 senders are pool-shared
-clones and are not watched.
+clones and are not watched. A response that arrives after a release comes back
+without a connection handle, so `try_send_request` returns it without the step
+that hands the connection back to the pool.
 
 The outcome matches what hyper already produces when the dispatcher does see a
 request queued behind a connection error:
@@ -102,7 +110,10 @@ request queued behind a connection error:
 Hot path cost: one extra `poll_want` per poll of the response future (an
 atomic load; on the first park, a try-lock, a compare-and-swap and a waker
 clone, which is a reference-count increment for tokio). There is no
-allocation. `conn_info` is cloned only on the release path.
+allocation. `conn_info` is cloned only on the release path. The watch also
+leaves the task's waker in the connection's `want` slot, so a kept-alive HTTP/1
+response whose connection is not yet ready can cost one extra wake when the
+dispatcher next asks for work.
 
 ## Why not a Ferrum-side workaround
 
@@ -137,6 +148,25 @@ sender drops, on a connection whose dispatcher stops reading.
   hyper HTTP/1 connection, checks the premise that `poll_ready` reports
   closure once the dispatcher is gone with a request queued, and that the
   request comes back unsent.
+
+The `pooled_http1` tests run `await_pooled_response`, the step
+`try_send_request` takes after queuing a request, on a real pooled HTTP/1
+`PoolClient`:
+
+- `watch_reports_when_the_http1_dispatcher_is_gone`: `poll_h1_dispatch_open`
+  ends the watch while the dispatcher waits for work and reports closure once
+  it is dropped.
+- `release_records_reuse_and_conn_info`: `release_pool_conn` keeps the reuse
+  flag and the connection info of fresh and reused connections.
+- `unsent_request_on_released_connection_is_retryable_as_reused`: a request
+  that fails unsent only after the release maps to
+  `TrySendError::Retryable` with the reuse flag recorded before the release.
+- `response_on_released_connection_is_not_handed_back_for_the_pool`: a
+  response after a release keeps the connection's extras and comes back
+  without a handle.
+- `request_queued_when_reused_connection_closes_is_retryable`: with no
+  simulated state, a request queued on a reused connection whose dispatcher is
+  dropped comes back retryable.
 
 The `Vendored Patch Regressions` CI job runs them with
 

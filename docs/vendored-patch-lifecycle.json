@@ -706,7 +706,7 @@
       "owner_github": null,
       "reason": "An HTTP/1 request enqueued while its pooled connection closes can miss the dispatcher's drain; hyper-util holds the channel's only sender while waiting, so reqwest's send() hangs until backend_read_timeout_ms (504) instead of failing as an unsent request (#5714).",
       "upstream": {
-        "filing": "filed",
+        "filing": "deliberate_fork_unfiled",
         "github_repo": "hyperium/hyper",
         "pr_number": null,
         "issue_number": 4202,
@@ -723,8 +723,7 @@
       },
       "regression_tests": [
         "vendor/hyper-util-0.1.20-ferrum-patched (client::legacy::client::ferrum_release_on_close_tests)",
-        "vendor/hyper-util-0.1.20-ferrum-patched/tests/legacy_client.rs",
-        "tests/functional/scripted_backend_matrix_tests.rs (backend_accepts_then_rst_returns_502__*)"
+        "vendor/hyper-util-0.1.20-ferrum-patched/tests/legacy_client.rs"
       ]
     }
   ]
