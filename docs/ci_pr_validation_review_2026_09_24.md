@@ -18,7 +18,7 @@ required checks, and the release publication gate are unchanged.
 | Profile lanes: PR trigger limited to profiler paths; daily run on `main` | 610 fewer PR runs; about **30,100 runner-minutes** net of the daily runs |
 | `ci.yml` edits no longer start the Kind live suites | 248 fewer Kind jobs; about **5,100 runner-minutes** |
 | `tests/performance/**` benchmark workspaces no longer start the Rust lane | 17 fewer full Rust lanes; about **2,100 runner-minutes** and about 35 minutes of wall time on each of those PRs |
-| Data-plane functional shard split in two | Estimated median full-mode PR wall time from about 34.6 to about 32 minutes (not yet measured); costs about 1,200 extra runner-minutes |
+| Data-plane functional shard split in two | Full-mode PR functional phase ≈16.4 → 14.1 minutes (first hosted run); costs about 1,200 extra runner-minutes |
 | Superseded PR runs cancelled in 16 side workflows | Unmeasured; each saves up to the full job length per extra push |
 | Replay tool plus its self-test in `Tests` | Future gate changes can be measured before merge |
 
@@ -167,8 +167,26 @@ runner-minutes (all always-run `ci.yml` jobs), so about 2,100 runner-minutes.
   month.
 - The cost is one more runner's setup and container start: about 2.1 minutes,
   or about 1,200 runner-minutes a month.
-- These are estimates from the per-module times. Confirm them against the
-  hosted durations of the first few runs after merge.
+- These are estimates from the per-module times.
+
+**First hosted run with the split:** this PR's run
+[35968298802](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35968298802)
+on head `196050c`. It is one sample, so confirm it against the first week of
+runs after merge.
+
+| Job | This run (min) | Previous median (min) |
+|---|---:|---:|
+| Build Test Artifacts | 17.3 | 16.5 |
+| Functional Tests (data-plane) | 6.6 | 16.3 (single shard) |
+| Functional Tests (data-plane-runtime) | 8.7 | — |
+| Functional Tests (protocols), now last to finish | 14.1 | 13.7 |
+| Functional Tests (application) | 7.2 | 7.1 |
+| Build Test Artifacts done → last functional shard done | 14.1 | ≈16.4 |
+
+- `Tests` completed 32.75 minutes after `CI Plan` started. The earlier median
+  was about 34.2 minutes on the same basis.
+- All nine required checks passed on that head, including
+  `Trusted Cross Build Policy` with the `test-functional` edit.
 
 ### 5. Superseded runs were never cancelled in 16 side workflows
 
@@ -232,11 +250,9 @@ This PR's own CI turned `H2 pinned guard regressions`
   - `verify_publication_gate.py` still requires all nine to be green at the
     exact release SHA. That post-merge gate is what makes the narrower PR
     scoping safe.
-- **Trusted policy:** on this PR's second head (`1ca78e9`), `CI Policy`
-  reported `verified=true` and `Trusted Cross Build Policy` ran on the same
-  changes. The data-plane shard split edits the frozen `test-functional` job
-  in `ci.yml`, so it may need a reviewed policy decision if the trusted
-  verifier rejects it.
+- **Trusted policy:** `CI Policy` (`verified=true`) and
+  `Trusted Cross Build Policy` passed on head `196050c`, including the
+  `test-functional` edit in `ci.yml`. No override was needed.
 - **FIPS (`ci_runtime_plan.py` `fips-build`):** already scoped to FIPS logic.
   124 of 646 PRs (19%) run it, driven by `src/http3/server.rs`, `src/tls/`,
   `tests/unit/tls/`, and `Cargo.*`. It is required, so it stays.
