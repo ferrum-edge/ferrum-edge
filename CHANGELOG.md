@@ -42,6 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An HTTP/1.1 backend request no longer waits for `backend_read_timeout_ms`
+  and returns `504` when its pooled connection is reset or closed at the moment
+  the request is queued (#5714). The request never reached the backend, so it
+  now fails straight away: a reused connection is retried on a new one, and a
+  fresh connection returns `502` (`connection_pool_error`, pre-wire). The fix is
+  in a vendored hyper-util 0.1.20: its legacy client stops holding the closed
+  connection's only request sender, so the request stranded by tokio's
+  two-step channel send is dropped and fails as unsent. HTTP/1 pools that
+  Ferrum drives directly (HBONE inner HTTP/1, Unix-socket backends) are not
+  covered yet.
 - Reject a health-check `active.http_path` that does not start with `/`
   (#5683). The probe URL is `scheme://host:port` + path, so a path like
   `@169.254.169.254/` turned the target into userinfo and sent the probe to a

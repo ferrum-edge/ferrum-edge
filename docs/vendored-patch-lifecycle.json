@@ -694,6 +694,38 @@
       "regression_tests": [
         "vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs"
       ]
+    },
+    {
+      "id": "hyper-util-001-release-h1-sender-on-dispatch-close",
+      "label": "hyper-util legacy client releases a closed HTTP/1 sender",
+      "crate": "hyper-util",
+      "vendored_version": "0.1.20",
+      "vendor_path": "vendor/hyper-util-0.1.20-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "An HTTP/1 request enqueued while its pooled connection closes can miss the dispatcher's drain; hyper-util holds the channel's only sender while waiting, so reqwest's send() hangs until backend_read_timeout_ms (504) instead of failing as an unsent request (#5714).",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper-util",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "A hyper-util release stops holding the only HTTP/1 sender across the response wait after its dispatcher closes, or a hyper release stops stranding a racing send.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-util-0.1.20-ferrum-patched (client::legacy::client::ferrum_release_on_close_tests)",
+        "vendor/hyper-util-0.1.20-ferrum-patched/tests/legacy_client.rs",
+        "tests/functional/scripted_backend_matrix_tests.rs (backend_accepts_then_rst_returns_502__*)"
+      ]
     }
   ]
 }
