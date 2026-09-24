@@ -217,8 +217,10 @@ fn builtin_parity_meta_matches_registry_set() {
 
 #[tokio::test]
 async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
+    // ENV_LOCK first: `PluginCache` builds take the registry serializer while
+    // env-guarded tests hold ENV_LOCK, so ENV_LOCK is always the outer lock.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     let _registry = super::plugin_utils::log_schema_registry_guard();
-    super::plugin_utils::ensure_basic_auth_test_secret();
     let rows = parse_complete_order_table(EXECUTION_ORDER_DOC);
     assert_unique_names("complete-order table", rows.iter().map(|r| r.name.clone()));
 
@@ -307,8 +309,10 @@ async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
 
 #[tokio::test]
 async fn protocol_matrix_matches_parity_meta_and_runtime_protocols() {
+    // ENV_LOCK first: `PluginCache` builds take the registry serializer while
+    // env-guarded tests hold ENV_LOCK, so ENV_LOCK is always the outer lock.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     let _registry = super::plugin_utils::log_schema_registry_guard();
-    super::plugin_utils::ensure_basic_auth_test_secret();
     let rows = parse_protocol_matrix(EXECUTION_ORDER_DOC);
     assert_unique_names("protocol matrix", rows.iter().map(|r| r.name.clone()));
 

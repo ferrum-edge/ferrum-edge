@@ -144,12 +144,28 @@ gateway_matrix! {
 // ────────────────────────────────────────────────────────────────────────────
 //
 // Similar shape to Scenario 1 but the backend accepts the TCP
-// handshake then immediately RST's the socket
-// (`TcpStep::Reset` — `SO_LINGER=0` then drop). Distinct error
-// class from "refuse" — exercises the gateway's "request error"
-// classifier rather than its "connect error" classifier.
+// handshake then RST's the socket (`TcpStep::Reset` — `SO_LINGER=0`
+// then drop). Distinct error class from "refuse" — exercises the
+// gateway's "request error" classifier rather than its "connect
+// error" classifier.
 // The fixture repeats Reset on EVERY connection, including any capability
 // probe. Issue #5575 was not a Once-mode scenario; preserve that distinction.
+//
+// For the HTTP/1-dispatched backend kinds (H1, H2, Tcp all configure a
+// plain `http` backend) the fixture reads the request head before it
+// resets. Issue #5575's intermittent 504s were an immediate reset that
+// reached hyper's HTTP/1 dispatcher while it was still idle, concurrently
+// with the request being enqueued: every recorded failure logs hyper-util's
+// `client connection error` (the idle-connection error path, which fires
+// only when no request is in flight and none is visible in the dispatch
+// channel) and then nothing until `backend_read_timeout_ms`. The dispatcher
+// closes and drops its tokio receiver; a send that already passed the
+// closed check but has not published its message is neither received nor
+// drained, and hyper-util holds that channel's only sender across the
+// response await, so the request's cancellation never runs. That is an
+// upstream hyper/tokio race, not gateway classification. Reading the head
+// first guarantees the reset hits a dequeued, written request — the path
+// this scenario asserts. See `BackendKind::spawn_accept_then_rst`.
 //
 // Generated tests (after skips):
 //

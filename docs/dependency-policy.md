@@ -165,6 +165,20 @@ members are `publish = false`, so `[licenses] private = { ignore = true }`
 already covers their PolyForm-Noncommercial first-party licenses. Do not add an
 `ebpf/deny.toml`: a second config would let the two policies diverge.
 
+Both lanes also run an **advisories-only** pass over every standalone Cargo
+workspace (`fuzz/`, `tests/performance/**`, and any crate added later), each of
+which resolves its own committed `Cargo.lock` that neither check above can see
+(issues #5704, #5708). The manifest list comes from
+`.github/scripts/standalone_cargo_manifests.py`, the same inventory the ci.yml
+`standalone-cargo` fmt/check gate uses, so a new standalone crate is audited
+without editing either workflow. These harnesses never ship, so the license and
+ban policy is not applied to them; a vulnerable, unsound, or yanked version in
+one of their lockfiles is still blocking. The weekly workflow additionally runs
+the informational `cargo audit --file <lockfile>` over each of them. Refresh a
+standalone lockfile with a targeted
+`cargo update --manifest-path <manifest> -p <crate>@<locked-version>` so the
+benchmark inputs stay otherwise stable.
+
 Run locally:
 
 ```bash
@@ -172,6 +186,10 @@ cargo install --locked cargo-deny
 cargo deny check advisories bans sources licenses   # the gate (root workspace)
 cargo deny --manifest-path ebpf/Cargo.toml \
     check --allow advisory-not-detected --config deny.toml advisories bans sources licenses          # the gate (eBPF workspace)
+for manifest in $(python3 .github/scripts/standalone_cargo_manifests.py); do
+  cargo deny --manifest-path "$manifest" \
+    check --allow advisory-not-detected --config deny.toml advisories   # standalone workspaces
+done
 ```
 
 ### 2. Advisory exceptions are time-boxed

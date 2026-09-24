@@ -99,7 +99,7 @@ mod unix_bench {
     /// config model changes.
     fn bench_proxy(id: &str) -> Proxy {
         Proxy {
-labels: Default::default(),
+            labels: Default::default(),
             id: id.to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             name: None,
@@ -141,6 +141,13 @@ labels: Default::default(),
             h2_upgrade_policy: None,
             pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
+            // Derived-only (`#[serde(skip)]`): interned by
+            // `GatewayConfig::resolve_pending_limit_scopes` at config
+            // publication. This bench never publishes a config and dials the
+            // socket path directly through `checkout_h1`, which does not
+            // consult the H1 pending-admission scope, so the unresolved value
+            // keeps both arms measuring exactly the pre-field behaviour.
+            pending_limit_scope: None,
             upstream_id: Some("unix-upstream".to_string()),
             upstream_subset: None,
             api_spec_id: None,

@@ -941,6 +941,10 @@ DEPENDENCY_AUDIT_PATTERNS = [
     for pattern in (
         r"^\.github/workflows/ci\.yml$",
         r"^Cargo\.(?:toml|lock)$",
+        # Standalone workspaces (fuzz/, tests/performance/**, ...) carry their
+        # own lockfiles, which the job audits through the manifest inventory.
+        r"(?:^|/)Cargo\.(?:toml|lock)$",
+        r"^\.github/scripts/standalone_cargo_manifests\.py$",
         r"^ebpf/",
         r"^deny\.toml$",
         r"^vendor/",
@@ -949,6 +953,40 @@ DEPENDENCY_AUDIT_PATTERNS = [
         r"^docs/upstream-",
         r"^PRODUCTION_READINESS\.md$",
         r"^scripts/(?:check_advisory_expiry\.sh|check_vendored_patch_lifecycle\.py)$",
+    )
+]
+
+# `run_standalone_cargo`: `cargo fmt --check` and `cargo check --locked
+# --all-targets` over every standalone Cargo workspace the inventory script
+# discovers (fuzz/, tests/performance/**, and any crate added later). Their own
+# Rust/Cargo/proto inputs schedule it, as do the root build-graph inputs the
+# path-dependent crates (fuzz, tests/performance/mesh) compile and the public
+# gateway APIs those crates call (issues #5703, #5707).
+STANDALONE_CARGO_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        r"^\.github/workflows/ci\.yml$",
+        r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker)/",
+        r"^\.github/scripts/standalone_cargo_manifests\.py$",
+        r"(?:^|/)Cargo\.(?:toml|lock)$",
+        r"(?:^|/)rust-toolchain(?:\.toml)?$",
+        r"^\.cargo/",
+        r"^build\.rs$",
+        r"^proto/",
+        r"^vendor/",
+        r"^ebpf/ferrum-ebpf-common/",
+        r"^(?:fuzz|tests/performance)/.*\.(?:rs|proto)$",
+        # Gateway APIs the fuzz targets and mesh Criterion benches call.
+        r"^src/lib\.rs$",
+        r"^src/fuzz_support\.rs$",
+        r"^src/config/",
+        r"^src/config_sources/k8s/",
+        r"^src/identity/",
+        r"^src/load_balancer",
+        r"^src/modes/mesh/",
+        r"^src/xds/",
+        r"^src/plugins/(?:mod\.rs|otel_tracing\.rs|ip_restriction\.rs|ai_semantic_cache|utils/)",
+        r"^src/proxy/(?:datagram_client_address|mesh_udp_frame|proxy_protocol|unix_backend_pool)\.rs$",
     )
 ]
 
@@ -970,6 +1008,7 @@ JOB_GATE_NAMES = (
     "run_platform_build",
     "run_vendor_patches",
     "run_dependency_audit",
+    "run_standalone_cargo",
 )
 
 # Scripts whose logic controls the gate decisions themselves. Changing either
@@ -1122,6 +1161,9 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
         ),
         "run_dependency_audit": any_path_matches(
             DEPENDENCY_AUDIT_PATTERNS, changed_files
+        ),
+        "run_standalone_cargo": any_path_matches(
+            STANDALONE_CARGO_PATTERNS, changed_files
         ),
     }
 
@@ -1505,6 +1547,7 @@ def self_test() -> int:
                 "run_platform_build": True,
                 "run_vendor_patches": True,
                 "run_dependency_audit": True,
+                "run_standalone_cargo": True,
                 "run_secrets_backends": True,
                 "run_pkcs11": True,
                 "run_ebpf_kernel_live": False,
@@ -1544,6 +1587,7 @@ def self_test() -> int:
                 "run_platform_build": True,
                 "run_vendor_patches": True,
                 "run_dependency_audit": True,
+                "run_standalone_cargo": True,
                 "run_ebpf_build": False,
             },
         ),
@@ -1587,12 +1631,13 @@ def self_test() -> int:
                 "run_conformance": True,
                 "run_netns_capture_live": True,
                 "run_two_cluster_live": True,
+                "run_standalone_cargo": True,
             },
         ),
         (
             "pull_request",
             ["src/xds/mod.rs"],
-            src_only | {"run_conformance": True},
+            src_only | {"run_conformance": True, "run_standalone_cargo": True},
         ),
         (
             "pull_request",
@@ -1643,17 +1688,17 @@ def self_test() -> int:
         (
             "pull_request",
             ["fuzz/fuzz_targets/traceparent.rs"],
-            {"run_fuzz_smoke": True, "run_rust": False},
+            {"run_fuzz_smoke": True, "run_standalone_cargo": True, "run_rust": False},
         ),
         (
             "pull_request",
             ["src/fuzz_support.rs"],
-            src_only | {"run_fuzz_smoke": True},
+            src_only | {"run_fuzz_smoke": True, "run_standalone_cargo": True},
         ),
         (
             "pull_request",
             ["src/proxy/proxy_protocol.rs"],
-            src_only | {"run_fuzz_smoke": True},
+            src_only | {"run_fuzz_smoke": True, "run_standalone_cargo": True},
         ),
         (
             "pull_request",
@@ -1683,11 +1728,13 @@ def self_test() -> int:
             {"run_dependency_audit": True, "run_rust": False},
         ),
         # Standalone benchmark workspaces are not root-crate inputs; their own
-        # workflows (benchmark-harness-tests, performance-regression) own them.
+        # workflows (benchmark-harness-tests, performance-regression) own their
+        # runs, and the standalone-cargo gate owns their fmt/check. Standalone
+        # lockfiles are also dependency-audit inputs.
         (
             "pull_request",
             ["tests/performance/mesh/benches/rr_selection.rs"],
-            {name: False for name in JOB_GATE_NAMES},
+            {name: False for name in JOB_GATE_NAMES} | {"run_standalone_cargo": True},
         ),
         (
             "pull_request",
@@ -1695,7 +1742,25 @@ def self_test() -> int:
                 "tests/performance/multi_protocol/proto_bench.rs",
                 "tests/performance/multi_protocol/Cargo.lock",
             ],
+            {name: False for name in JOB_GATE_NAMES}
+            | {"run_standalone_cargo": True, "run_dependency_audit": True},
+        ),
+        (
+            "pull_request",
+            ["tests/performance/payload_size/Cargo.lock"],
+            {name: False for name in JOB_GATE_NAMES}
+            | {"run_standalone_cargo": True, "run_dependency_audit": True},
+        ),
+        (
+            "pull_request",
+            ["tests/performance/multi_protocol/run_protocol_test.sh"],
             {name: False for name in JOB_GATE_NAMES},
+        ),
+        (
+            "pull_request",
+            [".github/scripts/standalone_cargo_manifests.py"],
+            {name: False for name in JOB_GATE_NAMES}
+            | {"run_standalone_cargo": True, "run_dependency_audit": True},
         ),
         # ...except the fixtures root-crate unit tests embed.
         (

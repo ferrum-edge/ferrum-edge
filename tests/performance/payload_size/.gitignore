@@ -1,4 +1,3 @@
 target/
 certs/
 results/
-Cargo.lock

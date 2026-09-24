@@ -2875,3 +2875,92 @@ fn arming_a_route_request_timeout_folds_into_the_grpc_deadline() {
     assert_eq!(looser_client.grpc_deadline_at(), Some(folded));
     assert!(route_deadline > tokio::time::Instant::now());
 }
+
+#[tokio::test]
+async fn mesh_route_dispatch_retry_only_rule_is_an_action_catch_all() {
+    // The Gateway API translator emits a path-only HTTPRoute rule whose only
+    // effect is its `retry` as an empty-match rule; it must admit and select
+    // the policy for the requests it matches.
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {},
+            "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+            "retry": {
+                "max_retries": 2,
+                "retryable_status_codes": [503],
+                "backoff": {"fixed": {"delay_ms": 25}},
+                "retry_on_connect_failure": true
+            }
+        }]
+    }))
+    .expect("a retry-only rule is a route-action catch-all");
+
+    let mut request = ctx();
+    let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let retry = request
+        .route_override_retry
+        .clone()
+        .flatten()
+        .expect("the matched rule publishes its retry policy");
+    assert_eq!(retry.max_retries, 2);
+    assert_eq!(retry.retryable_status_codes, vec![503]);
+    assert_eq!(
+        retry.retryable_methods,
+        RetryConfig::default().retryable_methods
+    );
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_retry_disabled_only_rule_is_an_action_catch_all() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {},
+            "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+            "retry_disabled": true
+        }]
+    }))
+    .expect("a retry_disabled-only rule is a route-action catch-all");
+
+    let mut request = ctx();
+    let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    // `Some(None)` explicitly clears an inherited proxy retry policy.
+    assert_eq!(request.route_override_retry, Some(None));
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_publishes_retry_for_the_matched_rule_only() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [
+            {
+                "match": {"headers": {"x-variant": "retry"}},
+                "destination": {"upstream_id": "retried"},
+                "retry": {"max_retries": 1, "retryable_status_codes": [502]}
+            },
+            {
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "plain"}
+            }
+        ]
+    }))
+    .expect("retry is a valid rule field");
+
+    let mut retried = ctx();
+    let mut headers = HashMap::from([("x-variant".to_string(), "retry".to_string())]);
+    let result = plugin.before_proxy(&mut retried, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let retry = retried
+        .route_override_retry
+        .clone()
+        .flatten()
+        .expect("the matched rule publishes its retry policy");
+    assert_eq!(retry.max_retries, 1);
+
+    // A request matching the sibling rule inherits the proxy policy untouched.
+    let mut plain = ctx();
+    let result = plugin.before_proxy(&mut plain, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plain.route_override_upstream_id.as_deref(), Some("plain"));
+    assert_eq!(plain.route_override_retry, None);
+}

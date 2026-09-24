@@ -12848,6 +12848,35 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             }]}),
             true,
         ),
+        // So is rule `retry`: the Gateway API translator emits a path-only
+        // rule whose only effect is its `retry` (or `attempts: 0`).
+        (
+            "retry_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "retry": {"max_retries": 2, "retryable_status_codes": [503]}
+            }]}),
+            true,
+        ),
+        (
+            "retry_disabled_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "retry_disabled": true
+            }]}),
+            true,
+        ),
+        (
+            "retry_disabled_false_is_not_a_route_action",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "retry_disabled": false
+            }]}),
+            false,
+        ),
         (
             "request_timeout_with_backend_timeout",
             parity_rule(json!({"request_timeout_ms": 10_000, "timeout_ms": 2_000})),
