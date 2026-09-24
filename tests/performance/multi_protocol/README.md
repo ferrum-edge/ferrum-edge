@@ -28,6 +28,19 @@ cd tests/performance/multi_protocol
 ./run_protocol_test.sh http2 --envoy --duration 30 --concurrency 200
 ```
 
+## Port conflicts and cleanup ownership
+
+`run_protocol_test.sh`, `run_gateway_protocol_bench.sh`, and
+`run_connection_saturation_bench.sh` refuse to start if any of their fixed
+ports (8000, 8443, and the backend/gateway/Envoy/Redis ports) is already bound,
+printing the port and an `lsof` command to inspect the listener, instead of
+`SIGKILL`-ing whatever is listening there. During the run, cleanup terminates
+only the PIDs and Docker container IDs that run recorded — sending `SIGTERM`,
+waiting a bounded interval, and then `SIGKILL` only if the process is still
+alive — and removes certificates/results only when that run actually created
+them. An early failure (for example, a port conflict) therefore cannot kill an
+unrelated local service or another test's listeners.
+
 ## Supported Protocols
 
 | Protocol | Client &rarr; Gateway | Gateway &rarr; Backend | Gateway Port | Backend Port |
@@ -690,8 +703,11 @@ share one definition. This package is not a workspace member, so the workspace
 `Tests` aggregate never builds it; the **Benchmark Harness Tests** workflow
 (`.github/workflows/benchmark-harness-tests.yml`) is the hosted lane that runs
 these tests, on every pull request and `main` push touching
-`tests/performance/multi_protocol/**`. It is not a branch-protection-required
-check. The same two commands run locally:
+`tests/performance/**`. It is not a branch-protection-required
+check. It also runs a static contract
+(`tests/test_benchmark_runner_cleanup.py`) that fails if any benchmark runner
+or its invoking workflow still contains a port-wide `SIGKILL` idiom. The same
+two commands run locally:
 
 ```bash
 python3 -m unittest discover -s tests/performance/multi_protocol/tests -p 'test_*.py'

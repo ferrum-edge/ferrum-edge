@@ -133,11 +133,7 @@ pub async fn handle_tcp_connection(mut stream: TcpStream) -> Result<(), anyhow::
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => return Err(anyhow::anyhow!("timed out reading TCP DNS length")),
         }
-        match tokio::time::timeout(
-            STUB_TCP_IO_TIMEOUT,
-            stream.read_exact(&mut len_buf[1..]),
-        )
-        .await
+        match tokio::time::timeout(STUB_TCP_IO_TIMEOUT, stream.read_exact(&mut len_buf[1..])).await
         {
             Ok(Ok(_)) => {}
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {

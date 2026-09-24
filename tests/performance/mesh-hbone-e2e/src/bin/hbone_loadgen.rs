@@ -125,7 +125,9 @@ async fn run(args: &RunArgs) -> Result<()> {
         }
     }
     if worker_join_failed {
-        return Err(anyhow::anyhow!("one or more HBONE load-generator workers failed"));
+        return Err(anyhow::anyhow!(
+            "one or more HBONE load-generator workers failed"
+        ));
     }
 
     let label = "hbone_e2e";

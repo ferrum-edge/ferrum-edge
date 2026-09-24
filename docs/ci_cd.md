@@ -675,7 +675,8 @@ aggregate accepts a skipped job only when its gate was `false`:
 | `run_fuzz_smoke` | Fuzz Smoke (property tests) | `fuzz/`, `src/fuzz_support.rs`, the parsers it links, `Cargo.*`, `vendor/` |
 | `run_platform_build` | Build (`pr-build` profile, `cloud-secrets`) | build graph, `src/secrets/`, the binary entry points |
 | `run_vendor_patches` | Vendored Patch Regressions | `vendor/`, `Cargo.*`, toolchain |
-| `run_dependency_audit` | Dependency Audit (cargo-deny) | `Cargo.*`, `deny.toml`, `vendor/`, `ebpf/`, the dependency-policy and vendored-patch lifecycle docs, the advisory/lifecycle scripts |
+| `run_dependency_audit` | Dependency Audit (cargo-deny) | `Cargo.*` (root and every standalone workspace), `deny.toml`, `vendor/`, `ebpf/`, the dependency-policy and vendored-patch lifecycle docs, the advisory/lifecycle scripts, the standalone manifest inventory |
+| `run_standalone_cargo` | Standalone Cargo Workspaces (fmt + `cargo check --locked --all-targets`) | Rust/proto sources and any `Cargo.*` / toolchain file under `fuzz/` or `tests/performance/`, the root build graph the path-dependent crates compile, the gateway modules the fuzz targets and mesh benches call (`src/config/`, `src/modes/mesh/`, `src/xds/`, `src/identity/`, `src/load_balancer*`, `src/fuzz_support.rs`, the called plugins/proxy parsers), the manifest inventory, `ci.yml` |
 | `run_helm` | Helm Chart | `charts/`, Dockerfiles, the Kubernetes-facing runtime modules, chart lint scripts |
 | `run_secrets_backends`, `run_pkcs11` | Secret Backends, PKCS#11 SoftHSM | unchanged feature-scoped surfaces |
 | `run_ebpf_kernel_live`, `run_netns_capture_live`, `run_two_cluster_live` | the three privileged ci.yml live suites | only their owner modules and harnesses; never the Cargo build graph |
@@ -699,6 +700,40 @@ A regression in any of these on an ordinary source change turns `main` red
 for that commit, which makes the commit ineligible for a production release
 (see [Publish-blocking required checks](#publish-blocking-required-checks));
 it does not cost every unrelated pull request a Kind cluster or a FIPS build.
+
+### Standalone Cargo workspaces
+
+The root `Cargo.toml` declares no `[workspace]`, so the root `cargo fmt --all`
+in CI Plan and every root compile/lint/audit job see only `ferrum-edge`. The
+fuzz crate and the `tests/performance/**` harnesses (`backend_server`, `mesh`,
+`mesh-dns-e2e`, `mesh-hbone-e2e`, `multi_protocol`, `payload_size`) each
+resolve as a separate workspace with a committed `Cargo.lock`. Issues #5703,
+#5704, #5707, and #5708 were all drift that only those separate workspaces
+could show: rustfmt drift, a stale lockfile carrying vulnerable QUIC/HTTP/2
+versions, a bench that stopped compiling when `Proxy` gained a field, and an
+ignored lockfile.
+
+`.github/scripts/standalone_cargo_manifests.py` inventories every manifest
+outside the root package, `vendor/` (patched upstream copies owned by
+`test-vendor-patches`), and `ebpf/` (the nightly BPF workspace owned by
+`build-ebpf` and the eBPF cargo-deny step), skipping members of an ancestor
+`[workspace]`. It has a `--self-test` and fails closed on an empty inventory.
+Two consumers read it, so a new standalone crate is covered by the pull
+request that adds it:
+
+- `standalone-cargo` (**Standalone Cargo Workspaces**, gated by
+  `run_standalone_cargo`, required through the `Tests` aggregate) runs
+  `cargo fmt --manifest-path <m> --all -- --check` and
+  `cargo check --locked --manifest-path <m> --workspace --all-targets` for
+  each manifest from the repository root, so the root `rust-toolchain.toml`
+  stable toolchain and `.cargo/config.toml` apply. A shared
+  `CARGO_TARGET_DIR` lets the two path-dependent crates reuse one compile of
+  the gateway library; the `ci-standalone-cargo` rust-cache lane is saved only
+  on `main`. The formatting step prints rustfmt's diff; apply it with
+  `cargo fmt --manifest-path <m> --all`.
+- Both dependency-audit lanes (`dependency-audit` in `ci.yml`, weekly
+  `dependency-audit.yml`) run `cargo deny ... check advisories` over each
+  inventoried lockfile. See `docs/dependency-policy.md`.
 
 ### Optional PR lanes and post-merge validation
 

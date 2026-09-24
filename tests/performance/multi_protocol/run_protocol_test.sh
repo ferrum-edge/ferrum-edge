@@ -52,26 +52,72 @@ done
 GATEWAY_HTTP_PORT=8000
 GATEWAY_HTTPS_PORT=8443
 ENVOY_ADMIN_PORT=15000
+# Every fixed port the backend, gateway, and Envoy bind. The startup conflict
+# check and cleanup share this one list so they can never drift apart.
+BENCH_PORTS="3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
+$GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010 $ENVOY_ADMIN_PORT"
 
-# Track PIDs for cleanup
+# Track PIDs and artifacts created by this run. Cleanup terminates only these
+# PIDs (never anything an unrelated local service or a prior run started) and
+# deletes certs/results only once this run actually produced them.
 BACKEND_PID=""
 GATEWAY_PID=""
 ENVOY_PID=""
 RESULTS_DIR=""
+ARTIFACTS_OWNED=false
+
+# Gracefully stop a PID this run started: TERM, bounded wait, then KILL.
+stop_pid() {
+    local pid="$1"
+    local attempt
+    [ -z "$pid" ] && return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for attempt in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+# Refuse a port that is already bound instead of killing its owner.
+check_port_available() {
+    local port="$1"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo -e "${RED}Required TCP port $port is already in use. Inspect it with: lsof -nP -iTCP:$port -sTCP:LISTEN${NC}"
+        return 1
+    fi
+    if lsof -nP -iUDP:"$port" >/dev/null 2>&1; then
+        echo -e "${RED}Required UDP port $port is already in use. Inspect it with: lsof -nP -iUDP:$port${NC}"
+        return 1
+    fi
+}
+
+check_ports_available() {
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo -e "${RED}lsof is required to detect port conflicts before starting.${NC}"
+        return 1
+    fi
+    local port
+    for port in $BENCH_PORTS; do
+        check_port_available "$port" || return 1
+    done
+}
 
 cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
-    [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
-    [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
-    [ -n "$ENVOY_PID" ] && kill "$ENVOY_PID" 2>/dev/null || true
-    # Kill processes on known ports
-    for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
-                $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010 $ENVOY_ADMIN_PORT; do
-        lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    done
-    rm -rf "$SCRIPT_DIR/certs" 2>/dev/null || true
-    rm -f "$SCRIPT_DIR"/ferrum_runtime_*.yaml 2>/dev/null || true
-    [ -n "$RESULTS_DIR" ] && rm -rf "$RESULTS_DIR" 2>/dev/null || true
+    stop_pid "$GATEWAY_PID"
+    stop_pid "$BACKEND_PID"
+    stop_pid "$ENVOY_PID"
+    if $ARTIFACTS_OWNED; then
+        rm -rf "$SCRIPT_DIR/certs" 2>/dev/null || true
+        rm -f "$SCRIPT_DIR"/ferrum_runtime_*.yaml 2>/dev/null || true
+        [ -n "$RESULTS_DIR" ] && rm -rf "$RESULTS_DIR" 2>/dev/null || true
+    fi
     echo -e "${GREEN}Cleanup complete${NC}"
 }
 trap cleanup EXIT
@@ -266,11 +312,8 @@ start_gateway() {
 }
 
 stop_gateway() {
-    [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
+    stop_pid "$GATEWAY_PID"
     GATEWAY_PID=""
-    for port in $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5010 5001 5003 5004; do
-        lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    done
     sleep 1
 }
 
@@ -334,11 +377,8 @@ start_envoy() {
 }
 
 stop_envoy() {
-    [ -n "$ENVOY_PID" ] && kill "$ENVOY_PID" 2>/dev/null || true
+    stop_pid "$ENVOY_PID"
     ENVOY_PID=""
-    for port in $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5010 5001 5003 $ENVOY_ADMIN_PORT; do
-        lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    done
     sleep 1
 }
 
@@ -745,29 +785,6 @@ run_envoy_comparison() {
     print_comparison_table "${protos[@]}"
 }
 
-# Kill stale processes from prior crashed runs before starting.
-# Without this, leftover listeners on test ports cause "Connection refused"
-# or "Address already in use" failures when the backend/gateway try to bind.
-kill_stale_processes() {
-    local stale=false
-    for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
-                $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010 $ENVOY_ADMIN_PORT; do
-        if lsof -ti:"$port" > /dev/null 2>&1; then
-            stale=true
-            break
-        fi
-    done
-    if $stale; then
-        echo -e "${YELLOW}Killing stale processes from prior run...${NC}"
-        for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
-                    $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010 $ENVOY_ADMIN_PORT; do
-            lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
-        done
-        sleep 1
-        echo -e "${GREEN}Stale processes cleaned${NC}"
-    fi
-}
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if $ENVOY_MODE; then
@@ -777,9 +794,10 @@ if $ENVOY_MODE; then
     echo ""
 
     check_envoy
-    kill_stale_processes
+    check_ports_available || exit 1
     build
     start_backend
+    ARTIFACTS_OWNED=true
 
     run_envoy_comparison
 
@@ -792,9 +810,10 @@ else
     echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
     echo ""
 
-    kill_stale_processes
+    check_ports_available || exit 1
     build
     start_backend
+    ARTIFACTS_OWNED=true
 
     case "$PROTOCOL" in
         http1)     test_http1 ;;

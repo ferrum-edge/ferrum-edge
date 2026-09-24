@@ -311,9 +311,67 @@ GATEWAY_CID=""
 sampler_pid=""
 sampler_stop_file=""
 CERT_DIR="$SCRIPT_DIR/certs"
+# Every fixed port this runner's backend/gateways/Redis/Envoy bind. The startup
+# conflict check and cleanup share this list so they cannot drift apart.
+BENCH_PORTS="3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 3446 3447 \
+50052 50053 \
+$GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT \
+$GATEWAY_TCP_TLS_PORT $GATEWAY_UDP_PORT $GATEWAY_UDP_DTLS_PORT \
+15000 9901 6379"
+
+# Gracefully stop a PID this run started: TERM, bounded wait, then KILL.
+stop_pid() {
+    local pid="$1"
+    local attempt
+    [ -z "$pid" ] && return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for attempt in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+# Gracefully stop a Docker container this run started: `docker stop` (SIGTERM
+# then bounded SIGKILL) with a forced removal fallback.
+stop_container() {
+    local cid="$1"
+    [ -z "$cid" ] && return 0
+    docker stop --time 5 "$cid" >/dev/null 2>&1 || true
+    docker rm -f "$cid" >/dev/null 2>&1 || true
+}
+
+# Refuse a port that is already bound instead of killing its owner.
+check_port_available() {
+    local port="$1"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "[error] required TCP port $port is already in use; inspect with: lsof -nP -iTCP:$port -sTCP:LISTEN" >&2
+        return 1
+    fi
+    if lsof -nP -iUDP:"$port" >/dev/null 2>&1; then
+        echo "[error] required UDP port $port is already in use; inspect with: lsof -nP -iUDP:$port" >&2
+        return 1
+    fi
+}
+
+check_ports_available() {
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo "[error] lsof is required to detect port conflicts before starting." >&2
+        return 1
+    fi
+    local port
+    for port in $BENCH_PORTS; do
+        check_port_available "$port" || return 1
+    done
+}
 
 cleanup() {
-    echo "[cleanup] stopping all processes..."
+    echo "[cleanup] stopping processes this run started..."
     if [ -n "$sampler_pid" ]; then
         if [ -n "$sampler_stop_file" ]; then
             touch "$sampler_stop_file"
@@ -322,23 +380,17 @@ cleanup() {
         fi
         wait "$sampler_pid" || true
     fi
-    [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
-    [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
-    [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
+    stop_pid "$BACKEND_PID"
+    stop_container "$GATEWAY_CID"
+    stop_container "$REDIS_CID"
     h1_trace_stop
-    for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 3446 3447 \
-                50052 50053 \
-                $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT \
-                $GATEWAY_TCP_TLS_PORT $GATEWAY_UDP_PORT $GATEWAY_UDP_DTLS_PORT \
-                15000 9901 6379; do
-        lsof -ti:"$port" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-    done
 }
 if [ "$H1_PROFILE" != diagnostic ]; then
     trap cleanup EXIT
 fi
 # Diagnostic cleanup is unconditional in the independent supervisor. In
-# particular it does not inherit cleanup()'s unbounded waits or port-wide kill.
+# particular it does not inherit cleanup()'s owned-process waits; that rerun
+# path stops and removes only the gateway/backend IDs that supervisor started.
 
 # ── Build ────────────────────────────────────────────────────────────────────
 build_binaries() {
@@ -949,8 +1001,8 @@ h1_trace_stop() {
 stop_gateway() {
     # Successful run_bench already obtained the supervisor's teardown receipt.
     # Startup/abort cleanup has no receipt and must remain an incomplete capture.
-    [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
-    [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
+    stop_container "$GATEWAY_CID"
+    stop_container "$REDIS_CID"
     h1_trace_stop
     GATEWAY_CID=""
     REDIS_CID=""
@@ -1222,6 +1274,10 @@ run_bench() {
 main() {
     mkdir -p "$OUTPUT_DIR"
     echo "[main] protocol=$PROTOCOL sizes=$PAYLOAD_SIZES gateways=$GATEWAYS"
+
+    # Refuse to start on a host that already has any benchmark port bound rather
+    # than silently killing the unrelated listener later.
+    check_ports_available || exit 1
 
     # A paired suite is self-contained even when the frozen caller passes
     # --skip-direct after iteration one. Every pair measures direct again.

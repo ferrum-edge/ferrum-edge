@@ -133,9 +133,7 @@ async fn main() -> Result<(), anyhow::Error> {
         print_text_report(&all_reports, &args.target, args.concurrency);
     }
 
-    if let Some(reason) =
-        selected_reports_failure(&all_reports, &selected_classes, &transports)
-    {
+    if let Some(reason) = selected_reports_failure(&all_reports, &selected_classes, &transports) {
         eprintln!("[dns_loadgen] {reason}");
         return Err(anyhow!(reason));
     }
