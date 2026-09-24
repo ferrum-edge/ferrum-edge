@@ -66,8 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in a vendored hyper-util 0.1.20: its legacy client stops holding the closed
   connection's only request sender, so the request stranded by tokio's
   two-step channel send is dropped and fails as unsent. HTTP/1 pools that
-  Ferrum drives directly (HBONE inner HTTP/1, Unix-socket backends) are not
-  covered yet.
+  Ferrum drives directly (HBONE inner HTTP/1, Unix-socket backends) get the same
+  release in Ferrum code (#5720).
 - Benchmark runners no longer `SIGKILL` unrelated host listeners on fixed ports
   (#5702). `run_protocol_test.sh`, `run_gateway_protocol_bench.sh`,
   `run_connection_saturation_bench.sh`, `run_perf_test.sh`, `run_payload_test.sh`,

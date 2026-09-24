@@ -182,14 +182,13 @@ End to end, the `backend_accepts_then_rst_returns_502__*` functional matrix
 exercises the reset-at-dispatch shape. PR #5712 makes those cells reset only
 after the request head arrives, so they no longer depend on this interleaving.
 
-## Not covered
+## Ferrum's own HTTP/1 pools
 
 Ferrum's own HTTP/1 pools that drive `hyper::client::conn::http1::SendRequest`
-directly (the HBONE inner HTTP/1 path and the Unix-socket backend pool in
-`src/proxy/mod.rs` and `src/proxy/unix_backend_pool.rs`) hold their sender
-across the response wait in the same way, so the same interleaving can stall
-them. They are outside hyper-util, and they need the same release in Ferrum
-code.
+directly (the HBONE inner HTTP/1 path and the Unix-socket backend pool) hold
+their sender across the response wait in the same way. They are outside
+hyper-util and get the same release in Ferrum code:
+`src/proxy/h1_send_release.rs` (#5720).
 
 ## Retirement plan
 
