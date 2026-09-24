@@ -24,12 +24,12 @@ name: Benchmark Harness Tests
 on:
   pull_request:
     paths:
-      - tests/performance/multi_protocol/**
+      - tests/performance/**
       - .github/workflows/benchmark-harness-tests.yml
   push:
     branches: [main]
     paths:
-      - tests/performance/multi_protocol/**
+      - tests/performance/**
       - .github/workflows/benchmark-harness-tests.yml
   workflow_dispatch:
 

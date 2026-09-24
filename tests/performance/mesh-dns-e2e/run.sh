@@ -55,20 +55,63 @@ HBONE_PORT=17008
 EAST_WEST_PORT=17443
 EGRESS_PORT=17090
 
+# Every fixed port this run binds (gateway DNS, stubs, sidecar topology). The
+# startup conflict check and cleanup share this list so they cannot drift apart.
+BENCH_PORTS="$GATEWAY_DNS_PORT $UPSTREAM_STUB_PORT $CP_STUB_PORT \
+$INBOUND_PORT $OUTBOUND_PORT $HBONE_PORT $EAST_WEST_PORT $EGRESS_PORT"
+
 GATEWAY_PID=""
 CP_STUB_PID=""
 UPSTREAM_PID=""
 
+# Gracefully stop a PID this run started: TERM, bounded wait, then KILL.
+stop_pid() {
+    local pid="$1"
+    local attempt
+    [ -z "$pid" ] && return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for attempt in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+# Refuse a port that is already bound instead of killing its owner.
+check_port_available() {
+    local port="$1"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo -e "${RED}Required TCP port $port is already in use. Inspect it with: lsof -nP -iTCP:$port -sTCP:LISTEN${NC}"
+        return 1
+    fi
+    if lsof -nP -iUDP:"$port" >/dev/null 2>&1; then
+        echo -e "${RED}Required UDP port $port is already in use. Inspect it with: lsof -nP -iUDP:$port${NC}"
+        return 1
+    fi
+}
+
+check_ports_available() {
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo -e "${RED}lsof is required to detect port conflicts before starting.${NC}"
+        return 1
+    fi
+    local port
+    for port in $BENCH_PORTS; do
+        check_port_available "$port" || return 1
+    done
+}
+
 cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
     archive_failure_diagnostics
-    [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
-    [ -n "$CP_STUB_PID" ] && kill "$CP_STUB_PID" 2>/dev/null || true
-    [ -n "$UPSTREAM_PID" ] && kill "$UPSTREAM_PID" 2>/dev/null || true
-    for port in $GATEWAY_DNS_PORT $UPSTREAM_STUB_PORT $CP_STUB_PORT \
-                $INBOUND_PORT $OUTBOUND_PORT $HBONE_PORT $EAST_WEST_PORT $EGRESS_PORT; do
-        lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    done
+    stop_pid "$GATEWAY_PID"
+    stop_pid "$CP_STUB_PID"
+    stop_pid "$UPSTREAM_PID"
     echo -e "${GREEN}Cleanup complete${NC}"
 }
 trap cleanup EXIT
@@ -89,13 +132,9 @@ archive_failure_diagnostics() {
     done
 }
 
-# Kill any stragglers from a previous crashed run
-for port in $GATEWAY_DNS_PORT $UPSTREAM_STUB_PORT $CP_STUB_PORT \
-            $INBOUND_PORT $OUTBOUND_PORT $HBONE_PORT $EAST_WEST_PORT $EGRESS_PORT; do
-    if lsof -ti:"$port" >/dev/null 2>&1; then
-        lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    fi
-done
+# Refuse to start if any benchmark port is already bound (leftover from a
+# crashed run or an unrelated local service) instead of killing its owner.
+check_ports_available || exit 1
 
 build() {
     if $SKIP_BUILD; then

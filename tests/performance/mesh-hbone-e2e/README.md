@@ -61,6 +61,11 @@ cargo build --release --example hbone_perf_fixture
 
 ## Caveats
 
+- **Port conflicts fail closed.** `run.sh` refuses to start if 18000, 19999, or
+  15008 is already bound, and cleanup stops only the gateway/sidecar/backend
+  PIDs this run started (graceful `SIGTERM`, bounded wait, then `SIGKILL`) and
+  removes `$RUNTIME_DIR` only after it was created by this run. It never kills
+  an unrelated listener on those ports.
 - **Steady-state only.** The mTLS handshake and HBONE CONNECT setup are amortised across many requests; the per-request cost dominates after the first.
 - **Operator-specific numbers.** Baseline RPS depends entirely on hardware. The shipped `baseline.md` records provenance-tagged GitHub-hosted reference numbers; operators should run `./run.sh` on production-equivalent hardware before setting local expectations.
 - **Cross-platform.** macOS works end-to-end via the userspace HBONE relay. Linux uses the same userspace relay (the gateway's `splice(2)` fast path is bypassed for HBONE because the tunnel terminates in userspace TLS state).
