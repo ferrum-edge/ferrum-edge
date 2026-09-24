@@ -2665,8 +2665,9 @@ pub(crate) trait AdminResource:
         pagination: &super::PaginationParams,
     ) -> DbResult<PaginatedResult<Self>>;
 
-    /// Optional query filter a list route accepts. Default is unit — no filter.
-    type ListFilter: Send + Sync + Clone + Default + 'static = ();
+    /// Optional query filter a list route accepts. Resources without one use `()`
+    /// (associated type defaults are unstable, so each impl names it).
+    type ListFilter: Send + Sync + Clone + Default + 'static;
 
     /// Database list that applies `filter` inside the backend's own WHERE
     /// clause / filter document so `total` and the selected page both reflect
@@ -3604,6 +3605,8 @@ pub(crate) async fn check_credential_value_uniqueness(
 
 #[async_trait::async_trait]
 impl AdminResource for Upstream {
+    type ListFilter = ();
+
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
     }
@@ -3848,6 +3851,8 @@ impl AdminResource for Upstream {
 /// database is unreachable would be worse than reporting the outage.
 #[async_trait::async_trait]
 impl AdminResource for GatewayTrustBundleRecord {
+    type ListFilter = ();
+
     const RESOURCE_NAME: &'static str = "gateway trust bundle";
     const RESOURCE_LABEL: &'static str = "Gateway trust bundle";
     const VALIDATION_ERROR_LABEL: &'static str = "gateway trust bundle fields";
@@ -4561,6 +4566,8 @@ async fn enabled_prometheus_metrics_owner_exists_inner(
 
 #[async_trait::async_trait]
 impl AdminResource for Proxy {
+    type ListFilter = ();
+
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
     }
@@ -5272,6 +5279,8 @@ impl AdminResource for Proxy {
 
 #[async_trait::async_trait]
 impl AdminResource for Consumer {
+    type ListFilter = ();
+
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
     }
