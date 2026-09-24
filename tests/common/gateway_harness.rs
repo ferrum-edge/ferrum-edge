@@ -1696,6 +1696,15 @@ async fn build_env(
         "FERRUM_BASIC_AUTH_HMAC_SECRET".into(),
         b.basic_auth_hmac_secret.clone(),
     );
+    // The gateway binary resolves an unconfigured managed-TLS store to
+    // `./ferrum-managed-tls` in its working directory, which for a spawned
+    // test gateway is the repository checkout (issue #5706). Keep the store
+    // and its TLS event log in this attempt's temp dir; `.env(..)` still wins.
+    let managed_tls_dir = temp.path().join("managed-tls");
+    env.insert(
+        "FERRUM_TLS_MANAGED_STORE_PATH".into(),
+        managed_tls_dir.to_string_lossy().into_owned(),
+    );
     // Presenting this token unlocks the authenticated detail tier of `/health`
     // for readiness. Ownership still requires the JWT on `GET /proxies`
     // because allowed source CIDRs can grant the same health detail.

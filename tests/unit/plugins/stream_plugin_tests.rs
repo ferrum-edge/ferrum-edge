@@ -76,20 +76,12 @@ async fn test_all_protocol_plugins() {
 
 #[test]
 fn test_http_family_plugins() {
-    // `basic_auth` construction requires FERRUM_BASIC_AUTH_HMAC_SECRET (the
-    // plugin rejects a missing secret — there is no insecure default), so set
-    // it before constructing the plugins below. Without this, the test only
-    // passes when a sibling basic_auth test happens to set this process-global
-    // var first; run in isolation or on a clean checkout it fails to construct
-    // `basic_auth`. The value matches the constant in basic_auth_tests.rs.
-    // SAFETY: only `BasicAuth::new` reads this var and every test setter writes
-    // the same constant, so a concurrent write from another test is benign.
-    unsafe {
-        std::env::set_var(
-            "FERRUM_BASIC_AUTH_HMAC_SECRET",
-            "test-hmac-secret-for-basic-auth-unit-tests",
-        );
-    }
+    // `basic_auth` construction through `create_plugin` reads
+    // FERRUM_BASIC_AUTH_HMAC_SECRET from the environment (the plugin rejects a
+    // missing secret — there is no insecure default). Hold ENV_LOCK with the
+    // secret set for the whole test: env-isolated siblings clear every
+    // `FERRUM_*` variable while they hold the lock (issue #5705).
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
 
     // Plugins that support HTTP, gRPC, and WebSocket
     let plugins = vec![
