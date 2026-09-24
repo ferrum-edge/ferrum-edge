@@ -5,8 +5,9 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use crate::config::types::{
-    BackendScheme, FrontendTlsCertificateSource, MAX_FRONTEND_TLS_CERTIFICATE_SOURCES,
-    MAX_ID_LENGTH, MAX_TARGET_WEIGHT,
+    BackendScheme, FrontendTlsCertificateSource, MAX_BACKOFF_MS,
+    MAX_FRONTEND_TLS_CERTIFICATE_SOURCES, MAX_ID_LENGTH, MAX_RETRIES, MAX_TARGET_WEIGHT,
+    RetryConfig,
 };
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
@@ -5537,19 +5538,19 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
         let rule = rule.as_object().ok_or_else(|| {
             invalid_resource(object, format!("rules[{rule_index}] must be an object"))
         })?;
-        // `timeouts` is an HTTPRoute rule field on the pinned standard channel;
-        // GRPCRoute defines no such field and keeps refusing it. `retry`
-        // (experimental channel) is not implemented and stays refused.
-        let timeouts_supported = object.kind == "HTTPRoute";
+        // `timeouts` (standard channel) and `retry` (experimental channel,
+        // present in the CRD bundle the conformance lab installs) are HTTPRoute
+        // rule fields; GRPCRoute defines neither and keeps refusing both.
+        let http_rule_fields_supported = object.kind == "HTTPRoute";
         let field_supported = |key: &str| {
             matches!(
                 key,
                 "name" | "matches" | "backendRefs" | "filters" | "sessionPersistence"
-            ) || (timeouts_supported && key == "timeouts")
+            ) || (http_rule_fields_supported && matches!(key, "timeouts" | "retry"))
         };
         if rule.keys().any(|key| !field_supported(key.as_str())) {
-            let supported = if timeouts_supported {
-                "name, matches, backendRefs, filters, sessionPersistence and timeouts"
+            let supported = if http_rule_fields_supported {
+                "name, matches, backendRefs, filters, sessionPersistence, timeouts and retry"
             } else {
                 "name, matches, backendRefs, filters and sessionPersistence"
             };
@@ -5560,8 +5561,11 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
                 ),
             ));
         }
-        if timeouts_supported && let Some(timeouts) = rule.get("timeouts") {
+        if http_rule_fields_supported && let Some(timeouts) = rule.get("timeouts") {
             ensure_http_route_timeouts(object, rule_index, timeouts)?;
+        }
+        if http_rule_fields_supported && let Some(retry) = rule.get("retry") {
+            ensure_http_route_retry(object, rule_index, retry)?;
         }
         if let Some(backends) = rule.get("backendRefs").and_then(Value::as_array) {
             for (backend_index, backend) in backends.iter().enumerate() {
@@ -5775,6 +5779,107 @@ fn http_route_timeout_field_ms(
                 ),
             )
         })
+}
+
+/// Validate one admitted `HTTPRoute.rules[].retry` exactly as the pinned v1.5.1
+/// experimental-channel CRD does, then refuse the CRD-valid values Ferrum
+/// cannot honor. A file/CP-delivered object never passed through the API
+/// server's validation, so Ferrum re-checks it rather than guessing.
+///
+/// * `codes` is a list of integers in `400..=599`, `attempts` is an integer and
+///   `backoff` is a Gateway API Duration (GEP-2257). A value of the wrong
+///   type, a code outside that range, a backoff outside the duration grammar,
+///   and a non-object `retry` are `Invalid`.
+/// * The CRD bounds neither `attempts` nor `backoff`. A negative `attempts`,
+///   one above Ferrum's per-request retry ceiling ([`MAX_RETRIES`]), and a
+///   `backoff` above Ferrum's longest retry delay ([`MAX_BACKOFF_MS`]) are
+///   CRD-valid values Ferrum declines: `UnsupportedValue`.
+/// * A sub-field this CRD does not define is `UnsupportedValue`, like an
+///   unknown rule field.
+///
+/// No diagnostic echoes the offending value.
+fn ensure_http_route_retry(
+    object: &K8sObject,
+    rule_index: usize,
+    retry: &Value,
+) -> Result<(), K8sTranslateError> {
+    let location = format!("rules[{rule_index}].retry");
+    let Some(retry) = retry.as_object() else {
+        return Err(invalid_resource(
+            object,
+            format!("{location} must be an object"),
+        ));
+    };
+    if retry
+        .keys()
+        .any(|key| !matches!(key.as_str(), "codes" | "attempts" | "backoff"))
+    {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{location} contains a field that {UNSUPPORTED_SHAPE_MARKER}; supported fields are codes, attempts and backoff"
+            ),
+        ));
+    }
+    if let Some(codes) = retry.get("codes") {
+        let codes = codes.as_array().ok_or_else(|| {
+            invalid_resource(object, format!("{location}.codes must be an array"))
+        })?;
+        for (code_index, code) in codes.iter().enumerate() {
+            if !code
+                .as_u64()
+                .is_some_and(|code| (400..=599).contains(&code))
+            {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{location}.codes[{code_index}] must be an integer HTTP status code from 400 to 599"
+                    ),
+                ));
+            }
+        }
+    }
+    if let Some(attempts) = retry.get("attempts") {
+        if !(attempts.is_i64() || attempts.is_u64()) {
+            return Err(invalid_resource(
+                object,
+                format!("{location}.attempts must be an integer"),
+            ));
+        }
+        if !attempts
+            .as_u64()
+            .is_some_and(|attempts| attempts <= u64::from(MAX_RETRIES))
+        {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{location}.attempts {UNSUPPORTED_SHAPE_MARKER}: Ferrum retries a request from 0 to {MAX_RETRIES} times"
+                ),
+            ));
+        }
+    }
+    if let Some(backoff) = retry.get("backoff") {
+        let backoff_ms = backoff
+            .as_str()
+            .and_then(parse_gateway_api_duration_ms)
+            .ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!(
+                        "{location}.backoff must be a Gateway API duration (GEP-2257) such as 100ms, 1s or 1m"
+                    ),
+                )
+            })?;
+        if backoff_ms > MAX_BACKOFF_MS {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{location}.backoff {UNSUPPORTED_SHAPE_MARKER}: Ferrum waits at most {MAX_BACKOFF_MS}ms between retry attempts"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parse a Gateway API Duration (GEP-2257) exactly as the pinned CRD admits
@@ -6262,6 +6367,7 @@ fn http_route_resources(
             let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
             let rewrite = gateway_url_rewrite_value(rule);
             let timeouts = gateway_route_rule_timeouts(rule);
+            let retry = gateway_route_rule_retry(rule);
             let mut backend_resolution = route_backends(object, rule, acc)?;
             let backend_tls_policy = super::backend_tls_policy::resolve_backends_tls_policy(
                 acc,
@@ -6298,10 +6404,10 @@ fn http_route_resources(
             // Upstream `HTTPRouteRule.backendRefs`: with no backend to forward
             // to and no filter that answers the request itself
             // (`RequestRedirect`), every matching request MUST receive a 500.
-            // Header modifiers, `URLRewrite`, and `timeouts` shape a forwarded
-            // request or its response; alone they would otherwise send traffic
-            // to the unresolvable blackhole backend. GRPCRoute keeps the
-            // blackhole, exactly as its all-zero-weight rule does.
+            // Header modifiers, `URLRewrite`, `timeouts` and `retry` shape a
+            // forwarded request or its response; alone they would otherwise
+            // send traffic to the unresolvable blackhole backend. GRPCRoute
+            // keeps the blackhole, exactly as its all-zero-weight rule does.
             if object.kind == "HTTPRoute"
                 && backend_resolution.backends.is_empty()
                 && backend_resolution.fault_reason.is_none()
@@ -6309,7 +6415,8 @@ fn http_route_resources(
                 && (!request_transform.is_empty()
                     || !response_transform.is_empty()
                     || rewrite.is_some()
-                    || !timeouts.is_empty())
+                    || !timeouts.is_empty()
+                    || retry.is_some())
             {
                 backend_resolution.fault_reason = Some(BackendRefFaultReason::NoServiceableBackend);
                 acc.warnings.push(
@@ -6333,6 +6440,7 @@ fn http_route_resources(
                 rewrite: rewrite.as_ref(),
                 fault: backend_ref_fault.as_ref(),
                 timeouts,
+                retry: retry.as_ref(),
             };
             let has_route_actions = !rule_actions.is_empty();
 
@@ -6856,6 +6964,7 @@ struct RouteRuleActions<'a> {
     rewrite: Option<&'a Value>,
     fault: Option<&'a Value>,
     timeouts: RouteRuleTimeouts,
+    retry: Option<&'a RouteRuleRetry>,
 }
 
 impl RouteRuleActions<'_> {
@@ -6863,10 +6972,10 @@ impl RouteRuleActions<'_> {
     /// A rule with only actions still materializes a dispatch rule so the
     /// action fires; a rule with none can fall through to the proxy default.
     ///
-    /// Rule `timeouts` count: they must select their policy for exactly the
-    /// requests this rule matches, so a path-only rule carrying them still
-    /// emits its own dispatch rule instead of falling through to a proxy that
-    /// a sibling rule may share.
+    /// Rule `timeouts` and `retry` count: they must select their policy for
+    /// exactly the requests this rule matches, so a path-only rule carrying
+    /// them still emits its own dispatch rule instead of falling through to a
+    /// proxy that a sibling rule may share.
     fn is_empty(&self) -> bool {
         self.request_transform.is_empty()
             && self.response_transform.is_empty()
@@ -6874,7 +6983,21 @@ impl RouteRuleActions<'_> {
             && self.rewrite.is_none()
             && self.fault.is_none()
             && self.timeouts.is_empty()
+            && self.retry.is_none()
     }
+}
+
+/// An admitted HTTPRoute rule's `retry`, projected onto the emitted
+/// `mesh_route_dispatch` rule — the same per-rule retry override the Istio
+/// VirtualService translator drives. Like `timeouts`, it is request-scoped
+/// policy for the requests that rule matches and is never promoted onto the
+/// shared proxy or upstream (whose retry policy is always unset), so a merged
+/// sibling rule without `retry` is never retried.
+enum RouteRuleRetry {
+    /// Projected as the rule's `retry` object (a route-local `RetryConfig`).
+    Enabled(Value),
+    /// `attempts: 0`: projected as `retry_disabled: true`.
+    Disabled,
 }
 
 /// An admitted HTTPRoute rule's `timeouts`, in milliseconds.
@@ -6919,6 +7042,67 @@ fn gateway_route_rule_timeouts(rule: &Value) -> RouteRuleTimeouts {
         request_ms: field_ms("request").filter(|request_ms| *request_ms > 0),
         backend_request_ms: field_ms("backendRequest"),
     }
+}
+
+/// Project an HTTPRoute rule's `retry` onto Ferrum's retry policy. Shape,
+/// ranges and grammar were already enforced by [`ensure_http_route_retry`];
+/// GRPCRoute never reaches here with one.
+///
+/// * `attempts` is the number of RETRIES after the initial attempt (upstream:
+///   "the maximum number of times an individual request from the gateway to a
+///   backend should be retried"), so it maps to `max_retries` unchanged and a
+///   request reaches the backend at most `attempts + 1` times. `0` disables
+///   retries for the rule. Omitted, `max_retries` is left out of the
+///   projection and the route retry shape's default (Ferrum's retry default,
+///   3) applies.
+/// * `codes` become `retryable_status_codes` (sorted, de-duplicated). Omitted
+///   or empty, no response status is retried.
+/// * `backoff` is a FIXED delay: upstream makes it the minimum wait between
+///   attempts, and Ferrum's exponential strategy jitters below its base, so it
+///   could retry early. Omitted, the route retry shape's default fixed delay
+///   (100ms) applies.
+/// * Status-code retries apply only to Ferrum's default replay-safe methods
+///   (`GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`); a request of any other
+///   method that reached the backend is never replayed to honor the manifest.
+///   Upstream says implementations SHOULD also retry connection errors, so
+///   `retry_on_connect_failure` is on: a failure before any request byte
+///   reached the backend (refused connect, connect timeout, DNS, TLS) is
+///   retried for every method, replaying the bounded buffered body.
+fn gateway_route_rule_retry(rule: &Value) -> Option<RouteRuleRetry> {
+    let retry = rule.get("retry")?;
+    let mut projected = serde_json::Map::new();
+    if let Some(attempts) = retry.get("attempts").and_then(Value::as_u64) {
+        if attempts == 0 {
+            return Some(RouteRuleRetry::Disabled);
+        }
+        projected.insert("max_retries".to_string(), json!(attempts));
+    }
+    let mut codes: Vec<u64> = retry
+        .get("codes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+    projected.insert("retryable_status_codes".to_string(), json!(codes));
+    projected.insert(
+        "retryable_methods".to_string(),
+        json!(RetryConfig::default().retryable_methods),
+    );
+    if let Some(delay_ms) = retry
+        .get("backoff")
+        .and_then(Value::as_str)
+        .and_then(parse_gateway_api_duration_ms)
+    {
+        projected.insert(
+            "backoff".to_string(),
+            json!({"fixed": {"delay_ms": delay_ms}}),
+        );
+    }
+    projected.insert("retry_on_connect_failure".to_string(), Value::Bool(true));
+    Some(RouteRuleRetry::Enabled(Value::Object(projected)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7196,6 +7380,15 @@ fn gateway_api_dispatch_route_rule(
                 "timeout_ms".to_string(),
                 serde_json::json!(backend_request_ms),
             );
+        }
+        None => {}
+    }
+    match actions.retry {
+        Some(RouteRuleRetry::Enabled(retry)) => {
+            route_rule.insert("retry".to_string(), retry.clone());
+        }
+        Some(RouteRuleRetry::Disabled) => {
+            route_rule.insert("retry_disabled".to_string(), Value::Bool(true));
         }
         None => {}
     }

@@ -132,7 +132,8 @@ async fn run_request(
 }
 
 fn published(config: &GatewayConfig, proxy_id: &str) -> Vec<Arc<dyn Plugin>> {
-    super::plugin_utils::ensure_basic_auth_test_secret();
+    // Held until the cache is built: `basic_auth` reads its secret at construction.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     let cache = PluginCache::new(config).expect("plugin cache builds");
     cache.get_plugins(NS, proxy_id).as_ref().clone()
 }

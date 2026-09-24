@@ -12,9 +12,8 @@ use super::plugin_utils::{
     assert_continue, assert_reject_body, context_with_materialized_raw_header,
 };
 
-/// A fixed test secret used for all basic_auth tests.
-/// Tests set `FERRUM_BASIC_AUTH_HMAC_SECRET` to this value before constructing
-/// the plugin.
+/// A fixed test secret used for all basic_auth tests, passed to the plugin
+/// explicitly through [`new_basic_auth`].
 const TEST_HMAC_SECRET: &str = "test-hmac-secret-for-basic-auth-unit-tests";
 const BASIC_CHALLENGE: &str = r#"Basic realm="ferrum-edge", charset="UTF-8""#;
 
@@ -35,16 +34,13 @@ fn assert_basic_reject(result: PluginResult) {
     }
 }
 
-/// Set the test HMAC secret in the environment. Required before constructing
-/// `BasicAuth` because the plugin rejects missing secrets.
+/// Construct `BasicAuth` with the test HMAC secret passed explicitly.
 ///
-/// SAFETY: `std::env::set_var` is unsafe in Rust 2024 because it races with
-/// concurrent reads. Our `#[tokio::test]` tests are single-threaded by default,
-/// so there is no concurrent reader.
-fn set_test_hmac_secret() {
-    unsafe {
-        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", TEST_HMAC_SECRET);
-    }
+/// The plugin rejects a missing secret. Publishing it into the process
+/// environment instead raced env-isolated tests in this binary, which clear
+/// every `FERRUM_*` variable while they hold `ENV_LOCK` (issue #5705).
+fn new_basic_auth(config: &serde_json::Value) -> Result<BasicAuth, String> {
+    ferrum_edge::_test_support::basic_auth_with_secret_for_test(config, TEST_HMAC_SECRET)
 }
 
 fn make_ctx() -> RequestContext {
@@ -125,8 +121,12 @@ fn hmac_sha256_password_hash(password: &str) -> String {
 
 #[tokio::test]
 async fn test_basic_auth_plugin_creation() {
-    set_test_hmac_secret();
+    // The one test of the environment-reading constructor: hold ENV_LOCK with
+    // the secret set until construction is done.
+    let env = crate::unit::env_lock::EnvGuard::new(&[]);
+    env.set("FERRUM_BASIC_AUTH_HMAC_SECRET", TEST_HMAC_SECRET);
     let plugin = BasicAuth::new(&json!({})).unwrap();
+    drop(env);
     assert_eq!(plugin.name(), "basic_auth");
 }
 
@@ -140,8 +140,7 @@ fn test_basic_auth_enabled_construction_requires_a_strong_hmac_secret() {
 
 #[test]
 fn test_basic_auth_plugin_contract() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
 
     assert_eq!(plugin.priority(), priority::BASIC_AUTH);
     assert_eq!(plugin.priority(), 1300);
@@ -162,7 +161,6 @@ fn test_basic_auth_plugin_contract() {
 
 #[test]
 fn test_basic_auth_rejects_invalid_config() {
-    set_test_hmac_secret();
     let invalid_configs = [
         json!(""),
         json!(true),
@@ -176,7 +174,7 @@ fn test_basic_auth_rejects_invalid_config() {
 
     for config in invalid_configs {
         assert!(
-            BasicAuth::new(&config).is_err(),
+            new_basic_auth(&config).is_err(),
             "config should be rejected: {config}"
         );
     }
@@ -188,7 +186,7 @@ fn test_basic_auth_rejects_invalid_config() {
         json!({"hide_credentials": false}),
     ] {
         assert!(
-            BasicAuth::new(&config).is_ok(),
+            new_basic_auth(&config).is_ok(),
             "config should be accepted: {config}"
         );
     }
@@ -196,8 +194,7 @@ fn test_basic_auth_rejects_invalid_config() {
 
 #[tokio::test]
 async fn test_basic_auth_successful() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -216,8 +213,7 @@ async fn test_basic_auth_successful() {
 
 #[tokio::test]
 async fn test_basic_auth_wrong_password() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -234,8 +230,7 @@ async fn test_basic_auth_wrong_password() {
 
 #[tokio::test]
 async fn test_basic_auth_wrong_username() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -252,8 +247,7 @@ async fn test_basic_auth_wrong_username() {
 
 #[tokio::test]
 async fn test_basic_auth_missing_header() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
@@ -264,8 +258,7 @@ async fn test_basic_auth_missing_header() {
 
 #[tokio::test]
 async fn test_basic_auth_invalid_scheme() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
@@ -279,8 +272,7 @@ async fn test_basic_auth_invalid_scheme() {
 
 #[tokio::test]
 async fn test_basic_auth_invalid_base64() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
@@ -297,8 +289,7 @@ async fn test_basic_auth_invalid_base64() {
 async fn test_basic_auth_invalid_utf8_uses_basic_challenge() {
     use base64::Engine;
 
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
     let encoded = base64::engine::general_purpose::STANDARD.encode([0xff, 0xfe]);
     let mut ctx = make_ctx();
@@ -311,8 +302,7 @@ async fn test_basic_auth_invalid_utf8_uses_basic_challenge() {
 
 #[tokio::test]
 async fn test_basic_auth_missing_colon_separator() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
@@ -327,8 +317,7 @@ async fn test_basic_auth_missing_colon_separator() {
 
 #[tokio::test]
 async fn test_basic_auth_case_insensitive_scheme() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -346,8 +335,7 @@ async fn test_basic_auth_case_insensitive_scheme() {
 
 #[tokio::test]
 async fn test_basic_auth_uppercase_scheme() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -365,8 +353,7 @@ async fn test_basic_auth_uppercase_scheme() {
 
 #[tokio::test]
 async fn test_basic_auth_empty_consumers() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[]);
 
     let mut ctx = make_ctx();
@@ -381,8 +368,7 @@ async fn test_basic_auth_empty_consumers() {
 
 #[tokio::test]
 async fn test_basic_auth_password_with_colon() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -400,8 +386,7 @@ async fn test_basic_auth_password_with_colon() {
 
 #[tokio::test]
 async fn test_basic_auth_rejects_non_hmac_hash() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
 
     use chrono::Utc;
     use serde_json::Value;
@@ -438,8 +423,7 @@ async fn test_basic_auth_rejects_non_hmac_hash() {
 
 #[tokio::test]
 async fn test_basic_auth_hmac_sha256_password_hash() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer_with_hash(
         "hmacuser",
         hmac_sha256_password_hash("correct-password"),
@@ -469,8 +453,7 @@ async fn test_basic_auth_hmac_sha256_password_hash() {
 
 #[tokio::test]
 async fn test_basic_auth_malformed_hmac_hash_is_rejected() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer =
         create_basic_auth_consumer_with_hash("hmacuser", "hmac_sha256:not-hex".to_string());
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -519,8 +502,7 @@ fn create_basic_auth_consumer_with_two_passwords() -> ferrum_edge::config::types
 
 #[tokio::test]
 async fn test_basic_auth_multi_password_old_password_works() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer_with_two_passwords();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -538,8 +520,7 @@ async fn test_basic_auth_multi_password_old_password_works() {
 
 #[tokio::test]
 async fn test_basic_auth_multi_password_new_password_works() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer_with_two_passwords();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -557,8 +538,7 @@ async fn test_basic_auth_multi_password_new_password_works() {
 
 #[tokio::test]
 async fn test_basic_auth_multi_password_wrong_password_rejected() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer_with_two_passwords();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -670,8 +650,7 @@ fn test_verification_rounds_are_bounded_by_serializable_credential_capacity() {
 
 #[tokio::test]
 async fn test_basic_auth_non_ascii_authorization_returns_invalid_not_missing() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[]);
     let mut ctx =
         context_with_materialized_raw_header("Authorization", "Basic dXNlcjpwYXNz\u{3000}");
@@ -692,8 +671,7 @@ async fn test_basic_auth_non_ascii_authorization_returns_invalid_not_missing() {
 
 #[tokio::test]
 async fn test_basic_auth_removes_the_verified_credential_before_proxy() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
@@ -722,8 +700,7 @@ async fn test_basic_auth_removes_a_losing_credential_in_a_mixed_chain() {
     // `before_proxy` runs for every configured plugin, not only the mechanism
     // that won. A request that authenticated as `bob` through another plugin
     // must not still carry Alice's Basic password upstream.
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
 
     let mut ctx = make_ctx();
     ctx.headers.insert(
@@ -750,8 +727,7 @@ async fn test_basic_auth_removes_a_losing_credential_in_a_mixed_chain() {
 
 #[tokio::test]
 async fn test_basic_auth_can_explicitly_preserve_the_credential() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({"hide_credentials": false})).unwrap();
+    let plugin = new_basic_auth(&json!({"hide_credentials": false})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
@@ -775,8 +751,7 @@ async fn test_basic_auth_can_explicitly_preserve_the_credential() {
 async fn test_basic_auth_leaves_other_authorization_schemes_in_place() {
     // Removal is keyed on the scheme: a Bearer token another policy needs must
     // survive, and so must an unrelated scheme.
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
 
     for value in ["Bearer opaque-token", "Negotiate abcdef", "DPoP proof"] {
         let mut ctx = make_ctx();
@@ -794,8 +769,7 @@ async fn test_basic_auth_leaves_other_authorization_schemes_in_place() {
 
 #[tokio::test]
 async fn test_basic_auth_removal_is_scheme_and_name_case_insensitive() {
-    set_test_hmac_secret();
-    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let plugin = new_basic_auth(&json!({})).unwrap();
 
     let mut ctx = make_ctx();
     let mut backend_headers = std::collections::HashMap::new();

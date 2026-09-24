@@ -95,9 +95,22 @@ const DEFAULT_HBONE_LISTEN_ADDR: &str = "0.0.0.0:15008";
 const DEFAULT_EAST_WEST_LISTEN_PORT: u16 = 15443;
 const DEFAULT_DNS_LISTEN_ADDR: &str = "127.0.0.1:15053";
 const DEFAULT_DNS_UPSTREAM_ADDR: &str = "127.0.0.53:53";
-const DEFAULT_DNS_TTL_SECONDS: u32 = 60;
+/// Default `FERRUM_MESH_DNS_TTL_SECONDS`.
+pub const DEFAULT_DNS_TTL_SECONDS: u32 = 60;
+/// Largest accepted `FERRUM_MESH_DNS_TTL_SECONDS` (one day). Synthetic answers
+/// track live mesh state, so a client must not cache one for longer.
+pub const HARD_MAX_DNS_TTL_SECONDS: u32 = 86_400;
 const DEFAULT_DNS_ENABLED: bool = false;
-const DEFAULT_DNS_MAX_CONCURRENT_QUERIES: usize = 1024;
+/// Default `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES`.
+pub const DEFAULT_DNS_MAX_CONCURRENT_QUERIES: usize = 1024;
+/// Largest accepted `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES`. The cap also bounds
+/// outstanding upstream UDP forwards, which share one 65,536-entry transaction
+/// ID space; a quarter of it keeps random ID allocation collision retries rare.
+pub const HARD_MAX_DNS_MAX_CONCURRENT_QUERIES: usize = 16_384;
+/// Largest accepted `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` per slice.
+/// A cached template is at most 4 KiB, so this bounds one slice's cache at
+/// 1 GiB.
+pub const HARD_MAX_DNS_RESPONSE_CACHE_MAX_ENTRIES: usize = 262_144;
 const DEFAULT_EGRESS_LISTEN_ADDR: &str = "0.0.0.0:15090";
 const MESH_CA_INITIAL_SVID_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS: u64 = 5;
@@ -884,19 +897,14 @@ impl MeshRuntimeConfig {
                 .as_deref()
                 .unwrap_or(DEFAULT_DNS_UPSTREAM_ADDR),
         )?;
-        let dns_ttl_seconds = resolve_ferrum_var("FERRUM_MESH_DNS_TTL_SECONDS")
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(DEFAULT_DNS_TTL_SECONDS);
-        let dns_max_concurrent_queries =
-            resolve_ferrum_var("FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES")
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(DEFAULT_DNS_MAX_CONCURRENT_QUERIES);
-        let dns_response_cache_max_entries =
-            resolve_ferrum_var("FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES")
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES);
+        let dns_ttl_seconds =
+            parse_mesh_dns_ttl_seconds(resolve_ferrum_var(DNS_TTL_SECONDS_KEY).as_deref())?;
+        let dns_max_concurrent_queries = parse_mesh_dns_max_concurrent_queries(
+            resolve_ferrum_var(DNS_MAX_CONCURRENT_QUERIES_KEY).as_deref(),
+        )?;
+        let dns_response_cache_max_entries = parse_mesh_dns_response_cache_max_entries(
+            resolve_ferrum_var(DNS_RESPONSE_CACHE_MAX_ENTRIES_KEY).as_deref(),
+        )?;
         let cluster_domain = resolve_ferrum_var("FERRUM_MESH_CLUSTER_DOMAIN")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string());
@@ -20784,6 +20792,82 @@ fn sidecar_capture_listener_addrs(
 fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
     raw.parse::<SocketAddr>()
         .map_err(|e| format!("{key} must be a socket address (got {raw:?}): {e}"))
+}
+
+const DNS_TTL_SECONDS_KEY: &str = "FERRUM_MESH_DNS_TTL_SECONDS";
+const DNS_MAX_CONCURRENT_QUERIES_KEY: &str = "FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES";
+const DNS_RESPONSE_CACHE_MAX_ENTRIES_KEY: &str = "FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES";
+
+/// Pure parse for `FERRUM_MESH_DNS_TTL_SECONDS` (issue #5699).
+///
+/// `None` (configured nowhere) selects [`DEFAULT_DNS_TTL_SECONDS`]. A configured
+/// value must be a whole number in `0..=`[`HARD_MAX_DNS_TTL_SECONDS`] (`0` is a
+/// valid DNS TTL: clients must not cache the answer); anything else, blank
+/// included, fails startup and `validate` instead of silently running on the
+/// default.
+pub fn parse_mesh_dns_ttl_seconds(raw: Option<&str>) -> Result<u32, String> {
+    parse_mesh_dns_bounded(
+        DNS_TTL_SECONDS_KEY,
+        raw,
+        DEFAULT_DNS_TTL_SECONDS,
+        0,
+        HARD_MAX_DNS_TTL_SECONDS,
+    )
+}
+
+/// Pure parse for `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` (issue #5699).
+///
+/// `None` selects [`DEFAULT_DNS_MAX_CONCURRENT_QUERIES`]. A configured value
+/// must be a whole number in `1..=`[`HARD_MAX_DNS_MAX_CONCURRENT_QUERIES`].
+pub fn parse_mesh_dns_max_concurrent_queries(raw: Option<&str>) -> Result<usize, String> {
+    parse_mesh_dns_bounded(
+        DNS_MAX_CONCURRENT_QUERIES_KEY,
+        raw,
+        DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
+        1,
+        HARD_MAX_DNS_MAX_CONCURRENT_QUERIES,
+    )
+}
+
+/// Pure parse for `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` (issue #5699).
+///
+/// `None` selects [`dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES`]. A
+/// configured value must be a whole number in
+/// `1..=`[`HARD_MAX_DNS_RESPONSE_CACHE_MAX_ENTRIES`].
+pub fn parse_mesh_dns_response_cache_max_entries(raw: Option<&str>) -> Result<usize, String> {
+    parse_mesh_dns_bounded(
+        DNS_RESPONSE_CACHE_MAX_ENTRIES_KEY,
+        raw,
+        dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
+        1,
+        HARD_MAX_DNS_RESPONSE_CACHE_MAX_ENTRIES,
+    )
+}
+
+/// Shared rule for the mesh DNS capacity/TTL settings: absent selects the
+/// default; present must parse as a whole number in `min..=max`.
+///
+/// The error names the variable and the accepted range but never the
+/// configured value, which may itself be sourced from an external secret.
+fn parse_mesh_dns_bounded<T>(
+    key: &str,
+    raw: Option<&str>,
+    default: T,
+    min: T,
+    max: T,
+) -> Result<T, String>
+where
+    T: Copy + std::str::FromStr + PartialOrd + std::fmt::Display,
+{
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    match raw.trim().parse::<T>() {
+        Ok(value) if (min..=max).contains(&value) => Ok(value),
+        _ => Err(format!(
+            "{key} must be a whole number between {min} and {max}"
+        )),
+    }
 }
 
 /// Parse the SOURCE-side EgressGateway endpoint (issue #3263) from its two
