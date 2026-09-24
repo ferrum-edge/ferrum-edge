@@ -16,8 +16,7 @@ use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
 fn build_gateway_config(n_workloads: usize) -> GatewayConfig {
     let mut config = GatewayConfig::default();
-    let trust_domain =
-        TrustDomain::new("cluster.local").expect("static trust-domain must parse");
+    let trust_domain = TrustDomain::new("cluster.local").expect("static trust-domain must parse");
     let mut mesh = MeshConfig::default();
 
     for i in 0..n_workloads {
@@ -75,10 +74,8 @@ fn bench_slice_apply(c: &mut Criterion) {
         };
         group.bench_with_input(BenchmarkId::new("workloads", size), &size, |b, _| {
             b.iter(|| {
-                let slice = MeshSlice::from_gateway_config(
-                    black_box(&config),
-                    black_box(request.clone()),
-                );
+                let slice =
+                    MeshSlice::from_gateway_config(black_box(&config), black_box(request.clone()));
                 black_box(slice);
             });
         });

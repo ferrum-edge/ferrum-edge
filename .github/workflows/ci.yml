@@ -59,6 +59,7 @@ jobs:
       run_platform_build: ${{ steps.plan.outputs.run_platform_build }}
       run_vendor_patches: ${{ steps.plan.outputs.run_vendor_patches }}
       run_dependency_audit: ${{ steps.plan.outputs.run_dependency_audit }}
+      run_standalone_cargo: ${{ steps.plan.outputs.run_standalone_cargo }}
       binary-matrix: ${{ steps.binary-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -274,7 +275,7 @@ jobs:
           # after the new planner proves the NUL stream classifiable.
           # Missing/invalid individual outputs still fail closed to true.
           gate_fallbacks=()
-          for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit; do
+          for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_standalone_cargo; do
             value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
             if [ "$paths_classifiable" != "true" ]; then
               value=true
@@ -308,7 +309,7 @@ jobs:
             echo ""
             echo "| Gate | Scheduled |"
             echo "| --- | --- |"
-            for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit; do
+            for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_standalone_cargo; do
               value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
               if [ "$paths_classifiable" != "true" ]; then
                 value=true
@@ -1509,6 +1510,32 @@ jobs:
           cargo deny --manifest-path ebpf/Cargo.toml
           check --allow advisory-not-detected --config deny.toml advisories bans sources licenses
 
+      - name: cargo-deny advisories (standalone Cargo workspaces)
+        # BLOCKING advisory scan over every standalone Cargo workspace the
+        # inventory discovers (fuzz/, tests/performance/**, and any crate added
+        # later). Each carries its own Cargo.lock that neither step above can
+        # see (issues #5704, #5708). Advisories only: these are fuzz and
+        # benchmark harnesses that never ship, so the shipped-artifact license
+        # and ban policy does not apply to them. Same shared deny.toml and the
+        # same `--allow advisory-not-detected` rationale as the eBPF step.
+        run: |
+          set -euo pipefail
+          inventory="$RUNNER_TEMP/standalone-cargo-manifests.txt"
+          python3 .github/scripts/standalone_cargo_manifests.py --self-test
+          python3 .github/scripts/standalone_cargo_manifests.py > "$inventory"
+          mapfile -t manifests < "$inventory"
+          failed=0
+          for manifest in "${manifests[@]}"; do
+            echo "::group::cargo deny advisories ${manifest}"
+            if ! cargo deny --manifest-path "$manifest" \
+              check --allow advisory-not-detected --config deny.toml advisories; then
+              echo "::error file=${manifest}::cargo-deny advisories failed for ${manifest}"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+
       - name: Advisory-exception expiry self-test
         # The [expires:] convention is a repo rule cargo-deny knows nothing
         # about, so the checker is the only thing enforcing it. Run its synthetic
@@ -1542,6 +1569,100 @@ jobs:
         # vendor/, dependency-policy.md, or per-patch READMEs. The checker runs
         # synthetic self-tests before repository parity.
         run: python3 scripts/check_vendored_patch_lifecycle.py
+
+  standalone-cargo:
+    # Formatting and compile gate for every standalone Cargo workspace (issues
+    # #5703 and #5707). The root package declares no [workspace], so the root
+    # `cargo fmt --all` in CI Plan and every root compile/lint job see only
+    # `ferrum-edge`; fuzz/, tests/performance/**, and any crate added later
+    # resolve as separate workspaces with their own Cargo.lock. The manifest
+    # list comes from .github/scripts/standalone_cargo_manifests.py (not a
+    # hand-maintained list), so a new standalone crate is covered on the pull
+    # request that adds it. `--locked` also enforces that each committed
+    # lockfile matches its manifests (issue #5708).
+    name: Standalone Cargo Workspaces
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_standalone_cargo == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      # One shared target directory: fuzz/ and tests/performance/mesh both
+      # compile the root `ferrum-edge` library by path, and the harnesses share
+      # most of their third-party graph, so identical units are reused across
+      # workspaces instead of being rebuilt once per manifest.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/standalone-cargo
+      # Type-checking needs no DWARF; keep peak memory and cache size down.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_BENCH_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-standalone-cargo"
+          save: "true"
+          components: rustfmt
+          workspaces: ". -> target/standalone-cargo"
+
+      - id: inventory
+        name: Inventory standalone Cargo workspaces
+        run: |
+          set -euo pipefail
+          inventory="$RUNNER_TEMP/standalone-cargo-manifests.txt"
+          python3 .github/scripts/standalone_cargo_manifests.py --self-test
+          python3 .github/scripts/standalone_cargo_manifests.py > "$inventory"
+          {
+            echo "## Standalone Cargo workspaces"
+            echo ""
+            while IFS= read -r manifest; do
+              echo "- \`${manifest}\`"
+            done < "$inventory"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$inventory"
+
+      - name: Check standalone formatting
+        # rustfmt prints the full diff for every drifted file; apply it with
+        # `cargo fmt --manifest-path <manifest> --all` from the repository root
+        # (the root rust-toolchain.toml selects the same stable rustfmt).
+        run: |
+          set -euo pipefail
+          mapfile -t manifests < "$RUNNER_TEMP/standalone-cargo-manifests.txt"
+          failed=0
+          for manifest in "${manifests[@]}"; do
+            echo "::group::cargo fmt --check ${manifest}"
+            if ! cargo fmt --manifest-path "$manifest" --all -- --check; then
+              echo "::error file=${manifest}::rustfmt drift; run cargo fmt --manifest-path ${manifest} --all"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+
+      - name: Check standalone builds
+        # Every target (bins, libs, tests, benches, examples) of every
+        # standalone workspace against its committed lockfile. A config-model
+        # change in the root crate that a bench initializes field by field
+        # fails here instead of on the next manual benchmark run. Runs even
+        # when formatting failed so one push reports both verdicts.
+        if: ${{ !cancelled() && steps.inventory.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mapfile -t manifests < "$RUNNER_TEMP/standalone-cargo-manifests.txt"
+          failed=0
+          for manifest in "${manifests[@]}"; do
+            echo "::group::cargo check --locked --all-targets ${manifest}"
+            if ! cargo check --locked --manifest-path "$manifest" --workspace --all-targets; then
+              echo "::error file=${manifest}::cargo check --locked --all-targets failed for ${manifest}"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
 
   test-vendor-patches:
     name: Vendored Patch Regressions
@@ -5991,6 +6112,7 @@ jobs:
       - netns-capture-live
       - two-cluster-mesh-live
       - build-binaries
+      - standalone-cargo
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -6063,6 +6185,7 @@ jobs:
           add_row "Netns capture live" "${{ needs.netns-capture-live.result }}"
           add_row "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}"
           add_row "Native platform binaries" "${{ needs.build-binaries.result }}"
+          add_row "Standalone Cargo workspaces" "${{ needs.standalone-cargo.result }}"
 
           # These gates are mandatory even in light mode. The output is only
           # emitted after the complete verifier command succeeds.
@@ -6092,6 +6215,7 @@ jobs:
           require_planned_gate "Netns capture live" "${{ needs.netns-capture-live.result }}" "${{ needs.ci-plan.outputs.run_netns_capture_live }}"
           require_planned_gate "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}" "${{ needs.ci-plan.outputs.run_two_cluster_live }}"
           require_planned_gate "Native platform binaries" "${{ needs.build-binaries.result }}" "${{ needs.ci-plan.outputs.run_platform_build }}"
+          require_planned_gate "Standalone Cargo workspaces" "${{ needs.standalone-cargo.result }}" "${{ needs.ci-plan.outputs.run_standalone_cargo }}"
 
           if [ "$failures" -ne 0 ]; then
             exit 1
