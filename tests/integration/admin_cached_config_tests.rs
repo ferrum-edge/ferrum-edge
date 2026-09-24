@@ -1994,8 +1994,7 @@ async fn test_list_plugin_configs_filtered_by_proxy_id() {
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    let (status, body, _) =
-        admin_get(&base_url, "/plugins/config?proxy_id=proxy-a", &token).await;
+    let (status, body, _) = admin_get(&base_url, "/plugins/config?proxy_id=proxy-a", &token).await;
     assert_eq!(status, 200);
     let ids: Vec<String> = body["data"]
         .as_array()
@@ -2019,8 +2018,7 @@ async fn test_list_plugin_configs_filtered_by_proxy_id() {
     assert_eq!(body["pagination"]["total"], json!(2));
 
     // A different proxy returns only its own configs.
-    let (status, body, _) =
-        admin_get(&base_url, "/plugins/config?proxy_id=proxy-b", &token).await;
+    let (status, body, _) = admin_get(&base_url, "/plugins/config?proxy_id=proxy-b", &token).await;
     assert_eq!(status, 200);
     assert_eq!(body["data"].as_array().unwrap().len(), 1);
     assert_eq!(body["data"][0]["id"], "ctx-b-1");
@@ -2034,8 +2032,7 @@ async fn test_list_plugin_configs_filtered_by_proxy_id() {
     assert_eq!(body["pagination"]["total"], json!(0));
 
     // An invalid proxy id is a 400 with the shared {"error": ...} shape.
-    let (status, body, _) =
-        admin_get(&base_url, "/plugins/config?proxy_id=bad%21id", &token).await;
+    let (status, body, _) = admin_get(&base_url, "/plugins/config?proxy_id=bad%21id", &token).await;
     assert_eq!(status, 400);
     assert!(body["error"].as_str().unwrap().contains("is invalid"));
 }
@@ -2047,14 +2044,13 @@ async fn test_list_plugin_configs_rejects_duplicate_and_empty_proxy_id() {
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    let (status, body, _) = admin_get(
-        &base_url,
-        "/plugins/config?proxy_id=a&proxy_id=b",
-        &token,
-    )
-    .await;
+    let (status, body, _) =
+        admin_get(&base_url, "/plugins/config?proxy_id=a&proxy_id=b", &token).await;
     assert_eq!(status, 400);
-    assert_eq!(body["error"], "proxy_id must not be supplied more than once");
+    assert_eq!(
+        body["error"],
+        "proxy_id must not be supplied more than once"
+    );
 
     let (status, body, _) = admin_get(&base_url, "/plugins/config?proxy_id=", &token).await;
     assert_eq!(status, 400);

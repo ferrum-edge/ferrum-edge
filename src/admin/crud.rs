@@ -2810,7 +2810,14 @@ pub(crate) async fn handle_list<R: AdminResource>(
     role: AdminRole,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    handle_list_filtered::<R>(state, pagination, role, namespace, &R::ListFilter::default()).await
+    handle_list_filtered::<R>(
+        state,
+        pagination,
+        role,
+        namespace,
+        &R::ListFilter::default(),
+    )
+    .await
 }
 
 pub(crate) async fn handle_list_filtered<R: AdminResource>(

@@ -4965,11 +4965,7 @@ impl DatabaseStore {
         if let Some(proxy_id) = proxy_id {
             data_query = data_query.bind(proxy_id);
         }
-        let rows: Vec<AnyRow> = data_query
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?;
+        let rows: Vec<AnyRow> = data_query.bind(limit).bind(offset).fetch_all(pool).await?;
 
         let mut configs = Vec::new();
         for row in rows {
