@@ -366,7 +366,7 @@ async fn hyper_http1_queued_request_on_a_dropped_connection_comes_back_unsent() 
     assert!(err.into_error().is_canceled());
     if let Some(mut sender) = lease {
         let ready = std::future::poll_fn(|cx| Poll::Ready(sender.poll_ready(cx))).await;
-        assert!(ready.is_err());
+        assert!(matches!(ready, Poll::Ready(Err(_))));
         assert!(sender.is_closed());
     }
 }
@@ -386,6 +386,9 @@ async fn hyper_http1_sender_reports_closed_after_the_peer_closes_an_idle_connect
     let _ = driver.await.expect("connection task join");
 
     let ready = std::future::poll_fn(|cx| Poll::Ready(sender.poll_ready(cx))).await;
-    assert!(ready.is_err(), "a closed connection must not be ready");
+    assert!(
+        matches!(ready, Poll::Ready(Err(_))),
+        "a closed connection must not be ready"
+    );
     assert!(sender.is_closed());
 }
