@@ -5,6 +5,7 @@ use super::*;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ResolvesServerCert;
+use std::io::Cursor;
 
 fn resolver() -> Arc<AcmeTlsAlpnResolver> {
     let certs = CertificateDer::pem_slice_iter(include_bytes!("../../certs/server.crt"))
