@@ -209,7 +209,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING (library API) — load-balancer runtime state** (#5693). The public
+- **BREAKING (library API) — load-balancer runtime state** (issue #5693). The public
   `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and
   `LoadBalancer::latency_sample_count` `DashMap` fields are removed, along with
   `LoadBalancerCache::record_connection_start` / `record_connection_end`, which
