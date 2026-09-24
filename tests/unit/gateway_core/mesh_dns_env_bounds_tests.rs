@@ -22,17 +22,16 @@ const TTL_KEY: &str = "FERRUM_MESH_DNS_TTL_SECONDS";
 const QUERIES_KEY: &str = "FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES";
 const CACHE_KEY: &str = "FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES";
 
-const TTL_ERROR: &str = "FERRUM_MESH_DNS_TTL_SECONDS must be a whole number between 1 and 86400";
+const TTL_ERROR: &str = "FERRUM_MESH_DNS_TTL_SECONDS must be a whole number between 0 and 86400";
 const QUERIES_ERROR: &str =
     "FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES must be a whole number between 1 and 16384";
 const CACHE_ERROR: &str =
     "FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES must be a whole number between 1 and 262144";
 
-/// Present values refused by every setting: zero, malformed (including the
-/// issue's `2048x` / `64x` typos), negative, fractional, blank, and past
-/// `u64::MAX`.
+/// Present values refused by every setting: malformed (including the issue's
+/// `2048x` / `64x` typos), negative, fractional, blank, and past `u64::MAX`.
+/// `0` is refused only by the capacity settings; it is a valid DNS TTL.
 const REJECTED_EVERYWHERE: &[&str] = &[
-    "0",
     "abc",
     "2048x",
     "64x",
@@ -73,7 +72,13 @@ fn unset_selects_each_default() {
 
 #[test]
 fn valid_values_are_accepted_including_both_bounds() {
-    for (raw, expected) in [("1", 1), ("300", 300), (" 120 ", 120), ("86400", 86_400)] {
+    for (raw, expected) in [
+        ("0", 0),
+        ("1", 1),
+        ("300", 300),
+        (" 120 ", 120),
+        ("86400", 86_400),
+    ] {
         assert_eq!(parse_mesh_dns_ttl_seconds(Some(raw)).unwrap(), expected);
     }
     for (raw, expected) in [("1", 1), ("2048", 2048), ("16384", 16_384)] {
@@ -91,7 +96,20 @@ fn valid_values_are_accepted_including_both_bounds() {
 }
 
 #[test]
-fn zero_malformed_and_overflow_are_rejected_without_echo() {
+fn zero_capacity_is_rejected_but_zero_ttl_is_accepted() {
+    assert_eq!(parse_mesh_dns_ttl_seconds(Some("0")).unwrap(), 0);
+    assert_eq!(
+        parse_mesh_dns_max_concurrent_queries(Some("0")).unwrap_err(),
+        QUERIES_ERROR
+    );
+    assert_eq!(
+        parse_mesh_dns_response_cache_max_entries(Some("0")).unwrap_err(),
+        CACHE_ERROR
+    );
+}
+
+#[test]
+fn malformed_and_overflow_are_rejected_without_echo() {
     for &raw in REJECTED_EVERYWHERE {
         assert_eq!(
             parse_mesh_dns_ttl_seconds(Some(raw)).unwrap_err(),
@@ -174,7 +192,8 @@ fn mesh_runtime_rejects_each_invalid_setting() {
         (QUERIES_KEY, QUERIES_ERROR),
         (CACHE_KEY, CACHE_ERROR),
     ] {
-        for &raw in REJECTED_EVERYWHERE {
+        let zero = if key == TTL_KEY { None } else { Some("0") };
+        for &raw in REJECTED_EVERYWHERE.iter().chain(zero.iter()) {
             env.set(key, raw);
             let error = MeshRuntimeConfig::from_env_config(&mesh_env_config())
                 .expect_err("an invalid mesh DNS setting must fail startup and validate");

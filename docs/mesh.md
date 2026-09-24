@@ -6806,7 +6806,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_DNS_PROXY_ENABLED` | `false` | Enable the transparent DNS proxy |
 | `FERRUM_MESH_DNS_LISTEN_ADDR` | `127.0.0.1:15053` | DNS proxy listen address (UDP + TCP) |
 | `FERRUM_MESH_DNS_UPSTREAM_ADDR` | `127.0.0.53:53` | Upstream resolver for non-mesh queries |
-| `FERRUM_MESH_DNS_TTL_SECONDS` | `60` | TTL for mesh-resolved DNS responses, `1`–`86400` seconds |
+| `FERRUM_MESH_DNS_TTL_SECONDS` | `60` | TTL for mesh-resolved DNS responses, `0`–`86400` seconds |
 | `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` | `1024` | Concurrent query semaphore limit, `1`–`16384` |
 | `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` | `4096` | Per-slice cached response templates, `1`–`262144` |
 | `FERRUM_MESH_CLUSTER_DOMAIN` | `cluster.local` | Kubernetes cluster domain for FQDN synthesis |

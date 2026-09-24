@@ -151,13 +151,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetch that waited on I/O time out immediately, and a malformed or negative
   value silently became 30. The same rule applies to startup secret resolution
   (environment only), to later runtime fetches, and to the `ferrum.conf` value
-  when settings load. `FERRUM_MESH_DNS_TTL_SECONDS` (1–86400),
+  when settings load. `FERRUM_MESH_DNS_TTL_SECONDS` (0–86400),
   `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` (1–16384) and
   `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` (1–262144) no longer fall back to
-  their defaults on a malformed, blank, zero or overflowing value. `run` and
-  `validate` now fail with an error naming the variable and its range, without
-  echoing the value. Unset variables keep their documented defaults. A TTL of
-  `0` was previously accepted and is now refused. See
+  their defaults on a malformed, blank or overflowing value (or, for the two
+  capacity settings, zero). `run` and `validate` now fail with an error naming
+  the variable and its range, without echoing the value. Unset variables keep
+  their documented defaults. See
   [docs/upgrade_guide.md](docs/upgrade_guide.md).
 - **MCP trailing-slash alias withdrawn** (#5582). The single-trailing-slash
   alias introduced for #5536 is no longer accepted. Authorization plugins

@@ -20800,14 +20800,16 @@ const DNS_RESPONSE_CACHE_MAX_ENTRIES_KEY: &str = "FERRUM_MESH_DNS_RESPONSE_CACHE
 /// Pure parse for `FERRUM_MESH_DNS_TTL_SECONDS` (issue #5699).
 ///
 /// `None` (configured nowhere) selects [`DEFAULT_DNS_TTL_SECONDS`]. A configured
-/// value must be a whole number in `1..=`[`HARD_MAX_DNS_TTL_SECONDS`]; anything
-/// else, blank included, fails startup and `validate` instead of silently
-/// running on the default.
+/// value must be a whole number in `0..=`[`HARD_MAX_DNS_TTL_SECONDS`] (`0` is a
+/// valid DNS TTL: clients must not cache the answer); anything else, blank
+/// included, fails startup and `validate` instead of silently running on the
+/// default.
 pub fn parse_mesh_dns_ttl_seconds(raw: Option<&str>) -> Result<u32, String> {
     parse_mesh_dns_bounded(
         DNS_TTL_SECONDS_KEY,
         raw,
         DEFAULT_DNS_TTL_SECONDS,
+        0,
         HARD_MAX_DNS_TTL_SECONDS,
     )
 }
@@ -20821,6 +20823,7 @@ pub fn parse_mesh_dns_max_concurrent_queries(raw: Option<&str>) -> Result<usize,
         DNS_MAX_CONCURRENT_QUERIES_KEY,
         raw,
         DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
+        1,
         HARD_MAX_DNS_MAX_CONCURRENT_QUERIES,
     )
 }
@@ -20835,25 +20838,32 @@ pub fn parse_mesh_dns_response_cache_max_entries(raw: Option<&str>) -> Result<us
         DNS_RESPONSE_CACHE_MAX_ENTRIES_KEY,
         raw,
         dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
+        1,
         HARD_MAX_DNS_RESPONSE_CACHE_MAX_ENTRIES,
     )
 }
 
 /// Shared rule for the mesh DNS capacity/TTL settings: absent selects the
-/// default; present must parse as a whole number in `1..=max`.
+/// default; present must parse as a whole number in `min..=max`.
 ///
 /// The error names the variable and the accepted range but never the
 /// configured value, which may itself be sourced from an external secret.
-fn parse_mesh_dns_bounded<T>(key: &str, raw: Option<&str>, default: T, max: T) -> Result<T, String>
+fn parse_mesh_dns_bounded<T>(
+    key: &str,
+    raw: Option<&str>,
+    default: T,
+    min: T,
+    max: T,
+) -> Result<T, String>
 where
-    T: Copy + std::str::FromStr + PartialOrd + From<u8> + std::fmt::Display,
+    T: Copy + std::str::FromStr + PartialOrd + std::fmt::Display,
 {
     let Some(raw) = raw else {
         return Ok(default);
     };
     match raw.trim().parse::<T>() {
-        Ok(value) if (T::from(1)..=max).contains(&value) => Ok(value),
-        _ => Err(format!("{key} must be a whole number between 1 and {max}")),
+        Ok(value) if (min..=max).contains(&value) => Ok(value),
+        _ => Err(format!("{key} must be a whole number between {min} and {max}")),
     }
 }
 
