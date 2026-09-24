@@ -210,7 +210,7 @@ b47cc5fcb41e5d802bd175f0014f5636eefb897419720ab125b446e0b7f6f666  vendor/hyper-u
 8153fa0d74b3653f9cee113e2d42448febe20562f9bccc7a32b2fc151fc47dd0  vendor/hyper-util-0.1.20-ferrum-patched/examples/client.rs
 2e04d3f86a76810bb170d8c1633b44b4c5989822b17dbed0f3b63c221cc23f1a  vendor/hyper-util-0.1.20-ferrum-patched/examples/server.rs
 e4d65a46c7d2f44266b5c540596da1e753eeb74c580c9265296352d6e8bde83c  vendor/hyper-util-0.1.20-ferrum-patched/examples/server_graceful.rs
-87de0c5ce240d067fb2b5b9f512fa7944efc3f8a8caa7d9c1e0081ac5c6a25a9  vendor/hyper-util-0.1.20-ferrum-patched/src/client/legacy/client.rs
+390a5dfa840d1779945b8d99ccd74e37258da50766898cb55eaf19086ba9cf17  vendor/hyper-util-0.1.20-ferrum-patched/src/client/legacy/client.rs
 270c9d6be46aa2077df5ed52bb7cb1ac20c8153f88a4fbb3c57a19ef71936e67  vendor/hyper-util-0.1.20-ferrum-patched/src/client/legacy/connect/capture.rs
 ea20854191ca43b7755ec9e317af9b89238160a6a9e94235139aab0b39f707e5  vendor/hyper-util-0.1.20-ferrum-patched/src/client/legacy/connect/dns.rs
 91138d11a2cff92699dbbfd367856d0b90ce8b0aa1286f595c16b4fd9c491b67  vendor/hyper-util-0.1.20-ferrum-patched/src/client/legacy/connect/http.rs

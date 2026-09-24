@@ -363,7 +363,7 @@ where
             }
         };
 
-        let pooled = match pooled {
+        let mut pooled = match pooled {
             ConnSlot::Held(pooled) => pooled,
             ConnSlot::Released((_, conn_info)) => {
                 // The connection is already closed, so there is nothing to
