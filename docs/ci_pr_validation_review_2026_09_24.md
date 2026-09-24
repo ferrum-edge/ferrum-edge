@@ -137,3 +137,21 @@ the follow-ups below.
   `tests/unit/tls/`, and `Cargo.*`. It is required, so it is left unchanged.
 - **Production Dockerfile smoke:** already skips ordinary source changes.
   29 of 646 PRs (4%) run it.
+
+## Follow-ups (not in this PR)
+
+- **Pinned-hash optional lanes:** give `h2-guard-observation.yml` (and any
+  lane that pins a `src/` file hash) a `push: main` trigger on the pinned
+  files. Pin drift then surfaces on the commit that caused it, not on an
+  unrelated PR.
+- **NodeWaypoint eBPF Live on PRs:** this check isn't required. On pull
+  requests it runs for any `src/modes/mesh/`, `src/plugins/mesh/`,
+  `charts/ferrum-mesh/`, or `src/k8s_controller/` change: 128 of 646 PRs (20%)
+  in the sample. Narrowing it to NodeWaypoint-owned paths and relying on the
+  `main` run would drop most of those 120-minute Kind/eBPF jobs. Its relevance
+  job is frozen by `NODE_WAYPOINT_RELEVANCE_CONTRACT` in
+  `verify_cross_build_policy.py`, so this needs a direct-to-`main` policy
+  change.
+- **Merge-queue cost:** `ci_runtime_plan.py` force-runs FIPS, the production
+  images, and NodeWaypoint on `merge_group`. If the merge queue becomes the
+  normal path, give those suites the same path gating `pull_request` gets.
