@@ -34,7 +34,6 @@ from collections import Counter
 from pathlib import Path
 from types import ModuleType
 
-import yaml
 
 WORKTREE = "WORKTREE"
 PR_SUBJECT_RE = re.compile(r"^Merge pull request #(\d+) |\(#(\d+)\)\s*$")
@@ -115,6 +114,8 @@ def workflow_pr_filters(revision: str) -> dict[str, list[re.Pattern[str]] | None
             for p in git("ls-tree", "--name-only", revision, ".github/workflows/").split()
             if p.endswith(".yml")
         )
+    import yaml  # third-party; imported lazily so --self-test needs only stdlib
+
     filters: dict[str, list[re.Pattern[str]] | None] = {}
     for name in names:
         text = read_revision_file(revision, f".github/workflows/{name}")
@@ -201,6 +202,46 @@ def tally(results: list[dict], key: str) -> Counter:
     return counter
 
 
+def self_test() -> int:
+    failures: list[str] = []
+    glob_cases = (
+        ("src/proxy/**", "src/proxy/mod.rs", True),
+        ("src/proxy/**", "src/proxy/a/b.rs", True),
+        ("src/proxy/**", "src/proxyx.rs", False),
+        ("tests/unit/gateway_core/h1_profile*", "tests/unit/gateway_core/h1_profile_tests.rs", True),
+        ("tests/unit/gateway_core/h1_profile*", "tests/unit/gateway_core/x/h1_profile.rs", False),
+        ("**/*.md", "README.md", True),
+        ("**/*.md", "docs/a/b.md", True),
+        ("Cargo.toml", "Cargo.toml", True),
+        ("Cargo.toml", "sub/Cargo.toml", False),
+        ("a?.rs", "ab.rs", True),
+        ("a?.rs", "a/.rs", False),
+    )
+    for pattern, path, expected in glob_cases:
+        if bool(github_glob_to_regex(pattern).match(path)) != expected:
+            failures.append(f"glob {pattern!r} vs {path!r}: expected {expected}")
+    subject_cases = (
+        ("Merge pull request #5651 from ferrum-edge/deps/x", 5651),
+        ("Fix thing (#5672)", 5672),
+        ("Implement X (#5646 workstreams 1-2) (#5650)", 5650),
+        ("Direct push without a PR", None),
+    )
+    for subject, expected in subject_cases:
+        match = PR_SUBJECT_RE.search(subject)
+        number = int(match.group(1) or match.group(2)) if match else None
+        if number != expected:
+            failures.append(f"subject {subject!r}: expected {expected}, got {number}")
+    if workflow_triggered(None, []) is not True:
+        failures.append("a workflow without paths must trigger on every PR")
+    if workflow_triggered([github_glob_to_regex("src/**")], ["docs/a.md"]):
+        failures.append("an unmatched paths filter must not trigger")
+    for failure in failures:
+        print(f"::error::{failure}", file=sys.stderr)
+    if not failures:
+        print("ci_gate_replay self-test passed")
+    return 1 if failures else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--ref", default="origin/main")
@@ -209,7 +250,10 @@ def main() -> int:
     parser.add_argument("--baseline", default="origin/main")
     parser.add_argument("--candidate", default=WORKTREE)
     parser.add_argument("--json", type=Path, help="write per-PR decisions here")
+    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+    if args.self_test:
+        return self_test()
 
     samples = merged_pull_requests(args.ref, args.since, args.limit)
     if not samples:

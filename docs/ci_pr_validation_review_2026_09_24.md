@@ -106,7 +106,9 @@ group, so they are never cancelled and never displace each other.
 `.github/scripts/ci_gate_replay.py` makes future gate changes measurable before
 merge. It evaluates the baseline and candidate revisions of the planner, the
 live-suite filter, and every workflow's `on.pull_request.paths` against real
-merged PRs. It reads Git objects only.
+merged PRs. It reads Git objects only. Its `--self-test` (glob translation,
+merge-subject parsing, trigger semantics) runs inside `verify_required_ci.py`
+in the `Tests` aggregate.
 
 ## Unchanged by design
 
