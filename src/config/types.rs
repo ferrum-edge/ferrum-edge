@@ -251,9 +251,14 @@ pub const DEFAULT_MAX_CREDENTIALS_PER_TYPE: usize = 2;
 
 /// Resolve the runtime max credentials per type from env var / conf file, falling
 /// back to `DEFAULT_MAX_CREDENTIALS_PER_TYPE` if unset or unparsable.
+///
+/// Parses exactly like `EnvConfig` (surrounding whitespace trimmed) so a value
+/// startup validated is the value enforced here; `EnvConfig::validate` rejects
+/// unparsable and zero values before serving.
 pub fn max_credentials_per_type() -> usize {
     crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_CREDENTIALS_PER_TYPE")
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|limit: &usize| *limit >= 1)
         .unwrap_or(DEFAULT_MAX_CREDENTIALS_PER_TYPE)
 }
 
@@ -10187,6 +10192,13 @@ impl HealthCheckConfig {
             ) {
                 errors.push(e);
             }
+            // The probe URL is `{scheme}://{host}:{port}{http_path}`. Without a
+            // leading `/`, a path such as `@169.254.169.254/` turns the target
+            // into userinfo and redirects the probe to another host, skipping
+            // the egress screen that only inspects the target host.
+            if !active.http_path.starts_with('/') {
+                errors.push("`active.http_path` must start with a slash".to_string());
+            }
             if let Err(e) = validate_u64_range(
                 "active.interval_seconds",
                 active.interval_seconds,
@@ -10221,10 +10233,16 @@ impl HealthCheckConfig {
             {
                 errors.push(e);
             }
-            if let Some(ref payload) = active.udp_probe_payload
-                && let Err(e) = validate_string_field("active.udp_probe_payload", payload, 2048)
-            {
-                errors.push(e);
+            if let Some(ref payload) = active.udp_probe_payload {
+                if let Err(e) = validate_string_field("active.udp_probe_payload", payload, 2048) {
+                    errors.push(e);
+                } else if hex::decode(payload).is_err() {
+                    // The probe decodes this at runtime; an undecodable value
+                    // would otherwise silently fall back to a single zero byte.
+                    errors.push(
+                        "`active.udp_probe_payload` must be an even-length hex string".to_string(),
+                    );
+                }
             }
         }
 

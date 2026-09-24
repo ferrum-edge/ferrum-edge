@@ -42,6 +42,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject a health-check `active.http_path` that does not start with `/`
+  (#5683). The probe URL is `scheme://host:port` + path, so a path like
+  `@169.254.169.254/` turned the target into userinfo and sent the probe to a
+  different host that the egress screen never inspected.
+- Reject non-finite (`NaN`, `inf`) floating-point env values (#5684). A `NaN`
+  `FERRUM_OVERLOAD_*_THRESHOLD` passed validation and silently disabled load
+  shedding.
+- `bot_detection` `allow_list` entries whose first or last character is
+  punctuation now match (#5685). Word-boundary anchors are applied only to
+  word-character edges, so embedded-token smuggling stays blocked.
+- `spec_expose` serves specs with `Content-Security-Policy: default-src 'none';
+  sandbox` (#5686), so an upstream-supplied `application/xml` document cannot
+  run XHTML-namespaced script on the gateway origin.
+- `ldap_auth` escapes NUL in bind DN values as `\00` (RFC 4514) (#5687).
+- Reject an `active.udp_probe_payload` that is not an even-length hex string
+  (#5688) instead of silently probing with a single zero byte.
+- `FERRUM_MAX_CREDENTIALS_PER_TYPE=0` now fails startup, and the enforced value
+  is parsed exactly as startup validated it (#5689).
+- `graphql` and `grpc_method_router` tag `limit_by: consumer` rate keys as
+  `consumer:` or `ip:` (#5692), so an identity that equals an IP no longer
+  shares the anonymous budget of that IP. Existing local and Redis counters for
+  these two plugins restart once after upgrading.
+
 - Flush the two writes that run just before a byte relay starts (#5588): the
   TCP+TLS first-bytes prefix forwarded to the backend, and WebSocket tunnel
   mode's forward of backend bytes that arrived with the `101`. The relay only
@@ -85,6 +108,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header elements and remaining constructor scalar/type diagnostics follow the
   same withholding convention. Version and credential schema names remain
   visible in backticks. Real-binary regressions inspect both output streams.
+
+### Performance
+
+- `ws_frame_logging` builds its payload-fingerprint HMAC key once per plugin
+  instead of once per frame (#5690).
+- Circuit-breaker cache hits no longer allocate a key string (#5691).
 
 ### Security
 

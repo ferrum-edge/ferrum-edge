@@ -460,15 +460,23 @@ impl GrpcMethodRouter {
     /// When `limit_by: "consumer"`, uses the identified consumer's username,
     /// falling back to `authenticated_identity` (for external auth like JWKS
     /// where no gateway Consumer exists), then to client IP.
+    ///
+    /// The identity is tagged `consumer:` or `ip:` (as in `rate_limiting`) so an
+    /// identity string that equals an IP never shares a budget with the
+    /// unauthenticated caller at that IP.
     fn rate_key(&self, ctx: &RequestContext, method_path: &str) -> String {
-        let identity = if self.limit_by == "consumer" {
-            ctx.effective_identity().unwrap_or(ctx.client_ip.as_str())
-        } else {
-            ctx.client_ip.as_str()
+        let (kind, identity) = match (self.limit_by == "consumer")
+            .then(|| ctx.effective_identity())
+            .flatten()
+        {
+            Some(identity) => ("consumer:", identity),
+            None => ("ip:", ctx.client_ip.as_str()),
         };
-        let mut key =
-            String::with_capacity("grpc_method::".len() + identity.len() + method_path.len());
+        let mut key = String::with_capacity(
+            "grpc_method::".len() + kind.len() + identity.len() + method_path.len(),
+        );
         key.push_str("grpc_method:");
+        key.push_str(kind);
         key.push_str(identity);
         key.push(':');
         key.push_str(method_path);

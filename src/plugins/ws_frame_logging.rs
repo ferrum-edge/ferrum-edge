@@ -252,7 +252,9 @@ pub struct WsFrameLogging {
     log_level: LogLevel,
     include_payload_preview: bool,
     payload_preview_bytes: usize,
-    payload_fingerprint_key: Option<[u8; 32]>,
+    /// Built once at construction; rebuilding the HMAC key per frame costs two
+    /// extra SHA-256 compressions on the WebSocket hot path.
+    payload_fingerprint_key: Option<crate::fips::backend::hmac::Key>,
     log_ping_pong: bool,
 }
 
@@ -346,7 +348,10 @@ impl WsFrameLogging {
                 .map_err(|_| {
                     "ws_frame_logging: failed to generate payload fingerprint key".to_string()
                 })?;
-            Some(key)
+            Some(crate::fips::backend::hmac::Key::new(
+                crate::fips::backend::hmac::HMAC_SHA256,
+                &key,
+            ))
         } else {
             None
         };
@@ -563,10 +568,13 @@ fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
 /// `hashed` is the prefix of the payload that is folded into the digest,
 /// `full_len` is the total payload length reported to operators, and
 /// `truncated` indicates the digest only covers a prefix of the payload.
-fn payload_fingerprint(key: &[u8; 32], hashed: &[u8], full_len: usize, truncated: bool) -> String {
-    let hmac_key =
-        crate::fips::backend::hmac::Key::new(crate::fips::backend::hmac::HMAC_SHA256, key);
-    let digest = crate::fips::backend::hmac::sign(&hmac_key, hashed);
+fn payload_fingerprint(
+    key: &crate::fips::backend::hmac::Key,
+    hashed: &[u8],
+    full_len: usize,
+    truncated: bool,
+) -> String {
+    let digest = crate::fips::backend::hmac::sign(key, hashed);
     // 6 bytes -> 12 lowercase hex chars: enough entropy to correlate frames
     // within a plugin instance while staying compact in log lines.
     let prefix = hex::encode(&digest.as_ref()[..6]);

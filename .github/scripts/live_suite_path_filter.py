@@ -47,7 +47,7 @@ def exact_path_patterns(paths: frozenset[str]) -> list[str]:
 # unrelated PR a Kind cluster. Unknown paths do NOT force a run.
 SUITE_PATTERNS: dict[str, list[str]] = {
     "gateway-api": [
-        r"^\.github/workflows/(ci|gateway-api-conformance)\.yml$",
+        r"^\.github/workflows/gateway-api-conformance\.yml$",
         r"^\.github/scripts/live_suite_path_filter\.py$",
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
@@ -65,7 +65,7 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         *exact_path_patterns(MESH_FEDERATION_DOCUMENTATION_PATHS),
     ],
     "mesh-federation": [
-        r"^\.github/workflows/(ci|multicluster-federation-live|multicluster-poller-partition-live)\.yml$",
+        r"^\.github/workflows/(multicluster-federation-live|multicluster-poller-partition-live)\.yml$",
         r"^\.github/scripts/(live_suite_path_filter|validate_live_assertions)\.py$",
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
@@ -86,7 +86,7 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         *exact_path_patterns(MESH_FEDERATION_DOCUMENTATION_PATHS),
     ],
     "mesh-e2e-sidecar": [
-        r"^\.github/workflows/(ci|mesh-e2e-sidecar-live)\.yml$",
+        r"^\.github/workflows/mesh-e2e-sidecar-live\.yml$",
         r"^\.github/scripts/live_suite_path_filter\.py$",
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
@@ -108,7 +108,7 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         *exact_path_patterns(MESH_E2E_SIDECAR_DOCUMENTATION_PATHS),
     ],
     "ambient-host-udp": [
-        r"^\.github/workflows/(ci|ambient-host-udp-live|release)\.yml$",
+        r"^\.github/workflows/(ambient-host-udp-live|release)\.yml$",
         r"^\.github/scripts/(live_suite_path_filter|pr_ci_plan|verify_cross_build_policy|verify_release_image_attestations)\.py$",
         r"^\.github/scripts/stage_iproute2_runtime\.sh$",
         r"^\.github/actions/setup-rust-ci/",
@@ -1368,6 +1368,12 @@ def self_test() -> int:
         ("ambient-host-udp", ["charts/ferrum-mesh/values.yaml"], True),
         ("ambient-host-udp", ["Dockerfile"], True),
         ("ambient-host-udp", [".github/workflows/release.yml"], True),
+        # ci.yml is a separate workflow none of the Kind suites execute; editing
+        # it must not buy four Kind clusters (every suite still runs on main).
+        ("gateway-api", [".github/workflows/ci.yml"], False),
+        ("mesh-federation", [".github/workflows/ci.yml"], False),
+        ("mesh-e2e-sidecar", [".github/workflows/ci.yml"], False),
+        ("ambient-host-udp", [".github/workflows/ci.yml"], False),
         ("ambient-host-udp", [".github/scripts/stage_iproute2_runtime.sh"], True),
         (
             "ambient-host-udp",

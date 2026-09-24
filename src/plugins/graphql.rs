@@ -493,14 +493,23 @@ impl GraphqlPlugin {
     }
 
     /// Build the rate limit key based on `limit_by` config.
+    ///
+    /// The identity is tagged `consumer:` or `ip:` (as in `rate_limiting`) so an
+    /// identity string that equals an IP never shares a budget with the
+    /// unauthenticated caller at that IP.
     fn rate_key(&self, ctx: &RequestContext, kind: &str, value: &str) -> String {
-        let identity = if self.limit_by == "consumer" {
-            ctx.effective_identity().unwrap_or(ctx.client_ip.as_str())
-        } else {
-            ctx.client_ip.as_str()
+        let (identity_kind, identity) = match (self.limit_by == "consumer")
+            .then(|| ctx.effective_identity())
+            .flatten()
+        {
+            Some(identity) => ("consumer:", identity),
+            None => ("ip:", ctx.client_ip.as_str()),
         };
-        let mut key = String::with_capacity(4 + identity.len() + kind.len() + value.len() + 2);
+        let mut key = String::with_capacity(
+            4 + identity_kind.len() + identity.len() + kind.len() + value.len() + 2,
+        );
         key.push_str("gql:");
+        key.push_str(identity_kind);
         key.push_str(identity);
         key.push(':');
         key.push_str(kind);

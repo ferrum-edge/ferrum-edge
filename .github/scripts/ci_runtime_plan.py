@@ -76,8 +76,17 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
     # prefix on purpose: those modules exist solely to implement this suite,
     # so a new one must be sensitive by construction. Since #3908 this suite
     # is the ONLY relevance authority for the live job (the workflow carries
-    # no `paths:` filter). Shared runtime trees are validated by the ordinary
-    # shards on the PR and by this suite on every push to `main`.
+    # no `paths:` filter).
+    #
+    # On a pull request only NodeWaypoint-owned surfaces are sensitive: the BPF
+    # program tree and its userspace loader/capture modules, the NodeWaypoint
+    # proxy modules, the live harness, and the workflow's own image/toolchain
+    # inputs. Broad mesh trees (`src/modes/mesh/`, `src/plugins/mesh/`,
+    # `src/k8s_controller/`, `charts/ferrum-mesh/`, the HBONE/mesh TCP proxy
+    # files, `src/modes/node_agent.rs`, `tests/k8s/lib/`) are exercised on the
+    # PR by the required mesh live suites and the ordinary shards, and by this
+    # suite on every push to `main`. The check is not branch-protection-
+    # required, so a shared-path regression surfaces on `main`.
     "node-waypoint-ebpf-live": (
         r"^\.github/workflows/node-waypoint-ebpf-live\.yml$",
         r"^\.dockerignore$",
@@ -95,18 +104,7 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^ebpf/",
         r"^src/capture/",
         r"^src/ebpf/",
-        r"^src/k8s_controller/",
-        r"^src/modes/mesh/",
-        r"^src/modes/node_agent\.rs$",
-        r"^src/plugins/mesh/",
-        r"^src/proxy/hbone_pool\.rs$",
-        r"^src/proxy/hbone_proxy\.rs$",
-        r"^src/proxy/mesh_tcp_egress\.rs$",
-        r"^src/proxy/mesh_tcp_inbound\.rs$",
-        r"^src/proxy/netns_capture\.rs$",
         r"^src/proxy/node_waypoint_",
-        r"^charts/ferrum-mesh/",
-        r"^tests/k8s/lib/",
         r"^tests/k8s/node_waypoint_ebpf_live/",
     ),
 }
@@ -461,16 +459,8 @@ def self_test() -> int:
         ("production-dockerfile-smoke", ['"Dockerfile"'], True),
         # NodeWaypoint: its own datapath modules, harness, and image inputs.
         ("node-waypoint-ebpf-live", ["src/ebpf/mod.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/ebpf/loader.rs"], True),
         ("node-waypoint-ebpf-live", ["src/capture/mod.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/k8s_controller/mod.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/modes/mesh/mod.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/modes/node_agent.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/plugins/mesh/mod.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/proxy/hbone_pool.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/proxy/mesh_tcp_egress.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/proxy/mesh_tcp_inbound.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/proxy/hbone_proxy.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/proxy/netns_capture.rs"], True),
         (
             "node-waypoint-ebpf-live",
             ["src/proxy/node_waypoint_ingress_capture.rs"],
@@ -518,9 +508,33 @@ def self_test() -> int:
         ("node-waypoint-ebpf-live", [".github/actions/setup-sccache/action.yml"], True),
         ("node-waypoint-ebpf-live", [".github/actions/setup-fast-linker/action.yml"], True),
         ("node-waypoint-ebpf-live", [".github/actions/setup-bpf-linker/action.yml"], True),
-        ("node-waypoint-ebpf-live", ["charts/ferrum-mesh/values.yaml"], True),
         ("node-waypoint-ebpf-live", ["tests/k8s/node_waypoint_ebpf_live/run.sh"], True),
-        ("node-waypoint-ebpf-live", ["tests/k8s/lib/helpers.sh"], True),
+        # A broad mesh change that also touches a NodeWaypoint-owned path runs.
+        (
+            "node-waypoint-ebpf-live",
+            ["src/modes/mesh/mod.rs", "src/proxy/node_waypoint_udp_steering.rs"],
+            True,
+        ),
+        # Broad mesh surfaces are validated on the PR by the required mesh live
+        # suites and ordinary shards, and by this suite on every push to main.
+        ("node-waypoint-ebpf-live", ["src/modes/mesh/mod.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/modes/mesh/enrolled_destinations.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/plugins/mesh/mod.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/k8s_controller/mod.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/modes/node_agent.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/hbone_pool.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/hbone_proxy.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/mesh_tcp_egress.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/mesh_tcp_inbound.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/netns_capture.rs"], False),
+        ("node-waypoint-ebpf-live", ["charts/ferrum-mesh/values.yaml"], False),
+        (
+            "node-waypoint-ebpf-live",
+            ["charts/ferrum-mesh/templates/node-agent-daemonset.yaml"],
+            False,
+        ),
+        ("node-waypoint-ebpf-live", ["tests/k8s/lib/helpers.sh"], False),
+        ("node-waypoint-ebpf-live", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
         # Shared runtime trees, the build graph, and documentation stay on main.
         ("node-waypoint-ebpf-live", ["src/grpc/mod.rs"], False),
         ("node-waypoint-ebpf-live", ["src/identity/mod.rs"], False),
