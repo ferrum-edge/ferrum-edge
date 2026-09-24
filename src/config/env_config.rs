@@ -31,9 +31,54 @@ pub(crate) use env_config_macro::EnvValue;
 
 pub const DEFAULT_TLS_MANAGED_STORE_PATH: &str = "./ferrum-managed-tls";
 
+/// Set by the gateway binary's entry point; see
+/// [`use_working_directory_tls_managed_store_default`].
+static TLS_STORE_CWD_DEFAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Private per-process store directory for every process that has not opted
+/// into the working-directory default.
+static TLS_STORE_PROCESS_DEFAULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Make an unconfigured `FERRUM_TLS_MANAGED_STORE_PATH` resolve to the
+/// documented working-directory default, [`DEFAULT_TLS_MANAGED_STORE_PATH`].
+///
+/// Only the gateway binary calls this, first thing in `main`. Every other
+/// process that links the library — above all the Rust test harnesses, which
+/// Cargo runs from the repository root — instead gets a private directory
+/// under the system temporary directory, unique to that process. A test that
+/// reaches the process-global managed-TLS, ACME, lease, or TLS event stores
+/// without configuring a path therefore cannot write into the checkout or
+/// share persistent TLS state with another run (issue #5706). An explicit,
+/// non-empty path from the environment or `ferrum.conf` wins in both cases.
+pub fn use_working_directory_tls_managed_store_default() {
+    TLS_STORE_CWD_DEFAULT.store(true, std::sync::atomic::Ordering::Release);
+}
+
 pub fn tls_managed_store_path_from_env() -> String {
-    crate::config::conf_file::resolve_ferrum_var("FERRUM_TLS_MANAGED_STORE_PATH")
-        .unwrap_or_else(|| DEFAULT_TLS_MANAGED_STORE_PATH.to_string())
+    match crate::config::conf_file::resolve_ferrum_var("FERRUM_TLS_MANAGED_STORE_PATH") {
+        Some(path) if !path.is_empty() => path,
+        _ => unconfigured_tls_managed_store_path(),
+    }
+}
+
+fn unconfigured_tls_managed_store_path() -> String {
+    if TLS_STORE_CWD_DEFAULT.load(std::sync::atomic::Ordering::Acquire) {
+        return DEFAULT_TLS_MANAGED_STORE_PATH.to_string();
+    }
+    TLS_STORE_PROCESS_DEFAULT
+        .get_or_init(process_private_tls_managed_store_path)
+        .clone()
+}
+
+/// The directory is only named here; the stores create it privately on first
+/// use, so a process that never opens one leaves nothing behind.
+fn process_private_tls_managed_store_path() -> String {
+    let pid = std::process::id();
+    let nonce = uuid::Uuid::new_v4().simple();
+    let name = format!("ferrum-managed-tls-{pid}-{nonce}");
+    let path = std::env::temp_dir().join(name);
+    path.to_string_lossy().into_owned()
 }
 
 /// Default bound on waiting for the shared managed-TLS/ACME store lock.

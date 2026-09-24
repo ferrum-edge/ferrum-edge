@@ -42,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Rust tests no longer write the gateway's TLS store into the checkout
+  (#5706). Only the `ferrum-edge` binary resolves an unconfigured
+  `FERRUM_TLS_MANAGED_STORE_PATH` to `./ferrum-managed-tls`; other processes
+  that link the library, including every test harness, use a private
+  per-process temporary directory. An empty value now counts as unset. The
+  accidentally committed `ferrum-managed-tls/` store is removed and ignored,
+  and the Unit and Integration Tests jobs fail when a test run changes or adds
+  files in the checkout. `basic_auth` tests no longer race env-isolated tests
+  for `FERRUM_BASIC_AUTH_HMAC_SECRET` (#5705).
 - Reject a health-check `active.http_path` that does not start with `/`
   (#5683). The probe URL is `scheme://host:port` + path, so a path like
   `@169.254.169.254/` turned the target into userinfo and sent the probe to a

@@ -719,6 +719,30 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Check the test run left the checkout clean
+        # Tests keep runtime state in temporary directories (issue #5706).
+        # Fail if this shard's tests modified a tracked file, left an
+        # untracked one, or recreated the gateway's working-directory TLS
+        # store, which .gitignore hides so a locally run gateway cannot commit
+        # it. Build output stays under the ignored target/ and .cache/ trees.
+        # File names only: a leaked store can hold private keys.
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          leaked=0
+          changes="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$changes" ]; then
+            echo "::error::the test run modified or created files in the checkout"
+            printf '%s\n' "$changes"
+            leaked=1
+          fi
+          if [ -e ferrum-managed-tls ]; then
+            echo "::error::the test run wrote the working-directory TLS store ./ferrum-managed-tls"
+            find ferrum-managed-tls -maxdepth 1 -print
+            leaked=1
+          fi
+          exit "$leaked"
+
       - name: Preserve unit compile diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -1355,6 +1379,28 @@ jobs:
           INTEGRATION_FILTERS: ${{ matrix.filters }}
           RUST_BACKTRACE: 1
         timeout-minutes: 30
+
+      - name: Check the test run left the checkout clean
+        # Same guard as the Unit Tests job (issue #5706). The downloaded
+        # nextest archive is this job's only expected untracked file; the
+        # prebuilt ferrum-cni binary lands in the ignored target/ tree.
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          leaked=0
+          changes="$(git status --porcelain --untracked-files=all -- . \
+            ":(exclude)integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst")"
+          if [ -n "$changes" ]; then
+            echo "::error::the test run modified or created files in the checkout"
+            printf '%s\n' "$changes"
+            leaked=1
+          fi
+          if [ -e ferrum-managed-tls ]; then
+            echo "::error::the test run wrote the working-directory TLS store ./ferrum-managed-tls"
+            find ferrum-managed-tls -maxdepth 1 -print
+            leaked=1
+          fi
+          exit "$leaked"
 
       - name: Summarize integration shard
         if: always()

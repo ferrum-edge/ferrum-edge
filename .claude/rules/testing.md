@@ -44,6 +44,27 @@ does not poison `cargo test --test unit_tests` (or the other unit targets). A
 test that needs a specific `FERRUM_*` value must set it explicitly inside the
 guard; do not rely on host environment.
 
+A guard's lifetime must cover every READ of the value it sets, not just the
+write. Issue #5705: a helper set `FERRUM_BASIC_AUTH_HMAC_SECRET` under
+`ENV_LOCK`, released the lock, and a sibling `EnvGuard` cleared it before the
+test constructed `basic_auth`. Bind `plugin_utils::basic_auth_test_secret_guard()`
+for the whole construction phase, or build `BasicAuth` with
+`_test_support::basic_auth_with_secret_for_test` and no env at all. `PluginCache`
+builds enter the log-schema registry serializer, so take `ENV_LOCK` before
+`log_schema_registry_guard()`, never after.
+
+## Runtime State Isolation
+
+Tests must not write into the checkout (issue #5706). Only the `ferrum-edge`
+binary resolves an unconfigured `FERRUM_TLS_MANAGED_STORE_PATH` to
+`./ferrum-managed-tls`; every test harness gets a private per-process temp dir
+for the process-global managed-TLS, ACME, lease, and TLS event stores, and
+`TestGateway` sets a per-spawn store dir. Bespoke gateway spawners that run
+from the repo root must set `FERRUM_TLS_MANAGED_STORE_PATH` (or a temp
+`current_dir`) themselves. The Unit Tests and Integration Tests jobs fail on any
+tracked-file change, untracked file, or recreated `./ferrum-managed-tls` after
+the suite.
+
 ## TLS Inventory Fixture Isolation
 
 TLS inventory cache tests must own their `TlsInventoryCache` and admin metrics
