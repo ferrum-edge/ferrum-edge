@@ -1041,23 +1041,27 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Build gateway binary
-        # Match ferrum-cni and the nextest archives below: a separate pr-build
-        # directory compiles the dependency graph again before shards can run.
-        # This binary is used only for tests; release producers keep their
-        # shipping profile and all consumers keep the target/debug contract.
-        run: cargo build --bin ferrum-edge
-
-      - name: Build ferrum-cni binary
+      - name: Build test targets and binaries
+        # One Cargo invocation compiles both nextest targets, so the two test
+        # crates build concurrently once the shared library is done. Cargo
+        # also builds every package bin for integration tests (for
+        # `CARGO_BIN_EXE_*`) and uplifts them to target/debug/ferrum-edge and
+        # target/debug/ferrum-cni, the paths the upload steps below publish.
+        # The archive steps then find every unit fresh and only package it.
+        #
+        # Do not add a separate `cargo build --bin` step. Without
+        # dev-dependencies Cargo resolves a different feature set (tokio
+        # `test-util`, rustls `aws-lc-rs`), which misses the test-built
+        # `ci-debug` lane and compiles the dependency graph and the library a
+        # second time. The test build then overwrote that binary anyway.
+        #
         # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, which
         # Cargo bakes in as target/debug/ferrum-cni under the workspace path
         # used to build the archive. Keep archive builders and shard runners on
         # matching OS/arch + checkout layout, or update this artifact/path with
-        # any future runner/workspace/target-dir change.
-        #
-        # This debug-path binary is transferred to every integration shard;
-        # omit DWARF from the transfer-only build to keep the artifact small.
-        run: cargo build --bin ferrum-cni
+        # any future runner/workspace/target-dir change. These binaries are
+        # used only for tests; release producers keep their shipping profile.
+        run: cargo test --no-run --test integration_tests --test functional_tests
 
       - name: Build integration tests archive
         # Nextest archives are native binaries, so the file and artifact names
@@ -1070,8 +1074,7 @@ jobs:
             --archive-file "$archive_file"
 
       - name: Build functional tests archive
-        # Build the second test target in the same job and shared Cargo cache,
-        # reusing the leaf-crate compilation from the integration archive.
+        # Packages the functional target compiled by the step above.
         run: |
           archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
@@ -1718,27 +1721,43 @@ jobs:
               functional_response_mock_semantics_test
               functional_response_protocol_managed_headers_test
               functional_websocket_limits_test
+          # The service-backed shards run serially (`nextest_jobs: 1`) against
+          # one set of Redis/MongoDB/PostgreSQL/MySQL containers per runner, so
+          # the old single data-plane shard was the functional critical path
+          # (~15 min of serial test time after Build Test Artifacts). Two
+          # runners, each with its own containers, halve it. Balance by the
+          # hosted per-module durations recorded in
+          # docs/ci_pr_validation_review_2026_09_24.md; `data_services` (not
+          # the shard name) gates the containers and backend URLs.
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and
-            # race when nextest runs this shard in parallel. Also hosts the
-            # required PostgreSQL/MySQL/MongoDB/Redis persistence-parity cells
-            # documented in docs/functional_testing_database.md.
+            # race when nextest runs this shard in parallel. Hosts the required
+            # PostgreSQL/MySQL/MongoDB/Redis persistence-parity cells documented
+            # in docs/functional_testing_database.md.
             nextest_jobs: 1
+            data_services: true
             filters: |
-              functional_capability_registry_test
               functional_admin_crud_resources_test
-              functional_cp_dp_resilience_test
-              functional_cp_dp_test
               functional_database_parity_test
               functional_database_test
               functional_db_failover_test
-              functional_db_outage_test
               functional_db_tls_test
               functional_db_upstream_test
+              functional_mongodb_test
+          - shard: data-plane-runtime
+            # Same serialization and service containers as `data-plane`: DB
+            # outage/pause, Redis rate limiting, namespace, CP/DP and mesh-mode
+            # suites.
+            nextest_jobs: 1
+            data_services: true
+            filters: |
+              functional_capability_registry_test
+              functional_cp_dp_resilience_test
+              functional_cp_dp_test
+              functional_db_outage_test
               functional_gateway_trust_bundle_ha_test
               functional_mesh_mode_test
               functional_mesh_stock_xds_test
-              functional_mongodb_test
               functional_namespace_test
               functional_plugin_quarantine_test
               functional_redis_rate_limiting_test
@@ -1779,13 +1798,13 @@ jobs:
           path: .
 
       - name: Start data-plane service containers
-        # Only the data-plane shard runs redis/mongo/postgres/mysql-backed
+        # Only the data-plane shards run redis/mongo/postgres/mysql-backed
         # functional persistence tests. These services were previously declared
         # job-wide (or omitted for SQL), so either every shard paid the Docker
         # cost or PostgreSQL/MySQL suites silently skipped. Start them only
         # where they're used, set explicit URLs, and fail closed when readiness
         # fails. Ports map to the runner's localhost exactly as the tests expect.
-        if: matrix.shard == 'data-plane'
+        if: matrix.data_services == true
         #
         # Four mongod instances on purpose:
         # - standalone 27017: documented `POST /batch` 501 refusal + plaintext matrix,
@@ -2257,21 +2276,21 @@ jobs:
           FERRUM_SKIP_GATEWAY_BUILD: "1"
           RUST_BACKTRACE: 1
           # Explicit backend URLs for the data-plane persistence matrix. Empty
-          # on non-data-plane shards (harmless — those filters never consult them).
-          FERRUM_TEST_POSTGRES_URL: ${{ matrix.shard == 'data-plane' && 'postgres://ferrum:ferrum@127.0.0.1:5432/ferrum' || '' }}
-          FERRUM_TEST_MYSQL_URL: ${{ matrix.shard == 'data-plane' && 'mysql://ferrum:ferrum@127.0.0.1:3306/ferrum' || '' }}
-          FERRUM_TEST_MONGO_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27017/ferrum_test' || '' }}
-          FERRUM_TEST_MONGO_TLS_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
-          FERRUM_TEST_MONGO_TLS_REQUIRE_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
-          FERRUM_TEST_MONGO_MTLS_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27019/ferrum_test' || '' }}
-          FERRUM_TEST_MONGO_CERT_DIR: ${{ matrix.shard == 'data-plane' && format('{0}/ferrum-mongo-tls-certs', runner.temp) || '' }}
-          FERRUM_TEST_CERT_DIR: ${{ matrix.shard == 'data-plane' && format('{0}/ferrum-db-tls-certs', runner.temp) || '' }}
-          FERRUM_DB_BACKENDS_REQUIRED: ${{ matrix.shard == 'data-plane' && '1' || '' }}
-          FERRUM_DB_TLS_REQUIRED: ${{ matrix.shard == 'data-plane' && '1' || '' }}
+          # on shards without data_services (harmless — those filters never consult them).
+          FERRUM_TEST_POSTGRES_URL: ${{ matrix.data_services == true && 'postgres://ferrum:ferrum@127.0.0.1:5432/ferrum' || '' }}
+          FERRUM_TEST_MYSQL_URL: ${{ matrix.data_services == true && 'mysql://ferrum:ferrum@127.0.0.1:3306/ferrum' || '' }}
+          FERRUM_TEST_MONGO_URL: ${{ matrix.data_services == true && 'mongodb://127.0.0.1:27017/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_TLS_URL: ${{ matrix.data_services == true && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_TLS_REQUIRE_URL: ${{ matrix.data_services == true && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_MTLS_URL: ${{ matrix.data_services == true && 'mongodb://127.0.0.1:27019/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_CERT_DIR: ${{ matrix.data_services == true && format('{0}/ferrum-mongo-tls-certs', runner.temp) || '' }}
+          FERRUM_TEST_CERT_DIR: ${{ matrix.data_services == true && format('{0}/ferrum-db-tls-certs', runner.temp) || '' }}
+          FERRUM_DB_BACKENDS_REQUIRED: ${{ matrix.data_services == true && '1' || '' }}
+          FERRUM_DB_TLS_REQUIRED: ${{ matrix.data_services == true && '1' || '' }}
         timeout-minutes: 45
 
       - name: Stop data-plane service containers
-        if: always() && matrix.shard == 'data-plane'
+        if: always() && matrix.data_services == true
         run: |
           set +e
           for name in ferrum-ci-redis ferrum-ci-mongo ferrum-ci-mongo-rs \
@@ -2288,7 +2307,7 @@ jobs:
         run: |
           echo "## Functional Test Shard: ${{ matrix.shard }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ matrix.shard }}" = "data-plane" ]; then
+          if [ "${{ matrix.data_services }}" = "true" ]; then
             # Keep parity mapping as plain prose (no Markdown table pipes beside
             # workflow expressions). Trusted Cross otherwise treats a piped
             # expression cell as an opaque command outside build-arm64-cross.

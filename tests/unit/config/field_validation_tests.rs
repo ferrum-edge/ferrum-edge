@@ -1471,6 +1471,72 @@ fn test_upstream_health_check_validated() {
 }
 
 #[test]
+fn test_upstream_health_check_http_path_requires_leading_slash() {
+    // Without a leading '/', `http://10.0.0.5:8080@169.254.169.254/` reparses
+    // the target as userinfo and dials a different host.
+    for bad in ["@169.254.169.254/latest/meta-data/", "health", ""] {
+        let mut upstream = make_upstream("test");
+        upstream.health_checks = Some(HealthCheckConfig {
+            active: Some(ActiveHealthCheck {
+                http_path: bad.to_string(),
+                ..Default::default()
+            }),
+            passive: None,
+        });
+        let errs = upstream.validate_fields().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`health_checks.active.http_path` must start with a slash")),
+            "expected leading-slash rejection for {bad:?}, got: {errs:?}"
+        );
+    }
+
+    let mut upstream = make_upstream("test");
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: Some(ActiveHealthCheck {
+            http_path: "/healthz?probe=1".to_string(),
+            ..Default::default()
+        }),
+        passive: None,
+    });
+    assert!(upstream.validate_fields().is_ok());
+}
+
+#[test]
+fn test_upstream_health_check_udp_probe_payload_must_be_hex() {
+    for (payload, ok) in [
+        ("abc", false),
+        ("ping", false),
+        ("zz00", false),
+        ("", true),
+        ("00ff", true),
+        ("DEADbeef", true),
+    ] {
+        let mut upstream = make_upstream("test");
+        upstream.health_checks = Some(HealthCheckConfig {
+            active: Some(ActiveHealthCheck {
+                probe_type: ferrum_edge::config::types::HealthProbeType::Udp,
+                udp_probe_payload: Some(payload.to_string()),
+                ..Default::default()
+            }),
+            passive: None,
+        });
+        let result = upstream.validate_fields();
+        if ok {
+            assert!(result.is_ok(), "{payload:?} should validate: {result:?}");
+        } else {
+            let errs = result.unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.contains(
+                    "`health_checks.active.udp_probe_payload` must be an even-length hex string"
+                )),
+                "expected hex rejection for {payload:?}, got: {errs:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_upstream_passive_health_check_validated() {
     let mut upstream = make_upstream("test");
     upstream.health_checks = Some(HealthCheckConfig {

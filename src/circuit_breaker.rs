@@ -633,10 +633,31 @@ impl CircuitBreaker {
 /// including direct-backend proxies (`backend_host:backend_port`). UDP/DTLS
 /// direct-backend sessions still omit the target, producing `namespace|proxy_id`.
 fn circuit_breaker_key(namespace: &str, proxy_id: &str, target_key: Option<&str>) -> String {
-    match target_key {
-        Some(tk) => format!("{namespace}|{proxy_id}::{tk}"),
-        None => crate::config::db_backend::namespaced_runtime_key(namespace, proxy_id),
+    let mut key = String::new();
+    write_circuit_breaker_key(&mut key, namespace, proxy_id, target_key);
+    key
+}
+
+/// Clear `out` and write the [`circuit_breaker_key`] into it.
+fn write_circuit_breaker_key(
+    out: &mut String,
+    namespace: &str,
+    proxy_id: &str,
+    target_key: Option<&str>,
+) {
+    crate::config::db_backend::write_namespaced_runtime_key(out, namespace, proxy_id);
+    if let Some(tk) = target_key {
+        out.reserve(2 + tk.len());
+        out.push_str("::");
+        out.push_str(tk);
     }
+}
+
+thread_local! {
+    /// Scratch buffer for breaker lookups on the proxy hot path, so a cache
+    /// hit does not allocate a key; only a miss allocates the owned key.
+    static CB_KEY_BUF: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::with_capacity(96));
 }
 
 /// Build a target key string from host and port (e.g. `"10.0.0.1:8080"`).
@@ -726,13 +747,20 @@ impl CircuitBreakerCache {
     ) -> Arc<CircuitBreaker> {
         use dashmap::mapref::entry::Entry;
 
-        let key = circuit_breaker_key(namespace, proxy_id, target_key);
-        // Hot path: matching-config hits use a shard read lock only.
-        if let Some(existing) = self.breakers.get(&key)
-            && existing.config() == config
-        {
-            return existing.clone();
+        // Hot path: matching-config hits use a shard read lock only and look up
+        // through a thread-local key buffer instead of allocating.
+        let hit = CB_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_circuit_breaker_key(&mut key, namespace, proxy_id, target_key);
+            self.breakers
+                .get(key.as_str())
+                .filter(|existing| existing.config() == config)
+                .map(|existing| existing.value().clone())
+        });
+        if let Some(existing) = hit {
+            return existing;
         }
+        let key = circuit_breaker_key(namespace, proxy_id, target_key);
 
         // Miss or config change: per-key entry API holds the shard write lock
         // for create/replace so concurrent same-key callers share one Arc, and
@@ -796,8 +824,13 @@ impl CircuitBreakerCache {
         proxy_id: &str,
         target_key: Option<&str>,
     ) -> Option<Arc<CircuitBreaker>> {
-        let key = circuit_breaker_key(namespace, proxy_id, target_key);
-        self.breakers.get(&key).map(|entry| entry.value().clone())
+        CB_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_circuit_breaker_key(&mut key, namespace, proxy_id, target_key);
+            self.breakers
+                .get(key.as_str())
+                .map(|entry| entry.value().clone())
+        })
     }
 
     /// Check if a request can proceed for a given proxy (or proxy+target).

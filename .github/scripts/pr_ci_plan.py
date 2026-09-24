@@ -786,16 +786,36 @@ RUST_BUILD_GRAPH_PATTERNS = (
     r"^custom_plugins/",
 )
 
+# `tests/performance/` holds standalone benchmark workspaces (multi_protocol,
+# mesh Criterion, payload_size, ...) with their own manifests and lockfiles.
+# The root crate declares no target there and no ci.yml job builds them: the
+# harness tests run in benchmark-harness-tests.yml, the Criterion workspace in
+# performance-regression.yml / rr-build-comparison.yml. Only the files below are
+# read by root-crate tests (via include_str!/fs reads), so only they schedule
+# the compile-and-test lane. `self_test()` scans src/ and tests/ and fails when
+# a root-crate file references another tests/performance/ path.
+PERFORMANCE_TREE_WORKSPACE_INPUTS = frozenset(
+    {
+        "tests/performance/mesh-hbone-e2e/run.sh",
+        "tests/performance/mesh/README.md",
+    }
+)
+
 # `run_rust`: the compile-and-test lane. Source, every test tree except the
 # Kubernetes shell suites under `tests/k8s/` (owned by the dedicated live
-# workflows), the operator config template and OpenAPI document (both have
-# parity unit tests), and the build graph.
+# workflows) and the standalone benchmark workspaces under `tests/performance/`,
+# the operator config template and OpenAPI document (both have parity unit
+# tests), and the build graph.
 RUST_PATTERNS = [
     re.compile(pattern)
     for pattern in (
         *RUST_BUILD_GRAPH_PATTERNS,
         r"^src/",
-        r"^tests/(?!k8s/)",
+        r"^tests/(?!k8s/|performance/)",
+        *(
+            "^" + re.escape(path) + "$"
+            for path in sorted(PERFORMANCE_TREE_WORKSPACE_INPUTS)
+        ),
         r"^schemas/clickhouse/",  # DDL embedded by Rust integration tests
         r"^ferrum\.conf$",
         r"^openapi\.yaml$",
@@ -1278,6 +1298,47 @@ def nul_transport_self_test() -> list[str]:
     return failures
 
 
+PERFORMANCE_TREE_REFERENCE_RE = re.compile(r"tests/performance/[A-Za-z0-9._/-]+")
+
+
+def validate_performance_tree_inputs(repo_root: Path) -> list[str]:
+    """Fail when root-crate code reads an unlisted tests/performance/ file.
+
+    `run_rust` skips `tests/performance/` except for
+    PERFORMANCE_TREE_WORKSPACE_INPUTS. A root-crate source or test that starts
+    embedding another file from that tree would otherwise stop re-running when
+    only that file changes, so any referenced path (outside comments) must be
+    listed. References inside tests/performance/ itself are not root-crate code.
+    """
+
+    failures: list[str] = []
+    for root_name in ("src", "tests"):
+        root = repo_root / root_name
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*.rs")):
+            rel = path.relative_to(repo_root).as_posix()
+            if rel.startswith("tests/performance/"):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as error:
+                failures.append(f"{rel}: unreadable during performance-input scan: {error}")
+                continue
+            for line in text.splitlines():
+                code = line.split("//", 1)[0]
+                for match in PERFORMANCE_TREE_REFERENCE_RE.finditer(code):
+                    referenced = match.group(0).rstrip("/.")
+                    if referenced not in PERFORMANCE_TREE_WORKSPACE_INPUTS:
+                        failures.append(
+                            f"{rel} references {referenced}; add it to "
+                            "PERFORMANCE_TREE_WORKSPACE_INPUTS in "
+                            ".github/scripts/pr_ci_plan.py so a change to it "
+                            "schedules the Rust lane"
+                        )
+    return failures
+
+
 def self_test() -> int:
     cases = [
         ("pull_request", ["docs/admin_api.md"], "light"),
@@ -1621,10 +1682,31 @@ def self_test() -> int:
             ["scripts/check_advisory_expiry.sh"],
             {"run_dependency_audit": True, "run_rust": False},
         ),
+        # Standalone benchmark workspaces are not root-crate inputs; their own
+        # workflows (benchmark-harness-tests, performance-regression) own them.
         (
             "pull_request",
             ["tests/performance/mesh/benches/rr_selection.rs"],
-            {"run_rust": True, "run_platform_build": False},
+            {name: False for name in JOB_GATE_NAMES},
+        ),
+        (
+            "pull_request",
+            [
+                "tests/performance/multi_protocol/proto_bench.rs",
+                "tests/performance/multi_protocol/Cargo.lock",
+            ],
+            {name: False for name in JOB_GATE_NAMES},
+        ),
+        # ...except the fixtures root-crate unit tests embed.
+        (
+            "pull_request",
+            ["tests/performance/mesh-hbone-e2e/run.sh"],
+            rust_only,
+        ),
+        (
+            "pull_request",
+            ["tests/performance/mesh-hbone-e2e/README.sh"],
+            {name: False for name in JOB_GATE_NAMES},
         ),
         # Live suites: only their owner paths schedule them on a PR.
         (
@@ -1708,6 +1790,7 @@ def self_test() -> int:
         failures.append("live-suite path-filter self-test failed")
     failures.extend(action_pinning_self_test())
     failures.extend(validate_action_pinning_policy(Path.cwd()))
+    failures.extend(validate_performance_tree_inputs(Path.cwd()))
     failures.extend(nul_transport_self_test())
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)

@@ -108,8 +108,19 @@ impl_env_value_parse!(
     u32 => "a valid u32 integer",
     u64 => "a valid u64 integer",
     usize => "a valid usize integer",
-    f64 => "a valid floating-point number",
 );
+
+impl EnvValue for f64 {
+    fn parse_env(raw: &str, key: &str) -> Result<Self, String> {
+        // `str::parse::<f64>` accepts `NaN`/`inf`; NaN survives `clamp` and
+        // makes every threshold comparison false, so reject non-finite values.
+        raw.trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| invalid_env_value(key, raw, "a finite floating-point number"))
+    }
+}
 
 impl EnvValue for String {
     fn parse_env(raw: &str, _key: &str) -> Result<Self, String> {

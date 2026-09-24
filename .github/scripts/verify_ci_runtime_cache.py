@@ -722,7 +722,7 @@ def check_node_waypoint_live_job(
         relevant, _reason, _matched = decide_relevance("node-waypoint-ebpf-live", [probe])
         require(
             relevant,
-            f"{source} prior-scope path {probe} must run the NodeWaypoint live job",
+            f"{source} NodeWaypoint-owned path {probe} must run the NodeWaypoint live job",
             failures,
         )
     for probe in NODE_WAYPOINT_PRODUCTION_ONLY_PROBES:
@@ -5008,9 +5008,10 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "prior" in ci_cd.lower()
-        and ("nodewaypoint" in ci_cd.lower() or "node-waypoint" in ci_cd.lower()),
-        "docs/ci_cd.md must document NodeWaypoint prior-scope scheduling vs "
+        "### NodeWaypoint relevance\n" in ci_cd
+        and "NodeWaypoint-owned paths" in ci_cd
+        and "still start the workflow for the production-image" in ci_cd,
+        "docs/ci_cd.md must document the NodeWaypoint-owned PR scope vs "
         "the production-image trigger superset",
         failures,
     )
