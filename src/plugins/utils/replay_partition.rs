@@ -59,6 +59,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 use crate::plugins::RequestContext;
+use crate::plugins::utils::route_header_transform::RouteHeaderTransformOp;
 use crate::util::body_limit::{ContentLength, parse_content_length};
 
 /// Request headers that carry caller authorization context.
@@ -639,6 +640,30 @@ fn append_route_override_partition(hasher: &mut PartitionHasher, ctx: &RequestCo
         .route_override_backend_scheme
         .map(|scheme| scheme.to_scheme_str());
     hasher.optional_text("dst.override_backend_scheme", override_scheme);
+
+    // A finalized replay skips route response-header transforms because its
+    // headers were already finalized on the request that stored it. Bind the
+    // current matched rule's complete, ordered transform here so a route-only
+    // reload cannot address an entry finalized under an older rule. This
+    // shared destination partition protects response caching, request
+    // deduplication, and semantic-cache replays alike.
+    match ctx.route_override_response_transform.as_deref() {
+        Some(rules) => {
+            hasher.bool_value("dst.response_transform_present", true);
+            hasher.count("dst.response_transform_rules", rules.len());
+            for rule in rules {
+                let operation = match rule.operation {
+                    RouteHeaderTransformOp::Add => "add",
+                    RouteHeaderTransformOp::Update => "update",
+                    RouteHeaderTransformOp::Remove => "remove",
+                };
+                hasher.text("dst.response_transform_operation", operation);
+                hasher.text("dst.response_transform_key", &rule.key);
+                hasher.optional_text("dst.response_transform_value", rule.value.as_deref());
+            }
+        }
+        None => hasher.bool_value("dst.response_transform_present", false),
+    }
 }
 
 /// Append the backend-visible request *target* dimension: original client
