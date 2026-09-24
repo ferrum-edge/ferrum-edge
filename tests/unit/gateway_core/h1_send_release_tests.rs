@@ -142,10 +142,10 @@ fn fixture(state: DispatchState, placement: Placement) -> Fixture {
 }
 
 /// The response future the dispatch awaits.
-fn sent(
+async fn sent(
     response: oneshot::Receiver<Result<&'static str, &'static str>>,
-) -> impl Future<Output = Result<&'static str, &'static str>> {
-    async move { response.await.unwrap_or(Err("callback dropped")) }
+) -> Result<&'static str, &'static str> {
+    response.await.unwrap_or(Err("callback dropped"))
 }
 
 struct WakeCount(AtomicUsize);
