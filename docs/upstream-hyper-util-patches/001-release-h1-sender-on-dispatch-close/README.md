@@ -6,12 +6,12 @@
 
 ## Status
 
-Deliberate fork, unfiled upstream. Owner: Ferrum Edge maintainers. This patch
-fixes Ferrum issue [#5714](https://github.com/ferrum-edge/ferrum-edge/issues/5714)
-(first seen as the #5575 flake). The upstream issue draft is in
-[`issue.md`](issue.md). It is ready to file against `hyperium/hyper-util`, and
-it cross-references `hyperium/hyper`. Once it is filed, record the number here,
-in the inventory table, and in `docs/vendored-patch-lifecycle.json`.
+Filed upstream as [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202)
+(`hyperium/hyper-util` has issues disabled, and the stranding happens in
+hyper's HTTP/1 dispatcher). Owner: Ferrum Edge maintainers. This patch fixes
+Ferrum issue [#5714](https://github.com/ferrum-edge/ferrum-edge/issues/5714)
+(first seen as the #5575 flake). The filed text is kept in
+[`issue.md`](issue.md).
 
 ## The bug
 

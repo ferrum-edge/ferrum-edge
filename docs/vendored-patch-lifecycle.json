@@ -706,10 +706,10 @@
       "owner_github": null,
       "reason": "An HTTP/1 request enqueued while its pooled connection closes can miss the dispatcher's drain; hyper-util holds the channel's only sender while waiting, so reqwest's send() hangs until backend_read_timeout_ms (504) instead of failing as an unsent request (#5714).",
       "upstream": {
-        "filing": "deliberate_fork_unfiled",
-        "github_repo": "hyperium/hyper-util",
+        "filing": "filed",
+        "github_repo": "hyperium/hyper",
         "pr_number": null,
-        "issue_number": null,
+        "issue_number": 4202,
         "fork_ref": null
       },
       "reaffirmation": null,

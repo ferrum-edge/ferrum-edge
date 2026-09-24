@@ -1,9 +1,7 @@
 # Legacy client: an HTTP/1 request can hang forever when the connection closes while the request is being queued
 
-<!-- Draft for hyperium/hyper-util. Cross-reference it from hyperium/hyper,
-     because the stranding happens in hyper's HTTP/1 dispatcher. File it, then
-     record the issue number in the Ferrum README, the dependency-policy
-     inventory, and docs/vendored-patch-lifecycle.json. -->
+<!-- Filed as https://github.com/hyperium/hyper/issues/4202 (hyper-util has
+     issues disabled). Kept here as the record of what was reported. -->
 
 ## Summary
 
