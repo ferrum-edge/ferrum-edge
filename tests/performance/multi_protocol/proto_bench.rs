@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 
 use multi_protocol_perf::h2_observation::{Observer, error_chain, escaped_snippet};
 
@@ -611,7 +613,7 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         let mut cfg = if let Some(path) = &args.ca_cert {
             let pem = std::fs::read(path).context("reading H2 CA")?;
             let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+            for cert in CertificateDer::pem_slice_iter(pem.as_slice()) {
                 roots.add(cert?)?;
             }
             rustls::ClientConfig::builder()

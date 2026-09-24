@@ -23,6 +23,8 @@ use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, UdpSocket};
 
 use multi_protocol_perf::h2_observation::Observer;
@@ -613,13 +615,12 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
     let cert_pem = std::fs::read(cert_path).context("reading DTLS cert")?;
     let key_pem = std::fs::read(key_path).context("reading DTLS key")?;
 
-    let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
+    let cert_der = CertificateDer::pem_slice_iter(&cert_pem[..])
         .next()
         .ok_or_else(|| anyhow::anyhow!("No cert in PEM"))?
         .map_err(|e| anyhow::anyhow!("cert parse: {e}"))?;
-    let key_der = rustls_pemfile::private_key(&mut &key_pem[..])
-        .map_err(|e| anyhow::anyhow!("key parse: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("No key in PEM"))?;
+    let key_der =
+        PrivateKeyDer::from_pem_slice(&key_pem[..]).map_err(|e| anyhow::anyhow!("key parse: {e}"))?;
 
     let certificate = DtlsCertificate {
         certificate: cert_der.to_vec(),
