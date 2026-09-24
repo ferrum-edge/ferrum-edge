@@ -55,7 +55,7 @@ jobs:
           mapfile -t manifests < "$RUNNER_TEMP/out/manifests.txt"
           for manifest in "${manifests[@]}"; do
             lock="$(dirname "$manifest")/Cargo.lock"
-            for crate in quinn-proto h2 rand; do
+            for crate in quinn-proto h2 rand anyhow crossbeam-epoch event-listener chacha20 spin; do
               versions="$(awk -v c="$crate" '
                 /^\[\[package\]\]/ { n = ""; next }
                 /^name = / { n = $3; gsub(/"/, "", n); next }
@@ -72,6 +72,7 @@ jobs:
       - name: Advisory scan after refresh
         if: always()
         run: |
+          set +e
           set -uo pipefail
           mapfile -t manifests < "$RUNNER_TEMP/out/manifests.txt"
           for manifest in "${manifests[@]}"; do

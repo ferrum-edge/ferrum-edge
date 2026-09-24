@@ -45,11 +45,7 @@ fn build_instances(config: &serde_json::Value, count: usize) -> Vec<IpRestrictio
         .collect()
 }
 
-fn run_instances(
-    instances: &[IpRestriction],
-    context: &mut RequestContext,
-    waker: &Waker,
-) {
+fn run_instances(instances: &[IpRestriction], context: &mut RequestContext, waker: &Waker) {
     for plugin in instances {
         black_box(poll_ready(plugin.on_request_received(context), waker));
     }
