@@ -333,6 +333,7 @@ async fn test_allow_list_entries_with_punctuation_edges_match() {
     // `\b` next to a punctuation edge needs a word character outside the
     // entry, so full-UA fragments like these previously never matched.
     let plugin = BotDetection::new(&json!({
+        "blocked_patterns": ["bot"],
         "allow_list": [
             "(compatible; UptimeRobot/2.0; http://www.uptimerobot.com/)",
             "+http://www.google.com/bot.html)",

@@ -1515,7 +1515,7 @@ fn test_upstream_health_check_udp_probe_payload_must_be_hex() {
         let mut upstream = make_upstream("test");
         upstream.health_checks = Some(HealthCheckConfig {
             active: Some(ActiveHealthCheck {
-                probe_type: HealthProbeType::Udp,
+                probe_type: ferrum_edge::config::types::HealthProbeType::Udp,
                 udp_probe_payload: Some(payload.to_string()),
                 ..Default::default()
             }),
