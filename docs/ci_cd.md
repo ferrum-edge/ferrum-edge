@@ -71,6 +71,7 @@ adding, removing, or materially changing a workflow.
 | `comparison-benchmark.yml` | Gateway Comparison Benchmark | Manual | Cross-gateway comparison benchmarks. |
 | `gateways-protocol-benchmark.yml` | Gateways Protocol Benchmark | Manual | Gateway/protocol benchmark harness. |
 | `benchmark-harness-tests.yml` | Benchmark Harness Tests | PRs and push to `main` on `tests/performance/multi_protocol/**`, manual | Runs the multi-protocol benchmark harness's own tests: `cargo test --test metrics_tests` for worker/error accounting and `python3 -m unittest` for the `benchmark_validity.py` sample and scenario rules. That package is not a workspace member, so the `Tests` aggregate never builds it. Not a required check. |
+| `h2-guard-observation.yml` | H2 Guard Observation | PRs on its own paths, push to `main` on its own paths plus the repository files it pins, manual | Temporary [#5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588) patched-`h2` guard regressions; manual dispatch can add the H2/gRPC campaign. `prepare.py` fails closed on pin drift, so a main push that stales a pin turns red on that commit; see [Optional PR lanes and post-merge validation](#optional-pr-lanes-and-post-merge-validation). Not a required check. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
 | `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
@@ -670,6 +671,33 @@ before it can finish. Intermediate SHAs skipped by that coalescing carry no
 evidence and are simply not releasable; after a burst of merges the tip is
 validated by every workflow. Dispatch **Start Production Release** from a
 quiet `main` and, if the gate reports a pending run, let it complete.
+
+### Optional PR lanes and post-merge validation
+
+Several optional (not branch-protection-required) lanes trigger on
+`pull_request` with a `paths:` filter over their own harness files. That is
+enough when the lane only reads its own inputs, but a lane that pins a hash or
+exact text of a file *outside* those paths goes stale silently: the PR that
+edits the pinned file never runs the lane, and the drift surfaces only when a
+later, unrelated PR happens to touch the lane's own files.
+
+Such a lane must also trigger on `push: branches: [main]` with `paths:`
+covering every repository file it pins, so a stale pin turns that main push's
+run red on the commit that caused it. Its concurrency group follows
+[Main-push concurrency](#main-push-concurrency): cancel superseded
+`pull_request` runs only; main pushes and manual runs complete.
+
+| Workflow | Pin check | Pinned repository inputs (in its `push` paths) |
+|---|---|---|
+| `h2-guard-observation.yml` | `tests/performance/multi_protocol/h2_guard/prepare.py` | `src/admin/mod.rs` (`context_files` SHA-256 in `h2_guard/source.json`), the `h2` entry in `Cargo.lock`, the single `[patch.crates-io]` table in `Cargo.toml`, the two `cargo build` calls in `Dockerfile` |
+
+When a pinned file changes on purpose, refresh the pin in the same PR where
+possible (run the lane with `workflow_dispatch` on the PR branch); otherwise
+the post-merge run goes red and the next PR must refresh it. Any new optional
+lane whose prepare script hashes files under `src/` (for example a
+`context_files` entry) must add those files to its `push` paths and a row here.
+Lanes that hash only their own assets or runtime evidence (the internal-profile
+and trace lanes, `native-cache-envelope.yml`) need no extra trigger.
 
 ### Rust cache lanes
 
