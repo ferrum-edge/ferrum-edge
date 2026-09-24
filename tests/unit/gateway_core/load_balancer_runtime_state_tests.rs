@@ -108,7 +108,10 @@ fn least_connections_preference_survives_service_discovery_update() {
         None,
     );
     let new = balancer(&cache, "lc");
-    assert!(!Arc::ptr_eq(&old, &new), "update must publish a new balancer");
+    assert!(
+        !Arc::ptr_eq(&old, &new),
+        "update must publish a new balancer"
+    );
 
     assert_eq!(connections(&new, &a), 1_000);
     assert_eq!(connections(&new, &b), 0);
@@ -167,7 +170,11 @@ fn least_latency_ewma_and_samples_survive_service_discovery_update() {
         let selected = new.select("", None).expect("target selected");
         *hits.entry(selected.target.host.clone()).or_default() += 1;
     }
-    assert_eq!(hits.get("slow"), None, "known-slow target must not regain traffic");
+    assert_eq!(
+        hits.get("slow"),
+        None,
+        "known-slow target must not regain traffic"
+    );
     assert!(hits.get("fast").copied().unwrap_or(0) > 100, "{hits:?}");
 }
 
@@ -261,7 +268,11 @@ fn removed_then_readded_target_starts_clean_and_late_release_never_goes_negative
     );
     let readded = balancer(&cache, "readd");
     let state = readded.target_runtime_state(&a).expect("a re-added");
-    assert_eq!(state.active_connections(), 0, "removed state must not return");
+    assert_eq!(
+        state.active_connections(),
+        0,
+        "removed state must not return"
+    );
     assert_eq!(state.latency_ewma_us(), None);
     assert_eq!(state.latency_sample_count(), 0);
 
@@ -372,7 +383,11 @@ fn duplicate_host_port_entries_share_one_slot_across_rebuilds() {
     old.record_connection_start(&lane_81);
     assert_eq!(connections(&old, &lane_80), 2);
     let counts = old.active_connection_counts();
-    assert_eq!(counts.len(), 2, "one entry per distinct host:port: {counts:?}");
+    assert_eq!(
+        counts.len(),
+        2,
+        "one entry per distinct host:port: {counts:?}"
+    );
     assert!(counts.contains(&("dup:8080".to_string(), 2)), "{counts:?}");
 
     cache.update_targets(
@@ -416,7 +431,10 @@ fn standalone_inherit_runtime_state_adopts_only_surviving_targets() {
     assert_eq!(connections(&next, &c), 0);
     let next_b = next.target_runtime_state(&b).expect("b present");
     let previous_b = previous.target_runtime_state(&b).expect("b present");
-    assert!(std::ptr::eq(next_b, previous_b), "surviving target shares one slot");
+    assert!(
+        std::ptr::eq(next_b, previous_b),
+        "surviving target shares one slot"
+    );
     drop(previous);
     assert_eq!(connections(&next, &b), 1);
 }
