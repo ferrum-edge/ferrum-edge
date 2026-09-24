@@ -430,6 +430,19 @@ TLS handshake offload is not implemented. A nonzero `FERRUM_TLS_OFFLOAD_THREADS`
 
 **Operator action:** remove `FERRUM_GRPC_POOL_READY_WAIT_MS` from your configuration; it never had a runtime effect. There is no replacement knob.
 
+### Malformed secret-fetch timeout and mesh DNS limits refuse to start (issues [#5699](https://github.com/ferrum-edge/ferrum-edge/issues/5699) / [#5700](https://github.com/ferrum-edge/ferrum-edge/issues/5700))
+
+These settings used to fall back silently when their value could not be used:
+
+- `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS=0` was accepted and made every external secret fetch that waited on I/O time out at once. A malformed or negative value, such as `30s` or `-1`, silently became the 30-second default.
+- `FERRUM_MESH_DNS_TTL_SECONDS`, `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` and `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` used their defaults (60, 1024, 4096) when the value was malformed or overflowed. The two capacity settings also ignored `0`.
+
+Each of these now fails `ferrum-edge run` and `ferrum-edge validate` with an error that names the variable and its accepted range. The value itself is not echoed. Accepted ranges are whole numbers from 1 to 600 seconds for the secret-fetch timeout, 1 to 86400 seconds for the mesh DNS TTL, 1 to 16384 for mesh DNS concurrency, and 1 to 262144 for the per-slice mesh DNS response cache. Unset variables keep their defaults. `FERRUM_MESH_DNS_TTL_SECONDS=0` was accepted before and is now refused.
+
+The secret-fetch timeout is checked at startup secret resolution, which reads only the process environment. It is checked again when settings load, which also reads `ferrum.conf`, and on each later runtime fetch. A bad value in either place stops startup.
+
+**Operator action:** run `ferrum-edge validate` with the production environment and `ferrum.conf` before upgrading. Correct any value it reports, or remove the variable to use its default.
+
 ## Database Mode (`FERRUM_MODE=database`)
 ## Build-Out Database Upgrade (PostgreSQL, MySQL, SQLite, MongoDB)
 

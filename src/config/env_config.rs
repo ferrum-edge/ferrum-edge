@@ -99,6 +99,55 @@ pub fn parse_tls_store_lock_timeout(raw: Option<&str>) -> Result<std::time::Dura
     )))
 }
 
+/// Settings key for the per-fetch external secret timeout.
+pub const SECRET_FETCH_TIMEOUT_SECONDS_KEY: &str = "FERRUM_SECRET_FETCH_TIMEOUT_SECONDS";
+/// Default per-fetch external secret timeout, used only when the key is
+/// configured nowhere.
+pub const DEFAULT_SECRET_FETCH_TIMEOUT_SECONDS: u64 = 30;
+/// Smallest accepted per-fetch external secret timeout. `0` is refused rather
+/// than treated as "no timeout": a zero deadline fails any fetch that yields
+/// even once.
+pub const MIN_SECRET_FETCH_TIMEOUT_SECONDS: u64 = 1;
+/// Largest accepted per-fetch external secret timeout (ten minutes), the same
+/// ceiling as `FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS`, the other bound on a
+/// single call to an external service.
+pub const HARD_MAX_SECRET_FETCH_TIMEOUT_SECONDS: u64 = 600;
+
+/// Pure parse/validation for `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS`.
+///
+/// The secrets registry reads the raw value itself (from the process
+/// environment for startup resolution, conf-file-aware for later runtime
+/// fetches) and [`EnvConfig`] validates the conf-file-aware value, so all three
+/// share this one rule. `None` means the key is configured nowhere and selects
+/// [`DEFAULT_SECRET_FETCH_TIMEOUT_SECONDS`]. A configured value that is not a
+/// whole number of seconds in
+/// `[MIN_SECRET_FETCH_TIMEOUT_SECONDS, HARD_MAX_SECRET_FETCH_TIMEOUT_SECONDS]`,
+/// blank included, is an error instead of a silent fallback to the default.
+///
+/// The error names the variable and the accepted range, never the configured
+/// value: every `FERRUM_*` key may itself be sourced from an external secret.
+pub fn parse_secret_fetch_timeout(raw: Option<&str>) -> Result<std::time::Duration, String> {
+    let seconds = match raw {
+        None => DEFAULT_SECRET_FETCH_TIMEOUT_SECONDS,
+        Some(value) => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| secret_fetch_timeout_contract_error())?,
+    };
+    let accepted = MIN_SECRET_FETCH_TIMEOUT_SECONDS..=HARD_MAX_SECRET_FETCH_TIMEOUT_SECONDS;
+    if !accepted.contains(&seconds) {
+        return Err(secret_fetch_timeout_contract_error());
+    }
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+fn secret_fetch_timeout_contract_error() -> String {
+    format!(
+        "{SECRET_FETCH_TIMEOUT_SECONDS_KEY} must be a whole number of seconds between \
+         {MIN_SECRET_FETCH_TIMEOUT_SECONDS} and {HARD_MAX_SECRET_FETCH_TIMEOUT_SECONDS}"
+    )
+}
+
 /// Operator-pinned identity for this instance's shared TLS store leases
 /// (`FERRUM_TLS_STORE_INSTANCE_ID`).
 ///
@@ -4807,6 +4856,15 @@ impl EnvConfig {
             tls_source_load_timeout_seconds,
         )
         .map_err(|error| error.to_string())?;
+
+        // Consumed by the secrets registry, not stored here: startup secret
+        // resolution reads it from the environment before this parse, and the
+        // runtime single-key fetches re-read it conf-file-aware. Validating the
+        // conf-file-aware value with the same pure parser makes a malformed,
+        // zero, or out-of-range `ferrum.conf` entry fail `run` / `validate`
+        // instead of the first runtime secret fetch.
+        let secret_fetch_timeout_raw = resolve_var(conf, SECRET_FETCH_TIMEOUT_SECONDS_KEY);
+        parse_secret_fetch_timeout(secret_fetch_timeout_raw.as_deref())?;
 
         let discovery_body_limits = parse_discovery_body_limits(
             resolve_var(conf, SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY).as_deref(),
