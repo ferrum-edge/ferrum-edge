@@ -308,8 +308,10 @@ async fn the_gateway_stops_advertising_http3_where_a_timed_rule_is_served() {
     use ferrum_edge::dns::{DnsCache, DnsConfig};
     use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 
-    let mut env_config = EnvConfig::default();
-    env_config.enable_http3 = true;
+    let env_config = EnvConfig {
+        enable_http3: true,
+        ..Default::default()
+    };
     let https_port = env_config.proxy_https_port;
     let timed = config(
         vec![proxy("api", None)],
