@@ -28,7 +28,8 @@
 //! * **Effective destination** — the post-routing upstream / host / port /
 //!   scheme / authority and rewritten path, not the originally matched proxy,
 //!   plus the matched route's response-header policy, which a finalized replay
-//!   does not re-apply.
+//!   does not re-apply, and the route-override backend TLS identity and DNS
+//!   policy.
 //! * **Request target** — the original client authority, `Host`, method, path,
 //!   and effective outbound query
 //!   ([`append_request_target_partition`]).
@@ -60,7 +61,9 @@ use crate::fips::approved::Sha256;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
+use crate::config::types::BackendTlsConfig;
 use crate::plugins::RequestContext;
+use crate::plugins::RouteOverrideDnsPolicy;
 use crate::plugins::utils::route_header_transform::RouteHeaderTransformOp;
 use crate::util::body_limit::{ContentLength, parse_content_length};
 
@@ -665,6 +668,73 @@ fn append_route_override_partition(hasher: &mut PartitionHasher, ctx: &RequestCo
             }
         }
         None => hasher.bool_value("dst.response_transform_present", false),
+    }
+
+    append_route_override_backend_tls_partition(hasher, ctx.route_override_resolved_tls.as_ref());
+
+    // DNS intent selects which address a same-host direct override dials
+    // (`ClearInherited` drops the proxy's `dns_override` pin), so two rules
+    // that differ only here can reach different origins.
+    let dns_policy = match ctx.route_override_dns_policy {
+        RouteOverrideDnsPolicy::InheritProxy => "inherit_proxy",
+        RouteOverrideDnsPolicy::ClearInherited => "clear_inherited",
+    };
+    hasher.text("dst.override_dns_policy", dns_policy);
+}
+
+/// Bind the route-override backend TLS identity.
+///
+/// Two dispatch rules can send the same request target to the same host and
+/// port under different backend TLS: a per-tenant client certificate selected
+/// by a header match, or one rule that verifies the origin and one that does
+/// not. A replay stored under one must not answer the other.
+///
+/// `BackendTlsConfig` holds only identities, never PEM material, so every field
+/// is hashed directly with no per-request allocation or file read:
+///
+/// * `client_cert_path` / `client_key_path` — the client-certificate identity
+///   the origin authenticates. These are file paths or secret references
+///   (`managed://…`), not key bytes.
+/// * `server_ca_cert_path` — the trust-anchor identity, including the
+///   `system://` selection.
+/// * `verify_server_cert` — whether the origin was authenticated at all.
+/// * `sni` — the server name presented, which can select a virtual origin.
+/// * `san_allow_list` — the accepted origin identities, hashed in configured
+///   order (a reordered list only costs a miss). The derived
+///   `san_allow_list_key_digest` is skipped: it is recomputed from this list
+///   and serde does not carry it, so it adds nothing and could be stale.
+///
+/// There is no min-version or ALPN field on `BackendTlsConfig`; those follow
+/// the gateway-global TLS policy, which is identical for every rule.
+fn append_route_override_backend_tls_partition(
+    hasher: &mut PartitionHasher,
+    tls: Option<&BackendTlsConfig>,
+) {
+    let Some(tls) = tls else {
+        hasher.bool_value("dst.override_tls_present", false);
+        return;
+    };
+    hasher.bool_value("dst.override_tls_present", true);
+    hasher.optional_text(
+        "dst.override_tls_client_cert",
+        tls.client_cert_path.as_deref(),
+    );
+    hasher.optional_text(
+        "dst.override_tls_client_key",
+        tls.client_key_path.as_deref(),
+    );
+    hasher.optional_text(
+        "dst.override_tls_server_ca",
+        tls.server_ca_cert_path.as_deref(),
+    );
+    hasher.bool_value(
+        "dst.override_tls_verify_server_cert",
+        tls.verify_server_cert,
+    );
+    hasher.optional_text("dst.override_tls_sni", tls.sni.as_deref());
+    hasher.count("dst.override_tls_san_allow_list", tls.san_allow_list.len());
+    for san in &tls.san_allow_list {
+        hasher.text("dst.override_tls_san", san);
     }
 }
 
