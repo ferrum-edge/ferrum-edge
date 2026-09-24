@@ -1,0 +1,99 @@
+# TEMPORARY (PR for #5703/#5704/#5707/#5708): produce rustfmt output and
+# refreshed standalone lockfiles on a hosted runner. Removed before merge.
+name: TEMP Standalone Bootstrap
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    name: TEMP standalone bootstrap
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        with:
+          tool: cargo-deny@0.19.9
+
+      - name: Inventory
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          python3 .github/scripts/standalone_cargo_manifests.py --self-test
+          python3 .github/scripts/standalone_cargo_manifests.py > "$RUNNER_TEMP/out/manifests.txt"
+          cat "$RUNNER_TEMP/out/manifests.txt"
+
+      - name: Apply rustfmt
+        run: |
+          set -euo pipefail
+          mapfile -t manifests < "$RUNNER_TEMP/out/manifests.txt"
+          for manifest in "${manifests[@]}"; do
+            cargo fmt --manifest-path "$manifest" --all
+          done
+          git diff --stat
+
+      - name: Refresh lockfiles
+        run: |
+          set -euo pipefail
+          cargo generate-lockfile --manifest-path tests/performance/payload_size/Cargo.toml
+          mapfile -t manifests < "$RUNNER_TEMP/out/manifests.txt"
+          for manifest in "${manifests[@]}"; do
+            lock="$(dirname "$manifest")/Cargo.lock"
+            for crate in quinn-proto h2 rand; do
+              versions="$(awk -v c="$crate" '
+                /^\[\[package\]\]/ { n = ""; next }
+                /^name = / { n = $3; gsub(/"/, "", n); next }
+                /^version = / { v = $3; gsub(/"/, "", v); if (n == c) print v }
+              ' "$lock")"
+              for version in $versions; do
+                echo "update ${manifest}: ${crate}@${version}"
+                cargo update --manifest-path "$manifest" -p "${crate}@${version}" \
+                  2>&1 | tee -a "$RUNNER_TEMP/out/update.log"
+              done
+            done
+          done
+
+      - name: Advisory scan after refresh
+        if: always()
+        run: |
+          set -uo pipefail
+          mapfile -t manifests < "$RUNNER_TEMP/out/manifests.txt"
+          for manifest in "${manifests[@]}"; do
+            echo "=== ${manifest}" | tee -a "$RUNNER_TEMP/out/deny.log"
+            cargo deny --manifest-path "$manifest" \
+              check --allow advisory-not-detected --config deny.toml advisories \
+              2>&1 | tee -a "$RUNNER_TEMP/out/deny.log"
+            echo "exit=${PIPESTATUS[0]}" | tee -a "$RUNNER_TEMP/out/deny.log"
+          done
+
+      - name: Collect patch
+        if: always()
+        run: |
+          set -euo pipefail
+          git add -A fuzz tests/performance
+          git diff --cached --binary > "$RUNNER_TEMP/out/standalone.patch"
+          git diff --cached --stat
+
+      - name: Upload bootstrap output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: standalone-bootstrap
+          path: ${{ runner.temp }}/out/
+          retention-days: 3
