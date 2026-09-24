@@ -26,7 +26,9 @@
 //!   origins provably ignore caller address may opt one plugin instance out for
 //!   *anonymous* callers only, with [`AnonymousCallerScope::Shared`].
 //! * **Effective destination** — the post-routing upstream / host / port /
-//!   scheme / authority and rewritten path, not the originally matched proxy.
+//!   scheme / authority and rewritten path, not the originally matched proxy,
+//!   plus the matched route's response-header policy, which a finalized replay
+//!   does not re-apply.
 //! * **Request target** — the original client authority, `Host`, method, path,
 //!   and effective outbound query
 //!   ([`append_request_target_partition`]).
