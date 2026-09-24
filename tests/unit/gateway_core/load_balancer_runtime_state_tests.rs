@@ -12,7 +12,9 @@ use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
 use ferrum_edge::load_balancer::{LoadBalancer, LoadBalancerCache};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn ns() -> String {
     ferrum_edge::config::types::default_namespace()
@@ -187,8 +189,8 @@ fn release_through_old_balancer_decrements_the_counter_the_new_balancer_reads() 
         vec![a.clone(), b.clone()],
     );
     let cache = cache_with(vec![initial]);
-    // Stands in for a `LoadBalancerConnectionGuard`: it holds the balancer it
-    // started the connection on and releases through that same balancer.
+    // Paired start/end calls on the one balancer instance the connection was
+    // started on, as a caller holding that balancer would make them.
     let old = balancer(&cache, "guard");
     old.record_connection_start(&a);
     old.record_connection_start(&a);
@@ -407,24 +409,26 @@ fn duplicate_host_port_entries_share_one_slot_across_rebuilds() {
 }
 
 #[test]
-fn standalone_inherit_runtime_state_adopts_only_surviving_targets() {
+fn rebuilt_balancer_adopts_the_previous_slot_only_for_surviving_targets() {
     let (a, b, c) = (target("a"), target("b"), target("c"));
-    let previous = LoadBalancer::new(
-        "standalone",
+    let initial = upstream(
+        "adopt",
         LoadBalancerAlgorithm::LeastConnections,
-        &[a.clone(), b.clone()],
-        None,
+        vec![a.clone(), b.clone()],
     );
+    let cache = cache_with(vec![initial]);
+    let previous = balancer(&cache, "adopt");
     previous.record_connection_start(&a);
     previous.record_connection_start(&b);
 
-    let mut next = LoadBalancer::new(
-        "standalone",
+    cache.update_targets(
+        &ns(),
+        "adopt",
+        vec![b.clone(), c.clone()],
         LoadBalancerAlgorithm::LeastConnections,
-        &[b.clone(), c.clone()],
         None,
     );
-    next.inherit_runtime_state(&previous);
+    let next = balancer(&cache, "adopt");
 
     assert!(next.target_runtime_state(&a).is_none());
     assert_eq!(connections(&next, &b), 1);
@@ -439,24 +443,267 @@ fn standalone_inherit_runtime_state_adopts_only_surviving_targets() {
     assert_eq!(connections(&next, &b), 1);
 }
 
-/// Every place `LoadBalancerCache` builds a replacement balancer must inherit
-/// the published balancer's runtime state. A new construction site without
-/// `inherit_runtime_state` would silently bring back #5693 for that path.
 #[test]
-fn every_cache_balancer_construction_inherits_runtime_state() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/load_balancer.rs");
-    let source = std::fs::read_to_string(&path).expect("read src/load_balancer.rs");
-    let production = source
-        .split("#[cfg(test)]\nmod tests {")
-        .next()
-        .expect("split yields at least one part");
-    let constructions = production
-        .matches("LoadBalancer::with_subsets_and_port_overrides(")
-        .count();
-    let inherits = production.matches(".inherit_runtime_state(").count();
-    assert!(constructions > 0, "no balancer construction site found");
-    assert_eq!(
-        constructions, inherits,
-        "each cache-side balancer construction must call inherit_runtime_state"
+fn lease_taken_before_a_rebuild_releases_the_counter_the_new_balancer_reads() {
+    let (a, b) = (target("a"), target("b"));
+    let initial = upstream(
+        "lease",
+        LoadBalancerAlgorithm::LeastConnections,
+        vec![a.clone(), b.clone()],
     );
+    let cache = cache_with(vec![initial]);
+    let lease = balancer(&cache, "lease")
+        .lease_connection(&a)
+        .expect("a is a target");
+    assert!(
+        balancer(&cache, "lease")
+            .lease_connection(&target("absent"))
+            .is_none(),
+        "no lease for a target outside the balancer"
+    );
+
+    // The lease holds the slot, not the balancer: two rebuilds retire the
+    // balancer it was taken through without disturbing the count.
+    for targets in [vec![a.clone(), b.clone(), target("c")], vec![a.clone()]] {
+        cache.update_targets(
+            &ns(),
+            "lease",
+            targets,
+            LoadBalancerAlgorithm::LeastConnections,
+            None,
+        );
+    }
+    let newest = balancer(&cache, "lease");
+    assert_eq!(connections(&newest, &a), 1);
+
+    drop(lease);
+    assert_eq!(connections(&newest, &a), 0);
+    assert!(cache.active_connections_snapshot().is_empty());
+}
+
+/// Counts a churn worker as finished even if it panics, so the publisher loop
+/// cannot spin forever.
+struct Finished<'a>(&'a AtomicUsize);
+
+impl Drop for Finished<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Connections opened and closed from several threads while service
+/// discovery and config deltas keep republishing the balancer must settle at
+/// exactly zero: no start may be lost, no end may be applied twice, and no
+/// count may go negative while the churn is running.
+#[test]
+fn concurrent_connection_churn_across_rebuilds_settles_to_zero() {
+    const WORKERS: usize = 4;
+    const ITERATIONS: usize = 2_000;
+    let (a, b, c) = (target("a"), target("b"), target("c"));
+    let initial = upstream(
+        "churn",
+        LoadBalancerAlgorithm::LeastConnections,
+        vec![a.clone(), b.clone()],
+    );
+    let cache = cache_with(vec![initial]);
+    let finished = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for worker in 0..WORKERS {
+            let (cache, finished) = (&cache, &finished);
+            let (a, b) = (&a, &b);
+            scope.spawn(move || {
+                let _finished = Finished(finished);
+                let mut held = std::collections::VecDeque::new();
+                for i in 0..ITERATIONS {
+                    let lb = balancer(cache, "churn");
+                    let chosen = if (i + worker) % 2 == 0 { a } else { b };
+                    if i % 3 == 0 {
+                        // Paired calls on the one balancer instance.
+                        lb.record_connection_start(chosen);
+                        std::thread::yield_now();
+                        lb.record_connection_end(chosen);
+                    } else {
+                        // Leases stay open across later rebuilds.
+                        held.push_back(lb.lease_connection(chosen));
+                        if held.len() > 8 {
+                            drop(held.pop_front());
+                        }
+                    }
+                }
+                drop(held);
+            });
+        }
+
+        let mut round = 0usize;
+        while finished.load(Ordering::SeqCst) < WORKERS {
+            match round % 4 {
+                0 => cache.update_targets(
+                    &ns(),
+                    "churn",
+                    vec![a.clone(), b.clone(), c.clone()],
+                    LoadBalancerAlgorithm::LeastConnections,
+                    None,
+                ),
+                1 => {
+                    let modified = upstream(
+                        "churn",
+                        LoadBalancerAlgorithm::LeastLatency,
+                        vec![b.clone(), a.clone()],
+                    );
+                    let config = GatewayConfig {
+                        upstreams: vec![modified.clone()],
+                        ..GatewayConfig::default()
+                    };
+                    cache.apply_delta(&config, &[], &[], &[modified]);
+                }
+                // `b` leaves and comes back: its old slot is orphaned.
+                2 => cache.update_targets(
+                    &ns(),
+                    "churn",
+                    vec![a.clone(), c.clone()],
+                    LoadBalancerAlgorithm::LeastConnections,
+                    None,
+                ),
+                _ => cache.update_targets(
+                    &ns(),
+                    "churn",
+                    vec![a.clone(), b.clone()],
+                    LoadBalancerAlgorithm::LeastConnections,
+                    None,
+                ),
+            }
+            for (key, count) in balancer(&cache, "churn").active_connection_counts() {
+                assert!(count >= 0, "{key} went negative: {count}");
+            }
+            round += 1;
+            std::thread::yield_now();
+        }
+    });
+
+    cache.update_targets(
+        &ns(),
+        "churn",
+        vec![a.clone(), b.clone(), c.clone()],
+        LoadBalancerAlgorithm::LeastConnections,
+        None,
+    );
+    let settled = balancer(&cache, "churn");
+    for target in [&a, &b, &c] {
+        assert_eq!(connections(&settled, target), 0, "{}", target.host);
+    }
+    assert!(cache.active_connections_snapshot().is_empty());
+}
+
+/// Byte offset of every occurrence of `needle` in `haystack` that is not the
+/// tail of a longer identifier (so `LoadBalancer::new(` does not match
+/// `FooLoadBalancer::new(`).
+fn standalone_matches(haystack: &str, needle: &str) -> Vec<usize> {
+    haystack
+        .match_indices(needle)
+        .filter(|(at, _)| {
+            haystack[..*at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        })
+        .map(|(at, _)| at)
+        .collect()
+}
+
+fn rust_sources(dir: &Path, out: &mut Vec<(String, String)>) {
+    let entries = std::fs::read_dir(dir).expect("read source directory");
+    for entry in entries {
+        let path = entry.expect("directory entry").path();
+        if path.is_dir() {
+            rust_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            let source = std::fs::read_to_string(&path).expect("read source file");
+            out.push((path.display().to_string(), source));
+        }
+    }
+}
+
+/// The body of `fn <name>(` in `source`, up to the next `\n    fn ` or
+/// `\n    pub`.
+fn fn_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let signature = format!("fn {name}(");
+    let start = source
+        .find(signature.as_str())
+        .unwrap_or_else(|| panic!("fn {name} present"));
+    let rest = &source[start + 1..];
+    let end = ["\n    fn ", "\n    pub", "\n}\n"]
+        .into_iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()
+        .unwrap_or(rest.len());
+    &source[start..start + 1 + end]
+}
+
+/// Every production `LoadBalancer` construction must hand the published
+/// balancer over so surviving targets keep their state. The cache builds all
+/// of its balancers through one builder that passes `previous`; any other
+/// construction site (`LoadBalancer::new(`, `LoadBalancer::with_subsets(`, or
+/// a second `with_subsets_and_port_overrides(` call) anywhere in production
+/// code would silently bring back #5693 for that path.
+#[test]
+fn every_production_balancer_construction_hands_over_runtime_state() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = Vec::new();
+    rust_sources(&src, &mut sources);
+    assert!(sources.len() > 10, "source walk found {}", sources.len());
+
+    let mut builder_calls = Vec::new();
+    for (path, source) in &sources {
+        // Everything before the first top-level inline test module.
+        let production = source
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or_default();
+        for needle in ["LoadBalancer::new(", "LoadBalancer::with_subsets("] {
+            assert!(
+                standalone_matches(production, needle).is_empty(),
+                "{path}: production `{needle}` bypasses the cache builder"
+            );
+        }
+        let full = "LoadBalancer::with_subsets_and_port_overrides(";
+        for at in standalone_matches(production, full) {
+            builder_calls.push((path.clone(), at));
+        }
+    }
+    assert_eq!(
+        builder_calls.len(),
+        1,
+        "exactly one production construction site: {builder_calls:?}"
+    );
+
+    let (path, at) = &builder_calls[0];
+    assert!(path.ends_with("load_balancer.rs"), "{path}");
+    let source = &sources
+        .iter()
+        .find(|(candidate, _)| candidate == path)
+        .expect("builder source")
+        .1;
+    let builder = fn_body(source, "build_balancer_with_targets");
+    let builder_start = source.find(builder).expect("builder body");
+    assert!(
+        (builder_start..builder_start + builder.len()).contains(at),
+        "the one construction must be inside build_balancer_with_targets"
+    );
+    assert!(
+        builder.contains("previous,\n        ))"),
+        "the builder must hand `previous` to the constructor"
+    );
+    for cache_path in [
+        "build_balancer",
+        "build_balancers",
+        "build_delta_inner",
+        "build_update_targets_inner",
+    ] {
+        let body = fn_body(source, cache_path);
+        assert!(
+            body.contains("Self::build_balancer"),
+            "{cache_path} must build through the runtime-state-inheriting builder"
+        );
+    }
 }

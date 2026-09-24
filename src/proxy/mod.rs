@@ -5037,14 +5037,17 @@ pub(crate) fn stream_lb_accounting_target(
     }
 }
 
-/// RAII guard for load-balancer connection accounting on upgraded sessions.
+/// RAII guard for load-balancer active-connection accounting.
 ///
-/// WebSocket proxying runs in a spawned task after the HTTP handler returns.
-/// Keeping the accounting in a guard makes the end event fire on normal close,
-/// upgrade failure, task cancellation, or panic unwind.
+/// Every proxy path that counts a backend connection for least-connections
+/// and the per-target connection metrics holds one of these for as long as
+/// the connection is in use; there are no bare start/end pairs. The end fires
+/// on normal completion, early return or `?`, task cancellation, or panic
+/// unwind, and always releases the exact counter the start incremented, even
+/// if the balancer has since been rebuilt. Balancer rebuilds keep surviving
+/// targets' counts, so a skipped end would never be reset.
 pub(crate) struct LoadBalancerConnectionGuard {
-    target: Option<Arc<UpstreamTarget>>,
-    balancer: Option<Arc<LoadBalancer>>,
+    _lease: Option<crate::load_balancer::TargetConnectionLease>,
 }
 
 impl LoadBalancerConnectionGuard {
@@ -5052,18 +5055,19 @@ impl LoadBalancerConnectionGuard {
         target: Option<Arc<UpstreamTarget>>,
         balancer: Option<Arc<LoadBalancer>>,
     ) -> Self {
-        if let (Some(target), Some(balancer)) = (target.as_ref(), balancer.as_ref()) {
-            balancer.record_connection_start(target);
-        }
-        Self { target, balancer }
+        Self::for_target(target.as_deref(), balancer.as_deref())
     }
-}
 
-impl Drop for LoadBalancerConnectionGuard {
-    fn drop(&mut self) {
-        if let (Some(target), Some(balancer)) = (self.target.as_ref(), self.balancer.as_ref()) {
-            balancer.record_connection_end(target);
-        }
+    /// Like [`Self::new`] for a borrowed target and balancer; holds neither.
+    pub(crate) fn for_target(
+        target: Option<&UpstreamTarget>,
+        balancer: Option<&LoadBalancer>,
+    ) -> Self {
+        let lease = match (target, balancer) {
+            (Some(target), Some(balancer)) => balancer.lease_connection(target),
+            _ => None,
+        };
+        Self { _lease: lease }
     }
 }
 

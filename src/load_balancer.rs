@@ -1366,8 +1366,10 @@ impl LoadBalancerCacheInner {
 /// upstream, or a full rebuild over a published snapshot) gets a fresh
 /// `LoadBalancer`, but every target whose `host:port` survives in the same
 /// namespace-qualified upstream keeps its live [`TargetRuntimeState`] --
-/// active-connection count, latency EWMA, and latency sample count -- via
-/// [`LoadBalancer::inherit_runtime_state`].
+/// active-connection count, latency EWMA, and latency sample count. Every
+/// cache-side construction goes through `build_balancer_with_targets`, which
+/// hands the currently published balancer to the constructor so surviving
+/// targets adopt its slots.
 pub struct LoadBalancerCache {
     inner: ArcSwap<LoadBalancerCacheInner>,
 }
@@ -1382,12 +1384,11 @@ impl LoadBalancerCache {
     /// Rebuild every balancer from `config`.
     ///
     /// Targets that survive in the same upstream keep their live
-    /// [`TargetRuntimeState`] from the currently published snapshot (see
-    /// [`LoadBalancer::inherit_runtime_state`]).
+    /// [`TargetRuntimeState`] from the currently published snapshot.
     pub fn rebuild(&self, config: &GatewayConfig) {
-        let current = self.inner.load();
+        let current = self.inner.load_full();
         self.inner
-            .store(Self::build_inner_inheriting(config, Some(&**current)));
+            .store(Self::build_inner_inheriting(config, Some(&*current)));
     }
 
     /// Build a snapshot from `config` alone, with no prior runtime state.
@@ -1443,11 +1444,33 @@ impl LoadBalancerCache {
         upstream: &Upstream,
         previous: Option<&LoadBalancer>,
     ) -> Arc<LoadBalancer> {
-        let mut balancer = LoadBalancer::with_subsets_and_port_overrides(
+        Self::build_balancer_with_targets(
             runtime_key,
-            upstream.algorithm,
+            upstream,
             &upstream.targets,
+            upstream.algorithm,
             upstream.hash_on.clone(),
+            previous,
+        )
+    }
+
+    /// [`Self::build_balancer`] with the target set, algorithm, and hash-on
+    /// strategy supplied separately from `upstream`'s (service-discovery
+    /// updates). The ONE place the cache constructs a `LoadBalancer`, so no
+    /// rebuild path can skip handing over `previous`.
+    fn build_balancer_with_targets(
+        runtime_key: &str,
+        upstream: &Upstream,
+        targets: &[UpstreamTarget],
+        algorithm: LoadBalancerAlgorithm,
+        hash_on: Option<String>,
+        previous: Option<&LoadBalancer>,
+    ) -> Arc<LoadBalancer> {
+        Arc::new(LoadBalancer::with_subsets_and_port_overrides(
+            runtime_key,
+            algorithm,
+            targets,
+            hash_on,
             upstream.subsets.as_deref(),
             Some(&upstream.port_overrides),
             upstream.health_checks.as_ref(),
@@ -1455,11 +1478,8 @@ impl LoadBalancerCache {
             &upstream.source_labels,
             upstream.locality_lb_setting.as_ref(),
             upstream.locality_lb_strict,
-        );
-        if let Some(previous) = previous {
-            balancer.inherit_runtime_state(previous);
-        }
-        Arc::new(balancer)
+            previous,
+        ))
     }
 
     fn build_upstream_index(config: &GatewayConfig) -> HashMap<String, Arc<Upstream>> {
@@ -1481,8 +1501,7 @@ impl LoadBalancerCache {
     /// - Removes deleted upstreams
     /// - Creates fresh `LoadBalancer` instances only for added/modified upstreams;
     ///   targets that survive a modification keep their live active-connection
-    ///   counts, latency EWMAs, and sample counts
-    ///   ([`LoadBalancer::inherit_runtime_state`])
+    ///   counts, latency EWMAs, and sample counts ([`TargetRuntimeState`])
     /// - Unchanged upstreams keep their exact same `Arc<LoadBalancer>`, preserving
     ///   round-robin counters, WRR schedules, active connection counts, latency
     ///   EWMAs, and hash rings
@@ -1552,7 +1571,7 @@ impl LoadBalancerCache {
         removed_ids: &[crate::config::db_backend::NamespacedResourceId],
         modified: &[Upstream],
     ) {
-        let current = self.inner.load();
+        let current = self.inner.load_full();
         let inner =
             Self::build_delta_inner(&current, full_new_config, added, removed_ids, modified);
         self.store_inner(inner);
@@ -1574,11 +1593,10 @@ impl LoadBalancerCache {
     /// Within the updated upstream, every target whose `host:port` is in both
     /// the old and the new target set keeps its live active-connection count,
     /// latency EWMA, and latency sample count: the new balancer shares the old
-    /// balancer's per-target counters (see
-    /// [`LoadBalancer::inherit_runtime_state`]), so connections opened through
-    /// the old balancer are still counted and release the same counter when
-    /// they close. Removed targets' state is dropped with the old balancer; a
-    /// target that is later re-added starts from a clean slate. Round-robin
+    /// balancer's per-target counters ([`TargetRuntimeState`]), so connections
+    /// opened through the old balancer are still counted and release the same
+    /// counter when they close. Removed targets' state is dropped with the old
+    /// balancer; a target that is later re-added starts from a clean slate. Round-robin
     /// counters, WRR schedules, and hash rings are rebuilt for the new set.
     pub fn update_targets(
         &self,
@@ -1588,7 +1606,7 @@ impl LoadBalancerCache {
         algorithm: LoadBalancerAlgorithm,
         hash_on: Option<String>,
     ) {
-        let current = self.inner.load();
+        let current = self.inner.load_full();
         self.store_inner(Self::build_update_targets_inner(
             &current,
             namespace,
@@ -1617,33 +1635,15 @@ impl LoadBalancerCache {
 
         // Clone-and-patch both maps, then swap as a single unit
         let mut new_balancers = current.balancers.clone();
-        let existing_subsets = existing_upstream
-            .subsets
-            .as_deref()
-            .map(|subsets| subsets.to_vec());
-        let existing_port_overrides = existing_upstream.port_overrides.clone();
-        let existing_health_checks = existing_upstream.health_checks.clone();
-        let existing_source_locality = existing_upstream.source_locality.clone();
-        let existing_source_labels = existing_upstream.source_labels.clone();
-        let existing_locality_lb_setting = existing_upstream.locality_lb_setting.clone();
-        let existing_locality_lb_strict = existing_upstream.locality_lb_strict;
-        let mut balancer = LoadBalancer::with_subsets_and_port_overrides(
+        let balancer = Self::build_balancer_with_targets(
             &key,
-            algorithm,
+            existing_upstream,
             &new_targets,
+            algorithm,
             hash_on,
-            existing_subsets.as_deref(),
-            Some(&existing_port_overrides),
-            existing_health_checks.as_ref(),
-            existing_source_locality.as_deref(),
-            &existing_source_labels,
-            existing_locality_lb_setting.as_ref(),
-            existing_locality_lb_strict,
+            current.balancers.get(&key).map(Arc::as_ref),
         );
-        if let Some(previous) = current.balancers.get(&key) {
-            balancer.inherit_runtime_state(previous);
-        }
-        new_balancers.insert(key.clone(), Arc::new(balancer));
+        new_balancers.insert(key.clone(), balancer);
 
         let mut new_upstreams = current.upstreams.clone();
         let mut updated = (**existing_upstream).clone();
@@ -2296,44 +2296,18 @@ impl LoadBalancerCache {
         Self::max_ejection_percent_from(snapshot, namespace, upstream_id)
     }
 
-    /// Snapshot of active connection counts per upstream for metrics.
+    /// Snapshot of active connection counts per upstream for metrics. Only
+    /// targets with at least one open connection are reported.
     pub fn active_connections_snapshot(&self) -> Vec<(String, Vec<(String, i64)>)> {
         let inner = self.inner.load();
         let mut result = Vec::new();
         for (upstream_id, balancer) in inner.balancers.iter() {
-            let mut targets = balancer.active_connection_counts();
-            targets.retain(|(_, count)| *count > 0);
+            let targets = balancer.open_connection_counts();
             if !targets.is_empty() {
                 result.push((upstream_id.clone(), targets));
             }
         }
         result
-    }
-
-    /// Record that a connection was opened to a target (for least-connections).
-    pub fn record_connection_start(
-        &self,
-        namespace: &str,
-        upstream_id: &str,
-        target: &UpstreamTarget,
-    ) {
-        let inner = self.inner.load();
-        if let Some(balancer) = inner.balancer(namespace, upstream_id) {
-            balancer.record_connection_start(target);
-        }
-    }
-
-    /// Record that a connection was closed to a target (for least-connections).
-    pub fn record_connection_end(
-        &self,
-        namespace: &str,
-        upstream_id: &str,
-        target: &UpstreamTarget,
-    ) {
-        let inner = self.inner.load();
-        if let Some(balancer) = inner.balancer(namespace, upstream_id) {
-            balancer.record_connection_end(target);
-        }
     }
 
     /// Record a response latency measurement for a target (for least-latency).
@@ -3303,13 +3277,16 @@ fn locality_from_matches_source(from: &LocalityPreference, source: &LocalityPref
 /// endpoint under different Services, subsets, or policy lanes) share one
 /// slot, matching the endpoint-level accounting the gateway has always used.
 ///
-/// Slots are reference-counted so a rebuilt balancer can adopt the previous
-/// generation's slot for every surviving target
-/// ([`LoadBalancer::inherit_runtime_state`]). A connection guard that still
-/// holds the old balancer then decrements the very counter the new balancer
-/// reads, so a count can neither leak nor be double-released across a
-/// rebuild. The fields share one cache-line-padded allocation so two targets'
-/// hot counters never false-share a line.
+/// Slots are reference-counted so a rebuilt balancer adopts the previous
+/// generation's slot for every surviving target when it is built (see
+/// [`LoadBalancerCache`]). A [`TargetConnectionLease`] taken through the old
+/// balancer then releases the very counter the new balancer reads, so a count
+/// can neither leak nor be double-released across a rebuild.
+///
+/// A slot is one small heap allocation (three atomics plus the `Arc` header,
+/// about 48 bytes) per distinct target. It is deliberately not cache-line
+/// padded: slots are separate allocations, and padding would multiply the
+/// per-target memory cost for every algorithm.
 #[derive(Debug)]
 pub struct TargetRuntimeState {
     /// Connections currently open to this endpoint. Never negative: the
@@ -3323,11 +3300,11 @@ pub struct TargetRuntimeState {
 
 impl TargetRuntimeState {
     fn new_slot() -> TargetStateSlot {
-        Arc::new(CachePadded::new(Self {
+        Arc::new(Self {
             active_connections: AtomicI64::new(0),
             latency_ewma_us: AtomicU64::new(LATENCY_UNSET),
             latency_samples: AtomicU64::new(0),
-        }))
+        })
     }
 
     /// Connections currently open to this endpoint.
@@ -3352,9 +3329,47 @@ impl TargetRuntimeState {
     fn latency_ewma_raw(&self) -> u64 {
         self.latency_ewma_us.load(Ordering::Relaxed)
     }
+
+    #[inline]
+    fn open_connection(&self) {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Saturates at zero so an unmatched release can never drive the shared
+    /// counter negative.
+    #[inline]
+    fn close_connection(&self) {
+        let count = &self.active_connections;
+        let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            if v > 0 { Some(v - 1) } else { None }
+        });
+    }
 }
 
-type TargetStateSlot = Arc<CachePadded<TargetRuntimeState>>;
+type TargetStateSlot = Arc<TargetRuntimeState>;
+
+/// One open connection counted against a target's [`TargetRuntimeState`],
+/// released exactly once when the lease drops.
+///
+/// Taken with [`LoadBalancer::lease_connection`]. The lease holds the target's
+/// slot itself, not the balancer, so the release always lands on the counter
+/// the start incremented: on every exit path (early return, `?`, panic
+/// unwind, task cancellation), and across any number of balancer rebuilds in
+/// between. Prefer it to paired
+/// [`LoadBalancer::record_connection_start`] /
+/// [`LoadBalancer::record_connection_end`] calls, which leak a count whenever
+/// a path skips the end.
+#[derive(Debug)]
+#[must_use = "dropping the lease immediately releases the connection count"]
+pub struct TargetConnectionLease {
+    state: TargetStateSlot,
+}
+
+impl Drop for TargetConnectionLease {
+    fn drop(&mut self) {
+        self.state.close_connection();
+    }
+}
 
 /// Per-upstream load balancer with algorithm-specific state.
 pub struct LoadBalancer {
@@ -3637,11 +3652,26 @@ impl LoadBalancer {
             &HashMap::new(),
             None,
             false,
+            None,
         )
     }
 
     /// Create a new load balancer with optional subset definitions and
     /// per-port override state.
+    ///
+    /// `previous` is the balancer currently published for the same
+    /// namespace-qualified upstream, when this one replaces it. Every target
+    /// whose `host:port` is also in `previous` adopts `previous`'s
+    /// [`TargetRuntimeState`] slot instead of a fresh one, so its
+    /// active-connection count, latency EWMA, and sample count carry over and
+    /// a [`TargetConnectionLease`] taken through `previous` releases the
+    /// counter this balancer reads. Targets absent from `previous` start
+    /// clean. Targets `previous` had but this set drops are not referenced,
+    /// so their state is freed with the last holder of `previous`; a target
+    /// re-added later starts clean.
+    ///
+    /// Round-robin counters, WRR schedules, hash rings, and eligibility
+    /// snapshots are derived from the target set and are never inherited.
     #[allow(clippy::too_many_arguments)]
     fn with_subsets_and_port_overrides(
         upstream_id: &str,
@@ -3655,6 +3685,7 @@ impl LoadBalancer {
         source_labels: &HashMap<String, String>,
         locality_lb_setting: Option<&UpstreamLocalityLbSetting>,
         locality_lb_strict: bool,
+        previous: Option<&LoadBalancer>,
     ) -> Self {
         // Pre-compute host:port keys for internal use (active connections, latency, hash ring)
         let host_port_keys: Vec<String> = targets.iter().map(target_host_port_key).collect();
@@ -3713,15 +3744,19 @@ impl LoadBalancer {
         };
 
         // One live runtime-state slot per distinct "host:port"; duplicate
-        // entries for the same endpoint share it.
+        // entries for the same endpoint share it. A target that survives from
+        // `previous` adopts its slot directly, so no fresh slot is allocated
+        // for it only to be discarded.
         let mut target_state: Vec<TargetStateSlot> = Vec::with_capacity(host_port_keys.len());
         {
             let mut slot_by_key: HashMap<&str, TargetStateSlot> =
                 HashMap::with_capacity(host_port_keys.len());
             for key in &host_port_keys {
-                let slot = slot_by_key
-                    .entry(key.as_str())
-                    .or_insert_with(TargetRuntimeState::new_slot);
+                let slot = slot_by_key.entry(key.as_str()).or_insert_with(|| {
+                    previous
+                        .and_then(|previous| previous.runtime_state_slot(key))
+                        .unwrap_or_else(TargetRuntimeState::new_slot)
+                });
                 target_state.push(Arc::clone(slot));
             }
         }
@@ -4008,51 +4043,46 @@ impl LoadBalancer {
         }
     }
 
-    /// Adopt `previous`'s live [`TargetRuntimeState`] for every target whose
-    /// `host:port` is also in `previous`.
-    ///
-    /// Called on the not-yet-published balancer when an upstream is rebuilt
-    /// (service-discovery target update, modified upstream, full rebuild over
-    /// a published snapshot). `previous` must be the balancer currently
-    /// published under the same namespace-qualified upstream key; the identity
-    /// is `host:port` within that upstream, the same key the gateway already
-    /// used to aggregate an endpoint's connections and latency.
-    ///
-    /// Surviving targets share `previous`'s slot, so their active-connection
-    /// counts, latency EWMAs, and sample counts carry over, and a connection
-    /// guard still holding `previous` releases the counter this balancer
-    /// reads. Targets absent from `previous` keep their fresh slot. Targets
-    /// dropped by the rebuild are not referenced here, so their state is
-    /// freed with the last holder of `previous`; a target re-added later
-    /// starts clean, and late releases against the old balancer only touch
-    /// that orphaned slot, never the new one.
-    ///
-    /// Round-robin counters, WRR schedules, hash rings, and eligibility
-    /// snapshots are derived from the target set and are not inherited.
-    pub fn inherit_runtime_state(&mut self, previous: &LoadBalancer) {
-        for (slot, key) in self.target_state.iter_mut().zip(&self.host_port_keys) {
-            if let Some(&previous_idx) = previous.target_index.get(key.as_str()) {
-                *slot = Arc::clone(&previous.target_state[previous_idx]);
-            }
-        }
+    /// The runtime-state slot this balancer holds for the `host:port` `key`,
+    /// shared with a replacement balancer built over this one.
+    fn runtime_state_slot(&self, key: &str) -> Option<TargetStateSlot> {
+        let &idx = self.target_index.get(key)?;
+        Some(Arc::clone(&self.target_state[idx]))
     }
 
     /// Live runtime state for `target`, matched by `host:port`. `None` when
     /// the target is not in this balancer.
     pub fn target_runtime_state(&self, target: &UpstreamTarget) -> Option<&TargetRuntimeState> {
         let idx = self.find_target_index(target)?;
-        Some(&**self.target_state[idx])
+        Some(&*self.target_state[idx])
+    }
+
+    /// Each distinct `host:port` once, with its runtime state. Duplicate
+    /// `host:port` entries share one slot and are reported once.
+    fn distinct_target_states(&self) -> impl Iterator<Item = (&str, &TargetRuntimeState)> {
+        self.host_port_keys
+            .iter()
+            .enumerate()
+            .filter(|(idx, key)| self.target_index.get(key.as_str()) == Some(idx))
+            .map(|(idx, key)| (key.as_str(), &*self.target_state[idx]))
     }
 
     /// Active-connection count per distinct `host:port` target, including
     /// targets with no open connection. Cold path (metrics / diagnostics).
     pub fn active_connection_counts(&self) -> Vec<(String, i64)> {
-        // Duplicate `host:port` entries share one slot; report it once.
-        self.host_port_keys
-            .iter()
-            .enumerate()
-            .filter(|(idx, key)| self.target_index.get(key.as_str()) == Some(idx))
-            .map(|(idx, key)| (key.clone(), self.target_state[idx].active_connections()))
+        self.distinct_target_states()
+            .map(|(key, state)| (key.to_owned(), state.active_connections()))
+            .collect()
+    }
+
+    /// Like [`Self::active_connection_counts`], but only targets with at
+    /// least one open connection; idle targets' keys are never cloned.
+    fn open_connection_counts(&self) -> Vec<(String, i64)> {
+        self.distinct_target_states()
+            .filter_map(|(key, state)| {
+                let count = state.active_connections();
+                (count > 0).then(|| (key.to_owned(), count))
+            })
             .collect()
     }
 
@@ -4115,21 +4145,39 @@ impl LoadBalancer {
         self.record_latency(target, LATENCY_FAILURE_PENALTY_US);
     }
 
+    /// Count one open connection to `target` until the returned lease drops.
+    /// `None` when the target is not in this balancer.
+    ///
+    /// This is how the proxy paths account connections (through
+    /// `proxy::LoadBalancerConnectionGuard`): the release cannot be skipped
+    /// by an early return, and it always lands on the slot the start
+    /// incremented, even after the balancer is rebuilt.
+    pub fn lease_connection(&self, target: &UpstreamTarget) -> Option<TargetConnectionLease> {
+        let idx = self.find_target_index(target)?;
+        let state = Arc::clone(&self.target_state[idx]);
+        state.open_connection();
+        Some(TargetConnectionLease { state })
+    }
+
+    /// Count one open connection to `target`.
+    ///
+    /// Each call must be matched by exactly one
+    /// [`Self::record_connection_end`] on this same balancer, on every exit
+    /// path. Surviving targets keep their count across rebuilds, so a missed
+    /// end is never reset and the target stays disfavoured by
+    /// least-connections. Prefer [`Self::lease_connection`].
     pub fn record_connection_start(&self, target: &UpstreamTarget) {
         if let Some(idx) = self.find_target_index(target) {
-            let count = &self.target_state[idx].active_connections;
-            count.fetch_add(1, Ordering::Relaxed);
+            self.target_state[idx].open_connection();
         }
     }
 
+    /// Release one connection counted by [`Self::record_connection_start`].
+    /// Saturates at zero, so an unmatched release never drives the count
+    /// negative.
     pub fn record_connection_end(&self, target: &UpstreamTarget) {
         if let Some(idx) = self.find_target_index(target) {
-            // Saturate at zero so an unmatched release can never drive the
-            // shared counter negative.
-            let count = &self.target_state[idx].active_connections;
-            let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                if v > 0 { Some(v - 1) } else { None }
-            });
+            self.target_state[idx].close_connection();
         }
     }
 
@@ -8430,6 +8478,7 @@ mod tests {
             &HashMap::new(),
             None,
             false,
+            None,
         );
 
         let random_state = lb.port_overrides.get(&8080).expect("random override");

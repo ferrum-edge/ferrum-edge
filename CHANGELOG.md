@@ -67,7 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with 1,000 open sessions look idle to `least_connections`, sent
   `least_latency` back into round-robin warm-up, and dropped those connections
   from the per-target connection metrics. A removed target's state is dropped;
-  if the target is added again, it starts clean.
+  if the target is added again, it starts clean. Because counts now persist,
+  every HTTP/3 path (native streaming, buffered, native gRPC, and the
+  cross-protocol bridge) releases its connection count through an RAII guard,
+  as HTTP/1.1, HTTP/2, gRPC, WebSocket, TCP and UDP already did. An early
+  return between the start and the outcome record previously leaked one count,
+  and a retry that rotated to another target released the wrong one.
 - Rust tests no longer write the gateway's TLS store into the checkout
   (#5706). Only the `ferrum-edge` binary resolves an unconfigured
   `FERRUM_TLS_MANAGED_STORE_PATH` to `./ferrum-managed-tls`; other processes
@@ -204,6 +209,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (library API) — load-balancer runtime state** (#5693). The public
+  `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and
+  `LoadBalancer::latency_sample_count` `DashMap` fields are removed, along with
+  `LoadBalancerCache::record_connection_start` / `record_connection_end`, which
+  re-resolved the balancer at release time and could release a re-added
+  target's fresh count. Per-target state is now one shared
+  `TargetRuntimeState` slot per distinct `host:port`. Read it with
+  `LoadBalancer::target_runtime_state(target)` (`active_connections()`,
+  `latency_ewma_us()`, `latency_sample_count()`) or
+  `LoadBalancer::active_connection_counts()`. Count a connection with
+  `LoadBalancer::lease_connection(target)`, whose `TargetConnectionLease`
+  releases on drop. `LoadBalancer::record_connection_start` /
+  `record_connection_end` remain, but every start must be matched by an end on
+  the same balancer, because a rebuild no longer resets a leaked count. This
+  affects only code linking the `ferrum_edge` crate; configuration, the Admin
+  API and metrics are unchanged.
 - **BREAKING — malformed secret-fetch timeout and mesh DNS limits refuse to
   start** (issues #5699 / #5700). `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` must be
   a whole number of seconds from 1 to 600. Previously `0` made every secret

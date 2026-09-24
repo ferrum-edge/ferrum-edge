@@ -905,12 +905,14 @@ fn test_least_latency_late_joiner_does_not_disrupt_routing() {
     // reload), the existing latency-based routing should continue uninterrupted.
     // The new target receives bounded exploration, not an unconditional preference.
     let targets = make_targets(2);
-    let before = LoadBalancer::new(
-        TEST_UPSTREAM,
-        LoadBalancerAlgorithm::LeastLatency,
-        &targets[1..],
-        None,
-    );
+    let mut upstream = make_upstream(TEST_UPSTREAM, targets[1..].to_vec());
+    upstream.algorithm = LoadBalancerAlgorithm::LeastLatency;
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    });
+    let ns = ferrum_edge::config::types::default_namespace();
+    let before = cache.load().get_balancer(&ns, TEST_UPSTREAM).unwrap();
 
     // Complete warm-up for host1 (5ms) before host0 exists.
     for _ in 0..10 {
@@ -919,15 +921,16 @@ fn test_least_latency_late_joiner_does_not_disrupt_routing() {
     let sel = before.select("", None).unwrap();
     assert_eq!(sel.target.host, "host1");
 
-    // host0 joins: the rebuilt balancer keeps host1's warmed state and starts
-    // host0 unsampled.
-    let mut lb = LoadBalancer::new(
+    // host0 joins through service discovery: the rebuilt balancer keeps
+    // host1's warmed state and starts host0 unsampled.
+    cache.update_targets(
+        &ns,
         TEST_UPSTREAM,
+        targets.clone(),
         LoadBalancerAlgorithm::LeastLatency,
-        &targets,
         None,
     );
-    lb.inherit_runtime_state(&before);
+    let lb = cache.load().get_balancer(&ns, TEST_UPSTREAM).unwrap();
     let joiner = lb.target_runtime_state(&targets[0]).unwrap();
     assert_eq!(joiner.latency_sample_count(), 0);
     assert_eq!(joiner.latency_ewma_us(), None);
