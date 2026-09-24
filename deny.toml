@@ -48,7 +48,8 @@ unused-ignored-advisory = "deny"
 # upstream fix became reachable (see docs/dependency-policy.md, "Advisory
 # exception register"):
 #   - RUSTSEC-2026-0118 / RUSTSEC-2026-0119 (hickory-proto 0.25.2): mongodb 3.7
-#     moved its SRV resolver to hickory 0.26; Cargo.toml now requires >= 3.7.
+#     moved its SRV resolver to hickory 0.26; Cargo.toml now requires >= 3.7
+#     (the lockfile resolves 3.9.1).
 #   - RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and
 #     RUSTSEC-2026-0258 (h2 0.3.27): all came from the AWS SDK's legacy
 #     `rustls` feature (hyper 0.14 / rustls 0.21 connector), which
@@ -86,7 +87,7 @@ ignore = [
 
 [bans]
 # The repo intentionally carries duplicate major versions during build-out
-# (rustls 0.21+0.23, hyper 0.14+1.x, hickory 0.25+0.26, tungstenite 0.28+0.29).
+# (for example tungstenite 0.28+0.29 and the RustCrypto digest 0.10/0.11 lines).
 # Surface them as warnings for visibility without blocking PRs.
 #
 # FIPS profile (issue #3510): `--no-default-features --features fips` adds

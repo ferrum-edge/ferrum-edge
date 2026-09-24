@@ -160,8 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change; the manifest's `0.12` requirement already admits the patch release.
 - Re-evaluate the time-boxed `deny.toml` advisory exceptions before their
   2026-09-30 expiry (#5721). `mongodb` now requires 3.7 or later, the first
-  release on hickory 0.26, which drops hickory-proto 0.25.2 (RUSTSEC-2026-0118,
-  RUSTSEC-2026-0119). The optional `secrets-aws` build no longer enables
+  release on hickory 0.26 (the lockfile moves from 3.6.0 to 3.9.1), which drops
+  hickory-proto 0.25.2 (RUSTSEC-2026-0118, RUSTSEC-2026-0119). The optional `secrets-aws` build no longer enables
   `aws-sdk-secretsmanager`'s legacy `rustls` feature, so hyper 0.14, rustls 0.21
   with rustls-webpki 0.101.7 (RUSTSEC-2026-0098, -0099, -0104) and h2 0.3.27
   (RUSTSEC-2026-0258) leave the tree. The client already used the SDK's

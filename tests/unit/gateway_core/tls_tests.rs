@@ -925,9 +925,10 @@ fn test_no_verifier_accepts_any_cert() {
 
     // Create a dummy certificate (self-signed, doesn't matter — verifier should accept anything)
     let (cert_pem, _) = generate_self_signed_cert(&["example.com"]);
-    let cert_der: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
-        .filter_map(|r| r.ok())
-        .collect();
+    let cert_der: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .filter_map(|r| r.ok())
+            .collect();
     assert!(!cert_der.is_empty(), "Should parse at least one cert");
 
     let server_name = ServerName::try_from("example.com").unwrap();
