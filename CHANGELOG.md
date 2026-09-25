@@ -41,6 +41,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule's `request` or `backendRequest` is now cut on HTTP/3 as it already was
   on HTTP/1.1 and HTTP/2.
 
+### Fixed
+
+- The graceful-shutdown functional tests no longer pass on evidence that does
+  not show a working drain (#5739). A proxy or TCP stream port now counts as
+  closed only when the connect is refused, or when the peer closes or resets
+  it without answering. Before, a connection that was accepted but never
+  answered also counted, so a hung listener passed. Responses are read with
+  hyper's HTTP/1.1 client. The reader reports a truncated `Content-Length` or
+  chunked body, a stall, a malformed head, and a body that ends only at a
+  socket close as separate failures, instead of treating them as a closed
+  socket or a complete response. The `Connection: close` case now holds a
+  real request at the backend until the listener is closed, then requires the
+  full body together with the close token. An idle socket closed by shutdown
+  no longer passes it; idle-connection closure is its own case. Every case
+  checks that SIGTERM was delivered and that the gateway exits with status 0
+  within its bound. The drain-timeout case also fails if the gateway exits
+  before its drain window ends. New HTTP/1.1 and HTTP/2 (h2c) cases hold a
+  streaming response body open across shutdown. Tests that need no gateway
+  binary check the helpers against fake peers, including a peer that accepts
+  and never answers, and against child processes that never exit or exit
+  non-zero.
+
 ## [0.9.7] - 2026-09-25
 
 This is the first published release after 0.9.5. It ships every change
