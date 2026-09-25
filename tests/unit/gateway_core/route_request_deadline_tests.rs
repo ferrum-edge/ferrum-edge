@@ -605,7 +605,10 @@ async fn a_cancelled_head_write_reports_whether_it_reached_the_send_half() {
     let deadline = Instant::now() + Duration::from_secs(1);
     let ready = std::future::ready(Ok::<(), &'static str>(()));
     let (expired, offered) = await_offered_response_write_for_test(Some(deadline), ready).await;
-    assert!(!expired, "a write that lands before its deadline is not cut");
+    assert!(
+        !expired,
+        "a write that lands before its deadline is not cut"
+    );
     assert!(offered);
 }
 
