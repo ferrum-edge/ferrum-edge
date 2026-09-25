@@ -208,7 +208,12 @@ shares.
   signal was delivered and that the exit status is 0, and hold in-flight work
   with a backend barrier, not a sleep. `functional_graceful_shutdown_test.rs`
   has the closure probe, the typed HTTP/1.1 reader, and fake-peer tests that
-  check both.
+  check both. Hyper adds `Connection: close` by itself once
+  `graceful_shutdown()` disables keep-alive, so the gateway's own drain hint is
+  pinned in `tests/integration/graceful_shutdown_tests.rs` with the listener's
+  shutdown channel left unsignalled. A hyper client closes an idle connection
+  once its last `SendRequest` drops; keep the sender alive when asserting that
+  the server closed it.
 - Readiness is not identity — and that applies to bespoke spawners too, not just `TestGateway`. `functional_websocket_test.rs::wait_for_owned_gateway` reuses the exported `probe_gateway_identity` because a bare TCP accept let a foreign H2 fixture answer (and `PROTOCOL_ERROR`-reset) an RFC 8441 Extended CONNECT handshake (issue #3435).
 - `TestGateway` mints a per-spawn-attempt admin JWT secret/issuer and `FERRUM_METRICS_BEARER_TOKEN`, and its spawn barrier requires the authenticated detail tier of `/health` plus `ready: true`; that combination is also the proof the child owns its proxy port, because `ready` flips only after every listener bind. Do not weaken it to an unauthenticated `/health` or a bare TCP accept, and do not add sleeps or test-level retries in its place.
 - Use a struct harness with `try_new()` retry wrapper or a `start_gateway_with_retry()` helper.

@@ -185,6 +185,82 @@ async fn start_h1_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
+/// HTTP/1.1 backend that reports each request's arrival and answers it only
+/// after the test adds a release permit, so a request is provably in flight at
+/// the gateway while the test changes drain state.
+struct HeldH1Backend {
+    addr: SocketAddr,
+    arrivals: tokio::sync::mpsc::UnboundedReceiver<()>,
+    releases: Arc<tokio::sync::Semaphore>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl HeldH1Backend {
+    async fn start() -> Self {
+        use hyper::server::conn::http1;
+        let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (arrival_tx, arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let releases = Arc::new(tokio::sync::Semaphore::new(0));
+        let task_releases = releases.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let arrival_tx = arrival_tx.clone();
+                let releases = task_releases.clone();
+                tokio::spawn(async move {
+                    let _ = stream.set_nodelay(true);
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        let arrival_tx = arrival_tx.clone();
+                        let releases = releases.clone();
+                        async move {
+                            let _ = arrival_tx.send(());
+                            if let Ok(permit) = releases.acquire().await {
+                                permit.forget();
+                            }
+                            Ok::<_, hyper::Error>(
+                                Response::builder()
+                                    .status(200)
+                                    .header("content-type", "text/plain")
+                                    .body(Full::new(Bytes::from_static(b"held")))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+        Self {
+            addr,
+            arrivals,
+            releases,
+            _task: task,
+        }
+    }
+
+    async fn wait_for_arrival(&mut self) {
+        tokio::time::timeout(Duration::from_secs(5), self.arrivals.recv())
+            .await
+            .expect("request did not reach the backend within 5s")
+            .expect("backend arrival channel closed");
+    }
+
+    fn release_one(&self) {
+        self.releases.add_permits(1);
+    }
+}
+
+/// True when any `Connection` header value lists the `close` token.
+fn has_close_token(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("close"))
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 /// Verify HTTP/2 connections receive a GOAWAY when the gateway shuts down,
@@ -304,14 +380,37 @@ async fn http1_keepalive_connection_closes_on_shutdown() {
     let resp = sender.send_request(req).await.expect("first request");
     assert_eq!(resp.status().as_u16(), 200);
     let _ = resp.into_body().collect().await;
-    drop(sender);
+
+    // `sender` stays alive until the end of the test. Hyper's client closes an
+    // idle connection by itself once every `SendRequest` is dropped, which
+    // would end `conn_task` without the gateway doing anything. With a live,
+    // ready sender the connection can only end because the server closed it.
+    sender
+        .ready()
+        .await
+        .expect("keepalive connection must be reusable before shutdown");
+    assert!(
+        !conn_task.is_finished(),
+        "client connection ended before shutdown was signalled"
+    );
 
     let shutdown_start = std::time::Instant::now();
     shutdown_tx.send(true).expect("send shutdown");
 
-    let _ = tokio::time::timeout(Duration::from_secs(2), conn_task)
+    let conn_result = tokio::time::timeout(Duration::from_secs(2), conn_task)
         .await
         .expect("H1 keepalive connection did not close within 2s after shutdown");
+    conn_result
+        .expect("client connection task panicked")
+        .expect("server should close the idle keepalive connection cleanly");
+    assert!(
+        sender.is_closed(),
+        "the live request sender must observe the server-initiated close"
+    );
+    assert!(
+        sender.ready().await.is_err(),
+        "no further request may be sent on a connection the server closed"
+    );
 
     let elapsed = shutdown_start.elapsed();
     assert!(
@@ -321,6 +420,95 @@ async fn http1_keepalive_connection_closes_on_shutdown() {
     );
 
     let _ = tokio::time::timeout(Duration::from_secs(2), listener_handle).await;
+}
+
+/// The gateway itself marks an HTTP/1.1 response produced during drain with
+/// `Connection: close`; hyper's shutdown handling is not the only producer.
+///
+/// The functional drain case (`test_drain_sets_connection_close_header`)
+/// cannot tell the two producers apart: once SIGTERM reaches the listener,
+/// `graceful_shutdown()` disables hyper's keep-alive and hyper adds the close
+/// token on its own. Here drain begins through `overload::begin_drain` while
+/// the listener's shutdown channel is never signalled, so hyper still treats
+/// the connection as reusable. The drain hint in the proxy response builder is
+/// then the only thing that can put the token on the wire, and removing it
+/// fails this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_flag_marks_inflight_h1_response_connection_close() {
+    use http_body_util::Empty;
+    use hyper::client::conn::http1;
+
+    let mut backend = HeldH1Backend::start().await;
+    let proxy = create_test_proxy("h1-drain-close", "/api", backend.addr.port());
+    let state = create_test_proxy_state(vec![proxy]);
+    let overload = state.overload.clone();
+
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+    let gateway_addr = listener.local_addr().unwrap();
+    // Held for the whole test and never sent, so the listener never calls
+    // `graceful_shutdown()` and hyper keep-alive stays enabled.
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let _listener_handle = tokio::spawn(async move {
+        let _ = start_proxy_listener_with_bound_listener(listener, state, shutdown_rx, None).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = http1::handshake::<_, Empty<Bytes>>(io).await.unwrap();
+    let _conn_task = tokio::spawn(conn);
+
+    let get = || {
+        Request::builder()
+            .method("GET")
+            .uri("/api/")
+            .header("host", "127.0.0.1")
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+
+    // Baseline: outside drain the response carries no close token, so the one
+    // asserted below cannot come from the backend or from hyper.
+    backend.release_one();
+    let resp = sender.send_request(get()).await.expect("baseline request");
+    backend.wait_for_arrival().await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(
+        !has_close_token(resp.headers()),
+        "a response outside drain must leave the connection reusable: {:?}",
+        resp.headers()
+    );
+    let _ = resp.into_body().collect().await;
+
+    // Drain begins while the second request is held at the backend, so its
+    // response head is built with the drain flag set.
+    sender
+        .ready()
+        .await
+        .expect("connection must be reusable before drain");
+    let pending = sender.send_request(get());
+    backend.wait_for_arrival().await;
+    ferrum_edge::overload::begin_drain(&overload);
+    backend.release_one();
+
+    let resp = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .expect("in-flight response did not arrive within 5s of release")
+        .expect("in-flight request failed");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(
+        has_close_token(resp.headers()),
+        "the gateway must add `Connection: close` to a response built during drain: {:?}",
+        resp.headers()
+    );
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("in-flight response body")
+        .to_bytes();
+    assert_eq!(&body[..], b"held");
 }
 
 /// Regression: when there are no in-flight requests, shutdown is essentially

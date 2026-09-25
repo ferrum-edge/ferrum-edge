@@ -61,7 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streaming response body open across shutdown. Tests that need no gateway
   binary check the helpers against fake peers, including a peer that accepts
   and never answers, and against child processes that never exit or exit
-  non-zero.
+  non-zero. An in-process integration test begins drain without signalling the
+  listener, so hyper keeps the connection alive and only the gateway's own
+  drain hint can add `Connection: close`. The HTTP/1.1 idle keep-alive
+  integration test now keeps its request sender alive, so it passes only when
+  the server closes the connection.
 
 ## [0.9.7] - 2026-09-25
 

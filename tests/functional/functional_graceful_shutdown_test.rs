@@ -283,7 +283,10 @@ fn spawn_gateway(
         .env("FERRUM_ADMIN_HTTPS_PORT", "0")
         .env("FERRUM_SHUTDOWN_DRAIN_SECONDS", drain_seconds.to_string())
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .env("FERRUM_TLS_MANAGED_STORE_PATH", state_dir.join("managed-tls"))
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            state_dir.join("managed-tls"),
+        )
         .env("FERRUM_LOG_LEVEL", "info")
         .stdin(std::process::Stdio::null());
     // Deliberately no `configure_coverage_gateway_command`: it pins the drain
@@ -578,7 +581,10 @@ enum H1Read {
     /// a socket close, which cannot be told apart from truncation.
     UnsupportedFraming,
     /// The body ended before its declared framing completed.
-    TruncatedBody { received: usize, error: String },
+    TruncatedBody {
+        received: usize,
+        error: String,
+    },
     /// Any other transport failure before the response head.
     Transport(String),
 }
@@ -852,7 +858,10 @@ async fn test_drain_zero_exits_immediately() {
 /// On this path the close token has two producers: the drain hint in the proxy
 /// response builder, and hyper's keep-alive disable from the per-connection
 /// `graceful_shutdown()`. This case pins the wire contract that either one
-/// satisfies; it cannot tell them apart.
+/// satisfies; it cannot tell them apart. The gateway's own drain hint is
+/// isolated by `drain_flag_marks_inflight_h1_response_connection_close` in
+/// `tests/integration/graceful_shutdown_tests.rs`, which begins drain without
+/// signalling the listener so hyper keep-alive stays on.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_drain_sets_connection_close_header() {
@@ -1423,24 +1432,18 @@ async fn harness_h1_reader_rejects_truncated_stalled_and_malformed_responses() {
             false,
             |read| matches!(read, H1Read::Stalled(ReadPhase::Body)),
         ),
-        (
-            "no response and the socket held open",
-            b"",
-            false,
-            |read| matches!(read, H1Read::Stalled(ReadPhase::Head)),
-        ),
+        ("no response and the socket held open", b"", false, |read| {
+            matches!(read, H1Read::Stalled(ReadPhase::Head))
+        }),
         (
             "partial head and the socket held open",
             b"HTTP/1.1 200 OK\r\nContent-Le",
             false,
             |read| matches!(read, H1Read::Stalled(ReadPhase::Head)),
         ),
-        (
-            "close before any response",
-            b"",
-            true,
-            |read| matches!(read, H1Read::ClosedBeforeResponse),
-        ),
+        ("close before any response", b"", true, |read| {
+            matches!(read, H1Read::ClosedBeforeResponse)
+        }),
         (
             "malformed Content-Length",
             b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\nhello",
