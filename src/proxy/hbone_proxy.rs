@@ -1244,7 +1244,7 @@ pub(super) async fn handle_hbone_request(
     let relay_read_timeout = backend_read_timeout(proxy);
     let relay_write_timeout = backend_write_timeout(proxy);
     let lb_guard =
-        LoadBalancerConnectionGuard::new(upstream_target.clone(), upstream_balancer.clone());
+        LoadBalancerConnectionGuard::new(upstream_target.as_deref(), upstream_balancer.as_deref());
     let backend_stream = backend.stream;
     tokio::spawn(async move {
         let _lb_guard = lb_guard;

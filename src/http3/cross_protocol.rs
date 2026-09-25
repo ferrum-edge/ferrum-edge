@@ -125,8 +125,9 @@ use crate::plugins::{
     RequestContext, ResponseStreamAction, ResponseStreamInspector,
     normalize_response_body_for_inspection,
 };
+use crate::proxy::LoadBalancerConnectionGuard;
 use crate::proxy::ProxyState;
-use crate::proxy::backend_dispatch::{record_backend_outcome, record_backend_outcome_no_conn_end};
+use crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end;
 use crate::proxy::grpc_proxy::{
     self, GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
@@ -280,13 +281,22 @@ where
     pub response_trailer_governance: ResponseTrailerGovernance<'a>,
 }
 
+/// Count one least-connections connection to this attempt's target, first
+/// ending the previous attempt's if `lb_connection` still holds it.
+///
+/// `lb_connection` lives for the whole dispatch, so the count is released on
+/// every exit (return, `?`, cancellation, unwind) exactly once, and outcome
+/// records never touch it (issue #5693).
 fn record_cross_protocol_connection_start(
+    lb_connection: &mut Option<LoadBalancerConnectionGuard>,
     selected_balancer: Option<&Arc<LoadBalancer>>,
     upstream_target: Option<&UpstreamTarget>,
 ) {
-    if let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
-        balancer.record_connection_start(target);
-    }
+    *lb_connection = None;
+    *lb_connection = Some(LoadBalancerConnectionGuard::new(
+        upstream_target,
+        selected_balancer.map(Arc::as_ref),
+    ));
 }
 
 fn cross_protocol_proxy_protocol(flavor: HttpFlavor) -> ProxyProtocol {
@@ -329,7 +339,7 @@ fn record_cross_protocol_header_write_disconnect(
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
 ) {
-    record_backend_outcome(
+    record_backend_outcome_no_conn_end(
         state,
         proxy,
         &epoch.load_balancer,
@@ -501,7 +511,7 @@ where
         Some(ErrorClass::ReadWriteTimeout),
         args.backend_admission_elapsed,
     );
-    record_backend_outcome(
+    record_backend_outcome_no_conn_end(
         args.state,
         args.proxy,
         &args.epoch.load_balancer,
@@ -687,16 +697,14 @@ where
 fn record_cross_protocol_retry_failure(
     state: &ProxyState,
     proxy: &Proxy,
-    selected_balancer: Option<&Arc<LoadBalancer>>,
-    upstream_target: Option<&UpstreamTarget>,
+    lb_connection: &mut Option<LoadBalancerConnectionGuard>,
     cb_target_key: Option<&str>,
     response_status: u16,
     connection_error: bool,
     is_half_open_probe: bool,
 ) {
-    if let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
-        balancer.record_connection_end(target);
-    }
+    // The failed attempt's connection ends now, not after the retry backoff.
+    *lb_connection = None;
 
     if let Some(cb_config) = &proxy.circuit_breaker {
         let cb = state.circuit_breaker_cache.get_or_create(
@@ -1334,13 +1342,10 @@ async fn collect_reqwest_response_body_with_limit(
 /// Both callers run backend admission AND
 /// `record_cross_protocol_connection_start` for the selected target BEFORE this
 /// helper, so a client-build/pool failure here must take the FULL normal outcome
-/// path, exactly like the `http1MaxPendingRequests` overflow shed below: (1)
-/// record the backend-admission outcome (so the 502 connection failure feeds
-/// adaptive concurrency and the permits are released), and (2) END the
-/// least-connections connection via `record_backend_outcome` (conn_end = true)
-/// to BALANCE the connection-start. Using `record_backend_outcome_no_conn_end`
-/// instead would leave the connection-start unended — permanently inflating the
-/// target's active-connection count — and drop the admission permits unrecorded.
+/// path, exactly like the `http1MaxPendingRequests` overflow shed below: record
+/// the backend-admission outcome (so the 502 connection failure feeds adaptive
+/// concurrency and the permits are released) and the backend outcome. The
+/// least-connections count is released by the caller's connection guard.
 #[allow(clippy::too_many_arguments)]
 async fn get_cross_protocol_client<S>(
     state: &ProxyState,
@@ -1407,13 +1412,10 @@ where
 /// Both callers run backend admission AND
 /// `record_cross_protocol_connection_start` for the selected target BEFORE the
 /// client acquire, so this failure must take the FULL normal outcome path,
-/// exactly like the `http1MaxPendingRequests` overflow shed: (1) record the
+/// exactly like the `http1MaxPendingRequests` overflow shed: record the
 /// backend-admission outcome (so the 502 connection failure feeds adaptive
-/// concurrency and the permits are released), and (2) END the least-connections
-/// connection via `record_backend_outcome` (conn_end = true) to BALANCE the
-/// connection-start. Using `record_backend_outcome_no_conn_end` instead would
-/// leave the connection-start unended — permanently inflating the target's
-/// active-connection count — and drop the admission permits unrecorded.
+/// concurrency and the permits are released) and the backend outcome. The
+/// least-connections count is released by the caller's connection guard.
 #[allow(clippy::too_many_arguments)]
 fn record_cross_protocol_client_acquire_failure(
     state: &ProxyState,
@@ -1436,12 +1438,10 @@ fn record_cross_protocol_client_acquire_failure(
         None,
         backend_admission_elapsed,
     );
-    // END the least-connections connection (conn_end = true) to balance the
-    // `record_cross_protocol_connection_start` the caller issued for this target,
-    // and feed the 502 connection failure to the backend circuit breaker /
-    // passive health / adaptive concurrency — mirroring the H1/H2 reqwest path's
-    // connection-start/connection-end balance and the pending-overflow shed.
-    record_backend_outcome(
+    // Feed the 502 connection failure to the backend circuit breaker / passive
+    // health / least-latency — mirroring the H1/H2 reqwest path and the
+    // pending-overflow shed.
+    record_backend_outcome_no_conn_end(
         state,
         dispatch_proxy,
         &epoch.load_balancer,
@@ -1821,7 +1821,7 @@ fn record_plain_grpc_web_client_deadline(
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
 ) {
-    record_backend_outcome(
+    record_backend_outcome_no_conn_end(
         state,
         proxy,
         &epoch.load_balancer,
@@ -1884,7 +1884,7 @@ fn record_plain_grpc_web_client_deadline_after_backend_response(
         return;
     }
 
-    record_backend_outcome(
+    record_backend_outcome_no_conn_end(
         state,
         proxy,
         &epoch.load_balancer,
@@ -2276,6 +2276,9 @@ where
     let mut current_target = upstream_target.cloned().map(Arc::new);
     let mut current_cb_target_key = cb_target_key.map(str::to_owned);
     let mut current_url = backend_url.to_string();
+    // The current attempt's least-connections count. Held for the whole
+    // dispatch so its drop is the one release on every exit (issue #5693).
+    let mut lb_connection_guard = None;
     // Absolute route ceiling retained on Proxy.retry (never permanently lowered
     // to the initial target's DestinationRule cap). Retry authorization uses
     // min(route_retry_ceiling, current_or_candidate_cap).
@@ -2482,6 +2485,7 @@ where
                             }
                         };
                     record_cross_protocol_connection_start(
+                        &mut lb_connection_guard,
                         upstream_balancer,
                         current_target.as_deref(),
                     );
@@ -2569,8 +2573,7 @@ where
                                 record_cross_protocol_retry_failure(
                                     state,
                                     proxy,
-                                    upstream_balancer,
-                                    current_target.as_deref(),
+                                    &mut lb_connection_guard,
                                     current_cb_target_key.as_deref(),
                                     attempt_result.status_code,
                                     attempt_result.connection_error,
@@ -2586,14 +2589,12 @@ where
                                 {
                                     // This attempt's admission + backend outcome
                                     // were ALREADY settled just above, and the
-                                    // retry-failure record owns the single
-                                    // least-connections end matching this
-                                    // iteration's connection start. Recording a
-                                    // client deadline or authorization expiry
-                                    // here too would end that connection a SECOND
-                                    // time and undercount the target's active
-                                    // connections, so settle only the
-                                    // client-facing write — same as the
+                                    // retry-failure record already released this
+                                    // iteration's least-connections count.
+                                    // Recording a client deadline or
+                                    // authorization expiry here too would settle
+                                    // that outcome a SECOND time, so settle only
+                                    // the client-facing write — same as the
                                     // reqwest retry arms below.
                                     if let Some(termination) =
                                         plain_write_bound.expired_authorization()
@@ -2673,7 +2674,7 @@ where
                                 "cross-protocol H3→HTTP mesh dispatch returned a streaming \
                                  response body in buffered mode; failing closed"
                             );
-                            record_backend_outcome(
+                            record_backend_outcome_no_conn_end(
                                 state,
                                 proxy,
                                 &epoch.load_balancer,
@@ -2758,7 +2759,7 @@ where
                                     Some(ErrorClass::ClientDisconnect),
                                     backend_admission_start.elapsed(),
                                 );
-                                record_backend_outcome(
+                                record_backend_outcome_no_conn_end(
                                     state,
                                     proxy,
                                     &epoch.load_balancer,
@@ -2989,7 +2990,7 @@ where
                                     Some(ErrorClass::ClientDisconnect),
                                     backend_admission_start.elapsed(),
                                 );
-                                record_backend_outcome(
+                                record_backend_outcome_no_conn_end(
                                     state,
                                     proxy,
                                     &epoch.load_balancer,
@@ -3113,8 +3114,7 @@ where
                                     record_cross_protocol_retry_failure(
                                         state,
                                         proxy,
-                                        upstream_balancer,
-                                        current_target.as_deref(),
+                                        &mut lb_connection_guard,
                                         current_cb_target_key.as_deref(),
                                         attempt_result.status_code,
                                         false,
@@ -3239,8 +3239,7 @@ where
                                     record_cross_protocol_retry_failure(
                                         state,
                                         proxy,
-                                        upstream_balancer,
-                                        current_target.as_deref(),
+                                        &mut lb_connection_guard,
                                         current_cb_target_key.as_deref(),
                                         attempt_result.status_code,
                                         attempt_result.connection_error,
@@ -3316,7 +3315,7 @@ where
                                 attempt_result.error_class,
                                 backend_admission_start.elapsed(),
                             );
-                            record_backend_outcome(
+                            record_backend_outcome_no_conn_end(
                                 state,
                                 proxy,
                                 &epoch.load_balancer,
@@ -3466,6 +3465,7 @@ where
                         Err(outcome) => return Ok(outcome),
                     };
                 record_cross_protocol_connection_start(
+                    &mut lb_connection_guard,
                     upstream_balancer,
                     current_target.as_deref(),
                 );
@@ -3513,7 +3513,7 @@ where
                                 Some(ErrorClass::ClientDisconnect),
                                 backend_admission_start.elapsed(),
                             );
-                            record_backend_outcome(
+                            record_backend_outcome_no_conn_end(
                                 state,
                                 proxy,
                                 &epoch.load_balancer,
@@ -4025,7 +4025,7 @@ where
                             Some(ErrorClass::ClientDisconnect),
                             backend_admission_start.elapsed(),
                         );
-                        record_backend_outcome(
+                        record_backend_outcome_no_conn_end(
                             state,
                             proxy,
                             &epoch.load_balancer,
@@ -4140,7 +4140,7 @@ where
                         Some(ErrorClass::ClientDisconnect),
                         backend_admission_start.elapsed(),
                     );
-                    record_backend_outcome(
+                    record_backend_outcome_no_conn_end(
                         state,
                         proxy,
                         &epoch.load_balancer,
@@ -4203,7 +4203,7 @@ where
                             class = ?attempt_result.error_class,
                             "cross-protocol H3→HTTP: backend request failed"
                         );
-                        record_backend_outcome(
+                        record_backend_outcome_no_conn_end(
                             state,
                             proxy,
                             &epoch.load_balancer,
@@ -4306,7 +4306,7 @@ where
             max_response_body_size_bytes = effective_max_response_body_size_bytes,
             "Cross-protocol backend response body exceeds configured size limit"
         );
-        record_backend_outcome(
+        record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -4417,7 +4417,7 @@ where
         && let Some(reject) =
             crate::proxy::run_after_proxy_hooks(plugins, ctx, status, &mut response_headers).await
     {
-        record_backend_outcome(
+        record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -4536,7 +4536,7 @@ where
                 // and admission see the classification actually returned.
                 let reject_status_code =
                     StatusCode::from_u16(reject_status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-                record_backend_outcome(
+                record_backend_outcome_no_conn_end(
                     state,
                     proxy,
                     &epoch.load_balancer,
@@ -4863,7 +4863,7 @@ where
                 "cross-protocol H3 buffered response header write failed"
             );
             if terminal_connection_error || terminal_error_class.is_some() {
-                record_backend_outcome(
+                record_backend_outcome_no_conn_end(
                     state,
                     proxy,
                     &epoch.load_balancer,
@@ -4998,7 +4998,7 @@ where
                 }
             };
 
-        record_backend_outcome(
+        record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -5065,7 +5065,7 @@ where
                 status = status,
                 "cross-protocol H3→HTTP mesh response reached the streaming path; failing closed"
             );
-            record_backend_outcome(
+            record_backend_outcome_no_conn_end(
                 state,
                 proxy,
                 &epoch.load_balancer,
@@ -5301,7 +5301,7 @@ where
         ctx.latch_authorization_termination(termination);
     }
 
-    record_backend_outcome(
+    record_backend_outcome_no_conn_end(
         state,
         proxy,
         &epoch.load_balancer,
@@ -5584,7 +5584,7 @@ where
             "grpc_status".to_string(),
             grpc_proxy::grpc_status::RESOURCE_EXHAUSTED.to_string(),
         );
-        record_backend_outcome(
+        record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -5722,7 +5722,7 @@ where
                 ));
             }
         };
-        record_backend_outcome(
+        record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -6260,7 +6260,7 @@ where
         Some(code) if code != 0 => crate::proxy::grpc_proxy::grpc_status_to_http_status(code),
         _ => streaming.status,
     };
-    record_backend_outcome(
+    record_backend_outcome_no_conn_end(
         state,
         proxy,
         &epoch.load_balancer,
@@ -6693,7 +6693,14 @@ where
                 Err(outcome) => return Ok(outcome),
             }
         };
-    record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
+    // Held for the whole dispatch: its drop is the one least-connections
+    // release for the current attempt (issue #5693).
+    let mut lb_connection_guard = None;
+    record_cross_protocol_connection_start(
+        &mut lb_connection_guard,
+        upstream_balancer,
+        current_target.as_deref(),
+    );
     // `initial_hmap` already contains the complete backend-bound header set
     // (plugin-transformed end-to-end headers + canonical forwarding headers
     // synthesized by this bridge). The shared gRPC core merge treats its
@@ -6807,8 +6814,7 @@ where
             record_cross_protocol_retry_failure(
                 state,
                 proxy,
-                upstream_balancer,
-                current_target.as_deref(),
+                &mut lb_connection_guard,
                 current_cb_target_key.as_deref(),
                 502,
                 true,
@@ -6911,7 +6917,11 @@ where
                 // Probe release happens inside the helper, before the reject write.
                 Err(outcome) => return Ok(outcome),
             };
-            record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
+            record_cross_protocol_connection_start(
+                &mut lb_connection_guard,
+                upstream_balancer,
+                current_target.as_deref(),
+            );
 
             // Stream the retry response under the same conditions as the
             // initial attempt. Hard-coding `false` here would silently
@@ -7112,7 +7122,7 @@ where
                         ));
                     }
                 };
-                record_backend_outcome(
+                record_backend_outcome_no_conn_end(
                     state,
                     proxy,
                     &epoch.load_balancer,
@@ -7742,7 +7752,7 @@ where
                     body_completed = false;
                 }
             }
-            record_backend_outcome(
+            record_backend_outcome_no_conn_end(
                 state,
                 proxy,
                 &epoch.load_balancer,
@@ -7884,7 +7894,7 @@ where
                 connection_error,
                 "cross-protocol H3→gRPC backend call failed"
             );
-            record_backend_outcome(
+            record_backend_outcome_no_conn_end(
                 state,
                 proxy,
                 &epoch.load_balancer,
@@ -8142,7 +8152,14 @@ pub(crate) async fn dispatch_grpc_streaming(
         // Probe release happens inside the helper, before the reject write.
         Err(outcome) => return Ok(outcome),
     };
-    record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
+    // Held for the whole dispatch: its drop is the one least-connections
+    // release (issue #5693).
+    let mut lb_connection_guard = None;
+    record_cross_protocol_connection_start(
+        &mut lb_connection_guard,
+        upstream_balancer,
+        current_target.as_deref(),
+    );
 
     // Split the QUIC stream so request DATA (recv half) and response DATA (send
     // half) flow concurrently — required for bidi, where the backend responds
@@ -8365,7 +8382,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         // unreachable, but handle it as an internal error rather than panicking.
         Ok(GrpcResponseKind::Buffered(_)) => {
             let bytes_sent = request_bytes_forwarded.load(Ordering::Relaxed);
-            record_backend_outcome(
+            record_backend_outcome_no_conn_end(
                 state,
                 proxy,
                 &epoch.load_balancer,
@@ -8486,7 +8503,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 connection_error,
                 "cross-protocol H3→gRPC streaming backend call failed"
             );
-            record_backend_outcome(
+            record_backend_outcome_no_conn_end(
                 state,
                 proxy,
                 &epoch.load_balancer,
@@ -12018,13 +12035,13 @@ mod tests {
     /// #1806 codex r2 finding 1: both H3→HTTP plain-bridge callers run backend
     /// admission AND `record_cross_protocol_connection_start` for the selected
     /// target BEFORE acquiring the reqwest client. A client-build/pool failure
-    /// must therefore END the least-connections connection (balancing the start —
-    /// no active-count leak) AND feed the 502 connection failure to the backend
-    /// outcome path. Previously this path used `record_backend_outcome_no_conn_end`
-    /// and skipped the admission outcome, permanently inflating the target's
-    /// active-connection count and never feeding the 502 to adaptive concurrency.
+    /// must feed the 502 connection failure to the backend outcome path. Since
+    /// #5693 the outcome record never ends the connection: the dispatch-scoped
+    /// guard does, exactly once, whichever way the dispatch exits. A second,
+    /// concurrent connection keeps the gauge above zero, so a double release
+    /// or a lost start would show instead of saturating at zero.
     #[tokio::test]
-    async fn client_acquire_failure_balances_connection_start_and_records_outcome() {
+    async fn client_acquire_failure_records_outcome_and_guard_releases_connection() {
         let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
             "version": "1",
             "consumers": [],
@@ -12070,18 +12087,37 @@ mod tests {
 
         let active = || {
             balancer
-                .active_connections
+                .active_connection_counts()
                 .iter()
-                .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
+                .map(|(_, count)| count)
                 .sum::<i64>()
         };
 
+        let mut concurrent = None;
+        record_cross_protocol_connection_start(
+            &mut concurrent,
+            Some(&balancer),
+            Some(target.as_ref()),
+        );
         // The caller issues the connection-start before the client acquire.
-        record_cross_protocol_connection_start(Some(&balancer), Some(target.as_ref()));
-        assert_eq!(active(), 1, "connection-start increments the gauge");
+        let mut lb_connection = None;
+        record_cross_protocol_connection_start(
+            &mut lb_connection,
+            Some(&balancer),
+            Some(target.as_ref()),
+        );
+        assert_eq!(active(), 2, "connection-start increments the gauge");
+        // A retry re-arms the same slot: the previous attempt's count is
+        // released, not stacked.
+        record_cross_protocol_connection_start(
+            &mut lb_connection,
+            Some(&balancer),
+            Some(target.as_ref()),
+        );
+        assert_eq!(active(), 2, "re-arming replaces, not adds, a count");
 
-        // No admission permits in this minimal setup, but the outcome path must
-        // still balance the connection-start (conn_end = true).
+        // No admission permits in this minimal setup; the outcome record must
+        // leave the connection to the guard.
         let mut permits = None;
         record_cross_protocol_client_acquire_failure(
             &state,
@@ -12098,9 +12134,14 @@ mod tests {
 
         assert_eq!(
             active(),
-            0,
-            "client-acquire failure must END the connection to balance the start (no active-count leak)"
+            2,
+            "the outcome record must not end the connection the guard owns"
         );
+
+        drop(lb_connection);
+        assert_eq!(active(), 1, "the guard's drop releases one count");
+        drop(concurrent);
+        assert_eq!(active(), 0);
     }
 
     /// #1806: the H3→HTTP plain bridge resolves the per-target effective proxy

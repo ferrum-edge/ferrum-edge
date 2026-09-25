@@ -89,6 +89,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Service-discovery target updates, modified upstreams, and full load-balancer
+  rebuilds no longer reset the live state of targets that stay in the set
+  (#5693). Each surviving `host:port` keeps its active-connection count, latency
+  EWMA, and latency sample count. The new balancer shares these counters with
+  the old one, so connections opened before the update are still counted and
+  release the same counter when they close. Previously a scale-up made a target
+  with 1,000 open sessions look idle to `least_connections`, sent
+  `least_latency` back into round-robin warm-up, and dropped those connections
+  from the per-target connection metrics. A removed target's state is dropped;
+  if the target is added again, it starts clean. Because counts now persist,
+  every HTTP/3 path (native streaming, buffered, native gRPC, and the
+  cross-protocol bridge) releases its connection count through an RAII guard,
+  as HTTP/1.1, HTTP/2, gRPC, WebSocket, TCP and UDP already did. An early
+  return between the start and the outcome record previously leaked one count,
+  and a retry that rotated to another target released the wrong one.
 - An HTTP/1.1 backend request no longer waits for `backend_read_timeout_ms`
   and returns `504` when its pooled connection is reset or closed at the moment
   the request is queued (#5714). The request never reached the backend, so it
@@ -205,6 +220,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ws_frame_logging` builds its payload-fingerprint HMAC key once per plugin
   instead of once per frame (#5690).
 - Circuit-breaker cache hits no longer allocate a key string (#5691).
+- `least_connections` and `least_latency` selection read each candidate's
+  counters by index instead of doing one or more `DashMap<String, _>` lookups
+  per candidate per request (#5693). Each balancer also no longer allocates
+  three default-sharded `DashMap`s.
 
 ### Security
 
@@ -278,6 +297,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (library API) — load-balancer runtime state** (issue #5693). The public
+  `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and
+  `LoadBalancer::latency_sample_count` `DashMap` fields are removed, along with
+  `LoadBalancerCache::record_connection_start` / `record_connection_end`, which
+  re-resolved the balancer at release time and could release a re-added
+  target's fresh count. Per-target state is now one shared
+  `TargetRuntimeState` slot per distinct `host:port`. Read it with
+  `LoadBalancer::target_runtime_state(target)` (`active_connections()`,
+  `latency_ewma_us()`, `latency_sample_count()`) or
+  `LoadBalancer::active_connection_counts()`. Count a connection with
+  `LoadBalancer::lease_connection(target)`, whose `TargetConnectionLease`
+  releases on drop. `LoadBalancer::record_connection_start` /
+  `record_connection_end` remain, but every start must be matched by an end on
+  the same balancer, because a rebuild no longer resets a leaked count. This
+  affects only code linking the `ferrum_edge` crate; configuration, the Admin
+  API and metrics are unchanged.
 - **BREAKING — malformed secret-fetch timeout and mesh DNS limits refuse to
   start** (issues #5699 / #5700). `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` must be
   a whole number of seconds from 1 to 600. Previously `0` made every secret

@@ -1348,8 +1348,8 @@ pub(crate) async fn handle_h3_websocket(
     // a panic anywhere below still releases the per-target connection
     // count. The guard is moved into the session task below.
     let ws_lb_guard = crate::proxy::LoadBalancerConnectionGuard::new(
-        current_target.clone(),
-        upstream_balancer.clone(),
+        current_target.as_deref(),
+        upstream_balancer.as_deref(),
     );
     if let Some(permits) = backend_admission_permits.as_ref() {
         // The permit is held for the full session (moved into the task below),
