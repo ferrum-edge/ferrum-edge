@@ -39,8 +39,15 @@ env:
   # Give ~0.9pt of headroom below the low-water mark. A genuine >~1pt regression
   # still trips the floor. Re-ratchet these upward deliberately once coverage
   # stabilizes materially higher — do not pin them back to the current peak.
-  MIN_OVERALL_LINE_COVERAGE: "77.50"
-  MIN_PLUGINS_LINE_COVERAGE: "84.50"
+  #
+  # Re-ratchet: adding the functional coverage shards raised the overall figure
+  # to 82.79% (526752/636227 lines, run 36117488050); the overall floor moves
+  # to 81.00, keeping ~1.8pt of headroom for the functional suite's run-to-run
+  # variance (its test failures warn rather than fail the shard). The same run
+  # measured src/plugins/ at 90.81% (154123/169721 lines); its floor moves to
+  # 89.00 with the same headroom.
+  MIN_OVERALL_LINE_COVERAGE: "81.00"
+  MIN_PLUGINS_LINE_COVERAGE: "89.00"
   MIN_CHANGED_PLUGIN_LINE_COVERAGE: "84.98"
   # cargo-llvm-cov applies this during report generation; v0.8.7 warns if it
   # is passed to --no-report collection commands.
@@ -237,6 +244,222 @@ jobs:
         env:
           INTEGRATION_FILTERS: ${{ matrix.filters }}
           RUST_BACKTRACE: 1
+
+      - name: Start functional data-plane service containers
+        # Plaintext Redis/MongoDB/PostgreSQL/MySQL for the serial
+        # `functional-data` shard, matching the ports and URLs ci.yml's
+        # data-plane functional shards use. The TLS database fixtures stay
+        # ci.yml-only: without FERRUM_DB_TLS_REQUIRED those cells skip here,
+        # which costs their coverage but not the gate.
+        if: matrix.kind == 'functional' && matrix.data_services == 'true'
+        run: |
+          set -euo pipefail
+
+          docker run -d --name ferrum-cov-redis -p 6379:6379 redis:7-alpine
+          docker run -d --name ferrum-cov-mongo -p 27017:27017 mongo:7
+          # A replica-set member advertises its own host:port, so it must run
+          # on the host network at the port the driver dials.
+          docker run -d --name ferrum-cov-mongo-rs --network host \
+            mongo:7 --replSet rs0 --port 27020 --bind_ip_all \
+            --setParameter enableTestCommands=1
+          docker run -d --name ferrum-cov-postgres \
+            -e POSTGRES_DB=ferrum \
+            -e POSTGRES_USER=ferrum \
+            -e POSTGRES_PASSWORD=ferrum \
+            -p 5432:5432 \
+            postgres:16-alpine
+          docker run -d --name ferrum-cov-mysql \
+            -e MYSQL_DATABASE=ferrum \
+            -e MYSQL_USER=ferrum \
+            -e MYSQL_PASSWORD=ferrum \
+            -e MYSQL_ROOT_PASSWORD=ferrum \
+            -p 3306:3306 \
+            mysql:8
+
+          redis_ok=""
+          for _ in $(seq 1 30); do
+            if docker exec ferrum-cov-redis redis-cli ping 2>/dev/null | grep -q PONG; then
+              redis_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$redis_ok" ]; then
+            echo "::error::redis did not become ready"; docker logs ferrum-cov-redis; exit 1
+          fi
+
+          mongo_ok=""
+          for _ in $(seq 1 30); do
+            if docker exec ferrum-cov-mongo mongosh --quiet \
+                --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)' 2>/dev/null; then
+              mongo_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$mongo_ok" ]; then
+            echo "::error::mongo did not become ready"; docker logs ferrum-cov-mongo; exit 1
+          fi
+
+          mongo_rs_ok=""
+          for _ in $(seq 1 30); do
+            if docker exec ferrum-cov-mongo-rs mongosh --quiet --port 27020 \
+                --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)' 2>/dev/null; then
+              mongo_rs_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$mongo_rs_ok" ]; then
+            echo "::error::mongo replica set did not become ready"
+            docker logs ferrum-cov-mongo-rs; exit 1
+          fi
+          # The primary election loop below is the readiness gate; `|| true`
+          # keeps `set -e` from pre-empting its diagnostic.
+          docker exec ferrum-cov-mongo-rs mongosh --quiet --port 27020 --eval \
+            'try { rs.status() } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27020"}]}) }' || true
+          mongo_rs_primary=""
+          for _ in $(seq 1 60); do
+            if docker exec ferrum-cov-mongo-rs mongosh --quiet --port 27020 \
+                --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)' 2>/dev/null; then
+              mongo_rs_primary=1; break
+            fi
+            sleep 1
+          done
+          if [ -z "$mongo_rs_primary" ]; then
+            echo "::error::mongo replica set did not elect a primary"
+            docker logs ferrum-cov-mongo-rs; exit 1
+          fi
+          {
+            echo "FERRUM_TEST_MONGO_REPLICA_SET=rs0"
+            echo "FERRUM_TEST_MONGO_REPLICA_SET_URL=mongodb://localhost:27020/ferrum_test"
+          } >> "$GITHUB_ENV"
+
+          # `-h 127.0.0.1`: a socket-only pg_isready reports ready while the
+          # entrypoint's initialization server is still running.
+          pg_ok=""
+          for _ in $(seq 1 60); do
+            if docker exec ferrum-cov-postgres pg_isready -h 127.0.0.1 -U ferrum -d ferrum >/dev/null 2>&1; then
+              pg_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$pg_ok" ]; then
+            echo "::error::postgres did not become ready"; docker logs ferrum-cov-postgres; exit 1
+          fi
+
+          mysql_ok=""
+          for _ in $(seq 1 90); do
+            if MYSQL_PWD=ferrum docker exec -e MYSQL_PWD ferrum-cov-mysql mysqladmin ping -h 127.0.0.1 -uferrum --silent >/dev/null 2>&1 \
+              && MYSQL_PWD=ferrum docker exec -e MYSQL_PWD ferrum-cov-mysql mysql -h 127.0.0.1 -uferrum -D ferrum \
+                   -e "SELECT 1" >/dev/null 2>&1; then
+              mysql_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$mysql_ok" ]; then
+            echo "::error::mysql did not become ready"; docker logs ferrum-cov-mysql; exit 1
+          fi
+
+          # Functional cells provision per-cell databases via CREATE/DROP.
+          MYSQL_PWD=ferrum docker exec -e MYSQL_PWD ferrum-cov-mysql mysql -uroot -e \
+            "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO 'ferrum'@'%'; FLUSH PRIVILEGES;"
+          docker exec ferrum-cov-postgres psql -U ferrum -d ferrum -v ON_ERROR_STOP=1 -c \
+            "ALTER USER ferrum WITH CREATEDB;"
+
+      - name: Run functional coverage shard
+        # Runs the subprocess `functional_tests` suite so the spawned
+        # instrumented `ferrum-edge` processes write profiles next to the test
+        # binaries' (the harness forwards LLVM_PROFILE_FILE, and a gateway
+        # stopped with SIGTERM flushes on exit; one stopped with SIGKILL does
+        # not). ci.yml's Functional Tests shards are the correctness gate for
+        # this suite, so test failures here only warn: instrumented debug
+        # binaries are slower, and a timing-sensitive failure must not turn
+        # the coverage floor red. A build failure, or a run that produced no
+        # profiles at all, still fails the shard.
+        if: matrix.kind == 'functional'
+        run: |
+          set -euo pipefail
+          # Build the test binary and the instrumented gateway first, running
+          # no test, so a compile failure fails the shard outright.
+          cargo llvm-cov --no-report \
+            nextest --test functional_tests \
+            --no-tests=pass \
+            -E 'none()'
+          # Several functional suites resolve the gateway through the fixed
+          # ./target/debug/ferrum-edge path rather than FERRUM_EDGE_TEST_BIN,
+          # and the CLI suite hard-links that path into temp directories.
+          # A symlink would be linked as a dangling relative link there, so
+          # hard-link the real instrumented binary instead.
+          mkdir -p target/debug
+          ln -f target/llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge
+          filters=()
+          while IFS= read -r filter; do
+            [ -z "$filter" ] && continue
+            filters+=("$filter")
+          done <<< "$FUNCTIONAL_FILTERS"
+          nextest_args=()
+          if [ -n "$FUNCTIONAL_PARTITION" ]; then
+            nextest_args+=(--partition "$FUNCTIONAL_PARTITION")
+          fi
+          if [ -n "$FUNCTIONAL_TEST_THREADS" ]; then
+            nextest_args+=(--test-threads "$FUNCTIONAL_TEST_THREADS")
+          fi
+          started="${RUNNER_TEMP}/functional-coverage-started"
+          touch "$started"
+          status=0
+          # `--no-report` implies `--no-clean` (the two flags conflict), so
+          # this run reuses the binary linked above instead of cleaning and
+          # rebuilding it.
+          cargo llvm-cov --no-report \
+            nextest --test functional_tests \
+            --run-ignored all \
+            --no-fail-fast \
+            --retries 1 \
+            -E "$FUNCTIONAL_FILTERSET" \
+            "${nextest_args[@]}" \
+            "${filters[@]}" || status=$?
+          profiles="$(find target/llvm-cov-target -name '*.profraw' -newer "$started" | wc -l)"
+          echo "functional coverage profiles written: ${profiles}"
+          if [ "$profiles" -eq 0 ]; then
+            echo "::error::the functional coverage run wrote no profiles (exit ${status})"
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::functional coverage shard ${COVERAGE_SHARD} finished with test failures (exit ${status}); ci.yml's Functional Tests own correctness, so the collected profiles are kept"
+          fi
+          {
+            echo "## Functional coverage shard: ${COVERAGE_SHARD}"
+            echo ""
+            echo "Profiles written: ${profiles}. nextest exit status: ${status}."
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          COVERAGE_SHARD: ${{ matrix.shard }}
+          FUNCTIONAL_FILTERS: ${{ matrix.filters }}
+          FUNCTIONAL_FILTERSET: ${{ matrix.filterset }}
+          FUNCTIONAL_PARTITION: ${{ matrix.partition }}
+          FUNCTIONAL_TEST_THREADS: ${{ matrix.test_threads }}
+          FERRUM_EDGE_TEST_BIN: ${{ github.workspace }}/target/llvm-cov-target/debug/ferrum-edge
+          # cargo-llvm-cov's default name carries `%p`, one profile per process.
+          # The suite spawns thousands of test and gateway processes at several
+          # MB of counters each, which would swamp the shard tar and the merge
+          # job. Drop `%p` so every process of one binary merges online into a
+          # pool of at most four files (LLVM `%Nm`, keyed by binary signature).
+          LLVM_PROFILE_FILE_NAME: ferrum-edge-functional-%4m.profraw
+          # The nextest build above already produced the instrumented binary;
+          # skip the harness's per-process `cargo build --bin ferrum-edge`.
+          FERRUM_SKIP_GATEWAY_BUILD: "1"
+          RUST_BACKTRACE: 1
+          FERRUM_TEST_POSTGRES_URL: ${{ matrix.data_services == 'true' && 'postgres://ferrum:ferrum@127.0.0.1:5432/ferrum' || '' }}
+          FERRUM_TEST_MYSQL_URL: ${{ matrix.data_services == 'true' && 'mysql://ferrum:ferrum@127.0.0.1:3306/ferrum' || '' }}
+          FERRUM_TEST_MONGO_URL: ${{ matrix.data_services == 'true' && 'mongodb://127.0.0.1:27017/ferrum_test' || '' }}
+
+      - name: Stop functional data-plane service containers
+        if: always() && matrix.kind == 'functional' && matrix.data_services == 'true'
+        run: |
+          set +e
+          for name in ferrum-cov-redis ferrum-cov-mongo ferrum-cov-mongo-rs \
+                      ferrum-cov-postgres ferrum-cov-mysql; do
+            docker unpause "$name" >/dev/null 2>&1
+            docker rm -f "$name" >/dev/null 2>&1
+          done
 
       - name: Package coverage data
         run: |
