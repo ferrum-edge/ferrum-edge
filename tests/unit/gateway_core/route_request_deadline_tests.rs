@@ -319,7 +319,11 @@ fn alt_svc_is_withheld_where_a_rule_bounds_each_attempt() {
             proxy("api", Some(TIMED_PORT)),
             proxy("web", Some(OTHER_PORT)),
         ],
-        vec![dispatch_plugin("proxy", Some("api"), attempt_bounded_rule.clone())],
+        vec![dispatch_plugin(
+            "proxy",
+            Some("api"),
+            attempt_bounded_rule.clone(),
+        )],
     );
     assert!(withholds(&scoped, Some(TIMED_PORT)));
     assert!(!withholds(&scoped, Some(OTHER_PORT)));
