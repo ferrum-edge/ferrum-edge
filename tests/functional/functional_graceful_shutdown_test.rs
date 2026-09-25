@@ -774,7 +774,13 @@ async fn test_inflight_request_completes_during_drain() {
 
     let (status, body) = match timeout(Duration::from_secs(10), inflight).await {
         Ok(Ok(Ok(outcome))) => outcome,
-        Ok(Ok(Err(error))) => panic!("in-flight request failed during drain: {error}"),
+        // `{error:?}` keeps the hyper cause (closed, incomplete, reset) that
+        // reqwest's Display drops.
+        Ok(Ok(Err(error))) => panic!(
+            "in-flight request failed during drain: {error:?}\ngateway exited: {}\n{}",
+            gateway.guard.has_exited(),
+            gateway.guard.startup_diagnostics()
+        ),
         Ok(Err(error)) => panic!("in-flight request task panicked: {error}"),
         Err(_) => panic!("in-flight request did not finish within 10s of its release"),
     };
