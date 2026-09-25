@@ -2601,3 +2601,80 @@ fn every_pre_relay_write_flushes_before_the_relay_starts() {
         "the outbound PROXY v2 header must be flushed before the relay starts"
     );
 }
+
+/// Every direct hyper HTTP/1.1 dispatch that holds its connection's only
+/// `SendRequest` across the response wait (issue #5720): the HBONE inner pool
+/// and the Unix-socket pool, both in `src/proxy/mod.rs`. A request tokio
+/// publishes just after the connection task drained its queue stays stranded
+/// until that sender drops, so each site must await its response through the
+/// release helper. The reqwest HTTP/1.1 path carries the same fix inside the
+/// vendored hyper-util (issue #5714). HTTP/2 senders are clones shared with
+/// their pool, so dropping one cannot release the channel, and they are not
+/// sites of this invariant.
+const DIRECT_H1_DISPATCH_SITES: &[(&str, usize)] = &[("src/proxy/mod.rs", 2)];
+
+#[test]
+fn every_direct_h1_dispatch_awaits_through_the_sender_release() {
+    let mut found = Vec::new();
+    for (path, text) in production_sources() {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut sites = 0;
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !line.contains(".try_send_request(") {
+                continue;
+            }
+            sites += 1;
+            let site = format!("{path}:{}", index + 1);
+            // rustfmt may break `let <name> =` onto the line before the call.
+            let start = if line.trim_start().starts_with("let ") {
+                index
+            } else {
+                index.saturating_sub(1)
+            };
+            let binding: String = lines[start]
+                .trim_start()
+                .strip_prefix("let ")
+                .unwrap_or_default()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                !binding.is_empty(),
+                "{site}: a direct HTTP/1.1 dispatch must bind its response future to a local \
+                 for `h1_send_release::await_h1_response_or_release` (issue #5720)"
+            );
+            // Whitespace-free, so the check does not depend on how rustfmt
+            // wraps either statement.
+            let code: String = lines[start..]
+                .iter()
+                .take(12)
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .flat_map(|line| line.split_whitespace())
+                .collect();
+            let (dispatch, rest) = code.split_once(';').unwrap_or((code.as_str(), ""));
+            assert!(
+                dispatch.ends_with(')') && !dispatch.contains(".await"),
+                "{site}: a direct HTTP/1.1 dispatch must not await `try_send_request` directly \
+                 (issue #5720)"
+            );
+            let release =
+                format!("let{binding}=h1_send_release::await_h1_response_or_release({binding},");
+            assert!(
+                rest.starts_with(&release),
+                "{site}: a direct HTTP/1.1 dispatch must await its response through \
+                 `h1_send_release::await_h1_response_or_release` (issue #5720)"
+            );
+        }
+        if sites > 0 {
+            found.push((path, sites));
+        }
+    }
+    let expected: Vec<(String, usize)> = DIRECT_H1_DISPATCH_SITES
+        .iter()
+        .map(|(path, sites)| ((*path).to_string(), *sites))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the direct HTTP/1.1 dispatch sites changed; list the new site above"
+    );
+}

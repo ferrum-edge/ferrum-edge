@@ -2293,8 +2293,10 @@ fn unix_h1_keep_alive_buffers_only_within_the_eager_buffer_contract() {
         .split("async fn proxy_to_backend_unix(")
         .nth(1)
         .expect("unix dispatch");
+    // The response wait hands the lease back as an `Option` (issue #5720): a
+    // released lease has nothing to check in, so it must never buffer.
     assert!(
-        dispatch.contains("checkout.keep_alive()"),
+        dispatch.contains("checkout.as_ref().is_some_and(|lease| lease.keep_alive())"),
         "unix dispatch must gate in-dispatch buffering on the lease's keep-alive decision"
     );
     assert!(
