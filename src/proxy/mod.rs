@@ -61029,7 +61029,7 @@ mod tests {
             &bytes_sent,
             hyper::Version::HTTP_11,
             &mut backend_start,
-            &mut false,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -61095,7 +61095,7 @@ mod tests {
                 &bytes_sent,
                 hyper::Version::HTTP_11,
                 &mut std::time::Instant::now(),
-                &mut false,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .await;
             let resp = match dispatch {
@@ -61208,7 +61208,7 @@ mod tests {
                 &bytes_sent,
                 hyper::Version::HTTP_11,
                 &mut std::time::Instant::now(),
-                &mut false,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .await;
             let resp = match dispatch {
@@ -61365,7 +61365,7 @@ mod tests {
             &bytes_sent,
             hyper::Version::HTTP_11,
             &mut std::time::Instant::now(),
-            &mut false,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
         let initial_response = match initial {
