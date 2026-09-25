@@ -11299,13 +11299,15 @@ where
     if !plugins.is_empty() && crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
         // Boxed: the hook runner is large, and `dispatch_plain` awaits this
         // helper from cold arms whose inline temporaries are frame slots.
-        Box::pin(crate::proxy::apply_after_proxy_hooks_to_gateway_error_terminal(
-            plugins,
-            ctx,
-            &mut status_code,
-            &mut body,
-            &mut headers,
-        ))
+        Box::pin(
+            crate::proxy::apply_after_proxy_hooks_to_gateway_error_terminal(
+                plugins,
+                ctx,
+                &mut status_code,
+                &mut body,
+                &mut headers,
+            ),
+        )
         .await;
     }
     let status = StatusCode::from_u16(status_code).unwrap_or(status);
