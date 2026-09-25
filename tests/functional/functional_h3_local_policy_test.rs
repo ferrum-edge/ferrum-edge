@@ -1011,6 +1011,13 @@ async fn functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_e
 /// charges the expiry; before, the first `after_proxy` hook read that expired
 /// budget as the gateway's own deadline and the client got `Deadline exceeded
 /// at gateway` instead.
+///
+/// Pass-through gRPC-Web over HTTP/1.1 and HTTP/2 rides proxy core's native
+/// gRPC branch, which dials this plaintext backend over h2c. The backend is a
+/// scripted h2c peer that accepts the call and never answers, so the budget
+/// expires after the request was sent and proxy core charges it. An HTTP/1.1
+/// backend never sends the h2c SETTINGS frame: the budget would expire during
+/// connection acquisition instead, which is the gateway's own deadline.
 #[ignore]
 #[tokio::test]
 async fn functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tcp() {
@@ -1020,7 +1027,15 @@ async fn functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tc
 }
 
 async fn assert_tcp_grpc_web_attempt_budget_expiry_wording(http2: bool) {
-    let (backend_port, backend_hits, backend_task) = spawn_echo_backend(usize::MAX).await;
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind h2c backend");
+    let backend_port = listener.local_addr().expect("backend addr").port();
+    let mut backend = ScriptedH2Backend::builder_plain(listener)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::AwaitTestSignal)
+        .spawn()
+        .expect("spawn h2c backend");
     let mut config = route_timeout_config(
         h3_policy_config(
             backend_port,
@@ -1117,10 +1132,15 @@ async fn assert_tcp_grpc_web_attempt_budget_expiry_wording(http2: bool) {
         elapsed < Duration::from_secs(5),
         "{protocol}: the call must end at its budget: {elapsed:?}"
     );
-    assert_backend_hits_eq(&backend_hits, 1, Duration::from_millis(250)).await;
+    sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        backend.received_stream_count(),
+        1,
+        "{protocol}: the stalled call must reach the backend exactly once"
+    );
 
     gateway.shutdown().await;
-    backend_task.abort();
+    backend.shutdown();
 }
 
 /// A gRPC-Web client deadline that cuts a response body write parked in QUIC
