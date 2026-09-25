@@ -31,10 +31,14 @@ baseline contract above.
 v0.9.6 adds Gateway API `ResponseHeaderModifier` and `URLRewrite` filters, plus
 HTTPRoute rule-level `timeouts` and `retry` (#5646). `timeouts.request` bounds
 the full request, including retries and the streaming response body;
-`timeouts.backendRequest` bounds each backend attempt. Native HTTP/3 refuses
-non-gRPC requests governed by a total request timeout with `503` until that
-deadline can be enforced, and the gateway does not advertise HTTP/3 on listener
-ports serving such rules. See
+`timeouts.backendRequest` bounds each backend attempt until its full response
+has been received, with a fresh budget per retry attempt. Any response that
+takes longer than that budget to deliver is cut, including large fast downloads,
+Server-Sent Events, long polls, and server-streaming gRPC calls, so size
+`backendRequest` for the longest complete response the rule must serve, or omit
+it. Native HTTP/3 refuses non-gRPC requests governed by either timeout with
+`503` until it can enforce them, and the gateway does not advertise HTTP/3 on
+listener ports serving such rules. See
 [Rule timeouts](gateway_api_conformance.md#rule-timeouts) and
 [Rule retry](gateway_api_conformance.md#rule-retry).
 

@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+## [0.9.6] - 2026-09-25
+
+### Added
 
 - Gateway API HTTPRoute `timeouts.backendRequest` bounds each backend attempt
   until its full response has been received, as upstream v1.5.1 defines it
@@ -32,10 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/3 is not advertised (`Alt-Svc`) on a listener port that serves such a
   rule.
 
-## [0.9.6] - 2026-09-25
-
-### Added
-
 - Gateway API HTTPRoute rule-level `timeouts` (#5646). `timeouts.backendRequest`
   bounds each backend attempt and `timeouts.request` is one total deadline for
   the whole request, including retries, retry backoff and the streaming response
@@ -52,9 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-gRPC requests yet, so it refuses those requests with `503` instead of
   serving them without the deadline, and HTTP/3 is no longer advertised
   (`Alt-Svc`) on a listener port that serves such a rule. CI now declares
-  `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`; `backendRequest`
-  bounds an attempt's response-head wait and idle gaps rather than its total
-  duration, a documented deviation.
+  `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`; the per-attempt
+  semantics of `backendRequest` are the entry above.
 
 - Gateway API HTTPRoute rule-level `retry` (#5646). The experimental-channel
   field, present in the pinned v1.5.1 experimental CRD bundle, is validated like
