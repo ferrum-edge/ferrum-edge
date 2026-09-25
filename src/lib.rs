@@ -7384,6 +7384,21 @@ pub mod _test_support {
         .await
     }
 
+    /// End a gRPC attempt as proxy core does after charging its budget expiry
+    /// to the backend, marking the charged `Backend deadline exceeded`
+    /// terminal (#5744).
+    pub fn end_charged_grpc_route_attempt_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.end_charged_grpc_route_attempt();
+    }
+
+    /// Whether the context holds proxy core's charged backend deadline
+    /// terminal (#5744).
+    pub fn charged_backend_deadline_terminal_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.charged_backend_deadline_terminal()
+    }
+
     /// Like [`transform_buffered_response_body_with_deadline_for_test`] but
     /// returns the full `(response_replaced, representation_rewritten)` pair,
     /// so a test can distinguish "the gate rejected and replaced the response"
@@ -7641,6 +7656,81 @@ pub mod _test_support {
             response_headers,
         )
         .await;
+    }
+
+    /// Run reject-path `after_proxy` hooks over a charged backend deadline
+    /// terminal (#5744): bounded as over the gateway deadline terminal, with
+    /// the rejection's own wording kept.
+    pub async fn apply_after_proxy_hooks_to_charged_deadline_rejection_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: &mut u16,
+        response_body: &mut bytes::Bytes,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::apply_after_proxy_hooks_to_charged_deadline_rejection(
+            plugins,
+            ctx,
+            status_code,
+            response_body,
+            response_headers,
+        )
+        .await;
+    }
+
+    /// The HTTP/3 plain bridge's charged gRPC-Web terminal for a budget expiry
+    /// after `after_proxy` added `gateway_headers` to the backend's response
+    /// head (#5744): its status and header map.
+    pub fn h3_charged_grpc_web_terminal_after_head_for_test(
+        mut backend_headers: HashMap<String, String>,
+        gateway_headers: HashMap<String, String>,
+    ) -> Option<(u16, HashMap<String, String>)> {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test.Service/Call".to_string(),
+        );
+        ctx.set_grpc_deadline_budget(Some(1_000));
+        ctx.begin_buffered_deadline_response_header_provenance(&backend_headers);
+        backend_headers.extend(gateway_headers);
+        ctx.record_deadline_response_header_mutations(&backend_headers);
+        match crate::http3::cross_protocol::plain_grpc_web_backend_deadline_after_head(
+            &mut ctx,
+            &backend_headers,
+        ) {
+            crate::plugins::PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => Some((status_code, headers)),
+            _ => None,
+        }
+    }
+
+    /// Run the HTTP/3 bridge's reject-path `response_committed` observers over
+    /// a native gRPC rejection built from `headers`. Returns whether they
+    /// replaced it with the gateway deadline terminal, and its final
+    /// `grpc-message`.
+    pub async fn h3_run_reject_committed_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        charged_backend_deadline: bool,
+    ) -> (bool, Option<String>) {
+        use crate::http3::cross_protocol as bridge;
+        let status = http::StatusCode::OK;
+        let (mut normalized, mut translated) =
+            bridge::normalize_reject_for_client(ctx, status, bytes::Bytes::new(), headers, true);
+        let replaced = bridge::run_cross_protocol_reject_committed_hooks(
+            plugins,
+            ctx,
+            true,
+            charged_backend_deadline,
+            &mut normalized,
+            &mut translated,
+        )
+        .await;
+        (replaced, normalized.grpc_message)
     }
 
     pub async fn run_after_proxy_hooks_for_test(
@@ -8007,6 +8097,33 @@ pub mod _test_support {
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
             )
         })
+    }
+
+    /// The backend request the HTTP/3 plain bridge builds for one attempt,
+    /// for `proxy_headers` under the RPC deadline in force (#5734).
+    pub fn h3_plain_bridge_backend_request_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        proxy_headers: &HashMap<String, String>,
+        backend_url: &str,
+        grpc_deadline_at: Option<tokio::time::Instant>,
+    ) -> Result<reqwest::Request, reqwest::Error> {
+        let client = reqwest::Client::new();
+        crate::http3::cross_protocol::build_plain_request_builder(
+            &client,
+            state,
+            proxy,
+            reqwest::Method::POST,
+            proxy_headers,
+            backend_url,
+            "backend.example",
+            "203.0.113.1",
+            "203.0.113.1",
+            /* request_is_secure = */ true,
+            /* is_early_data = */ false,
+            grpc_deadline_at,
+        )
+        .build()
     }
 
     pub fn h3_post_deadline_terminal_write_grace_for_test() -> std::time::Duration {
@@ -11708,6 +11825,34 @@ pub mod _test_support {
         crate::http3::stream_util::await_authorized_headers_write(bound, family, latch, write).await
     }
 
+    /// [`await_authorized_headers_write_for_test`], also returning whether the
+    /// write was offered to the send half first, as the aggregate SSE writer
+    /// races its protected head (#5745).
+    pub async fn await_offered_authorized_headers_write_for_test<F, T, E>(
+        bound: crate::proxy::auth_lifetime::ComposedAuthBound,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        write: F,
+    ) -> (H3AuthorizedHeadersWrite, bool)
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        use crate::http3::stream_util as seam;
+        seam::await_offered_authorized_headers_write(bound, family, latch, write).await
+    }
+
+    /// Drive `write` through the in-flight tracker a relay wraps each response
+    /// write in (#5745).
+    pub async fn track_response_write_in_flight_for_test<F, T, E>(
+        in_flight: &mut bool,
+        write: F,
+    ) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        crate::http3::stream_util::track_response_write_in_flight(in_flight, write).await
+    }
+
     /// Compose the aggregate MCP SSE listener lifetime with a captured
     /// authorization plan, matching the native-H3 aggregate SSE writer.
     pub fn compose_aggregate_sse_bound_for_test(
@@ -11951,14 +12096,54 @@ pub mod _test_support {
     where
         F: std::future::Future<Output = Result<T, E>>,
     {
+        let route_sleep = route_deadline.map(tokio::time::sleep_until);
+        tokio::pin!(route_sleep);
         crate::http3::stream_util::await_authorized_response_write(
             plan,
-            route_deadline,
+            route_sleep,
             crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
             latch,
             write,
         )
         .await
+    }
+
+    /// [`await_authorized_response_write_for_test`] against a route timer the
+    /// caller pinned once, as every relay passes its `route_body_sleep` (#5745).
+    pub async fn await_authorized_response_write_with_route_sleep_for_test<F, T, E>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        route_sleep: std::pin::Pin<&mut Option<tokio::time::Sleep>>,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        write: F,
+    ) -> H3AuthorizedWrite
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        crate::http3::stream_util::await_authorized_response_write(
+            plan,
+            route_sleep,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+            latch,
+            write,
+        )
+        .await
+    }
+
+    /// Race a response HEADERS write against `deadline` through the bridge's
+    /// head-write seam, returning whether the deadline fired and whether the
+    /// write had been offered to the send half first (#5745).
+    pub async fn await_offered_response_write_for_test<F, T, E>(
+        deadline: Option<tokio::time::Instant>,
+        write: F,
+    ) -> (bool, bool)
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        use crate::http3::stream_util as seam;
+        let (result, offered) =
+            seam::await_offered_response_write_before_deadline(deadline, write).await;
+        let expired = matches!(result, Err(seam::H3ResponseWriteError::DeadlineExceeded));
+        (expired, offered)
     }
 
     /// Attribute a native-H3 streaming HEADERS write's protocol-deadline

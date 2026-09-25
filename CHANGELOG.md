@@ -62,11 +62,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly as a slow backend body is: an `H3_REQUEST_CANCELLED` reset,
   `body_error_class: read_write_timeout`, and no charge to the backend's
   circuit breaker or passive health. Routes without timeouts arm no extra
-  timer. A buffered response is complete when written and is not cut, as on
-  HTTP/1.1 and HTTP/2; the bridge's buffered writer now settles the backend
-  outcome and releases the admission permit and least-connections count before
-  its client write, as the native HTTP/3 buffered writer already did, so a
-  client parking that write no longer holds them.
+  timer, and a timed route's writes race the relay's existing route timer
+  instead of arming a new one for every frame (#5745). A buffered response is
+  complete when written and is not cut, as on HTTP/1.1 and HTTP/2; the
+  bridge's buffered writer now settles the backend outcome and releases the
+  admission permit and least-connections count before its client write, as the
+  native HTTP/3 buffered writer already did, so a client parking that write no
+  longer holds them.
+- An HTTP/3 client that stops reading before a bridged response's HEADERS
+  arrive no longer loses its whole QUIC connection when the request's
+  credential expires or its gRPC-Web deadline passes (#5745). The HTTP/3
+  bridge to HTTP/1.1 and HTTP/2 backends cancelled the parked HEADERS write and
+  then wrote its `401` or `DEADLINE_EXCEEDED` HEADERS on the same stream. The
+  QUIC layer still held the cancelled frame, failed that write with a
+  connection-level error, and the connection closed with `H3_INTERNAL_ERROR`,
+  ending every other request on it. The stream is now reset instead once the
+  cancelled HEADERS had been handed to QUIC; a deadline that passed before the
+  write began still answers with the `401` or `DEADLINE_EXCEEDED` terminal.
+  The same applies to the native aggregate MCP SSE listener's `401` after a
+  credential expiry cut its event-stream HEADERS, and to the bridge's gRPC-Web
+  `DEADLINE_EXCEEDED` trailer frame after a client deadline cut a response
+  body write, buffered or streamed: once the cut write had been handed to
+  QUIC, the stream is reset instead of writing more. A gRPC-Web deadline reset
+  still records `grpc_status: 4` in the transaction log, as the native gRPC
+  reset does.
+- A gRPC-Web `backendRequest` budget expiry keeps its `Backend deadline
+  exceeded` terminal when `after_proxy` plugins (for example CORS) run
+  (#5744). On HTTP/1.1 and HTTP/2, and on the HTTP/3 bridge's mesh backends,
+  the first such plugin read the spent budget as the gateway's own deadline
+  and turned the terminal into `Deadline exceeded at gateway`; the budget now
+  ends when the expiry is charged, as on the rest of the HTTP/3 bridge. With
+  the budget ended, the charged terminal's `after_proxy` and response-committed
+  plugins were awaited without a bound when no client `grpc-timeout` or route
+  `request` timeout remained, and an `after_proxy` or final-body plugin that
+  rejected the response replaced the charged wording. On every frontend they
+  now get the bounded treatment of the gateway's own deadline terminal: a
+  response-replacing plugin is skipped, other hooks get one poll, a rejection
+  from a hook is ignored, and a hook still pending after its poll finishes
+  detached under the cleanup bound, ended early at the credential's lifetime,
+  while every later hook still gets its poll. A pass-through gRPC-Web call
+  whose budget expires on the HTTP/1.1 and HTTP/2 native gRPC path now gets
+  these `after_proxy` decorations too, so a browser client receives the CORS
+  headers it needs to read the gRPC status; that terminal used to skip
+  `after_proxy` entirely. On HTTP/1.1 and HTTP/2 the response-body inspection
+  and final-body validation plugins no longer run over the charged terminal,
+  as they do not run over a rejection; the body transform still runs, so a
+  translated gRPC-Web terminal keeps its wire shape. An expired credential
+  still gets its fixed authorization terminal and is never detached. An expiry
+  while a buffered response body is read no longer runs `after_proxy` a second
+  time over the terminal: the terminal carries the gateway headers
+  `after_proxy` already added to the response head, and only the
+  response-committed plugins run over it.
 - A peer that resets an HTTP/3 stream in the middle of a DATA frame no longer
   tears down the whole QUIC connection (PR #5741). The vendored `h3` frame-drain
   patch held a QUIC error back so it could decode buffered bytes first. Quinn

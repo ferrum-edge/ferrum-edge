@@ -839,6 +839,611 @@ async fn rejection_mid_hook_deadline_preserves_completed_decorator() {
     assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+/// A reject-path hook allowed to replace the uncommitted rejection.
+struct ReplacingRejectHook;
+
+#[async_trait::async_trait]
+impl Plugin for ReplacingRejectHook {
+    fn name(&self) -> &str {
+        "replacing_reject_hook"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    fn may_replace_rejection_response(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 403,
+            body: "replaced".to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// The trailers-only terminal of a deadline charged to the backend.
+fn charged_backend_deadline_headers() -> HashMap<String, String> {
+    HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("grpc-status".to_string(), "4".to_string()),
+        (
+            "grpc-message".to_string(),
+            "Backend deadline exceeded".to_string(),
+        ),
+    ])
+}
+
+/// A charged backend deadline terminal (#5744) bounds its reject-path hooks as
+/// the gateway deadline terminal does even when no RPC deadline remains in
+/// force: a replacer is skipped, a ready decorator still decorates, and a
+/// pending one gets a single poll and continues detached instead of holding
+/// the response. The terminal keeps its `Backend deadline exceeded` wording.
+#[tokio::test]
+async fn charged_deadline_rejection_hooks_are_bounded_without_an_rpc_deadline() {
+    use ferrum_edge::_test_support::{
+        apply_after_proxy_hooks_to_charged_deadline_rejection_for_test,
+        gateway_deadline_response_selected_for_test,
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(ImmediateRejectHeaderDecorator),
+        Arc::new(ReplacingRejectHook),
+        Arc::new(SlowRejectDecorator {
+            name: "stalled-decorator",
+            delay: std::time::Duration::from_secs(3600),
+            calls: Arc::clone(&calls),
+            completed: Arc::clone(&completed),
+            completion: Arc::new(tokio::sync::Notify::new()),
+        }),
+    ];
+    let mut ctx = create_grpc_context_with_timeout(None);
+    assert!(ctx.grpc_deadline_at().is_none());
+    let mut status = 200;
+    let mut body = bytes::Bytes::new();
+    let mut headers = charged_backend_deadline_headers();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        apply_after_proxy_hooks_to_charged_deadline_rejection_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut body,
+            &mut headers,
+        ),
+    )
+    .await
+    .expect("a pending hook must not hold the charged terminal");
+
+    assert_eq!(status, 200);
+    assert!(
+        body.is_empty(),
+        "the replacer must not rewrite the charged terminal"
+    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Backend deadline exceeded")
+    );
+    assert_eq!(
+        headers.get("x-before-deadline").map(String::as_str),
+        Some("trusted"),
+        "a ready decorator still decorates the charged terminal"
+    );
+    assert!(!headers.contains_key("x-stalled-decorator-complete"));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the pending decorator gets exactly one poll"
+    );
+    assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(!gateway_deadline_response_selected_for_test(&ctx));
+}
+
+/// The charged terminal is the backend's deadline, not the gateway's: an RPC
+/// deadline that has also elapsed by the time it is written does not turn it
+/// into `Deadline exceeded at gateway` (#5744).
+#[tokio::test]
+async fn charged_deadline_rejection_keeps_its_wording_past_an_elapsed_rpc_deadline() {
+    use ferrum_edge::_test_support::{
+        apply_after_proxy_hooks_to_charged_deadline_rejection_for_test,
+        gateway_deadline_response_selected_for_test, set_grpc_deadline_budget_for_test,
+    };
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ImmediateRejectHeaderDecorator)];
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1));
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let mut status = 200;
+    let mut body = bytes::Bytes::new();
+    let mut headers = charged_backend_deadline_headers();
+
+    apply_after_proxy_hooks_to_charged_deadline_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut body,
+        &mut headers,
+    )
+    .await;
+
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Backend deadline exceeded")
+    );
+    assert_eq!(
+        headers.get("x-before-deadline").map(String::as_str),
+        Some("trusted")
+    );
+    assert!(!gateway_deadline_response_selected_for_test(&ctx));
+}
+
+/// A charged gRPC-Web budget expiry must end the spent attempt budget before
+/// `after_proxy` runs (#5744). While that budget is still the RPC deadline in
+/// force, the first hook is refused as the gateway's own deadline and the
+/// charged `Backend deadline exceeded` terminal becomes `Deadline exceeded at
+/// gateway`. Proxy core and the HTTP/3 bridge's mesh-egress arm both end it
+/// after charging; once ended, the hooks decorate the charged terminal.
+#[tokio::test(start_paused = true)]
+async fn an_unended_charged_attempt_budget_rewords_the_backend_terminal() {
+    use ferrum_edge::_test_support::run_after_proxy_hooks_reject_for_test;
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ImmediateRejectHeaderDecorator)];
+    let with_attempt_budget = || {
+        let mut ctx = create_grpc_context_with_timeout(None);
+        ctx.route_override_attempt_timeout_ms = Some(300);
+        ctx.arm_route_request_deadline(true);
+        ctx
+    };
+    let mut still_in_force = with_attempt_budget();
+    let mut ended = with_attempt_budget();
+    tokio::time::advance(std::time::Duration::from_millis(301)).await;
+    assert!(still_in_force.grpc_deadline_is_route_attempt_budget());
+
+    let mut headers = charged_backend_deadline_headers();
+    let (status, _body, reworded) =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut still_in_force, 200, &mut headers)
+            .await
+            .expect("an elapsed attempt budget refuses the first after_proxy hook");
+    assert_eq!(status, 200);
+    assert_eq!(
+        reworded.get("grpc-message").map(String::as_str),
+        Some("Deadline exceeded at gateway")
+    );
+
+    ended.end_grpc_route_attempt();
+    assert_eq!(ended.grpc_deadline_at(), None);
+    let mut headers = charged_backend_deadline_headers();
+    let rejected =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ended, 200, &mut headers).await;
+    assert!(
+        rejected.is_none(),
+        "an ended attempt budget no longer bounds after_proxy"
+    );
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Backend deadline exceeded")
+    );
+    assert_eq!(
+        headers.get("x-before-deadline").map(String::as_str),
+        Some("trusted")
+    );
+}
+
+/// A charged budget expiry after `after_proxy` decorated the response head
+/// (#5744) carries that run's gateway decorations into the terminal, instead of
+/// running `after_proxy` a second time, and sheds every backend field.
+#[test]
+fn charged_terminal_after_a_decorated_head_keeps_only_gateway_decorations() {
+    use ferrum_edge::_test_support::h3_charged_grpc_web_terminal_after_head_for_test;
+
+    let (status, headers) = h3_charged_grpc_web_terminal_after_head_for_test(
+        HashMap::from([
+            (
+                "content-type".to_string(),
+                "application/grpc-web+proto".to_string(),
+            ),
+            ("x-backend".to_string(), "present".to_string()),
+            ("grpc-message".to_string(), "backend view".to_string()),
+        ]),
+        HashMap::from([
+            (
+                "access-control-allow-origin".to_string(),
+                "https://browser.example".to_string(),
+            ),
+            ("x-correlation-id".to_string(), "request-123".to_string()),
+        ]),
+    )
+    .expect("the charged terminal is a trailers-only reject");
+
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .map(String::as_str),
+        Some("https://browser.example")
+    );
+    assert_eq!(
+        headers.get("x-correlation-id").map(String::as_str),
+        Some("request-123")
+    );
+    assert!(!headers.contains_key("x-backend"));
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Backend deadline exceeded")
+    );
+}
+
+/// The HTTP/3 bridge's committed observers over a charged terminal (#5744)
+/// get one poll each with no RPC deadline in force and then continue
+/// detached, and the charged wording is never replaced with the gateway
+/// deadline terminal.
+#[tokio::test]
+async fn charged_deadline_committed_observers_are_bounded_and_keep_the_wording() {
+    use ferrum_edge::_test_support::h3_run_reject_committed_hooks_for_test;
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completion = Arc::new(tokio::sync::Notify::new());
+    let probe = CommittedHookProbe {
+        calls: Arc::clone(&calls),
+        observed_grpc_statuses: Arc::new(std::sync::Mutex::new(Vec::new())),
+        release: Some(Arc::clone(&release)),
+        completion: Arc::clone(&completion),
+    };
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(probe)];
+    let mut ctx = create_grpc_context_with_timeout(None);
+    assert!(ctx.grpc_deadline_at().is_none());
+    let headers = charged_backend_deadline_headers();
+
+    let (replaced, message) = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        h3_run_reject_committed_hooks_for_test(&plugins, &mut ctx, &headers, true),
+    )
+    .await
+    .expect("a pending observer must not hold the charged terminal");
+
+    assert!(!replaced, "the charged terminal must not be reworded");
+    assert_eq!(message.as_deref(), Some("Backend deadline exceeded"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    release.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(2), completion.notified())
+        .await
+        .expect("the detached observer must continue");
+}
+
+/// A non-replacing `after_proxy` hook that rejects the response in hand.
+struct RejectingAfterProxyHook;
+
+#[async_trait::async_trait]
+impl Plugin for RejectingAfterProxyHook {
+    fn name(&self) -> &str {
+        "rejecting_after_proxy_hook"
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 502,
+            body: "rejected".to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// Proxy core's charged backend deadline terminal on HTTP/1.1 and HTTP/2
+/// (#5744) bounds its ordinary `after_proxy` chain as the HTTP/3 bridge bounds
+/// its charged terminal. With only an attempt budget configured, no RPC
+/// deadline is in force once that budget ends, yet a replacer is skipped, a
+/// rejecting hook cannot replace the terminal, a ready decorator still
+/// decorates, and a pending hook gets one poll and continues detached. The
+/// terminal keeps its `Backend deadline exceeded` wording.
+#[tokio::test]
+async fn proxy_core_charged_terminal_after_proxy_hooks_are_bounded() {
+    use ferrum_edge::_test_support::{
+        end_charged_grpc_route_attempt_for_test, gateway_deadline_response_selected_for_test,
+        run_after_proxy_hooks_reject_for_test,
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(ImmediateRejectHeaderDecorator),
+        Arc::new(ReplacingRejectHook),
+        Arc::new(RejectingAfterProxyHook),
+        Arc::new(SlowRejectDecorator {
+            name: "stalled-decorator",
+            delay: std::time::Duration::from_secs(3600),
+            calls: Arc::clone(&calls),
+            completed: Arc::clone(&completed),
+            completion: Arc::new(tokio::sync::Notify::new()),
+        }),
+    ];
+
+    // Unmarked, the same hooks replace the terminal: the first rejection wins.
+    let mut unmarked = create_grpc_context_with_timeout(None);
+    let mut headers = charged_backend_deadline_headers();
+    let replaced =
+        run_after_proxy_hooks_reject_for_test(&plugins[..3], &mut unmarked, 200, &mut headers)
+            .await;
+    assert!(
+        replaced.is_some(),
+        "an unmarked response is replaced by a rejecting hook"
+    );
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    assert!(ctx.grpc_deadline_at().is_none());
+    let mut headers = charged_backend_deadline_headers();
+
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers),
+    )
+    .await
+    .expect("a pending hook must not hold the charged terminal");
+
+    assert!(
+        rejected.is_none(),
+        "no hook may replace the charged terminal"
+    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Backend deadline exceeded")
+    );
+    assert_eq!(
+        headers.get("x-before-deadline").map(String::as_str),
+        Some("trusted"),
+        "a ready decorator still decorates the charged terminal"
+    );
+    assert!(!headers.contains_key("x-stalled-decorator-complete"));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the pending decorator gets exactly one poll"
+    );
+    assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(!gateway_deadline_response_selected_for_test(&ctx));
+}
+
+/// Over a charged backend deadline terminal (#5744) a hook still pending after
+/// its one poll detaches alone: a later decorator that completes within its
+/// own poll (CORS on a gRPC-Web terminal) still decorates the terminal. This
+/// holds on the reject-path runner the HTTP/3 bridge and the native gRPC
+/// branch use, and on proxy core's `after_proxy` runner.
+#[tokio::test]
+async fn a_pending_hook_does_not_drop_a_later_decorator_over_the_charged_terminal() {
+    use ferrum_edge::_test_support::{
+        apply_after_proxy_hooks_to_charged_deadline_rejection_for_test,
+        end_charged_grpc_route_attempt_for_test, run_after_proxy_hooks_reject_for_test,
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(SlowRejectDecorator {
+            name: "stalled-decorator",
+            delay: std::time::Duration::from_secs(3600),
+            calls: Arc::clone(&calls),
+            completed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            completion: Arc::new(tokio::sync::Notify::new()),
+        }),
+        Arc::new(ImmediateRejectHeaderDecorator),
+    ];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    let mut status = 200;
+    let mut body = bytes::Bytes::new();
+    let mut headers = charged_backend_deadline_headers();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        apply_after_proxy_hooks_to_charged_deadline_rejection_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut body,
+            &mut headers,
+        ),
+    )
+    .await
+    .expect("a pending hook must not hold the charged terminal");
+    assert_eq!(
+        headers.get("x-before-deadline").map(String::as_str),
+        Some("trusted"),
+        "reject path: a later ready decorator still decorates the charged terminal"
+    );
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Backend deadline exceeded")
+    );
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    let mut headers = charged_backend_deadline_headers();
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers),
+    )
+    .await
+    .expect("a pending hook must not hold the charged terminal");
+    assert!(rejected.is_none());
+    assert_eq!(
+        headers.get("x-before-deadline").map(String::as_str),
+        Some("trusted"),
+        "proxy core: a later ready decorator still decorates the charged terminal"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "each runner polls the pending hook exactly once"
+    );
+}
+
+/// A hook detached over a charged terminal (#5744) never outlives the admitted
+/// credential: its work ends at the authorization lifetime even though the
+/// post-response cleanup bound is later, on both charged runners.
+#[tokio::test(start_paused = true)]
+async fn a_detached_charged_terminal_hook_ends_at_the_authorization_lifetime() {
+    use ferrum_edge::_test_support::{
+        apply_after_proxy_hooks_to_charged_deadline_rejection_for_test,
+        end_charged_grpc_route_attempt_for_test, request_received_at_for_test,
+        run_after_proxy_hooks_reject_for_test, set_request_credential_deadline_for_test,
+    };
+
+    // Pin the authenticated-stream maximum, so the one-second credential below
+    // is the plan's bound whatever another test published.
+    let lifetime = crate::unit::env_lock::StreamAuthMaxLifetimeGuard::new();
+    lifetime.publish(3_600);
+    let authorized_ctx = || {
+        let mut ctx = create_grpc_context_with_timeout(None);
+        ctx.authenticated_identity = Some("spiffe://example/sa/api".to_string());
+        let received_at = request_received_at_for_test(&ctx);
+        set_request_credential_deadline_for_test(
+            &mut ctx,
+            Some(received_at + std::time::Duration::from_secs(1)),
+        );
+        ctx
+    };
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(SlowRejectDecorator {
+        name: "slow-decorator",
+        delay: std::time::Duration::from_secs(2),
+        calls: Arc::clone(&calls),
+        completed: Arc::clone(&completed),
+        completion: Arc::new(tokio::sync::Notify::new()),
+    })];
+
+    let mut ctx = authorized_ctx();
+    let mut status = 200;
+    let mut body = bytes::Bytes::new();
+    let mut headers = charged_backend_deadline_headers();
+    apply_after_proxy_hooks_to_charged_deadline_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut body,
+        &mut headers,
+    )
+    .await;
+    let mut ctx = authorized_ctx();
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    let mut headers = charged_backend_deadline_headers();
+    let rejected =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers).await;
+    assert!(rejected.is_none());
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "each runner polls the hook once before detaching it"
+    );
+
+    // Past the hook's own delay, but inside the fixed cleanup bound: only the
+    // credential's lifetime can have ended the detached work.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(
+        completed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a detached hook must not run past the credential's lifetime"
+    );
+}
+
+/// Proxy core's committed observers over its charged terminal (#5744) get one
+/// poll each with no RPC deadline in force and then continue detached. The
+/// buffered terminal keeps its charged wording.
+#[tokio::test]
+async fn proxy_core_charged_terminal_committed_observers_are_bounded() {
+    use ferrum_edge::_test_support::{
+        end_charged_grpc_route_attempt_for_test,
+        run_deadline_bounded_response_committed_hooks_for_test,
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completion = Arc::new(tokio::sync::Notify::new());
+    let probe = CommittedHookProbe {
+        calls: Arc::clone(&calls),
+        observed_grpc_statuses: Arc::new(std::sync::Mutex::new(Vec::new())),
+        release: Some(Arc::clone(&release)),
+        completion: Arc::clone(&completion),
+    };
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(probe)];
+    let mut ctx = create_grpc_context_with_timeout(None);
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    assert!(ctx.grpc_deadline_at().is_none());
+    let mut status = 200;
+    let mut headers = charged_backend_deadline_headers();
+    let mut body = bytes::Bytes::new();
+
+    let replaced = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        ),
+    )
+    .await
+    .expect("a pending observer must not hold the charged terminal");
+
+    assert!(!replaced, "the charged terminal must not be reworded");
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Backend deadline exceeded")
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    release.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(2), completion.notified())
+        .await
+        .expect("the detached observer must continue");
+}
+
+/// The charged-terminal marker (#5744) describes only the response of the
+/// attempt that was charged: ending that attempt for retry backoff, or starting
+/// the next attempt, clears it.
+#[test]
+fn a_retry_clears_the_charged_terminal_marker() {
+    use ferrum_edge::_test_support::{
+        charged_backend_deadline_terminal_for_test, end_charged_grpc_route_attempt_for_test,
+    };
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    assert!(!charged_backend_deadline_terminal_for_test(&ctx));
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    assert!(charged_backend_deadline_terminal_for_test(&ctx));
+    ctx.end_grpc_route_attempt();
+    assert!(!charged_backend_deadline_terminal_for_test(&ctx));
+
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    ctx.begin_grpc_route_attempt();
+    assert!(!charged_backend_deadline_terminal_for_test(&ctx));
+}
+
 #[tokio::test]
 async fn context_free_final_body_timeout_marks_authoritative_deadline_provenance() {
     use ferrum_edge::_test_support::{

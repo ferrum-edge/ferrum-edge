@@ -1335,6 +1335,98 @@ async fn h3_auth_lifetime_stalled_cross_protocol_plain_response_cannot_outlive_t
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// 8b. Regression (#5745): the cross-protocol plain bridge stalled at response
+//     HEADERS must end ONLY that stream when the credential expires.
+//
+//     The backend HEADERS block is larger than the client's 4 KiB stream
+//     window and the client never reads it, so the bridge's `send_response`
+//     parks after h3 took the frame. When the authorization bound cancels that
+//     write, the bridge used to write its fixed `401` HEADERS on the same
+//     stream. h3-quinn still held the cancelled frame, failed that write with
+//     a connection-level error, and h3 closed the whole QUIC connection with
+//     `H3_INTERNAL_ERROR`. The stream must be reset instead, and another
+//     request on the same connection must still be answered.
+//
+//     Production path: `http3::cross_protocol::dispatch_plain`'s streaming
+//     response-head write and its pre-commitment authorization terminal.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_auth_lifetime_stalled_cross_protocol_headers_reset_only_their_stream() {
+    let ca = TestCa::new("h3-auth-lifetime-stalled-xproto-headers").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+
+    let pad: String = (0..12_000)
+        .map(|i| char::from(b'!' + (i % 90) as u8))
+        .collect();
+    let steps = vec![
+        H2Step::ExpectHeaders(MatchHeaders::any()),
+        H2Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-type", "text/event-stream".to_string()),
+            ("cache-control", "no-cache".to_string()),
+            ("x-auth-lifetime-pad", pad),
+        ]),
+        H2Step::Sleep(Duration::from_secs(45)),
+    ];
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls builder")
+        .steps(steps)
+        .spawn()
+        .expect("spawn oversized-headers h2 backend");
+
+    let (harness, https_port) = spawn_h3_gateway(protected_proxy_yaml(backend_port), false).await;
+    let capability = wait_for_h2_bridge_ready(&harness, Duration::from_secs(20)).await;
+    assert!(
+        capability.is_some(),
+        "the H2/TLS backend must be classified for the cross-protocol bridge before the \
+         short-lived credential is minted; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
+
+    let client = Http3Client::insecure_with_stream_receive_window(4 * 1024).expect("H3 client");
+    let url = proxy_url(https_port, "/api/events");
+    let mut connection = client.connect(&url).await.expect("QUIC connection");
+    let token = mint_short_lived_token();
+    let mut stalled = connection
+        .open_stream(
+            &url,
+            GetOptions::default().header("authorization", format!("Bearer {token}")),
+            true,
+        )
+        .await
+        .expect("open cross-protocol streaming response");
+
+    // Never read: the bridge's HEADERS write stays parked until the expiry.
+    assert_credential_expired_exactly(&harness, "http", 1).await;
+
+    if let Ok((status, _)) = stalled.recv_response().await {
+        panic!(
+            "protected response HEADERS committed after authorization expiry \
+             (status={status}); logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        );
+    }
+
+    // The connection that carried the stalled stream must still serve: an
+    // unauthenticated request on it gets the gateway's own `401`.
+    let follow_up = connection.get(&url).await.unwrap_or_else(|error| {
+        panic!(
+            "the stalled stream's expiry closed its whole QUIC connection: {error}; \
+             logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        )
+    });
+    assert_eq!(
+        follow_up.status.as_u16(),
+        401,
+        "a follow-up request on the same connection must be answered: {follow_up:?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // 9. Request direction under CONTINUOUS ACTIVITY. Test 2 proves a STALLED
 //    upload is bounded; this one proves relayed request DATA cannot buy extra
 //    authorized lifetime either. A per-read operator timeout never fires for a

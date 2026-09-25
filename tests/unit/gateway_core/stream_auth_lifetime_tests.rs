@@ -2672,15 +2672,76 @@ async fn a_live_or_absent_credential_leaves_the_buffered_terminal_summary_untouc
 /// The eighth site is the deferred semantic-cache replay transport encoder
 /// (`encode_semantic_cache_replay`), which runs the compression `after_proxy`
 /// hook after the synthetic header chain and must stay under the same bound.
+///
+/// The ninth and tenth are the charged backend deadline terminal's hook runners
+/// (#5744): proxy core's one-poll `after_proxy` runner and the reject-path
+/// runner's charged mode. Neither races an awaited phase, since each hook gets
+/// one poll, so each composes the bound at its two edges: an elapsed
+/// credential answers with the fixed terminal before any poll, and a pending
+/// hook detaches only under the credential's lifetime.
 #[test]
 fn every_precommit_response_phase_composes_the_authorization_lifetime() {
     assert_eq!(
         PROXY_SOURCE
             .matches("ctx.precommit_response_phase_bound()")
             .count(),
-        8,
+        10,
         "a pre-commitment response phase lost its authorization bound"
     );
+    let charged_runner = PROXY_SOURCE
+        .split("async fn run_charged_terminal_after_proxy_hook(")
+        .nth(1)
+        .expect("charged-terminal after_proxy runner")
+        .split("\n}\n")
+        .next()
+        .expect("charged-terminal after_proxy runner bounded");
+    assert!(
+        charged_runner.contains("bound.expired_authorization()")
+            && charged_runner.contains("settle_precommit_authorization_expiry(ctx, termination)"),
+        "the charged after_proxy runner must settle an elapsed credential before polling"
+    );
+    let bounded_detach =
+        "spawn_detached_charged_terminal_hook(future, bound.authorization_deadline_at())";
+    assert!(
+        charged_runner.contains(bounded_detach),
+        "the charged after_proxy runner must detach only under the credential's lifetime"
+    );
+    let charged_reject_path = PROXY_SOURCE
+        .split("async fn run_after_proxy_hooks_on_rejection(")
+        .nth(1)
+        .expect("reject-path after_proxy runner")
+        .split("\n}\n")
+        .next()
+        .expect("reject-path after_proxy runner bounded");
+    let settles_expiry = "charged_bound.and_then(|bound| bound.expired_authorization())";
+    assert!(
+        charged_reject_path.contains(settles_expiry)
+            && charged_reject_path.contains("replace_rejection_with_authorization_terminal("),
+        "the charged reject path must settle an elapsed credential before polling"
+    );
+    assert!(
+        charged_reject_path
+            .contains("charged_bound.and_then(|bound| bound.authorization_deadline_at())"),
+        "the charged reject path must detach only under the credential's lifetime"
+    );
+    let detached = PROXY_SOURCE
+        .split("fn spawn_detached_charged_terminal_hook(")
+        .nth(1)
+        .expect("charged-terminal detached runner")
+        .split("\nfn spawn_detached_rejection_cleanup(")
+        .next()
+        .expect("charged-terminal detached runner bounded");
+    for enforced in [
+        "if authorization_at.is_some_and(|at| started_at >= at) {",
+        "if authorization_at.is_some_and(|at| tokio::time::Instant::now() >= at) {",
+        "tokio::time::sleep_until(authorization_at.unwrap_or(cleanup_at))",
+        "biased;",
+    ] {
+        assert!(
+            detached.contains(enforced),
+            "the detached charged-terminal hook must enforce the authorization bound: {enforced}"
+        );
+    }
     assert!(
         !PROXY_SOURCE.contains("ctx.precommit_response_phase_deadline_at()"),
         "a pre-commitment phase that keeps only the composed instant cannot tell an \
@@ -5897,6 +5958,74 @@ async fn a_stalled_aggregate_sse_headers_write_on_an_exact_tie_is_authorization(
     );
 }
 
+/// An authorization expiry that cancels the aggregate SSE HEADERS write after
+/// its first poll reports the head as offered, so the writer resets the stream
+/// instead of writing its `401` HEADERS (#5745). A bound that had already
+/// elapsed never offers the head, and the `401` is still legal after it.
+#[tokio::test(start_paused = true)]
+async fn an_aggregate_sse_headers_expiry_reports_whether_the_head_was_offered() {
+    use ferrum_edge::_test_support::await_offered_authorized_headers_write_for_test;
+
+    let now = tokio::time::Instant::now();
+    let bound = compose_aggregate_sse_bound_for_test(
+        now + Duration::from_secs(30),
+        Some(plan_at(
+            now + Duration::from_secs(2),
+            StreamAuthTermination::CredentialExpired,
+        )),
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::pending::<Result<(), &'static str>>();
+    let (outcome, offered) = await_offered_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(
+        offered,
+        "the parked head was offered before the expiry cancelled it"
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::pending::<Result<(), &'static str>>();
+    let (outcome, offered) = await_offered_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(!offered, "an elapsed bound must not poll the head");
+
+    let bound = compose_aggregate_sse_bound_for_test(now + Duration::from_secs(30), None);
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::ready(Ok::<(), &'static str>(()));
+    let (outcome, offered) = await_offered_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(outcome, H3AuthorizedHeadersWrite::Written);
+    assert!(offered);
+    assert_eq!(latch.observed(), None);
+}
+
 /// An already-elapsed authorization bound with a later listener lifetime must
 /// not poll send_response, so the protected 200/event-stream head cannot commit.
 #[tokio::test(start_paused = true)]
@@ -6056,9 +6185,42 @@ fn every_native_h3_streaming_response_headers_write_uses_the_shared_helper() {
         .split("async fn send_h3_grpc_error_with_recv_halt(")
         .next()
         .expect("native H3 aggregate SSE writer bounded");
+    // The head races through the offered variant of the shared helper (#5745),
+    // which must keep the same deadline race and the same authorization
+    // attribution as `await_authorized_headers_write`, adding only whether h3
+    // already took the head.
+    let sse_head = "await_offered_authorized_headers_write(\n            aggregate_sse_bound,";
     assert!(
-        sse_writer.contains("await_authorized_headers_write("),
+        sse_writer.contains(sse_head) && sse_writer.contains("stream.send_response(response),"),
         "aggregate MCP SSE must race HEADERS through the shared authorized-write helper"
+    );
+    let offered_helper = helper
+        .split("pub(crate) async fn await_offered_authorized_headers_write<")
+        .nth(1)
+        .expect("offered authorized HEADERS helper present")
+        .split("\nfn authorized_headers_write_outcome<")
+        .next()
+        .expect("offered authorized HEADERS helper bounded");
+    let offered_race = "await_offered_response_write_before_deadline(bound.deadline(), write)";
+    assert!(
+        offered_helper.contains(offered_race),
+        "the offered HEADERS helper must race the composed bound"
+    );
+    let shared_attribution = "authorized_headers_write_outcome(bound, family, latch, result)";
+    assert!(
+        offered_helper.contains(shared_attribution),
+        "the offered HEADERS helper must attribute through the shared outcome"
+    );
+    let plain_helper = helper
+        .split("pub(crate) async fn await_authorized_headers_write<")
+        .nth(1)
+        .expect("authorized HEADERS helper present")
+        .split("pub(crate) async fn await_offered_authorized_headers_write<")
+        .next()
+        .expect("authorized HEADERS helper bounded");
+    assert!(
+        plain_helper.contains(shared_attribution),
+        "both HEADERS helpers must share one authorization attribution"
     );
     assert!(
         sse_writer.contains("compose_aggregate_sse_bound("),

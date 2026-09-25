@@ -828,18 +828,20 @@ async fn finish_h3_response_with_backend_trailers<S>(
     // that parks past the credential cannot count a second termination for a
     // stream the relay's own arms already settled.
     auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
-    // The matched route rule's body deadline (#5646), or `None`. It bounds the
-    // trailer read exactly as it bounds every body frame of the relay.
-    route_body_deadline: Option<tokio::time::Instant>,
+    // The relay's pinned timer for the matched route rule's body deadline
+    // (#5646), or `None`. It bounds the trailer read exactly as it bounds every
+    // body frame of the relay, and the trailer/FIN writes race it directly.
+    mut route_body_sleep: std::pin::Pin<&mut Option<tokio::time::Sleep>>,
 ) -> Result<(), H3TrailerFinishError>
 where
     S: SendStream<Bytes>,
 {
+    let route_body_deadline = Option::as_ref(&route_body_sleep).map(tokio::time::Sleep::deadline);
     macro_rules! authorized_terminal_write {
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline,
-                route_body_deadline,
+                route_body_sleep.as_mut(),
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 auth_latch,
                 $write,
@@ -7613,7 +7615,7 @@ async fn handle_h3_request(
             ($write:expr) => {
                 match crate::http3::stream_util::await_authorized_response_write(
                     auth_deadline_plan,
-                    route_body_deadline,
+                    route_body_sleep.as_mut(),
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                     &auth_latch,
                     $write,
@@ -7975,7 +7977,7 @@ async fn handle_h3_request(
                         },
                         auth_deadline_plan,
                         &auth_latch,
-                        route_body_deadline,
+                        route_body_sleep.as_mut(),
                     )
                     .await
                 };
@@ -11785,7 +11787,7 @@ async fn stream_h3_open_response_to_client(
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline_plan,
-                route_body_deadline,
+                route_body_sleep.as_mut(),
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 &auth_latch,
                 $write,
@@ -12022,7 +12024,7 @@ async fn stream_h3_open_response_to_client(
                 },
                 auth_deadline_plan,
                 &auth_latch,
-                route_body_deadline,
+                route_body_sleep.as_mut(),
             )
             .await
             {
@@ -16142,7 +16144,7 @@ async fn proxy_to_backend_h3_streaming(
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline_plan,
-                route_body_deadline,
+                route_body_sleep.as_mut(),
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 &auth_latch,
                 $write,
@@ -16394,7 +16396,7 @@ async fn proxy_to_backend_h3_streaming(
                 },
                 auth_deadline_plan,
                 &auth_latch,
-                route_body_deadline,
+                route_body_sleep.as_mut(),
             )
             .await
             {
@@ -17656,14 +17658,15 @@ async fn send_h3_aggregate_sse_response(
     let auth_latch = ctx.authorization_termination_latch();
     let auth_family = crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http;
 
-    match crate::http3::stream_util::await_authorized_headers_write(
-        aggregate_sse_bound,
-        auth_family,
-        &auth_latch,
-        stream.send_response(response),
-    )
-    .await
-    {
+    let (headers_write, head_offered) =
+        crate::http3::stream_util::await_offered_authorized_headers_write(
+            aggregate_sse_bound,
+            auth_family,
+            &auth_latch,
+            stream.send_response(response),
+        )
+        .await;
+    match headers_write {
         crate::http3::stream_util::H3AuthorizedHeadersWrite::Written => {}
         crate::http3::stream_util::H3AuthorizedHeadersWrite::ClientWriteFailed => {
             drop(body);
@@ -17684,6 +17687,18 @@ async fn send_h3_aggregate_sse_response(
         crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(termination) => {
             ctx.latch_authorization_termination(termination);
             drop(body);
+            if head_offered {
+                // h3 took the protected head before the expiry cancelled it
+                // (#5745). h3-quinn still holds that frame, so a `401` HEADERS
+                // would fail with a connection-level error and h3 would close
+                // the whole QUIC connection with every sibling stream. Part of
+                // the head may already be on the wire: reset this stream only.
+                crate::http3::stream_util::abort_response_stream(stream);
+                if halt_recv {
+                    crate::http3::stream_util::halt_request_body(stream);
+                }
+                return Ok(());
+            }
             let (status, terminal_headers, terminal_body) =
                 crate::proxy::authorization_expired_pre_commitment_response(
                     ctx,

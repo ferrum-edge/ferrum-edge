@@ -2553,6 +2553,14 @@ pub struct RequestContext {
     /// backend or plugin-controlled `grpc-status`/`grpc-message` text must not
     /// unlock the write-biased terminal H3 completion path.
     gateway_deadline_response_selected: bool,
+    /// Whether the response in hand is proxy core's charged backend deadline
+    /// terminal (`Backend deadline exceeded`, #5744): a gRPC attempt budget
+    /// expiry charged to the backend after the request was sent. It is written
+    /// after that deadline passed, so the post-dispatch response phases bound
+    /// every hook as over the gateway's own deadline terminal while keeping the
+    /// charged wording. Set only by trusted proxy code; cleared when the attempt
+    /// ends for retry backoff or a new attempt starts.
+    charged_backend_deadline_terminal: bool,
     /// Latest dispatch outcome, retaining possible execution across retries.
     /// Only trusted transport code may set this; it is not serialized.
     backend_dispatch_state: BackendDispatchState,
@@ -3854,6 +3862,7 @@ impl RequestContext {
             grpc_route_attempt_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
+            charged_backend_deadline_terminal: false,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
             gateway_capacity_response_selected: false,
             gateway_representation_response_selected: false,
@@ -4223,6 +4232,12 @@ impl RequestContext {
         self.gateway_deadline_response_selected
     }
 
+    /// Whether the response in hand is the charged backend deadline terminal
+    /// (#5744); see [`Self::end_charged_grpc_route_attempt`].
+    pub(crate) fn charged_backend_deadline_terminal(&self) -> bool {
+        self.charged_backend_deadline_terminal
+    }
+
     pub(crate) fn mark_gateway_capacity_response_selected(&mut self) {
         self.gateway_capacity_response_selected = true;
     }
@@ -4427,6 +4442,9 @@ impl RequestContext {
     /// production caller.
     #[doc(hidden)]
     pub fn begin_grpc_route_attempt(&mut self) {
+        // A new attempt's response is not the previous attempt's charged
+        // terminal.
+        self.charged_backend_deadline_terminal = false;
         let Some(attempt_timeout) = self.grpc_route_attempt_timeout else {
             return;
         };
@@ -4457,6 +4475,10 @@ impl RequestContext {
     /// alone and never by the attempt that just failed. A no-op unless the
     /// matched rule carries an attempt budget.
     ///
+    /// It also clears the charged backend deadline marker (#5744): an attempt
+    /// ended for retry backoff leaves no charged terminal in hand, and whatever
+    /// response replaces it is not that terminal.
+    ///
     /// Public only for external contract tests; proxy core is the only
     /// production caller.
     #[doc(hidden)]
@@ -4465,6 +4487,20 @@ impl RequestContext {
             self.grpc_deadline_at = self.grpc_total_deadline_at();
         }
         self.grpc_route_attempt_deadline_at = None;
+        self.charged_backend_deadline_terminal = false;
+    }
+
+    /// End an attempt whose budget expiry proxy core charged to the backend
+    /// (#5744) and mark the charged `Backend deadline exceeded` terminal it
+    /// produced. The spent budget no longer bounds the response pipeline, so
+    /// the marker takes over: `after_proxy` skips response replacers and gives
+    /// every other hook one poll, detaching pending work; the final-body
+    /// validators are skipped; and committed observers get one poll each. The
+    /// terminal keeps its charged wording throughout. Ending the attempt for
+    /// retry backoff, or starting a new one, clears the marker.
+    pub(crate) fn end_charged_grpc_route_attempt(&mut self) {
+        self.end_grpc_route_attempt();
+        self.charged_backend_deadline_terminal = true;
     }
 
     /// The receipt-anchored total RPC deadline — the client / `grpc_deadline`
@@ -5293,6 +5329,7 @@ impl RequestContext {
             grpc_route_attempt_deadline_at: self.grpc_route_attempt_deadline_at,
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
+            charged_backend_deadline_terminal: self.charged_backend_deadline_terminal,
             backend_dispatch_state: self.backend_dispatch_state,
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,

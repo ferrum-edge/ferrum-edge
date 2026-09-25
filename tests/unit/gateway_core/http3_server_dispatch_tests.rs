@@ -1255,7 +1255,7 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
         "the H3 SSE writer must compose the listener lifetime with that captured plan"
     );
     assert!(
-        sse_writer.contains("await_authorized_headers_write("),
+        sse_writer.contains("await_offered_authorized_headers_write("),
         "the H3 SSE HEADERS write must race the composed bound"
     );
     assert!(
@@ -1365,6 +1365,50 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
             "the H3 SSE pump must never buffer the stream (`{buffering}`)"
         );
     }
+}
+
+/// An authorization expiry that cancels the aggregate SSE HEADERS write after
+/// h3 took the frame resets the stream instead of writing the `401` HEADERS
+/// (#5745): h3-quinn would fail that second write with a connection-level
+/// error and h3 would close the whole QUIC connection. A bound that elapsed
+/// before the write began still gets the `401`.
+#[test]
+fn h3_aggregate_sse_resets_after_an_offered_protected_head() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let start = server
+        .find("async fn send_h3_aggregate_sse_response(")
+        .expect("native H3 aggregate SSE writer");
+    let end = server[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset)
+        .expect("bounded aggregate SSE writer");
+    let sse_writer = &server[start..end];
+
+    assert!(
+        sse_writer.contains("let (headers_write, head_offered) ="),
+        "the HEADERS write must report whether it was offered"
+    );
+    let expired = sse_writer
+        .find("H3AuthorizedHeadersWrite::AuthorizationExpired(termination) => {")
+        .expect("the authorization-expired arm");
+    let arm = &sse_writer[expired..];
+    let reset = arm
+        .find("if head_offered {")
+        .expect("an offered head must be reset");
+    let terminal = arm
+        .find("authorization_expired_pre_commitment_response(")
+        .expect("the pre-commitment 401 terminal");
+    assert!(
+        reset < terminal,
+        "the offered-head reset must come before the 401"
+    );
+    let reset_arm = &arm[reset..terminal];
+    assert!(reset_arm.contains("abort_response_stream(stream);"));
+    assert!(reset_arm.contains("return Ok(());"));
+    assert!(
+        !reset_arm.contains("send_h3_finalized_reject_response_with_recv_halt("),
+        "an offered head must never be followed by a second HEADERS"
+    );
 }
 
 #[test]

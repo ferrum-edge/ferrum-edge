@@ -1005,6 +1005,236 @@ async fn functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_e
     backend_task.abort();
 }
 
+/// The same gRPC-Web budget expiry over HTTP/1.1 and HTTP/2 keeps the charged
+/// `Backend deadline exceeded` terminal when an `after_proxy` plugin (CORS)
+/// decorates it (#5744). Proxy core ends the spent attempt budget when it
+/// charges the expiry; before, the first `after_proxy` hook read that expired
+/// budget as the gateway's own deadline and the client got `Deadline exceeded
+/// at gateway` instead.
+///
+/// Pass-through gRPC-Web over HTTP/1.1 and HTTP/2 rides proxy core's native
+/// gRPC branch, which dials this plaintext backend over h2c. The backend is a
+/// scripted h2c peer that accepts the call and never answers, so the budget
+/// expires after the request was sent and proxy core charges it. An HTTP/1.1
+/// backend never sends the h2c SETTINGS frame: the budget would expire during
+/// connection acquisition instead, which is the gateway's own deadline.
+#[ignore]
+#[tokio::test]
+async fn functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tcp() {
+    for http2 in [false, true] {
+        assert_tcp_grpc_web_attempt_budget_expiry_wording(http2).await;
+    }
+}
+
+async fn assert_tcp_grpc_web_attempt_budget_expiry_wording(http2: bool) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind h2c backend");
+    let backend_port = listener.local_addr().expect("backend addr").port();
+    let mut backend = ScriptedH2Backend::builder_plain(listener)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::AwaitTestSignal)
+        .spawn()
+        .expect("spawn h2c backend");
+    let mut config = route_timeout_config(
+        h3_policy_config(
+            backend_port,
+            "http",
+            None,
+            json!({"tls": {"sni": "backend-sni.example.com"}}),
+            None,
+        ),
+        json!({"attempt_timeout_ms": 300}),
+    );
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "tcp-grpc-web-cors",
+            "namespace": H3_POLICY_NAMESPACE,
+            "plugin_name": "cors",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "allowed_origins": [GRPC_WEB_CORS_ORIGIN],
+                "exposed_headers": ["grpc-status", "grpc-message"]
+            }
+        }))
+        .expect("cors plugin config is valid"),
+    );
+    let gateway = start_h3_policy_gateway(config)
+        .await
+        .expect("start route-deadline gateway");
+
+    let builder = reqwest::Client::builder().danger_accept_invalid_certs(true);
+    let client = if http2 {
+        builder.http2_prior_knowledge()
+    } else {
+        builder.http1_only()
+    }
+    .build()
+    .expect("build TLS client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/echo.Echo/Stall",
+        gateway.https_port
+    );
+    let mut attempts = 0;
+    let (resp, elapsed) = loop {
+        attempts += 1;
+        let started = Instant::now();
+        let sent = client
+            .post(&url)
+            .header("content-type", "application/grpc-web+proto")
+            .header("origin", GRPC_WEB_CORS_ORIGIN)
+            .body(grpc_web_data_frame(b"stalled"))
+            .send()
+            .await;
+        match sent {
+            Ok(resp) => break (resp, started.elapsed()),
+            Err(error) if attempts < 20 => {
+                eprintln!("gRPC-Web call over TCP not answered yet: {error}");
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("gRPC-Web call over TCP failed: {error}"),
+        }
+    };
+    let protocol = if http2 { "HTTP/2" } else { "HTTP/1.1" };
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{protocol}: gRPC-Web errors ride HTTP 200"
+    );
+    let cors = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    assert_eq!(
+        cors.as_deref(),
+        Some(GRPC_WEB_CORS_ORIGIN),
+        "{protocol}: after_proxy must decorate the charged terminal"
+    );
+    let header_message = resp
+        .headers()
+        .get("grpc-message")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body = resp.text().await.expect("gRPC-Web terminal body");
+    let terminal = format!("{header_message}\n{body}");
+    assert!(
+        terminal.contains("Backend deadline exceeded"),
+        "{protocol}: a charged budget expiry must use the backend terminal: {terminal:?}"
+    );
+    assert!(
+        !terminal.contains("Deadline exceeded at gateway"),
+        "{protocol}: a charged budget expiry is not the gateway's own deadline: {terminal:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "{protocol}: the call must end at its budget: {elapsed:?}"
+    );
+    sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        backend.received_stream_count(),
+        1,
+        "{protocol}: the stalled call must reach the backend exactly once"
+    );
+
+    gateway.shutdown().await;
+    backend.shutdown();
+}
+
+/// A gRPC-Web client deadline that cuts a response body write parked in QUIC
+/// flow control resets ONLY that stream (#5745). The bridge used to append its
+/// `DEADLINE_EXCEEDED` trailer frame after the cut write: h3-quinn still held
+/// the cut frame, failed that DATA write with a connection-level error, and h3
+/// closed the whole QUIC connection with `H3_INTERNAL_ERROR`. The streamed and
+/// the buffered response legs are both covered, and a follow-up request on the
+/// same connection must still be answered.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_grpc_web_deadline_after_a_stalled_body_write_resets_only_its_stream() {
+    for buffered in [false, true] {
+        assert_grpc_web_deadline_after_a_stalled_body_write(buffered).await;
+    }
+}
+
+async fn assert_grpc_web_deadline_after_a_stalled_body_write(buffered: bool) {
+    let leg = if buffered { "buffered" } else { "streamed" };
+    let (backend_port, backend_task) = spawn_grpc_web_bulk_backend().await;
+    let mut config = plaintext_backend_tls_sni_config(backend_port);
+    if buffered {
+        buffer_every_response(&mut config);
+    }
+    let gateway = start_h3_policy_gateway(config)
+        .await
+        .expect("start h3 gRPC-Web gateway");
+
+    // A tiny per-stream receive window parks the bridge's body write in QUIC
+    // flow control once the client stops reading.
+    let client = Http3Client::insecure_with_stream_receive_window(4 * 1024).expect("h3 client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/echo.Echo/Bulk",
+        gateway.https_port
+    );
+    let connect_by = Instant::now() + Duration::from_secs(10);
+    let mut connection = loop {
+        match client.connect(&url).await {
+            Ok(connection) => break connection,
+            Err(_) if Instant::now() < connect_by => sleep(Duration::from_millis(100)).await,
+            Err(error) => panic!("{leg}: QUIC connection to the gateway failed: {error}"),
+        }
+    };
+    let frame = grpc_web_data_frame(b"bulk");
+    let options = GetOptions::default()
+        .method(http::Method::POST)
+        .header("content-type", "application/grpc-web+proto")
+        .header("content-length", frame.len().to_string())
+        .header("grpc-timeout", "1500m")
+        .body(bytes::Bytes::from(frame));
+    let mut stalled = connection
+        .open_stream(&url, options, true)
+        .await
+        .expect("open the gRPC-Web call");
+    let (status, _) = stalled.recv_response().await.expect("response head");
+    assert_eq!(status, StatusCode::OK, "{leg}: the head lands in time");
+
+    // Never read the body: the bridge's body write parks until the client's
+    // `grpc-timeout` cuts it.
+    sleep(Duration::from_secs(3)).await;
+
+    let miss = format!("https://localhost:{}/no-such-route", gateway.https_port);
+    let follow_up = connection.get(&miss).await.unwrap_or_else(|error| {
+        panic!("{leg}: the cut body write closed its whole QUIC connection: {error}")
+    });
+    assert_eq!(
+        follow_up.status,
+        StatusCode::NOT_FOUND,
+        "{leg}: a follow-up request on the same connection must be answered"
+    );
+
+    // The cut stream itself ends in a reset, never a clean finish.
+    let reset_by = Instant::now() + Duration::from_secs(5);
+    loop {
+        match stalled.recv_data().await {
+            Ok(Some(_)) => assert!(
+                Instant::now() < reset_by,
+                "{leg}: the cut stream kept receiving past its deadline"
+            ),
+            Ok(None) => panic!("{leg}: the cut body must be reset, not finished cleanly"),
+            Err(error) => {
+                assert!(
+                    !error.to_string().contains("timed out"),
+                    "{leg}: the cut stream was never reset: {error}"
+                );
+                break;
+            }
+        }
+    }
+
+    gateway.shutdown().await;
+    backend_task.abort();
+}
+
 /// A gRPC-Web pass-through call tells the backend its remaining budget in
 /// `grpc-timeout` in place of the client's relative value, as proxy core does
 /// (#5734): the rule's 5 s attempt budget binds over the client's 30 s.
@@ -1814,6 +2044,47 @@ async fn spawn_endless_body_backend() -> (u16, Arc<AtomicBool>, JoinHandle<()>) 
         }
     });
     (port, released, task)
+}
+
+/// Length of [`spawn_grpc_web_bulk_backend`]'s single response message: far
+/// more than a stalled client's receive window admits, and inside the default
+/// response ceiling, so the buffered leg can collect it.
+const GRPC_WEB_BULK_MESSAGE_LEN: usize = 1 << 20;
+
+/// A backend that answers every gRPC-Web call with one large message frame,
+/// written as fast as the gateway accepts it, and then holds the connection.
+async fn spawn_grpc_web_bulk_backend() -> (u16, JoinHandle<()>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind gRPC-Web bulk backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                if read_http_request_body(&mut stream).await.is_err() {
+                    return;
+                }
+                let body = grpc_web_data_frame(&b"x".repeat(GRPC_WEB_BULK_MESSAGE_LEN));
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/grpc-web+proto\r\n\
+                     Content-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = stream.write_all(&body).await;
+                let _ = stream.flush().await;
+                // Hold the connection until the gateway drops it.
+                let mut probe = [0u8; 1];
+                let _ = stream.read(&mut probe).await;
+            });
+        }
+    });
+    (port, task)
 }
 
 /// A backend that stalls the first `hold_first` requests forever and answers
