@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::sync::Arc;
 #[cfg(feature = "acme")]
 use std::time::Duration;
@@ -8,7 +7,8 @@ use chrono::{DateTime, Utc};
 use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use serde::Deserialize;
 use serde_json::{Value, json};
 #[cfg(feature = "acme")]
@@ -1637,7 +1637,7 @@ fn validate_ca_bundle(
 /// credential an operator can knowingly stage, it is a list that has stopped
 /// describing the revocations it claims to.
 fn validate_crl_bundle(crl_pem: &str) -> Result<usize, String> {
-    let crls = rustls_pemfile::crls(&mut Cursor::new(crl_pem.as_bytes()))
+    let crls = CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("crl_pem: failed to parse PEM CRLs: {error}"))?;
     if crls.is_empty() {
@@ -1675,7 +1675,7 @@ fn parse_cert_chain(
     field: &'static str,
     pem: &str,
 ) -> Result<Vec<CertificateDer<'static>>, String> {
-    let certs = rustls_pemfile::certs(&mut Cursor::new(pem.as_bytes()))
+    let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("{field}: failed to parse PEM certificates: {error}"))?;
     if certs.is_empty() {
@@ -1685,7 +1685,7 @@ fn parse_cert_chain(
 }
 
 fn parse_private_key(field: &'static str, pem: &str) -> Result<PrivateKeyDer<'static>, String> {
-    rustls_pemfile::private_key(&mut Cursor::new(pem.as_bytes()))
+    crate::tls::first_pem_private_key(pem.as_bytes())
         .map_err(|error| format!("{field}: failed to parse PEM private key: {error}"))?
         .ok_or_else(|| format!("{field}: no PEM private key found"))
 }

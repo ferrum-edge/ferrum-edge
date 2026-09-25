@@ -3,6 +3,8 @@
 
 use base64::Engine;
 use rcgen::SigningKey;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
 use x509_parser::prelude::{CertificateRevocationList, FromDer, X509Certificate};
 
 fn fields(mut der: &[u8]) -> Vec<&[u8]> {
@@ -54,7 +56,7 @@ fn wrap(tag: u8, body: &[u8]) -> Vec<u8> {
 }
 
 pub fn without_authority_key_identifier(pem: &str, key: &rcgen::KeyPair, ca_pem: &str) -> String {
-    let crl = rustls_pemfile::crls(&mut pem.as_bytes())
+    let crl = CertificateRevocationListDer::pem_slice_iter(pem.as_bytes())
         .next()
         .unwrap()
         .unwrap();
@@ -90,7 +92,7 @@ pub fn without_authority_key_identifier(pem: &str, key: &rcgen::KeyPair, ca_pem:
 
     // Verify that this is genuinely signed by the supplied CA, not just a
     // parseable CRL whose signature was invalidated by extension removal.
-    let ca = rustls_pemfile::certs(&mut ca_pem.as_bytes())
+    let ca = CertificateDer::pem_slice_iter(ca_pem.as_bytes())
         .next()
         .unwrap()
         .unwrap();

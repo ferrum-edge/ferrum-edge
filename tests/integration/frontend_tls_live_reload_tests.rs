@@ -23,6 +23,8 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_dynamic_tls_and_signal};
 use ferrum_edge::tls::NoVerifier;
 use rustls::pki_types::ServerName;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -65,16 +67,12 @@ fn generate_server_config_with_san(san: &str) -> (Arc<ServerConfig>, Vec<u8>) {
     let cert = params.self_signed(&key_pair).expect("self-sign cert");
 
     let cert_pem = cert.pem();
-    let mut cert_reader = cert_pem.as_bytes();
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(Result::ok)
         .collect();
     let cert_der = certs[0].as_ref().to_vec();
     let key_pem = key_pair.serialize_pem();
-    let mut key_reader = key_pem.as_bytes();
-    let private_key = rustls_pemfile::private_key(&mut key_reader)
-        .expect("read private key")
-        .expect("private key present");
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("read private key");
 
     let config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -625,13 +623,11 @@ fn admin_mtls_pki() -> AdminMtlsPki {
         .expect("self-signed server cert");
 
     let server_key_pem = server_key_pair.serialize_pem();
-    let server_key = rustls_pemfile::private_key(&mut server_key_pem.as_bytes())
-        .expect("read server key")
-        .expect("server key present");
+    let server_key =
+        PrivateKeyDer::from_pem_slice(server_key_pem.as_bytes()).expect("read server key");
     let client_key_pem = client_key_pair.serialize_pem();
-    let client_key = rustls_pemfile::private_key(&mut client_key_pem.as_bytes())
-        .expect("read client key")
-        .expect("client key present");
+    let client_key =
+        PrivateKeyDer::from_pem_slice(client_key_pem.as_bytes()).expect("read client key");
 
     AdminMtlsPki {
         server_certs: vec![server_cert.der().clone()],

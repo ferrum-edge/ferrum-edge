@@ -8,7 +8,9 @@
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_passthrough --ignored --nocapture
 
 use crate::scaffolding::port_registry::TestSocket;
+use rustls::pki_types::pem::PemObject;
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::process::Child;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -55,17 +57,15 @@ async fn start_tcp_echo_server(port: u16) {
 /// TLS-wrapped TCP echo server — clients perform TLS handshake, then echo.
 async fn start_tls_echo_server(port: u16, cert_pem: &str, key_pem: &str) {
     use rustls::ServerConfig;
-    use rustls_pemfile::{certs, private_key};
-    use std::io::BufReader;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::sync::Arc;
     use tokio_rustls::TlsAcceptor;
 
-    let cert_chain: Vec<_> = certs(&mut BufReader::new(cert_pem.as_bytes()))
+    let cert_chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(|r| r.ok())
         .collect();
-    let key = private_key(&mut BufReader::new(key_pem.as_bytes()))
-        .unwrap()
-        .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -641,10 +641,9 @@ upstreams: []
         .expect("Failed to connect to passthrough proxy");
 
     // Build a TLS client that trusts our self-signed cert
-    let cert_chain: Vec<_> =
-        rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_bytes()))
-            .filter_map(|r| r.ok())
-            .collect();
+    let cert_chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .filter_map(|r| r.ok())
+        .collect();
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add_parsable_certificates(cert_chain);
 
@@ -1136,12 +1135,10 @@ async fn test_tcp_passthrough_rotates_before_forwarding_client_hello() {
     use std::sync::Arc;
 
     let (cert_pem, key_pem) = generate_self_signed_cert();
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_bytes()))
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<_, _>>()
         .unwrap();
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem.as_bytes()))
-        .unwrap()
-        .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.add_parsable_certificates(certs.clone());

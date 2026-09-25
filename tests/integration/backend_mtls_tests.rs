@@ -10,7 +10,8 @@ use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::retry::{ErrorClass, classify_reqwest_error};
 use rustls::RootCertStore;
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, private_key};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write;
@@ -494,14 +495,13 @@ fn spawn_client_cert_required_origin(
     key_pem: &str,
     ca_pem: &str,
 ) -> tokio::task::JoinHandle<()> {
-    let mut cert_reader = cert_pem.as_bytes();
-    let cert_chain: Vec<_> = certs(&mut cert_reader).filter_map(|c| c.ok()).collect();
-    let mut key_reader = key_pem.as_bytes();
-    let key = private_key(&mut key_reader)
-        .expect("parse key pem")
-        .expect("server private key");
-    let mut ca_reader = ca_pem.as_bytes();
-    let ca_certs: Vec<_> = certs(&mut ca_reader).filter_map(|c| c.ok()).collect();
+    let cert_chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .filter_map(|c| c.ok())
+        .collect();
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("parse key pem");
+    let ca_certs: Vec<_> = CertificateDer::pem_slice_iter(ca_pem.as_bytes())
+        .filter_map(|c| c.ok())
+        .collect();
     let mut roots = RootCertStore::empty();
     for ca in ca_certs {
         roots.add(ca).expect("add client CA");

@@ -31,7 +31,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures_util::StreamExt;
-use rustls::pki_types::{CertificateRevocationListDer, ServerName};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
 use serde_json::json;
 use tempfile::TempDir;
@@ -63,15 +64,13 @@ fn ensure_crypto_provider() {
 }
 
 fn pem_certs(pem: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
-    rustls_pemfile::certs(&mut pem.as_bytes())
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .filter_map(Result::ok)
         .collect()
 }
 
 fn pem_key(pem: &str) -> rustls::pki_types::PrivateKeyDer<'static> {
-    rustls_pemfile::private_key(&mut pem.as_bytes())
-        .expect("read private key")
-        .expect("private key present")
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("read private key")
 }
 
 /// Server-authenticated TLS config from a leaf issued by `ca`.

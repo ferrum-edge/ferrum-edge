@@ -39,6 +39,7 @@ use ferrum_edge::tls::{
 };
 use rustls::ClientConfig;
 use rustls::client::ResolvesClientCert;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
 };
@@ -172,7 +173,7 @@ impl TestPki {
 
 fn parse_crls(pem: &str) -> CrlList {
     std::sync::Arc::new(
-        rustls_pemfile::crls(&mut pem.as_bytes())
+        CertificateRevocationListDer::pem_slice_iter(pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .expect("parse CRLs"),
     )
@@ -1989,9 +1990,7 @@ fn self_signed_server(cn: &str) -> (String, String, Vec<u8>) {
 }
 
 fn parse_client_key(pem: &str) -> PrivateKeyDer<'static> {
-    rustls_pemfile::private_key(&mut pem.as_bytes())
-        .expect("read client key")
-        .expect("client key present")
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("read client key")
 }
 
 fn mtls_client_config(cert_der: &[u8], key_pem: &str) -> ClientConfig {
@@ -2058,7 +2057,7 @@ fn mtls_client_config_honoring_ca_hints(
         )
         .expect("client certified key"),
     );
-    let certs = rustls_pemfile::certs(&mut issuer_ca_pem.as_bytes())
+    let certs = CertificateDer::pem_slice_iter(issuer_ca_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse issuer CA");
     let mut roots = rustls::RootCertStore::empty();

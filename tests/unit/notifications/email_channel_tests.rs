@@ -19,6 +19,8 @@ use chrono::{TimeZone, Utc};
 use ferrum_edge::notifications::channels::{EmailChannel, NotificationChannel};
 use ferrum_edge::notifications::{EventAction, Notification, NotificationField, Severity};
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -1201,12 +1203,11 @@ fn tls_materials(san: &str) -> (NamedTempFile, TlsAcceptor) {
         .expect("write ca bundle");
     ca_file.flush().expect("flush ca bundle");
 
-    let certs = rustls_pemfile::certs(&mut leaf_cert.pem().as_bytes())
+    let certs = CertificateDer::pem_slice_iter(leaf_cert.pem().as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse leaf certificate");
-    let key = rustls_pemfile::private_key(&mut leaf_key.serialize_pem().as_bytes())
-        .expect("parse leaf key")
-        .expect("leaf key present");
+    let key =
+        PrivateKeyDer::from_pem_slice(leaf_key.serialize_pem().as_bytes()).expect("parse leaf key");
     let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))

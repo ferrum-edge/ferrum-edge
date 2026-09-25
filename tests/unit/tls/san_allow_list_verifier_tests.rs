@@ -8,6 +8,7 @@ use rcgen::{
     string::Ia5String,
 };
 use rustls::client::danger::ServerCertVerifier;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tempfile::TempDir;
 
@@ -63,7 +64,7 @@ fn generate_leaf(
     }
     let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign leaf");
     let cert_pem = cert.pem();
-    let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+    let cert_der = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse leaf PEM")
         .into_iter()

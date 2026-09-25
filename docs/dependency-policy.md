@@ -203,10 +203,25 @@ comment-only token, both of which would dodge the time-box — so an exception
 cannot silently become permanent. A maintainer must re-fix the advisory or
 consciously extend the window.
 
-Current exceptions are all transitive and either no-fix-available or semver-pinned
-by a transitive parent (e.g. `mongodb` pins `hickory ^0.25`; the old AWS SDK
-chain pins `rustls-webpki ^0.101.7`, only present under the optional `secrets-aws`
-feature). Each entry documents the confinement and the upstream we are waiting on.
+Each entry documents the confinement and the upstream it is waiting on. A
+re-review checks the latest upstream release of the crate and of every parent
+that pulls it in, and either retires the entry (bump, feature change, or
+migration) or re-affirms it with dated evidence and a new time box.
+
+#### Advisory exception register
+
+Last full re-evaluation: 2026-09-24 (issue #5721). Latest upstream versions
+below were checked against crates.io and the RustSec advisory database on that
+date.
+
+| Advisory | Crate | Disposition | Evidence / tracking |
+|---|---|---|---|
+| RUSTSEC-2023-0071 | `rsa` 0.9.10 (Marvin timing side-channel) | **Re-affirmed** until 2026-12-31 | No fixed release: RustSec `patched = []`; 0.9.10 is the latest stable and 0.10.0-rc.18 (required by sqlx 0.9.0) is still affected. Reached via `sqlx-mysql` (public-key OAEP encryption of the MySQL password only, no private-key operation) and via jsonwebtoken's `rust_crypto` backend in the default `crypto-ring` profile, where RSA *signing* of outbound client assertions (`private_key_jwt` in `oidc_relying_party` / `oauth2_introspection`, `ai_federation` service-account JWTs) runs on the non-constant-time code. For `oidc_relying_party` / `oauth2_introspection`, EC/EdDSA assertion keys or the `fips` profile (`aws_lc_rs`) avoid it. `ai_federation` always signs RS256 (GCP service-account keys are RSA), so only the `fips` profile avoids it there. Retire when `rsa` ships a fix. |
+| RUSTSEC-2024-0436 | `paste` 1.0.15 (unmaintained) | **Re-affirmed** until 2026-12-31 | Proc-macro only; no runtime surface. `tikv-jemalloc-ctl` still depends on `paste ^1` in its latest 0.7.0, and the test matrix macro (`tests/scaffolding/matrix.rs`) uses it as a dev-dependency. Retire when `tikv-jemalloc-ctl` drops it. |
+| RUSTSEC-2026-0118, RUSTSEC-2026-0119 | `hickory-proto` 0.25.2 | **Retired** | Only `mongodb` < 3.7 pulled hickory 0.25. `mongodb` 3.7.0 moved to hickory 0.26; `Cargo.toml` now requires `>=3.7, <3.9` and the lockfile resolves 3.8.2. The cap keeps MongoDB 4.2 / Cosmos DB server-version-4.2 support: 3.9 raised the driver's minimum wire version to 9 (MongoDB 4.4). |
+| RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104 | `rustls-webpki` 0.101.7 | **Retired** | Came only from rustls 0.21 in the AWS SDK's legacy `rustls` connector (`aws-smithy-runtime/tls-rustls`). `aws-sdk-secretsmanager` is now built with `default-features = false` and `default-https-client` + `rt-tokio`, the hyper 1.x / rustls 0.23 client that `aws_config::load_defaults` already selected. |
+| RUSTSEC-2026-0258 | `h2` 0.3.27 | **Retired** | Same legacy AWS connector (hyper 0.14). The gateway's own h2 0.4.x stays on the patched release. |
+| RUSTSEC-2025-0134 | `rustls-pemfile` 2.2.0 (unmaintained) | **Retired** | PEM parsing uses the `rustls-pki-types` `PemObject` API (`CertificateDer::pem_slice_iter`, `PrivateKeyDer::from_pem_slice`, `CertificateRevocationListDer::pem_slice_iter`), the code `rustls-pemfile` 2.2 already wrapped. `crate::tls::first_pem_private_key` keeps the old `Result<Option<_>>` contract where callers distinguish "no key" from "malformed". The standalone `tests/performance/**` harnesses were migrated the same way and their lockfiles refreshed. |
 
 ### 3. License allowlist and exceptions
 

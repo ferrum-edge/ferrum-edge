@@ -39,6 +39,8 @@ use ferrum_edge::config_sources::k8s::{
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -125,12 +127,10 @@ async fn start_https_echo_on(
     let observed_hosts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&observed_hosts);
     let handle = tokio::spawn(async move {
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert.as_bytes())
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert.as_bytes())
             .filter_map(|r| r.ok())
             .collect();
-        let pk = rustls_pemfile::private_key(&mut key.as_bytes())
-            .expect("key parse")
-            .expect("key present");
+        let pk = PrivateKeyDer::from_pem_slice(key.as_bytes()).expect("key parse");
         let provider = rustls::crypto::ring::default_provider();
         let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
             .with_safe_default_protocol_versions()

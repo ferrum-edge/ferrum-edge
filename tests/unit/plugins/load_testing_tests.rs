@@ -7,6 +7,8 @@ use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
     RequestContext, plugin_failure_policy, priority, validate_plugin_config,
 };
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -2072,12 +2074,11 @@ async fn spawn_h2_preferring_tls_capture(
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate replay key");
     let params = CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("replay cert params");
     let cert = params.self_signed(&key).expect("self-sign replay cert");
-    let certs = rustls_pemfile::certs(&mut cert.pem().as_bytes())
+    let certs = CertificateDer::pem_slice_iter(cert.pem().as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse replay certificate");
-    let signing_key = rustls_pemfile::private_key(&mut key.serialize_pem().as_bytes())
-        .expect("parse replay key")
-        .expect("replay key present");
+    let signing_key =
+        PrivateKeyDer::from_pem_slice(key.serialize_pem().as_bytes()).expect("parse replay key");
     let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
         ferrum_edge::fips::base_crypto_provider(),
     ))

@@ -43,59 +43,54 @@ unsound = "all"
 unused-ignored-advisory = "deny"
 # Everything not listed here is denied (vulnerabilities, unmaintained, unsound,
 # and notices alike, under advisories schema v2). Each exception is time-boxed.
+#
+# Last re-evaluated 2026-09-24 (issue #5721). Retired in that pass because an
+# upstream fix became reachable (see docs/dependency-policy.md, "Advisory
+# exception register"):
+#   - RUSTSEC-2026-0118 / RUSTSEC-2026-0119 (hickory-proto 0.25.2): mongodb 3.7
+#     moved its SRV resolver to hickory 0.26; Cargo.toml now requires
+#     >=3.7, <3.9 (the lockfile resolves 3.8.2). The cap keeps MongoDB 4.2:
+#     3.9 raised the driver's minimum wire version to 9 (MongoDB 4.4).
+#   - RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and
+#     RUSTSEC-2026-0258 (h2 0.3.27): all came from the AWS SDK's legacy
+#     `rustls` feature (hyper 0.14 / rustls 0.21 connector), which
+#     aws-sdk-secretsmanager now disables; the SDK uses its hyper 1.x
+#     `default-https-client` instead.
+#   - RUSTSEC-2025-0134 (rustls-pemfile, unmaintained): PEM parsing moved to
+#     the rustls-pki-types `PemObject` API and the dependency was dropped.
 ignore = [
-    # ── hickory-proto 0.25.2 — pulled ONLY by mongodb 3.6.0 (its internal SRV
-    # resolver). The gateway's own DNS path uses hickory-resolver 0.26.1, which
-    # is already patched. mongodb 3.6 pins hickory `^0.25`, so we cannot bump
-    # the transitive copy without mongodb relaxing its requirement.
-    { id = "RUSTSEC-2026-0119", reason = "hickory-proto 0.25.2 O(n^2) name-compression DoS; confined to the mongodb driver's SRV resolver (gateway DNS uses 0.26.1); mongodb 3.6 pins ^0.25. Tracking mongodb release. [expires:2026-09-30]" },
-    { id = "RUSTSEC-2026-0118", reason = "hickory-proto 0.25.2 NSEC3 unbounded loop; no upstream fix available; confined to the mongodb driver's resolver, not the proxy/gateway DNS path. Re-evaluate quarterly / on mongodb bump. [expires:2026-09-30]" },
+    # ── rsa 0.9.10 — RUSTSEC-2023-0071, the Marvin timing side-channel in
+    # private-key operations. There is still no fixed release: RustSec lists
+    # `patched = []`; rsa 0.9.10 is the latest stable and 0.10.0-rc.18 (the
+    # latest pre-release, already required by sqlx 0.9.0) is still affected
+    # (checked 2026-09-24). Two parents reach it:
+    #   - sqlx-mysql 0.8.6 uses only `RsaPublicKey` OAEP *encryption* of the
+    #     password for MySQL `sha256_password` / `caching_sha2_password` over a
+    #     non-TLS link. That is a public-key operation, so the timing leak is not
+    #     reachable there, and FERRUM_DB_TLS_MODE avoids the exchange entirely.
+    #   - jsonwebtoken 10's `rust_crypto` backend, selected by the default
+    #     `crypto-ring` profile (`fips` selects `aws_lc_rs` instead). RS*/PS*
+    #     verification is a public-key operation, but RSA *signing* of outbound
+    #     client assertions (`private_key_jwt` in oidc_relying_party and
+    #     oauth2_introspection, ai_federation service-account JWTs) runs on the
+    #     non-constant-time implementation. For oidc_relying_party and
+    #     oauth2_introspection, EC/EdDSA assertion keys or the `fips` profile
+    #     avoid it. ai_federation always signs RS256 (GCP service-account keys
+    #     are RSA), so only the `fips` profile avoids it there.
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side-channel; no fixed release (patched = [], 0.9.10 latest stable, 0.10.0-rc.18 still affected, checked 2026-09-24). sqlx-mysql does public-key encryption only; jsonwebtoken rust_crypto (crypto-ring profile) signs RSA client assertions (avoided with EC/EdDSA keys or the fips profile for oidc_relying_party/oauth2_introspection; ai_federation always signs RS256, so only fips avoids it there). Re-evaluate on an rsa fix. [expires:2026-12-31]" },
 
-    # ── rsa 0.9.10 — pulled ONLY by sqlx-mysql. The Marvin timing side-channel
-    # affects RSA key-exchange used by MySQL's sha2 public-key auth fallback.
-    # No fixed release exists upstream. Mitigation: use FERRUM_DB_TLS_MODE so
-    # the MySQL handshake does not fall back to RSA-encrypted password exchange;
-    # only relevant when the MySQL config backend is in use.
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side-channel via sqlx-mysql; no upstream fix; only on the optional MySQL config-DB path; mitigated by DB TLS. Re-evaluate on rsa/sqlx fix. [expires:2026-09-30]" },
-
-    # ── rustls-webpki 0.101.7 — pulled ONLY by the AWS SDK chain (hyper-rustls
-    # 0.24.2 / rustls 0.21), which is gated behind the optional `secrets-aws`
-    # feature (NOT in default builds). The gateway's own TLS stack uses
-    # rustls 0.23 + rustls-webpki 0.103. The AWS chain pins webpki `^0.101.7`,
-    # so the fix (>=0.103.x) is unreachable until aws-sdk-rust moves off
-    # rustls 0.21.
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 CRL-parse panic via AWS SDK (rustls 0.21) behind optional `secrets-aws`; gateway TLS uses webpki 0.103; aws chain pins ^0.101.7. Tracking aws-sdk-rust. [expires:2026-09-30]" },
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 name-constraint (URI) bypass via AWS SDK behind optional `secrets-aws`; gateway TLS uses webpki 0.103. Tracking aws-sdk-rust off rustls 0.21. [expires:2026-09-30]" },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 name-constraint (wildcard) bypass via AWS SDK behind optional `secrets-aws`; gateway TLS uses webpki 0.103. Tracking aws-sdk-rust off rustls 0.21. [expires:2026-09-30]" },
-
-    # ── h2 0.3.27 — pulled ONLY by the AWS SDK chain (aws-smithy-http-client
-    # -> aws-smithy-runtime -> aws-config / aws-runtime / aws-sdk-*), gated
-    # behind the optional `secrets-aws` feature (NOT in default builds). That
-    # path is OUTBOUND to AWS endpoints (Secrets Manager / STS); it never
-    # serves untrusted peers, so the empty-DATA-frame flood is not reachable
-    # there. The advisory has no fix on the 0.3.x line (>=0.4.16 only), and
-    # aws-smithy-http-client still declares an optional `h2 ^0.3.24` for its
-    # legacy hyper-0.14 arm as of 1.3.0, so the transitive copy cannot be
-    # dropped by bumping. The gateway's OWN HTTP/2 data path (h2 0.4.x, used by
-    # Http2ConnectionPool / GrpcConnectionPool / H2 termination) is patched to
-    # 0.4.16 in Cargo.lock — that is the attacker-facing exposure and it is
-    # fixed, not ignored.
-    #
-    # WARNING: cargo-deny ignores are keyed by advisory ID only, NOT by version.
-    # This entry therefore also suppresses RUSTSEC-2026-0258 if h2 0.4.x is ever
-    # regressed below 0.4.16, and `unused-ignored-advisory = "deny"` will NOT
-    # catch that because the 0.3.27 copy keeps the ignore "used". Delete this
-    # entry the moment the AWS chain drops h2 0.3.
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 unbounded empty DATA frames via the AWS SDK legacy hyper-0.14 arm behind optional `secrets-aws`; outbound-to-AWS only, never serving untrusted peers; no 0.3.x fix exists. The gateway's own h2 0.4.x data path is PATCHED to >=0.4.16, not ignored. Tracking aws-sdk-rust dropping h2 0.3. [expires:2026-09-30]" },
-
-    # ── Unmaintained / unsound (advisory schema v2 treats these as deny too).
-    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained; proc-macro only (tikv-jemalloc-ctl + dev-deps), no runtime/security surface. Replace if a successor stabilizes. [expires:2026-09-30]" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0 unmaintained; functional PEM parser at config load. Migrate to rustls-pki-types pemfile helpers. [expires:2026-09-30]" },
+    # ── paste 1.0.15 — RUSTSEC-2024-0436, unmaintained (repository archived).
+    # A proc-macro only: it runs at compile time and has no runtime or network
+    # surface. Parents: tikv-jemalloc-ctl (0.6.1, and still `paste ^1` in the
+    # latest 0.7.0, checked 2026-09-24) and our own test matrix macro
+    # (tests/scaffolding/matrix.rs, dev-dependency). Dropping our dev-dependency
+    # alone would not remove the crate while tikv-jemalloc-ctl keeps it.
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained; proc-macro only (tikv-jemalloc-ctl, still paste ^1 in 0.7.0 as of 2026-09-24, plus the test matrix dev-dependency), no runtime or network surface. Re-evaluate when tikv-jemalloc-ctl drops paste. [expires:2026-12-31]" },
 ]
 
 [bans]
 # The repo intentionally carries duplicate major versions during build-out
-# (rustls 0.21+0.23, hyper 0.14+1.x, hickory 0.25+0.26, tungstenite 0.28+0.29).
+# (for example tungstenite 0.28+0.29 and the RustCrypto digest 0.10/0.11 lines).
 # Surface them as warnings for visibility without blocking PRs.
 #
 # FIPS profile (issue #3510): `--no-default-features --features fips` adds

@@ -18,6 +18,8 @@ use ferrum_edge::admin::{
     jwt_auth::{JwtConfig, JwtManager},
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -210,12 +212,11 @@ fn admin_tls_pair() -> (Arc<rustls::ServerConfig>, String) {
         .signed_by(&leaf_key, &issuer)
         .expect("sign admin test leaf");
 
-    let certs = rustls_pemfile::certs(&mut leaf_cert.pem().as_bytes())
+    let certs = CertificateDer::pem_slice_iter(leaf_cert.pem().as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse admin test leaf certificate");
-    let key = rustls_pemfile::private_key(&mut leaf_key.serialize_pem().as_bytes())
-        .expect("parse admin test leaf key")
-        .expect("admin test leaf key present");
+    let key = PrivateKeyDer::from_pem_slice(leaf_key.serialize_pem().as_bytes())
+        .expect("parse admin test leaf key");
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
@@ -235,7 +236,7 @@ async fn tls_connect(
     alpn: &[u8],
 ) -> tokio_rustls::client::TlsStream<TcpStream> {
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
         let cert = cert.expect("parse admin test CA certificate");
         roots.add(cert).expect("add admin test CA to roots");
     }

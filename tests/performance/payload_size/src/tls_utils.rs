@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
 // -- Certificate generation ---------------------------------------------------
 
@@ -51,12 +52,10 @@ pub fn make_server_tls_config(
     let cert_bytes = std::fs::read(cert_path).context("reading server cert")?;
     let key_bytes = std::fs::read(key_path).context("reading server key")?;
 
-    let certs = rustls_pemfile::certs(&mut &cert_bytes[..])
+    let certs = CertificateDer::pem_slice_iter(&cert_bytes[..])
         .collect::<Result<Vec<_>, _>>()
         .context("parsing PEM certs")?;
-    let key = rustls_pemfile::private_key(&mut &key_bytes[..])
-        .context("parsing PEM key")?
-        .context("no private key found in PEM")?;
+    let key = PrivateKeyDer::from_pem_slice(&key_bytes[..]).context("parsing PEM key")?;
 
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -102,12 +101,10 @@ pub fn make_h3_server_config(
     let cert_bytes = std::fs::read(cert_path).context("reading h3 server cert")?;
     let key_bytes = std::fs::read(key_path).context("reading h3 server key")?;
 
-    let certs = rustls_pemfile::certs(&mut &cert_bytes[..])
+    let certs = CertificateDer::pem_slice_iter(&cert_bytes[..])
         .collect::<Result<Vec<_>, _>>()
         .context("parsing PEM certs for h3")?;
-    let key = rustls_pemfile::private_key(&mut &key_bytes[..])
-        .context("parsing PEM key for h3")?
-        .context("no private key found")?;
+    let key = PrivateKeyDer::from_pem_slice(&key_bytes[..]).context("parsing PEM key for h3")?;
 
     let mut tls_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()

@@ -362,17 +362,16 @@ async fn shutdown_with_no_active_connections_returns_immediately() {
 /// config but reads the cert resolver from the one passed in, so this only
 /// needs to install a working cert chain.
 fn build_h3_test_tls_config(ca: &crate::scaffolding::certs::TestCa) -> Arc<rustls::ServerConfig> {
+    use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     let (cert_pem, key_pem) = ca.valid().expect("test leaf cert");
-    let mut cert_reader = cert_pem.as_bytes();
-    let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-        .filter_map(|c| c.ok())
-        .collect();
-    let mut key_reader = key_pem.as_bytes();
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
-        .expect("parse key")
-        .expect("non-empty key");
+    let cert_chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .filter_map(|c| c.ok())
+            .collect();
+    let key: PrivateKeyDer<'static> =
+        PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("parse key");
 
     let provider = rustls::crypto::ring::default_provider();
     let mut config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(provider))

@@ -19,6 +19,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
@@ -170,15 +172,11 @@ fn self_signed_server_config() -> Arc<rustls::ServerConfig> {
     let params = rcgen::CertificateParams::new(vec![HOST.to_string()]).expect("cert params");
     let cert = params.self_signed(&key_pair).expect("self-sign cert");
     let cert_pem = cert.pem();
-    let mut cert_reader = cert_pem.as_bytes();
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(Result::ok)
         .collect();
     let key_pem = key_pair.serialize_pem();
-    let mut key_reader = key_pem.as_bytes();
-    let private_key = rustls_pemfile::private_key(&mut key_reader)
-        .expect("read private key")
-        .expect("private key present");
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("read private key");
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))

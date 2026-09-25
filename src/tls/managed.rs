@@ -13,12 +13,13 @@
 //! several instances cannot erase one another. See [`crate::tls::shared_store`].
 
 use std::collections::BTreeMap;
-use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use crate::fips::approved::Sha256;
 use chrono::{DateTime, Utc};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use x509_parser::prelude::*;
@@ -806,7 +807,7 @@ struct CertificateMetadata {
 }
 
 fn certificate_metadata(bytes: &[u8]) -> Result<CertificateMetadata, String> {
-    let certs = rustls_pemfile::certs(&mut Cursor::new(bytes))
+    let certs = CertificateDer::pem_slice_iter(bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("failed to parse PEM certificates: {error}"))?;
     let first = certs
@@ -830,7 +831,7 @@ fn certificate_metadata(bytes: &[u8]) -> Result<CertificateMetadata, String> {
 }
 
 fn count_crls(bytes: &[u8]) -> Result<usize, String> {
-    let crls = rustls_pemfile::crls(&mut Cursor::new(bytes))
+    let crls = CertificateRevocationListDer::pem_slice_iter(bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("failed to parse PEM CRLs: {error}"))?;
     if crls.is_empty() {
