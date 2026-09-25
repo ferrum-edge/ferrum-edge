@@ -26,6 +26,8 @@ const COVERAGE_MD: &str = include_str!("../../../docs/coverage.md");
 
 /// Cargo test targets that are not part of the default llvm-cov denominator.
 const OUTSIDE_DEFAULT_COVERAGE_BASELINE: &[&str] = &[
+    // Collected in CI by the dedicated `functional-*` coverage shards, not by
+    // the lib-unit/integration steps or the default `scripts/coverage.sh` run.
     "functional_tests",
     "conformance_tests",
     "secrets_functional",

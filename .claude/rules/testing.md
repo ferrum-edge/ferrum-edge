@@ -157,7 +157,7 @@ shares.
 - Install: `cargo install cargo-llvm-cov --locked && rustup component add llvm-tools-preview`.
 - Run: `scripts/coverage.sh` (lib + unit + integration). HTML report path is printed at the end.
 - Narrow scope: `scripts/coverage.sh -- <filter>` forwards to `cargo llvm-cov`. Example: `scripts/coverage.sh -- plugins::cors`.
-- Functional and conformance suites are intentionally excluded; they spawn subprocesses or use separate coverage reporters. Line coverage for lib/unit/integration runs in CI through `.github/workflows/coverage.yml`.
+- CI coverage (`.github/workflows/coverage.yml`) measures lib/unit/integration plus the functional suite: the `functional-1`/`functional-2` partition shards and the serial service-backed `functional-data` shard run `functional_tests` against the instrumented binary. Local `scripts/coverage.sh` omits functional tests unless passed `--functional`. Conformance stays excluded (separate reporter). A gateway killed with SIGKILL writes no profile; stop spawned gateways through the graceful-shutdown helpers.
 - Coverage outputs (`target/llvm-cov/`, `target/llvm-cov-target/`) are gitignored.
 
 ## Simulating A Server Going Away (tonic)
@@ -201,6 +201,19 @@ shares.
 - Keep the gateway's bounded port-race retry for nonparticipating OS processes.
   The registry is the primary guarantee; do not serialize shards, add `#[serial]`,
   or retry client connections to conceal collisions.
+- **Shutdown and drain assertions need positive evidence** (issue #5739). A
+  connect that succeeds and then stays silent is not a refused listener. A read
+  that stalls, ends early, or ends at a close with no framing is not a
+  response. A wait that times out is not a graceful exit. Check that the
+  signal was delivered and that the exit status is 0, and hold in-flight work
+  with a backend barrier, not a sleep. `functional_graceful_shutdown_test.rs`
+  has the closure probe, the typed HTTP/1.1 reader, and fake-peer tests that
+  check both. Hyper adds `Connection: close` by itself once
+  `graceful_shutdown()` disables keep-alive, so the gateway's own drain hint is
+  pinned in `tests/integration/graceful_shutdown_tests.rs` with the listener's
+  shutdown channel left unsignalled. A hyper client closes an idle connection
+  once its last `SendRequest` drops; keep the sender alive when asserting that
+  the server closed it.
 - Readiness is not identity — and that applies to bespoke spawners too, not just `TestGateway`. `functional_websocket_test.rs::wait_for_owned_gateway` reuses the exported `probe_gateway_identity` because a bare TCP accept let a foreign H2 fixture answer (and `PROTOCOL_ERROR`-reset) an RFC 8441 Extended CONNECT handshake (issue #3435).
 - `TestGateway` mints a per-spawn-attempt admin JWT secret/issuer and `FERRUM_METRICS_BEARER_TOKEN`, and its spawn barrier requires the authenticated detail tier of `/health` plus `ready: true`; that combination is also the proof the child owns its proxy port, because `ready` flips only after every listener bind. Do not weaken it to an unauthenticated `/health` or a bare TCP accept, and do not add sleeps or test-level retries in its place.
 - Use a struct harness with `try_new()` retry wrapper or a `start_gateway_with_retry()` helper.
@@ -237,6 +250,12 @@ shares.
 - **Every spawned gateway must be owned by an RAII guard, not a bare `std::process::Child`** (issue #4991). `Child` does nothing on drop, so a panic between spawn and the explicit shutdown call leaves a live gateway holding its ports. Bespoke spawners wrap the child in `crate::common::GatewayChildGuard` at the instant of spawn; `shutdown()` is idempotent and also runs from `Drop`.
 - **Socket fixtures must not assume Linux host behaviour** (issue #4983): a secondary loopback alias (`127.0.0.2`) exists on Linux but not on macOS; a bound-but-unlistened TCP port refuses on Linux and black-holes on Darwin (`ports::REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY`); Darwin's default UDP datagram ceiling is 9216 bytes; and `SO_REUSEADDR` lets a specific-address and a wildcard listener share one port on Darwin. Prefer a shape every supported host provides (`::1` for a second listen identity, a second ephemeral port for a second UDP session, a sub-ceiling payload for transport probes); where the prerequisite is genuinely required, probe for it and skip with an explicit message naming it. See `docs/functional_testing.md` -> "Host-Dependent Socket Fixtures".
 - Set `FERRUM_POOL_WARMUP_ENABLED=false` in tests that count backend hits.
+- Warmup off does not mean no backend traffic: once ready, file mode still runs
+  one capability refresh, which dials a plaintext backend with the h2c preface
+  (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`). The preface contains a blank line,
+  so a fixture that treats any `\r\n\r\n` as a request head counts the probe
+  as a hit. Match the request line instead
+  (`functional_graceful_shutdown_test.rs::is_client_request`).
 - Keep warmup true when tests require the capability registry to have a `Supported` entry before traffic, such as native H3 or direct H2 routing.
 
 ## Fuzz / property lane

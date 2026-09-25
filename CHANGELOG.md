@@ -19,9 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend_timeout` and transaction-log phase as on HTTP/1.1 and HTTP/2, and
   an expiry is charged to a backend only when that backend held the attempt.
   An attempt budget expiry is retried when the rule's `retry` lists `504`, and
-  the retry replays the retained request body. After the head, the response
-  body is cut with an `H3_REQUEST_CANCELLED` stream reset, never a clean
-  finish, and the cut is health-neutral. The HTTP/3 bridge to gRPC backends,
+  the retry replays the retained request body. The HTTP/3 bridge to HTTP/1.1
+  and HTTP/2 backends collects a buffered response body (a response-body
+  plugin or `response_body_mode: buffer`) inside the attempt when a failure
+  there could be retried, as HTTP/1.1, HTTP/2 and the native HTTP/3 backend
+  pool do (#5738), so a backend that sends its response head and then stalls
+  the body is retried too, and so is a read timeout or reset while that body
+  is read. The discarded attempt releases its buffered bytes and backend
+  connection, and `after_proxy` runs once, for the served response, after its
+  body was read. Without a `backendRequest` budget the bridge still reads a
+  buffered body after its retry loop, so a read timeout or reset there is not
+  retried, unlike HTTP/1.1 and HTTP/2. After the head, the response body is
+  cut with an `H3_REQUEST_CANCELLED` stream reset, never a clean finish, and
+  the cut is health-neutral. The HTTP/3 bridge to gRPC backends,
   and its gRPC-Web pass-through to HTTP/1.1 and HTTP/2 backends, now also start
   a fresh `backendRequest` budget for each retry attempt, end it before retry
   backoff, and charge an expiry after the request was sent to the backend, as
@@ -32,14 +42,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend_timeout`, as on HTTP/1.1 and HTTP/2. A route-timeout `504` no longer
   sets a mesh sticky-session cookie on the HTTP/3 bridge, and one raised while
   an HTTP/3 upload is still buffered is logged under the
-  `route_request_timeout_h3_upload` rejection phase. One deviation remains: the
-  HTTP/3 bridge collects a buffered response body after its retry loop, so an
-  attempt budget that expires during that collection is answered with the
-  charged `504` but not retried. **Operator action:**
+  `route_request_timeout_h3_upload` rejection phase. **Operator action:**
   with `FERRUM_ENABLE_HTTP3=true`, clients may switch back to HTTP/3 on those
   ports, so their UDP port must be reachable, and a response longer than the
   rule's `request` or `backendRequest` is now cut on HTTP/3 as it already was
   on HTTP/1.1 and HTTP/2.
+
+### Fixed
+
+- The graceful-shutdown functional tests no longer pass on evidence that does
+  not show a working drain (#5739). A proxy or TCP stream port now counts as
+  closed only when the connect is refused, or when the peer closes or resets
+  it without answering. Before, a connection that was accepted but never
+  answered also counted, so a hung listener passed. Responses are read with
+  hyper's HTTP/1.1 client. The reader reports a truncated `Content-Length` or
+  chunked body, a stall, a malformed head, and a body that ends only at a
+  socket close as separate failures, instead of treating them as a closed
+  socket or a complete response. The `Connection: close` case now holds a
+  real request at the backend until the listener is closed, then requires the
+  full body together with the close token. An idle socket closed by shutdown
+  no longer passes it; idle-connection closure is its own case. Every case
+  checks that SIGTERM was delivered and that the gateway exits with status 0
+  within its bound. The drain-timeout case also fails if the gateway exits
+  before its drain window ends. New HTTP/1.1 and HTTP/2 (h2c) cases hold a
+  streaming response body open across shutdown. Tests that need no gateway
+  binary check the helpers against fake peers, including a peer that accepts
+  and never answers, and against child processes that never exit or exit
+  non-zero. An in-process integration test begins drain without signalling the
+  listener, so hyper keeps the connection alive and only the gateway's own
+  drain hint can add `Connection: close`. The HTTP/1.1 idle keep-alive
+  integration test now keeps its request sender alive, so it passes only when
+  the server closes the connection. The held backend counts only real `GET`
+  requests as arrivals. It used to count the gateway's startup h2c probe as
+  one, so a drain case could send SIGTERM before its request reached the
+  gateway. When shutdown gives up on a held request (`drain=0` or an expired
+  drain window), the request may be cut off or answered with the gateway's
+  own `502` Backend unavailable body and `Connection: close`, since exit can
+  drop the backend call first. Any other response, a stall, or the unreleased
+  backend body fails.
+- gRPC-Web pass-through on the HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends
+  now matches HTTP/1.1 and HTTP/2 on two points (#5734). Every attempt tells
+  the backend its remaining RPC budget, including the rule's `backendRequest`
+  budget, in `grpc-timeout`, replacing the client's relative value; before, the
+  client's header was forwarded unchanged or none was sent, so the backend
+  could not cancel work the gateway had already abandoned. A `backendRequest`
+  budget that expires after the request was sent now answers the charged
+  backend terminal, `grpc-message: Backend deadline exceeded`, instead of the
+  gateway's own `Deadline exceeded at gateway`; `after_proxy` (for example
+  CORS headers) and response-committed plugins still run over it, and health
+  and circuit-breaker charging were already correct. A gRPC call's budget
+  still starts when the rule is selected and its expiry is still not retried;
+  both stay documented deviations.
+- `adaptive_concurrency` now relearns an obsolete minimum-latency baseline
+  (#5737). The baseline was an all-time minimum, so one unusually fast success
+  (a tiny `200`, a `304`, a cache hit) tightened the latency target forever:
+  ordinary healthy latency then kept shrinking the target to `min_limit`, and
+  concurrent traffic kept receiving `503`s with no backend failure. The
+  baseline is now the minimum of the current and the previous window of
+  `baseline_window_samples` healthy samples per target key (new option,
+  default `1000`), so an outlier stops tightening the target within two
+  windows and saturated healthy traffic regains capacity. A sustained latency
+  increase is still measured against the older, faster window and keeps
+  shrinking the limit until that window rolls out; backend failures, the
+  recovery-cohort barrier, and in-flight accounting are unchanged, and
+  compatible reloads keep the learned windows.
 
 ## [0.9.7] - 2026-09-25
 
