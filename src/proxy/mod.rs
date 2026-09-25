@@ -24925,6 +24925,69 @@ async fn encode_semantic_cache_replay(
     .await;
 }
 
+/// One `after_proxy` hook over proxy core's charged backend deadline terminal
+/// (#5744).
+enum ChargedTerminalAfterProxyHook {
+    /// The hook completed within its one poll, or the admitted credential's
+    /// authorization lifetime had already elapsed; act on the result.
+    Completed(PluginResult),
+    /// A response replacer, which never runs over the charged terminal.
+    Skipped,
+    /// The hook was still pending after its one poll. It and every later hook
+    /// continue detached under the cleanup bound.
+    Detached,
+}
+
+/// Run one `after_proxy` hook over proxy core's charged backend deadline
+/// terminal (#5744), bounded as the HTTP/3 bridge bounds its charged terminal
+/// (`apply_after_proxy_hooks_to_charged_deadline_rejection`). The terminal is
+/// written after its deadline passed, so no hook may hold it, whether or not an
+/// RPC deadline is still in force. A response replacer is skipped. Any other
+/// hook gets one poll, and pending work continues detached on owned state. A
+/// rejection from a hook that completed is ignored, so the terminal keeps its
+/// `Backend deadline exceeded` wording. An elapsed authorization lifetime is
+/// never detached: it settles the fixed authorization terminal before any hook
+/// is polled.
+async fn run_charged_terminal_after_proxy_hook(
+    plugins: &[Arc<dyn Plugin>],
+    index: usize,
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+) -> ChargedTerminalAfterProxyHook {
+    let plugin = &plugins[index];
+    if plugin.may_replace_rejection_response() {
+        return ChargedTerminalAfterProxyHook::Skipped;
+    }
+    let bound = ctx.precommit_response_phase_bound();
+    if let Some(termination) = bound.expired_authorization() {
+        let result = settle_precommit_authorization_expiry(ctx, termination);
+        return ChargedTerminalAfterProxyHook::Completed(result);
+    }
+    let mut future = owned_rejection_hook_future(
+        Arc::clone(plugin),
+        ctx.clone(),
+        response_status,
+        None,
+        response_headers.clone(),
+    );
+    let Some(outcome) = poll_owned_rejection_hook_once(&mut future).await else {
+        let remaining = plugins[index + 1..].to_vec();
+        spawn_detached_rejection_cleanup(future, remaining, None, None, false);
+        return ChargedTerminalAfterProxyHook::Detached;
+    };
+    *ctx = outcome.ctx;
+    *response_headers = outcome.response_headers;
+    if !matches!(outcome.result, PluginResult::Continue) {
+        warn_sampled!(
+            rejecting_plugin = plugin.name(),
+            "after_proxy plugin returned Reject over a charged backend deadline terminal; \
+             ignoring (the terminal keeps its wording)"
+        );
+    }
+    ChargedTerminalAfterProxyHook::Completed(PluginResult::Continue)
+}
+
 pub(crate) async fn run_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -25022,13 +25085,29 @@ pub(crate) async fn run_after_proxy_hooks(
             ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
         }
 
-        let bound = ctx.precommit_response_phase_bound();
-        let result = crate::plugins::await_precommit_response_phase(
-            bound,
-            plugin.after_proxy(ctx, response_status, response_headers),
-        )
-        .await
-        .into_plugin_result(ctx);
+        let result = if ctx.charged_backend_deadline_terminal() {
+            match run_charged_terminal_after_proxy_hook(
+                plugins,
+                index,
+                ctx,
+                response_status,
+                response_headers,
+            )
+            .await
+            {
+                ChargedTerminalAfterProxyHook::Completed(result) => result,
+                ChargedTerminalAfterProxyHook::Skipped => continue,
+                ChargedTerminalAfterProxyHook::Detached => break,
+            }
+        } else {
+            let bound = ctx.precommit_response_phase_bound();
+            crate::plugins::await_precommit_response_phase(
+                bound,
+                plugin.after_proxy(ctx, response_status, response_headers),
+            )
+            .await
+            .into_plugin_result(ctx)
+        };
         match result {
             PluginResult::Continue => {
                 // After the last eligible response_transformer static-rule pass,
@@ -25102,6 +25181,11 @@ pub(crate) async fn run_after_proxy_hooks(
     ctx.metadata
         .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
     ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
+    // Over a charged terminal the last route response finalizer may have been
+    // skipped or detached; apply the matched route list exactly once.
+    if ctx.charged_backend_deadline_terminal() {
+        maybe_finalize_route_override_response_headers(plugins, ctx, response_headers);
+    }
 
     // Final response-header phase. Reached only when the whole `after_proxy`
     // chain accepted this response, which makes `response_headers` the
@@ -28509,6 +28593,12 @@ pub(crate) fn spawn_detached_response_committed_hooks(
 /// response and transfer that exact pending invocation plus the remaining
 /// observers to bounded, owned post-response cleanup. Earlier observers are
 /// never replayed and no observer can retain the client response writer.
+///
+/// Over proxy core's charged backend deadline terminal (#5744) each observer
+/// gets one poll, as over the gateway deadline terminal, even with no RPC
+/// deadline in force. A pending one moves to the same bounded cleanup, and the
+/// terminal keeps its charged wording. An authorization expiry is never
+/// detached.
 pub(crate) async fn run_deadline_bounded_response_committed_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -28523,13 +28613,15 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             continue;
         }
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+        let charged_terminal =
+            !terminal_gateway_deadline && ctx.charged_backend_deadline_terminal();
         let (pending_hook, detached_bound) = match run_response_committed_hook_until_deadline(
             Arc::clone(plugin),
             ctx,
             *response_status,
             response_headers,
             response_body.clone(),
-            terminal_gateway_deadline,
+            terminal_gateway_deadline || charged_terminal,
         )
         .await
         {
@@ -28563,6 +28655,19 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
                 return true;
             }
         };
+        if charged_terminal {
+            // The charged terminal is already the client's response: the
+            // pending observer and the rest continue detached over it.
+            spawn_detached_response_committed_hooks(
+                pending_hook,
+                plugins[index + 1..].to_vec(),
+                *response_status,
+                Arc::new(response_headers.clone()),
+                response_body.clone(),
+                detached_bound,
+            );
+            return terminal_at_entry;
+        }
 
         let owned_grpc_web_response_content_type =
             crate::plugins::grpc_web::retained_response_content_type(ctx)
@@ -38030,9 +38135,10 @@ async fn handle_proxy_request_inner(
                     initial_handed_to_backend,
                     &mut response,
                 ) {
-                    // The charged attempt's budget is spent: the response
-                    // pipeline and any retry are bounded by the total deadline.
-                    ctx.end_grpc_route_attempt();
+                    // The charged attempt's budget is spent: any retry is
+                    // bounded by the total deadline, and the response pipeline
+                    // bounds its hooks by the charged-terminal marker.
+                    ctx.end_charged_grpc_route_attempt();
                 }
                 (response, retained_body)
             }
@@ -38707,9 +38813,10 @@ async fn handle_proxy_request_inner(
                 true,
                 &mut result,
             ) {
-                // The charged attempt's budget is spent: the response pipeline
-                // and any further retry are bounded by the total deadline.
-                ctx.end_grpc_route_attempt();
+                // The charged attempt's budget is spent: any further retry is
+                // bounded by the total deadline, and the response pipeline
+                // bounds its hooks by the charged-terminal marker.
+                ctx.end_charged_grpc_route_attempt();
             }
             // Retry helpers can reject the selected target before dialing it
             // (most notably when the egress policy blocks its resolved
@@ -38833,8 +38940,8 @@ async fn handle_proxy_request_inner(
                     &mut response,
                 ) {
                     // The charged attempt's budget is spent: the response
-                    // pipeline is bounded by the total deadline alone.
-                    ctx.end_grpc_route_attempt();
+                    // pipeline bounds its hooks by the charged-terminal marker.
+                    ctx.end_charged_grpc_route_attempt();
                 }
                 response
             }
@@ -39418,7 +39525,15 @@ async fn handle_proxy_request_inner(
     // The fragment gate lives inside `normalize_response_body_for_inspection`
     // itself, so every protocol path reaches it identically; duplicating it here
     // would let one path drift from the others.
+    //
+    // A charged backend deadline terminal (#5744) is gateway-authored and
+    // written after its deadline passed. Like a rejection, it skips the
+    // normalizers and the final-body validators below: none may hold it, and
+    // none may replace its `Backend deadline exceeded` wording. The transform
+    // phase still runs so a translated gRPC-Web terminal gets its wire shape.
+    let charged_backend_deadline_terminal = ctx.charged_backend_deadline_terminal();
     if !after_proxy_rejected
+        && !charged_backend_deadline_terminal
         && !plugins.is_empty()
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
@@ -39450,6 +39565,7 @@ async fn handle_proxy_request_inner(
     // A Reject result replaces the response before it reaches the client.
     if !after_proxy_rejected
         && !response_body_rejected
+        && !charged_backend_deadline_terminal
         && !plugins.is_empty()
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
@@ -39608,6 +39724,7 @@ async fn handle_proxy_request_inner(
     // This lets plugins validate or persist the final client-visible payload.
     if !after_proxy_rejected
         && !response_body_rejected
+        && !charged_backend_deadline_terminal
         && !plugins.is_empty()
         && let ResponseBody::Buffered(ref data) = response_body
     {
@@ -49364,11 +49481,13 @@ pub(crate) fn charge_grpc_route_attempt_budget_expiry(
 /// backend read timeout.
 ///
 /// Returns whether it charged. Proxy core then ends the spent attempt budget
-/// (#5744): the charged terminal flows through the ordinary response pipeline,
-/// whose phases are bounded by the RPC deadline in force, and an expired
-/// attempt budget still in force there would make the first `after_proxy` hook
-/// select the gateway's own deadline and replace `Backend deadline exceeded`
-/// with `Deadline exceeded at gateway`.
+/// and marks the charged terminal (`end_charged_grpc_route_attempt`, #5744).
+/// The terminal flows through the ordinary response pipeline, whose phases
+/// are bounded by the RPC deadline in force. An expired attempt budget still in
+/// force there would make the first `after_proxy` hook select the gateway's own
+/// deadline and replace `Backend deadline exceeded` with `Deadline exceeded at
+/// gateway`. With only the budget ended, nothing would bound the hooks at all;
+/// the marker bounds them as over the gateway deadline terminal instead.
 pub(crate) fn charge_generic_grpc_route_attempt_budget_expiry(
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,

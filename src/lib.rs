@@ -7384,6 +7384,21 @@ pub mod _test_support {
         .await
     }
 
+    /// End a gRPC attempt as proxy core does after charging its budget expiry
+    /// to the backend, marking the charged `Backend deadline exceeded`
+    /// terminal (#5744).
+    pub fn end_charged_grpc_route_attempt_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.end_charged_grpc_route_attempt();
+    }
+
+    /// Whether the context holds proxy core's charged backend deadline
+    /// terminal (#5744).
+    pub fn charged_backend_deadline_terminal_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.charged_backend_deadline_terminal()
+    }
+
     /// Like [`transform_buffered_response_body_with_deadline_for_test`] but
     /// returns the full `(response_replaced, representation_rewritten)` pair,
     /// so a test can distinguish "the gate rejected and replaced the response"

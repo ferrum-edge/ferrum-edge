@@ -2700,6 +2700,9 @@ pub(crate) fn plain_grpc_web_backend_deadline_after_head(
     head_headers: &HashMap<String, String>,
 ) -> PluginResult {
     let mut decorations = head_headers.clone();
+    // Keeping a gateway-minted sticky cookie is intentional: it matches the
+    // gateway deadline rebuild of the same head, which keeps it too, so both
+    // terminals bind the client to the backend that served the head.
     ctx.retain_deadline_response_gateway_headers(&mut decorations);
     plain_grpc_web_backend_deadline_plugin_result(decorations)
 }
@@ -2821,6 +2824,13 @@ where
 {
     ctx.mark_gateway_deadline_response_selected();
     if write_in_flight {
+        // The reset still answers the client deadline: the transaction log
+        // records `DEADLINE_EXCEEDED`, as the native gRPC head-write abort does.
+        crate::proxy::insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+        );
         crate::http3::stream_util::abort_response_stream(stream);
         return (0, false);
     }
@@ -3377,20 +3387,27 @@ where
                         // `after_proxy` and the response write read it as the
                         // gateway's own deadline and replace `Backend deadline
                         // exceeded` with `Deadline exceeded at gateway`. The
-                        // gateway-local bound is re-derived before any backoff.
+                        // shared pipeline reads the two re-derived bounds. The
+                        // gateway-local bound is not read again on this path: a
+                        // retry re-derives all three before its backoff, and
+                        // the terminal attempt leaves the loop. Assigning it
+                        // here would be a dead store. The charged-terminal
+                        // marker then bounds the shared pipeline's
+                        // `after_proxy` and committed hooks as proxy core
+                        // bounds them; a retry clears it.
                         if crate::proxy::charge_generic_grpc_route_attempt_budget_expiry(
                             ctx,
                             proxy_headers,
                             true,
                             &mut attempt_result,
                         ) {
-                            (grpc_web_deadline_at, plain_write_bound, _) =
-                                end_plain_route_attempt(
-                                    ctx,
-                                    policy_flavor,
-                                    plain_auth_deadline_plan,
-                                    route,
-                                );
+                            (grpc_web_deadline_at, plain_write_bound, _) = end_plain_route_attempt(
+                                ctx,
+                                policy_flavor,
+                                plain_auth_deadline_plan,
+                                route,
+                            );
+                            ctx.end_charged_grpc_route_attempt();
                         }
                         if let Some(retry_config) = retry_config
                             && !crate::http3::route_deadline::total_expiry_recorded(route, ctx)
@@ -11583,6 +11600,13 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     ctx.mark_gateway_deadline_response_selected();
+    // The reset still answers the client deadline: the transaction log records
+    // `DEADLINE_EXCEEDED`, as the native gRPC head-write abort does.
+    crate::proxy::insert_grpc_error_metadata(
+        &mut ctx.metadata,
+        grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+        GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+    );
     let mut outcome = reset_offered_plain_head(stream, StatusCode::OK, backend_start, bytes_sent);
     outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
     outcome.body_error_class = Some(ErrorClass::ClientDisconnect);

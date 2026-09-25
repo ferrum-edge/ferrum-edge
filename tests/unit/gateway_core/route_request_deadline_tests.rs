@@ -1096,9 +1096,48 @@ fn native_http3_plain_bridge_resets_after_a_cut_grpc_web_body_write() {
         .find("stream.send_data(")
         .expect("the appended terminal");
     assert!(reset < data, "the reset must come before any appended DATA");
+    let cut = &append[reset..data];
     assert!(
-        append[reset..data].contains("abort_response_stream(stream);"),
+        cut.contains("abort_response_stream(stream);"),
         "a cut write must be answered with a reset"
+    );
+    let logged = cut
+        .find("insert_grpc_error_metadata(")
+        .expect("a cut write still logs DEADLINE_EXCEEDED");
+    assert!(
+        logged < cut.find("abort_response_stream(stream);").unwrap(),
+        "the transaction log records the deadline before the reset"
+    );
+}
+
+/// A gRPC-Web deadline that cancels an offered response head resets the stream
+/// and still records `grpc_status=4` for the transaction log, as the native
+/// gRPC head-write abort does.
+#[test]
+fn native_http3_plain_bridge_logs_the_deadline_for_a_reset_grpc_web_head() {
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let reset = bridge
+        .split("fn reset_offered_plain_grpc_web_deadline_head<S>(")
+        .nth(1)
+        .expect("reset_offered_plain_grpc_web_deadline_head")
+        .split("\n}\n")
+        .next()
+        .expect("bounded reset_offered_plain_grpc_web_deadline_head");
+    let logged = reset
+        .find("insert_grpc_error_metadata(")
+        .expect("the reset records the deadline");
+    let head_reset = reset
+        .find("reset_offered_plain_head(")
+        .expect("the offered head is reset");
+    assert!(
+        logged < head_reset,
+        "the transaction log records the deadline before the reset"
+    );
+    let recorded = &reset[logged..head_reset];
+    assert!(
+        recorded.contains("grpc_proxy::grpc_status::DEADLINE_EXCEEDED,")
+            && recorded.contains("GATEWAY_DEADLINE_EXCEEDED_MESSAGE,"),
+        "the recorded terminal is the gateway's DEADLINE_EXCEEDED"
     );
 }
 
@@ -1150,6 +1189,10 @@ fn native_http3_plain_bridge_mesh_arm_ends_a_charged_attempt_budget() {
         charged.contains("(grpc_web_deadline_at, plain_write_bound, _) =")
             && charged.contains("end_plain_route_attempt("),
         "a charged mesh expiry must end the attempt budget and re-derive the bounds"
+    );
+    assert!(
+        charged.contains("ctx.end_charged_grpc_route_attempt();"),
+        "a charged mesh expiry must mark the charged terminal for the shared pipeline"
     );
 }
 

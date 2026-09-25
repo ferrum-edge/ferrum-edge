@@ -1129,6 +1129,180 @@ async fn charged_deadline_committed_observers_are_bounded_and_keep_the_wording()
         .expect("the detached observer must continue");
 }
 
+/// A non-replacing `after_proxy` hook that rejects the response in hand.
+struct RejectingAfterProxyHook;
+
+#[async_trait::async_trait]
+impl Plugin for RejectingAfterProxyHook {
+    fn name(&self) -> &str {
+        "rejecting_after_proxy_hook"
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 502,
+            body: "rejected".to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// Proxy core's charged backend deadline terminal on HTTP/1.1 and HTTP/2
+/// (#5744) bounds its ordinary `after_proxy` chain as the HTTP/3 bridge bounds
+/// its charged terminal. With only an attempt budget configured, no RPC
+/// deadline is in force once that budget ends, yet a replacer is skipped, a
+/// rejecting hook cannot replace the terminal, a ready decorator still
+/// decorates, and a pending hook gets one poll and continues detached. The
+/// terminal keeps its `Backend deadline exceeded` wording.
+#[tokio::test]
+async fn proxy_core_charged_terminal_after_proxy_hooks_are_bounded() {
+    use ferrum_edge::_test_support::{
+        end_charged_grpc_route_attempt_for_test, gateway_deadline_response_selected_for_test,
+        run_after_proxy_hooks_reject_for_test,
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(ImmediateRejectHeaderDecorator),
+        Arc::new(ReplacingRejectHook),
+        Arc::new(RejectingAfterProxyHook),
+        Arc::new(SlowRejectDecorator {
+            name: "stalled-decorator",
+            delay: std::time::Duration::from_secs(3600),
+            calls: Arc::clone(&calls),
+            completed: Arc::clone(&completed),
+            completion: Arc::new(tokio::sync::Notify::new()),
+        }),
+    ];
+
+    // Unmarked, the same hooks replace the terminal: the first rejection wins.
+    let mut unmarked = create_grpc_context_with_timeout(None);
+    let mut headers = charged_backend_deadline_headers();
+    let replaced =
+        run_after_proxy_hooks_reject_for_test(&plugins[..3], &mut unmarked, 200, &mut headers)
+            .await;
+    assert!(
+        replaced.is_some(),
+        "an unmarked response is replaced by a rejecting hook"
+    );
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    assert!(ctx.grpc_deadline_at().is_none());
+    let mut headers = charged_backend_deadline_headers();
+
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers),
+    )
+    .await
+    .expect("a pending hook must not hold the charged terminal");
+
+    assert!(
+        rejected.is_none(),
+        "no hook may replace the charged terminal"
+    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Backend deadline exceeded")
+    );
+    assert_eq!(
+        headers.get("x-before-deadline").map(String::as_str),
+        Some("trusted"),
+        "a ready decorator still decorates the charged terminal"
+    );
+    assert!(!headers.contains_key("x-stalled-decorator-complete"));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the pending decorator gets exactly one poll"
+    );
+    assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(!gateway_deadline_response_selected_for_test(&ctx));
+}
+
+/// Proxy core's committed observers over its charged terminal (#5744) get one
+/// poll each with no RPC deadline in force and then continue detached. The
+/// buffered terminal keeps its charged wording.
+#[tokio::test]
+async fn proxy_core_charged_terminal_committed_observers_are_bounded() {
+    use ferrum_edge::_test_support::{
+        end_charged_grpc_route_attempt_for_test,
+        run_deadline_bounded_response_committed_hooks_for_test,
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completion = Arc::new(tokio::sync::Notify::new());
+    let probe = CommittedHookProbe {
+        calls: Arc::clone(&calls),
+        observed_grpc_statuses: Arc::new(std::sync::Mutex::new(Vec::new())),
+        release: Some(Arc::clone(&release)),
+        completion: Arc::clone(&completion),
+    };
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(probe)];
+    let mut ctx = create_grpc_context_with_timeout(None);
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    assert!(ctx.grpc_deadline_at().is_none());
+    let mut status = 200;
+    let mut headers = charged_backend_deadline_headers();
+    let mut body = bytes::Bytes::new();
+
+    let replaced = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        ),
+    )
+    .await
+    .expect("a pending observer must not hold the charged terminal");
+
+    assert!(!replaced, "the charged terminal must not be reworded");
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Backend deadline exceeded")
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    release.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(2), completion.notified())
+        .await
+        .expect("the detached observer must continue");
+}
+
+/// The charged-terminal marker (#5744) describes only the response of the
+/// attempt that was charged: ending that attempt for retry backoff, or starting
+/// the next attempt, clears it.
+#[test]
+fn a_retry_clears_the_charged_terminal_marker() {
+    use ferrum_edge::_test_support::{
+        charged_backend_deadline_terminal_for_test, end_charged_grpc_route_attempt_for_test,
+    };
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    assert!(!charged_backend_deadline_terminal_for_test(&ctx));
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    assert!(charged_backend_deadline_terminal_for_test(&ctx));
+    ctx.end_grpc_route_attempt();
+    assert!(!charged_backend_deadline_terminal_for_test(&ctx));
+
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    ctx.begin_grpc_route_attempt();
+    assert!(!charged_backend_deadline_terminal_for_test(&ctx));
+}
+
 #[tokio::test]
 async fn context_free_final_body_timeout_marks_authoritative_deadline_provenance() {
     use ferrum_edge::_test_support::{
