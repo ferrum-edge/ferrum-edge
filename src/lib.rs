@@ -2173,6 +2173,7 @@ pub mod _test_support {
                     initial_limit,
                     max_limit,
                     min_samples: 1,
+                    baseline_window_samples: 1000,
                     target_latency_multiplier: 1.5,
                     decrease_ratio,
                     increase_step: 1,
