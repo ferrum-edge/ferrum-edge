@@ -7678,6 +7678,63 @@ pub mod _test_support {
         .await;
     }
 
+    /// Run reject-path `after_proxy` hooks over a gateway-generated gRPC-Web
+    /// error terminal (#5747): bounded as over the charged terminal, with the
+    /// terminal's own wording kept.
+    pub async fn apply_after_proxy_hooks_to_gateway_error_terminal_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: &mut u16,
+        response_body: &mut bytes::Bytes,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::apply_after_proxy_hooks_to_gateway_error_terminal(
+            plugins,
+            ctx,
+            status_code,
+            response_body,
+            response_headers,
+        )
+        .await;
+    }
+
+    /// Build the gRPC-Web error terminal proxy core's native gRPC branch
+    /// returns for a gateway-generated backend error (#5747), through the same
+    /// out-of-line builder both of that arm's gRPC-Web call sites use.
+    pub async fn grpc_web_gateway_error_response_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_content_type: &str,
+        grpc_status: u32,
+        message: &str,
+        initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    ) -> http::Response<crate::proxy::ProxyBody> {
+        crate::proxy::boxed_grpc_web_gateway_error_response(
+            plugins,
+            ctx,
+            response_content_type,
+            grpc_status,
+            message,
+            initial_response_header_policy_plugins,
+        )
+        .await
+    }
+
+    /// The HTTP/3 plain bridge's header map for a gRPC-Web gateway error
+    /// terminal selected after `after_proxy` decorated `head_headers` (#5747),
+    /// here a response found too large while its body is collected.
+    pub fn h3_grpc_web_gateway_error_after_head_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        head_headers: &HashMap<String, String>,
+        terminal_headers: HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        crate::http3::cross_protocol::plain_grpc_web_gateway_error_after_head_headers(
+            ctx,
+            head_headers,
+            terminal_headers,
+        )
+    }
+
     /// The HTTP/3 plain bridge's charged gRPC-Web terminal for a budget expiry
     /// after `after_proxy` added `gateway_headers` to the backend's response
     /// head (#5744): its status and header map.
@@ -7731,6 +7788,27 @@ pub mod _test_support {
         )
         .await;
         (replaced, normalized.grpc_message)
+    }
+
+    /// Run the HTTP/3 plain bridge's buffered response-body plugin pipeline,
+    /// which its reqwest and mesh-egress arms share, over a buffered response.
+    pub async fn h3_run_plain_buffered_response_plugin_pipeline_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut bytes::Bytes,
+    ) {
+        crate::http3::cross_protocol::run_plain_buffered_response_plugin_pipeline(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            &[],
+            &[],
+        )
+        .await;
     }
 
     pub async fn run_after_proxy_hooks_for_test(

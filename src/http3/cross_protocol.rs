@@ -2529,10 +2529,12 @@ fn mark_plain_route_backoff_expiry(ctx: &mut RequestContext) {
 /// the client upload, acquiring the backend client, or in retry backoff. No
 /// backend held the request, so it is health-neutral, and the transaction log
 /// names the phase (`before_dispatch` unless backoff already recorded
-/// `retry_backoff`).
+/// `retry_backoff`). A gRPC-Web client's terminal is decorated through
+/// [`write_plain_gateway_error_terminal`] (#5747).
 #[inline(never)]
 async fn write_plain_route_timeout<S>(
     stream: &mut RequestStream<S, Bytes>,
+    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     backend_start: Instant,
     bytes_sent: u64,
@@ -2547,8 +2549,14 @@ where
     );
     let class = ErrorClass::DispatchPolicyRejected;
     let response = crate::proxy::route_request_timeout_response(None, class);
-    let written =
-        write_classified_backend_dispatch_error(stream, ctx, &response, backend_start, bytes_sent);
+    let written = write_classified_backend_dispatch_error(
+        stream,
+        plugins,
+        ctx,
+        &response,
+        backend_start,
+        bytes_sent,
+    );
     let mut outcome = written.await?;
     outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
     Ok(outcome)
@@ -2572,6 +2580,7 @@ where
     if plain_route_deadline_fired(ctx) {
         return write_plain_route_timeout(
             stream,
+            plugins,
             ctx,
             backend_start,
             bytes_sent,
@@ -2705,6 +2714,24 @@ pub(crate) fn plain_grpc_web_backend_deadline_after_head(
     // terminals bind the client to the backend that served the head.
     ctx.retain_deadline_response_gateway_headers(&mut decorations);
     plain_grpc_web_backend_deadline_plugin_result(decorations)
+}
+
+/// The header map of a gRPC-Web gateway error terminal selected after
+/// `after_proxy` decorated the response head: a response found too large, or
+/// unretainable, while its body is collected (#5747). The head's
+/// provenance-known gateway decorations (CORS) are carried over without
+/// running `after_proxy` a second time, every backend field is shed, and the
+/// terminal's own fields win. `run_after_proxy_hooks` arms that provenance for
+/// every gRPC-Web head, so this holds with no RPC deadline and no body policy.
+pub(crate) fn plain_grpc_web_gateway_error_after_head_headers(
+    ctx: &mut RequestContext,
+    head_headers: &HashMap<String, String>,
+    terminal_headers: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut decorations = head_headers.clone();
+    ctx.retain_deadline_response_gateway_headers(&mut decorations);
+    decorations.extend(terminal_headers);
+    decorations
 }
 
 /// The trailers-only rejection [`write_plain_grpc_web_deadline_after_handoff`]
@@ -4309,6 +4336,7 @@ where
                             );
                             let mut outcome = write_classified_backend_dispatch_error(
                                 stream,
+                                plugins,
                                 ctx,
                                 &attempt_result,
                                 backend_start,
@@ -5232,6 +5260,7 @@ where
                         );
                         let mut outcome = write_classified_backend_dispatch_error(
                             stream,
+                            plugins,
                             ctx,
                             &attempt_result,
                             backend_start,
@@ -5369,12 +5398,15 @@ where
             },
             backend_admission_elapsed,
         );
-        let mut outcome = write_plain_gateway_error(
+        // `after_proxy` has not run over this head: a gRPC-Web terminal is
+        // decorated as a gateway error terminal (#5747).
+        let mut outcome = write_plain_gateway_error_terminal(
             stream,
+            plugins,
             ctx,
             StatusCode::BAD_GATEWAY,
-            r#"{"error":"Backend response body exceeds maximum size"}"#,
-            None,
+            Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
+            HashMap::new(),
             backend_start,
             bytes_sent,
         )
@@ -5595,7 +5627,17 @@ where
                     error_class,
                     backend_admission_elapsed,
                 );
-                let reject_headers = plain_collect_failure_headers(reject_status);
+                let mut reject_headers = plain_collect_failure_headers(reject_status);
+                // `after_proxy` already decorated this head: a gRPC-Web terminal
+                // carries its provenance-known gateway decorations (CORS)
+                // instead of running the hooks a second time (#5747).
+                if crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
+                    reject_headers = plain_grpc_web_gateway_error_after_head_headers(
+                        ctx,
+                        &response_headers,
+                        reject_headers,
+                    );
+                }
                 let mut outcome = write_plain_gateway_reject(
                     stream,
                     ctx,
@@ -5644,141 +5686,15 @@ where
             }
         };
 
-        let plugin_pipeline = async {
-            if !plugins.is_empty() {
-                normalize_response_body_for_inspection(
-                    plugins,
-                    ctx,
-                    &mut response_status,
-                    &mut response_headers,
-                    &mut response_body,
-                    initial_response_header_policy_plugins,
-                )
-                .await;
-                // Set once an earlier body phase selects a gateway-authored
-                // terminal response. Transforms still run so presentation and
-                // protocol encoding stays correct, but final-body validators
-                // must not replace the selected error. A retained-response
-                // capacity terminal is already protocol-correct and skips those
-                // later mutating phases.
-                let mut response_body_rejected = ctx.gateway_capacity_response_selected();
-                if !response_body_rejected {
-                    for plugin in plugins {
-                        let result = plugin
-                            .on_response_body(
-                                ctx,
-                                response_status,
-                                &mut response_headers,
-                                &response_body,
-                            )
-                            .await;
-                        match result {
-                            PluginResult::Continue => {
-                                if crate::proxy::install_pending_buffered_response_capacity_refusal(
-                                    ctx,
-                                    &mut response_status,
-                                    &mut response_headers,
-                                    &mut response_body,
-                                    crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
-                                        initial_response_header_policy_plugins,
-                                    ),
-                                ) {
-                                    response_body_rejected = true;
-                                    break;
-                                }
-                                ctx.record_deadline_response_header_plugin(
-                                    plugin.as_ref(),
-                                    &response_headers,
-                                );
-                            }
-                            reject @ PluginResult::Reject { .. }
-                            | reject @ PluginResult::RejectBinary { .. } => {
-                                apply_buffered_plain_plugin_reject(
-                                    plugins,
-                                    ctx,
-                                    reject,
-                                    &mut response_status,
-                                    &mut response_headers,
-                                    &mut response_body,
-                                )
-                                .await;
-                                response_body_rejected = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Shared representation gate — identical to H1/H2 and native H3.
-                // An H3 client bridged to an H1/H2 backend must not receive a
-                // protected representation this gateway could not inspect just
-                // because the frontend protocol differs.
-                let owned_grpc_web_response_content_type =
-                    crate::plugins::grpc_web::retained_response_content_type(ctx)
-                        .map(str::to_owned);
-                let grpc_web_response_content_type =
-                    owned_grpc_web_response_content_type.as_deref();
-                let (response_replaced, _) =
-                    crate::proxy::transform_buffered_response_body_with_deadline(
-                        plugins,
-                        ctx,
-                        crate::proxy::buffered_response_representation_origin(
-                            response_body_rejected,
-                        ),
-                        &mut response_status,
-                        &mut response_headers,
-                        &mut response_body,
-                        grpc_web_response_content_type,
-                        initial_response_header_policy_plugins,
-                    )
-                    .await;
-                response_body_rejected |= response_replaced;
-
-                if !response_body_rejected {
-                    for plugin in plugins {
-                        if plugin.enforces_final_client_visible_response_body(ctx) {
-                            continue;
-                        }
-                        let result = plugin
-                            .on_final_response_body(
-                                ctx,
-                                response_status,
-                                &response_headers,
-                                &response_body,
-                            )
-                            .await;
-                        match result {
-                            PluginResult::Continue => {}
-                            reject @ PluginResult::Reject { .. }
-                            | reject @ PluginResult::RejectBinary { .. } => {
-                                apply_buffered_plain_plugin_reject(
-                                    plugins,
-                                    ctx,
-                                    reject,
-                                    &mut response_status,
-                                    &mut response_headers,
-                                    &mut response_body,
-                                )
-                                .await;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if !response_committed_plugins.is_empty() {
-                    crate::proxy::run_deadline_bounded_response_committed_hooks(
-                        response_committed_plugins,
-                        ctx,
-                        &mut response_status,
-                        &mut response_headers,
-                        &mut response_body,
-                        initial_response_header_policy_plugins,
-                    )
-                    .await;
-                }
-            }
-        };
+        let plugin_pipeline = run_plain_buffered_response_plugin_pipeline(
+            plugins,
+            ctx,
+            &mut response_status,
+            &mut response_headers,
+            &mut response_body,
+            initial_response_header_policy_plugins,
+            response_committed_plugins,
+        );
         if crate::plugins::await_grpc_deadline(grpc_web_deadline_at, plugin_pipeline)
             .await
             .is_err()
@@ -6423,6 +6339,146 @@ where
         backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
         rejection_logged: false,
     })
+}
+
+/// The buffered plain bridge's response-body plugin pipeline, shared by the
+/// reqwest and mesh-egress arms: the protocol normalizers, `on_response_body`,
+/// the representation transform gate, `on_final_response_body`, and the
+/// response-committed observers.
+///
+/// A charged backend deadline terminal (#5744) is gateway-authored and written
+/// after its deadline passed. As in proxy core, it skips the normalizers,
+/// `on_response_body`, and the final-body validators: none may hold it, and
+/// none may replace its `Backend deadline exceeded` wording (#5747). The
+/// transform phase still runs so a translated gRPC-Web terminal gets its wire
+/// shape, and the charged-terminal marker bounds the committed observers.
+pub(crate) async fn run_plain_buffered_response_plugin_pipeline(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    response_committed_plugins: &[Arc<dyn Plugin>],
+) {
+    if plugins.is_empty() {
+        return;
+    }
+    let charged_backend_deadline_terminal = ctx.charged_backend_deadline_terminal();
+    if !charged_backend_deadline_terminal {
+        normalize_response_body_for_inspection(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            initial_response_header_policy_plugins,
+        )
+        .await;
+    }
+    // Set once an earlier body phase selects a gateway-authored terminal
+    // response. Transforms still run so presentation and protocol encoding
+    // stays correct, but final-body validators must not replace the selected
+    // error. A retained-response capacity terminal is already protocol-correct
+    // and skips those later mutating phases.
+    let mut response_body_rejected = ctx.gateway_capacity_response_selected();
+    if !response_body_rejected && !charged_backend_deadline_terminal {
+        for plugin in plugins {
+            let result = plugin
+                .on_response_body(ctx, *response_status, response_headers, response_body)
+                .await;
+            match result {
+                PluginResult::Continue => {
+                    if crate::proxy::install_pending_buffered_response_capacity_refusal(
+                        ctx,
+                        response_status,
+                        response_headers,
+                        response_body,
+                        crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                            initial_response_header_policy_plugins,
+                        ),
+                    ) {
+                        response_body_rejected = true;
+                        break;
+                    }
+                    ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
+                }
+                reject @ PluginResult::Reject { .. }
+                | reject @ PluginResult::RejectBinary { .. } => {
+                    apply_buffered_plain_plugin_reject(
+                        plugins,
+                        ctx,
+                        reject,
+                        response_status,
+                        response_headers,
+                        response_body,
+                    )
+                    .await;
+                    response_body_rejected = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Shared representation gate — identical to H1/H2 and native H3. An H3
+    // client bridged to an H1/H2 backend must not receive a protected
+    // representation this gateway could not inspect just because the frontend
+    // protocol differs.
+    let owned_grpc_web_response_content_type =
+        crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
+    let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
+    let (response_replaced, _) = crate::proxy::transform_buffered_response_body_with_deadline(
+        plugins,
+        ctx,
+        crate::proxy::buffered_response_representation_origin(response_body_rejected),
+        response_status,
+        response_headers,
+        response_body,
+        grpc_web_response_content_type,
+        initial_response_header_policy_plugins,
+    )
+    .await;
+    response_body_rejected |= response_replaced;
+
+    if !response_body_rejected && !charged_backend_deadline_terminal {
+        for plugin in plugins {
+            if plugin.enforces_final_client_visible_response_body(ctx) {
+                continue;
+            }
+            let result = plugin
+                .on_final_response_body(ctx, *response_status, response_headers, response_body)
+                .await;
+            match result {
+                PluginResult::Continue => {}
+                reject @ PluginResult::Reject { .. }
+                | reject @ PluginResult::RejectBinary { .. } => {
+                    apply_buffered_plain_plugin_reject(
+                        plugins,
+                        ctx,
+                        reject,
+                        response_status,
+                        response_headers,
+                        response_body,
+                    )
+                    .await;
+                    break;
+                }
+            }
+        }
+    }
+
+    if !response_committed_plugins.is_empty() {
+        crate::proxy::run_deadline_bounded_response_committed_hooks(
+            response_committed_plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            initial_response_header_policy_plugins,
+        )
+        .await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -11235,11 +11291,79 @@ where
     .await
 }
 
+/// A gateway-generated error terminal the plain bridge writes before
+/// `after_proxy` ran (#5747): a classified backend dispatch failure (backend
+/// unavailable, a backend timeout), the route's own deadline, or an oversized
+/// response. For a gRPC-Web client it is a final reject that the reject-path
+/// `after_proxy` decorators run over in the bounded charged-terminal mode, as
+/// over proxy core's native gRPC-Web terminals: a browser client needs the
+/// CORS headers to read its gRPC status, no replacer may rewrite the terminal,
+/// and a hook still pending after its one poll detaches alone under the
+/// credential's lifetime. Every other client keeps the undecorated terminal.
+///
+/// An elapsed credential makes the hooks select the authorization terminal in
+/// place of the gateway's own. That terminal is written as every other
+/// authorization terminal on this bridge is, under the bounded post-deadline
+/// write grace, never through the unbounded gateway reject writer.
+#[allow(clippy::too_many_arguments)]
+async fn write_plain_gateway_error_terminal<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    mut body: Bytes,
+    mut headers: HashMap<String, String>,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let mut status_code = status.as_u16();
+    if !plugins.is_empty() && crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
+        // Boxed: the hook runner is large, and `dispatch_plain` awaits this
+        // helper from cold arms whose inline temporaries are frame slots.
+        Box::pin(
+            crate::proxy::apply_after_proxy_hooks_to_gateway_error_terminal(
+                plugins,
+                ctx,
+                &mut status_code,
+                &mut body,
+                &mut headers,
+            ),
+        )
+        .await;
+        if ctx.authorization_termination().is_some() {
+            return write_plain_authorization_expired_terminal(
+                stream,
+                ctx,
+                backend_start,
+                bytes_sent,
+            )
+            .await;
+        }
+    }
+    let status = StatusCode::from_u16(status_code).unwrap_or(status);
+    write_plain_gateway_reject(
+        stream,
+        ctx,
+        status,
+        body,
+        &headers,
+        backend_start,
+        bytes_sent,
+    )
+    .await
+}
+
 /// Write a classified HTTP-family backend dispatch failure to the H3 client.
 /// Preserves the status/body/`X-Gateway-Error` mapping H1/H2 already emit
 /// instead of collapsing every classified failure to generic 502 Bad Gateway.
+/// A gRPC-Web client's terminal is decorated through
+/// [`write_plain_gateway_error_terminal`] (#5747).
 async fn write_classified_backend_dispatch_error<S>(
     stream: &mut RequestStream<S, Bytes>,
+    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     attempt_result: &crate::retry::BackendResponse,
     backend_start: Instant,
@@ -11264,12 +11388,13 @@ where
         attempt_result.connection_error,
         status.as_u16(),
     );
-    let mut outcome = write_plain_gateway_reject(
+    let mut outcome = write_plain_gateway_error_terminal(
         stream,
+        plugins,
         ctx,
         status,
         body,
-        &headers,
+        headers,
         backend_start,
         bytes_sent,
     )

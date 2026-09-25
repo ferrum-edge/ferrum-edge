@@ -644,6 +644,20 @@ impl ComposedAuthBound {
         }
         expired_authorization(self.authorization)
     }
+
+    /// The credential's own termination class once its authorization deadline
+    /// has elapsed, WHETHER OR NOT it won the composition.
+    ///
+    /// This is not attribution: a phase that already ended at a strictly
+    /// earlier protocol bound is still attributed through
+    /// [`Self::expired_authorization`]. It is the gate for work that has NOT
+    /// started yet: once the credential has elapsed, no new poll may run over
+    /// protected request state, whichever bound fired first.
+    #[inline]
+    #[must_use]
+    pub fn elapsed_authorization(self) -> Option<StreamAuthTermination> {
+        expired_authorization(self.authorization)
+    }
 }
 
 /// Attribute an already-fired composed bound: `Some` when the authorization
