@@ -314,9 +314,11 @@ missing profiles fail the step. The pipeline drains tar end padding so ZIP CRC
 verification finishes, and `pipefail` preserves both processes' failures.
 The required `Merge Coverage` check, shard-success checks, report commands,
 ignore regex, full/changed-line gates, and exact-SHA publication evidence remain
-unchanged. The operative workflow floors remain **77.50% overall**, **84.50%
-plugins**, and **84.98% changed plugin lines**; the earlier baseline table above
-records the historical introduction values.
+unchanged. The operative workflow floors are **81.00% overall** (raised from
+77.50% once the functional shards lifted the measured figure to 82.79%,
+`526,752/636,227` lines in run 36117488050), **84.50% plugins**, and **84.98%
+changed plugin lines**; the earlier baseline table above records the historical
+introduction values.
 
 Before-change observations from the two successful main runs on 2026-09-06:
 

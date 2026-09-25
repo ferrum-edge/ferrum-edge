@@ -39,7 +39,12 @@ env:
   # Give ~0.9pt of headroom below the low-water mark. A genuine >~1pt regression
   # still trips the floor. Re-ratchet these upward deliberately once coverage
   # stabilizes materially higher — do not pin them back to the current peak.
-  MIN_OVERALL_LINE_COVERAGE: "77.50"
+  #
+  # Re-ratchet: adding the functional coverage shards raised the overall figure
+  # to 82.79% (526752/636227 lines, run 36117488050); the overall floor moves
+  # to 81.00, keeping ~1.8pt of headroom for the functional suite's run-to-run
+  # variance (its test failures warn rather than fail the shard).
+  MIN_OVERALL_LINE_COVERAGE: "81.00"
   MIN_PLUGINS_LINE_COVERAGE: "84.50"
   MIN_CHANGED_PLUGIN_LINE_COVERAGE: "84.98"
   # cargo-llvm-cov applies this during report generation; v0.8.7 warns if it
