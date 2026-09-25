@@ -2702,8 +2702,18 @@ fn every_precommit_response_phase_composes_the_authorization_lifetime() {
         .split("\n}\n")
         .next()
         .expect("charged-terminal after_proxy runner bounded");
+    // Like the reject path, the charged runner gates on the credential's own
+    // elapsed deadline, not the winning bound, so an earlier RPC deadline
+    // cannot buy an expired credential one more poll.
+    let settle_at = charged_runner
+        .find("if let Some(termination) = bound.elapsed_authorization() {")
+        .expect("the charged after_proxy runner gates on the credential's own deadline");
+    let poll_at = charged_runner
+        .find("owned_rejection_hook_future(")
+        .expect("the charged after_proxy runner constructs the hook future");
     assert!(
-        charged_runner.contains("bound.expired_authorization()")
+        settle_at < poll_at
+            && !charged_runner.contains("bound.expired_authorization()")
             && charged_runner.contains("settle_precommit_authorization_expiry(ctx, termination)"),
         "the charged after_proxy runner must settle an elapsed credential before polling"
     );
@@ -2856,8 +2866,18 @@ fn an_expired_committed_hook_is_dropped_rather_than_detached() {
     // and the clone of the request context and protected body it would own —
     // is even constructed.
     let early_gate_at = hook
-        .find("if let Some(termination) = bound.expired_authorization() {")
+        .find("if let Some(termination) = expired {")
         .expect("pre-construction authorization gate");
+    // Over a charged terminal the gate is the credential's own elapsed
+    // deadline, not the winning bound, as on the charged `after_proxy`
+    // runners; elsewhere it attributes the winning bound.
+    let gate_selection_at = hook
+        .find(
+            "let expired = if charged_terminal {\n        bound.elapsed_authorization()\n    \
+             } else {\n        bound.expired_authorization()\n    };",
+        )
+        .expect("the pre-construction gate selects the credential's own deadline when charged");
+    assert!(gate_selection_at < early_gate_at);
     let construct_at = hook
         .find("owned_response_committed_hook_future(")
         .expect("observer construction");

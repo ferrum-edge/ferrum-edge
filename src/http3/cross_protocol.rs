@@ -11221,7 +11221,8 @@ pub(crate) async fn run_cross_protocol_reject_committed_hooks(
                 status,
                 headers,
                 body,
-                terminal_gateway_deadline || charged_backend_deadline,
+                terminal_gateway_deadline,
+                charged_backend_deadline,
             )
             .await
             {
@@ -12146,6 +12147,7 @@ where
                 &normalized.headers,
                 normalized.body.clone(),
                 terminal_gateway_deadline,
+                false,
             )
             .await
             {
