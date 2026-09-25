@@ -78,7 +78,8 @@ async fn sequential_healthy_requests(client: &Http1Client, url: &str, count: usi
     for request in 0..count {
         let response = client.get(url).await.expect("sequential GET");
         assert_eq!(
-            response.status, StatusCode::OK,
+            response.status,
+            StatusCode::OK,
             "sequential request {request} must be admitted"
         );
     }
@@ -163,7 +164,8 @@ async fn adaptive_concurrency_relearns_fast_outlier_baseline_over_http1() {
     let (held, shed) = overlapping_pair(&client, &url, &hits).await;
     assert_eq!(held, StatusCode::OK, "the single slot admits one request");
     assert_eq!(
-        shed.status, StatusCode::SERVICE_UNAVAILABLE,
+        shed.status,
+        StatusCode::SERVICE_UNAVAILABLE,
         "the outlier-pinned target sheds an overlapping request"
     );
     let shed_error = shed.headers.get("x-gateway-error");
@@ -180,7 +182,8 @@ async fn adaptive_concurrency_relearns_fast_outlier_baseline_over_http1() {
     let (first, second) = overlapping_pair(&client, &url, &hits).await;
     assert_eq!(first, StatusCode::OK);
     assert_eq!(
-        second.status, StatusCode::OK,
+        second.status,
+        StatusCode::OK,
         "the relearned target admits overlapping traffic again"
     );
 
