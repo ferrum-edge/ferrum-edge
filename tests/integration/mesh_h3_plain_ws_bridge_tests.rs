@@ -197,9 +197,30 @@ fn h3_plain_bridge_mesh_response_shares_the_buffered_policy_pipeline() {
         plain.contains("PlainBridgeBodySource::MeshBuffered(body) => Ok(Ok(body)),"),
         "the buffered mesh body must feed the shared buffered-response pipeline"
     );
+    // The buffering refinement must pin the mesh variant unconditionally to the
+    // buffered pipeline; only a live reqwest body may consult the chain.
+    let buffer_refinement = plain
+        .split("let should_buffer_response = match &body_source {")
+        .nth(1)
+        .expect("buffering refinement over the body source")
+        .split("};")
+        .next()
+        .expect("bounded buffering refinement");
+    let mesh_pinned_arm =
+        "PlainBridgeBodySource::MeshBuffered(_) | PlainBridgeBodySource::Collected(_) => true,";
     assert!(
-        plain.contains("matches!(body_source, PlainBridgeBodySource::MeshBuffered(_))"),
+        buffer_refinement.contains(mesh_pinned_arm),
         "a mesh response must be pinned to the buffered (fully inspected) pipeline"
+    );
+    assert_eq!(
+        buffer_refinement.matches("MeshBuffered").count(),
+        1,
+        "the mesh variant must appear only in the arm pinned to buffering"
+    );
+    assert!(
+        buffer_refinement
+            .contains("PlainBridgeBodySource::Reqwest(_) => plain_bridge_buffers_response("),
+        "only a live reqwest body may consult the streaming/buffering decision"
     );
 
     // Every plain-response policy phase must exist exactly once in the shared
@@ -256,8 +277,19 @@ fn h3_plain_bridge_mesh_streaming_variants_fail_closed() {
         "an unexpected mesh body variant must not fabricate a body under the \
          backend's status"
     );
+    let streaming_writer = plain
+        .split("let response = match body_source {")
+        .nth(1)
+        .expect("streaming writer body-source match")
+        .split("let mut outcome = write_plain_gateway_error(")
+        .next()
+        .expect("bounded streaming writer unexpected-variant arm");
+    let unexpected_arm =
+        "PlainBridgeBodySource::MeshBuffered(_) | PlainBridgeBodySource::Collected(_) => {";
     assert!(
-        plain.contains("PlainBridgeBodySource::MeshBuffered(_) => {"),
+        streaming_writer.contains("PlainBridgeBodySource::Reqwest(response) => response,")
+            && streaming_writer.contains(unexpected_arm)
+            && streaming_writer.contains("failing closed"),
         "the streaming writer must handle the structurally unexpected mesh variant"
     );
     // Two fail-closed arms (unexpected body variant, mesh response reaching the
