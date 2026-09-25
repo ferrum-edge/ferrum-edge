@@ -6157,8 +6157,8 @@ fn every_composed_h3_write_bound_attributes_from_the_captured_composition() {
     ] {
         // `plain_write_bound` is re-derived per retry attempt, so it is bound
         // mutably in a tuple with its sibling bounds.
-        let composed = source.contains(&format!("let {bound} ="))
-            || source.contains(&format!("mut {bound},"));
+        let composed =
+            source.contains(&format!("let {bound} =")) || source.contains(&format!("mut {bound},"));
         assert!(composed, "http3/{file}.rs lost its composed `{bound}`");
         assert!(
             source.contains(&format!("{bound}.deadline()")),
