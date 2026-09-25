@@ -203,28 +203,62 @@ fn h3_cross_protocol_classified_failures_keep_typed_gateway_error() {
         .find(helper_definition)
         .expect("cross-protocol reqwest classifier definition")
         + helper_definition.len();
+
+    // The prebuffered (buffered-exhausted) bridge wraps its attempt failure in
+    // `PlainAttemptFailure` so a route attempt budget (#5646) can share the
+    // retry/terminal path. Its `attempt_result` must still classify transport
+    // failures through the reqwest classifier, and an attempt-budget expiry
+    // must use proxy core's classified backend-timeout response.
+    let failure_impl_start = cross
+        .find("impl PlainAttemptFailure {")
+        .expect("prebuffered attempt failure classifier must remain present");
+    let failure_impl = &cross[failure_impl_start..];
+    let failure_impl_end = failure_impl
+        .find("\n}\n")
+        .expect("PlainAttemptFailure impl must close");
+    let failure_impl = &failure_impl[..failure_impl_end];
+    let transport_arm =
+        "Self::Transport(error) => reqwest_error_response_for_cross_protocol(state, error, None)";
+    assert!(
+        failure_impl.contains(transport_arm),
+        "prebuffered transport failures must classify through the reqwest classifier"
+    );
+    assert!(
+        failure_impl.contains("crate::proxy::http_backend_dispatch_error_response(class, None)"),
+        "prebuffered attempt-budget expiry must use the classified backend-timeout response"
+    );
+
     let mut classified_writes = 0usize;
     // Search only after the helper definition. Slicing at the function-name
     // match itself loses the preceding `fn `, so trying to reject the
-    // definition from the suffix misclassifies it as a call site.
-    let mut search = &cross[helper_end..];
-    while let Some(idx) = search.find("reqwest_error_response_for_cross_protocol(") {
-        let suffix = &search[idx..];
-        let end = suffix
-            .find("return Ok(outcome);")
-            .expect("classified dispatch branch must return its written outcome")
-            + "return Ok(outcome);".len();
-        let window = &suffix[..end];
-        assert!(
-            window.contains("write_classified_backend_dispatch_error("),
-            "classified H3→HTTP dispatch failure must write via write_classified_backend_dispatch_error"
-        );
-        assert!(
-            !window.contains(r#"{"error":"Bad Gateway"}"#),
-            "classified H3→HTTP dispatch failure must not collapse to generic Bad Gateway"
-        );
-        classified_writes += 1;
-        search = &search[idx + 1..];
+    // definition from the suffix misclassifies it as a call site. The
+    // prebuffered bridge classifies via `e.attempt_result(state)` (which
+    // delegates to the helper, asserted above); the streaming bridge calls
+    // the helper directly.
+    let classifier_call_sites = [
+        "reqwest_error_response_for_cross_protocol(",
+        "let attempt_result = e.attempt_result(state);",
+    ];
+    for needle in classifier_call_sites {
+        let mut search = &cross[helper_end..];
+        while let Some(idx) = search.find(needle) {
+            let suffix = &search[idx..];
+            let end = suffix
+                .find("return Ok(outcome);")
+                .expect("classified dispatch branch must return its written outcome")
+                + "return Ok(outcome);".len();
+            let window = &suffix[..end];
+            assert!(
+                window.contains("write_classified_backend_dispatch_error("),
+                "classified H3→HTTP dispatch failure must use the classified error writer"
+            );
+            assert!(
+                !window.contains(r#"{"error":"Bad Gateway"}"#),
+                "classified H3→HTTP dispatch failure must not collapse to generic Bad Gateway"
+            );
+            classified_writes += 1;
+            search = &search[idx + 1..];
+        }
     }
     assert_eq!(
         classified_writes, 2,

@@ -6755,24 +6755,57 @@ fn cross_protocol_mesh_force_buffer_uses_the_composed_authorization_bound() {
         .split("async fn dispatch_grpc<S>(")
         .next()
         .expect("bounded cross-protocol plain dispatcher");
+    // Buffering a mesh upload is a gateway-local phase, so it drains under
+    // `plain_local_bound`: the authorization plan composed with the earliest of
+    // the client RPC deadline and the route rule's total deadline (#5646).
     let bound_at = dispatch
-        .find("mut plain_write_bound")
-        .expect("plain_write_bound must be composed in dispatch_plain");
+        .find("mut plain_local_bound")
+        .expect("plain_local_bound must be composed in dispatch_plain");
     let mesh_block_start = dispatch
         .find("target_requires_http_mesh_egress")
         .expect("mesh force-buffer gate");
     assert!(
         bound_at < mesh_block_start,
-        "plain_write_bound must be composed before the mesh force-buffer branch"
+        "plain_local_bound must be composed before the mesh force-buffer branch"
+    );
+    let bounds_helper = cross
+        .split("fn plain_bridge_dispatch_bounds(")
+        .nth(1)
+        .expect("plain bridge bound composition helper")
+        .split("type PlainBridgeDispatchBounds")
+        .next()
+        .expect("bounded plain bridge bound composition helper");
+    let bounds_helper_compact: String = bounds_helper
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let local_bound_args = bounds_helper_compact
+        .split_once("letlocal_bound=crate::proxy::auth_lifetime::ComposedAuthBound::compose(")
+        .expect("plain_local_bound must compose through ComposedAuthBound")
+        .1;
+    assert!(
+        local_bound_args.starts_with(
+            "crate::proxy::earliest_deadline(grpc_web_deadline_at,route.total()),auth_plan,);"
+        ),
+        "plain_local_bound must compose the authorization plan with the route total"
     );
     let mesh_block = &dispatch[mesh_block_start..];
     let mesh_block_end = mesh_block
         .find("let (response, bytes_sent, mut backend_admission_permits")
         .expect("bounded mesh force-buffer");
     let mesh_collection = &mesh_block[..mesh_block_end];
+    let mesh_collection_compact: String = mesh_collection
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let mesh_drain_args = mesh_collection_compact
+        .split_once("collect_h3_request_body_under_authorization(")
+        .expect("the mesh force-buffer must collect under the authorization bound")
+        .1;
     assert!(
-        mesh_collection.contains("collect_h3_request_body_under_authorization(")
-            && mesh_collection.contains("plain_write_bound"),
+        mesh_drain_args.starts_with(
+            "drain_h3_body(stream,effective_max_request_body_size_bytes),plain_local_bound,"
+        ),
         "the mesh force-buffer must drain under the composed authorization bound"
     );
     assert!(
