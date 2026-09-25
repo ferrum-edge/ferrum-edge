@@ -659,6 +659,13 @@ async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from
         json!({"request_timeout_ms": 3000, "attempt_timeout_ms": 300}),
     );
     buffer_every_response(&mut config);
+    // The route dials through its upstream, whose backend TLS settings govern
+    // the dial (the proxy's `backend_tls_verify_server_cert` applies only to a
+    // direct backend). Without this every attempt fails the handshake against
+    // the test CA's leaf before a stream is opened.
+    for upstream in &mut config.upstreams {
+        upstream.backend_tls_verify_server_cert = false;
+    }
     let gateway = start_h3_policy_gateway(config)
         .await
         .expect("start h3 route-deadline gateway");
@@ -672,7 +679,12 @@ async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from
     assert_eq!(
         resp.status,
         StatusCode::OK,
-        "a body stall before commit must be retried over HTTP/2, got {resp:?}"
+        "a body stall before commit must be retried over HTTP/2, got {resp:?}; \
+         backend accepted={} streams={} resets={} step_errors={:?}",
+        backend.accepted_connections(),
+        backend.received_stream_count(),
+        backend.stream_reset_count(),
+        backend.step_errors().await
     );
     assert_eq!(resp.body_text(), STALLED_BODY_RETRY_PAYLOAD);
     assert_eq!(
