@@ -6155,10 +6155,11 @@ fn every_composed_h3_write_bound_attributes_from_the_captured_composition() {
         ("cross", cross, "terminal_write_bound"),
         ("cross", cross, "downstream_write_bound"),
     ] {
-        assert!(
-            source.contains(&format!("let {bound} =")),
-            "http3/{file}.rs lost its composed `{bound}`"
-        );
+        // `plain_write_bound` is re-derived per retry attempt, so it is bound
+        // mutably in a tuple with its sibling bounds.
+        let composed = source.contains(&format!("let {bound} ="))
+            || source.contains(&format!("mut {bound},"));
+        assert!(composed, "http3/{file}.rs lost its composed `{bound}`");
         assert!(
             source.contains(&format!("{bound}.deadline()")),
             "http3/{file}.rs must await the composed instant through `{bound}`"
@@ -6755,7 +6756,7 @@ fn cross_protocol_mesh_force_buffer_uses_the_composed_authorization_bound() {
         .next()
         .expect("bounded cross-protocol plain dispatcher");
     let bound_at = dispatch
-        .find("let plain_write_bound =")
+        .find("mut plain_write_bound")
         .expect("plain_write_bound must be composed in dispatch_plain");
     let mesh_block_start = dispatch
         .find("target_requires_http_mesh_egress")

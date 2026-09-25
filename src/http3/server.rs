@@ -885,25 +885,24 @@ where
     };
     let trailer_wait_at =
         crate::proxy::earliest_deadline(auth_deadline.map(|plan| plan.at), route_body_deadline);
-    let trailers_result = match crate::plugins::await_deadline_first(trailer_wait_at, recv_trailers)
-        .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(err)) => return Err(err),
-        Err(()) => {
-            // Authorization wins an exact tie with the route deadline.
-            let Some(plan) = auth_deadline
-                .filter(|plan| route_body_deadline.is_none_or(|route| plan.at <= route))
-            else {
-                return Err(H3TrailerFinishError::RouteDeadline);
-            };
-            auth_latch.record_once(
-                plan.termination,
-                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
-            );
-            return Err(H3TrailerFinishError::AuthorizationExpired(plan.termination));
-        }
-    };
+    let trailers_result =
+        match crate::plugins::await_deadline_first(trailer_wait_at, recv_trailers).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => return Err(err),
+            Err(()) => {
+                // Authorization wins an exact tie with the route deadline.
+                let Some(plan) = auth_deadline
+                    .filter(|plan| route_body_deadline.is_none_or(|route| plan.at <= route))
+                else {
+                    return Err(H3TrailerFinishError::RouteDeadline);
+                };
+                auth_latch.record_once(
+                    plan.termination,
+                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                );
+                return Err(H3TrailerFinishError::AuthorizationExpired(plan.termination));
+            }
+        };
     let trailers = match trailers_result {
         Ok(trailers) => trailers,
         Err(err) if crate::http3::client::is_h3_graceful_close(&err) => None,
@@ -5114,6 +5113,12 @@ async fn handle_h3_request(
         let previous_routing_proxy = Arc::clone(&routing_proxy);
         routing_proxy = ctx
             .apply_route_overrides_with_upstreams(routing_proxy, epoch.load_balancer.upstreams());
+        // A deferred hook may have re-published route overrides, so re-arm the
+        // matched rule's deadlines (#5646) exactly as proxy core does here. The
+        // receipt-anchored total only ever shortens, but a gRPC rule's
+        // per-attempt budget restarts from now, which is still before the
+        // handoff to the backend.
+        ctx.arm_route_request_deadline(matches!(http_flavor, HttpFlavor::Grpc));
         // `apply_route_overrides_with_upstreams` is idempotent: it hands back
         // the SAME `Arc` when the already-baked proxy reflects every override,
         // so pointer identity against the retained pre-pass `Arc` is an exact,
@@ -6970,7 +6975,9 @@ async fn handle_h3_request(
         };
         let streaming_resp = match dispatched {
             Ok(result) => result,
-            Err(expiry) => Err(crate::http3::route_deadline::expiry_pool_error(&mut ctx, expiry)),
+            Err(expiry) => Err(crate::http3::route_deadline::expiry_pool_error(
+                &mut ctx, expiry,
+            )),
         };
         let route_body_deadline = route.body_deadline(route_attempt_deadline);
 
@@ -17213,13 +17220,18 @@ async fn finalize_h3_upload_deadline_rejection(
     let (rejection_phase, canonical_result) = match authorization_termination {
         // A plain request's matched route rule's total deadline (#5646) expired
         // while the gateway was still buffering the client upload: proxy core's
-        // health-neutral route timeout `504`, never the gRPC deadline shape.
+        // health-neutral route timeout `504`, never the gRPC deadline shape,
+        // and logged under its own rejection phase rather than the caller's
+        // gRPC deadline label.
         None if route_timeout => {
             crate::http3::route_deadline::mark_phase_once(
                 ctx,
                 crate::proxy::ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH,
             );
-            (rejection_phase, h3_route_upload_timeout_plugin_result())
+            (
+                H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE,
+                h3_route_upload_timeout_plugin_result(),
+            )
         }
         Some(termination) => {
             // Deliberately NOT `mark_gateway_deadline_response_selected()`: that
@@ -17311,6 +17323,11 @@ async fn finalize_h3_upload_deadline_rejection(
     )
     .await
 }
+
+/// Transaction-log rejection phase of a route timeout `504` (#5646) raised
+/// while the gateway was still buffering an HTTP/3 client upload. Distinct from
+/// every `grpc_deadline_*` upload label, which name a client RPC deadline.
+const H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE: &str = "route_request_timeout_h3_upload";
 
 /// Proxy core's route timeout `504` (#5646) as a canonical gateway rejection:
 /// the fixed body and the `backend_timeout` `X-Gateway-Error` token. It names no

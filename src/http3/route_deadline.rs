@@ -182,7 +182,10 @@ pub(crate) fn mark_expiry_phase(ctx: &mut RequestContext, expiry: RouteDeadlineE
 /// site already recorded one.
 #[inline]
 pub(crate) fn mark_phase_once(ctx: &mut RequestContext, phase: &'static str) {
-    if !ctx.metadata.contains_key(ROUTE_REQUEST_TIMEOUT_METADATA_KEY) {
+    if !ctx
+        .metadata
+        .contains_key(ROUTE_REQUEST_TIMEOUT_METADATA_KEY)
+    {
         ctx.mark_route_request_timeout_exceeded(phase);
     }
 }
@@ -203,7 +206,10 @@ pub(crate) fn mark_backoff_expiry(ctx: &mut RequestContext) {
 /// Free when the rule carries no total deadline.
 #[inline]
 pub(crate) fn total_expiry_recorded(route: H3RouteDeadlines, ctx: &RequestContext) -> bool {
-    route.total.is_some() && ctx.metadata.contains_key(ROUTE_REQUEST_TIMEOUT_METADATA_KEY)
+    route.total.is_some()
+        && ctx
+            .metadata
+            .contains_key(ROUTE_REQUEST_TIMEOUT_METADATA_KEY)
 }
 
 /// The backend response for an attempt a route deadline cancelled, exactly as

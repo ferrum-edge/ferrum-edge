@@ -26,6 +26,22 @@ over production traffic.** File-mode config version bumps still use in-memory or
 `FERRUM_MODE=migrate` config migration; that is separate from the database
 baseline contract above.
 
+## Upgrading to the next release
+
+**Native HTTP/3 enforces HTTPRoute rule `timeouts` (#5646).** HTTP/3 no longer
+refuses a plain request routed under a rule carrying `timeouts.request` or
+`timeouts.backendRequest` with `503`: it serves the request under both bounds,
+exactly as HTTP/1.1 and HTTP/2 do, and a response body the deadline cuts is
+reset with `H3_REQUEST_CANCELLED`. HTTP/1.1 and HTTP/2 listeners advertise
+HTTP/3 (`Alt-Svc`) again on ports that serve such rules.
+
+**Operator action:** with `FERRUM_ENABLE_HTTP3=true`, clients that fell back to
+TCP while `Alt-Svc` was withheld switch back to HTTP/3 on those ports, so their
+UDP port must be reachable wherever the TCP port is. Size `request` and
+`backendRequest` for the longest response the rule serves: a longer response is
+now cut on HTTP/3 as it already was on HTTP/1.1 and HTTP/2. See
+[Rule timeouts](gateway_api_conformance.md#rule-timeouts).
+
 ## Upgrading to 0.9.6
 
 v0.9.6 adds Gateway API `ResponseHeaderModifier` and `URLRewrite` filters, plus

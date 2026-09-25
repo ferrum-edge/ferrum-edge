@@ -11851,7 +11851,13 @@ pub mod _test_support {
     /// one of `"not_started"`, `"in_flight"`, or `"attempt_budget"`.
     pub fn h3_route_deadline_terminal_for_test(
         expiry: &str,
-    ) -> (u16, &'static str, crate::retry::ErrorClass, Option<String>, bool) {
+    ) -> (
+        u16,
+        &'static str,
+        crate::retry::ErrorClass,
+        Option<String>,
+        bool,
+    ) {
         let expiry = match expiry {
             "not_started" => crate::proxy::RouteDeadlineExpiry::BeforeDispatch,
             "in_flight" => crate::proxy::RouteDeadlineExpiry::InFlight,
@@ -11886,7 +11892,12 @@ pub mod _test_support {
         total: Option<tokio::time::Instant>,
         attempt_timeout: Option<std::time::Duration>,
         attempt_deadline: Option<tokio::time::Instant>,
-    ) -> (Option<tokio::time::Instant>, Option<tokio::time::Instant>, bool, &'static str) {
+    ) -> (
+        Option<tokio::time::Instant>,
+        Option<tokio::time::Instant>,
+        bool,
+        &'static str,
+    ) {
         let route = crate::http3::route_deadline::H3RouteDeadlines::new(total, attempt_timeout);
         (
             route.start_attempt(),

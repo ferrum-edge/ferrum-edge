@@ -750,7 +750,7 @@ head and every idle gap between response frames, as before.
 | Request | Expiry before the response head | Expiry while the body streams |
 |---|---|---|
 | HTTP/1.1, HTTP/2 or HTTP/3, not gRPC | The attempt is cancelled and the client gets the ordinary backend-timeout `504` (`{"error":"Backend timeout"}`), charged to the backend. Only the attempt ends: when the rule's `retry` lists `504`, the next attempt runs under a **fresh** budget | The body ends with a timeout error exactly like the `request` cut below: the HTTP/2 stream is reset, the HTTP/1.1 connection is closed and the HTTP/3 stream is reset with `H3_REQUEST_CANCELLED`; a backend `Content-Length` stays advertised on HTTP/1.1 and HTTP/2, `body_error_class` is `read_write_timeout`, and the cut is not charged to the backend. A response whose head reached the client is never retried |
-| gRPC / gRPC-Web, any frontend | Folded into the RPC deadline, anchored when the rule is selected (see the known deviations below): the earliest of that budget, `request` and any client `grpc-timeout` / `grpc_deadline` budget wins, the backend is told the remaining budget in `grpc-timeout`, and the client gets `DEADLINE_EXCEEDED`. When the attempt budget binds and expires after the request was sent — waiting for the response head, or collecting a buffered response body — the terminal is `Backend deadline exceeded`, charged to the backend's circuit breaker and passive health exactly like a stalled backend under the header wait. On every frontend each retry attempt re-arms a fresh budget, and retry backoff is bounded by the total alone | `DEADLINE_EXCEEDED` trailers before response DATA, a stream reset after it |
+| gRPC / gRPC-Web, any frontend | Folded into the RPC deadline, anchored when the rule is selected (see the known deviations below): the earliest of that budget, `request` and any client `grpc-timeout` / `grpc_deadline` budget wins, the backend is told the remaining budget in `grpc-timeout`, and the client gets `DEADLINE_EXCEEDED`. When the attempt budget binds and expires after the request was sent — waiting for the response head, or collecting a buffered response body — the terminal is `Backend deadline exceeded`, charged to the backend's circuit breaker and passive health exactly like a stalled backend under the header wait. On every frontend — the HTTP/3 bridge's gRPC and gRPC-Web pass-through dispatch included — each retry attempt re-arms a fresh budget, and retry backoff is bounded by the total alone | `DEADLINE_EXCEEDED` trailers before response DATA, a stream reset after it |
 
 `request`, when set, still bounds the whole transaction: an attempt never runs
 past it, the earlier of the two instants wins, and when both expire together
@@ -781,6 +781,14 @@ expiry while it is still streaming is charged to the backend.
 - **gRPC budget expiry is not retried.** gRPC calls are retried only after
   connection failures, so a call whose attempt budget expired ends with
   `DEADLINE_EXCEEDED` even when the rule's `retry` lists `504`.
+- **HTTP/3 bridge buffered collection is not retried.** The HTTP/3 bridge to
+  HTTP/1.1 and HTTP/2 backends collects a buffered response body (a
+  response-body plugin or `response_body_mode: buffer`) after its retry loop,
+  once `after_proxy` has run on the response head. An attempt budget that
+  expires while that body is collected ends the request with the same charged
+  backend-timeout `504`, but the rule's `retry` does not replay it, unlike
+  HTTP/1.1, HTTP/2 and the native HTTP/3 backend pool, which collect a buffered
+  body inside the attempt.
 
 The upstream `HTTPRouteTimeoutBackendRequest` test delays only the response
 head, which every frontend bounds.
@@ -825,9 +833,13 @@ included. A native HTTP/3 attempt is handed to the backend from its first poll
 attempt, so its budget starts there. A gateway-local wait before an attempt
 starts (backend admission, request-body hooks) is not cancelled mid-wait: a
 total deadline spent there refuses the next attempt without dialing it, with
-the health-neutral `before_dispatch` `504`. A relay whose client stops reading
-is cut the next time it waits on the backend, the HTTP/3 counterpart of a
-transport polling the body.
+the health-neutral `before_dispatch` `504`. The route deadline is not raced
+against a client write parked in QUIC flow control: a relay whose client stops
+reading is cut the next time it waits on the backend, so a client that never
+grants flow control again keeps its stream until it reads, its connection
+closes, or an authenticated request's credential lifetime ends. HTTP/1.1 and
+HTTP/2 behave the same way — their body is cut only when the transport next
+polls it.
 
 Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
 not bounded by `request` on any frontend. Gateway-local
@@ -873,9 +885,15 @@ rule, `Content-Length` preservation, native HTTP/3's pre-head terminals (byte
 for byte proxy core's), its committed-body bound and `H3_REQUEST_CANCELLED`
 cut, the HTTP/3 gRPC bridge re-arming the attempt budget for each retry, and
 `Alt-Svc` staying advertised where a timed rule is served;
-`tests/functional/functional_h3_local_policy_test.rs` drives native HTTP/3
-through a live gateway: a served request, the pre-head `504`, a reset
-committed body, and an attempt budget retried with its request body replayed;
+`tests/functional/functional_h3_local_policy_test.rs` drives an HTTP/3
+client through a live gateway's bridge to an HTTP/1.1 backend: a served
+request, the pre-head `504`, a reset committed body, an attempt budget retried
+with its request body replayed, and a fresh budget for each retry of a
+gRPC-Web pass-through call; `tests/functional/scripted_backend_h3_tests.rs`
+drives the same deadlines through the native HTTP/3 backend pool to a scripted
+HTTP/3 backend: the pre-head `504`, a committed body reset with
+`H3_REQUEST_CANCELLED`, and an attempt budget retried with its request body
+replayed;
 `tests/unit/gateway_core/route_attempt_budget_tests.rs` pins where the
 per-attempt budget starts (at the handoff, even when the attempt answers in the
 same poll, or a retry's first poll), that it

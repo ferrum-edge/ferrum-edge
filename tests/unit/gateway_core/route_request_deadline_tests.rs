@@ -20,7 +20,9 @@
 //!
 //! Data-plane behavior through the real gateway is covered by
 //! `tests/integration/k8s_controller_gateway_status_tests.rs` and, over native
-//! HTTP/3, by `tests/functional/functional_h3_local_policy_test.rs`.
+//! HTTP/3, by `tests/functional/functional_h3_local_policy_test.rs` (the bridge
+//! to an HTTP/1.1 backend) and `tests/functional/scripted_backend_h3_tests.rs`
+//! (the native HTTP/3 backend pool).
 
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
@@ -384,6 +386,145 @@ fn native_http3_grpc_bridge_rearms_the_attempt_budget_per_retry() {
         .expect("streaming attempt");
     let streaming_charge = streaming.find(charge).expect("streaming attempt charge");
     assert!(open < streaming_charge);
+}
+
+/// The plain HTTP/3 bridge's source between `dispatch_plain` and
+/// `dispatch_grpc`.
+fn plain_bridge_dispatch() -> &'static str {
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    bridge
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("dispatch_plain")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded dispatch_plain")
+}
+
+/// A gRPC-Web pass-through call on the plain HTTP/3 bridge carries the matched
+/// rule's attempt budget in its RPC deadline. The bridge re-arms it exactly as
+/// proxy core does: ended before every retry backoff, begun again at every
+/// retry attempt's handoff, and an expiry after the handoff charged to the
+/// backend.
+#[test]
+fn native_http3_plain_bridge_rearms_a_grpc_web_attempt_budget_per_retry() {
+    let dispatch = plain_bridge_dispatch();
+    let backoff = "let delay = crate::retry::retry_delay(retry_config, attempt);";
+    let backoffs: Vec<usize> = dispatch.match_indices(backoff).map(|m| m.0).collect();
+    assert_eq!(backoffs.len(), 3, "the mesh and both reqwest retry arms");
+    for at in backoffs {
+        let end = dispatch[..at]
+            .rfind("end_plain_route_attempt(")
+            .expect("a retry backoff must end the attempt budget first");
+        assert!(
+            at - end < 800,
+            "every retry backoff must be bounded by the total alone"
+        );
+    }
+    assert_eq!(
+        dispatch.matches("begin_plain_route_attempt(").count(),
+        2,
+        "both the mesh and the reqwest attempt restart the budget at the handoff"
+    );
+    assert_eq!(
+        dispatch.matches("if attempt > 0 {\n").count(),
+        2,
+        "the first attempt keeps the budget armed when the rule was selected"
+    );
+    assert_eq!(
+        dispatch
+            .matches("record_plain_grpc_web_deadline_after_handoff(")
+            .count(),
+        3,
+        "the header wait, the streamed upload, and buffered collection charge a budget expiry"
+    );
+    assert!(
+        dispatch.contains("crate::proxy::charge_generic_grpc_route_attempt_budget_expiry("),
+        "a mesh attempt's budget expiry is charged as proxy core charges its mesh retry"
+    );
+    assert!(
+        dispatch.contains(
+            "let (mut grpc_web_deadline_at, mut plain_write_bound, mut plain_local_bound) ="
+        ),
+        "the bridge's bounds must be re-derivable per attempt"
+    );
+}
+
+/// A route timeout `504` handed to the plain bridge's shared response pipeline
+/// (the mesh arm) mints no session affinity, as on the native path and in proxy
+/// core.
+#[test]
+fn native_http3_plain_bridge_mints_no_affinity_on_a_route_timeout() {
+    let dispatch = plain_bridge_dispatch();
+    let served = dispatch
+        .find("let sticky_served_target = if crate::http3::route_deadline::total_expiry_recorded(")
+        .expect("served target gated on the route timeout");
+    let reissue = dispatch
+        .find("sticky_cookie_reissue_target(")
+        .expect("sticky reissue");
+    let inject = dispatch
+        .find("inject_sticky_cookie_with_deadline_provenance(")
+        .expect("sticky injection");
+    assert!(served < reissue && reissue < inject);
+    let reissue_call = &dispatch[reissue..inject];
+    assert!(
+        reissue_call.contains("sticky_served_target,")
+            && !reissue_call.contains("current_target.as_deref(),"),
+        "the reissue must name the gated served target"
+    );
+}
+
+/// A deferred `before_proxy` pass can re-publish route overrides, so the
+/// native HTTP/3 handler re-arms the rule's deadlines after the rebind exactly
+/// as proxy core does.
+#[test]
+fn native_http3_rearms_route_deadlines_after_the_deferred_rebind() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let arm = "ctx.arm_route_request_deadline(matches!(http_flavor, HttpFlavor::Grpc));";
+    assert_eq!(server.matches(arm).count(), 2);
+    let rebind = server
+        .find("routing_proxy = ctx\n            .apply_route_overrides_with_upstreams(")
+        .expect("deferred rebind");
+    let rearm = server.rfind(arm).expect("re-arm");
+    assert!(
+        rebind < rearm,
+        "the second arm must follow the deferred rebind"
+    );
+    assert!(
+        !server[rebind..rearm].contains("let destination_rebound"),
+        "the re-arm must run right after the overrides are re-applied"
+    );
+}
+
+/// A route timeout raised while buffering an HTTP/3 upload is logged under its
+/// own rejection phase, never a gRPC deadline label.
+#[test]
+fn native_http3_logs_an_upload_route_timeout_under_its_own_phase() {
+    let server = include_str!("../../../src/http3/server.rs");
+    assert!(
+        server.contains("const H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE: &str =")
+            && server.contains("\"route_request_timeout_h3_upload\";"),
+        "a route upload timeout has its own rejection phase"
+    );
+    let finalize = server
+        .split("async fn finalize_h3_upload_deadline_rejection(")
+        .nth(1)
+        .expect("upload deadline finalizer");
+    let route_arm = finalize
+        .split("None if route_timeout => {")
+        .nth(1)
+        .expect("route timeout arm")
+        .split("Some(termination) => {")
+        .next()
+        .expect("bounded route timeout arm");
+    assert!(
+        route_arm.contains("H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE,"),
+        "the route timeout arm must log its own phase"
+    );
+    assert!(
+        !route_arm.contains("(rejection_phase,"),
+        "the caller's gRPC deadline label must not name a route timeout"
+    );
 }
 
 // ── HTTP/3 advertisement (`Alt-Svc`) ────────────────────────────────────────

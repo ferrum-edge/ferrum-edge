@@ -49299,7 +49299,7 @@ pub(crate) fn charge_grpc_route_attempt_budget_expiry(
 /// had been handed to the backend and its RPC deadline — the matched rule's
 /// per-attempt budget — has elapsed, the terminal is re-shaped as the charged
 /// backend read timeout.
-fn charge_generic_grpc_route_attempt_budget_expiry(
+pub(crate) fn charge_generic_grpc_route_attempt_budget_expiry(
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
     handed_to_backend: bool,
