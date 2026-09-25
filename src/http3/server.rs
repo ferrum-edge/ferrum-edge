@@ -6893,14 +6893,16 @@ async fn handle_h3_request(
             Err(()) => return Ok(()),
         };
 
-        // Track connection for least-connections LB (after all pre-dispatch rejects)
-        if let (Some(_upstream_id), Some(target), Some(balancer)) = (
-            &proxy.upstream_id,
-            &upstream_target,
-            upstream_balancer.as_ref(),
-        ) {
-            balancer.record_connection_start(target);
-        }
+        // Track connection for least-connections LB (after all pre-dispatch
+        // rejects). The guard is the one release: it drops when this branch
+        // exits, on every return, `?`, or unwind, so no early exit can leak
+        // the count (issue #5693).
+        let lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
+            upstream_target
+                .as_deref()
+                .filter(|_| proxy.upstream_id.is_some()),
+            upstream_balancer.as_deref(),
+        );
 
         let client_ip_owned = ctx.client_ip.clone();
         let h3_headers = build_h3_backend_headers(
@@ -6977,23 +6979,20 @@ async fn handle_h3_request(
                 let err_msg = e.to_string();
                 if err_msg.contains("exceeds maximum size") {
                     record_request(&state, 413);
-                    // Do NOT propagate a send error: record_backend_outcome
-                    // below releases the LB active-connection count, so a `?`
-                    // here would skip it and leak the count when the client
-                    // disconnects during the 413 write.
+                    // Do NOT propagate a send error: the outcome record below
+                    // releases the CB probe slot and the admission outcome, so
+                    // a `?` here would skip them when the client disconnects
+                    // during the 413 write.
                     let _ = send_h3_response(
                         &mut stream,
                         StatusCode::PAYLOAD_TOO_LARGE,
                         r#"{"error":"Request body exceeds maximum size"}"#,
                     )
                     .await;
-                    // Balance the record_connection_start above: this early
-                    // return was the only exit from this branch that did not
-                    // flow through record_backend_outcome, so the
-                    // least-connections gauge leaked one count for the selected
-                    // target on every oversized streaming upload. An oversized
-                    // client body is client-caused, which drives the two flags
-                    // below:
+                    // Record the outcome for this early return too (the
+                    // connection guard above releases the least-connections
+                    // count on its own). An oversized client body is
+                    // client-caused, which drives the two flags below:
                     //   * connection_error=false — accurate: no transport error
                     //     occurred; we chose to emit a 413 for a too-large body.
                     //     The ClientDisconnect class centrally suppresses the
@@ -7012,7 +7011,7 @@ async fn handle_h3_request(
                     //     and permanently wedging the breaker. Mirrors the
                     //     sibling 502 / oversized-response / after_proxy-reject
                     //     early returns below.
-                    crate::proxy::backend_dispatch::record_backend_outcome(
+                    crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                         &state,
                         &proxy,
                         &epoch.load_balancer,
@@ -7074,10 +7073,10 @@ async fn handle_h3_request(
                         e.is_read_timeout(),
                         h3_error_class,
                     );
-                // Do NOT propagate a send error: record_backend_outcome below
-                // releases the LB active-connection count, so a `?` here would
-                // skip it and leak the count when the client disconnects during
-                // the reject write.
+                // Do NOT propagate a send error: the outcome record below
+                // releases the CB probe slot and the admission outcome, so a `?`
+                // here would skip them when the client disconnects during the
+                // reject write.
                 let _ = send_h3_backend_failure_response(
                     &mut stream,
                     reject_status,
@@ -7085,7 +7084,7 @@ async fn handle_h3_request(
                     outcome_connection_error,
                 )
                 .await;
-                crate::proxy::backend_dispatch::record_backend_outcome(
+                crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                     &state,
                     &proxy,
                     &epoch.load_balancer,
@@ -7106,6 +7105,9 @@ async fn handle_h3_request(
                     outcome_error_class,
                     backend_admission_start.elapsed(),
                 );
+                // The backend exchange is settled: release the least-connections
+                // count now, not after the logging below.
+                drop(lb_connection_guard);
 
                 let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -7193,10 +7195,9 @@ async fn handle_h3_request(
                 max_response_body_size_bytes = effective_max_response_body_size_bytes,
                 "HTTP/3 backend response body exceeds configured size limit"
             );
-            // Do NOT propagate a send error: record_backend_outcome below
-            // releases the LB active-connection count, so a `?` here would skip
-            // it and leak the count when the client disconnects during the
-            // reject write.
+            // Do NOT propagate a send error: the outcome record below releases
+            // the CB probe slot and the admission outcome, so a `?` here would
+            // skip them when the client disconnects during the reject write.
             let _ = send_h3_response(
                 &mut stream,
                 StatusCode::BAD_GATEWAY,
@@ -7204,7 +7205,7 @@ async fn handle_h3_request(
             )
             .await;
 
-            crate::proxy::backend_dispatch::record_backend_outcome(
+            crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                 &state,
                 &proxy,
                 &epoch.load_balancer,
@@ -7301,7 +7302,7 @@ async fn handle_h3_request(
             // CB / passive-health must see the TRUE backend status: the plugin
             // override is a gateway policy decision and must neither penalize a
             // healthy backend nor mask a real backend failure.
-            crate::proxy::backend_dispatch::record_backend_outcome(
+            crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                 &state,
                 &proxy,
                 &epoch.load_balancer,
@@ -7322,6 +7323,9 @@ async fn handle_h3_request(
                 None,
                 backend_admission_response_elapsed,
             );
+            // The backend exchange is settled: release the least-connections
+            // count now, not after the logging below.
+            drop(lb_connection_guard);
 
             let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -7464,9 +7468,8 @@ async fn handle_h3_request(
         let resp = resp_builder
             .body(())
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
-        // Do NOT `?`-propagate a send_response failure: `record_connection_start`
-        // already ran above, so bailing out here would leak the least-connections
-        // count, a CB HALF_OPEN probe slot, the admission outcome, and the
+        // Do NOT `?`-propagate a send_response failure: bailing out here would
+        // leak a CB HALF_OPEN probe slot, the admission outcome, and the
         // transaction summary (the same client-disconnect case the sibling
         // relays in `proxy_to_backend_h3_streaming` /
         // `stream_h3_open_response_to_client` handle explicitly). Fall through
@@ -8024,7 +8027,7 @@ async fn handle_h3_request(
             Some(crate::retry::ErrorClass::ClientDisconnect) if backend_failure_status => None,
             other => other,
         };
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             &state,
             &proxy,
             &epoch.load_balancer,
@@ -8045,6 +8048,10 @@ async fn handle_h3_request(
             body_outcome_error_class,
             backend_admission_response_elapsed,
         );
+        // The backend exchange is settled: release the least-connections
+        // count here, as the outcome record used to, not after the logging
+        // below.
+        drop(lb_connection_guard);
 
         let backend_ttfb_ms = backend_admission_response_elapsed.as_secs_f64() * 1000.0;
         // Concurrent backend-body / client-delivery lifetime cannot be split on
@@ -8413,13 +8420,15 @@ async fn handle_h3_request(
     // Track connection for least-connections LB (after all pre-dispatch rejects).
     // Placed here so the streaming-request path above handles its own tracking,
     // and early returns from body collection/plugin rejects don't leak counts.
-    if let (Some(_upstream_id), Some(target), Some(balancer)) = (
-        &proxy.upstream_id,
-        &upstream_target,
-        upstream_balancer.as_ref(),
-    ) {
-        balancer.record_connection_start(target);
-    }
+    // The guard is the one release; it drops on every exit from this handler,
+    // and the retry loop below re-arms it for each attempt so the count
+    // follows the target actually dialed (issue #5693).
+    let mut lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
+        upstream_target
+            .as_deref()
+            .filter(|_| proxy.upstream_id.is_some()),
+        upstream_balancer.as_deref(),
+    );
 
     let can_refine_h3_response_buffering = needs_response_buffering
         && (!has_retry || retry_response_needs_header_refinement)
@@ -8619,7 +8628,7 @@ async fn handle_h3_request(
             }
             other => other.or(h3_error_class),
         };
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             &state,
             &proxy,
             &epoch.load_balancer,
@@ -8640,6 +8649,10 @@ async fn handle_h3_request(
             backend_outcome_error_class,
             h3_stream_result.backend_admission_elapsed,
         );
+        // The backend exchange is settled: release the least-connections
+        // count here, as the outcome record used to, not after the logging
+        // below.
+        drop(lb_connection_guard);
 
         // Admission elapsed above still drives adaptive concurrency. TTFB is
         // only concrete when response headers were observed — pre-header
@@ -9065,6 +9078,16 @@ async fn handle_h3_request(
                     "Retrying backend request (HTTP/3 frontend)"
                 );
 
+                // Count this attempt against the target it dials. The new
+                // lease is taken before the previous attempt's drops, so a
+                // rotation moves the count to the new target without a gap.
+                lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
+                    current_target
+                        .as_deref()
+                        .filter(|_| proxy.upstream_id.is_some()),
+                    upstream_balancer.as_deref(),
+                );
+
                 // Re-resolve the effective proxy for the (possibly rotated)
                 // retry target from the post-selection BASE proxy, so this
                 // attempt dials with ITS policy port's TLS/SNI/connectTimeout
@@ -9198,7 +9221,7 @@ async fn handle_h3_request(
         // accounting treats a graceful close (or any other post-`send_request`
         // fault) as a successful (post-wire) request for latency purposes —
         // the request did reach the backend.
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             &state,
             &proxy,
             &epoch.load_balancer,
@@ -9219,6 +9242,10 @@ async fn handle_h3_request(
             h3_error_class,
             backend_admission_start.elapsed(),
         );
+        // The backend exchange is settled: release the least-connections
+        // count here, as the outcome record used to, not after the logging
+        // below.
+        drop(lb_connection_guard);
 
         let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -10688,11 +10715,10 @@ enum H3RefinedResponse {
 /// client (502 generic, or 504 for a `backend_read_timeout_ms` expiry — see
 /// [`h3_backend_failure_status_body`]). `reject_sent` is whether that write
 /// reached the client. A failed write is reported as `client_disconnected`
-/// rather than propagated as an error: these dispatch functions start
-/// least-connections LB tracking before dispatch and their caller releases
-/// the active-connection count via `record_backend_outcome` off the returned
-/// result, so returning `Err` on a failed reject write would skip that
-/// accounting and leak the count. The backend never produced a response here,
+/// rather than propagated as an error: the caller records the backend outcome
+/// (circuit breaker, passive health, admission) off the returned result, so
+/// returning `Err` on a failed reject write would skip that accounting. The
+/// backend never produced a response here,
 /// so `backend_status` is the same gateway-synthesized status.
 fn h3_backend_unavailable_stream_result(
     status: u16,
@@ -10858,14 +10884,11 @@ async fn proxy_to_backend_h3_refined_response(
                     request_on_wire,
                 }));
             }
-            // Do NOT propagate a send error here: this refined path already
-            // started least-connections LB tracking before dispatch, so
-            // returning `Err` would skip the caller's `record_backend_outcome`
-            // and leak the active-connection count for the selected target when
-            // the client disconnects during the reject write. Report the
-            // disconnect in the result so the caller still records the outcome
-            // and releases the connection — mirrors the size-limit / after_proxy
-            // reject paths in `stream_h3_open_response_to_client`.
+            // Do NOT propagate a send error here: returning `Err` would skip the
+            // caller's backend outcome record when the client disconnects during
+            // the reject write. Report the disconnect in the result so the
+            // caller still records the outcome — mirrors the size-limit /
+            // after_proxy reject paths in `stream_h3_open_response_to_client`.
             let reject_sent = send_h3_backend_failure_response(
                 h3_stream,
                 reject_status,
@@ -12569,9 +12592,9 @@ where
             .mark_h3_unsupported(proxy, upstream_target);
     }
 
-    // Do NOT propagate a send error: `record_failed_h3_grpc_dispatch` releases
-    // the LB active-connection count through `record_backend_outcome`, so bailing
-    // here would leak it on a client disconnect during the error write. Capture
+    // Do NOT propagate a send error: `record_failed_h3_grpc_dispatch` records the
+    // backend outcome and admission, so bailing here would skip them on a client
+    // disconnect during the error write. Capture
     // whether the gRPC error actually reached the client so the transaction log's
     // `client_disconnected` stays accurate when the client already reset.
     let error_sent = await_h3_grpc_terminal_write_with_grace(send_h3_grpc_error_send(
@@ -12741,7 +12764,7 @@ async fn record_failed_h3_grpc_dispatch(
         outcome_connection_error,
         error_sent,
     } = failure;
-    crate::proxy::backend_dispatch::record_backend_outcome(
+    crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
         state,
         proxy,
         &epoch.load_balancer,
@@ -13048,12 +13071,14 @@ async fn dispatch_grpc_native_h3(
     };
     let backend_admission_start = std::time::Instant::now();
 
-    // Least-connections LB tracking (after all pre-dispatch rejects).
-    if let (Some(_upstream_id), Some(target), Some(balancer)) =
-        (&proxy.upstream_id, upstream_target, upstream_balancer)
-    {
-        balancer.record_connection_start(target);
-    }
+    // Least-connections LB tracking (after all pre-dispatch rejects). The
+    // guard is the one release (issue #5693). Every exit drops it explicitly
+    // once its backend outcome is recorded, so the count is never held across
+    // the awaited transaction logging; any other exit drops it on return.
+    let lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
+        upstream_target.filter(|_| proxy.upstream_id.is_some()),
+        upstream_balancer.map(Arc::as_ref),
+    );
 
     // Stream the gRPC request body to the native H3 backend. gRPC frames are
     // forwarded unchanged; the ceiling is the gRPC-specific recv limit so H3
@@ -13268,6 +13293,7 @@ async fn dispatch_grpc_native_h3(
             )
             .await;
             crate::http3::stream_util::halt_request_body(&mut stream);
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13292,6 +13318,7 @@ async fn dispatch_grpc_native_h3(
             let failure =
                 send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut stream, error).await;
             crate::http3::stream_util::halt_request_body(&mut stream);
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13404,6 +13431,7 @@ async fn dispatch_grpc_native_h3(
             )
             .await;
             pump_guard.retire().await;
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13424,6 +13452,7 @@ async fn dispatch_grpc_native_h3(
             let failure =
                 send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut send_half, error).await;
             pump_guard.retire().await;
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13545,7 +13574,7 @@ async fn dispatch_grpc_native_h3(
                 false
             };
             pump_guard.retire().await;
-            crate::proxy::backend_dispatch::record_backend_outcome(
+            crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                 state,
                 proxy,
                 &epoch.load_balancer,
@@ -13559,6 +13588,7 @@ async fn dispatch_grpc_native_h3(
                 false,
                 backend_start.elapsed(),
             );
+            drop(lb_connection_guard);
             record_h3_backend_admission_outcome(
                 &mut backend_admission_permits,
                 response_status,
@@ -13643,7 +13673,7 @@ async fn dispatch_grpc_native_h3(
         // before we found the body too large) but with `ResponseBodyTooLarge` so
         // the post-wire backend-failure path counts it — matching the streaming
         // overrun path below; the adaptive limiter likewise treats it as a failure.
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -13657,6 +13687,7 @@ async fn dispatch_grpc_native_h3(
             false,
             backend_start.elapsed(),
         );
+        drop(lb_connection_guard);
         record_h3_backend_admission_outcome(
             &mut backend_admission_permits,
             response_status,
@@ -13755,7 +13786,7 @@ async fn dispatch_grpc_native_h3(
         pump_guard.retire().await;
         // CB / passive-health must see the TRUE backend status, not the gateway
         // policy override.
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -13769,6 +13800,7 @@ async fn dispatch_grpc_native_h3(
             false,
             backend_start.elapsed(),
         );
+        drop(lb_connection_guard);
         // Train the adaptive limiter on the BACKEND's terminal gRPC status (a
         // Trailers-Only status rode in the initial headers, snapshotted pre-hook),
         // not the gateway policy reject — a failing backend must still shrink the
@@ -13997,7 +14029,7 @@ async fn dispatch_grpc_native_h3(
         } else {
             Some(crate::retry::ErrorClass::ClientDisconnect)
         };
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -14011,6 +14043,7 @@ async fn dispatch_grpc_native_h3(
             false,
             backend_start.elapsed(),
         );
+        drop(lb_connection_guard);
         record_h3_backend_admission_outcome(
             &mut backend_admission_permits,
             response_status,
@@ -15112,7 +15145,7 @@ async fn dispatch_grpc_native_h3(
         Some(crate::retry::ErrorClass::ClientDisconnect) if backend_failure_status => None,
         other => other,
     };
-    crate::proxy::backend_dispatch::record_backend_outcome(
+    crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
         state,
         proxy,
         &epoch.load_balancer,
@@ -15126,6 +15159,7 @@ async fn dispatch_grpc_native_h3(
         false,
         backend_start.elapsed(),
     );
+    drop(lb_connection_guard);
     // The adaptive-concurrency limiter samples the backend gRPC terminal status:
     // a non-OK `grpc-status` (trailer or trailers-only header) maps to a 5xx so the
     // limiter shrinks, while a client-side status stays healthy. Mirrors the H2
@@ -15451,13 +15485,11 @@ async fn proxy_to_backend_h3_streaming(
                     .mark_h3_unsupported(proxy, upstream_target);
             }
             let (reject_status, reject_body) = h3_backend_failure_status_body(&e);
-            // Do NOT propagate a send error here: this path already started
-            // least-connections LB tracking before dispatch, so returning `Err`
-            // would skip the caller's `record_backend_outcome` and leak the
-            // active-connection count for the selected target when the client
-            // disconnects during the reject write. Report the disconnect so the
-            // caller still records the outcome and releases the connection —
-            // same contract as the size-limit / after_proxy reject paths below.
+            // Do NOT propagate a send error here: returning `Err` would skip the
+            // caller's backend outcome record when the client disconnects during
+            // the reject write. Report the disconnect so the caller still
+            // records the outcome — same contract as the size-limit /
+            // after_proxy reject paths below.
             let reject_sent = send_h3_backend_failure_response(
                 h3_stream,
                 reject_status,
@@ -15510,10 +15542,9 @@ async fn proxy_to_backend_h3_streaming(
             "Backend response body ({} bytes) exceeds limit ({} bytes)",
             len, effective_max_response_body_size_bytes
         );
-        // Same connection-accounting contract as the after_proxy reject below:
-        // never propagate a send error, or the caller's `record_backend_outcome`
-        // is skipped and the LB active-connection count leaks for a client that
-        // disconnected during the reject write.
+        // Same outcome-accounting contract as the after_proxy reject below:
+        // never propagate a send error, or the caller's backend outcome record
+        // is skipped for a client that disconnected during the reject write.
         let size_reject_sent = send_h3_response(
             h3_stream,
             StatusCode::BAD_GATEWAY,
@@ -15570,12 +15601,9 @@ async fn proxy_to_backend_h3_streaming(
     {
         let reject_status =
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
-        // Do NOT propagate a send error here: this path already started
-        // least-connections LB tracking before dispatch, so returning `Err`
-        // would skip the caller's `record_backend_outcome` and leak the
-        // active-connection count for the selected target. Report the
-        // disconnect in the result so the caller still records the (true
-        // backend) outcome and releases the connection.
+        // Do NOT propagate a send error here: returning `Err` would skip the
+        // caller's backend outcome record. Report the disconnect in the result
+        // so the caller still records the (true backend) outcome.
         let reject_sent = send_h3_reject_response(
             h3_stream,
             reject_status,

@@ -3913,12 +3913,11 @@ async fn handle_tcp_connection_inner(
             !health_checker.has_running_active_probes(&proxy.namespace, upstream_id)
         });
     let arm_lb_guard = |host: &str, port: u16, policy_port: u16| {
-        LoadBalancerConnectionGuard::new(
-            lb_balancer
-                .is_some()
-                .then(|| Arc::new(stream_lb_accounting_target(host, port, policy_port))),
-            lb_balancer.clone(),
-        )
+        let Some(balancer) = lb_balancer.as_deref() else {
+            return LoadBalancerConnectionGuard::new(None, None);
+        };
+        let target = stream_lb_accounting_target(host, port, policy_port);
+        LoadBalancerConnectionGuard::new(Some(&target), Some(balancer))
     };
     // Reassigned on every connect-phase target rotation below: the right-hand
     // side increments the new target before the previous guard's `Drop`
@@ -7051,9 +7050,8 @@ mod backend_target_selection_tests {
             .expect("synthetic target must correspond to a configured target");
         let expected_key = crate::load_balancer::target_host_port_key(selected);
         let counted = balancer
-            .active_connections
-            .get(expected_key.as_str())
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+            .target_runtime_state(selected)
+            .map(|state| state.active_connections());
         assert_eq!(
             counted,
             Some(1),
@@ -7063,9 +7061,8 @@ mod backend_target_selection_tests {
 
         balancer.record_connection_end(&synthetic);
         let counted = balancer
-            .active_connections
-            .get(expected_key.as_str())
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+            .target_runtime_state(selected)
+            .map(|state| state.active_connections());
         assert_eq!(counted, Some(0), "guard drop must return the gauge to zero");
     }
 

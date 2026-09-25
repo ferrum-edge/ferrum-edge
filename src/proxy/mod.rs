@@ -5013,7 +5013,7 @@ impl PerIpStreamAdmission {
 /// Build the synthetic [`UpstreamTarget`] that keys stream load-balancer
 /// accounting for an already-resolved backend (issue #4514).
 ///
-/// `LoadBalancer::find_target_key` resolves a target purely by the `host:port`
+/// `LoadBalancer::find_target_index` resolves a target purely by the `host:port`
 /// string `write_target_host_port_key` builds, so a target carrying only the
 /// dialled host/port keys exactly the same active-connection counter and
 /// latency EWMA slot the real selected target does. This is the same
@@ -5040,33 +5040,29 @@ pub(crate) fn stream_lb_accounting_target(
     }
 }
 
-/// RAII guard for load-balancer connection accounting on upgraded sessions.
+/// RAII guard for load-balancer active-connection accounting.
 ///
-/// WebSocket proxying runs in a spawned task after the HTTP handler returns.
-/// Keeping the accounting in a guard makes the end event fire on normal close,
-/// upgrade failure, task cancellation, or panic unwind.
+/// Every proxy path that counts a backend connection for least-connections
+/// and the per-target connection metrics holds one of these for as long as
+/// the connection is in use; there are no bare start/end pairs. The end fires
+/// on normal completion, early return or `?`, task cancellation, or panic
+/// unwind, and always releases the exact counter the start incremented, even
+/// if the balancer has since been rebuilt. Balancer rebuilds keep surviving
+/// targets' counts, so a skipped end would never be reset.
 pub(crate) struct LoadBalancerConnectionGuard {
-    target: Option<Arc<UpstreamTarget>>,
-    balancer: Option<Arc<LoadBalancer>>,
+    _lease: Option<crate::load_balancer::TargetConnectionLease>,
 }
 
 impl LoadBalancerConnectionGuard {
-    pub(crate) fn new(
-        target: Option<Arc<UpstreamTarget>>,
-        balancer: Option<Arc<LoadBalancer>>,
-    ) -> Self {
-        if let (Some(target), Some(balancer)) = (target.as_ref(), balancer.as_ref()) {
-            balancer.record_connection_start(target);
-        }
-        Self { target, balancer }
-    }
-}
-
-impl Drop for LoadBalancerConnectionGuard {
-    fn drop(&mut self) {
-        if let (Some(target), Some(balancer)) = (self.target.as_ref(), self.balancer.as_ref()) {
-            balancer.record_connection_end(target);
-        }
+    /// Count one connection to `target` on `balancer` until the guard drops.
+    /// A no-op guard when either is `None` or the target is not in the
+    /// balancer. Holds neither argument, only the target's counter.
+    pub(crate) fn new(target: Option<&UpstreamTarget>, balancer: Option<&LoadBalancer>) -> Self {
+        let lease = match (target, balancer) {
+            (Some(target), Some(balancer)) => balancer.lease_connection(target),
+            _ => None,
+        };
+        Self { _lease: lease }
     }
 }
 
@@ -15990,7 +15986,7 @@ async fn handle_websocket_request_authenticated(
     }
 
     let ws_lb_guard =
-        LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
+        LoadBalancerConnectionGuard::new(current_target.as_deref(), upstream_balancer.as_deref());
     if let Some(permits) = backend_admission_permits.as_ref() {
         // The permit is held for the full session below, so this records the
         // backend-handshake latency without growing the limit — otherwise each
@@ -34863,8 +34859,8 @@ async fn handle_proxy_request_inner(
                 }
             };
             grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
-                upstream_target.clone(),
-                upstream_balancer.clone(),
+                upstream_target.as_deref(),
+                upstream_balancer.as_deref(),
             ));
             grpc_backend_admission_started_at = Instant::now();
             // Capture the real HeaderMap for retries BEFORE it moves into the
@@ -35026,8 +35022,8 @@ async fn handle_proxy_request_inner(
                     }
                 };
                 grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
-                    upstream_target.clone(),
-                    upstream_balancer.clone(),
+                    upstream_target.as_deref(),
+                    upstream_balancer.as_deref(),
                 ));
                 grpc_backend_admission_started_at = Instant::now();
                 let request_bytes_latch = Arc::new(body::DirectH2BytesLatch::new());
@@ -35152,8 +35148,8 @@ async fn handle_proxy_request_inner(
                                 }
                             };
                         grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
-                            upstream_target.clone(),
-                            upstream_balancer.clone(),
+                            upstream_target.as_deref(),
+                            upstream_balancer.as_deref(),
                         ));
                         grpc_backend_admission_started_at = Instant::now();
                         // Capture the real HeaderMap for retries BEFORE it
@@ -35716,8 +35712,8 @@ async fn handle_proxy_request_inner(
                 };
                 grpc_final_upstream_target = grpc_current_target.clone();
                 grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
-                    grpc_current_target.clone(),
-                    upstream_balancer.clone(),
+                    grpc_current_target.as_deref(),
+                    upstream_balancer.as_deref(),
                 ));
                 grpc_backend_admission_started_at = Instant::now();
                 grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
@@ -37714,13 +37710,13 @@ async fn handle_proxy_request_inner(
     };
     let backend_start = Instant::now();
 
-    // Track connection for least-connections load balancing. The guard calls
-    // record_connection_start now and record_connection_end on drop. For
+    // Track connection for least-connections load balancing. The guard leases
+    // the target's connection counter now and releases it on drop. For
     // streaming responses the guard is attached to ProxyBody so it lives as
     // long as hyper streams the response; for buffered responses it drops
     // immediately after body construction.
     let lb_connection_guard =
-        LoadBalancerConnectionGuard::new(upstream_target.clone(), upstream_balancer.clone());
+        LoadBalancerConnectionGuard::new(upstream_target.as_deref(), upstream_balancer.as_deref());
 
     let should_stream = should_stream_response_body(
         &proxy,
@@ -40882,7 +40878,7 @@ async fn handle_proxy_request_inner(
         }
         ResponseBody::Buffered(data) => {
             // Buffered response: body is fully consumed, drop the guard
-            // immediately so record_connection_end fires now.
+            // immediately so the connection count is released now.
             drop(lb_connection_guard);
             ProxyBody::full(data)
         }

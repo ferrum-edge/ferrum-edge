@@ -446,6 +446,16 @@ The secret-fetch timeout is checked at startup secret resolution, which reads on
 
 **Operator action:** run `ferrum-edge validate` with the production environment and `ferrum.conf` before upgrading. Correct any value it reports, or remove the variable to use its default.
 
+### Load-balancer runtime-state library API (issue [#5693](https://github.com/ferrum-edge/ferrum-edge/issues/5693))
+
+This only affects code that links the `ferrum-edge` library, such as custom plugins or embedding crates. Gateway configuration, the Admin API and metrics are unchanged, apart from the fix itself: least-connections counts and least-latency averages now survive service-discovery and upstream updates for targets that remain.
+
+The public `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and `LoadBalancer::latency_sample_count` `DashMap` fields are removed, along with `LoadBalancerCache::record_connection_start` / `record_connection_end`.
+
+**Operator action:** none for gateway deployments. Library users read per-target state through `LoadBalancer::target_runtime_state(&target)` (`active_connections()`, `latency_ewma_us()`, `latency_sample_count()`), and count a connection with `LoadBalancer::lease_connection(&target)`, whose lease releases on drop, instead of pairing `record_connection_start` and `record_connection_end` by hand.
+
+`LoadBalancer::record_connection_start` and `LoadBalancer::record_connection_end` remain, but they must now be strictly paired: every start needs exactly one end, on the same balancer, on every exit path. A rebuild no longer resets a leaked count, so a missed end keeps the target looking busier than it is to least-connections, and to the per-target connection metrics, until the target leaves the upstream.
+
 ## Database Mode (`FERRUM_MODE=database`)
 ## Build-Out Database Upgrade (PostgreSQL, MySQL, SQLite, MongoDB)
 

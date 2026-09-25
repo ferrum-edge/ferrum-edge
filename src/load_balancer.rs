@@ -13,7 +13,6 @@ use crate::config::types::{
 };
 use crate::health_check::{ActiveUnhealthyTargets, ProxyHealthState};
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::LazyLock;
@@ -1362,6 +1361,15 @@ impl LoadBalancerCacheInner {
 /// upstreams. Unchanged upstreams keep their exact same instance --
 /// round-robin counters, WRR schedules, active connection counts, latency
 /// EWMAs, and consistent hash rings are all preserved.
+///
+/// A rebuilt upstream (target-set change from service discovery, modified
+/// upstream, or a full rebuild over a published snapshot) gets a fresh
+/// `LoadBalancer`, but every target whose `host:port` survives in the same
+/// namespace-qualified upstream keeps its live [`TargetRuntimeState`] --
+/// active-connection count, latency EWMA, and latency sample count. Every
+/// cache-side construction goes through `build_balancer_with_targets`, which
+/// hands the currently published balancer to the constructor so surviving
+/// targets adopt its slots.
 pub struct LoadBalancerCache {
     inner: ArcSwap<LoadBalancerCacheInner>,
 }
@@ -1373,13 +1381,32 @@ impl LoadBalancerCache {
         }
     }
 
+    /// Rebuild every balancer from `config`.
+    ///
+    /// Targets that survive in the same upstream keep their live
+    /// [`TargetRuntimeState`] from the currently published snapshot.
     pub fn rebuild(&self, config: &GatewayConfig) {
-        self.inner.store(Self::build_inner(config));
+        let current = self.inner.load_full();
+        self.inner
+            .store(Self::build_inner_inheriting(config, Some(&*current)));
     }
 
+    /// Build a snapshot from `config` alone, with no prior runtime state.
+    ///
+    /// Use [`Self::build_inner_inheriting`] when a published snapshot exists
+    /// whose live connection counts and latency EWMAs must carry over.
     pub(crate) fn build_inner(config: &GatewayConfig) -> Arc<LoadBalancerCacheInner> {
+        Self::build_inner_inheriting(config, None)
+    }
+
+    /// Build a snapshot from `config`, carrying each surviving target's live
+    /// [`TargetRuntimeState`] over from `previous`.
+    pub(crate) fn build_inner_inheriting(
+        config: &GatewayConfig,
+        previous: Option<&LoadBalancerCacheInner>,
+    ) -> Arc<LoadBalancerCacheInner> {
         Arc::new(LoadBalancerCacheInner {
-            balancers: Self::build_balancers(config),
+            balancers: Self::build_balancers(config, previous),
             upstreams: Self::build_upstream_index(config),
         })
     }
@@ -1392,31 +1419,67 @@ impl LoadBalancerCache {
         self.inner.load_full()
     }
 
-    fn build_balancers(config: &GatewayConfig) -> HashMap<String, Arc<LoadBalancer>> {
+    fn build_balancers(
+        config: &GatewayConfig,
+        previous: Option<&LoadBalancerCacheInner>,
+    ) -> HashMap<String, Arc<LoadBalancer>> {
         let mut map = HashMap::with_capacity(config.upstreams.len());
         for upstream in &config.upstreams {
             let key = crate::config::db_backend::namespaced_runtime_key(
                 &upstream.namespace,
                 &upstream.id,
             );
-            map.insert(
-                key.clone(),
-                Arc::new(LoadBalancer::with_subsets_and_port_overrides(
-                    &key,
-                    upstream.algorithm,
-                    &upstream.targets,
-                    upstream.hash_on.clone(),
-                    upstream.subsets.as_deref(),
-                    Some(&upstream.port_overrides),
-                    upstream.health_checks.as_ref(),
-                    upstream.source_locality.as_deref(),
-                    &upstream.source_labels,
-                    upstream.locality_lb_setting.as_ref(),
-                    upstream.locality_lb_strict,
-                )),
-            );
+            let prior = previous.and_then(|inner| inner.balancers.get(&key));
+            let balancer = Self::build_balancer(&key, upstream, prior.map(Arc::as_ref));
+            map.insert(key, balancer);
         }
         map
+    }
+
+    /// Build the balancer for one upstream, inheriting surviving targets'
+    /// live runtime state from `previous` (the balancer currently published
+    /// under the same namespace-qualified runtime key), when there is one.
+    fn build_balancer(
+        runtime_key: &str,
+        upstream: &Upstream,
+        previous: Option<&LoadBalancer>,
+    ) -> Arc<LoadBalancer> {
+        Self::build_balancer_with_targets(
+            runtime_key,
+            upstream,
+            &upstream.targets,
+            upstream.algorithm,
+            upstream.hash_on.clone(),
+            previous,
+        )
+    }
+
+    /// [`Self::build_balancer`] with the target set, algorithm, and hash-on
+    /// strategy supplied separately from `upstream`'s (service-discovery
+    /// updates). The ONE place the cache constructs a `LoadBalancer`, so no
+    /// rebuild path can skip handing over `previous`.
+    fn build_balancer_with_targets(
+        runtime_key: &str,
+        upstream: &Upstream,
+        targets: &[UpstreamTarget],
+        algorithm: LoadBalancerAlgorithm,
+        hash_on: Option<String>,
+        previous: Option<&LoadBalancer>,
+    ) -> Arc<LoadBalancer> {
+        Arc::new(LoadBalancer::with_subsets_and_port_overrides(
+            runtime_key,
+            algorithm,
+            targets,
+            hash_on,
+            upstream.subsets.as_deref(),
+            Some(&upstream.port_overrides),
+            upstream.health_checks.as_ref(),
+            upstream.source_locality.as_deref(),
+            &upstream.source_labels,
+            upstream.locality_lb_setting.as_ref(),
+            upstream.locality_lb_strict,
+            previous,
+        ))
     }
 
     fn build_upstream_index(config: &GatewayConfig) -> HashMap<String, Arc<Upstream>> {
@@ -1436,7 +1499,9 @@ impl LoadBalancerCache {
     /// Clones the current `HashMap<String, Arc<LoadBalancer>>` (cheap — just
     /// Arc pointer copies for all 10k entries), then:
     /// - Removes deleted upstreams
-    /// - Creates fresh `LoadBalancer` instances only for added/modified upstreams
+    /// - Creates fresh `LoadBalancer` instances only for added/modified upstreams;
+    ///   targets that survive a modification keep their live active-connection
+    ///   counts, latency EWMAs, and sample counts ([`TargetRuntimeState`])
     /// - Unchanged upstreams keep their exact same `Arc<LoadBalancer>`, preserving
     ///   round-robin counters, WRR schedules, active connection counts, latency
     ///   EWMAs, and hash rings
@@ -1463,28 +1528,18 @@ impl LoadBalancerCache {
             new_balancers.remove(&key);
         }
 
-        // Create fresh LoadBalancer instances only for added/modified upstreams
+        // Create fresh LoadBalancer instances only for added/modified upstreams.
+        // Surviving targets inherit their live runtime state from the balancer
+        // currently published under the same key (a removed upstream was
+        // dropped from `new_balancers` above, so it has nothing to inherit).
         for upstream in added.iter().chain(modified.iter()) {
             let key = crate::config::db_backend::namespaced_runtime_key(
                 &upstream.namespace,
                 &upstream.id,
             );
-            new_balancers.insert(
-                key.clone(),
-                Arc::new(LoadBalancer::with_subsets_and_port_overrides(
-                    &key,
-                    upstream.algorithm,
-                    &upstream.targets,
-                    upstream.hash_on.clone(),
-                    upstream.subsets.as_deref(),
-                    Some(&upstream.port_overrides),
-                    upstream.health_checks.as_ref(),
-                    upstream.source_locality.as_deref(),
-                    &upstream.source_labels,
-                    upstream.locality_lb_setting.as_ref(),
-                    upstream.locality_lb_strict,
-                )),
-            );
+            let previous = new_balancers.get(&key).map(Arc::as_ref);
+            let balancer = Self::build_balancer(&key, upstream, previous);
+            new_balancers.insert(key, balancer);
         }
 
         // Upstream index is cheap to rebuild (just Arc<Upstream> clones).
@@ -1516,7 +1571,7 @@ impl LoadBalancerCache {
         removed_ids: &[crate::config::db_backend::NamespacedResourceId],
         modified: &[Upstream],
     ) {
-        let current = self.inner.load();
+        let current = self.inner.load_full();
         let inner =
             Self::build_delta_inner(&current, full_new_config, added, removed_ids, modified);
         self.store_inner(inner);
@@ -1534,6 +1589,15 @@ impl LoadBalancerCache {
     /// Creates a new `LoadBalancer` instance with the provided targets and
     /// swaps it in atomically. Other upstreams keep their existing instances
     /// with preserved round-robin counters and connection counts.
+    ///
+    /// Within the updated upstream, every target whose `host:port` is in both
+    /// the old and the new target set keeps its live active-connection count,
+    /// latency EWMA, and latency sample count: the new balancer shares the old
+    /// balancer's per-target counters ([`TargetRuntimeState`]), so connections
+    /// opened through the old balancer are still counted and release the same
+    /// counter when they close. Removed targets' state is dropped with the old
+    /// balancer; a target that is later re-added starts from a clean slate. Round-robin
+    /// counters, WRR schedules, and hash rings are rebuilt for the new set.
     pub fn update_targets(
         &self,
         namespace: &str,
@@ -1542,7 +1606,7 @@ impl LoadBalancerCache {
         algorithm: LoadBalancerAlgorithm,
         hash_on: Option<String>,
     ) {
-        let current = self.inner.load();
+        let current = self.inner.load_full();
         self.store_inner(Self::build_update_targets_inner(
             &current,
             namespace,
@@ -1571,32 +1635,15 @@ impl LoadBalancerCache {
 
         // Clone-and-patch both maps, then swap as a single unit
         let mut new_balancers = current.balancers.clone();
-        let existing_subsets = existing_upstream
-            .subsets
-            .as_deref()
-            .map(|subsets| subsets.to_vec());
-        let existing_port_overrides = existing_upstream.port_overrides.clone();
-        let existing_health_checks = existing_upstream.health_checks.clone();
-        let existing_source_locality = existing_upstream.source_locality.clone();
-        let existing_source_labels = existing_upstream.source_labels.clone();
-        let existing_locality_lb_setting = existing_upstream.locality_lb_setting.clone();
-        let existing_locality_lb_strict = existing_upstream.locality_lb_strict;
-        new_balancers.insert(
-            key.clone(),
-            Arc::new(LoadBalancer::with_subsets_and_port_overrides(
-                &key,
-                algorithm,
-                &new_targets,
-                hash_on,
-                existing_subsets.as_deref(),
-                Some(&existing_port_overrides),
-                existing_health_checks.as_ref(),
-                existing_source_locality.as_deref(),
-                &existing_source_labels,
-                existing_locality_lb_setting.as_ref(),
-                existing_locality_lb_strict,
-            )),
+        let balancer = Self::build_balancer_with_targets(
+            &key,
+            existing_upstream,
+            &new_targets,
+            algorithm,
+            hash_on,
+            current.balancers.get(&key).map(Arc::as_ref),
         );
+        new_balancers.insert(key.clone(), balancer);
 
         let mut new_upstreams = current.upstreams.clone();
         let mut updated = (**existing_upstream).clone();
@@ -2249,49 +2296,18 @@ impl LoadBalancerCache {
         Self::max_ejection_percent_from(snapshot, namespace, upstream_id)
     }
 
-    /// Snapshot of active connection counts per upstream for metrics.
+    /// Snapshot of active connection counts per upstream for metrics. Only
+    /// targets with at least one open connection are reported.
     pub fn active_connections_snapshot(&self) -> Vec<(String, Vec<(String, i64)>)> {
         let inner = self.inner.load();
         let mut result = Vec::new();
         for (upstream_id, balancer) in inner.balancers.iter() {
-            let mut targets = Vec::new();
-            for entry in balancer.active_connections.iter() {
-                let count = entry.value().load(Ordering::Relaxed);
-                if count > 0 {
-                    targets.push((entry.key().clone(), count));
-                }
-            }
+            let targets = balancer.open_connection_counts();
             if !targets.is_empty() {
                 result.push((upstream_id.clone(), targets));
             }
         }
         result
-    }
-
-    /// Record that a connection was opened to a target (for least-connections).
-    pub fn record_connection_start(
-        &self,
-        namespace: &str,
-        upstream_id: &str,
-        target: &UpstreamTarget,
-    ) {
-        let inner = self.inner.load();
-        if let Some(balancer) = inner.balancer(namespace, upstream_id) {
-            balancer.record_connection_start(target);
-        }
-    }
-
-    /// Record that a connection was closed to a target (for least-connections).
-    pub fn record_connection_end(
-        &self,
-        namespace: &str,
-        upstream_id: &str,
-        target: &UpstreamTarget,
-    ) {
-        let inner = self.inner.load();
-        if let Some(balancer) = inner.balancer(namespace, upstream_id) {
-            balancer.record_connection_end(target);
-        }
     }
 
     /// Record a response latency measurement for a target (for least-latency).
@@ -3251,16 +3267,126 @@ fn locality_from_matches_source(from: &LocalityPreference, source: &LocalityPref
     from_sub_zone == "*" || source.sub_zone.as_deref() == Some(from_sub_zone)
 }
 
+/// Live runtime state for one `host:port` endpoint of one upstream: its
+/// active-connection count (least-connections, metrics) and its latency EWMA
+/// plus sample count (least-latency).
+///
+/// Each [`LoadBalancer`] holds one slot per target, index-aligned with its
+/// targets, so selection reads a candidate's state by index with no map
+/// lookup. Targets that share a `host:port` inside one upstream (the same
+/// endpoint under different Services, subsets, or policy lanes) share one
+/// slot, matching the endpoint-level accounting the gateway has always used.
+///
+/// Slots are reference-counted so a rebuilt balancer adopts the previous
+/// generation's slot for every surviving target when it is built (see
+/// [`LoadBalancerCache`]). A [`TargetConnectionLease`] taken through the old
+/// balancer then releases the very counter the new balancer reads, so a count
+/// can neither leak nor be double-released across a rebuild.
+///
+/// A slot is one small heap allocation (three atomics plus the `Arc` header,
+/// about 40-48 bytes) per distinct target. Slots are allocated back to back
+/// when a balancer is built, so neighbouring targets' counters can share a
+/// cache line. That is no worse than the per-target map entries this
+/// replaced, so it is not a regression. The slot is deliberately not
+/// cache-line padded, because padding would multiply the per-target memory
+/// cost for every algorithm.
+#[derive(Debug)]
+pub struct TargetRuntimeState {
+    /// Connections currently open to this endpoint. Never negative: the
+    /// decrement saturates at zero.
+    active_connections: AtomicI64,
+    /// EWMA latency in microseconds; `LATENCY_UNSET` until the first sample.
+    latency_ewma_us: AtomicU64,
+    /// Latency samples recorded (least-latency warm-up accounting).
+    latency_samples: AtomicU64,
+}
+
+impl TargetRuntimeState {
+    fn new_slot() -> TargetStateSlot {
+        Arc::new(Self {
+            active_connections: AtomicI64::new(0),
+            latency_ewma_us: AtomicU64::new(LATENCY_UNSET),
+            latency_samples: AtomicU64::new(0),
+        })
+    }
+
+    /// Connections currently open to this endpoint.
+    pub fn active_connections(&self) -> i64 {
+        self.active_connections.load(Ordering::Relaxed)
+    }
+
+    /// Latency EWMA in microseconds, or `None` before the first sample.
+    pub fn latency_ewma_us(&self) -> Option<u64> {
+        let ewma = self.latency_ewma_us.load(Ordering::Relaxed);
+        (ewma != LATENCY_UNSET).then_some(ewma)
+    }
+
+    /// Latency samples recorded for least-latency warm-up.
+    pub fn latency_sample_count(&self) -> u64 {
+        self.latency_samples.load(Ordering::Relaxed)
+    }
+
+    /// Raw EWMA for selection: [`LATENCY_UNSET`] (the worst score) until the
+    /// first sample.
+    #[inline]
+    fn latency_ewma_raw(&self) -> u64 {
+        self.latency_ewma_us.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn open_connection(&self) {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Saturates at zero so an unmatched release can never drive the shared
+    /// counter negative.
+    #[inline]
+    fn close_connection(&self) {
+        let count = &self.active_connections;
+        let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            if v > 0 { Some(v - 1) } else { None }
+        });
+    }
+}
+
+type TargetStateSlot = Arc<TargetRuntimeState>;
+
+/// One open connection counted against a target's [`TargetRuntimeState`],
+/// released exactly once when the lease drops.
+///
+/// Taken with [`LoadBalancer::lease_connection`]. The lease holds the target's
+/// slot itself, not the balancer, so the release always lands on the counter
+/// the start incremented: on every exit path (early return, `?`, panic
+/// unwind, task cancellation), and across any number of balancer rebuilds in
+/// between. Prefer it to paired
+/// [`LoadBalancer::record_connection_start`] /
+/// [`LoadBalancer::record_connection_end`] calls, which leak a count whenever
+/// a path skips the end.
+#[derive(Debug)]
+#[must_use = "dropping the lease immediately releases the connection count"]
+pub struct TargetConnectionLease {
+    state: TargetStateSlot,
+}
+
+impl Drop for TargetConnectionLease {
+    fn drop(&mut self) {
+        self.state.close_connection();
+    }
+}
+
 /// Per-upstream load balancer with algorithm-specific state.
 pub struct LoadBalancer {
     targets: Vec<Arc<UpstreamTarget>>,
     /// Pre-computed "upstream_id::host:port" keys for each target, matching the
     /// format used by `HealthChecker.unhealthy_targets` for O(1) health filtering.
     target_keys: Vec<String>,
-    /// Pre-computed "host:port" keys (no upstream scope) for internal use by
-    /// active_connections, latency_ewma, and find_target_key lookups that are
-    /// already scoped to this LoadBalancer instance.
+    /// Pre-computed "host:port" keys (no upstream scope), index-aligned with
+    /// `targets`. They identify a target's [`TargetRuntimeState`] slot (and
+    /// hash-ring placement) within this upstream.
     host_port_keys: Vec<String>,
+    /// Live per-target runtime state, index-aligned with `targets`. Targets
+    /// with the same `host:port` share one slot. See [`TargetRuntimeState`].
+    target_state: Vec<TargetStateSlot>,
     /// Pre-computed locality tier rank per target with respect to the
     /// upstream's `source_locality`. Each value is one of `0` (exact match),
     /// `1` (same zone), `2` (same region), or `3` (no preference). Index-
@@ -3292,7 +3418,7 @@ pub struct LoadBalancer {
     /// sticky-session eligibility probe — sees the same tier decision.
     srv_priorities: Vec<u32>,
     /// O(1) reverse lookup from "host:port" string to index in `targets`/`host_port_keys`.
-    /// Replaces the O(n) linear scan in `find_target_key()`. Keys are the same
+    /// Replaces the O(n) linear scan in `find_target_index()`. Keys are the same
     /// "host:port" format as `host_port_keys`, enabling zero-allocation lookup
     /// via `write!()` into a thread-local buffer.
     target_index: HashMap<String, usize>,
@@ -3355,19 +3481,8 @@ pub struct LoadBalancer {
     /// Weighted round-robin lane state (smooth weighted round-robin).
     /// See [`WrrLaneState`] for the wait-free hot path and rebuild tradeoff.
     wrr_state: WrrLaneState,
-    /// Active connections per target (for least-connections).
-    pub active_connections: DashMap<String, AtomicI64>,
     /// Consistent hash ring (sorted hash values -> target index).
     hash_ring: Vec<(u64, usize)>,
-    /// EWMA latency per target in microseconds (for least-latency).
-    /// Key: "host:port", Value: EWMA in microseconds (LATENCY_UNSET = no data yet).
-    /// Uses AtomicU64 for lock-free updates on the hot path.
-    pub latency_ewma: DashMap<String, AtomicU64>,
-    /// Number of latency samples recorded per target (for least-latency warm-up).
-    /// During the warm-up phase (< LATENCY_WARMUP_THRESHOLD samples per target),
-    /// round-robin is used to ensure all targets get enough traffic to establish
-    /// baseline latency measurements.
-    pub latency_sample_count: DashMap<String, AtomicU64>,
     /// Pre-parsed hash-on strategy for consistent hashing key resolution.
     pub hash_on_strategy: HashOnStrategy,
     /// Pre-computed subset → target indices mapping for O(1) subset lookup.
@@ -3540,11 +3655,26 @@ impl LoadBalancer {
             &HashMap::new(),
             None,
             false,
+            None,
         )
     }
 
     /// Create a new load balancer with optional subset definitions and
     /// per-port override state.
+    ///
+    /// `previous` is the balancer currently published for the same
+    /// namespace-qualified upstream, when this one replaces it. Every target
+    /// whose `host:port` is also in `previous` adopts `previous`'s
+    /// [`TargetRuntimeState`] slot instead of a fresh one, so its
+    /// active-connection count, latency EWMA, and sample count carry over and
+    /// a [`TargetConnectionLease`] taken through `previous` releases the
+    /// counter this balancer reads. Targets absent from `previous` start
+    /// clean. Targets `previous` had but this set drops are not referenced,
+    /// so their state is freed with the last holder of `previous`; a target
+    /// re-added later starts clean.
+    ///
+    /// Round-robin counters, WRR schedules, hash rings, and eligibility
+    /// snapshots are derived from the target set and are never inherited.
     #[allow(clippy::too_many_arguments)]
     fn with_subsets_and_port_overrides(
         upstream_id: &str,
@@ -3558,6 +3688,7 @@ impl LoadBalancer {
         source_labels: &HashMap<String, String>,
         locality_lb_setting: Option<&UpstreamLocalityLbSetting>,
         locality_lb_strict: bool,
+        previous: Option<&LoadBalancer>,
     ) -> Self {
         // Pre-compute host:port keys for internal use (active connections, latency, hash ring)
         let host_port_keys: Vec<String> = targets.iter().map(target_host_port_key).collect();
@@ -3615,19 +3746,27 @@ impl LoadBalancer {
             Vec::new()
         };
 
-        // Initialize latency tracking for least-latency algorithm
-        let latency_ewma = DashMap::new();
-        let latency_sample_count = DashMap::new();
-        if algorithm == LoadBalancerAlgorithm::LeastLatency {
+        // One live runtime-state slot per distinct "host:port"; duplicate
+        // entries for the same endpoint share it. A target that survives from
+        // `previous` adopts its slot directly, so no fresh slot is allocated
+        // for it only to be discarded.
+        let mut target_state: Vec<TargetStateSlot> = Vec::with_capacity(host_port_keys.len());
+        {
+            let mut slot_by_key: HashMap<&str, TargetStateSlot> =
+                HashMap::with_capacity(host_port_keys.len());
             for key in &host_port_keys {
-                latency_ewma.insert(key.clone(), AtomicU64::new(LATENCY_UNSET));
-                latency_sample_count.insert(key.clone(), AtomicU64::new(0));
+                let slot = slot_by_key.entry(key.as_str()).or_insert_with(|| {
+                    previous
+                        .and_then(|previous| previous.runtime_state_slot(key))
+                        .unwrap_or_else(TargetRuntimeState::new_slot)
+                });
+                target_state.push(Arc::clone(slot));
             }
         }
 
         let hash_on_strategy = HashOnStrategy::parse(hash_on.as_deref());
 
-        // Pre-compute O(1) reverse index from "host:port" → index for find_target_key()
+        // Pre-compute O(1) reverse index from "host:port" → index for find_target_index()
         let target_index: HashMap<String, usize> = host_port_keys
             .iter()
             .enumerate()
@@ -3872,6 +4011,7 @@ impl LoadBalancer {
             targets: targets.iter().cloned().map(Arc::new).collect(),
             target_keys,
             host_port_keys,
+            target_state,
             target_locality_ranks,
             srv_priorities,
             target_index,
@@ -3887,10 +4027,7 @@ impl LoadBalancer {
             } else {
                 WrrLaneState::inactive()
             },
-            active_connections: DashMap::new(),
             hash_ring,
-            latency_ewma,
-            latency_sample_count,
             hash_on_strategy,
             subset_indices,
             subset_algorithms,
@@ -3909,6 +4046,49 @@ impl LoadBalancer {
         }
     }
 
+    /// The runtime-state slot this balancer holds for the `host:port` `key`,
+    /// shared with a replacement balancer built over this one.
+    fn runtime_state_slot(&self, key: &str) -> Option<TargetStateSlot> {
+        let &idx = self.target_index.get(key)?;
+        Some(Arc::clone(&self.target_state[idx]))
+    }
+
+    /// Live runtime state for `target`, matched by `host:port`. `None` when
+    /// the target is not in this balancer.
+    pub fn target_runtime_state(&self, target: &UpstreamTarget) -> Option<&TargetRuntimeState> {
+        let idx = self.find_target_index(target)?;
+        Some(&*self.target_state[idx])
+    }
+
+    /// Each distinct `host:port` once, with its runtime state. Duplicate
+    /// `host:port` entries share one slot and are reported once.
+    fn distinct_target_states(&self) -> impl Iterator<Item = (&str, &TargetRuntimeState)> {
+        self.host_port_keys
+            .iter()
+            .enumerate()
+            .filter(|(idx, key)| self.target_index.get(key.as_str()) == Some(idx))
+            .map(|(idx, key)| (key.as_str(), &*self.target_state[idx]))
+    }
+
+    /// Active-connection count per distinct `host:port` target, including
+    /// targets with no open connection. Cold path (metrics / diagnostics).
+    pub fn active_connection_counts(&self) -> Vec<(String, i64)> {
+        self.distinct_target_states()
+            .map(|(key, state)| (key.to_owned(), state.active_connections()))
+            .collect()
+    }
+
+    /// Like [`Self::active_connection_counts`], but only targets with at
+    /// least one open connection; idle targets' keys are never cloned.
+    fn open_connection_counts(&self) -> Vec<(String, i64)> {
+        self.distinct_target_states()
+            .filter_map(|(key, state)| {
+                let count = state.active_connections();
+                (count > 0).then(|| (key.to_owned(), count))
+            })
+            .collect()
+    }
+
     /// Record a latency sample for a target, updating the EWMA.
     ///
     /// Uses fixed-point arithmetic (scale factor 1000) to avoid floating-point
@@ -3922,90 +4102,85 @@ impl LoadBalancer {
     ///
     /// The first sample for a target sets the EWMA directly (no smoothing).
     pub fn record_latency(&self, target: &UpstreamTarget, latency_us: u64) {
-        let key = match self.find_target_key(target) {
-            Some(k) => k,
-            None => return,
+        let Some(idx) = self.find_target_index(target) else {
+            return;
         };
+        let state = &self.target_state[idx];
 
         // Update sample count
-        if let Some(count) = self.latency_sample_count.get(key) {
-            count.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.latency_sample_count
-                .insert(key.to_owned(), AtomicU64::new(1));
-        }
+        state.latency_samples.fetch_add(1, Ordering::Relaxed);
 
         // Update EWMA using compare-and-swap loop for lock-free concurrent updates.
         // The CAS loop is bounded — contention only occurs when two latency
         // recordings for the same target happen simultaneously, which is rare.
-        if let Some(ewma_ref) = self.latency_ewma.get(key) {
-            let ewma = ewma_ref.value();
-            loop {
-                let current = ewma.load(Ordering::Relaxed);
-                let new_ewma = if current == LATENCY_UNSET {
-                    // First sample — seed the EWMA directly
-                    latency_us
-                } else {
-                    // EWMA = alpha * sample + (1 - alpha) * current
-                    // Using fixed-point: (alpha_fp * sample + (SCALE - alpha_fp) * current) / SCALE
-                    // Use saturating_mul to prevent overflow with extreme latency values.
-                    let alpha = DEFAULT_EWMA_ALPHA_FP;
-                    (alpha
-                        .saturating_mul(latency_us)
-                        .saturating_add((EWMA_SCALE - alpha).saturating_mul(current)))
-                        / EWMA_SCALE
-                };
-                if ewma
-                    .compare_exchange_weak(current, new_ewma, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break;
-                }
+        let ewma = &state.latency_ewma_us;
+        loop {
+            let current = ewma.load(Ordering::Relaxed);
+            let new_ewma = if current == LATENCY_UNSET {
+                // First sample — seed the EWMA directly
+                latency_us
+            } else {
+                // EWMA = alpha * sample + (1 - alpha) * current
+                // Using fixed-point: (alpha_fp * sample + (SCALE - alpha_fp) * current) / SCALE
+                // Use saturating_mul to prevent overflow with extreme latency values.
+                let alpha = DEFAULT_EWMA_ALPHA_FP;
+                (alpha
+                    .saturating_mul(latency_us)
+                    .saturating_add((EWMA_SCALE - alpha).saturating_mul(current)))
+                    / EWMA_SCALE
+            };
+            if ewma
+                .compare_exchange_weak(current, new_ewma, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
             }
-        } else {
-            // Target not pre-initialized (shouldn't happen for LeastLatency, but
-            // handle gracefully for mixed-algorithm recording)
-            self.latency_ewma
-                .insert(key.to_owned(), AtomicU64::new(latency_us));
         }
     }
 
     /// Record a failed dispatch attempt for least-latency warm-up accounting.
     ///
     /// Failed attempts (connection errors / 5xx) never previously counted toward
-    /// `latency_sample_count`, so a persistently failing target stayed forever
+    /// the latency sample count, so a persistently failing target stayed forever
     /// in the biased warm-up state. A synthetic penalty sample both exits
     /// warm-up and keeps the EWMA from looking artificially fast.
     pub fn record_failed_attempt(&self, target: &UpstreamTarget) {
         self.record_latency(target, LATENCY_FAILURE_PENALTY_US);
     }
 
+    /// Count one open connection to `target` until the returned lease drops.
+    /// `None` when the target is not in this balancer.
+    ///
+    /// This is how the proxy paths account connections (through
+    /// `proxy::LoadBalancerConnectionGuard`): the release cannot be skipped
+    /// by an early return, and it always lands on the slot the start
+    /// incremented, even after the balancer is rebuilt.
+    pub fn lease_connection(&self, target: &UpstreamTarget) -> Option<TargetConnectionLease> {
+        let idx = self.find_target_index(target)?;
+        let state = Arc::clone(&self.target_state[idx]);
+        state.open_connection();
+        Some(TargetConnectionLease { state })
+    }
+
+    /// Count one open connection to `target`.
+    ///
+    /// Each call must be matched by exactly one
+    /// [`Self::record_connection_end`] on this same balancer, on every exit
+    /// path. Surviving targets keep their count across rebuilds, so a missed
+    /// end is never reset and the target stays disfavoured by
+    /// least-connections. Prefer [`Self::lease_connection`].
     pub fn record_connection_start(&self, target: &UpstreamTarget) {
-        let key = self.find_target_key(target).unwrap_or("");
-        if key.is_empty() {
-            return;
-        }
-        // Fast path: get() uses a shared read lock. entry() takes a write
-        // lock and clones the key -- avoid it when the counter already exists.
-        if let Some(counter) = self.active_connections.get(key) {
-            counter.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.active_connections
-                .entry(key.to_owned())
-                .or_insert_with(|| AtomicI64::new(0))
-                .fetch_add(1, Ordering::Relaxed);
+        if let Some(idx) = self.find_target_index(target) {
+            self.target_state[idx].open_connection();
         }
     }
 
+    /// Release one connection counted by [`Self::record_connection_start`].
+    /// Saturates at zero, so an unmatched release never drives the count
+    /// negative.
     pub fn record_connection_end(&self, target: &UpstreamTarget) {
-        let key = self.find_target_key(target).unwrap_or("");
-        if key.is_empty() {
-            return;
-        }
-        if let Some(count) = self.active_connections.get(key) {
-            let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                if v > 0 { Some(v - 1) } else { None }
-            });
+        if let Some(idx) = self.find_target_index(target) {
+            self.target_state[idx].close_connection();
         }
     }
 
@@ -4018,37 +4193,42 @@ impl LoadBalancer {
     /// The sample count is set to `LATENCY_WARMUP_THRESHOLD` so the recovered
     /// target immediately participates in latency-based selection rather than
     /// forcing the entire upstream back into round-robin warm-up mode.
+    ///
+    /// On a balancer whose own algorithm is not least-latency, a target with
+    /// no latency sample yet is left untouched, so an unsampled target is
+    /// never marked warm.
     pub fn reset_recovered_target_latency(&self, target: &UpstreamTarget) {
-        let key = match self.find_target_key(target) {
-            Some(k) => k,
-            None => return,
+        let Some(idx) = self.find_target_index(target) else {
+            return;
         };
         // WRR schedules are pure functions of healthy-set fingerprint + immutable
         // weights on this balancer generation. Recovery either changes the
         // fingerprint (cold miss) or restores a still-valid cached schedule —
         // no invalidate flag is required (and a boolean would race publishers).
+        let state = &self.target_state[idx];
+        if self.algorithm != LoadBalancerAlgorithm::LeastLatency
+            && state.latency_samples.load(Ordering::Relaxed) == 0
+        {
+            return;
+        }
 
         // Find minimum EWMA among all targets (excluding unset)
         let min_ewma = self
-            .latency_ewma
+            .target_state
             .iter()
-            .map(|entry| entry.value().load(Ordering::Relaxed))
+            .map(|slot| slot.latency_ewma_us.load(Ordering::Relaxed))
             .filter(|&v| v != LATENCY_UNSET)
             .min()
             .unwrap_or(LATENCY_UNSET);
 
-        if let Some(ewma_ref) = self.latency_ewma.get(key) {
-            ewma_ref.value().store(min_ewma, Ordering::Relaxed);
-        }
+        state.latency_ewma_us.store(min_ewma, Ordering::Relaxed);
         // Set sample count to the warm-up threshold so this target immediately
         // participates in latency-based selection. Setting to 0 would force the
         // entire upstream back into round-robin warm-up, disrupting routing for
         // other targets that already have good latency data.
-        if let Some(count_ref) = self.latency_sample_count.get(key) {
-            count_ref
-                .value()
-                .store(LATENCY_WARMUP_THRESHOLD, Ordering::Relaxed);
-        }
+        state
+            .latency_samples
+            .store(LATENCY_WARMUP_THRESHOLD, Ordering::Relaxed);
     }
 
     /// Parent WRR lane counters: `(schedule_publishes, allocation_free_miss_fallbacks)`.
@@ -4136,13 +4316,12 @@ impl LoadBalancer {
         )
     }
 
-    /// Find the pre-computed host:port key for a target via O(1) HashMap lookup.
-    /// Returns the internal (non-upstream-scoped) key used for active connections,
-    /// latency EWMA, and hash ring lookups within this LoadBalancer instance.
+    /// Find a target's index (and so its [`TargetRuntimeState`] slot) by
+    /// `host:port` via O(1) HashMap lookup.
     ///
     /// Uses a thread-local buffer to construct the lookup key without allocation.
     #[inline]
-    fn find_target_key(&self, target: &UpstreamTarget) -> Option<&str> {
+    fn find_target_index(&self, target: &UpstreamTarget) -> Option<usize> {
         thread_local! {
             static TARGET_KEY_BUF: std::cell::RefCell<String> =
                 std::cell::RefCell::new(String::with_capacity(64));
@@ -4151,9 +4330,7 @@ impl LoadBalancer {
             let mut buf = buf.borrow_mut();
             buf.clear();
             write_target_host_port_key(&mut buf, target);
-            self.target_index
-                .get(buf.as_str())
-                .map(|&i| self.host_port_keys[i].as_str())
+            self.target_index.get(buf.as_str()).copied()
         })
     }
 
@@ -7520,12 +7697,7 @@ impl LoadBalancer {
             if !healthy.contains(i) {
                 continue;
             }
-            let key = &self.host_port_keys[i];
-            let conns = self
-                .active_connections
-                .get(key)
-                .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or(0);
+            let conns = self.target_state[i].active_connections();
             if !found || conns < min_conns {
                 min_conns = conns;
                 best_idx = i;
@@ -7563,12 +7735,7 @@ impl LoadBalancer {
             if !healthy.contains(i) {
                 continue;
             }
-            let key = &self.host_port_keys[i];
-            let samples = self
-                .latency_sample_count
-                .get(key)
-                .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or(0);
+            let samples = self.target_state[i].latency_sample_count();
             if samples >= LATENCY_WARMUP_THRESHOLD {
                 warmed_count += 1;
             } else {
@@ -7600,11 +7767,7 @@ impl LoadBalancer {
                     if !healthy.contains(i) {
                         continue;
                     }
-                    let samples = self
-                        .latency_sample_count
-                        .get(&self.host_port_keys[i])
-                        .map(|v| v.load(Ordering::Relaxed))
-                        .unwrap_or(0);
+                    let samples = self.target_state[i].latency_sample_count();
                     if samples >= LATENCY_WARMUP_THRESHOLD {
                         continue;
                     }
@@ -7623,20 +7786,11 @@ impl LoadBalancer {
                 if !healthy.contains(i) {
                     continue;
                 }
-                let key = &self.host_port_keys[i];
-                let samples = self
-                    .latency_sample_count
-                    .get(key)
-                    .map(|v| v.load(Ordering::Relaxed))
-                    .unwrap_or(0);
-                if samples < LATENCY_WARMUP_THRESHOLD {
+                let state = &self.target_state[i];
+                if state.latency_sample_count() < LATENCY_WARMUP_THRESHOLD {
                     continue;
                 }
-                let latency = self
-                    .latency_ewma
-                    .get(key)
-                    .map(|v| v.load(Ordering::Relaxed))
-                    .unwrap_or(LATENCY_UNSET);
+                let latency = state.latency_ewma_raw();
                 if !found || latency < best_latency {
                     best_latency = latency;
                     best_idx = i;
@@ -7661,12 +7815,7 @@ impl LoadBalancer {
             if !healthy.contains(i) {
                 continue;
             }
-            let key = &self.host_port_keys[i];
-            let latency = self
-                .latency_ewma
-                .get(key)
-                .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or(LATENCY_UNSET);
+            let latency = self.target_state[i].latency_ewma_raw();
             if !found || latency < best_latency {
                 best_latency = latency;
                 best_idx = i;
@@ -7742,12 +7891,7 @@ impl LoadBalancer {
         let mut best = &candidates[0];
 
         for candidate in candidates {
-            let key = &self.host_port_keys[candidate.0];
-            let conns = self
-                .active_connections
-                .get(key)
-                .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or(0);
+            let conns = self.target_state[candidate.0].active_connections();
             if conns < min_conns {
                 min_conns = conns;
                 best = candidate;
@@ -7784,12 +7928,7 @@ impl LoadBalancer {
         let mut any_has_data = false;
         let mut unwarmed_count = 0usize;
         for (idx, _) in candidates {
-            let key = &self.host_port_keys[*idx];
-            let samples = self
-                .latency_sample_count
-                .get(key)
-                .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or(0);
+            let samples = self.target_state[*idx].latency_sample_count();
             if samples >= LATENCY_WARMUP_THRESHOLD {
                 warmed_count += 1;
             } else {
@@ -7811,11 +7950,7 @@ impl LoadBalancer {
             let ticket = selection_counter_ticket(rr_counter);
             if let Some(mut skip) = unwarmed_explore_slot(ticket, unwarmed_count) {
                 for candidate in candidates {
-                    let samples = self
-                        .latency_sample_count
-                        .get(&self.host_port_keys[candidate.0])
-                        .map(|v| v.load(Ordering::Relaxed))
-                        .unwrap_or(0);
+                    let samples = self.target_state[candidate.0].latency_sample_count();
                     if samples >= LATENCY_WARMUP_THRESHOLD {
                         continue;
                     }
@@ -7830,20 +7965,11 @@ impl LoadBalancer {
             let mut best = candidates[0];
             let mut found = false;
             for candidate in candidates {
-                let key = &self.host_port_keys[candidate.0];
-                let samples = self
-                    .latency_sample_count
-                    .get(key)
-                    .map(|v| v.load(Ordering::Relaxed))
-                    .unwrap_or(0);
-                if samples < LATENCY_WARMUP_THRESHOLD {
+                let state = &self.target_state[candidate.0];
+                if state.latency_sample_count() < LATENCY_WARMUP_THRESHOLD {
                     continue;
                 }
-                let latency = self
-                    .latency_ewma
-                    .get(key)
-                    .map(|v| v.load(Ordering::Relaxed))
-                    .unwrap_or(LATENCY_UNSET);
+                let latency = state.latency_ewma_raw();
                 if !found || latency < best_latency {
                     best_latency = latency;
                     best = *candidate;
@@ -7861,12 +7987,7 @@ impl LoadBalancer {
         let mut best = candidates[0];
 
         for candidate in candidates {
-            let key = &self.host_port_keys[candidate.0];
-            let latency = self
-                .latency_ewma
-                .get(key)
-                .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or(LATENCY_UNSET);
+            let latency = self.target_state[candidate.0].latency_ewma_raw();
             if latency < best_latency {
                 best_latency = latency;
                 best = *candidate;
@@ -8360,6 +8481,7 @@ mod tests {
             &HashMap::new(),
             None,
             false,
+            None,
         );
 
         let random_state = lb.port_overrides.get(&8080).expect("random override");

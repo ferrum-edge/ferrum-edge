@@ -361,7 +361,7 @@ Active connection counts per upstream target. Only useful when using the `least_
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `active_connections` | array | One object per upstream with active connections. Each entry has `namespace`, `upstream_id`, and `targets` (`host:port` → count). Only targets with `count > 0` are included. Empty upstreams (no active requests) are omitted |
+| `active_connections` | array | One object per upstream with active connections. Each entry has `namespace`, `upstream_id`, and `targets` (`host:port` → count). Only targets with `count > 0` are included. Empty upstreams (no active requests) are omitted. A target's count carries across service-discovery updates and config reloads while the target stays in the upstream ([details](load_balancing.md#runtime-state-across-rebuilds)) |
 
 **What to look for:**
 

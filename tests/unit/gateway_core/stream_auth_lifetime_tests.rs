@@ -5530,7 +5530,7 @@ fn every_precommit_h3_grpc_terminal_is_preceded_by_the_authorization_gate() {
     // CB / passive health / adaptive concurrency stay neutral: the TRUE backend
     // status with NO error class.
     let outcome = terminal
-        .split("record_backend_outcome(")
+        .split("record_backend_outcome_no_conn_end(")
         .nth(1)
         .expect("backend outcome")
         .split(");")

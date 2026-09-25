@@ -3596,7 +3596,8 @@ fn mesh_source_workload_locality_resolution(mesh_slice: &MeshSlice) -> MeshSourc
 /// mesh upstream would look "modified" on EVERY apply — and a "modified"
 /// upstream rebuilds a fresh `LoadBalancer`
 /// (`LoadBalancerCache::build_delta_inner`), discarding its round-robin
-/// counters, latency EWMAs, hash rings, and passive-health state.
+/// counters, WRR schedules, hash rings, and passive-health state (per-target
+/// connection counts and latency EWMAs carry over for surviving targets).
 /// That means an unrelated mesh-only update (a federation/trust-bundle overlay
 /// refresh, or a remote-cluster scale event for a DIFFERENT service) would reset
 /// LB + health for every materialized upstream.
