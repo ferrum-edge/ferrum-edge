@@ -11,9 +11,6 @@
 #     -f charts/ferrum-gateway/examples/database-values.yaml
 mode: database
 
-image:
-  tag: latest  # evaluation only; pin an immutable release tag in production
-
 replicaCount: 2
 
 database:

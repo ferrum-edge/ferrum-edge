@@ -358,10 +358,35 @@ impl BackendKind {
         }
     }
 
-    /// Spawn a backend that accepts the connection and immediately
-    /// resets it (`SO_LINGER=0`). Same observability for all the
-    /// HTTP-family backends — the gateway sees ECONNRESET on its
-    /// next read/write.
+    /// Spawn a backend that accepts the connection and resets it
+    /// (`SO_LINGER=0`). The gateway sees ECONNRESET on its next
+    /// read/write.
+    ///
+    /// H1, H2 and Tcp kinds all configure a plain `http` backend, which the
+    /// gateway dispatches as HTTP/1.1 through reqwest. For those kinds the
+    /// fixture first reads the request head (`\r\n\r\n`) and only then
+    /// resets, so the reset always lands on a request the gateway's HTTP/1
+    /// dispatcher has already dequeued and written. That is the "request
+    /// error" path this scenario asserts as 502.
+    ///
+    /// Resetting before the request is written races the gateway's
+    /// connection task against request enqueue inside hyper. One ordering of
+    /// that race loses the request's cancellation: hyper's HTTP/1 dispatcher
+    /// sees the reset while idle, closes and drops its request receiver, and
+    /// a send that passed tokio's closed check but had not yet published its
+    /// message lands in a channel nobody drains. hyper-util keeps that
+    /// channel's sender alive while it awaits the response, so the pending
+    /// request never resolves and the gateway falls through to
+    /// `backend_read_timeout_ms` (504). That is an upstream hyper/tokio
+    /// defect, not the classifier under test. See
+    /// `scripted_backend_matrix_tests.rs` scenario 2.
+    ///
+    /// The `\r\n\r\n` needle also ends the h2c prior-knowledge preface, so a
+    /// capability probe still resets as soon as it sends its preface.
+    ///
+    /// Grpc keeps the immediate reset: the gateway dispatches it through its
+    /// own HTTP/2 gRPC pool, not reqwest's HTTP/1 dispatcher, and that cell
+    /// is the #2057 guard for the accept-then-RST races it documents.
     pub async fn spawn_accept_then_rst(
         self,
     ) -> Result<MatrixBackend, Box<dyn std::error::Error + Send + Sync>> {
@@ -369,7 +394,11 @@ impl BackendKind {
             BackendKind::H1 | BackendKind::Tcp | BackendKind::H2 | BackendKind::Grpc => {
                 let reservation = reserve_port().await?;
                 let port = reservation.port;
-                let backend = ScriptedTcpBackend::builder(reservation.into_listener())
+                let mut builder = ScriptedTcpBackend::builder(reservation.into_listener());
+                if self != BackendKind::Grpc {
+                    builder = builder.step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()));
+                }
+                let backend = builder
                     .step(TcpStep::Reset)
                     // Pin the scenario contract even if the builder default
                     // changes: probes and requests must all execute Reset.
@@ -821,14 +850,21 @@ mod tests {
                 b"",
                 b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
             ];
-            for (index, payload) in payloads.into_iter().enumerate() {
+            // HTTP/1-dispatched kinds reset only after a complete head, so a
+            // silent connection is not part of their contract (it would wait
+            // for bytes that never come). gRPC still resets before any write.
+            let payloads = payloads
+                .into_iter()
+                .filter(|payload| kind == BackendKind::Grpc || !payload.is_empty());
+            for (index, payload) in payloads.enumerate() {
                 tokio::time::timeout(Duration::from_secs(2), async {
                     let mut client = tokio::net::TcpStream::connect(("127.0.0.1", backend.port()))
                         .await
                         .expect("connect to held listener");
-                    // Deliberately put the h2c preface first. The next connection
-                    // sends nothing, forcing Reset before its first write; the
-                    // third models a request after a probe. No sleeps or retries.
+                    // Deliberately put the h2c preface first. For gRPC the next
+                    // connection sends nothing, forcing Reset before its first
+                    // write; the last models a request after a probe. No sleeps
+                    // or retries.
                     if !payload.is_empty()
                         && let Err(error) = client.write_all(payload).await
                     {

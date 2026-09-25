@@ -2506,6 +2506,16 @@ pub mod _test_support {
         crate::plugins::basic_auth::BasicAuth::new_with_hmac_secret(config, secret).map(|_| ())
     }
 
+    /// Build `basic_auth` with an explicit HMAC secret, so a test never has to
+    /// publish `FERRUM_BASIC_AUTH_HMAC_SECRET` into the shared process
+    /// environment that env-isolated tests clear concurrently (issue #5705).
+    pub fn basic_auth_with_secret_for_test(
+        config: &serde_json::Value,
+        secret: &str,
+    ) -> Result<crate::plugins::basic_auth::BasicAuth, String> {
+        crate::plugins::basic_auth::BasicAuth::new_with_hmac_secret(config, Some(secret))
+    }
+
     pub fn validate_admin_plugin_config_for_test(
         plugin_config: &crate::config::types::PluginConfig,
     ) -> Result<(), String> {
@@ -4307,6 +4317,22 @@ pub mod _test_support {
         .await
     }
 
+    /// The production WebSocket tunnel-mode residual forward
+    /// (`proxy::forward_ws_tunnel_residual`): the backend bytes recovered at
+    /// the frame-codec boundary are written to the client and flushed before
+    /// the raw relay starts. `offset` reports how many bytes the writer
+    /// accepted.
+    pub async fn forward_ws_tunnel_residual_for_test<W>(
+        writer: &mut W,
+        residual: &[u8],
+        offset: &mut usize,
+    ) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
+        crate::proxy::forward_ws_tunnel_residual(writer, residual, offset).await
+    }
+
     /// Connect to a WebSocket backend using production dialer settings that
     /// are relevant to unit tests.
     pub async fn connect_websocket_backend_for_test(
@@ -4971,6 +4997,14 @@ pub mod _test_support {
 
     pub fn finalized_response_replay_for_test(ctx: &crate::plugins::RequestContext) -> bool {
         ctx.finalized_response_replay
+    }
+
+    /// Stand in for a provider claim that states `ClearInherited` DNS intent,
+    /// which only crate-internal route dispatchers may set.
+    pub fn set_route_override_dns_policy_clear_inherited_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.route_override_dns_policy = crate::plugins::RouteOverrideDnsPolicy::ClearInherited;
     }
 
     /// Stand in for the protocol entry paths, which copy this digest from the
@@ -11701,6 +11735,206 @@ pub mod _test_support {
         body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
     }
 
+    /// Parse a Gateway API Duration (GEP-2257) exactly as the HTTPRoute
+    /// `timeouts` admission does.
+    pub fn parse_gateway_api_duration_ms_for_test(value: &str) -> Option<u64> {
+        crate::config_sources::k8s::parse_gateway_api_duration_ms(value)
+    }
+
+    /// Apply a route rule's total request deadline to a NON-gRPC response
+    /// body, exactly as the H1/H2 response funnel does.
+    pub fn proxy_body_with_route_request_deadline_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: tokio::time::Instant,
+    ) -> crate::proxy::ProxyBody {
+        body.with_route_request_deadline(deadline)
+    }
+
+    /// Drive one backend attempt through the route request deadline wrapper
+    /// exactly as proxy core does. `Err` names how the deadline ended it:
+    /// `"not_started"` (refused without polling the attempt) or `"in_flight"`
+    /// (the attempt was polled and then cancelled).
+    pub async fn await_route_request_deadline_for_test<F: std::future::Future>(
+        deadline: Option<tokio::time::Instant>,
+        attempt: F,
+    ) -> Result<F::Output, &'static str> {
+        crate::proxy::await_route_request_deadline(deadline, None, attempt)
+            .await
+            .map_err(route_deadline_expiry_label)
+    }
+
+    /// Drive one backend attempt through the route deadline wrapper with a
+    /// per-attempt budget (`attempt_timeout_ms`), exactly as proxy core does.
+    /// `handed_to_backend` is the attempt's dispatch marker: `None` starts the
+    /// budget on the first poll (a retry attempt), `Some` once the marker is
+    /// set (an initial attempt). Returns the outcome — `Err` additionally
+    /// names `"attempt_budget"` — and the instant the budget expires at, once
+    /// it started, which proxy core also applies to the committed body.
+    pub async fn await_route_attempt_budget_for_test<F: std::future::Future>(
+        deadline: Option<tokio::time::Instant>,
+        attempt_timeout: std::time::Duration,
+        handed_to_backend: Option<&std::sync::atomic::AtomicBool>,
+        attempt: F,
+    ) -> (
+        Result<F::Output, &'static str>,
+        Option<tokio::time::Instant>,
+    ) {
+        let mut armed_deadline = None;
+        let budget = match handed_to_backend {
+            Some(marker) => crate::proxy::RouteAttemptBudget::from_handoff(
+                Some(attempt_timeout),
+                marker,
+                &mut armed_deadline,
+            ),
+            None => crate::proxy::RouteAttemptBudget::from_start(
+                Some(attempt_timeout),
+                &mut armed_deadline,
+            ),
+        };
+        let outcome = crate::proxy::await_route_request_deadline(deadline, budget, attempt)
+            .await
+            .map_err(route_deadline_expiry_label);
+        (outcome, armed_deadline)
+    }
+
+    fn route_deadline_expiry_label(expiry: crate::proxy::RouteDeadlineExpiry) -> &'static str {
+        match expiry {
+            crate::proxy::RouteDeadlineExpiry::BeforeDispatch => "not_started",
+            crate::proxy::RouteDeadlineExpiry::InFlight => "in_flight",
+            crate::proxy::RouteDeadlineExpiry::AttemptBudget => "attempt_budget",
+        }
+    }
+
+    /// The response proxy core builds for an attempt a route deadline
+    /// cancelled, and the transaction-log phase it records (`None` for a
+    /// per-attempt budget expiry, which is an ordinary retryable backend
+    /// timeout rather than a spent transaction). `expiry` is one of
+    /// `"not_started"`, `"in_flight"`, or `"attempt_budget"`.
+    pub fn route_deadline_expiry_response_for_test(
+        expiry: &str,
+        handed_to_backend: bool,
+    ) -> (crate::retry::BackendResponse, Option<&'static str>) {
+        let expiry = match expiry {
+            "not_started" => crate::proxy::RouteDeadlineExpiry::BeforeDispatch,
+            "in_flight" => crate::proxy::RouteDeadlineExpiry::InFlight,
+            _ => crate::proxy::RouteDeadlineExpiry::AttemptBudget,
+        };
+        let mut phase = None;
+        let response =
+            crate::proxy::route_deadline_expiry_response(expiry, handed_to_backend, &mut phase);
+        (response, phase)
+    }
+
+    /// The transaction-log phase and dispatch error class proxy core records
+    /// for a route request deadline expiry. `in_flight` selects a cancelled
+    /// (rather than never-started) attempt; `handed_to_backend` is that
+    /// attempt's dispatch marker.
+    pub fn route_request_deadline_outcome_for_test(
+        in_flight: bool,
+        handed_to_backend: bool,
+    ) -> (&'static str, crate::retry::ErrorClass) {
+        let expiry = if in_flight {
+            crate::proxy::RouteDeadlineExpiry::InFlight
+        } else {
+            crate::proxy::RouteDeadlineExpiry::BeforeDispatch
+        };
+        (
+            expiry.phase(handed_to_backend),
+            expiry.error_class(handed_to_backend),
+        )
+    }
+
+    /// The native HTTP/3 terminal for an attempt a matched route rule's
+    /// deadline ended before the response head (#5646): `(status, body, error
+    /// class, logged phase, reads as a post-wire read timeout)`. Every native
+    /// HTTP/3 attempt is handed to the backend from its first poll. `expiry` is
+    /// one of `"not_started"`, `"in_flight"`, or `"attempt_budget"`.
+    pub fn h3_route_deadline_terminal_for_test(
+        expiry: &str,
+    ) -> (
+        u16,
+        &'static str,
+        crate::retry::ErrorClass,
+        Option<String>,
+        bool,
+    ) {
+        let expiry = match expiry {
+            "not_started" => crate::proxy::RouteDeadlineExpiry::BeforeDispatch,
+            "in_flight" => crate::proxy::RouteDeadlineExpiry::InFlight,
+            _ => crate::proxy::RouteDeadlineExpiry::AttemptBudget,
+        };
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        let error = crate::http3::route_deadline::expiry_pool_error(&mut ctx, expiry);
+        let (status, body) = crate::http3::route_deadline::expiry_status_body(expiry);
+        let phase = ctx
+            .metadata
+            .remove(crate::plugins::ROUTE_REQUEST_TIMEOUT_METADATA_KEY);
+        (
+            status,
+            body,
+            crate::http3::route_deadline::expiry_error_class(expiry),
+            phase,
+            error.request_on_wire() && error.is_read_timeout(),
+        )
+    }
+
+    /// How the native HTTP/3 relays bound one attempt under a matched route
+    /// rule's deadlines (#5646), for a total deadline `total`, an attempt
+    /// budget `attempt_timeout`, and the committed attempt's budget instant
+    /// `attempt_deadline`: `(a fresh attempt's budget instant, the committed
+    /// body's deadline, whether the attempt budget alone has expired, how the
+    /// body deadline ended the attempt)`.
+    pub fn h3_route_attempt_bounds_for_test(
+        total: Option<tokio::time::Instant>,
+        attempt_timeout: Option<std::time::Duration>,
+        attempt_deadline: Option<tokio::time::Instant>,
+    ) -> (
+        Option<tokio::time::Instant>,
+        Option<tokio::time::Instant>,
+        bool,
+        &'static str,
+    ) {
+        let route = crate::http3::route_deadline::H3RouteDeadlines::new(total, attempt_timeout);
+        (
+            route.start_attempt(),
+            route.body_deadline(attempt_deadline),
+            route.attempt_budget_expired(attempt_deadline),
+            route_deadline_expiry_label(route.body_expiry()),
+        )
+    }
+
+    /// The deadlines the native HTTP/3 relays read for a request whose matched
+    /// rule carries `request_timeout_ms` / `attempt_timeout_ms` (#5646):
+    /// `(total deadline armed, attempt budget)`. A gRPC-flavored request folds
+    /// both into its RPC deadline instead, so the relays see neither.
+    pub fn h3_route_deadlines_armed_for_test(
+        request_timeout_ms: Option<u64>,
+        attempt_timeout_ms: Option<u64>,
+        grpc_flavored: bool,
+    ) -> (bool, Option<std::time::Duration>) {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        ctx.route_override_request_timeout_ms = request_timeout_ms;
+        ctx.route_override_attempt_timeout_ms = attempt_timeout_ms;
+        ctx.arm_route_request_deadline(grpc_flavored);
+        let route = crate::http3::route_deadline::H3RouteDeadlines::from_ctx(&ctx);
+        (route.total().is_some(), route.attempt_timeout())
+    }
+
+    /// The HTTP/3 error code a route deadline cut resets a committed response
+    /// with (#5646): RFC 9114 `H3_REQUEST_CANCELLED`.
+    pub fn h3_route_deadline_reset_code_for_test() -> u64 {
+        let code = crate::http3::route_deadline::ROUTE_DEADLINE_RESET_CODE;
+        code.value()
+    }
+
     pub fn proxy_body_into_grpc_web_streaming_for_test(
         body: crate::proxy::ProxyBody,
         content_type: &str,
@@ -11875,22 +12109,15 @@ pub mod _test_support {
         let snapshot = cache.load_inner();
         let balancer =
             crate::proxy::mesh_tcp_egress_connection_balancer(&snapshot, namespace, upstream_id)?;
-        let target_key = crate::load_balancer::target_host_port_key(target);
-        let guard = crate::proxy::LoadBalancerConnectionGuard::new(
-            Some(Arc::new(target.clone())),
-            Some(Arc::clone(&balancer)),
-        );
+        let guard =
+            crate::proxy::LoadBalancerConnectionGuard::new(Some(target), Some(balancer.as_ref()));
         let during = balancer
-            .active_connections
-            .get(&target_key)
-            .map(|count| count.load(Ordering::Relaxed))
-            .unwrap_or(0);
+            .target_runtime_state(target)
+            .map_or(0, |state| state.active_connections());
         drop(guard);
         let after = balancer
-            .active_connections
-            .get(&target_key)
-            .map(|count| count.load(Ordering::Relaxed))
-            .unwrap_or(0);
+            .target_runtime_state(target)
+            .map_or(0, |state| state.active_connections());
         Some((during, after))
     }
 

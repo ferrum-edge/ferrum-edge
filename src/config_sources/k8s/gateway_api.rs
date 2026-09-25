@@ -5,8 +5,9 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use crate::config::types::{
-    BackendScheme, FrontendTlsCertificateSource, MAX_FRONTEND_TLS_CERTIFICATE_SOURCES,
-    MAX_ID_LENGTH, MAX_TARGET_WEIGHT,
+    BackendScheme, FrontendTlsCertificateSource, MAX_BACKOFF_MS,
+    MAX_FRONTEND_TLS_CERTIFICATE_SOURCES, MAX_ID_LENGTH, MAX_RETRIES, MAX_TARGET_WEIGHT,
+    RetryConfig,
 };
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
@@ -26,8 +27,9 @@ use super::{
     mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
     optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
     resource_id, route_backends_require_node_waypoint_authz,
-    route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
-    upstream_for_route, upstream_for_route_with_session,
+    route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
+    service_dns_name, string_array, string_field, upstream_for_route,
+    upstream_for_route_with_session,
 };
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
@@ -39,6 +41,8 @@ const ZERO_WEIGHT_BACKEND_PORT: u16 = 65535;
 const GATEWAY_API_DISPATCH_PRECEDENCE_KEY: &str = "_ferrum_gateway_api_precedence";
 const GATEWAY_API_REDIRECT_REPLACE_PREFIX_MATCH_KEY: &str =
     "_ferrum_gateway_api_replace_prefix_match";
+const GATEWAY_API_REWRITE_REPLACE_PREFIX_MATCH_KEY: &str =
+    "_ferrum_gateway_api_rewrite_replace_prefix_match";
 
 /// `Gateway.spec.gatewayClassName` values that mark a GAMMA Waypoint
 /// Gateway. Both the Istio canonical value and a Ferrum-native alias are
@@ -5534,18 +5538,34 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
         let rule = rule.as_object().ok_or_else(|| {
             invalid_resource(object, format!("rules[{rule_index}] must be an object"))
         })?;
-        if rule.keys().any(|key| {
-            !matches!(
-                key.as_str(),
+        // `timeouts` (standard channel) and `retry` (experimental channel,
+        // present in the CRD bundle the conformance lab installs) are HTTPRoute
+        // rule fields; GRPCRoute defines neither and keeps refusing both.
+        let http_rule_fields_supported = object.kind == "HTTPRoute";
+        let field_supported = |key: &str| {
+            matches!(
+                key,
                 "name" | "matches" | "backendRefs" | "filters" | "sessionPersistence"
-            )
-        }) {
+            ) || (http_rule_fields_supported && matches!(key, "timeouts" | "retry"))
+        };
+        if rule.keys().any(|key| !field_supported(key.as_str())) {
+            let supported = if http_rule_fields_supported {
+                "name, matches, backendRefs, filters, sessionPersistence, timeouts and retry"
+            } else {
+                "name, matches, backendRefs, filters and sessionPersistence"
+            };
             return Err(invalid_resource(
                 object,
                 format!(
-                    "rules[{rule_index}] contains a field that {UNSUPPORTED_SHAPE_MARKER}; supported fields are name, matches, backendRefs, filters and sessionPersistence"
+                    "rules[{rule_index}] contains a field that {UNSUPPORTED_SHAPE_MARKER}; supported fields are {supported}"
                 ),
             ));
+        }
+        if http_rule_fields_supported && let Some(timeouts) = rule.get("timeouts") {
+            ensure_http_route_timeouts(object, rule_index, timeouts)?;
+        }
+        if http_rule_fields_supported && let Some(retry) = rule.get("retry") {
+            ensure_http_route_retry(object, rule_index, retry)?;
         }
         if let Some(backends) = rule.get("backendRefs").and_then(Value::as_array) {
             for (backend_index, backend) in backends.iter().enumerate() {
@@ -5570,24 +5590,30 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
                 format!("rules[{rule_index}].filters must be an array"),
             )
         })?;
+        let mut seen_singleton_filters: Vec<&str> = Vec::new();
         for (filter_index, filter) in filters.iter().enumerate() {
             let location = format!("rules[{rule_index}].filters[{filter_index}]");
-            let (payload, supported_fields): (&str, &[&str]) = match string_field(filter, "type") {
+            let filter_type = string_field(filter, "type");
+            let (payload, supported_fields): (&str, &[&str]) = match filter_type {
                 Some("RequestHeaderModifier") => {
                     ("requestHeaderModifier", &["set", "add", "remove"])
+                }
+                Some("ResponseHeaderModifier") => {
+                    ("responseHeaderModifier", &["set", "add", "remove"])
                 }
                 Some("RequestRedirect") if object.kind == "HTTPRoute" => (
                     "requestRedirect",
                     &["scheme", "hostname", "path", "port", "statusCode"],
                 ),
+                // `URLRewrite` is an HTTPRoute-only filter upstream; the
+                // GRPCRoute filter enum does not carry it, so a GRPCRoute
+                // asking for one keeps the fail-closed refusal below.
+                Some("URLRewrite") if object.kind == "HTTPRoute" => {
+                    ("urlRewrite", &["hostname", "path"])
+                }
                 Some(
-                    "ResponseHeaderModifier"
-                    | "URLRewrite"
-                    | "ExtensionRef"
-                    | "RequestMirror"
-                    | "CORS"
-                    | "ExternalAuth"
-                    | "RequestRedirect",
+                    "ExtensionRef" | "RequestMirror" | "CORS" | "ExternalAuth" | "RequestRedirect"
+                    | "URLRewrite",
                 ) => {
                     return Err(invalid_resource(
                         object,
@@ -5605,6 +5631,23 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
                     ));
                 }
             };
+            // Upstream marks these four filter types as "MUST NOT be specified
+            // more than once" within a single rule. A repeat is a conflicting
+            // declaration, not a stackable one: honoring only the first would
+            // silently discard the operator's second action.
+            if let Some(filter_type) = filter_type
+                && SINGLETON_ROUTE_FILTER_TYPES.contains(&filter_type)
+            {
+                if seen_singleton_filters.contains(&filter_type) {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "{INCOMPATIBLE_FILTERS_MARKER}: {location} repeats the {filter_type} filter, which may appear at most once per rule"
+                        ),
+                    ));
+                }
+                seen_singleton_filters.push(filter_type);
+            }
             let filter_object = filter
                 .as_object()
                 .ok_or_else(|| invalid_resource(object, format!("{location} must be an object")))?;
@@ -5629,9 +5672,617 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
                     ),
                 ));
             }
+            match filter_type {
+                Some("URLRewrite") => {
+                    ensure_url_rewrite_filter(object, rule, rule_index, &location, payload_object)?;
+                }
+                Some(modifier @ ("RequestHeaderModifier" | "ResponseHeaderModifier")) => {
+                    ensure_header_modifier_filter(
+                        object,
+                        &location,
+                        payload,
+                        payload_object,
+                        modifier == "ResponseHeaderModifier",
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        // Upstream forbids combining these two in one rule: a redirect answers
+        // the request itself and a rewrite rebases what reaches the backend, so
+        // honoring either one alone would silently drop the other action.
+        if seen_singleton_filters.contains(&"URLRewrite")
+            && seen_singleton_filters.contains(&"RequestRedirect")
+        {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{INCOMPATIBLE_FILTERS_MARKER}: rules[{rule_index}] combines URLRewrite with RequestRedirect, which cannot both be honored"
+                ),
+            ));
         }
     }
     Ok(())
+}
+
+/// Validate one admitted `HTTPRoute.rules[].timeouts` exactly as the pinned
+/// v1.5.1 CRD does. A file/CP-delivered object never passed through the API
+/// server's validation, so Ferrum re-checks it rather than guessing.
+///
+/// * `request` and `backendRequest` are each a Gateway API Duration (GEP-2257;
+///   CRD pattern `^([0-9]{1,5}(h|m|s|ms)){1,4}$`). A value outside that
+///   grammar is `Invalid`.
+/// * The CRD's CEL rule: when both are set and `request` is not the zero
+///   duration, `backendRequest` may not exceed it. A violation is `Invalid`.
+/// * A sub-field this CRD does not define — one a newer channel might add — is
+///   `UnsupportedValue`, like an unknown rule field.
+///
+/// Zero (`0s`) is accepted for both and means "disabled", as the CRD says.
+fn ensure_http_route_timeouts(
+    object: &K8sObject,
+    rule_index: usize,
+    timeouts: &Value,
+) -> Result<(), K8sTranslateError> {
+    let location = format!("rules[{rule_index}].timeouts");
+    let Some(timeouts) = timeouts.as_object() else {
+        return Err(invalid_resource(
+            object,
+            format!("{location} must be an object"),
+        ));
+    };
+    if timeouts
+        .keys()
+        .any(|key| !matches!(key.as_str(), "request" | "backendRequest"))
+    {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{location} contains a field that {UNSUPPORTED_SHAPE_MARKER}; supported fields are request and backendRequest"
+            ),
+        ));
+    }
+    let request_ms = http_route_timeout_field_ms(object, &location, timeouts, "request")?;
+    let backend_request_ms =
+        http_route_timeout_field_ms(object, &location, timeouts, "backendRequest")?;
+    if let (Some(request_ms), Some(backend_request_ms)) = (request_ms, backend_request_ms)
+        && request_ms != 0
+        && backend_request_ms > request_ms
+    {
+        return Err(invalid_resource(
+            object,
+            format!("{location}.backendRequest timeout cannot be longer than request timeout"),
+        ));
+    }
+    Ok(())
+}
+
+fn http_route_timeout_field_ms(
+    object: &K8sObject,
+    location: &str,
+    timeouts: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, K8sTranslateError> {
+    let Some(value) = timeouts.get(field) else {
+        return Ok(None);
+    };
+    // The value is never echoed: a status message must not reflect arbitrary
+    // manifest bytes back to readers of the route status.
+    value
+        .as_str()
+        .and_then(parse_gateway_api_duration_ms)
+        .map(Some)
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "{location}.{field} must be a Gateway API duration (GEP-2257) such as 500ms, 10s or 1h30m"
+                ),
+            )
+        })
+}
+
+/// Validate one admitted `HTTPRoute.rules[].retry` exactly as the pinned v1.5.1
+/// experimental-channel CRD does, then refuse the CRD-valid values Ferrum
+/// cannot honor. A file/CP-delivered object never passed through the API
+/// server's validation, so Ferrum re-checks it rather than guessing.
+///
+/// * `codes` is a list of integers in `400..=599`, `attempts` is an integer and
+///   `backoff` is a Gateway API Duration (GEP-2257). A value of the wrong
+///   type, a code outside that range, a backoff outside the duration grammar,
+///   and a non-object `retry` are `Invalid`.
+/// * The CRD bounds neither `attempts` nor `backoff`. A negative `attempts`,
+///   one above Ferrum's per-request retry ceiling ([`MAX_RETRIES`]), and a
+///   `backoff` above Ferrum's longest retry delay ([`MAX_BACKOFF_MS`]) are
+///   CRD-valid values Ferrum declines: `UnsupportedValue`.
+/// * A sub-field this CRD does not define is `UnsupportedValue`, like an
+///   unknown rule field.
+///
+/// No diagnostic echoes the offending value.
+fn ensure_http_route_retry(
+    object: &K8sObject,
+    rule_index: usize,
+    retry: &Value,
+) -> Result<(), K8sTranslateError> {
+    let location = format!("rules[{rule_index}].retry");
+    let Some(retry) = retry.as_object() else {
+        return Err(invalid_resource(
+            object,
+            format!("{location} must be an object"),
+        ));
+    };
+    if retry
+        .keys()
+        .any(|key| !matches!(key.as_str(), "codes" | "attempts" | "backoff"))
+    {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{location} contains a field that {UNSUPPORTED_SHAPE_MARKER}; supported fields are codes, attempts and backoff"
+            ),
+        ));
+    }
+    if let Some(codes) = retry.get("codes") {
+        let codes = codes.as_array().ok_or_else(|| {
+            invalid_resource(object, format!("{location}.codes must be an array"))
+        })?;
+        for (code_index, code) in codes.iter().enumerate() {
+            if !code
+                .as_u64()
+                .is_some_and(|code| (400..=599).contains(&code))
+            {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{location}.codes[{code_index}] must be an integer HTTP status code from 400 to 599"
+                    ),
+                ));
+            }
+        }
+    }
+    if let Some(attempts) = retry.get("attempts") {
+        if !(attempts.is_i64() || attempts.is_u64()) {
+            return Err(invalid_resource(
+                object,
+                format!("{location}.attempts must be an integer"),
+            ));
+        }
+        if !attempts
+            .as_u64()
+            .is_some_and(|attempts| attempts <= u64::from(MAX_RETRIES))
+        {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{location}.attempts {UNSUPPORTED_SHAPE_MARKER}: Ferrum retries a request from 0 to {MAX_RETRIES} times"
+                ),
+            ));
+        }
+    }
+    if let Some(backoff) = retry.get("backoff") {
+        let backoff_ms = backoff
+            .as_str()
+            .and_then(parse_gateway_api_duration_ms)
+            .ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!(
+                        "{location}.backoff must be a Gateway API duration (GEP-2257) such as 100ms, 1s or 1m"
+                    ),
+                )
+            })?;
+        if backoff_ms > MAX_BACKOFF_MS {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{location}.backoff {UNSUPPORTED_SHAPE_MARKER}: Ferrum waits at most {MAX_BACKOFF_MS}ms between retry attempts"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a Gateway API Duration (GEP-2257) exactly as the pinned CRD admits
+/// it — `^([0-9]{1,5}(h|m|s|ms)){1,4}$` — into whole milliseconds.
+///
+/// Components are summed the way Go's `time.ParseDuration` (and therefore the
+/// CRD's CEL `duration()`) sums them, so a repeated unit such as `1s1s` is two
+/// seconds. `ms` is matched before `m`: a component always starts with a
+/// digit, so `m` followed by `s` can only be milliseconds. Returns `None` for
+/// anything outside the grammar, including the empty string and more than four
+/// components. The largest admissible value (four `99999h` components) is far
+/// below `u64::MAX` milliseconds; the arithmetic is still checked.
+pub(crate) fn parse_gateway_api_duration_ms(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    let mut components = 0usize;
+    let mut total_ms: u64 = 0;
+    while index < bytes.len() {
+        if components == 4 {
+            return None;
+        }
+        let digits_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        let digits = index - digits_start;
+        if digits == 0 || digits > 5 {
+            return None;
+        }
+        let amount: u64 = value.get(digits_start..index)?.parse().ok()?;
+        let unit_ms: u64 = match bytes.get(index..) {
+            Some([b'm', b's', ..]) => {
+                index += 2;
+                1
+            }
+            Some([b'h', ..]) => {
+                index += 1;
+                3_600_000
+            }
+            Some([b'm', ..]) => {
+                index += 1;
+                60_000
+            }
+            Some([b's', ..]) => {
+                index += 1;
+                1_000
+            }
+            _ => return None,
+        };
+        total_ms = total_ms.checked_add(amount.checked_mul(unit_ms)?)?;
+        components += 1;
+    }
+    (components > 0).then_some(total_ms)
+}
+
+/// Validate one admitted header-modifier payload before any rule materializes.
+///
+/// The emitted `mesh_route_dispatch` rule must always construct: the dispatch
+/// plugin applies the same header-name / header-value gates, so a manifest that
+/// slipped a malformed name or a CR/LF value past the CRD would otherwise leave
+/// an accepted route carrying a plugin config that fails to build.
+///
+/// Response-side `set` / `add` additionally refuse protocol-managed
+/// destinations (hop-by-hop and framing headers). Ferrum strips those from
+/// backend responses by design, so reintroducing one from a route filter would
+/// punch a hole in the proxy boundary; the route is refused rather than
+/// silently dropping that one entry.
+///
+/// Response-side `set` / `add` / `remove` also refuse the gRPC terminal status
+/// fields ([`GRPC_TERMINAL_STATUS_FIELDS`]). In a Trailers-Only response —
+/// how a gRPC server reports most errors — those fields travel in the one
+/// HEADERS frame the transform edits, so a route filter could rewrite a failed
+/// RPC into `grpc-status: 0` or strip its status altogether. HTTPRoute is
+/// covered too, because an HTTPRoute can carry gRPC traffic.
+fn ensure_header_modifier_filter(
+    object: &K8sObject,
+    location: &str,
+    payload: &str,
+    modifier: &serde_json::Map<String, Value>,
+    response_side: bool,
+) -> Result<(), K8sTranslateError> {
+    for field in ["set", "add"] {
+        let Some(entries) = modifier.get(field) else {
+            continue;
+        };
+        let Some(entries) = entries.as_array() else {
+            return Err(invalid_resource(
+                object,
+                format!("{location}.{payload}.{field} must be an array"),
+            ));
+        };
+        for (index, entry) in entries.iter().enumerate() {
+            let where_ = format!("{location}.{payload}.{field}[{index}]");
+            let Some(name) = string_field(entry, "name") else {
+                return Err(invalid_resource(
+                    object,
+                    format!("{where_}.name must be a string"),
+                ));
+            };
+            let Some(value) = string_field(entry, "value") else {
+                return Err(invalid_resource(
+                    object,
+                    format!("{where_}.value must be a string"),
+                ));
+            };
+            ensure_valid_header_name(object, &where_, name)?;
+            if value.bytes().any(|byte| byte == b'\r' || byte == b'\n')
+                || http::HeaderValue::from_str(value).is_err()
+            {
+                return Err(invalid_resource(
+                    object,
+                    format!("{where_}.value must be a valid HTTP header value"),
+                ));
+            }
+            if response_side
+                && crate::proxy::headers::is_protocol_managed_plugin_response_destination(name)
+            {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{where_}.name {UNSUPPORTED_SHAPE_MARKER}: hop-by-hop and framing response headers are protocol-managed and cannot be set by a route filter"
+                    ),
+                ));
+            }
+            if response_side {
+                ensure_not_grpc_terminal_status_field(object, &format!("{where_}.name"), name)?;
+            }
+        }
+    }
+    let Some(remove) = modifier.get("remove") else {
+        return Ok(());
+    };
+    let Some(remove) = remove.as_array() else {
+        return Err(invalid_resource(
+            object,
+            format!("{location}.{payload}.remove must be an array"),
+        ));
+    };
+    for (index, entry) in remove.iter().enumerate() {
+        let where_ = format!("{location}.{payload}.remove[{index}]");
+        let Some(name) = entry.as_str() else {
+            return Err(invalid_resource(
+                object,
+                format!("{where_} must be a string"),
+            ));
+        };
+        ensure_valid_header_name(object, &where_, name)?;
+        if response_side {
+            ensure_not_grpc_terminal_status_field(object, &where_, name)?;
+        }
+    }
+    Ok(())
+}
+
+/// gRPC terminal status fields a response-side route filter may not touch.
+const GRPC_TERMINAL_STATUS_FIELDS: [&str; 3] =
+    ["grpc-status", "grpc-message", "grpc-status-details-bin"];
+
+fn ensure_not_grpc_terminal_status_field(
+    object: &K8sObject,
+    where_: &str,
+    name: &str,
+) -> Result<(), K8sTranslateError> {
+    if GRPC_TERMINAL_STATUS_FIELDS
+        .iter()
+        .any(|field| field.eq_ignore_ascii_case(name))
+    {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{where_} {UNSUPPORTED_SHAPE_MARKER}: gRPC terminal status fields are protocol-managed and cannot be modified by a route filter"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_valid_header_name(
+    object: &K8sObject,
+    where_: &str,
+    name: &str,
+) -> Result<(), K8sTranslateError> {
+    if name.is_empty() || http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+        return Err(invalid_resource(
+            object,
+            format!("{where_} must be a valid HTTP header name"),
+        ));
+    }
+    Ok(())
+}
+
+/// Filter types upstream declares as at-most-once within a single route rule.
+const SINGLETON_ROUTE_FILTER_TYPES: [&str; 4] = [
+    "RequestHeaderModifier",
+    "ResponseHeaderModifier",
+    "RequestRedirect",
+    "URLRewrite",
+];
+
+/// Validate one admitted `URLRewrite` payload before any rule materializes.
+///
+/// `hostname` is an upstream `PreciseHostname` (no wildcard, no port) and lands
+/// on the backend-facing `Host` / `:authority`; `path` carries exactly one of
+/// the two supported modifier shapes, and only that shape's field. A
+/// `ReplacePrefixMatch` additionally needs a `PathPrefix` match to rebase
+/// against. Upstream's CRD enforces all of these with a `Pattern` or an
+/// `XValidation` rule; Ferrum re-checks them because a file/CP-delivered object
+/// never passed through the API server's validation.
+///
+/// Status reasons follow WHAT is wrong, never which CRD mechanism forbids it
+/// (see "Rule-filter admission" in `docs/gateway_api_conformance.md`):
+///
+/// * a bad VALUE inside this one filter — a malformed hostname or path, a
+///   missing required field, a modifier field the selected `type` does not
+///   use, `ReplacePrefixMatch` under a non-prefix match — is `Invalid`;
+/// * a CRD-valid value Ferrum declines — an unknown `path.type` a newer channel
+///   may add — is `UnsupportedValue`;
+/// * a filter FIELD Ferrum does not implement (an unknown key inside `path`) is
+///   `IncompatibleFilters`, like every other unimplemented filter field or type
+///   and every conflict between filters of one rule.
+fn ensure_url_rewrite_filter(
+    object: &K8sObject,
+    rule: &serde_json::Map<String, Value>,
+    rule_index: usize,
+    location: &str,
+    rewrite: &serde_json::Map<String, Value>,
+) -> Result<(), K8sTranslateError> {
+    if let Some(hostname) = rewrite.get("hostname") {
+        let hostname = hostname.as_str().filter(|value| !value.is_empty());
+        let Some(hostname) = hostname else {
+            return Err(invalid_resource(
+                object,
+                format!("{location}.urlRewrite.hostname must be a non-empty string"),
+            ));
+        };
+        if !is_precise_gateway_hostname(hostname) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{location}.urlRewrite.hostname must be a precise hostname without a wildcard or port"
+                ),
+            ));
+        }
+    }
+
+    let Some(path) = rewrite.get("path") else {
+        return Ok(());
+    };
+    let Some(path) = path.as_object() else {
+        return Err(invalid_resource(
+            object,
+            format!("{location}.urlRewrite.path must be an object"),
+        ));
+    };
+    if path.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "type" | "replaceFullPath" | "replacePrefixMatch"
+        )
+    }) {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{INCOMPATIBLE_FILTERS_MARKER}: {location}.urlRewrite.path contains unhandled fields"
+            ),
+        ));
+    }
+    let path_type = path.get("type").and_then(Value::as_str);
+    // Upstream's CEL rules tie each modifier field to its own `type`. A stray
+    // field for the OTHER type would otherwise be silently dropped, so the
+    // operator's second replacement would never take effect.
+    let stray_field = match path_type {
+        Some("ReplaceFullPath") => Some("replacePrefixMatch"),
+        Some("ReplacePrefixMatch") => Some("replaceFullPath"),
+        _ => None,
+    };
+    if let (Some(path_type), Some(stray_field)) = (path_type, stray_field)
+        && path.contains_key(stray_field)
+    {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{location}.urlRewrite.path.{stray_field} must not be set for type {path_type}"
+            ),
+        ));
+    }
+    match path_type {
+        Some("ReplaceFullPath") => {
+            let Some(replacement) = path.get("replaceFullPath").and_then(Value::as_str) else {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{location}.urlRewrite.path.replaceFullPath is required for type ReplaceFullPath"
+                    ),
+                ));
+            };
+            ensure_rewrite_replacement_path(object, location, "replaceFullPath", replacement)?;
+        }
+        Some("ReplacePrefixMatch") => {
+            let Some(replacement) = path.get("replacePrefixMatch").and_then(Value::as_str) else {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{location}.urlRewrite.path.replacePrefixMatch is required for type ReplacePrefixMatch"
+                    ),
+                ));
+            };
+            // An empty replacement is legal upstream and means "drop the
+            // matched prefix"; it normalizes to `/` at materialization.
+            if !replacement.is_empty() {
+                ensure_rewrite_replacement_path(
+                    object,
+                    location,
+                    "replacePrefixMatch",
+                    replacement,
+                )?;
+            }
+            if !rule_matches_are_all_path_prefix(rule) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "rules[{rule_index}] urlRewrite path.type ReplacePrefixMatch requires every match in the rule to use a PathPrefix path match"
+                    ),
+                ));
+            }
+        }
+        _ => {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{location}.urlRewrite.path.type {UNSUPPORTED_SHAPE_MARKER}: expected ReplaceFullPath or ReplacePrefixMatch"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a rewrite replacement Ferrum cannot forward verbatim. The dispatch
+/// plugin applies the same absolute/canonical/CRLF rules at construction, so
+/// catching them here turns a plugin-build failure into a route-scoped
+/// `Accepted=False` with a field-specific message.
+fn ensure_rewrite_replacement_path(
+    object: &K8sObject,
+    location: &str,
+    field: &str,
+    replacement: &str,
+) -> Result<(), K8sTranslateError> {
+    if !replacement.starts_with('/')
+        || replacement.contains(['?', '#'])
+        || replacement.contains(['\r', '\n'])
+    {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "{location}.urlRewrite.path.{field} must be an absolute path without a query or fragment"
+            ),
+        ));
+    }
+    if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(replacement) {
+        return Err(invalid_resource(
+            object,
+            format!("{location}.urlRewrite.path.{field} is not canonical: {reason}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether every `matches[]` entry in this rule selects on a `PathPrefix` path.
+/// A rule with no `matches` is the implicit `PathPrefix: /` catch-all, which
+/// qualifies.
+fn rule_matches_are_all_path_prefix(rule: &serde_json::Map<String, Value>) -> bool {
+    let Some(matches) = rule.get("matches").and_then(Value::as_array) else {
+        return true;
+    };
+    if matches.is_empty() {
+        return true;
+    }
+    matches.iter().all(|entry| {
+        entry.get("path").is_none_or(|path| {
+            path.get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("PathPrefix")
+                == "PathPrefix"
+        })
+    })
+}
+
+/// Upstream `PreciseHostname`: a lowercase DNS name with no wildcard label, no
+/// port, and no trailing dot.
+fn is_precise_gateway_hostname(hostname: &str) -> bool {
+    if hostname.is_empty() || hostname.len() > 253 || hostname.contains(['*', ':', '/']) {
+        return false;
+    }
+    hostname.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    })
 }
 
 type HttpRouteResources = (Vec<Proxy>, Vec<PluginConfig>);
@@ -5712,7 +6363,11 @@ fn http_route_resources(
             match_paths.dedup();
 
             let request_transform = gateway_request_header_modifier_rules(rule);
+            let response_transform = gateway_response_header_modifier_rules(rule);
             let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
+            let rewrite = gateway_url_rewrite_value(rule);
+            let timeouts = gateway_route_rule_timeouts(rule);
+            let retry = gateway_route_rule_retry(rule);
             let mut backend_resolution = route_backends(object, rule, acc)?;
             let backend_tls_policy = super::backend_tls_policy::resolve_backends_tls_policy(
                 acc,
@@ -5746,6 +6401,29 @@ fn http_route_resources(
                 &backend_resolution.backends,
                 acc,
             )?;
+            // Upstream `HTTPRouteRule.backendRefs`: with no backend to forward
+            // to and no filter that answers the request itself
+            // (`RequestRedirect`), every matching request MUST receive a 500.
+            // Header modifiers, `URLRewrite`, `timeouts` and `retry` shape a
+            // forwarded request or its response; alone they would otherwise
+            // send traffic to the unresolvable blackhole backend. GRPCRoute
+            // keeps the blackhole, exactly as its all-zero-weight rule does.
+            if object.kind == "HTTPRoute"
+                && backend_resolution.backends.is_empty()
+                && backend_resolution.fault_reason.is_none()
+                && redirect.is_none()
+                && (!request_transform.is_empty()
+                    || !response_transform.is_empty()
+                    || rewrite.is_some()
+                    || !timeouts.is_empty()
+                    || retry.is_some())
+            {
+                backend_resolution.fault_reason = Some(BackendRefFaultReason::NoServiceableBackend);
+                acc.warnings.push(
+                    "HTTPRoute rule forwards to no backendRefs; materializing HTTP 500 fail-closed route action"
+                        .to_string(),
+                );
+            }
             let backend_ref_fault = backend_resolution.fault_reason.map(|reason| {
                 backend_ref_fault_value_with_percentage(
                     reason,
@@ -5755,8 +6433,16 @@ fn http_route_resources(
                     ),
                 )
             });
-            let has_route_actions =
-                !request_transform.is_empty() || redirect.is_some() || backend_ref_fault.is_some();
+            let rule_actions = RouteRuleActions {
+                request_transform: &request_transform,
+                response_transform: &response_transform,
+                redirect: redirect.as_ref(),
+                rewrite: rewrite.as_ref(),
+                fault: backend_ref_fault.as_ref(),
+                timeouts,
+                retry: retry.as_ref(),
+            };
+            let has_route_actions = !rule_actions.is_empty();
 
             let (
                 backend_host,
@@ -5951,12 +6637,12 @@ fn http_route_resources(
                             },
                             &skipped_descriptors,
                             &entry_descriptors_for_path,
-                            &request_transform,
-                            redirect.as_ref(),
-                            backend_ref_fault.as_ref(),
+                            rule_actions,
                         );
                         let rules_have_request_transform =
                             dispatch_rules_carry_field(&rules, "request_transform");
+                        let rules_have_response_transform =
+                            dispatch_rules_carry_field(&rules, "response_transform");
                         if let Some(mut plugin) = mesh_route_dispatch_plugin_from_rules(
                             &proxy_id,
                             config_namespace,
@@ -5967,6 +6653,20 @@ fn http_route_resources(
                             let mut route_plugins = Vec::new();
                             if rules_have_request_transform {
                                 route_plugins.push(route_request_transformer_plugin_for_proxy(
+                                    &proxy_id,
+                                    config_namespace,
+                                ));
+                            }
+                            // The dispatch plugin publishes per-rule response
+                            // transforms onto the request context; without a
+                            // `response_transformer` on this proxy nothing would
+                            // consume them. The emitted instance carries no
+                            // static rules of its own, so a same-name GLOBAL
+                            // transformer keeps running its rules and the route
+                            // transform is applied once in the authoritative
+                            // route-header final phase.
+                            if rules_have_response_transform {
+                                route_plugins.push(route_response_transformer_plugin_for_proxy(
                                     &proxy_id,
                                     config_namespace,
                                 ));
@@ -6252,6 +6952,161 @@ fn has_only_zero_weight_backend_refs(rule: &Value) -> bool {
         .all(|backend_ref| backend_ref.get("weight").and_then(Value::as_u64) == Some(0))
 }
 
+/// Route-local actions projected onto every dispatch rule a single Gateway API
+/// route rule emits. Grouped so each match entry receives exactly the same
+/// action set and a new upstream action cannot be threaded onto one emitter
+/// while another silently drops it.
+#[derive(Clone, Copy, Default)]
+struct RouteRuleActions<'a> {
+    request_transform: &'a [Value],
+    response_transform: &'a [Value],
+    redirect: Option<&'a Value>,
+    rewrite: Option<&'a Value>,
+    fault: Option<&'a Value>,
+    timeouts: RouteRuleTimeouts,
+    retry: Option<&'a RouteRuleRetry>,
+}
+
+impl RouteRuleActions<'_> {
+    /// Whether this rule does something on its own, independent of a backend.
+    /// A rule with only actions still materializes a dispatch rule so the
+    /// action fires; a rule with none can fall through to the proxy default.
+    ///
+    /// Rule `timeouts` and `retry` count: they must select their policy for
+    /// exactly the requests this rule matches, so a path-only rule carrying
+    /// them still emits its own dispatch rule instead of falling through to a
+    /// proxy that a sibling rule may share.
+    fn is_empty(&self) -> bool {
+        self.request_transform.is_empty()
+            && self.response_transform.is_empty()
+            && self.redirect.is_none()
+            && self.rewrite.is_none()
+            && self.fault.is_none()
+            && self.timeouts.is_empty()
+            && self.retry.is_none()
+    }
+}
+
+/// An admitted HTTPRoute rule's `retry`, projected onto the emitted
+/// `mesh_route_dispatch` rule — the same per-rule retry override the Istio
+/// VirtualService translator drives. Like `timeouts`, it is request-scoped
+/// policy for the requests that rule matches and is never promoted onto the
+/// shared proxy or upstream (whose retry policy is always unset), so a merged
+/// sibling rule without `retry` is never retried.
+enum RouteRuleRetry {
+    /// Projected as the rule's `retry` object (a route-local `RetryConfig`).
+    Enabled(Value),
+    /// `attempts: 0`: projected as `retry_disabled: true`.
+    Disabled,
+}
+
+/// An admitted HTTPRoute rule's `timeouts`, in milliseconds.
+///
+/// Both stay on the emitted `mesh_route_dispatch` rule — request-scoped policy
+/// for the requests that rule matches — and are never promoted onto the shared
+/// proxy or upstream, so a merged sibling rule without `timeouts` keeps the
+/// proxy defaults.
+#[derive(Clone, Copy, Default)]
+struct RouteRuleTimeouts {
+    /// `timeouts.request`: the rule's total request deadline, projected as
+    /// `request_timeout_ms`. `None` when absent or the zero duration, which
+    /// the CRD defines as disabled (Ferrum has no default total deadline).
+    request_ms: Option<u64>,
+    /// `timeouts.backendRequest`: the per-attempt backend bound, projected as
+    /// both `timeout_ms` (the attempt's response-head wait and idle gap) and
+    /// `attempt_timeout_ms` (the attempt's total duration, until its full
+    /// response has been received). `Some(0)` is the zero duration and
+    /// projects as `timeout_disabled` alone, clearing the proxy's default read
+    /// bound for this rule. `None` when absent.
+    backend_request_ms: Option<u64>,
+}
+
+impl RouteRuleTimeouts {
+    fn is_empty(&self) -> bool {
+        self.request_ms.is_none() && self.backend_request_ms.is_none()
+    }
+}
+
+/// Project an HTTPRoute rule's `timeouts`. Shape, grammar, and the CRD's
+/// `backendRequest <= request` rule were already enforced by
+/// [`ensure_http_route_timeouts`]; GRPCRoute never reaches here with one.
+fn gateway_route_rule_timeouts(rule: &Value) -> RouteRuleTimeouts {
+    let Some(timeouts) = rule.get("timeouts") else {
+        return RouteRuleTimeouts::default();
+    };
+    let field_ms = |field: &str| {
+        timeouts
+            .get(field)
+            .and_then(Value::as_str)
+            .and_then(parse_gateway_api_duration_ms)
+    };
+    RouteRuleTimeouts {
+        request_ms: field_ms("request").filter(|request_ms| *request_ms > 0),
+        backend_request_ms: field_ms("backendRequest"),
+    }
+}
+
+/// Project an HTTPRoute rule's `retry` onto Ferrum's retry policy. Shape,
+/// ranges and grammar were already enforced by [`ensure_http_route_retry`];
+/// GRPCRoute never reaches here with one.
+///
+/// * `attempts` is the number of RETRIES after the initial attempt (upstream:
+///   "the maximum number of times an individual request from the gateway to a
+///   backend should be retried"), so it maps to `max_retries` unchanged and a
+///   request reaches the backend at most `attempts + 1` times. `0` disables
+///   retries for the rule. Omitted, `max_retries` is left out of the
+///   projection and the route retry shape's default (Ferrum's retry default,
+///   3) applies.
+/// * `codes` become `retryable_status_codes` (sorted, de-duplicated). Omitted
+///   or empty, no response status is retried.
+/// * `backoff` is a FIXED delay: upstream makes it the minimum wait between
+///   attempts, and Ferrum's exponential strategy jitters below its base, so it
+///   could retry early. Omitted, the route retry shape's default fixed delay
+///   (100ms) applies.
+/// * Status-code retries apply only to Ferrum's default replay-safe methods
+///   (`GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`); a request of any other
+///   method that reached the backend is never replayed to honor the manifest.
+///   Upstream says implementations SHOULD also retry connection errors, so
+///   `retry_on_connect_failure` is on: a failure before any request byte
+///   reached the backend (refused connect, connect timeout, DNS, TLS) is
+///   retried for every method, replaying the bounded buffered body.
+fn gateway_route_rule_retry(rule: &Value) -> Option<RouteRuleRetry> {
+    let retry = rule.get("retry")?;
+    let mut projected = serde_json::Map::new();
+    if let Some(attempts) = retry.get("attempts").and_then(Value::as_u64) {
+        if attempts == 0 {
+            return Some(RouteRuleRetry::Disabled);
+        }
+        projected.insert("max_retries".to_string(), json!(attempts));
+    }
+    let mut codes: Vec<u64> = retry
+        .get("codes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+    projected.insert("retryable_status_codes".to_string(), json!(codes));
+    projected.insert(
+        "retryable_methods".to_string(),
+        json!(RetryConfig::default().retryable_methods),
+    );
+    if let Some(delay_ms) = retry
+        .get("backoff")
+        .and_then(Value::as_str)
+        .and_then(parse_gateway_api_duration_ms)
+    {
+        projected.insert(
+            "backoff".to_string(),
+            json!({"fixed": {"delay_ms": delay_ms}}),
+        );
+    }
+    projected.insert("retry_on_connect_failure".to_string(), Value::Bool(true));
+    Some(RouteRuleRetry::Enabled(Value::Object(projected)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn http_route_dispatch_rules_for_proxy(
     object: &K8sObject,
@@ -6261,11 +7116,9 @@ fn http_route_dispatch_rules_for_proxy(
     route_destination: MeshRouteDispatchDestination<'_>,
     skipped_descriptors: &HashSet<RouteMatchDescriptor>,
     entry_descriptors: &[RouteMatchEntryDescriptor],
-    request_transform: &[Value],
-    redirect: Option<&Value>,
-    fault: Option<&Value>,
+    actions: RouteRuleActions<'_>,
 ) -> (Vec<Value>, bool) {
-    let has_route_actions = !request_transform.is_empty() || redirect.is_some() || fault.is_some();
+    let has_route_actions = !actions.is_empty();
     let matches = rule
         .get("matches")
         .and_then(Value::as_array)
@@ -6275,9 +7128,7 @@ fn http_route_dispatch_rules_for_proxy(
             object,
             rule_index,
             route_destination,
-            request_transform,
-            redirect,
-            fault,
+            actions,
             has_route_actions,
         );
     };
@@ -6321,9 +7172,7 @@ fn http_route_dispatch_rules_for_proxy(
                     rule_index,
                     match_index,
                     route_destination,
-                    request_transform,
-                    redirect,
-                    fault,
+                    actions,
                     entry,
                 ));
             }
@@ -6336,9 +7185,7 @@ fn http_route_dispatch_rules_for_proxy(
             rule_index,
             match_index,
             route_destination,
-            request_transform,
-            redirect,
-            fault,
+            actions,
             entry,
         ));
     }
@@ -6411,14 +7258,11 @@ fn http_route_dispatch_match_criteria(entry: &Value) -> serde_json::Map<String, 
 /// therefore always emits a rule carrying the gRPC-shape URI predicate plus
 /// the content-type gate, and reports `has_path_only_match = false` so
 /// `reject_unmatched` keeps non-gRPC traffic off the backend.
-#[allow(clippy::too_many_arguments)]
 fn route_default_match_dispatch_rules(
     object: &K8sObject,
     rule_index: usize,
     route_destination: MeshRouteDispatchDestination<'_>,
-    request_transform: &[Value],
-    redirect: Option<&Value>,
-    fault: Option<&Value>,
+    actions: RouteRuleActions<'_>,
     has_route_actions: bool,
 ) -> (Vec<Value>, bool) {
     if object.kind == "GRPCRoute" {
@@ -6431,9 +7275,7 @@ fn route_default_match_dispatch_rules(
                 rule_index,
                 0,
                 route_destination,
-                request_transform,
-                redirect,
-                fault,
+                actions,
                 &entry,
             )],
             false,
@@ -6449,9 +7291,7 @@ fn route_default_match_dispatch_rules(
                 rule_index,
                 0,
                 route_destination,
-                request_transform,
-                redirect,
-                fault,
+                actions,
                 &default_match,
             )],
             true,
@@ -6472,9 +7312,7 @@ fn gateway_api_dispatch_route_rule(
     rule_index: usize,
     match_index: usize,
     route_destination: MeshRouteDispatchDestination<'_>,
-    request_transform: &[Value],
-    redirect: Option<&Value>,
-    fault: Option<&Value>,
+    actions: RouteRuleActions<'_>,
     precedence_entry: &Value,
 ) -> Value {
     let mut destination = serde_json::Map::new();
@@ -6500,20 +7338,69 @@ fn gateway_api_dispatch_route_rule(
     let mut route_rule = serde_json::Map::new();
     route_rule.insert("match".to_string(), match_criteria);
     route_rule.insert("destination".to_string(), Value::Object(destination));
-    if !request_transform.is_empty() {
+    if !actions.request_transform.is_empty() {
         route_rule.insert(
             "request_transform".to_string(),
-            Value::Array(request_transform.to_vec()),
+            Value::Array(actions.request_transform.to_vec()),
         );
     }
-    if let Some(redirect) = redirect {
+    if !actions.response_transform.is_empty() {
+        route_rule.insert(
+            "response_transform".to_string(),
+            Value::Array(actions.response_transform.to_vec()),
+        );
+    }
+    if let Some(redirect) = actions.redirect {
         route_rule.insert(
             "redirect".to_string(),
             gateway_redirect_value_for_match(redirect, precedence_entry),
         );
+    } else if let Some(rewrite) = actions.rewrite {
+        // A redirect answers the request itself, so a rule carrying both would
+        // never apply the rewrite. Admission already refuses that combination;
+        // the `else` keeps the invariant local to the emitter too.
+        route_rule.insert(
+            "rewrite".to_string(),
+            gateway_rewrite_value_for_match(rewrite, precedence_entry),
+        );
     }
-    if let Some(fault) = fault {
+    if let Some(fault) = actions.fault {
         route_rule.insert("fault".to_string(), fault.clone());
+    }
+    if let Some(request_ms) = actions.timeouts.request_ms {
+        route_rule.insert(
+            "request_timeout_ms".to_string(),
+            serde_json::json!(request_ms),
+        );
+    }
+    match actions.timeouts.backend_request_ms {
+        Some(0) => {
+            route_rule.insert("timeout_disabled".to_string(), Value::Bool(true));
+        }
+        Some(backend_request_ms) => {
+            route_rule.insert(
+                "timeout_ms".to_string(),
+                serde_json::json!(backend_request_ms),
+            );
+            // Upstream bounds each attempt until its FULL response has been
+            // received, so the same budget also caps the attempt's total
+            // duration, body included; `timeout_ms` alone would let a backend
+            // trickling its body inside the idle gap run unbounded.
+            route_rule.insert(
+                "attempt_timeout_ms".to_string(),
+                serde_json::json!(backend_request_ms),
+            );
+        }
+        None => {}
+    }
+    match actions.retry {
+        Some(RouteRuleRetry::Enabled(retry)) => {
+            route_rule.insert("retry".to_string(), retry.clone());
+        }
+        Some(RouteRuleRetry::Disabled) => {
+            route_rule.insert("retry_disabled".to_string(), Value::Bool(true));
+        }
+        None => {}
     }
     route_rule.insert(
         GATEWAY_API_DISPATCH_PRECEDENCE_KEY.to_string(),
@@ -6531,19 +7418,32 @@ fn dispatch_rules_carry_field(rules: &[Value], field: &str) -> bool {
 }
 
 fn gateway_request_header_modifier_rules(rule: &Value) -> Vec<Value> {
+    gateway_header_modifier_rules(rule, "RequestHeaderModifier", "requestHeaderModifier")
+}
+
+/// Project rule-level `ResponseHeaderModifier` onto the same route-local
+/// header-transform rules `request_transform` uses, consumed on the response
+/// side by `response_transformer` after its own static rules.
+///
+/// Applies to HTTPRoute and GRPCRoute alike: for a native gRPC call these are
+/// the response's initial metadata (the HEADERS frame). gRPC **trailers** —
+/// including `grpc-status` / `grpc-message` — are not response headers and are
+/// deliberately left untouched, matching the upstream filter's scope.
+fn gateway_response_header_modifier_rules(rule: &Value) -> Vec<Value> {
+    gateway_header_modifier_rules(rule, "ResponseHeaderModifier", "responseHeaderModifier")
+}
+
+fn gateway_header_modifier_rules(rule: &Value, filter_type: &str, payload: &str) -> Vec<Value> {
     let mut out = Vec::new();
     let Some(filters) = rule.get("filters").and_then(Value::as_array) else {
         return out;
     };
 
     for filter in filters {
-        if string_field(filter, "type") != Some("RequestHeaderModifier") {
+        if string_field(filter, "type") != Some(filter_type) {
             continue;
         }
-        let Some(modifier) = filter
-            .get("requestHeaderModifier")
-            .and_then(Value::as_object)
-        else {
+        let Some(modifier) = filter.get(payload).and_then(Value::as_object) else {
             continue;
         };
 
@@ -6558,6 +7458,111 @@ fn gateway_request_header_modifier_rules(rule: &Value) -> Vec<Value> {
     }
 
     out
+}
+
+/// Project an HTTPRoute rule-level `URLRewrite` filter onto the per-rule
+/// `RouteRewriteConfig` shape `mesh_route_dispatch` consumes.
+///
+/// `hostname` becomes the backend-facing `authority`; `path` becomes `uri`.
+/// A `ReplacePrefixMatch` modifier additionally stamps
+/// [`GATEWAY_API_REWRITE_REPLACE_PREFIX_MATCH_KEY`] so each emitted dispatch
+/// rule can fill in `match_prefix` from *its own* match entry — the same
+/// per-match resolution `RequestRedirect` already uses. Returns `None` for an
+/// absent or action-less filter so an inert `urlRewrite: {}` never emits a
+/// rewrite the dispatch plugin would reject as empty.
+///
+/// Shape validation already ran in [`ensure_http_route_features`], so this
+/// consumer only projects what admission accepted.
+fn gateway_url_rewrite_value(rule: &Value) -> Option<Value> {
+    let filters = rule.get("filters").and_then(Value::as_array)?;
+    for filter in filters {
+        if string_field(filter, "type") != Some("URLRewrite") {
+            continue;
+        }
+        let Some(rewrite) = filter.get("urlRewrite").and_then(Value::as_object) else {
+            continue;
+        };
+        let mut out = serde_json::Map::new();
+        if let Some(hostname) = rewrite
+            .get("hostname")
+            .and_then(Value::as_str)
+            .filter(|hostname| !hostname.is_empty())
+        {
+            out.insert("authority".to_string(), Value::String(hostname.to_string()));
+        }
+        if let Some(path) = rewrite.get("path").and_then(Value::as_object) {
+            match path.get("type").and_then(Value::as_str) {
+                Some("ReplaceFullPath") => {
+                    if let Some(replacement) = path.get("replaceFullPath").and_then(Value::as_str) {
+                        out.insert("uri".to_string(), Value::String(replacement.to_string()));
+                    }
+                }
+                Some("ReplacePrefixMatch") => {
+                    if let Some(replacement) =
+                        path.get("replacePrefixMatch").and_then(Value::as_str)
+                    {
+                        // Upstream's rewrite table maps an empty replacement to
+                        // a bare `/` (`/foo` + prefix `/foo` + `""` -> `/`), so
+                        // normalize it here rather than emitting an empty `uri`
+                        // the dispatch plugin refuses.
+                        let replacement = if replacement.is_empty() {
+                            "/"
+                        } else {
+                            replacement
+                        };
+                        out.insert("uri".to_string(), Value::String(replacement.to_string()));
+                        out.insert(
+                            GATEWAY_API_REWRITE_REPLACE_PREFIX_MATCH_KEY.to_string(),
+                            Value::Bool(true),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        return Some(Value::Object(out));
+    }
+    None
+}
+
+/// Resolve the per-match `match_prefix` for a rewrite emitted against one
+/// match entry. Mirrors [`gateway_redirect_value_for_match`].
+fn gateway_rewrite_value_for_match(rewrite: &Value, match_entry: &Value) -> Value {
+    let mut value = rewrite.clone();
+    let Some(obj) = value.as_object_mut() else {
+        return value;
+    };
+    let replace_prefix = obj
+        .remove(GATEWAY_API_REWRITE_REPLACE_PREFIX_MATCH_KEY)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if replace_prefix && let Some(prefix) = gateway_match_path_prefix(match_entry) {
+        obj.insert(
+            "match_prefix".to_string(),
+            Value::String(gateway_prefix_rewrite_match_prefix(prefix).to_string()),
+        );
+    }
+    value
+}
+
+/// Canonicalize a matched `PathPrefix` value into the literal byte prefix the
+/// dispatch plugin strips before prepending the replacement.
+///
+/// Gateway API prefix matching is path-**element** aware, so `/foo/` and `/foo`
+/// select the same requests and must rewrite identically
+/// (`/foo/bar` + `/xyz` -> `/xyz/bar` for either spelling). The dispatch
+/// plugin's strip is a literal byte prefix, so a trailing separator would leave
+/// the tail without one and fuse `/xyz` onto `bar`. Dropping it — and reducing
+/// the root prefix to the empty prefix, which strips nothing and prepends —
+/// reproduces the upstream rewrite table exactly.
+fn gateway_prefix_rewrite_match_prefix(prefix: &str) -> &str {
+    match prefix.strip_suffix('/') {
+        Some(trimmed) => trimmed,
+        None => prefix,
+    }
 }
 
 fn gateway_header_name_value_entries(value: Option<&Value>) -> serde_json::Map<String, Value> {
@@ -6722,14 +7727,24 @@ fn gateway_redirect_value_for_match(redirect: &Value, match_entry: &Value) -> Va
     if replace_prefix && let Some(prefix) = gateway_match_path_prefix(match_entry) {
         obj.insert(
             "match_prefix".to_string(),
-            Value::String(prefix.to_string()),
+            Value::String(gateway_prefix_rewrite_match_prefix(prefix).to_string()),
         );
     }
     value
 }
 
+/// The `PathPrefix` a match entry selects on, as `ReplacePrefixMatch` rebases
+/// it, or `None` for a non-prefix path match.
+///
+/// Upstream defaults an omitted `path` to `PathPrefix: /`, and an omitted
+/// `path.value` to `/`. A file/CP-delivered object never passed through the API
+/// server's defaulting, so an absent or null `path` and a value-less
+/// `PathPrefix` are that same omission — and routing
+/// (`route_match_descriptor_for_entry`) already places such an entry on `/`.
+/// Resolving the rewrite/redirect prefix any other way would rebase a request
+/// routing matched as the root prefix as if it were a whole-path replacement.
 fn gateway_match_path_prefix(match_entry: &Value) -> Option<&str> {
-    let Some(path) = match_entry.get("path") else {
+    let Some(path) = match_entry.get("path").filter(|path| !path.is_null()) else {
         return Some("/");
     };
     let path = path.as_object()?;
@@ -6741,7 +7756,7 @@ fn gateway_match_path_prefix(match_entry: &Value) -> Option<&str> {
     {
         return None;
     }
-    path.get("value").and_then(Value::as_str)
+    Some(path.get("value").and_then(Value::as_str).unwrap_or("/"))
 }
 
 fn backend_ref_fault_value_with_percentage(
@@ -11379,7 +12394,7 @@ mod tests {
     }
 
     #[test]
-    fn http_route_replace_prefix_redirect_defaults_missing_match_to_root_prefix() {
+    fn http_route_replace_prefix_redirect_defaults_missing_match_to_empty_root_prefix() {
         let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
@@ -11409,7 +12424,626 @@ mod tests {
             .expect("dispatch plugin should be emitted for redirect");
         let redirect = &dispatch.config["rules"][0]["redirect"];
         assert_eq!(redirect["uri"], "/new");
-        assert_eq!(redirect["match_prefix"], "/");
+        // The implicit match is `PathPrefix: /`, which strips nothing: upstream's
+        // rewrite table requires `/bar` -> `/new/bar`. A literal `/` prefix would
+        // consume the leading separator and fuse the replacement onto the tail
+        // (`/newbar`), so the root prefix canonicalizes to the empty prefix.
+        assert_eq!(redirect["match_prefix"], "");
+    }
+
+    /// Translate one route and return its emitted plugin configs.
+    fn translate_route_plugins(
+        kind: &str,
+        rules: Value,
+    ) -> Vec<crate::config::types::PluginConfig> {
+        translate_k8s_objects(
+            &[object(kind, serde_json::json!({ "rules": rules }))],
+            options(),
+        )
+        .expect("route should materialize")
+        .config
+        .plugin_configs
+    }
+
+    fn dispatch_rules(plugins: &[crate::config::types::PluginConfig]) -> Value {
+        plugins
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted")
+            .config["rules"]
+            .clone()
+    }
+
+    fn translate_route_error(kind: &str, rules: Value) -> String {
+        let error = translate_k8s_objects(
+            &[object(kind, serde_json::json!({ "rules": rules }))],
+            options(),
+        )
+        .expect_err("route should be refused");
+        format!("{error}")
+    }
+
+    fn response_header_modifier_rule(modifier: Value) -> Value {
+        serde_json::json!([{
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": modifier}]
+        }])
+    }
+
+    fn url_rewrite_rule(matches: Value, rewrite: Value) -> Value {
+        serde_json::json!([{
+            "matches": matches,
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "filters": [{"type": "URLRewrite", "urlRewrite": rewrite}]
+        }])
+    }
+
+    #[test]
+    fn http_route_response_header_modifier_emits_response_transform_and_consumer() {
+        let plugins = translate_route_plugins(
+            "HTTPRoute",
+            response_header_modifier_rule(serde_json::json!({
+                "set": [{"name": "x-set", "value": "one"}],
+                "add": [{"name": "x-add", "value": "two"}],
+                "remove": ["x-drop"]
+            })),
+        );
+        let transform = dispatch_rules(&plugins)[0]["response_transform"].clone();
+        assert_eq!(
+            transform,
+            serde_json::json!([
+                {"operation": "update", "target": "header", "key": "x-set", "value": "one"},
+                {"operation": "add", "target": "header", "key": "x-add", "value": "two"},
+                {"operation": "remove", "target": "header", "key": "x-drop"},
+            ])
+        );
+        // The dispatch plugin only publishes the override; a `response_transformer`
+        // on the same proxy is what applies it.
+        let consumer = plugins
+            .iter()
+            .find(|plugin| plugin.plugin_name == "response_transformer")
+            .expect("route response-transform consumer must be emitted");
+        assert_eq!(consumer.config["apply_route_overrides"], true);
+        assert_eq!(consumer.config["rules"], serde_json::json!([]));
+        assert!(
+            plugins
+                .iter()
+                .all(|plugin| plugin.plugin_name != "request_transformer"),
+            "a response-only filter must not emit a request consumer"
+        );
+    }
+
+    #[test]
+    fn grpc_route_response_header_modifier_emits_response_transform() {
+        let plugins = translate_route_plugins(
+            "GRPCRoute",
+            response_header_modifier_rule(serde_json::json!({
+                "set": [{"name": "x-trace", "value": "on"}]
+            })),
+        );
+        let rules = dispatch_rules(&plugins);
+        assert_eq!(rules[0]["response_transform"][0]["key"], "x-trace");
+        assert!(
+            plugins
+                .iter()
+                .any(|plugin| plugin.plugin_name == "response_transformer")
+        );
+    }
+
+    #[test]
+    fn route_without_response_header_modifier_emits_no_response_transform() {
+        let plugins = translate_route_plugins(
+            "HTTPRoute",
+            serde_json::json!([{
+                "backendRefs": [{"name": "api", "port": 8080}],
+                "filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {
+                    "set": [{"name": "x-set", "value": "one"}]
+                }}]
+            }]),
+        );
+        assert!(
+            plugins
+                .iter()
+                .all(|plugin| plugin.plugin_name != "response_transformer")
+        );
+    }
+
+    #[test]
+    fn http_route_url_rewrite_replace_prefix_match_emits_per_match_prefix() {
+        let plugins = translate_route_plugins(
+            "HTTPRoute",
+            url_rewrite_rule(
+                serde_json::json!([{"path": {"type": "PathPrefix", "value": "/api"}}]),
+                serde_json::json!({
+                    "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/v2"}
+                }),
+            ),
+        );
+        let rewrite = dispatch_rules(&plugins)[0]["rewrite"].clone();
+        assert_eq!(rewrite["uri"], "/v2");
+        assert_eq!(rewrite["match_prefix"], "/api");
+        assert!(
+            rewrite.as_object().is_some_and(
+                |object| !object.contains_key(GATEWAY_API_REWRITE_REPLACE_PREFIX_MATCH_KEY)
+            ),
+            "private translator marker must not reach DP config"
+        );
+    }
+
+    #[test]
+    fn http_route_url_rewrite_trailing_slash_prefix_is_trimmed() {
+        // Upstream prefix matching is element-aware, so `/api/` and `/api`
+        // select the same requests and must rewrite identically. The dispatch
+        // plugin strips a LITERAL byte prefix, so a retained trailing separator
+        // would forward `/api/users` as `/v2users`.
+        let plugins = translate_route_plugins(
+            "HTTPRoute",
+            url_rewrite_rule(
+                serde_json::json!([{"path": {"type": "PathPrefix", "value": "/api/"}}]),
+                serde_json::json!({
+                    "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/v2"}
+                }),
+            ),
+        );
+        assert_eq!(
+            dispatch_rules(&plugins)[0]["rewrite"]["match_prefix"],
+            "/api"
+        );
+    }
+
+    #[test]
+    fn http_route_url_rewrite_root_prefix_uses_empty_match_prefix() {
+        let plugins = translate_route_plugins(
+            "HTTPRoute",
+            url_rewrite_rule(
+                serde_json::json!([{"path": {"type": "PathPrefix", "value": "/"}}]),
+                serde_json::json!({
+                    "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/v2"}
+                }),
+            ),
+        );
+        assert_eq!(dispatch_rules(&plugins)[0]["rewrite"]["match_prefix"], "");
+    }
+
+    #[test]
+    fn replace_prefix_match_defaults_an_omitted_path_value_to_root() {
+        // Upstream defaults `path.value` (and a missing `path`) to
+        // `PathPrefix: /`, and routing places these entries on `/`. A
+        // file/CP-delivered object never saw API-server defaulting, so the
+        // rewrite and redirect prefix must resolve the same way: the root
+        // prefix strips nothing and prepends (`/bar` -> `/xyz/bar`), rather
+        // than replacing the whole path.
+        for matches in [
+            serde_json::json!([{"path": {"type": "PathPrefix"}, "method": "GET"}]),
+            serde_json::json!([{"path": null, "method": "GET"}]),
+        ] {
+            let rewrite = translate_route_plugins(
+                "HTTPRoute",
+                url_rewrite_rule(
+                    matches.clone(),
+                    serde_json::json!({
+                        "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/xyz"}
+                    }),
+                ),
+            );
+            assert_eq!(
+                dispatch_rules(&rewrite)[0]["rewrite"]["match_prefix"],
+                "",
+                "rewrite under {matches}"
+            );
+
+            let redirect = translate_route_plugins(
+                "HTTPRoute",
+                serde_json::json!([{
+                    "matches": matches.clone(),
+                    "filters": [{"type": "RequestRedirect", "requestRedirect": {
+                        "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/xyz"}
+                    }}]
+                }]),
+            );
+            assert_eq!(
+                dispatch_rules(&redirect)[0]["redirect"]["match_prefix"],
+                "",
+                "redirect under {matches}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_route_url_rewrite_empty_replace_prefix_normalizes_to_root() {
+        // Upstream's table maps an empty replacement to a bare `/`
+        // (`/api` + prefix `/api` + "" -> `/`).
+        let plugins = translate_route_plugins(
+            "HTTPRoute",
+            url_rewrite_rule(
+                serde_json::json!([{"path": {"type": "PathPrefix", "value": "/api"}}]),
+                serde_json::json!({
+                    "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": ""}
+                }),
+            ),
+        );
+        let rewrite = dispatch_rules(&plugins)[0]["rewrite"].clone();
+        assert_eq!(rewrite["uri"], "/");
+        assert_eq!(rewrite["match_prefix"], "/api");
+    }
+
+    #[test]
+    fn http_route_url_rewrite_replace_full_path_has_no_match_prefix() {
+        let plugins = translate_route_plugins(
+            "HTTPRoute",
+            url_rewrite_rule(
+                serde_json::json!([{"path": {"type": "PathPrefix", "value": "/api"}}]),
+                serde_json::json!({
+                    "path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2"},
+                    "hostname": "internal.example.com"
+                }),
+            ),
+        );
+        let rewrite = dispatch_rules(&plugins)[0]["rewrite"].clone();
+        assert_eq!(rewrite["uri"], "/v2");
+        assert_eq!(rewrite["authority"], "internal.example.com");
+        assert!(
+            rewrite
+                .as_object()
+                .is_some_and(|object| !object.contains_key("match_prefix")),
+            "a full-path replacement must not carry a prefix to strip"
+        );
+    }
+
+    #[test]
+    fn http_route_url_rewrite_hostname_only_emits_authority() {
+        let plugins = translate_route_plugins(
+            "HTTPRoute",
+            url_rewrite_rule(
+                serde_json::json!([{"path": {"type": "Exact", "value": "/one"}}]),
+                serde_json::json!({"hostname": "internal.example.com"}),
+            ),
+        );
+        let rewrite = dispatch_rules(&plugins)[0]["rewrite"].clone();
+        assert_eq!(rewrite["authority"], "internal.example.com");
+        assert!(
+            rewrite
+                .as_object()
+                .is_some_and(|object| !object.contains_key("uri")),
+            "a hostname-only rewrite must not rewrite the path"
+        );
+    }
+
+    #[test]
+    fn http_route_url_rewrite_without_action_emits_no_rewrite() {
+        let plugins = translate_route_plugins(
+            "HTTPRoute",
+            url_rewrite_rule(
+                serde_json::json!([{"path": {"type": "PathPrefix", "value": "/api"}}]),
+                serde_json::json!({}),
+            ),
+        );
+        assert!(
+            plugins
+                .iter()
+                .all(|plugin| plugin.plugin_name != "mesh_route_dispatch"),
+            "an action-less rewrite must not synthesize a dispatch rule"
+        );
+    }
+
+    #[test]
+    fn grpc_route_url_rewrite_is_refused() {
+        let message = translate_route_error(
+            "GRPCRoute",
+            url_rewrite_rule(
+                Value::Array(Vec::new()),
+                serde_json::json!({"hostname": "internal.example.com"}),
+            ),
+        );
+        assert!(
+            message.contains(INCOMPATIBLE_FILTERS_MARKER),
+            "URLRewrite is HTTPRoute-only upstream: {message}"
+        );
+    }
+
+    #[test]
+    fn http_route_url_rewrite_with_request_redirect_is_refused() {
+        let message = translate_route_error(
+            "HTTPRoute",
+            serde_json::json!([{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                "filters": [
+                    {"type": "URLRewrite", "urlRewrite": {"hostname": "internal.example.com"}},
+                    {"type": "RequestRedirect", "requestRedirect": {"statusCode": 302}},
+                ]
+            }]),
+        );
+        assert!(
+            message.contains(INCOMPATIBLE_FILTERS_MARKER) && message.contains("RequestRedirect"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn repeated_singleton_route_filter_is_refused() {
+        for filter_type in SINGLETON_ROUTE_FILTER_TYPES {
+            let filter = match filter_type {
+                "RequestHeaderModifier" => serde_json::json!({
+                    "type": filter_type,
+                    "requestHeaderModifier": {"set": [{"name": "x-dup", "value": "one"}]}
+                }),
+                "ResponseHeaderModifier" => serde_json::json!({
+                    "type": filter_type,
+                    "responseHeaderModifier": {"set": [{"name": "x-dup", "value": "one"}]}
+                }),
+                "RequestRedirect" => serde_json::json!({
+                    "type": filter_type,
+                    "requestRedirect": {"statusCode": 302}
+                }),
+                "URLRewrite" => serde_json::json!({
+                    "type": filter_type,
+                    "urlRewrite": {"hostname": "internal.example.com"}
+                }),
+                other => panic!("unclassified singleton filter type {other}"),
+            };
+            let message = translate_route_error(
+                "HTTPRoute",
+                serde_json::json!([{
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": [filter.clone(), filter]
+                }]),
+            );
+            assert!(
+                message.contains(INCOMPATIBLE_FILTERS_MARKER) && message.contains("at most once"),
+                "{filter_type}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_route_replace_prefix_rewrite_requires_prefix_matches() {
+        let message = translate_route_error(
+            "HTTPRoute",
+            url_rewrite_rule(
+                serde_json::json!([
+                    {"path": {"type": "PathPrefix", "value": "/api"}},
+                    {"path": {"type": "Exact", "value": "/one"}},
+                ]),
+                serde_json::json!({
+                    "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/v2"}
+                }),
+            ),
+        );
+        // A bad value inside this one filter (it has no prefix to rebase) is
+        // `Invalid`, not a CRD-valid `UnsupportedValue` or a filter-set
+        // `IncompatibleFilters`.
+        assert!(
+            !message.contains(UNSUPPORTED_SHAPE_MARKER)
+                && !message.contains(INCOMPATIBLE_FILTERS_MARKER)
+                && message.contains("PathPrefix"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn http_route_url_rewrite_rejects_unsupported_shapes() {
+        // Status reason each shape must map to (see `status.rs`): a bad value
+        // inside this filter is `Invalid` (no marker); an unknown enum member
+        // upstream may add later is `UnsupportedValue`; an unimplemented field
+        // is `IncompatibleFilters`, checked before the type is interpreted.
+        const INVALID: &str = "Invalid";
+        const UNSUPPORTED: &str = "UnsupportedValue";
+        const INCOMPATIBLE: &str = "IncompatibleFilters";
+        let cases = [
+            (serde_json::json!({"hostname": "*.example.com"}), INVALID),
+            (serde_json::json!({"hostname": "example.com:8443"}), INVALID),
+            (serde_json::json!({"hostname": ""}), INVALID),
+            (
+                serde_json::json!({"path": {"type": "ReplaceQuery"}}),
+                UNSUPPORTED,
+            ),
+            (
+                serde_json::json!({"path": {"type": "ReplaceQuery", "replaceQuery": "a=b"}}),
+                INCOMPATIBLE,
+            ),
+            (
+                serde_json::json!({"path": {"type": "ReplaceFullPath"}}),
+                INVALID,
+            ),
+            (
+                serde_json::json!({"path": {"type": "ReplaceFullPath", "replaceFullPath": "v2"}}),
+                INVALID,
+            ),
+            (
+                serde_json::json!({
+                    "path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2?a=b"}
+                }),
+                INVALID,
+            ),
+            (
+                serde_json::json!({
+                    "path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2/../etc"}
+                }),
+                INVALID,
+            ),
+            // A modifier field the selected type does not use would be
+            // silently dropped.
+            (
+                serde_json::json!({"path": {
+                    "type": "ReplaceFullPath",
+                    "replaceFullPath": "/a",
+                    "replacePrefixMatch": "/b"
+                }}),
+                INVALID,
+            ),
+            (
+                serde_json::json!({"path": {
+                    "type": "ReplacePrefixMatch",
+                    "replacePrefixMatch": "/a",
+                    "replaceFullPath": "/b"
+                }}),
+                INVALID,
+            ),
+        ];
+        for (rewrite, expected) in cases {
+            let message = translate_route_error(
+                "HTTPRoute",
+                url_rewrite_rule(
+                    serde_json::json!([{"path": {"type": "PathPrefix", "value": "/api"}}]),
+                    rewrite.clone(),
+                ),
+            );
+            assert!(
+                message.contains("urlRewrite"),
+                "{rewrite}: expected a urlRewrite-scoped diagnostic, got {message}"
+            );
+            let actual = if message.contains(INCOMPATIBLE_FILTERS_MARKER) {
+                INCOMPATIBLE
+            } else if message.contains(UNSUPPORTED_SHAPE_MARKER) {
+                UNSUPPORTED
+            } else {
+                INVALID
+            };
+            assert_eq!(actual, expected, "{rewrite}: {message}");
+        }
+    }
+
+    #[test]
+    fn response_header_modifier_rejects_protocol_managed_destinations() {
+        for name in ["Content-Length", "Transfer-Encoding", "Connection"] {
+            let message = translate_route_error(
+                "HTTPRoute",
+                response_header_modifier_rule(
+                    serde_json::json!({"set": [{"name": name, "value": "1"}]}),
+                ),
+            );
+            assert!(
+                message.contains(UNSUPPORTED_SHAPE_MARKER) && message.contains("protocol-managed"),
+                "{name}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_route_filter_only_rule_without_backend_refs_answers_500() {
+        // Upstream `HTTPRouteRule.backendRefs`: no backend and no filter that
+        // answers the request itself means every matching request gets a 500.
+        // A header modifier or rewrite alone must not forward to the blackhole.
+        for filter in [
+            serde_json::json!({"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                "set": [{"name": "x-set", "value": "one"}]
+            }}),
+            serde_json::json!({"type": "RequestHeaderModifier", "requestHeaderModifier": {
+                "set": [{"name": "x-set", "value": "one"}]
+            }}),
+            serde_json::json!({"type": "URLRewrite", "urlRewrite": {
+                "path": {"type": "ReplaceFullPath", "replaceFullPath": "/v2"}
+            }}),
+        ] {
+            let plugins = translate_route_plugins(
+                "HTTPRoute",
+                serde_json::json!([{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "filters": [filter.clone()]
+                }]),
+            );
+            let abort = &dispatch_rules(&plugins)[0]["fault"]["abort"];
+            assert_eq!(abort["status_code"], 500, "{filter}");
+            assert_eq!(abort["percentage"], 100.0, "{filter}");
+            assert!(
+                abort["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("no serviceable backendRefs")),
+                "{filter}: {abort}"
+            );
+        }
+    }
+
+    #[test]
+    fn backendless_redirect_and_grpc_rules_carry_no_fault() {
+        // A redirect answers the request itself, so it needs no backend.
+        let redirect = translate_route_plugins(
+            "HTTPRoute",
+            serde_json::json!([{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                "filters": [{"type": "RequestRedirect", "requestRedirect": {"statusCode": 301}}]
+            }]),
+        );
+        assert!(dispatch_rules(&redirect)[0].get("fault").is_none());
+
+        // GRPCRoute keeps the blackhole backend, exactly as its all-zero-weight
+        // rule does.
+        let grpc = translate_route_plugins(
+            "GRPCRoute",
+            serde_json::json!([{
+                "filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                    "set": [{"name": "x-set", "value": "one"}]
+                }}]
+            }]),
+        );
+        assert!(dispatch_rules(&grpc)[0].get("fault").is_none());
+    }
+
+    #[test]
+    fn response_header_modifier_rejects_grpc_terminal_status_fields() {
+        // A Trailers-Only gRPC error carries its status in the HEADERS frame the
+        // response transform edits, so these names could turn a failed RPC
+        // into a success. Refused on both kinds, for every verb and casing.
+        for kind in ["GRPCRoute", "HTTPRoute"] {
+            for name in ["grpc-status", "Grpc-Message", "GRPC-STATUS-DETAILS-BIN"] {
+                for modifier in [
+                    serde_json::json!({"set": [{"name": name, "value": "0"}]}),
+                    serde_json::json!({"add": [{"name": name, "value": "0"}]}),
+                    serde_json::json!({"remove": [name]}),
+                ] {
+                    let message = translate_route_error(
+                        kind,
+                        response_header_modifier_rule(modifier.clone()),
+                    );
+                    assert!(
+                        message.contains(UNSUPPORTED_SHAPE_MARKER)
+                            && message.contains("gRPC terminal status"),
+                        "{kind} {modifier}: {message}"
+                    );
+                }
+            }
+        }
+
+        // The request side is untouched: a request header of that name reaches
+        // no client-visible status.
+        translate_route_plugins(
+            "GRPCRoute",
+            serde_json::json!([{
+                "backendRefs": [{"name": "api", "port": 8080}],
+                "filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {
+                    "remove": ["grpc-status"]
+                }}]
+            }]),
+        );
+    }
+
+    #[test]
+    fn header_modifier_rejects_malformed_names_and_values() {
+        let cases = [
+            serde_json::json!({"set": [{"name": "bad header", "value": "one"}]}),
+            serde_json::json!({"set": [{"name": "x-ok", "value": "one\rtwo"}]}),
+            serde_json::json!({"remove": ["bad header"]}),
+            serde_json::json!({"remove": [7]}),
+            serde_json::json!({"set": [{"name": "x-ok"}]}),
+        ];
+        for modifier in cases {
+            for (filter_type, payload) in [
+                ("RequestHeaderModifier", "requestHeaderModifier"),
+                ("ResponseHeaderModifier", "responseHeaderModifier"),
+            ] {
+                let message = translate_route_error(
+                    "HTTPRoute",
+                    serde_json::json!([{
+                        "backendRefs": [{"name": "api", "port": 8080}],
+                        "filters": [{"type": filter_type, payload: modifier.clone()}]
+                    }]),
+                );
+                assert!(
+                    message.contains(payload),
+                    "{filter_type} {modifier}: {message}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -11448,7 +13082,9 @@ mod tests {
         assert_eq!(rule["match"]["headers"]["x-mode"], "preview");
         let redirect = &rule["redirect"];
         assert_eq!(redirect["uri"], "/new");
-        assert_eq!(redirect["match_prefix"], "/");
+        // A predicate-only match carries the implicit root `PathPrefix: /`,
+        // which strips nothing: `/bar` redirects to `/new/bar`.
+        assert_eq!(redirect["match_prefix"], "");
     }
 
     #[test]

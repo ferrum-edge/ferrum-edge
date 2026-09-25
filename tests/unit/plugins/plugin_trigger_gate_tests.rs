@@ -132,7 +132,8 @@ async fn run_request(
 }
 
 fn published(config: &GatewayConfig, proxy_id: &str) -> Vec<Arc<dyn Plugin>> {
-    super::plugin_utils::ensure_basic_auth_test_secret();
+    // Held until the cache is built: `basic_auth` reads its secret at construction.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     let cache = PluginCache::new(config).expect("plugin cache builds");
     cache.get_plugins(NS, proxy_id).as_ref().clone()
 }
@@ -1767,6 +1768,36 @@ fn a_trigger_on_a_contextless_response_trailer_policy_is_refused() {
         candidate.contains("response-trailer ownership"),
         "{candidate}"
     );
+}
+
+/// The rules-free route-override consumer declares a REQUEST-CONDITIONAL
+/// trailer policy, so the contextless-trailer refusal above does not catch it.
+/// Proxy core still selects it as the route-header finalizer without consulting
+/// a trigger, so a skipped instance would apply the route override while its
+/// trailer policy stood down. It must stay refused.
+#[test]
+fn a_trigger_on_a_route_override_consumer_is_refused() {
+    let cfg = config(
+        vec![make_proxy("api", "/api", vec!["consumer"])],
+        vec![with_trigger(
+            make_plugin_config_with_json(
+                "consumer",
+                "response_transformer",
+                json!({"rules": [], "apply_route_overrides": true}),
+                PluginScope::Proxy,
+                Some("api"),
+            ),
+            json!({"when": {"match": {"path": {"prefix": ["/api/public"]}}}}),
+        )],
+    );
+    let error = publication_error(&cfg);
+    assert!(
+        error.contains("cannot carry an execution trigger"),
+        "{error}"
+    );
+    assert!(error.contains("route-header finalizer"), "{error}");
+    let candidate = candidate_error(&cfg);
+    assert!(candidate.contains("route-header finalizer"), "{candidate}");
 }
 
 /// A stream-only plugin can never reach the HTTP pipeline, and an identity

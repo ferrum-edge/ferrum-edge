@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$(pwd)}"
 RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/conformance-results}"
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-ferrum-gwapi}"
+. "$ROOT_DIR/scripts/gateway_api_gatewayclass_ownership.sh"
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:gateway-api-conformance}"
 GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.5.1}"
 
@@ -203,7 +204,7 @@ install_gateway_api_crds() {
   fetch_gateway_api_crd_bundle "$bundle" \
     "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml" \
     "$expected"
-  kubectl apply --server-side=true -f "$bundle"
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" apply --server-side=true -f "$bundle"
   for crd in \
     gatewayclasses.gateway.networking.k8s.io \
     gateways.gateway.networking.k8s.io \
@@ -212,7 +213,7 @@ install_gateway_api_crds() {
     tcproutes.gateway.networking.k8s.io \
     tlsroutes.gateway.networking.k8s.io \
     referencegrants.gateway.networking.k8s.io; do
-    kubectl wait --for=condition=Established "crd/${crd}" --timeout=120s
+    kubectl --context "$GATEWAY_API_LAB_CONTEXT" wait --for=condition=Established "crd/${crd}" --timeout=120s
   done
 }
 
@@ -227,10 +228,10 @@ create_tls_secret() {
     -subj "/CN=*.example.com" \
     -addext "subjectAltName=DNS:*.example.com,DNS:example.com,DNS:second-example.org,DNS:*.wildcard.org,DNS:fourth-example.wildcard.org,DNS:tls.blackbox.example" \
     >/dev/null 2>&1
-  kubectl -n "$namespace" create secret tls "$name" \
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" -n "$namespace" create secret tls "$name" \
     --cert="$tmpdir/tls.crt" \
     --key="$tmpdir/tls.key" \
-    --dry-run=client -o yaml | kubectl apply -f -
+    --dry-run=client -o yaml | kubectl --context "$GATEWAY_API_LAB_CONTEXT" apply -f -
 }
 
 create_frontend_tls_secret() {
@@ -247,9 +248,9 @@ deploy_control_plane() {
     "$DP_GATEWAY_NAMESPACE" \
     "$BACKEND_NAMESPACE" \
     "$APP_BACKEND_NAMESPACE"; do
-    kubectl create namespace "$watched_namespace" --dry-run=client -o yaml | kubectl apply -f -
+    kubectl --context "$GATEWAY_API_LAB_CONTEXT" create namespace "$watched_namespace" --dry-run=client -o yaml | kubectl --context "$GATEWAY_API_LAB_CONTEXT" apply -f -
   done
-  kubectl create namespace "$CP_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" create namespace "$CP_NAMESPACE" --dry-run=client -o yaml | kubectl --context "$GATEWAY_API_LAB_CONTEXT" apply -f -
   create_frontend_tls_secret
   # FERRUM_K8S_WATCH_IDLE_RELIST_SECS, not FERRUM_K8S_FULL_SYNC_INTERVAL_SECS, is
   # the bound on watch staleness: a full sync re-reconciles the SAME reflector
@@ -266,6 +267,7 @@ deploy_control_plane() {
   # not claim or recreate the cluster-scoped object (chart default is create=true).
   helm upgrade --install ferrum "$ROOT_DIR/charts/ferrum-mesh" \
     --namespace "$CP_NAMESPACE" \
+    --kube-context "$GATEWAY_API_LAB_CONTEXT" \
     --set image.repository=ferrum-edge \
     --set image.tag=gateway-api-conformance \
     --set image.pullPolicy=IfNotPresent \
@@ -304,11 +306,11 @@ deploy_control_plane() {
     --set controlPlane.env.FERRUM_GATEWAY_API_STATUS_ADDRESS="$GATEWAY_API_STATUS_ADDRESS" \
     --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
 
-  kubectl -n "$CP_NAMESPACE" rollout status deployment/ferrum-mesh-control-plane --timeout=180s
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" -n "$CP_NAMESPACE" rollout status deployment/ferrum-mesh-control-plane --timeout=180s
 }
 
 deploy_data_plane() {
-  cat <<YAML | kubectl apply -f -
+  cat <<YAML | kubectl --context "$GATEWAY_API_LAB_CONTEXT" apply -f -
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -454,18 +456,17 @@ spec:
       targetPort: ${TLS_BLACKBOX_PORT_DELETE}
       nodePort: ${TLS_BLACKBOX_NODEPORT_DELETE}
 YAML
-  kubectl -n "$CP_NAMESPACE" rollout status "deployment/${DP_SERVICE_NAME}" --timeout=240s
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" -n "$CP_NAMESPACE" rollout status "deployment/${DP_SERVICE_NAME}" --timeout=240s
 }
 
-apply_gateway_class() {
-  cat <<'YAML' | kubectl apply -f -
-apiVersion: gateway.networking.k8s.io/v1
-kind: GatewayClass
-metadata:
-  name: ferrum
-spec:
-  controllerName: ferrum.io/gateway-controller
-YAML
+create_gateway_class() {
+  local nonce
+  if [ -e "$GATEWAY_API_LAB_OWNERSHIP_FILE" ]; then
+    gatewayclass_lab_error "ownership record already exists; use a fresh file for each lab run"
+    return 1
+  fi
+  nonce="$(openssl rand -hex 16)"
+  gatewayclass_lab_create_owned "$nonce"
 }
 
 wait_for_gateway_class() {
@@ -473,20 +474,26 @@ wait_for_gateway_class() {
   # handing off to the upstream Go suite. The suite has its own 180s wait for this
   # condition, but on a cold kind cluster the CP's first reconcile can outlast it,
   # surfacing as "GatewayClass ... Accepted ... context deadline exceeded" and
-  # flaking the suite before any test runs. The class is applied before the CP
+  # flaking the suite before any test runs. The class is created before the CP
   # rollout so the controller's initial reflector list sees it; this wait confirms
   # the status writer completed before the conformance suite starts.
-  if ! kubectl wait --for=condition=Accepted gatewayclass/ferrum --timeout=240s; then
+  if ! kubectl --context "$GATEWAY_API_LAB_CONTEXT" wait \
+    --for=condition=Accepted gatewayclass/ferrum --timeout=240s; then
     echo "GatewayClass 'ferrum' did not reach Accepted within timeout; current status:" >&2
-    kubectl get gatewayclass ferrum -o yaml >&2 || true
+    kubectl --context "$GATEWAY_API_LAB_CONTEXT" get gatewayclass ferrum -o yaml >&2 || true
     return 1
   fi
 }
 
 setup() {
+  if [ -z "$GATEWAY_API_LAB_CONTEXT" ] || [ -z "$GATEWAY_API_LAB_OWNERSHIP_FILE" ]; then
+    gatewayclass_lab_error "set GATEWAY_API_LAB_CONTEXT and GATEWAY_API_LAB_OWNERSHIP_FILE before lab setup"
+    return 1
+  fi
   create_kind_cluster
+  gatewayclass_lab_require_identity
   install_gateway_api_crds
-  apply_gateway_class
+  create_gateway_class
   deploy_control_plane
   deploy_data_plane
   wait_for_gateway_class

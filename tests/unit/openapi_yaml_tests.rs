@@ -12819,6 +12819,98 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             }]}),
             true,
         ),
+        // Rule timeouts are route-local actions too: the Gateway API translator
+        // emits a path-only rule whose only effect is its `timeouts`.
+        (
+            "request_timeout_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "request_timeout_ms": 500
+            }]}),
+            true,
+        ),
+        (
+            "backend_timeout_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "timeout_ms": 250
+            }]}),
+            true,
+        ),
+        (
+            "timeout_disabled_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "timeout_disabled": true
+            }]}),
+            true,
+        ),
+        // So is rule `retry`: the Gateway API translator emits a path-only
+        // rule whose only effect is its `retry` (or `attempts: 0`).
+        (
+            "retry_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "retry": {"max_retries": 2, "retryable_status_codes": [503]}
+            }]}),
+            true,
+        ),
+        (
+            "retry_disabled_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "retry_disabled": true
+            }]}),
+            true,
+        ),
+        (
+            "retry_disabled_false_is_not_a_route_action",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "retry_disabled": false
+            }]}),
+            false,
+        ),
+        (
+            "request_timeout_with_backend_timeout",
+            parity_rule(json!({"request_timeout_ms": 10_000, "timeout_ms": 2_000})),
+            true,
+        ),
+        (
+            "request_timeout_zero",
+            parity_rule(json!({"request_timeout_ms": 0})),
+            false,
+        ),
+        // `backendRequest` projects a per-attempt total bound as well.
+        (
+            "attempt_timeout_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "attempt_timeout_ms": 250
+            }]}),
+            true,
+        ),
+        (
+            "attempt_timeout_with_backend_and_request_timeouts",
+            parity_rule(json!({
+                "request_timeout_ms": 10_000,
+                "timeout_ms": 2_000,
+                "attempt_timeout_ms": 2_000
+            })),
+            true,
+        ),
+        (
+            "attempt_timeout_zero",
+            parity_rule(json!({"attempt_timeout_ms": 0})),
+            false,
+        ),
     ] {
         assert_component_validity(&spec, "MeshRouteDispatchConfig", &config, accepted);
         assert_eq!(

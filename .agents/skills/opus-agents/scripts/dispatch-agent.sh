@@ -7,14 +7,14 @@ usage() {
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
     '                         --effort low|medium|high|xhigh|max' \
     '                         [--fast]' \
-    "                         [--model 'claude-opus-5[1m]'|'opus[1m]']" >&2
+    "                         [--model 'claude-opus-5-5[1m]'|'opus[1m]']" >&2
 }
 
 worktree=''
 prompt_file=''
 effort=''
 fast='false'
-model='claude-opus-5[1m]'
+model='claude-opus-5-5[1m]'
 
 while (($#)); do
   case "$1" in
@@ -80,7 +80,7 @@ case "$effort" in
 esac
 
 case "$model" in
-  'claude-opus-5[1m]'|'opus[1m]') ;;
+  'claude-opus-5-5[1m]'|'opus[1m]') ;;
   *)
     printf 'Invalid model: %s\n' "$model" >&2
     usage

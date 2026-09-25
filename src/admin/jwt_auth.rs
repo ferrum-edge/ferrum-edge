@@ -151,6 +151,13 @@ impl JwtManager {
         Self { config }
     }
 
+    /// Key for admin resource `ETag`s, derived from the admin JWT secret so
+    /// every replica that accepts the same tokens issues the same tags. `None`
+    /// when no secret is configured.
+    pub(crate) fn resource_etag_key(&self) -> Option<crate::fips::approved::HmacSha256Key> {
+        crate::admin::preconditions::etag_key(&self.config.secret)
+    }
+
     /// Verify and decode a JWT token
     pub fn verify_token(&self, token: &str) -> Result<TokenData<AdminClaims>, JwtEncodeError> {
         let key = DecodingKey::from_secret(self.config.secret.as_bytes());

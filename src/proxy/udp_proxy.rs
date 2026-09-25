@@ -7438,7 +7438,7 @@ async fn handle_dtls_client_inner(
             backend_port,
         ))
     });
-    let _lb_guard = LoadBalancerConnectionGuard::new(lb_target.clone(), lb_balancer.clone());
+    let _lb_guard = LoadBalancerConnectionGuard::new(lb_target.as_deref(), lb_balancer.as_deref());
     // Setup between here and the established backend abandons the selection on
     // any `?`; the penalty sample is owed once, from `Drop`.
     // Passive failure sampling follows the same precedence rule the HTTP path
@@ -8364,7 +8364,7 @@ async fn create_session(
             backend_port,
         ))
     });
-    let lb_guard = LoadBalancerConnectionGuard::new(lb_target.clone(), lb_balancer.clone());
+    let lb_guard = LoadBalancerConnectionGuard::new(lb_target.as_deref(), lb_balancer.as_deref());
     // Every `?` below this point abandons the selection, so the penalty sample
     // is owed from `Drop` rather than from each individual failure arm.
     // Passive failure sampling follows the same precedence rule the HTTP path

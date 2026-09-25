@@ -362,12 +362,28 @@ fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
     let re_resolve = loop_src[rotation..]
         .find("let attempt_dispatch_proxy = crate::proxy::resolve_effective_proxy_for_target(")
         .expect("rotated native-H3 retry attempts must re-resolve the effective proxy");
-    let rotated_dispatch = loop_src[rotation..]
-        .find("result = proxy_to_backend_h3(")
+    // The rotated native dispatch is the `current_dispatch_h3` arm of the
+    // per-attempt dispatch, run under the route rule's deadlines (#5646).
+    let native_arm = loop_src[rotation..]
+        .find("} else if current_dispatch_h3 {")
+        .expect("rotated attempts must branch on native-H3 eligibility");
+    let rotated_dispatch = loop_src[rotation + native_arm..]
+        .find("let attempt = proxy_to_backend_h3(")
+        .map(|offset| native_arm + offset)
         .expect("rotated native-H3 dispatch must remain present");
     assert!(
         re_resolve < rotated_dispatch,
         "the rotated attempt must re-resolve the effective proxy before dispatching"
+    );
+    let rotated_call: String = loop_src[rotation + rotated_dispatch..]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(128)
+        .collect();
+    assert!(
+        rotated_call
+            .starts_with("letattempt=proxy_to_backend_h3(&state,attempt_dispatch_proxy.as_ref(),"),
+        "the rotated native-H3 dispatch must receive the re-resolved attempt proxy"
     );
 }
 

@@ -12,6 +12,7 @@ pub mod mesh_remote_clusters;
 pub mod mesh_slice_drift;
 pub mod metrics;
 pub mod plugin_config_projection;
+pub(crate) mod preconditions;
 pub mod provisioning;
 pub mod spec_codec;
 mod tls_management;
@@ -1864,6 +1865,40 @@ fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<F
         }
     }
     Ok(PaginationParams { offset, limit })
+}
+
+/// Parse the optional `proxy_id` query filter for `GET /plugins/config`.
+///
+/// The value is validated with the same resource-id rules as every other id in
+/// the admin API (invalid → 400 with the shared `{"error": ...}` shape);
+/// duplicate `proxy_id` parameters are rejected rather than silently
+/// last-wins, matching other strict query-parameter parsers.
+fn parse_plugin_config_proxy_id(
+    uri: &hyper::Uri,
+) -> Result<Option<String>, Box<Response<Full<Bytes>>>> {
+    let Some(query) = uri.query() else {
+        return Ok(None);
+    };
+    let mut proxy_id: Option<String> = None;
+    for (key, val) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key.as_ref() != "proxy_id" {
+            continue;
+        }
+        if proxy_id.is_some() {
+            return Err(Box::new(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "proxy_id must not be supplied more than once"}),
+            )));
+        }
+        if let Err(error) = crate::config::types::validate_resource_id(&val) {
+            return Err(Box::new(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": error}),
+            )));
+        }
+        proxy_id = Some(val.into_owned());
+    }
+    Ok(proxy_id)
 }
 
 /// Narrow a shared `i64` pagination offset to the `u32` the audit store
@@ -3830,6 +3865,32 @@ async fn handle_admin_request_inner(
         None
     };
 
+    // `If-Match` makes a full-replacement write conditional. It lives in the
+    // request line, so it is parsed before the body read. A client that sends
+    // it believes its write is conditional, so a mutating route that does not
+    // evaluate it refuses it rather than silently writing unconditionally; the
+    // route's role gate is replayed first so the header never preempts a 403.
+    let if_match_parsed = preconditions::parse_if_match(req.headers());
+    if req.headers().contains_key(hyper::header::IF_MATCH)
+        && matches!(
+            method,
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        )
+        && !if_match_route(&method, segments_peek.as_slice())
+    {
+        if let Some(Some(role)) = body_consuming_route_role(&method, segments_peek.as_slice())
+            && let Some(resp) = require_admin_role(&auth, role)
+        {
+            drop(req.into_body());
+            return Ok(resp);
+        }
+        drop(req.into_body());
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": IF_MATCH_UNSUPPORTED_MESSAGE}),
+        ));
+    }
+
     let body_bytes = match body_consuming_route_role(&method, segments_peek.as_slice()) {
         Some(required_role) => {
             if let Some(role) = required_role
@@ -3921,6 +3982,22 @@ async fn handle_admin_request_inner(
         };
     }
 
+    // Evaluated inside an arm, after its role gate, so a malformed header on a
+    // supported route never preempts the 403 the arm would return.
+    macro_rules! route_if_match {
+        () => {
+            match &if_match_parsed {
+                Ok(if_match) => if_match.as_ref(),
+                Err(message) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &json!({"error": message}),
+                    ));
+                }
+            }
+        };
+    }
+
     let response = match (method.clone(), segments.as_slice()) {
         // Proxies CRUD
         (Method::GET, ["proxies"]) => {
@@ -3948,6 +4025,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             crud::handle_update::<Proxy>(
                 &state,
                 &auth,
@@ -3955,6 +4033,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -3962,6 +4041,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             crud::handle_delete::<Proxy>(
                 &state,
                 &auth,
@@ -3969,6 +4049,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 uri.query(),
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -3999,6 +4080,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             crud::handle_update::<Consumer>(
                 &state,
                 &auth,
@@ -4006,6 +4088,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4013,6 +4096,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             crud::handle_delete::<Consumer>(
                 &state,
                 &auth,
@@ -4020,6 +4104,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 uri.query(),
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4089,7 +4174,18 @@ async fn handle_admin_request_inner(
         (Method::GET, ["plugins"]) => handle_list_plugin_types().await,
         (Method::GET, ["plugins", "config"]) => {
             let pagination = route_pagination!();
-            crud::handle_list::<PluginConfig>(&state, &pagination, auth.role, &namespace).await
+            let proxy_id = match parse_plugin_config_proxy_id(&uri) {
+                Ok(proxy_id) => proxy_id,
+                Err(response) => return Ok(*response),
+            };
+            crud::handle_list_filtered::<PluginConfig>(
+                &state,
+                &pagination,
+                auth.role,
+                &namespace,
+                &proxy_id,
+            )
+            .await
         }
         (Method::POST, ["plugins", "config"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -4112,6 +4208,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             crud::handle_update::<PluginConfig>(
                 &state,
                 &auth,
@@ -4119,6 +4216,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4126,6 +4224,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             crud::handle_delete::<PluginConfig>(
                 &state,
                 &auth,
@@ -4133,6 +4232,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 uri.query(),
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4163,6 +4263,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             crud::handle_update::<Upstream>(
                 &state,
                 &auth,
@@ -4170,6 +4271,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4177,6 +4279,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             crud::handle_delete::<Upstream>(
                 &state,
                 &auth,
@@ -4184,6 +4287,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 uri.query(),
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4248,6 +4352,8 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                // Trust bundles keep their own body `revision` contract.
+                None,
             )
             .await
         }
@@ -4262,6 +4368,8 @@ async fn handle_admin_request_inner(
                 &namespace,
                 uri.query(),
                 route_live_apply_mode!(),
+                // Trust bundles keep their own body `revision` contract.
+                None,
             )
             .await
         }
@@ -6276,6 +6384,19 @@ struct PersistCounts {
 }
 
 const DATABASE_OPERATION_FAILED_MESSAGE: &str = "Database unavailable — operation failed";
+pub(crate) const IF_MATCH_UNSUPPORTED_MESSAGE: &str = "If-Match is only supported on PUT and \
+     DELETE of /proxies/{id}, /upstreams/{id}, /consumers/{id}, and /plugins/config/{id}";
+
+/// Routes that evaluate `If-Match` (see `preconditions`). Every other mutating
+/// route refuses the header instead of ignoring it.
+fn if_match_route(method: &Method, segments: &[&str]) -> bool {
+    (method == Method::PUT || method == Method::DELETE)
+        && matches!(
+            segments,
+            ["proxies", _] | ["upstreams", _] | ["consumers", _] | ["plugins", "config", _]
+        )
+}
+
 pub(crate) const RESOURCE_IDENTITY_CONFLICT_MESSAGE: &str =
     "Resource identity conflicts with an existing resource in the namespace";
 const CONFIG_ADMISSION_UNAVAILABLE_MESSAGE: &str = "Config admission unavailable";

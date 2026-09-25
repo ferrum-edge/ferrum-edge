@@ -5,6 +5,8 @@ use ferrum_edge::cli::{
     AmbientUdpPreflightArgs, Cli, Command, HealthArgs, ReloadArgs, RunArgs, ValidateArgs,
     VersionArgs, execute_health, resolve_settings_path, resolve_spec_path, select_gateway_pid,
 };
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -1312,15 +1314,11 @@ fn run_health_against_tls_response(response: &[u8]) -> Result<(), String> {
         .expect("self-sign certificate");
 
     let certificate_pem = certificate.pem();
-    let mut certificate_reader = certificate_pem.as_bytes();
-    let certificate_chain: Vec<_> = rustls_pemfile::certs(&mut certificate_reader)
+    let certificate_chain: Vec<_> = CertificateDer::pem_slice_iter(certificate_pem.as_bytes())
         .collect::<Result<_, _>>()
         .expect("parse certificate");
     let key_pem = key_pair.serialize_pem();
-    let mut key_reader = key_pem.as_bytes();
-    let private_key = rustls_pemfile::private_key(&mut key_reader)
-        .expect("parse private key")
-        .expect("private key present");
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("parse private key");
     let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))

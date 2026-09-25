@@ -8546,6 +8546,9 @@ fn test_priority_override_delegates_ws_session_binding() {
 
 #[tokio::test]
 async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
+    // Every built-in is constructed, including `basic_auth`, which reads its
+    // secret from the environment; ENV_LOCK is taken before the registry lock.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     let _registry = super::plugin_utils::log_schema_registry_guard();
     use ferrum_edge::plugins::available_plugins;
     use ferrum_edge::plugins::create_plugin;
@@ -8576,6 +8579,9 @@ async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
 
 #[tokio::test]
 async fn test_pre_auth_body_buffering_plugins_are_explicitly_tracked_for_hbone() {
+    // Every built-in is constructed, including `basic_auth`, which reads its
+    // secret from the environment; ENV_LOCK is taken before the registry lock.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     let _registry = super::plugin_utils::log_schema_registry_guard();
     use ferrum_edge::plugins::{available_plugins, create_plugin};
 
@@ -9384,6 +9390,44 @@ fn test_request_conditional_unbounded_trailer_policy_follows_waf_exemptions() {
         !view.unbounded_response_trailer_policy_applies(&by_consumer),
         "a consumer-exempt request must preserve its backend trailers"
     );
+}
+
+/// The translator-owned, rules-free `response_transformer` consumer governs
+/// trailers only for requests whose matched dispatch rule published a response
+/// route override. Merged Gateway API routes share that consumer, so the
+/// declaration must stay out of the unconditional bit and resolve per request.
+#[test]
+fn test_route_override_consumer_trailer_policy_follows_the_published_override() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["istio-vs-resp-xform-p1"])],
+        vec![make_plugin_config_with_json(
+            "istio-vs-resp-xform-p1",
+            "response_transformer",
+            json!({"rules": [], "apply_route_overrides": true}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        let view = cache.request_view("ferrum", "p1", protocol);
+        assert!(
+            !view
+                .capabilities()
+                .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+            "{protocol:?}: the consumer must not freeze the fail-closed arm per proxy"
+        );
+        assert!(
+            !view.unbounded_response_trailer_policy_applies(&trailer_policy_ctx("GET", "/api")),
+            "{protocol:?}: a sibling rule without a response transform keeps its trailers"
+        );
+        let mut published = trailer_policy_ctx("GET", "/api");
+        published.route_override_response_transform_published = true;
+        assert!(
+            view.unbounded_response_trailer_policy_applies(&published),
+            "{protocol:?}: a rule that published a response transform keeps the fail-closed arm"
+        );
+    }
 }
 
 /// An exempt WAF must not suppress a co-configured plugin whose unbounded policy

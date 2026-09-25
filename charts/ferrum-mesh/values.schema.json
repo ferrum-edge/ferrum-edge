@@ -15,7 +15,7 @@
         },
         "tag": {
           "type": "string",
-          "description": "Container image tag. Defaults to Chart.appVersion when empty; that tag must exist in the registry. Override with a published tag (for example --set image.tag=<tag>). The mutable latest tag exists for evaluation but must not be used in production."
+          "description": "Container image tag. Defaults to Chart.appVersion when empty; that tag must exist in the registry. Override with a published tag (for example --set image.tag=<tag>). The registry's latest tag is retired; existing images are historical artifacts and do not receive fixes."
         },
         "pullPolicy": {
           "type": "string",

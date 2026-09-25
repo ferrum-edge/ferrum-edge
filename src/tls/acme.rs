@@ -27,7 +27,6 @@
 use crate::fips::approved::Sha256;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(any(feature = "acme", test))]
@@ -36,6 +35,8 @@ use std::time::Duration;
 use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 #[cfg(feature = "acme")]
@@ -1522,7 +1523,7 @@ struct CertificateMetadata {
 }
 
 fn certificate_metadata(bytes: &[u8]) -> Result<CertificateMetadata, String> {
-    let certs = rustls_pemfile::certs(&mut Cursor::new(bytes))
+    let certs = CertificateDer::pem_slice_iter(bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("failed to parse PEM certificates: {error}"))?;
     let first = certs
@@ -3763,10 +3764,10 @@ pub async fn run_dns01_hook_for_tests(
 
 #[cfg(feature = "acme")]
 fn validate_completed_certificate_pair(cert_pem: &str, key_pem: &str) -> Result<(), AcmeError> {
-    let cert_chain = rustls_pemfile::certs(&mut Cursor::new(cert_pem.as_bytes()))
+    let cert_chain = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| AcmeError::Parse(error.to_string()))?;
-    let key = rustls_pemfile::private_key(&mut Cursor::new(key_pem.as_bytes()))
+    let key = crate::tls::first_pem_private_key(key_pem.as_bytes())
         .map_err(|error| AcmeError::Parse(error.to_string()))?
         .ok_or_else(|| AcmeError::Parse("no PEM private key found".to_string()))?;
     rustls::ServerConfig::builder_with_provider(Arc::new(crate::fips::base_crypto_provider()))

@@ -380,7 +380,7 @@ async fn late_api_spec_create_compensation_safe(
     const PAGE_SIZE: i64 = 1_000;
     loop {
         let page = db
-            .list_plugin_configs_paginated(&spec.namespace, PAGE_SIZE, offset)
+            .list_plugin_configs_paginated(&spec.namespace, None, PAGE_SIZE, offset)
             .await?;
         let items_len = page.items.len() as i64;
         if page.items.iter().any(|plugin| {

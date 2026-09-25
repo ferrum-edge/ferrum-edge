@@ -4884,10 +4884,12 @@ impl DatabaseStore {
         })
     }
 
-    /// List plugin configs with database-level LIMIT/OFFSET pagination.
+    /// List plugin configs with database-level LIMIT/OFFSET pagination and an
+    /// optional `proxy_id` filter.
     pub async fn list_plugin_configs_paginated(
         &self,
         namespace: &str,
+        proxy_id: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
@@ -4896,6 +4898,7 @@ impl DatabaseStore {
         match self
             .list_plugin_configs_paginated_from_admin_read(
                 namespace,
+                proxy_id,
                 limit,
                 offset,
                 &admin_read.pool,
@@ -4912,6 +4915,7 @@ impl DatabaseStore {
                 let retry = self
                     .list_plugin_configs_paginated_from_admin_read(
                         namespace,
+                        proxy_id,
                         limit,
                         offset,
                         &primary_pool,
@@ -4931,28 +4935,37 @@ impl DatabaseStore {
     async fn list_plugin_configs_paginated_from_admin_read(
         &self,
         namespace: &str,
+        proxy_id: Option<&str>,
         limit: i64,
         offset: i64,
         pool: &AnyPool,
     ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
 
-        let count_row =
-            sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM plugin_configs WHERE namespace = ?"))
-                .bind(namespace)
-                .fetch_one(pool)
-                .await?;
+        let mut conditions: Vec<&'static str> = vec!["namespace = ?"];
+        if proxy_id.is_some() {
+            conditions.push("proxy_id = ?");
+        }
+        let where_clause = conditions.join(" AND ");
+
+        let count_sql = self.q(&format!(
+            "SELECT COUNT(*) AS cnt FROM plugin_configs WHERE {where_clause}"
+        ));
+        let mut count_query = sqlx::query(&count_sql).bind(namespace);
+        if let Some(proxy_id) = proxy_id {
+            count_query = count_query.bind(proxy_id);
+        }
+        let count_row = count_query.fetch_one(pool).await?;
         let total: i64 = count_row.try_get("cnt")?;
 
-        let rows: Vec<AnyRow> = sqlx::query(
-            &self
-                .q("SELECT * FROM plugin_configs WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
-        )
-        .bind(namespace)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+        let data_sql = self.q(&format!(
+            "SELECT * FROM plugin_configs WHERE {where_clause} ORDER BY id LIMIT ? OFFSET ?"
+        ));
+        let mut data_query = sqlx::query(&data_sql).bind(namespace);
+        if let Some(proxy_id) = proxy_id {
+            data_query = data_query.bind(proxy_id);
+        }
+        let rows: Vec<AnyRow> = data_query.bind(limit).bind(offset).fetch_all(pool).await?;
 
         let mut configs = Vec::new();
         for row in rows {
@@ -11738,10 +11751,11 @@ impl DatabaseBackend for DatabaseStore {
     async fn list_plugin_configs_paginated(
         &self,
         namespace: &str,
+        proxy_id: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
-        DatabaseStore::list_plugin_configs_paginated(self, namespace, limit, offset).await
+        DatabaseStore::list_plugin_configs_paginated(self, namespace, proxy_id, limit, offset).await
     }
 
     async fn create_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {

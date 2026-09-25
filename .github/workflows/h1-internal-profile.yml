@@ -1,23 +1,22 @@
 name: H1 Internal Profile
 
 on:
+  # Observer-feature contracts are optional (not required, not release
+  # gating). A pull request runs them only when it edits the profiler itself.
+  # The shared proxy/pool/runtime surfaces the observers hook into are
+  # re-validated by a daily run on the main tip (one run instead of one per
+  # merge, ~20 merges/day); a red run points at that day's merges for
+  # revert/bisect before the next release cut.
   pull_request:
     paths:
       - src/h1_profile/**
-      - src/main.rs
-      - src/lib.rs
-      - src/proxy/body.rs
-      - src/proxy/mod.rs
-      - src/admin/mod.rs
-      - Cargo.toml
       - tests/unit/gateway_core/h1_profile*
       - tests/functional/h1_cadence_tests.rs
-      - tests/functional/mod.rs
-      - tests/common/gateway_harness.rs
-      - tests/scaffolding/**
+      - tests/performance/multi_protocol/h1_*
       - docs/h1_internal_profile.md
-      - tests/performance/multi_protocol/**
       - .github/workflows/h1-internal-profile.yml
+  schedule:
+    - cron: '43 3 * * *'
   workflow_dispatch:
     inputs:
       payloads:
@@ -42,6 +41,13 @@ env:
   RUSTC_WRAPPER: ""
   CARGO_BUILD_RUSTC_WRAPPER: ""
   RUSTFLAGS: ""
+
+# A newer push to the same pull request cancels the superseded run. Every
+# other event (push to main, dispatch, schedule) gets a unique group so it
+# always runs to completion and never displaces another dispatch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   checks:

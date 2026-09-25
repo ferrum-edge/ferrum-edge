@@ -37,10 +37,13 @@ citations):
   / CI surface changed.
 - **Profile & features.** Gateway API `v1.5.1`, profiles
   `GATEWAY-HTTP,GATEWAY-GRPC`, supported features
-  `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`, GatewayClass `ferrum`,
-  controller `ferrum.io/gateway-controller`. Live `TCPRoute` and `TLSRoute`
-  data-plane behavior is release-gated by Ferrum black-box checks in the same
-  workflow. `UDPRoute` is release-gated by the required `Tests` aggregate
+  `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute` plus the Extended filter features
+  `HTTPRouteResponseHeaderModification`, `HTTPRoutePathRewrite` and
+  `HTTPRouteHostRewrite` and the rule-timeout features `HTTPRouteRequestTimeout`
+  and `HTTPRouteBackendTimeout` (two known deviations, below), GatewayClass
+  `ferrum`, controller `ferrum.io/gateway-controller`. Live `TCPRoute` and
+  `TLSRoute` data-plane behavior is release-gated by Ferrum black-box checks in
+  the same workflow. `UDPRoute` is release-gated by the required `Tests` aggregate
   rather than by a black-box step in this workflow:
   translation/status/update/delete by CI Unit Tests
   (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`), and the
@@ -145,17 +148,139 @@ reviewers can compare the generated matrix to the declared product promise.
 
 ## Gateway API rule feature admission
 
-HTTPRoute and GRPCRoute support rule-level `RequestHeaderModifier`; HTTPRoute
-also supports `RequestRedirect`. ResponseHeaderModifier, URLRewrite,
-RequestMirror, ExtensionRef, CORS, ExternalAuth and backend-reference filters
-remain deferred. Translation rejects a route containing these unimplemented
-filter actions with `Accepted=False` / `IncompatibleFilters`; it does not emit
-partially interpreted rules. Unknown filter types and unimplemented rule fields,
-including timeouts and retry, report `UnsupportedValue`. Both cases report
-`Programmed=False`, while independently valid routes remain available.
+HTTPRoute and GRPCRoute support rule-level `RequestHeaderModifier` and
+`ResponseHeaderModifier`; HTTPRoute also supports `RequestRedirect` and
+`URLRewrite` (both HTTPRoute-only upstream — a GRPCRoute asking for either is
+still refused) and rule-level `timeouts` and `retry` (below). RequestMirror,
+ExtensionRef, CORS, ExternalAuth and backend-reference filters remain deferred.
+Translation rejects a route containing these unimplemented filter actions with
+`Accepted=False` / `IncompatibleFilters`; it does not emit partially interpreted
+rules. Unknown filter types and unimplemented rule fields — `timeouts` and
+`retry` on a GRPCRoute, which upstream does not define — report
+`UnsupportedValue`. Both cases report `Programmed=False`, while independently
+valid routes remain available.
+
+**Rule `timeouts` (HTTPRoute).** `timeouts.request` and
+`timeouts.backendRequest` are validated exactly as the pinned standard-channel
+CRD does: each must match the GEP-2257 duration grammar, and a non-zero
+`request` must not be shorter than `backendRequest` (the CRD's CEL rule).
+Violations, a non-string value and a non-object `timeouts` are `Invalid`; an
+undefined `timeouts` sub-field is `UnsupportedValue`. `0s` disables either
+bound. `backendRequest` bounds each backend attempt from its handoff to the
+backend until its full response has been received, with a fresh budget for
+every retry attempt: expiry before the head answers the ordinary
+backend-timeout `504` (retried when the rule's `retry` lists `504`, replaying
+the request body the attempt retained), expiry while the body streams cuts it
+like the `request` cut below, and a gRPC request folds it into its RPC deadline
+and charges an expiry after the request was sent to the backend. Any response
+longer than the budget is cut — a large fast download, Server-Sent Events, a
+long poll or a server-streaming gRPC call, not only a trickled body — and a
+streamed upload's time after the handoff counts against it. `request` is one
+absolute budget, anchored at request receipt, covering every attempt, retry backoff and the streaming response body:
+before the response head a non-gRPC request gets a gateway `504`
+(`{"error":"Request timeout"}`), a body still streaming at the deadline is
+reset (HTTP/2 and HTTP/3, the latter with `H3_REQUEST_CANCELLED`) or its
+connection closed (HTTP/1.1), and a gRPC request folds the
+budget into its RPC deadline and ends with `DEADLINE_EXCEEDED`. Both values stay
+on the rule's own dispatch entry, so sibling and merged rules keep the proxy
+defaults. A `request` expiry is charged to a backend's health (circuit
+breaker, passive health / outlier detection, latency samples) only when that
+backend held the request: expiry while the gateway is still collecting a
+buffered client upload, running request-body hooks, resolving DNS or taking
+admission, in retry backoff, or after the response head is health-neutral. A
+body cut by `request` keeps a backend `Content-Length` advertised.
+
+**Known deviations in the declared rule-timeout features:**
+
+- **`HTTPRouteBackendTimeout`:** upstream v1.5.1 defines `backendRequest` as
+  the time from when a request starts being sent to the backend until its full
+  response is received, per attempt. HTTP/1.1, HTTP/2 and native HTTP/3
+  enforce that for non-gRPC requests. A gRPC or gRPC-Web call folds the budget
+  into its RPC deadline when the rule is selected rather than at the handoff
+  (stricter: gateway-side time before the handoff counts against the first
+  attempt), and a gRPC budget expiry is not retried, since gRPC calls are
+  retried only after connection failures. The HTTP/3 bridge to HTTP/1.1 and
+  HTTP/2 backends collects a buffered response body after its retry loop, so
+  an expiry during that collection is answered with the charged `504` but not
+  retried. The upstream test delays only the response head, which every
+  frontend bounds.
+- **`HTTPRouteRequestTimeout`:** no known deviation. HTTP/1.1, HTTP/2 and
+  native HTTP/3 enforce `request` fully, and HTTP/3 stays advertised
+  (`Alt-Svc`) on a listener port that serves a timed rule.
+
+Upgraded WebSocket / CONNECT-UDP tunnels are not bounded by `request`.
+
+**Rule `retry` (HTTPRoute, experimental channel).** The field is present in the
+pinned `v1.5.1` experimental CRD bundle the Gateway API lab installs; upstream
+`v1.5.1` defines no retry conformance feature or test, so none is declared and
+the behavior is pinned by Ferrum's own data-plane regressions. Admission
+re-checks the CRD: `codes` must be integers from 400 to 599, `attempts` an
+integer and `backoff` a GEP-2257 duration, otherwise `Invalid`; a negative
+`attempts`, one above 100, a `backoff` above `5m`, or an undefined sub-field is
+`UnsupportedValue`. The policy lands on the rule's own dispatch entry through
+the same per-rule retry override the Istio VirtualService translator uses, never
+on the shared proxy or upstream, so sibling and merged rules are not retried.
+`attempts` counts retries after the initial attempt (at most `attempts + 1`
+backend requests; `0` disables retry), `codes` are the retried statuses, and
+`backoff` is a fixed minimum wait. Retries stay replay-safe: a listed status is
+retried only for `GET`, `HEAD`, `OPTIONS`, `PUT` and `DELETE`; a failure before
+any byte reached the backend is retried for every method from the bounded
+buffered body; a response whose head reached the client is never replayed.
+Every attempt and backoff spends the rule's `timeouts.request` budget.
+
+**Known deviation in rule `retry`:** upstream says implementations SHOULD retry
+connection errors (disconnect, reset, timeout) whenever `retry` is configured.
+Ferrum retries a failure that happened after the request reached the backend
+only when the resulting gateway status (`502` / `504`) is listed in `codes`, and
+only for the replay-safe methods, so a request the backend may already have
+processed is never replayed.
+
+Filter shapes are refused rather than partially honored, and the status reason
+follows what is wrong rather than which CRD mechanism forbids it:
+`IncompatibleFilters` when the rule's filter set cannot be honored as declared
+(conflicting filters, a filter type the kind does not carry, an unimplemented
+filter type or field), `Invalid` for a bad value inside one filter, and
+`UnsupportedValue` for a CRD-valid value Ferrum declines. So `URLRewrite` and
+`RequestRedirect` in one rule are `IncompatibleFilters` (a redirect answers the
+request itself, so the rewrite could never fire — upstream's own example of the
+reason), and the four upstream at-most-once filter types —
+`RequestHeaderModifier`, `ResponseHeaderModifier`, `RequestRedirect`,
+`URLRewrite` — are refused when repeated in one rule. `URLRewrite`
+`path.type: ReplacePrefixMatch` requires every match in the rule to use a
+`PathPrefix` path match; anything else is `Invalid`, as is a `URLRewrite.path`
+carrying the modifier field of the type it did not select. Upstream's CEL rule
+is stricter (exactly one `PathPrefix` match); Ferrum also accepts several
+`PathPrefix` matches and a match-less rule (the implicit `PathPrefix: /`), each
+rebased against its own prefix. A `PathPrefix` match with no `value`, or a match
+with no or a null `path`, rebases against `/`, matching upstream's default and
+Ferrum's routing. A `ResponseHeaderModifier` naming a protocol-managed response
+field (hop-by-hop or framing) is `UnsupportedValue`: Ferrum strips those from
+backend responses by design and a route filter may not put one back. So is a
+response-side `set` / `add` / `remove` of `grpc-status`, `grpc-message` or
+`grpc-status-details-bin` on either kind, because a Trailers-Only gRPC error
+carries its status in the headers the filter edits. Malformed header
+names/values and malformed rewrite hostnames or replacement paths are `Invalid`.
+An HTTPRoute rule with no `backendRefs` and no `RequestRedirect` whose only
+filters are header modifiers and/or `URLRewrite` answers HTTP 500, as upstream
+requires for a rule that forwards nowhere.
+
+**Response-trailer cost of `ResponseHeaderModifier`.** A route override can name
+any field at request time, so the requests a filtered rule matches have their
+non-reserved backend trailers dropped by the gateway's response-trailer
+governance boundary. The generated `response_transformer` consumer carries no
+rules of its own and declares a request-conditional policy, so the drop applies
+only when the matched dispatch rule published a response transform. Same-kind
+routes that share a hostname, listener and path merge onto one proxy and one
+consumer; a merged sibling rule or route that declares no response-header filter
+keeps its trailers. The gRPC terminal fields (`grpc-status`, `grpc-message`,
+`grpc-status-details-bin`), the response message and streaming are preserved;
+application trailers on the filtered rule are not. The filter does not modify
+trailers in either case — `ResponseHeaderModifier` governs response headers
+only, which for a native gRPC call is the initial metadata.
 
 The field inventory admits rule name, matches, backendRefs, filters and
-sessionPersistence, each subject to its existing validation. Empty backend
+sessionPersistence, plus `timeouts` on HTTPRoute, each subject to its existing
+validation. Empty backend
 filter lists have no action and remain accepted. Extra fields on a supported
 filter or its payload are refused. The integration regression
 `unsupported_http_and_grpc_route_features_are_refused_before_materialization`
@@ -163,14 +288,67 @@ checks translator/status agreement for both route kinds, all six reported gaps,
 future fields, and a supported RequestHeaderModifier control (issue #4816).
 `supported_gateway_request_headers_reach_backend_beside_rejected_route` also
 drives the translated HTTPRoute through the gateway to a real backend and
-checks header set/add/remove plus no traffic for the refused sibling. Default
+checks header set/add/remove plus no traffic for the refused sibling. Five more
+data-plane regressions in the same file cover the newly supported filters:
+`gateway_response_header_modifier_reaches_the_client_through_the_data_plane`
+(client-observed set/add/remove, sibling-rule isolation, and composition with an
+operator's global `response_transformer`),
+`gateway_url_rewrite_reaches_the_backend_through_the_data_plane`
+(backend-observed `ReplacePrefixMatch` path plus preserved query,
+`ReplaceFullPath`, hostname rewrite, and sibling-rule isolation),
+`grpc_route_response_header_modifier_reaches_the_client_and_preserves_status`
+(gRPC response metadata, message, terminal status, and the trailer cost above).
+`merged_grpc_route_sibling_without_response_header_modifier_keeps_trailers` and
+`merged_http_route_sibling_without_response_header_modifier_keeps_trailers`
+first prove two routes merged onto one proxy and one consumer, then show the
+filtered rule pays the trailer cost while the merged sibling keeps its
+application trailers. The response-header test also asserts that `add` appends
+to a header the backend already sent and that a filter-only rule with no
+`backendRefs` answers `500`.
+The translator-level `removing_a_rule_filter_withdraws_its_generated_resources`
+checks that dropping a filter emits no rewrite, response transform, or consumer
+plugin; the live reconciler replaces those generated ids on every compose
+because `istio-vs-resp-xform-` is a managed plugin-id prefix. The upstream
+`HTTPRouteResponseHeaderModifier`, `HTTPRouteRewritePath` and
+`HTTPRouteRewriteHost` conformance tests run and pass in the hosted lab. The
+upstream `HTTPRouteTimeoutRequest` and `HTTPRouteTimeoutBackendRequest` tests
+now run too (their features are declared). Data-plane regressions cover rule
+timeouts:
+`gateway_route_timeouts_reach_the_data_plane` (pre-head `504`, mid-body cut,
+`backendRequest` inside a larger `request` budget, `0s`, sibling isolation),
+`gateway_route_request_timeout_spans_retry_attempts_and_backoff` (one budget
+across attempts and backoff under an operator-configured proxy retry),
+`gateway_route_request_timeout_ends_grpc_calls_with_deadline_exceeded`,
+`removing_rule_timeouts_withdraws_the_deadline`, three backend-health
+attribution regressions through a live circuit breaker (a stalled client upload
+and a mid-body cut are not charged; a backend stalling its response head is),
+and seven per-attempt `backendRequest` regressions:
+`gateway_route_backend_request_bounds_each_attempt_until_its_full_response` (a
+trickled body cut with no `request` budget, a sibling and the rule without the
+per-attempt field streaming it to the end),
+`gateway_route_backend_request_gives_each_retry_attempt_a_fresh_budget`,
+`gateway_route_request_timeout_still_bounds_backend_request_retries`,
+`gateway_route_backend_request_bounds_grpc_attempts_until_the_full_response`,
+`gateway_route_backend_request_charges_a_grpc_backend_that_stalls_response_headers`,
+`gateway_route_backend_request_cuts_a_retry_body_at_its_own_budget` and
+`attempt_budget_shorter_than_the_header_wait_retries_with_the_retained_body`.
+Rule `retry` is covered by `gateway_route_retry_reaches_the_data_plane` (exact
+backend attempt counts for a listed status, one attempt for an unlisted status,
+a `POST`, `attempts: 0` and a sibling rule, a recovering retry, and `backoff` as
+the minimum wait), `gateway_route_retry_backoff_stays_inside_the_request_budget`,
+`gateway_route_retry_never_replays_after_response_commitment`,
+`merged_http_route_sibling_without_retry_is_never_retried`, and
+`removing_rule_retry_withdraws_the_policy`.
+Default
 HTTPRoute matches use the same internal predicate conversion as explicit
 matches, so supported actions do not emit an invalid raw Gateway API path field.
 The pinned [HTTPRoute v1.5.1 schema](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/httproute_types.go)
-marks response-header modification as Extended. The
+marks response-header modification and `URLRewrite` as Extended. The
 [GRPCRoute filter-type contract](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/grpcroute_types.go)
-lists it as Core. Ferrum records the missing implementation as a conformance
-gap for both kinds; refusing it visibly does not establish full conformance.
+lists response-header modification as Core and carries no `URLRewrite` variant.
+Both are now implemented for the kinds upstream defines them on; the remaining
+refusals above are still recorded as conformance gaps, and refusing them visibly
+does not establish full conformance.
 
 ## Status values
 

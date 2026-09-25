@@ -10,6 +10,8 @@ use ferrum_edge::dns::DnsCache;
 use ferrum_edge::http3::peer_identity::{H3ConnectionIdentity, server_0rtt_handshake_succeeded};
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::{ConsumerIndex, PluginCache, RouterCache};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use tracing::info;
 
 use crate::scaffolding::clients::{bind_quinn_client_endpoint, bind_quinn_server_endpoint};
@@ -1332,7 +1334,7 @@ async fn h3_buffered_response_survives_graceful_close_race() {
     // Build a rustls client config that trusts the test CA.
     let provider = rustls::crypto::ring::default_provider();
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+    let ca_certs: Vec<_> = CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
     for cert_der in &ca_certs {
@@ -1412,7 +1414,7 @@ async fn h3_stream_reset_after_partial_body_is_not_treated_as_graceful() {
 
     let provider = rustls::crypto::ring::default_provider();
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+    let ca_certs: Vec<_> = CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
     for cert_der in &ca_certs {
@@ -1485,7 +1487,7 @@ async fn h3_goaway_after_complete_body_is_treated_as_graceful() {
 
     let provider = rustls::crypto::ring::default_provider();
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+    let ca_certs: Vec<_> = CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
     for cert_der in &ca_certs {
@@ -2225,7 +2227,7 @@ async fn capped_h3_backend(
 
     let provider = rustls::crypto::ring::default_provider();
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+    let ca_certs: Vec<_> = CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
     for cert_der in &ca_certs {

@@ -177,7 +177,8 @@ async fn scripted_http1_backend_via_reqwest() {
 
 #[tokio::test]
 async fn scripted_tls_backend_alpn_negotiation() {
-    use rustls_pemfile::certs;
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
     let ca = TestCa::new("integration-test").expect("ca");
     let (cert_pem, key_pem) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("port");
@@ -197,8 +198,7 @@ async fn scripted_tls_backend_alpn_negotiation() {
 
     // Build a rustls client that advertises h2 first, then http/1.1.
     let mut root = rustls::RootCertStore::empty();
-    let mut reader = ca.cert_pem.as_bytes();
-    for cert in certs(&mut reader).filter_map(|c| c.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes()).filter_map(|c| c.ok()) {
         root.add(cert).expect("add ca");
     }
     let provider = rustls::crypto::ring::default_provider();
@@ -807,12 +807,19 @@ async fn serve_drains_spawned_tasks_when_late_startup_fails() {
 
     // The critical assertion: port released. With cleanup the proxy
     // listener task observed shutdown, exited, and dropped its listener.
-    // Without cleanup the orphan task still owns the listener and this
-    // bind would fail with EADDRINUSE. A small grace lets the runtime
-    // finish dropping the listener after the task exits — generous
-    // compared to the actual cost.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let rebind = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{proxy_port}")).await;
+    // Without cleanup the orphan task still owns the listener forever and
+    // every bind fails with EADDRINUSE. Retry until a deadline rather than
+    // after one fixed grace: on a loaded runner the task can take longer
+    // than a fixed sleep to exit and drop its socket (issue #5724), and a
+    // leaked listener still fails the test because it never lets go.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let rebind = loop {
+        match tokio::net::TcpListener::bind_test(format!("127.0.0.1:{proxy_port}")).await {
+            Ok(listener) => break Ok(listener),
+            Err(error) if tokio::time::Instant::now() >= deadline => break Err(error),
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    };
     rebind.expect(
         "proxy port should be free after serve() failure cleaned up the orphan listener task",
     );

@@ -11,9 +11,6 @@
 #     -f charts/ferrum-gateway/examples/dp-values.yaml
 mode: dp
 
-image:
-  tag: latest  # evaluation only; pin an immutable release tag in production
-
 replicaCount: 3
 
 dp:

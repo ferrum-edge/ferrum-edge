@@ -9,8 +9,8 @@ through the prompt's stopping point before ending. Never merge a PR yourself.
 Complete the implementation and assigned validation yourself in this session. Do not stop at
 analysis, partial work, or a handoff for the controller to finish. Perform commit, push, PR, review
 handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke any
-agent-dispatch skill or script in the environment, including `astra-agents`, `opus-agents`,
-`fable-agents`, `grok-agents`,
+agent-dispatch skill or script in the environment, including `astra-agents`, `sol-agents`, `luna-agents`, `opus-agents`,
+`fable-5-1-agents`, `grok-agents`,
 `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not manually spawn
 nested workers. Codex-managed automatic delegation is permitted only at explicitly selected
 `ultra` effort. The orchestrator chose this session's model and reasoning effort deliberately. If

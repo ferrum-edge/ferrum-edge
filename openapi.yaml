@@ -5015,6 +5015,8 @@ paths:
         "200":
           description: Proxy object
           headers:
+            ETag:
+              $ref: "#/components/headers/ResourceETag"
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
@@ -5054,6 +5056,7 @@ paths:
               $ref: "#/components/schemas/ProxyCreate"
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -5078,6 +5081,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -5131,6 +5136,7 @@ paths:
       tags: [Proxies]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/CleanupOrphanedUpstream"
       responses:
         "202":
@@ -5154,6 +5160,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           $ref: "#/components/responses/Conflict"
         "501":
@@ -5273,6 +5281,8 @@ paths:
         "200":
           description: Consumer object
           headers:
+            ETag:
+              $ref: "#/components/headers/ResourceETag"
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
@@ -5310,6 +5320,7 @@ paths:
               $ref: "#/components/schemas/ConsumerUpdate"
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -5332,6 +5343,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -5357,6 +5370,7 @@ paths:
       tags: [Consumers]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -5373,6 +5387,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           description: |
             Conflict — mTLS DNS identity repair cannot proceed, or an
@@ -5756,10 +5772,26 @@ paths:
       summary: List plugin configurations (paginated)
       description: |
         Returns a paginated envelope with `data` and `pagination` fields.
+
+        An optional `proxy_id` query parameter narrows the result to plugin
+        configs whose `proxy_id` matches exactly, so a caller listing one
+        proxy's configs does not have to page through the whole namespace and
+        filter client-side. Pagination (and `pagination.total`) is applied over
+        the filtered set.
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
+        - name: proxy_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Exact match on the `proxy_id` field of the plugin config. Returns
+            only proxy-scoped configs targeting this proxy. Must satisfy the
+            same identifier rules as other resource ids; an invalid value is
+            rejected with `400`.
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"
@@ -5868,6 +5900,8 @@ paths:
         "200":
           description: Plugin configuration object
           headers:
+            ETag:
+              $ref: "#/components/headers/ResourceETag"
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
@@ -5920,6 +5954,7 @@ paths:
               $ref: "#/components/schemas/PluginConfigReplace"
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -5942,6 +5977,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -5961,6 +5998,7 @@ paths:
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -5983,6 +6021,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
@@ -6083,6 +6123,8 @@ paths:
         "200":
           description: Upstream object
           headers:
+            ETag:
+              $ref: "#/components/headers/ResourceETag"
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
@@ -6115,6 +6157,7 @@ paths:
               $ref: "#/components/schemas/UpstreamCreate"
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -6137,6 +6180,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -6160,6 +6205,7 @@ paths:
       tags: [Upstreams]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -6176,6 +6222,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           description: |
             The upstream is still referenced by a proxy or by a
@@ -7606,6 +7654,34 @@ components:
 
   # ── Reusable parameters ────────────────────────────────────────────
   parameters:
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      schema:
+        type: string
+      description: |
+        Makes this full-replacement write conditional (RFC 9110 §13.1.1). Send
+        the `ETag` from `GET` on the same resource; the write is refused with
+        `412` unless the stored resource still has that representation, so a
+        draft opened before someone else's accepted change can never revert
+        it. `*` requires only that the resource exists. Comparison is strong:
+        a weak (`W/`) tag never matches. A comma-separated list matches when
+        any member does.
+
+        The comparison and the write are atomic with respect to every admin
+        writer of this namespace — including another control-plane replica
+        and `/batch`, `/restore`, API-spec imports, and credential endpoints —
+        because all of them serialize on the namespace config admission lease
+        the comparison runs under.
+
+        Omitting the header keeps the write unconditional. A malformed or
+        empty header is `400`, never treated as absent. `If-Match` is only
+        evaluated on `PUT`/`DELETE` of `/proxies/{id}`, `/upstreams/{id}`,
+        `/consumers/{id}`, and `/plugins/config/{id}`; any other `POST`,
+        `PUT`, `PATCH`, or `DELETE` carrying it is refused with `400` rather
+        than applied unconditionally. As RFC 9110 §13.2.1 requires, a request
+        that would otherwise be `404` is `404` regardless of the precondition.
     ProvisionedBy:
       name: X-Ferrum-Provisioned-By
       in: header
@@ -7759,6 +7835,21 @@ components:
 
   # ── Reusable headers ───────────────────────────────────────────────
   headers:
+    ResourceETag:
+      description: |
+        Strong entity-tag for the stored resource, for use in `If-Match`.
+        Present only when the resource was read from the database (absent on a
+        `X-Data-Source: cached` fallback). Opaque: it is a keyed MAC over the
+        full stored representation, bound to the resource kind, namespace, and
+        id, and it changes whenever any stored field changes — including
+        fields redacted from this caller's view. Replicas configured with the
+        same `FERRUM_ADMIN_JWT_SECRET` issue identical tags; rotating that
+        secret invalidates outstanding tags. Write responses do not carry a
+        tag: re-read the resource to obtain the tag for the accepted state.
+      required: false
+      schema:
+        type: string
+        example: '"3f0c8a1e9b2d4c6f8a0e1b3d5c7f9a2e"'
     X-Data-Source:
       description: |
         Present with value `cached` when the response was served from the
@@ -7824,6 +7915,17 @@ components:
 
   # ── Reusable responses ─────────────────────────────────────────────
   responses:
+    PreconditionFailed:
+      description: |
+        `If-Match` did not match: the resource changed after the supplied tag
+        was issued. Nothing was written. Re-read the resource, reapply the
+        intended changes to the current representation, and retry with its
+        new `ETag`; resending the same body with a fresh tag would revert the
+        change that caused this refusal.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     BadRequest:
       description: Invalid request body
       content:
@@ -13896,7 +13998,9 @@ components:
         http_path:
           type: string
           default: /health
-          description: HTTP path to probe
+          maxLength: 2048
+          pattern: "^/"
+          description: HTTP path to probe; must start with `/`
         interval_seconds:
           type: integer
           format: uint64
@@ -13947,6 +14051,8 @@ components:
             `grpc` — gRPC health check using `grpc.health.v1.Health/Check`.
         udp_probe_payload:
           type: [string, "null"]
+          maxLength: 2048
+          pattern: "^([0-9a-fA-F]{2})*$"
           description: |
             Hex-encoded payload to send for UDP probes (e.g., "0000").
             If omitted, a single zero byte is sent.
@@ -23655,6 +23761,18 @@ components:
                     properties: {rewrite: {type: object}}
                   - required: [redirect]
                     properties: {redirect: {type: object}}
+                  - required: [timeout_ms]
+                    properties: {timeout_ms: {type: integer}}
+                  - required: [timeout_disabled]
+                    properties: {timeout_disabled: {const: true}}
+                  - required: [request_timeout_ms]
+                    properties: {request_timeout_ms: {type: integer}}
+                  - required: [attempt_timeout_ms]
+                    properties: {attempt_timeout_ms: {type: integer}}
+                  - required: [retry]
+                    properties: {retry: {type: object}}
+                  - required: [retry_disabled]
+                    properties: {retry_disabled: {const: true}}
               - if:
                   required: [timeout_disabled]
                   properties:
@@ -23683,7 +23801,10 @@ components:
                   `query_params`/`authority`/`source_namespace`/`uri` must be
                   configured, UNLESS the rule carries a route action
                   (`request_transform`, `response_transform`, `fault`,
-                  `rewrite`, or `redirect`), which makes an empty match the
+                  `rewrite`, `redirect`, `timeout_ms`,
+                  `timeout_disabled: true`, `request_timeout_ms`,
+                  `attempt_timeout_ms`, `retry`, or
+                  `retry_disabled: true`), which makes an empty match the
                   translator's deliberate action-only catch-all. An empty
                   match with no route action is rejected at load time because
                   it would silently shadow every later rule. `ignore_uri_case`
@@ -23993,13 +24114,73 @@ components:
                 description: |
                   Explicitly clear the selected proxy's inherited backend
                   response/read timeout. Cannot be true when `timeout_ms` is set.
+              request_timeout_ms:
+                type: [integer, "null"]
+                format: uint64
+                minimum: 1
+                description: |
+                  Optional TOTAL request deadline for this rule, in
+                  milliseconds from request receipt (Gateway API
+                  `HTTPRoute.rules[].timeouts.request`). Unlike `timeout_ms`,
+                  which bounds one backend attempt's wait for response headers
+                  and the idle gap between response frames, it spans every
+                  attempt, retry backoff, and the streaming response body, and
+                  is never re-armed by a retry. Request-scoped: it never changes
+                  the selected proxy or upstream. Expiry before a non-gRPC
+                  response head answers `504`; expiry mid-body resets the
+                  HTTP/2 stream, closes the HTTP/1.1 connection, or resets the
+                  HTTP/3 stream with `H3_REQUEST_CANCELLED`; a gRPC request
+                  folds it into its RPC deadline and ends with
+                  `DEADLINE_EXCEEDED`. HTTP/1.1, HTTP/2 and native HTTP/3
+                  enforce it alike. Expiry is charged to a backend's health
+                  only when that backend held the cancelled attempt; expiry
+                  before the attempt was handed to a backend, in retry backoff,
+                  or after the response head is health-neutral. Upgraded
+                  WebSocket / CONNECT-UDP tunnels are not bounded by it. `0` is
+                  rejected; omit the field for no route deadline.
+              attempt_timeout_ms:
+                type: [integer, "null"]
+                format: uint64
+                minimum: 1
+                description: |
+                  Optional TOTAL bound on each backend attempt for this rule, in
+                  milliseconds (Gateway API
+                  `HTTPRoute.rules[].timeouts.backendRequest`, which the
+                  translator also projects as `timeout_ms`). The budget starts
+                  when the attempt is handed to the backend and covers its
+                  response head and its whole response body; every retry
+                  attempt gets a fresh budget, and `request_timeout_ms`, when
+                  set, still bounds the whole transaction. It is independent of
+                  `timeout_ms` / `timeout_disabled`, which keep bounding the
+                  header wait and the idle gap between frames. Expiry before a
+                  non-gRPC response head answers the ordinary backend-timeout
+                  `504` (retried when the rule's `retry` lists `504`); expiry
+                  after the head has been sent is never retried and cuts the
+                  body exactly like `request_timeout_ms` does (HTTP/2 stream
+                  reset, HTTP/1.1 connection close, HTTP/3
+                  `H3_REQUEST_CANCELLED` stream reset, health-neutral). A gRPC
+                  request folds it into its RPC deadline, anchored when the rule
+                  is selected and re-armed for each retry attempt, and ends with
+                  `DEADLINE_EXCEEDED`. HTTP/1.1, HTTP/2 and native HTTP/3
+                  enforce it alike. Request-scoped: it never changes the
+                  selected proxy or upstream. `0` is rejected; omit the field
+                  for no per-attempt total bound.
               retry:
                 oneOf:
                   - $ref: "#/components/schemas/MeshRouteRetryConfig"
                   - type: "null"
                 description: |
                   Optional route-local retry policy. Mutually exclusive with
-                  `retry_disabled: true`.
+                  `retry_disabled: true`. Request-scoped: it replaces the
+                  selected proxy's retry policy only for requests this rule
+                  matches. Istio `VirtualService.http[].retries` and Gateway
+                  API `HTTPRoute.rules[].retry` are projected here; the Gateway
+                  API translator emits `max_retries` = `attempts` (retries
+                  after the initial attempt), `retryable_status_codes` =
+                  `codes`, a `fixed` backoff of `backoff`, the default
+                  replay-safe `retryable_methods`, and
+                  `retry_on_connect_failure: true`. Backoff and every attempt
+                  stay inside the rule's `request_timeout_ms` budget.
               retry_disabled:
                 type: boolean
                 default: false
@@ -24239,9 +24420,12 @@ components:
                       `match_prefix: /prefix/old` and `uri: /new`,
                       `/prefix/oldtail` forwards as `/newtail`. A separator is
                       never synthesized; a doubled one is collapsed when both
-                      sides carry a `/`. An empty string is normalized to
-                      "no prefix" (whole-path replacement). Normally set by
-                      the VirtualService translator, not hand-authored.
+                      sides carry a `/`. An empty string strips nothing and
+                      prepends `uri` (the Gateway API root `PathPrefix: /`
+                      case); omit the field for whole-path replacement. A
+                      `match_prefix` with no `uri` is inert and dropped.
+                      Normally set by the VirtualService or Gateway API
+                      translator, not hand-authored.
               redirect:
                 type: [object, "null"]
                 additionalProperties: false
@@ -24283,9 +24467,10 @@ components:
                       Literal matched path prefix replaced by `uri`; the
                       unmatched suffix is appended verbatim, exactly as for
                       `rewrite.match_prefix` (no separator is synthesized at a
-                      boundary that had none). An empty string is normalized
-                      to "no prefix". Normally emitted by the VirtualService
-                      translator.
+                      boundary that had none). An empty string strips nothing
+                      and prepends `uri`; omit the field for whole-path
+                      replacement. Normally emitted by the VirtualService or
+                      Gateway API translator.
                   authority:
                     type: [string, "null"]
                     minLength: 1
@@ -27066,7 +27251,14 @@ components:
             chain-level route-header finalization phase. Auto-emitted by the
             Istio VirtualService translator on routes carrying
             `headers.response.{set,add,remove}` that have no operator-configured
-            `response_transformer`. Explicit `null` is accepted and treated as
+            `response_transformer`, and by the Gateway API translator on rules
+            carrying `ResponseHeaderModifier`. With no
+            static `rules`, the instance's fail-closed response-trailer policy
+            applies only to requests whose matched `mesh_route_dispatch` rule
+            published a `response_transform`, so other requests on the same
+            proxy keep their backend trailers; any static rule makes that policy
+            apply to every response. Such a rules-free instance cannot carry a
+            per-instance `trigger`. Explicit `null` is accepted and treated as
             `false`.
         runtime_overlay_scope:
           type: [string, "null"]

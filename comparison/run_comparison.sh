@@ -74,8 +74,12 @@ REDIS_CONTAINER="ferrum-bench-redis"
 # Docker image names for locally-built images
 FERRUM_IMAGE="ferrum-bench:local"
 
-# PIDs to track (backend only — gateways are Docker containers)
+# Processes and Docker resources created by this run.
 BACKEND_PID=""
+OWNED_CONTAINER_NAMES=()
+OWNED_CONTAINER_IDS=()
+OWNED_NETWORKS=()
+CLEANUP_READY=false
 
 # Detect platform for Docker networking
 # macOS Docker Desktop does not support --network host; use port mapping instead
@@ -140,8 +144,78 @@ wait_for_http() {
     return 1
 }
 
-kill_port() {
-    lsof -ti:"$1" 2>/dev/null | xargs kill -9 2>/dev/null || true
+check_port_available() {
+    local port="$1"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        log_err "Required port $port is already in use. Inspect it with: lsof -nP -iTCP:$port -sTCP:LISTEN"
+        return 1
+    fi
+}
+
+check_resource_names_available() {
+    local container
+    for container in "$FERRUM_CONTAINER" "$KONG_CONTAINER" "$TYK_CONTAINER" \
+                     "$KRAKEND_CONTAINER" "$ENVOY_CONTAINER" "$REDIS_CONTAINER"; do
+        if docker container inspect "$container" >/dev/null 2>&1; then
+            log_err "Docker container '$container' already exists; remove or rename it before running this benchmark."
+            return 1
+        fi
+    done
+    if [[ "$(uname -s)" != "Darwin" ]] && docker network inspect "$TYK_NETWORK" >/dev/null 2>&1; then
+        log_err "Docker network '$TYK_NETWORK' already exists; remove or rename it before running this benchmark."
+        return 1
+    fi
+}
+
+register_owned_container() {
+    local name="$1"
+    local id="$2"
+    OWNED_CONTAINER_NAMES+=("$name")
+    OWNED_CONTAINER_IDS+=("$id")
+}
+
+stop_owned_container() {
+    local name="$1"
+    local index
+    # `${arr[@]+...}` keeps an empty array safe under `set -u` on bash 3.2
+    # (macOS /bin/bash), where a bare "${arr[@]}" is an unbound variable.
+    for index in ${OWNED_CONTAINER_NAMES[@]+"${!OWNED_CONTAINER_NAMES[@]}"}; do
+        if [[ "${OWNED_CONTAINER_NAMES[$index]}" == "$name" ]]; then
+            docker stop --time 5 "${OWNED_CONTAINER_IDS[$index]}" >/dev/null 2>&1 || true
+            docker rm -f "${OWNED_CONTAINER_IDS[$index]}" >/dev/null 2>&1 || true
+            unset 'OWNED_CONTAINER_NAMES[index]' 'OWNED_CONTAINER_IDS[index]'
+            return 0
+        fi
+    done
+}
+
+ensure_owned_network() {
+    local name="$1"
+    local network
+    # Redis starts once per Tyk phase; reuse the network this run already
+    # created instead of failing on a second `docker network create`.
+    for network in ${OWNED_NETWORKS[@]+"${OWNED_NETWORKS[@]}"}; do
+        [[ "$network" == "$name" ]] && return 0
+    done
+    docker network create "$name" >/dev/null || return 1
+    OWNED_NETWORKS+=("$name")
+}
+
+stop_backend() {
+    local attempt
+    if [[ -n "$BACKEND_PID" ]] && kill -0 "$BACKEND_PID" 2>/dev/null; then
+        kill -TERM "$BACKEND_PID" 2>/dev/null || true
+        for attempt in {1..5}; do
+            kill -0 "$BACKEND_PID" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$BACKEND_PID" 2>/dev/null; then
+            kill -KILL "$BACKEND_PID" 2>/dev/null || true
+        fi
+        wait "$BACKEND_PID" 2>/dev/null || true
+        log_ok "Backend server stopped"
+    fi
+    BACKEND_PID=""
 }
 
 # Docker run helper — handles network mode per platform
@@ -170,9 +244,11 @@ docker_run_gateway() {
         done
     fi
 
-    docker run -d --name "$container_name" \
+    local container_id
+    container_id=$(docker run -d --name "$container_name" \
         "${network_args[@]}" \
-        "${extra_args[@]}" > /dev/null
+        "${extra_args[@]}") || return 1
+    register_owned_container "$container_name" "$container_id"
 }
 
 # ===========================================================================
@@ -183,34 +259,29 @@ cleanup() {
     echo ""
     log_header "Cleaning up"
 
-    if [[ -n "$BACKEND_PID" ]]; then
-        kill "$BACKEND_PID" 2>/dev/null || true
-        log_ok "Backend server stopped"
-    fi
+    stop_backend
 
-    # Remove all Docker containers
-    for c in "$FERRUM_CONTAINER" "$KONG_CONTAINER" \
-             "$TYK_CONTAINER" "$KRAKEND_CONTAINER" "$ENVOY_CONTAINER" "$REDIS_CONTAINER"; do
-        docker rm -f "$c" 2>/dev/null || true
+    for c in ${OWNED_CONTAINER_NAMES[@]+"${OWNED_CONTAINER_NAMES[@]}"}; do
+        stop_owned_container "$c"
     done
 
     # Clean up Docker network and temporary config files
-    docker network rm "$TYK_NETWORK" 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.ferrum_runtime"*.yaml 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.kong_runtime"*.yaml 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.kong_runtime_key_auth.yaml" 2>/dev/null || true
-    rm -rf "$COMP_DIR/configs/.tyk_runtime_apps" 2>/dev/null || true
-    rm -rf "$COMP_DIR/configs/.tyk_runtime_apps_e2e_tls" 2>/dev/null || true
-    rm -rf "$COMP_DIR/configs/.tyk_runtime_apps_key_auth" 2>/dev/null || true
-    rm -rf "$COMP_DIR/configs/.tyk_runtime" 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.krakend_runtime"*.json 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.envoy_runtime"*.yaml 2>/dev/null || true
-    rm -f "$COMP_DIR/lua/.tyk_key_auth_runtime.lua" 2>/dev/null || true
+    for network in ${OWNED_NETWORKS[@]+"${OWNED_NETWORKS[@]}"}; do
+        docker network rm "$network" 2>/dev/null || true
+    done
+    if [[ "$CLEANUP_READY" == "true" ]]; then
+        rm -f "$COMP_DIR/configs/.ferrum_runtime"*.yaml 2>/dev/null || true
+        rm -f "$COMP_DIR/configs/.kong_runtime"*.yaml 2>/dev/null || true
+        rm -f "$COMP_DIR/configs/.kong_runtime_key_auth.yaml" 2>/dev/null || true
+        rm -rf "$COMP_DIR/configs/.tyk_runtime_apps" 2>/dev/null || true
+        rm -rf "$COMP_DIR/configs/.tyk_runtime_apps_e2e_tls" 2>/dev/null || true
+        rm -rf "$COMP_DIR/configs/.tyk_runtime_apps_key_auth" 2>/dev/null || true
+        rm -rf "$COMP_DIR/configs/.tyk_runtime" 2>/dev/null || true
+        rm -f "$COMP_DIR/configs/.krakend_runtime"*.json 2>/dev/null || true
+        rm -f "$COMP_DIR/configs/.envoy_runtime"*.yaml 2>/dev/null || true
+        rm -f "$COMP_DIR/lua/.tyk_key_auth_runtime.lua" 2>/dev/null || true
+    fi
 
-    kill_port "$BACKEND_PORT"
-    kill_port "$BACKEND_HTTPS_PORT"
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
 }
 
 trap cleanup EXIT
@@ -223,7 +294,7 @@ check_dependencies() {
     log_header "Checking dependencies"
 
     local missing=0
-    local required_cmds=(wrk python3 cargo curl docker)
+    local required_cmds=(wrk python3 cargo curl docker lsof)
 
     for cmd in "${required_cmds[@]}"; do
         if command -v "$cmd" &>/dev/null; then
@@ -316,8 +387,6 @@ build_images() {
 
 start_backend() {
     log_info "Starting backend server on ports $BACKEND_PORT (HTTP) and $BACKEND_HTTPS_PORT (HTTPS)..."
-    kill_port "$BACKEND_PORT"
-    kill_port "$BACKEND_HTTPS_PORT"
     BACKEND_TLS_CERT="$CERTS_DIR/server.crt" \
     BACKEND_TLS_KEY="$CERTS_DIR/server.key" \
     "$PERF_DIR/target/release/backend_server" > "$RESULTS_DIR/backend.log" 2>&1 &
@@ -419,8 +488,7 @@ prepare_ferrum_config() {
 
 start_ferrum_http() {
     log_info "Starting Ferrum Edge Docker (HTTP) on port $GATEWAY_HTTP_PORT..."
-    docker rm -f "$FERRUM_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
+    stop_owned_container "$FERRUM_CONTAINER"
 
     docker_run_gateway "$FERRUM_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
         -v "$COMP_DIR/configs/.ferrum_runtime.yaml:/etc/ferrum/config.yaml:ro" \
@@ -457,9 +525,7 @@ start_ferrum_http() {
 
 start_ferrum_https() {
     log_info "Starting Ferrum Edge Docker (HTTPS) on port $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$FERRUM_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$FERRUM_CONTAINER"
 
     docker_run_gateway "$FERRUM_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.ferrum_runtime.yaml:/etc/ferrum/config.yaml:ro" \
@@ -501,9 +567,7 @@ start_ferrum_https() {
 
 start_ferrum_e2e_tls() {
     log_info "Starting Ferrum Edge Docker (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$FERRUM_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$FERRUM_CONTAINER"
 
     docker_run_gateway "$FERRUM_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.ferrum_runtime_e2e_tls.yaml:/etc/ferrum/config.yaml:ro" \
@@ -544,9 +608,7 @@ start_ferrum_e2e_tls() {
 }
 
 stop_ferrum() {
-    docker rm -f "$FERRUM_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$FERRUM_CONTAINER"
     sleep 1
 }
 
@@ -596,8 +658,7 @@ prepare_kong_config() {
 
 start_kong_http() {
     log_info "Starting Kong Gateway Docker (HTTP) on port $GATEWAY_HTTP_PORT..."
-    docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
+    stop_owned_container "$KONG_CONTAINER"
 
     docker_run_gateway "$KONG_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
         -v "$COMP_DIR/configs/.kong_runtime.yaml:/etc/kong/kong.yml:ro" \
@@ -616,9 +677,7 @@ start_kong_http() {
 
 start_kong_https() {
     log_info "Starting Kong Gateway Docker (HTTPS) on port $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$KONG_CONTAINER"
 
     docker_run_gateway "$KONG_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.kong_runtime.yaml:/etc/kong/kong.yml:ro" \
@@ -641,9 +700,7 @@ start_kong_https() {
 
 start_kong_e2e_tls() {
     log_info "Starting Kong Gateway Docker (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$KONG_CONTAINER"
 
     docker_run_gateway "$KONG_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.kong_runtime_e2e_tls.yaml:/etc/kong/kong.yml:ro" \
@@ -666,9 +723,7 @@ start_kong_e2e_tls() {
 }
 
 stop_kong() {
-    docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$KONG_CONTAINER"
     sleep 1
 }
 
@@ -741,30 +796,33 @@ TYK_NETWORK="ferrum-bench-net"
 
 start_redis() {
     log_info "Starting Redis for Tyk..."
-    docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+    stop_owned_container "$REDIS_CONTAINER"
 
     if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-        docker run -d --name "$REDIS_CONTAINER" \
+        local redis_id
+        redis_id=$(docker run -d --name "$REDIS_CONTAINER" \
             --network host \
-            redis:7-alpine > /dev/null
+            redis:7-alpine) || return 1
+        register_owned_container "$REDIS_CONTAINER" "$redis_id"
     else
-        docker network create "$TYK_NETWORK" 2>/dev/null || true
-        docker run -d --name "$REDIS_CONTAINER" \
+        ensure_owned_network "$TYK_NETWORK" || return 1
+        local redis_id
+        redis_id=$(docker run -d --name "$REDIS_CONTAINER" \
             --network "$TYK_NETWORK" \
-            redis:7-alpine > /dev/null
+            redis:7-alpine) || return 1
+        register_owned_container "$REDIS_CONTAINER" "$redis_id"
     fi
     sleep 2
     log_ok "Redis started"
 }
 
 stop_redis() {
-    docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+    stop_owned_container "$REDIS_CONTAINER"
 }
 
 start_tyk_http() {
     log_info "Starting Tyk Gateway (HTTP) on port $GATEWAY_HTTP_PORT..."
-    docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
+    stop_owned_container "$TYK_CONTAINER"
 
     local network_args=()
     if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
@@ -773,20 +831,20 @@ start_tyk_http() {
         network_args+=(--network "$TYK_NETWORK" -p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
     fi
 
-    docker run -d --name "$TYK_CONTAINER" \
+    local tyk_id
+    tyk_id=$(docker run -d --name "$TYK_CONTAINER" \
         "${network_args[@]}" \
         -v "$TYK_CONF_DIR/tyk.conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$COMP_DIR/configs/.tyk_runtime_apps:/etc/tyk/apps:ro" \
-        "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
+        "tykio/tyk-gateway:${TYK_VERSION}") || return 1
+    register_owned_container "$TYK_CONTAINER" "$tyk_id"
 
     wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/hello" "Tyk (HTTP)" 20 "$TYK_CONTAINER"
 }
 
 start_tyk_https() {
     log_info "Starting Tyk Gateway (HTTPS) on port $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$TYK_CONTAINER"
 
     local network_args=()
     if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
@@ -795,22 +853,22 @@ start_tyk_https() {
         network_args+=(--network "$TYK_NETWORK" -p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
     fi
 
-    docker run -d --name "$TYK_CONTAINER" \
+    local tyk_id
+    tyk_id=$(docker run -d --name "$TYK_CONTAINER" \
         "${network_args[@]}" \
         -v "$TYK_CONF_DIR/tyk_tls.conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$COMP_DIR/configs/.tyk_runtime_apps:/etc/tyk/apps:ro" \
         -v "$CERTS_DIR/server.crt:/etc/tyk/certs/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/tyk/certs/server.key:ro" \
-        "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
+        "tykio/tyk-gateway:${TYK_VERSION}") || return 1
+    register_owned_container "$TYK_CONTAINER" "$tyk_id"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/hello" "Tyk (HTTPS)" 20 "$TYK_CONTAINER"
 }
 
 start_tyk_e2e_tls() {
     log_info "Starting Tyk Gateway (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$TYK_CONTAINER"
 
     local network_args=()
     if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
@@ -819,21 +877,21 @@ start_tyk_e2e_tls() {
         network_args+=(--network "$TYK_NETWORK" -p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
     fi
 
-    docker run -d --name "$TYK_CONTAINER" \
+    local tyk_id
+    tyk_id=$(docker run -d --name "$TYK_CONTAINER" \
         "${network_args[@]}" \
         -v "$TYK_CONF_DIR/tyk_tls.conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$COMP_DIR/configs/.tyk_runtime_apps_e2e_tls:/etc/tyk/apps:ro" \
         -v "$CERTS_DIR/server.crt:/etc/tyk/certs/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/tyk/certs/server.key:ro" \
-        "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
+        "tykio/tyk-gateway:${TYK_VERSION}") || return 1
+    register_owned_container "$TYK_CONTAINER" "$tyk_id"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/hello" "Tyk (E2E TLS)" 20 "$TYK_CONTAINER"
 }
 
 stop_tyk() {
-    docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$TYK_CONTAINER"
     sleep 1
 }
 
@@ -888,8 +946,7 @@ prepare_krakend_config() {
 
 start_krakend_http() {
     log_info "Starting KrakenD Gateway (HTTP) on port $GATEWAY_HTTP_PORT..."
-    docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
+    stop_owned_container "$KRAKEND_CONTAINER"
 
     docker_run_gateway "$KRAKEND_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
         -v "$COMP_DIR/configs/.krakend_runtime_http.json:/etc/krakend/krakend.json:ro" \
@@ -901,9 +958,7 @@ start_krakend_http() {
 
 start_krakend_https() {
     log_info "Starting KrakenD Gateway (HTTPS) on port $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$KRAKEND_CONTAINER"
 
     docker_run_gateway "$KRAKEND_CONTAINER" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.krakend_runtime_https.json:/etc/krakend/krakend.json:ro" \
@@ -917,9 +972,7 @@ start_krakend_https() {
 
 start_krakend_e2e_tls() {
     log_info "Starting KrakenD Gateway (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$KRAKEND_CONTAINER"
 
     docker_run_gateway "$KRAKEND_CONTAINER" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.krakend_runtime_e2e_tls.json:/etc/krakend/krakend.json:ro" \
@@ -932,9 +985,7 @@ start_krakend_e2e_tls() {
 }
 
 stop_krakend() {
-    docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$KRAKEND_CONTAINER"
     sleep 1
 }
 
@@ -988,8 +1039,7 @@ prepare_envoy_config() {
 
 start_envoy_http() {
     log_info "Starting Envoy Proxy Docker (HTTP) on port $GATEWAY_HTTP_PORT..."
-    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
+    stop_owned_container "$ENVOY_CONTAINER"
 
     docker_run_gateway "$ENVOY_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
         -v "$COMP_DIR/configs/.envoy_runtime_http.yaml:/etc/envoy/envoy.yaml:ro" \
@@ -1000,9 +1050,7 @@ start_envoy_http() {
 
 start_envoy_https() {
     log_info "Starting Envoy Proxy Docker (HTTPS) on port $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$ENVOY_CONTAINER"
 
     docker_run_gateway "$ENVOY_CONTAINER" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.envoy_runtime_https.yaml:/etc/envoy/envoy.yaml:ro" \
@@ -1015,9 +1063,7 @@ start_envoy_https() {
 
 start_envoy_e2e_tls() {
     log_info "Starting Envoy Proxy Docker (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$ENVOY_CONTAINER"
 
     docker_run_gateway "$ENVOY_CONTAINER" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.envoy_runtime_e2e_tls.yaml:/etc/envoy/envoy.yaml:ro" \
@@ -1029,9 +1075,7 @@ start_envoy_e2e_tls() {
 }
 
 stop_envoy() {
-    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
+    stop_owned_container "$ENVOY_CONTAINER"
     sleep 1
 }
 
@@ -1087,8 +1131,7 @@ prepare_tyk_key_auth_config() {
 
 test_ferrum_key_auth() {
     log_info "Starting Ferrum Edge Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
-    docker rm -f "$FERRUM_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
+    stop_owned_container "$FERRUM_CONTAINER"
 
     docker_run_gateway "$FERRUM_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
         -v "$COMP_DIR/configs/.ferrum_runtime_key_auth.yaml:/etc/ferrum/config.yaml:ro" \
@@ -1133,8 +1176,7 @@ test_kong_key_auth() {
     prepare_kong_key_auth_config
 
     log_info "Starting Kong Gateway Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
-    docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
+    stop_owned_container "$KONG_CONTAINER"
 
     docker_run_gateway "$KONG_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
         -v "$COMP_DIR/configs/.kong_runtime_key_auth.yaml:/etc/kong/kong.yml:ro" \
@@ -1161,8 +1203,7 @@ test_tyk_key_auth() {
     prepare_tyk_key_auth_config
 
     log_info "Starting Tyk Gateway (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
-    docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
+    stop_owned_container "$TYK_CONTAINER"
 
     local network_args=()
     if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
@@ -1171,11 +1212,13 @@ test_tyk_key_auth() {
         network_args+=(--network "$TYK_NETWORK" -p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
     fi
 
-    docker run -d --name "$TYK_CONTAINER" \
+    local tyk_id
+    tyk_id=$(docker run -d --name "$TYK_CONTAINER" \
         "${network_args[@]}" \
         -v "$TYK_CONF_DIR/tyk.conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$COMP_DIR/configs/.tyk_runtime_apps_key_auth:/etc/tyk/apps:ro" \
-        "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
+        "tykio/tyk-gateway:${TYK_VERSION}") || return 1
+    register_owned_container "$TYK_CONTAINER" "$tyk_id"
 
     if ! wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/hello" "Tyk (Key Auth)" 20 "$TYK_CONTAINER"; then
         log_warn "Tyk Key Auth failed to start — skipping"
@@ -1242,8 +1285,7 @@ test_envoy_key_auth() {
     prepare_envoy_config
 
     log_info "Starting Envoy Proxy Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
-    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
+    stop_owned_container "$ENVOY_CONTAINER"
 
     docker_run_gateway "$ENVOY_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
         -v "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml:/etc/envoy/envoy.yaml:ro" \
@@ -1347,6 +1389,11 @@ main() {
     fi
 
     check_dependencies
+    for port in "$BACKEND_PORT" "$BACKEND_HTTPS_PORT" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT"; do
+        check_port_available "$port" || exit 1
+    done
+    check_resource_names_available || exit 1
+    CLEANUP_READY=true
     pull_images
     build_images
 

@@ -2085,7 +2085,35 @@ impl GrpcProxyError {
             source: Some(Box::new(source)),
         }
     }
+
+    /// Whether this is an RPC-deadline expiry raised after the request was
+    /// sent to the backend: while waiting for its response headers, or while
+    /// collecting its buffered response body. The backend held the attempt
+    /// then, so proxy core charges the expiry to it when the deadline in force
+    /// was the matched rule's per-attempt budget rather than the client's.
+    pub(crate) fn is_deadline_after_request_sent(&self) -> bool {
+        matches!(
+            self,
+            Self::ClientDeadlineExceeded(message)
+                if message == GRPC_DEADLINE_STREAMING_RESPONSE_HEADERS_MESSAGE
+                    || message == GRPC_DEADLINE_RESPONSE_HEADERS_MESSAGE
+                    || message == GRPC_DEADLINE_RESPONSE_BODY_MESSAGE
+        )
+    }
 }
+
+/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the deadline expired
+/// while a streaming-upload RPC waited for its response headers.
+const GRPC_DEADLINE_STREAMING_RESPONSE_HEADERS_MESSAGE: &str =
+    "gRPC deadline exceeded waiting for streaming RPC response headers";
+/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the deadline expired
+/// while a buffered-upload RPC waited for its response headers.
+const GRPC_DEADLINE_RESPONSE_HEADERS_MESSAGE: &str =
+    "gRPC deadline exceeded waiting for backend response headers";
+/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the deadline expired
+/// while the buffered response body was being collected.
+const GRPC_DEADLINE_RESPONSE_BODY_MESSAGE: &str =
+    "gRPC deadline exceeded while collecting response body";
 
 impl std::fmt::Display for GrpcProxyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -4838,8 +4866,7 @@ async fn proxy_grpc_streaming_dispatch(
                         "gRPC deadline exceeded waiting for streaming RPC response headers"
                     );
                     GrpcProxyError::ClientDeadlineExceeded(
-                        "gRPC deadline exceeded waiting for streaming RPC response headers"
-                            .to_string(),
+                        GRPC_DEADLINE_STREAMING_RESPONSE_HEADERS_MESSAGE.to_string(),
                     )
                 })?
         } else if let Some(timeout_ms) = effective_timeout_ms {
@@ -5329,8 +5356,7 @@ pub(crate) async fn proxy_grpc_request_core(
                             "gRPC client deadline exceeded waiting for backend response headers"
                         );
                         GrpcProxyError::ClientDeadlineExceeded(
-                            "gRPC deadline exceeded waiting for backend response headers"
-                                .to_string(),
+                            GRPC_DEADLINE_RESPONSE_HEADERS_MESSAGE.to_string(),
                         )
                     } else {
                         warn_sampled!(
@@ -5532,7 +5558,7 @@ pub(crate) async fn proxy_grpc_request_core(
                 if response_deadline_is_client {
                     warn_sampled!("gRPC client deadline exceeded while collecting response body");
                     GrpcProxyError::ClientDeadlineExceeded(
-                        "gRPC deadline exceeded while collecting response body".to_string(),
+                        GRPC_DEADLINE_RESPONSE_BODY_MESSAGE.to_string(),
                     )
                 } else {
                     warn_sampled!(

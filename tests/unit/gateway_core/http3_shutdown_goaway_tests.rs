@@ -56,9 +56,17 @@ fn listener_force_close_uses_h3_no_error_not_quic_zero() {
 #[test]
 fn connection_guard_is_constructed_once_in_the_spawn_wrapper() {
     let src = server_src();
+    // Count the HTTP/3 `ConnectionGuard` itself, not identifiers that merely
+    // end in it (for example `LoadBalancerConnectionGuard::new`).
+    let bytes = src.as_bytes();
+    let guard_constructions = src
+        .match_indices("ConnectionGuard::new")
+        .filter(|(at, _)| {
+            *at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_')
+        })
+        .count();
     assert_eq!(
-        src.matches("ConnectionGuard::new").count(),
-        1,
+        guard_constructions, 1,
         "exactly one ConnectionGuard::new in server.rs, inside run_h3_connection_with_guard"
     );
     let helper = src

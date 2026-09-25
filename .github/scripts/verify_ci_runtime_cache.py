@@ -92,8 +92,8 @@ COMPLETED_CACHE_PRODUCER_JOBS = (
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 RUST_TOOLCHAIN = "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
 RUST_CACHE = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
-BUILDX = "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e"
-BUILD_PUSH = "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a"
+BUILDX = "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
+BUILD_PUSH = "docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc"
 CACHE_RESTORE = "actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae"
 CACHE_SAVE = "actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae"
 UPLOAD_ARTIFACT = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
@@ -722,7 +722,7 @@ def check_node_waypoint_live_job(
         relevant, _reason, _matched = decide_relevance("node-waypoint-ebpf-live", [probe])
         require(
             relevant,
-            f"{source} prior-scope path {probe} must run the NodeWaypoint live job",
+            f"{source} NodeWaypoint-owned path {probe} must run the NodeWaypoint live job",
             failures,
         )
     for probe in NODE_WAYPOINT_PRODUCTION_ONLY_PROBES:
@@ -5008,9 +5008,10 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "prior" in ci_cd.lower()
-        and ("nodewaypoint" in ci_cd.lower() or "node-waypoint" in ci_cd.lower()),
-        "docs/ci_cd.md must document NodeWaypoint prior-scope scheduling vs "
+        "### NodeWaypoint relevance\n" in ci_cd
+        and "NodeWaypoint-owned paths" in ci_cd
+        and "still start the workflow for the production-image" in ci_cd,
+        "docs/ci_cd.md must document the NodeWaypoint-owned PR scope vs "
         "the production-image trigger superset",
         failures,
     )

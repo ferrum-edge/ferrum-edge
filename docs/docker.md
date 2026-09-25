@@ -415,10 +415,25 @@ services:
   ferrum-edge:
     secrets:
       - admin_jwt_secret
+    environment:
+      FERRUM_MODE: database
+      FERRUM_DB_TYPE: postgres
+      FERRUM_DB_URL: postgres://user:pass@postgres/ferrum
+      FERRUM_ADMIN_JWT_SECRET_FILE: /run/secrets/admin_jwt_secret
 secrets:
   admin_jwt_secret:
     external: true
 ```
+
+Docker mounts an external `admin_jwt_secret` at `/run/secrets/admin_jwt_secret`,
+but it does not populate `FERRUM_ADMIN_JWT_SECRET` from it. Point Ferrum at the
+mounted file with `FERRUM_ADMIN_JWT_SECRET_FILE`, which resolves the
+`FERRUM_ADMIN_JWT_SECRET` base key through the file secret backend. Do **not**
+also set `FERRUM_ADMIN_JWT_SECRET` directly: the startup secret resolver accepts
+only one source per base key and fails with a
+`Multiple secret sources configured` error when both the `_FILE` reference and
+the direct variable are present. In database mode the admin secret is required,
+so the `_FILE` wiring above is what actually supplies it.
 
 **Enable TLS**:
 ```bash

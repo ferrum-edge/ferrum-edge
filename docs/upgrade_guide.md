@@ -26,6 +26,161 @@ over production traffic.** File-mode config version bumps still use in-memory or
 `FERRUM_MODE=migrate` config migration; that is separate from the database
 baseline contract above.
 
+## Upgrading to the next release
+
+**Native HTTP/3 enforces HTTPRoute rule `timeouts` (#5646).** HTTP/3 no longer
+refuses a plain request routed under a rule carrying `timeouts.request` or
+`timeouts.backendRequest` with `503`: it serves the request under both bounds,
+exactly as HTTP/1.1 and HTTP/2 do, and a response body the deadline cuts is
+reset with `H3_REQUEST_CANCELLED`. HTTP/1.1 and HTTP/2 listeners advertise
+HTTP/3 (`Alt-Svc`) again on ports that serve such rules.
+
+**Operator action:** with `FERRUM_ENABLE_HTTP3=true`, clients that fell back to
+TCP while `Alt-Svc` was withheld switch back to HTTP/3 on those ports, so their
+UDP port must be reachable wherever the TCP port is. Size `request` and
+`backendRequest` for the longest response the rule serves: a longer response is
+now cut on HTTP/3 as it already was on HTTP/1.1 and HTTP/2. See
+[Rule timeouts](gateway_api_conformance.md#rule-timeouts).
+
+## Upgrading to 0.9.7
+
+v0.9.7 is the first published release after 0.9.5 (`v0.9.6` was tagged but
+never published). It adds Gateway API `ResponseHeaderModifier` and `URLRewrite`
+filters, plus HTTPRoute rule-level `timeouts` and `retry` (#5646). `timeouts.request` bounds
+the full request, including retries and the streaming response body;
+`timeouts.backendRequest` bounds each backend attempt until its full response
+has been received, with a fresh budget per retry attempt. Any response that
+takes longer than that budget to deliver is cut, including large fast downloads,
+Server-Sent Events, long polls, and server-streaming gRPC calls, so size
+`backendRequest` for the longest complete response the rule must serve, or omit
+it. Native HTTP/3 refuses non-gRPC requests governed by either timeout with
+`503` until it can enforce them, and the gateway does not advertise HTTP/3 on
+listener ports serving such rules. See
+[Rule timeouts](gateway_api_conformance.md#rule-timeouts) and
+[Rule retry](gateway_api_conformance.md#rule-retry).
+
+Run `ferrum-edge validate` with the production environment, `ferrum.conf`, and
+configuration before upgrading: several settings that were silently accepted or
+defaulted now refuse to start.
+
+**Configuration that now fails validation or startup**
+
+- **Health-check probe paths:** `active.http_path` must start with `/` (#5683).
+  A path such as `@169.254.169.254/` was spliced after `host:port` and sent the
+  probe to a different host. Prefix every configured path with `/`.
+- **Health-check UDP payloads:** `active.udp_probe_payload` must be an
+  even-length hex string (#5688). Invalid values previously probed with a
+  single zero byte; correct the hex or remove the field.
+- **Non-finite env values:** `NaN`, `inf`, and similar non-finite values in
+  floating-point `FERRUM_*` settings are rejected (#5684). A `NaN`
+  `FERRUM_OVERLOAD_*_THRESHOLD` previously passed validation and disabled load
+  shedding.
+- **Credential limit:** `FERRUM_MAX_CREDENTIALS_PER_TYPE=0` now fails startup
+  (#5689). Set a positive limit or remove the variable to use the default.
+- **Secret-fetch timeout and mesh DNS limits:**
+  `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` and the `FERRUM_MESH_DNS_*` limits no
+  longer fall back to defaults on malformed, zero, or out-of-range values
+  (#5699 / #5700). See
+  [Malformed secret-fetch timeout and mesh DNS limits refuse to start](#malformed-secret-fetch-timeout-and-mesh-dns-limits-refuse-to-start-issues-5699--5700).
+- **Mesh listeners:** inbound and outbound TCP listeners may not share a
+  nonzero port number, even on different addresses (#5595). Choose distinct
+  ports before restarting affected mesh deployments; UDP capture and port `0`
+  are excluded.
+- **Redis URLs:** database selectors must be canonical decimal integers from
+  `0` through `2147483647`, without signs, leading zeroes, or extra path
+  segments (#5518).
+- **mTLS CA bundles:** an `mtls_auth` `ca_certificate_pem` that also carries an
+  `ECHCONFIG` PEM block is now rejected (#5721 / #5723). Remove non-certificate
+  blocks from the bundle.
+
+**Behavior changes to plan for**
+
+- **Gateway API retry:** HTTPRoute rule `retry` (experimental channel) is now
+  accepted and enforced instead of refused (#5695). A route that relied on the
+  refusal now retries listed statuses for idempotent methods, spending the
+  rule's `timeouts.request` budget. GRPCRoute `retry` is still refused with
+  `UnsupportedValue`.
+- **Admin writes:** proxies, upstreams, consumers, and plugin configs now expose
+  strong `ETag` values on `GET` (#5659). Send the returned `If-Match` on `PUT`
+  or `DELETE` to reject stale drafts with `412`; requests without `If-Match`
+  retain their previous behavior. A malformed `If-Match`, or one sent to a
+  route that does not evaluate it, is now `400`. See
+  [Conditional writes](admin_api.md#conditional-writes-etag--if-match).
+  `GET /plugins/config` also accepts an optional `proxy_id` filter (#5726).
+- **MCP routes:** the single trailing-slash alias is no longer rewritten
+  (#5582). Set clients to the exact configured `endpoint.path`, or configure
+  that path with the slash clients use.
+- **Rate limiting:** `rate_limiting.redis_failure_policy` now defaults to
+  `local_fallback`, applying the configured quota independently in each pod
+  during Redis outages (#5519). Set `fail_closed` if centralized enforcement is
+  required. Redis-backed request quotas (`rate_limiting`, `graphql`, and
+  `grpc_method_router`) also require Redis `TIME` permission (`+time` or a
+  category that includes it). Their counter key layout changed (#5517), so
+  expect up to one window of reduced enforcement while new counters fill and
+  separate old/new counters during a rolling upgrade. `graphql` and
+  `grpc_method_router` `limit_by: consumer` keys are now tagged `consumer:` or
+  `ip:` (#5692), so their local and Redis counters also restart once.
+- **Replay caches:** `response_caching`, `request_deduplication`, and
+  `ai_semantic_cache` now bind the route's response-header transforms and the
+  route-override backend TLS and DNS policy into the replay key (#5709 / #5710,
+  PR #5718). Existing replay keys rotate once after upgrading, so expect a
+  transient drop in hit rate. See
+  [Retained-Response Replay Partition](#retained-response-replay-partition-breaking)
+  for the shared partition contract.
+- **HTTP/1 backend connection closes:** a request queued on a pooled HTTP/1.1
+  connection that the backend resets or closes at that moment no longer waits
+  for `backend_read_timeout_ms` and returns `504` (#5714 / #5719, #5720). A
+  reused connection is retried on a new one, and a fresh connection returns
+  `502` (`connection_pool_error`) at once. Alerts keyed on these `504`s will
+  see `502`s or successful retries instead. The fix ships in a vendored
+  hyper-util 0.1.20; see
+  [dependency-policy.md](dependency-policy.md) and the
+  [patch README](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md).
+- **TCP/TLS relays:** pending buffered writes are flushed before a relay parks
+  on its reader (#5588). With nonzero `backend_write_timeout_ms`, a TLS backend
+  whose pending write or half-close stalls can now hit the backend write
+  inactivity timeout. See
+  [TCP Backend Timeouts](tcp_udp_proxy.md#tcp-backend-timeouts).
+- **WAF scan budget:** `scan_budget_ms` no longer skips a body scan; the scan
+  always completes and an enforcing hit still rejects (#5528). The new opt-in
+  `on_scan_timeout: fail_closed` rejects over-budget bodies; measure the
+  `waf.scan_timed_out` rate before enabling it or `block`.
+- **HBONE inner reuse:** a mesh destination advertises inner-connection reuse
+  only when every admitting plugin declares itself reuse-safe (#5583). Custom
+  plugins refuse reuse by default, so chains that include them cost one
+  CONNECT per operation. See
+  [HBONE Inner Application Connection Reuse](mesh.md#hbone-inner-application-connection-reuse).
+- **Other plugin behavior:** `bot_detection` `allow_list` entries whose first or
+  last character is punctuation now match (#5685), and `spec_expose` responses
+  carry `Content-Security-Policy: default-src 'none'; sandbox` (#5686).
+- **Diagnostics:** startup and reload errors print the full cause chain and
+  withhold supplied configuration values (#5589 / #5591). PEM parse error
+  wording changed in admin TLS validation, the TLS inventory, ACME certificate
+  checks, and the managed TLS store (#5721 / #5723). Update tooling that matches
+  on exact error text.
+
+**Dependencies, databases, and library users**
+
+- **MongoDB driver:** `mongodb` moves from 3.6.0 to 3.8.2 and stays below 3.9,
+  keeping MongoDB 4.2 and Cosmos DB 4.2 support (#5721 / #5723). The optional
+  `secrets-aws` build no longer pulls hyper 0.14 or rustls 0.21, and
+  `rustls-pemfile` is replaced by the `rustls-pki-types` PEM API.
+- **Database initialization:** core SQL schema stays in `V001`; startup no
+  longer runs column/index repairs or namespace backfills, and MongoDB no longer
+  replaces conflicting indexes. Rebuild databases that predate the current
+  baseline with the
+  [build-out procedure](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb).
+  The external ClickHouse baseline is now `schemas/clickhouse/charges.sql`.
+- **Managed TLS store path:** an empty `FERRUM_TLS_MANAGED_STORE_PATH` now
+  counts as unset (#5706). Only the `ferrum-edge` binary defaults to
+  `./ferrum-managed-tls`; processes that link the library, including test
+  harnesses, use a private per-process temporary directory. Set the variable
+  explicitly if an embedding process relied on the checkout-relative default.
+- **Library API:** code that links the `ferrum-edge` crate must move to the new
+  load-balancer runtime-state API (#5693). See
+  [Load-balancer runtime-state library API](#load-balancer-runtime-state-library-api-issue-5693).
+  Gateway configuration, the Admin API, and metrics are unchanged.
+
 ## Upgrading to 0.9.5
 
 v0.9.5 is the first tagged release accepting resource `labels` on proxies,
@@ -292,15 +447,36 @@ response-header modification remains deferred; the earlier support claim in
 this guide was incorrect. This remains a documented conformance gap, including
 the GRPCRoute filter-type contract that lists response-header modification as Core.
 
+**Update (issue [#5646](https://github.com/ferrum-edge/ferrum-edge/issues/5646)):**
+rule-level `ResponseHeaderModifier` (HTTPRoute and GRPCRoute) and HTTPRoute
+`URLRewrite` are now translated and enforced, and HTTPRoute `rules[].timeouts`
+(`request`, `backendRequest`) and `rules[].retry` (experimental channel) are now
+enforced. GRPCRoute `timeouts` and `retry`, `RequestMirror`, `ExtensionRef`,
+`CORS`, `ExternalAuth` and backend-reference filters are still refused as
+described above. An HTTPRoute that carried `retry` and was previously refused
+is now accepted and retries the requests its rule matches. `backendRequest`
+bounds each attempt until its full response has been received (a fresh budget
+per retry attempt). **Any response that takes longer than that budget to
+deliver is cut** — not only a trickled body, but also a large fast download, a
+Server-Sent Events stream, a long poll, and a server-streaming gRPC call — so
+size `backendRequest` for the longest complete response the rule must serve,
+or omit it. The current admission contract, including the remaining refusals
+and the HTTP/3 `request`- and `backendRequest`-timeout limitations, is
+[`docs/gateway_api_conformance.md`](gateway_api_conformance.md).
+Native HTTP/3 enforcement of these timeouts lands after 0.9.7; see
+[Upgrading to the next release](#upgrading-to-the-next-release).
+
 ### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
 
 Auto-emitted `istio-vs-req-xform-*` / `istio-vs-resp-xform-*` consumers no
 longer shadow global `request_transformer` / `response_transformer` instances.
 Global static rules now run first, followed by the matched route rules. This
 changes existing Gateway API `HTTPRoute` deployments using
-`RequestHeaderModifier`; Gateway API `ResponseHeaderModifier` is not yet
-implemented and is rejected during translation. Newly supported Istio
-VirtualService header transforms follow the same composition contract.
+`RequestHeaderModifier`. Gateway API `ResponseHeaderModifier` was not yet
+implemented at that point; it is now (issue
+[#5646](https://github.com/ferrum-edge/ferrum-edge/issues/5646)) and follows the
+same composition contract, as do the supported Istio VirtualService header
+transforms.
 
 **Operator action:** audit HTTPRoute-backed proxies that relied on the former
 accidental suppression, then scope or remove global static transformer rules
@@ -418,6 +594,29 @@ TLS handshake offload is not implemented. A nonzero `FERRUM_TLS_OFFLOAD_THREADS`
 `FERRUM_GRPC_POOL_READY_WAIT_MS` was parsed, documented, and accepted by `run`/`validate`, but the gRPC pool selection path never read it. Ferrum uses an immediate `now_or_never` readiness probe when choosing among shard senders — there is no configurable wait, and reintroducing one would regress gRPC tail latency under burst concurrency.
 
 **Operator action:** remove `FERRUM_GRPC_POOL_READY_WAIT_MS` from your configuration; it never had a runtime effect. There is no replacement knob.
+
+### Malformed secret-fetch timeout and mesh DNS limits refuse to start (issues [#5699](https://github.com/ferrum-edge/ferrum-edge/issues/5699) / [#5700](https://github.com/ferrum-edge/ferrum-edge/issues/5700))
+
+These settings used to fall back silently when their value could not be used:
+
+- `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS=0` was accepted and made every external secret fetch that waited on I/O time out at once. A malformed or negative value, such as `30s` or `-1`, silently became the 30-second default.
+- `FERRUM_MESH_DNS_TTL_SECONDS`, `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` and `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` used their defaults (60, 1024, 4096) when the value was malformed or overflowed. The two capacity settings also ignored `0`.
+
+Each of these now fails `ferrum-edge run` and `ferrum-edge validate` with an error that names the variable and its accepted range. The value itself is not echoed. Accepted ranges are whole numbers from 1 to 600 seconds for the secret-fetch timeout, 0 to 86400 seconds for the mesh DNS TTL, 1 to 16384 for mesh DNS concurrency, and 1 to 262144 for the per-slice mesh DNS response cache. Unset variables keep their defaults.
+
+The secret-fetch timeout is checked at startup secret resolution, which reads only the process environment. It is checked again when settings load, which also reads `ferrum.conf`, and on each later runtime fetch. A bad value in either place stops startup.
+
+**Operator action:** run `ferrum-edge validate` with the production environment and `ferrum.conf` before upgrading. Correct any value it reports, or remove the variable to use its default.
+
+### Load-balancer runtime-state library API (issue [#5693](https://github.com/ferrum-edge/ferrum-edge/issues/5693))
+
+This only affects code that links the `ferrum-edge` library, such as custom plugins or embedding crates. Gateway configuration, the Admin API and metrics are unchanged, apart from the fix itself: least-connections counts and least-latency averages now survive service-discovery and upstream updates for targets that remain.
+
+The public `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and `LoadBalancer::latency_sample_count` `DashMap` fields are removed, along with `LoadBalancerCache::record_connection_start` / `record_connection_end`.
+
+**Operator action:** none for gateway deployments. Library users read per-target state through `LoadBalancer::target_runtime_state(&target)` (`active_connections()`, `latency_ewma_us()`, `latency_sample_count()`), and count a connection with `LoadBalancer::lease_connection(&target)`, whose lease releases on drop, instead of pairing `record_connection_start` and `record_connection_end` by hand.
+
+`LoadBalancer::record_connection_start` and `LoadBalancer::record_connection_end` remain, but they must now be strictly paired: every start needs exactly one end, on the same balancer, on every exit path. A rebuild no longer resets a leaked count, so a missed end keeps the target looking busier than it is to least-connections, and to the per-target connection metrics, until the target leaves the upstream.
 
 ## Database Mode (`FERRUM_MODE=database`)
 ## Build-Out Database Upgrade (PostgreSQL, MySQL, SQLite, MongoDB)

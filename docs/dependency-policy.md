@@ -76,6 +76,7 @@ surface drifts.
 | `tungstenite-004-fragment-accounting` | `tungstenite` | 0.29.0 | `FragmentMeter` + `max_incomplete_message_frames` / `max_incomplete_message_duration` (physical-fragment accounting and bounds) | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | The reader only sees reassembled messages, so fragmented (including zero-length continuation) frames bypass per-message admission policy and are unbounded in count and duration | Upstream ships an equivalent pre-reassembly fragment hook **and** independent incomplete-message count/duration bounds | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
 | `tokio-tungstenite-004-fragment-accounting-delegator` | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::set_fragment_accounting()` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Same accounting gap on the async wrapper, which hides the codec behind `SplitStream` after `split()` | Upstream ships the equivalent delegator alongside the tungstenite hook | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
 | `dimpl-001-certificate-chain-and-key-zeroization` | `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
+| `hyper-util-001-release-h1-sender-on-dispatch-close` | `hyper-util` | 0.1.20 | Legacy client releases an HTTP/1 connection's only request sender once its dispatcher stops reading, so a request stranded by a close during enqueue fails as unsent | **Deliberate fork** — no upstream PR; upstream issue [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) (hyper-util has issues disabled; filed on hyper, where the stranding dispatcher lives) ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | tokio's unbounded `send` checks for closure and publishes in two steps; a backend RST/FIN on the pooled connection between them strands the request in a channel nobody reads, and hyper-util holds the last sender, so reqwest's `send()` hung until `backend_read_timeout_ms` (504) instead of failing fast (#5714) | A hyper-util release stops holding the only HTTP/1 sender after its dispatcher closes, or a hyper release stops stranding a racing send | [docs/upstream-hyper-util-patches/001-…](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md) |
 
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/vendored-patch-lifecycle.json`,
 > `docs/upstream-*-patches/`, and the vendored-patch scripts are owned via
@@ -86,8 +87,9 @@ surface drifts.
 > records a published `fork_ref` for its filed upstream PR. Patches carried
 > without an upstream PR, including the tungstenite frame
 > error-origin and stray-continuation ordering extensions, the tungstenite `auto_pong` opt-out, the tungstenite /
-> tokio-tungstenite fragment-accounting extension, and the dimpl
-> credential-security patch, are governed by the
+> tokio-tungstenite fragment-accounting extension, the dimpl
+> credential-security patch, and the hyper-util HTTP/1 sender release, are
+> governed by the
 > [Deliberate fork policy and SLA](#deliberate-fork-policy-and-sla) below.
 
 ### Deliberate fork policy and SLA
@@ -102,8 +104,10 @@ merges. Fork-only patches currently include **h3 002** (Extended CONNECT
 unfiled with `fork_ref: null` pending maintainer handoff — plus the tungstenite
 frame-limit origin and stray-continuation ordering extensions, **tungstenite `auto_pong`** (transparent Ping
 relay), **tungstenite / tokio-tungstenite 004** (fragment accounting and
-incomplete-message bounds), and **dimpl 001** (DTLS certificate chains and private-key
-zeroization). They are not untracked TODOs; they are carried as
+incomplete-message bounds), **dimpl 001** (DTLS certificate chains and private-key
+zeroization), and **hyper-util 001** (release a closed HTTP/1 sender; upstream
+issue [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202), no
+upstream PR yet). They are not untracked TODOs; they are carried as
 **deliberate, time-boxed forks** and are governed as follows:
 
 - **Owner.** The dependency-governance owner in
@@ -162,6 +166,20 @@ members are `publish = false`, so `[licenses] private = { ignore = true }`
 already covers their PolyForm-Noncommercial first-party licenses. Do not add an
 `ebpf/deny.toml`: a second config would let the two policies diverge.
 
+Both lanes also run an **advisories-only** pass over every standalone Cargo
+workspace (`fuzz/`, `tests/performance/**`, and any crate added later), each of
+which resolves its own committed `Cargo.lock` that neither check above can see
+(issues #5704, #5708). The manifest list comes from
+`.github/scripts/standalone_cargo_manifests.py`, the same inventory the ci.yml
+`standalone-cargo` fmt/check gate uses, so a new standalone crate is audited
+without editing either workflow. These harnesses never ship, so the license and
+ban policy is not applied to them; a vulnerable, unsound, or yanked version in
+one of their lockfiles is still blocking. The weekly workflow additionally runs
+the informational `cargo audit --file <lockfile>` over each of them. Refresh a
+standalone lockfile with a targeted
+`cargo update --manifest-path <manifest> -p <crate>@<locked-version>` so the
+benchmark inputs stay otherwise stable.
+
 Run locally:
 
 ```bash
@@ -169,6 +187,10 @@ cargo install --locked cargo-deny
 cargo deny check advisories bans sources licenses   # the gate (root workspace)
 cargo deny --manifest-path ebpf/Cargo.toml \
     check --allow advisory-not-detected --config deny.toml advisories bans sources licenses          # the gate (eBPF workspace)
+for manifest in $(python3 .github/scripts/standalone_cargo_manifests.py); do
+  cargo deny --manifest-path "$manifest" \
+    check --allow advisory-not-detected --config deny.toml advisories   # standalone workspaces
+done
 ```
 
 ### 2. Advisory exceptions are time-boxed
@@ -181,10 +203,25 @@ comment-only token, both of which would dodge the time-box — so an exception
 cannot silently become permanent. A maintainer must re-fix the advisory or
 consciously extend the window.
 
-Current exceptions are all transitive and either no-fix-available or semver-pinned
-by a transitive parent (e.g. `mongodb` pins `hickory ^0.25`; the old AWS SDK
-chain pins `rustls-webpki ^0.101.7`, only present under the optional `secrets-aws`
-feature). Each entry documents the confinement and the upstream we are waiting on.
+Each entry documents the confinement and the upstream it is waiting on. A
+re-review checks the latest upstream release of the crate and of every parent
+that pulls it in, and either retires the entry (bump, feature change, or
+migration) or re-affirms it with dated evidence and a new time box.
+
+#### Advisory exception register
+
+Last full re-evaluation: 2026-09-24 (issue #5721). Latest upstream versions
+below were checked against crates.io and the RustSec advisory database on that
+date.
+
+| Advisory | Crate | Disposition | Evidence / tracking |
+|---|---|---|---|
+| RUSTSEC-2023-0071 | `rsa` 0.9.10 (Marvin timing side-channel) | **Re-affirmed** until 2026-12-31 | No fixed release: RustSec `patched = []`; 0.9.10 is the latest stable and 0.10.0-rc.18 (required by sqlx 0.9.0) is still affected. Reached via `sqlx-mysql` (public-key OAEP encryption of the MySQL password only, no private-key operation) and via jsonwebtoken's `rust_crypto` backend in the default `crypto-ring` profile, where RSA *signing* of outbound client assertions (`private_key_jwt` in `oidc_relying_party` / `oauth2_introspection`, `ai_federation` service-account JWTs) runs on the non-constant-time code. For `oidc_relying_party` / `oauth2_introspection`, EC/EdDSA assertion keys or the `fips` profile (`aws_lc_rs`) avoid it. `ai_federation` always signs RS256 (GCP service-account keys are RSA), so only the `fips` profile avoids it there. Retire when `rsa` ships a fix. |
+| RUSTSEC-2024-0436 | `paste` 1.0.15 (unmaintained) | **Re-affirmed** until 2026-12-31 | Proc-macro only; no runtime surface. `tikv-jemalloc-ctl` still depends on `paste ^1` in its latest 0.7.0, and the test matrix macro (`tests/scaffolding/matrix.rs`) uses it as a dev-dependency. Retire when `tikv-jemalloc-ctl` drops it. |
+| RUSTSEC-2026-0118, RUSTSEC-2026-0119 | `hickory-proto` 0.25.2 | **Retired** | Only `mongodb` < 3.7 pulled hickory 0.25. `mongodb` 3.7.0 moved to hickory 0.26; `Cargo.toml` now requires `>=3.7, <3.9` and the lockfile resolves 3.8.2. The cap keeps MongoDB 4.2 / Cosmos DB server-version-4.2 support: 3.9 raised the driver's minimum wire version to 9 (MongoDB 4.4). |
+| RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104 | `rustls-webpki` 0.101.7 | **Retired** | Came only from rustls 0.21 in the AWS SDK's legacy `rustls` connector (`aws-smithy-runtime/tls-rustls`). `aws-sdk-secretsmanager` is now built with `default-features = false` and `default-https-client` + `rt-tokio`, the hyper 1.x / rustls 0.23 client that `aws_config::load_defaults` already selected. |
+| RUSTSEC-2026-0258 | `h2` 0.3.27 | **Retired** | Same legacy AWS connector (hyper 0.14). The gateway's own h2 0.4.x stays on the patched release. |
+| RUSTSEC-2025-0134 | `rustls-pemfile` 2.2.0 (unmaintained) | **Retired** | PEM parsing uses the `rustls-pki-types` `PemObject` API (`CertificateDer::pem_slice_iter`, `PrivateKeyDer::from_pem_slice`, `CertificateRevocationListDer::pem_slice_iter`), the code `rustls-pemfile` 2.2 already wrapped. `crate::tls::first_pem_private_key` keeps the old `Result<Option<_>>` contract where callers distinguish "no key" from "malformed". The standalone `tests/performance/**` harnesses were migrated the same way and their lockfiles refreshed. |
 
 ### 3. License allowlist and exceptions
 
@@ -352,6 +389,18 @@ of the vendor copy and must keep passing after retirement:
   failed-construction, fallback, and shutdown zeroization observations. The
   Ferrum integration suite separately verifies a root-only client completes a
   handshake because the configured intermediate is transmitted.
+
+- An HTTP/1 request stranded by a connection close during enqueue fails as
+  unsent instead of hanging until `backend_read_timeout_ms` (issue #5714) — the
+  vendored hyper-util regressions
+  (`client::legacy::client::ferrum_release_on_close_tests`), run with
+  `cargo test --manifest-path vendor/hyper-util-0.1.20-ferrum-patched/Cargo.toml --features full --lib ferrum_release_on_close_tests`,
+  plus hyper-util's own `--test legacy_client` suite for ordinary keep-alive,
+  reuse, and close behavior through the patched send path. The race sits
+  between two instructions inside tokio's `send`, so the regressions build the
+  state it leaves behind rather than scheduling it. The `pooled_http1` tests in
+  that module run the step `Client::try_send_request` takes after queuing a
+  request (`await_pooled_response`) against a real pooled HTTP/1 connection.
 
 CI gates these vendored-patch contracts in the `Vendored Patch Regressions`
 job in `.github/workflows/ci.yml`. Keep that job in sync with this list when
@@ -576,6 +625,29 @@ When reviewing an actions Dependabot PR:
    to.
 3. Do not accept a PR that reintroduces a mutable tag ref.
 
+Dependabot version updates are ignored for the external actions whose exact
+invocations are covered by the trusted Cross build and CI runtime-cache
+contracts: `actions/cache/restore`, `actions/cache/save`,
+`actions/checkout`, `actions/download-artifact`, `actions/setup-python`,
+`actions/upload-artifact`, `docker/build-push-action`, `docker/login-action`,
+`docker/setup-buildx-action`, `dtolnay/rust-toolchain`, `Swatinem/rust-cache`,
+and `taiki-e/install-action`. A SHA or version-comment change in these frozen
+jobs can fail the trusted checks on `main`, while `CI Plan` intentionally
+rejects direct edits to the frozen policy scripts. The `ignore` entries suppress
+version-update PRs; Dependabot security updates remain allowed.
+
+#### Rotating frozen actions
+
+Schedule a periodic review of the ignored actions for upstream releases and
+security fixes. When an update is due, prepare one coordinated rotation PR,
+modeled on [#5675](https://github.com/ferrum-edge/ferrum-edge/pull/5675): update
+the affected workflow pins and version comments, the corresponding trusted
+contracts, and the action pin records in this document together. The PR is
+expected to fail `CI Plan` and trusted checks that use policy from `main`; this
+is by design. A maintainer override is needed after `Candidate policy
+self-test` and the CI aggregate wiring check pass. Do not land a partial action
+bump and defer the contract update.
+
 The setup-python v7.0.0 pin (`5fda3b95…`) now covers every use, including the
 previously frozen compiler-store `produce` and platform-study `study` jobs.
 Those two jobs were rotated in a coordinated trusted-policy update because their
@@ -595,16 +667,18 @@ request cannot normalize those comments. Correct them only as part of an
 authorized, coordinated rotation of the trusted policy; do not copy the legacy
 annotation onto new uses.
 
-The install-action v2.87.11 pin (`9534c846…`) now covers `ci.yml`,
+The install-action v2.87.15 pin (`4076c08d…`) covers `ci.yml`,
 `dependency-audit.yml`, the coverage workflow, and the ARM64 release producer.
-The previously frozen coverage and `build-release-arm64-cross` uses were
-rotated in the same trusted-policy update, and `WORKFLOW_CONTRACTS` job digests
-for `main-linux-image` and `build-release-arm64-cross` were recomputed over the
-resulting text (the Linux CI image job also moved onto the current distroless
-digest). The v2.87.11 action retains the composite runtime, checksum verification
-default, and existing `tool`/`fallback` inputs. Dependabot updates that retarget
-already-rotated uses can land via ordinary PR; a SHA change inside a Cross-frozen
-job still requires a coordinated trusted-policy rotation.
+The release producer's `WORKFLOW_CONTRACTS` job digest was rotated with the pin;
+the action retains the existing `tool`/`fallback` inputs.
+
+The docker/setup-buildx-action v4.4.1 pin (`f87e5991…`) and
+docker/build-push-action v7.4.0 pin (`c3c9e263…`) cover the release publication
+jobs and the image build workflows. The trusted ARM64 publication exact-job,
+step, and artifact-selection contracts, along with the NodeWaypoint and Ambient
+registry-cache jobs and the CI runtime-cache pin checks, were rotated to those
+same SHAs. Future SHA changes inside a frozen job require a coordinated
+trusted-policy rotation even when the action inputs stay the same.
 
 #### Scope of the repository-script (automation) freeze
 
@@ -810,6 +884,7 @@ covers, so it must not be replaced with a prebuilt artifact.
 - `deny.toml` — the gate configuration and current exceptions.
 - `SECURITY.md` — vulnerability reporting and severity timelines.
 - `docs/upstream-reqwest-patches/`, `docs/upstream-h3-patches/`,
-  `docs/upstream-tungstenite-patches/`, `docs/upstream-dimpl-patches/` —
+  `docs/upstream-tungstenite-patches/`, `docs/upstream-dimpl-patches/`,
+  `docs/upstream-hyper-util-patches/` —
   per-patch detail and retirement plans.
 - `Cargo.toml` `[patch.crates-io]` — the active vendored patches.

@@ -2614,16 +2614,37 @@ fn unsupported_http_and_grpc_route_features_are_refused_before_materialization()
     });
     let unsupported = [
         (
-            json!({"filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-secret"]}}]}),
-            "IncompatibleFilters",
-        ),
-        (
-            json!({"filters": [{"type": "URLRewrite", "urlRewrite": {"hostname": "rewritten.test"}}]}),
-            "IncompatibleFilters",
-        ),
-        (
             json!({"filters": [{"type": "ExtensionRef", "extensionRef": {"group": "example.test", "kind": "Filter", "name": "missing"}}]}),
             "IncompatibleFilters",
+        ),
+        (
+            json!({"filters": [{"type": "CORS", "cors": {"allowOrigins": [{"exact": "https://example.test"}]}}]}),
+            "IncompatibleFilters",
+        ),
+        // A repeated at-most-once filter is a conflicting declaration, not a
+        // stackable one.
+        (
+            json!({"filters": [
+                {"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-one"]}},
+                {"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-two"]}},
+            ]}),
+            "IncompatibleFilters",
+        ),
+        // Ferrum strips protocol-managed response headers by design; a route
+        // filter may not put one back.
+        (
+            json!({"filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                "set": [{"name": "Transfer-Encoding", "value": "chunked"}]
+            }}]}),
+            "UnsupportedValue",
+        ),
+        // A Trailers-Only gRPC error carries its status in the response
+        // headers, so a route filter may not rewrite or strip it.
+        (
+            json!({"filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                "remove": ["grpc-status"]
+            }}]}),
+            "UnsupportedValue",
         ),
         (
             json!({"filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "mirror", "port": 8080}}}]}),
@@ -2633,8 +2654,6 @@ fn unsupported_http_and_grpc_route_features_are_refused_before_materialization()
             json!({"backendRefs": [{"name": "api", "port": 8080, "filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {"remove": ["x-secret"]}}]}]}),
             "IncompatibleFilters",
         ),
-        (json!({"timeouts": {"request": "1s"}}), "UnsupportedValue"),
-        (json!({"retry": {"attempts": 2}}), "UnsupportedValue"),
         (
             json!({"futureRuleAction": {"enabled": true}}),
             "UnsupportedValue",
@@ -2652,8 +2671,74 @@ fn unsupported_http_and_grpc_route_features_are_refused_before_materialization()
             "IncompatibleFilters",
         ),
     ];
+    // `URLRewrite` and `RequestRedirect` are HTTPRoute-only upstream, so a
+    // GRPCRoute asking for either keeps the fail-closed refusal. So does a
+    // GRPCRoute rule carrying `timeouts` or `retry`, fields only HTTPRoute
+    // defines.
+    let grpc_only_unsupported = [
+        (
+            json!({"filters": [{"type": "URLRewrite", "urlRewrite": {"hostname": "rewritten.test"}}]}),
+            "IncompatibleFilters",
+        ),
+        (
+            json!({"filters": [{"type": "RequestRedirect", "requestRedirect": {"statusCode": 302}}]}),
+            "IncompatibleFilters",
+        ),
+        (json!({"timeouts": {"request": "1s"}}), "UnsupportedValue"),
+        (json!({"retry": {"attempts": 2}}), "UnsupportedValue"),
+    ];
+    // An HTTPRoute may use either, but never both in one rule: a redirect
+    // answers the request itself, so the rewrite could never be honored. Its
+    // `timeouts` are validated exactly as the pinned CRD does: a value outside
+    // the GEP-2257 duration grammar and a `backendRequest` longer than a
+    // non-zero `request` (the CRD's CEL rule) are malformed (`Invalid`); a
+    // sub-field the CRD does not define is `UnsupportedValue`. Its `retry`
+    // (experimental channel) likewise: a wrong type, a code outside 400-599 or
+    // a backoff outside the duration grammar is `Invalid`; a CRD-valid
+    // `attempts` or `backoff` beyond what Ferrum honors, or an undefined
+    // sub-field, is `UnsupportedValue`.
+    let http_only_unsupported = [
+        (
+            json!({"filters": [
+                {"type": "URLRewrite", "urlRewrite": {"hostname": "rewritten.test"}},
+                {"type": "RequestRedirect", "requestRedirect": {"statusCode": 302}},
+            ]}),
+            "IncompatibleFilters",
+        ),
+        (json!({"timeouts": {"request": "1x"}}), "Invalid"),
+        (json!({"timeouts": {"request": "500"}}), "Invalid"),
+        (json!({"timeouts": {"request": "123456s"}}), "Invalid"),
+        (json!({"timeouts": {"request": "1s1s1s1s1s"}}), "Invalid"),
+        (json!({"timeouts": {"backendRequest": 5}}), "Invalid"),
+        (json!({"timeouts": "1s"}), "Invalid"),
+        (
+            json!({"timeouts": {"request": "1s", "backendRequest": "1500ms"}}),
+            "Invalid",
+        ),
+        (json!({"timeouts": {"idle": "1s"}}), "UnsupportedValue"),
+        (json!({"retry": "2"}), "Invalid"),
+        (json!({"retry": {"codes": [399]}}), "Invalid"),
+        (json!({"retry": {"codes": [503, "504"]}}), "Invalid"),
+        (json!({"retry": {"attempts": "2"}}), "Invalid"),
+        (json!({"retry": {"backoff": "1x"}}), "Invalid"),
+        (json!({"retry": {"attempts": -1}}), "UnsupportedValue"),
+        (json!({"retry": {"attempts": 101}}), "UnsupportedValue"),
+        (json!({"retry": {"backoff": "6m"}}), "UnsupportedValue"),
+        (
+            json!({"retry": {"attempts": 2, "perTryTimeout": "1s"}}),
+            "UnsupportedValue",
+        ),
+    ];
     for kind in ["HTTPRoute", "GRPCRoute"] {
-        for (case_index, (patch, reason)) in unsupported.iter().enumerate() {
+        let kind_cases: Vec<_> = unsupported
+            .iter()
+            .chain(if kind == "GRPCRoute" {
+                grpc_only_unsupported.iter()
+            } else {
+                http_only_unsupported.iter()
+            })
+            .collect();
+        for (case_index, (patch, reason)) in kind_cases.iter().enumerate() {
             let mut bad_rule = supported_rule.clone();
             bad_rule
                 .as_object_mut()
@@ -2819,7 +2904,7 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
         .as_array_mut()
         .unwrap()
         .push(json!({
-            "type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-secret"]}
+            "type": "RequestMirror", "requestMirror": {"backendRef": {"name": "mirror", "port": 8080}}
         }));
     let objects = vec![
         gateway_class(),
@@ -2907,4 +2992,2670 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
         1,
         "rejected route must not reach backend"
     );
+}
+
+/// Shared fixture for the rule-filter data-plane tests: a `Service` +
+/// `EndpointSlice` pair pointing at a locally spawned backend, plus the
+/// `GatewayClass`/`Gateway` the routes attach to.
+fn route_filter_cluster_objects(
+    backend_port: u16,
+) -> Vec<ferrum_edge::config_sources::k8s::K8sObject> {
+    let service = object(
+        "v1",
+        "Service",
+        "api",
+        "default",
+        json!({
+            "clusterIP": "10.96.0.11",
+            "ports": [{"name": "http", "port": 8080, "targetPort": backend_port}]
+        }),
+    );
+    let mut endpoints = object(
+        "discovery.k8s.io/v1",
+        "EndpointSlice",
+        "api-manual",
+        "default",
+        json!({
+            "addressType": "IPv4",
+            "ports": [{"name": "http", "port": backend_port}],
+            "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
+        }),
+    );
+    endpoints
+        .metadata
+        .labels
+        .insert("kubernetes.io/service-name".to_string(), "api".to_string());
+    vec![
+        gateway_class(),
+        cross_kind_gateway(json!([{"name": "web", "port": 80, "protocol": "HTTP"}])),
+        service,
+        endpoints,
+    ]
+}
+
+/// Translate `route` and hand the result to a running gateway.
+///
+/// The harness owns an ephemeral listener instead of binding Gateway port 80,
+/// so every generated proxy's `listen_port` is cleared; everything else —
+/// routes, destinations, dispatch rules and generated plugins — is exactly what
+/// the translator produced.
+async fn spawn_translated_route_gateway(
+    objects: &[ferrum_edge::config_sources::k8s::K8sObject],
+    extra_plugins: Vec<ferrum_edge::config::types::PluginConfig>,
+) -> crate::scaffolding::harness::GatewayHarness {
+    spawn_translated_route_gateway_with(objects, extra_plugins, |_| {}).await
+}
+
+/// [`spawn_translated_route_gateway`] with a hook that edits the translated
+/// config before it is served — for operator policy the translated route does
+/// not carry (for example a proxy-scoped retry policy or circuit breaker).
+async fn spawn_translated_route_gateway_with(
+    objects: &[ferrum_edge::config_sources::k8s::K8sObject],
+    extra_plugins: Vec<ferrum_edge::config::types::PluginConfig>,
+    edit: impl FnOnce(&mut ferrum_edge::config::types::GatewayConfig),
+) -> crate::scaffolding::harness::GatewayHarness {
+    use crate::scaffolding::harness::GatewayHarness;
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+
+    let opts = options().with_pod_discovery_enabled(true);
+    let (mut translation, skipped) =
+        translate_k8s_objects_collecting_skips(objects, opts.clone()).expect("translate route");
+    assert!(skipped.is_empty(), "route must be accepted: {skipped:?}");
+    let updates = plan_gateway_api_status_updates(objects, opts, &translation.route_conflicts);
+    for update in updates
+        .iter()
+        .filter(|update| matches!(update.kind.as_str(), "HTTPRoute" | "GRPCRoute"))
+    {
+        assert_eq!(
+            accepted_condition(update)["status"],
+            "True",
+            "{}/{} must be Accepted: {update:?}",
+            update.kind,
+            update.name
+        );
+    }
+    // Every emitted plugin must construct, or an "Accepted" route would carry
+    // configuration no data plane can load.
+    for plugin in &translation.config.plugin_configs {
+        ferrum_edge::plugins::validate_plugin_config(&plugin.plugin_name, &plugin.config)
+            .unwrap_or_else(|error| panic!("{}: {error}", plugin.plugin_name));
+    }
+    for proxy in &mut translation.config.proxies {
+        proxy.listen_port = None;
+    }
+    translation.config.plugin_configs.extend(extra_plugins);
+    edit(&mut translation.config);
+    translation.config.version = ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string();
+    let yaml = serde_yaml::to_string(&translation.config).expect("serialize translated config");
+    GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .env("FERRUM_NAMESPACE", "default")
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("start translated gateway")
+}
+
+fn global_response_transformer(
+    rules: serde_json::Value,
+) -> ferrum_edge::config::types::PluginConfig {
+    use ferrum_edge::config::types::{PluginConfig, PluginScope};
+    let now = chrono::Utc::now();
+    PluginConfig {
+        labels: Default::default(),
+        id: "operator-global-response-transformer".to_string(),
+        plugin_name: "response_transformer".to_string(),
+        namespace: "default".to_string(),
+        config: json!({ "rules": rules }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// `ResponseHeaderModifier` must reach the CLIENT through the real data plane,
+/// apply only to the rule that declared it, and compose with — not suppress —
+/// an operator's global `response_transformer`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_response_header_modifier_reaches_the_client_through_the_data_plane() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+    use crate::scaffolding::ports::reserve_port;
+    use std::time::Duration;
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "x-set".into(),
+            value: "origin".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "x-remove".into(),
+            value: "leaked".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "x-appended".into(),
+            value: "origin".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "headers",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["headers.test"],
+            "rules": [
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/modified"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                        "set": [{"name": "x-set", "value": "route"}],
+                        "add": [
+                            {"name": "x-added", "value": "route"},
+                            {"name": "x-appended", "value": "route"}
+                        ],
+                        "remove": ["x-remove"]
+                    }}]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/plain"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                },
+                // No backendRefs and no RequestRedirect: upstream requires a
+                // 500, not a forward to an unresolvable backend.
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/nobackend"}}],
+                    "filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                        "set": [{"name": "x-set", "value": "route"}]
+                    }}]
+                }
+            ]
+        }),
+    ));
+
+    // An operator's global response transformer must keep running its own
+    // static rules; the route filter is applied last and wins on a shared name.
+    let global = global_response_transformer(json!([
+        {"operation": "add", "target": "header", "key": "x-global", "value": "on"},
+        {"operation": "update", "target": "header", "key": "x-set", "value": "global"}
+    ]));
+    let harness = spawn_translated_route_gateway(&objects, vec![global]).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("client");
+
+    let modified = client
+        .get(harness.proxy_url("/modified/thing"))
+        .header("host", "headers.test")
+        .send()
+        .await
+        .expect("filtered route response");
+    assert_eq!(modified.status(), reqwest::StatusCode::OK);
+    let headers = modified.headers().clone();
+    assert_eq!(headers.get("x-set").unwrap(), "route", "set must overwrite");
+    assert_eq!(headers.get("x-added").unwrap(), "route", "add must apply");
+    assert_eq!(
+        headers.get("x-appended").unwrap(),
+        "origin,route",
+        "add must append to a header the backend already sent, not replace it"
+    );
+    assert!(headers.get("x-remove").is_none(), "remove must apply");
+    assert_eq!(
+        headers.get("x-global").unwrap(),
+        "on",
+        "a route filter must not suppress the global transformer"
+    );
+    assert_eq!(modified.text().await.unwrap(), "pong");
+
+    // The sibling rule declared no filter and must observe the backend's own
+    // headers, with only the global transformer applied.
+    let plain = client
+        .get(harness.proxy_url("/plain/thing"))
+        .header("host", "headers.test")
+        .send()
+        .await
+        .expect("sibling route response");
+    assert_eq!(plain.status(), reqwest::StatusCode::OK);
+    let headers = plain.headers().clone();
+    assert_eq!(
+        headers.get("x-set").unwrap(),
+        "global",
+        "the sibling rule must not inherit the route filter"
+    );
+    assert!(headers.get("x-added").is_none());
+    assert_eq!(headers.get("x-appended").unwrap(), "origin");
+    assert_eq!(headers.get("x-remove").unwrap(), "leaked");
+    assert_eq!(headers.get("x-global").unwrap(), "on");
+
+    let backendless = client
+        .get(harness.proxy_url("/nobackend/thing"))
+        .header("host", "headers.test")
+        .send()
+        .await
+        .expect("backendless rule response");
+    assert_eq!(
+        backendless.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "a filter-only rule with no backendRefs must answer 500"
+    );
+
+    backend.assert_no_matcher_mismatches().await;
+    assert_eq!(
+        backend.received_requests().await.len(),
+        2,
+        "the backendless rule must never reach a backend"
+    );
+}
+
+/// `URLRewrite` must change what the BACKEND observes — path, preserved query
+/// and authority — for the rule that declared it and for no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_url_rewrite_reaches_the_backend_through_the_data_plane() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+    use crate::scaffolding::ports::reserve_port;
+    use std::time::Duration;
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "rewrites",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["rewrite.test"],
+            "rules": [
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": [{"type": "URLRewrite", "urlRewrite": {
+                        "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/v2"}
+                    }}]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/full"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": [{"type": "URLRewrite", "urlRewrite": {
+                        "hostname": "internal.example.test",
+                        "path": {"type": "ReplaceFullPath", "replaceFullPath": "/one"}
+                    }}]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/plain"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }
+            ]
+        }),
+    ));
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("client");
+    for path in ["/api/users?q=1", "/full/deep/path", "/plain/thing"] {
+        let response = client
+            .get(harness.proxy_url(path))
+            .header("host", "rewrite.test")
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+    }
+
+    backend.assert_no_matcher_mismatches().await;
+    let observed = backend.received_requests().await;
+    let seen: Vec<(String, String)> = observed
+        .iter()
+        .map(|request| {
+            (
+                request.path.clone(),
+                request.header("host").unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            // ReplacePrefixMatch replaces the matched prefix and keeps the
+            // untouched suffix and query string.
+            ("/v2/users?q=1".to_string(), "rewrite.test".to_string()),
+            // ReplaceFullPath discards the whole path; hostname rebases the
+            // backend-facing authority.
+            ("/one".to_string(), "internal.example.test".to_string()),
+            // The sibling rule declared no rewrite.
+            ("/plain/thing".to_string(), "rewrite.test".to_string()),
+        ]
+    );
+}
+
+/// A GRPCRoute `ResponseHeaderModifier` must reach the client as response
+/// metadata over a real gRPC call, preserving the message and the terminal
+/// `grpc-status`.
+///
+/// It also pins the cost operators must know about: a rule-level response-header
+/// policy governs the response TRAILERS of the requests it applies to (a route
+/// override can name any field at request time), so that rule's non-reserved
+/// backend trailers are governed away. The filter does not modify trailers — it
+/// suppresses them. The sibling rule on the same route, which declares no
+/// filter, keeps its application trailers, which is what proves the drop comes
+/// from attaching the policy rather than from gRPC translation. The merged-proxy
+/// variant of that guarantee is
+/// `merged_grpc_route_sibling_without_response_header_modifier_keeps_trailers`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_route_response_header_modifier_reaches_the_client_and_preserves_status() {
+    use crate::scaffolding::backends::grpc::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+    use crate::scaffolding::clients::grpc::GrpcClient;
+    use crate::scaffolding::ports::reserve_port;
+    use bytes::Bytes;
+
+    let rpc_script = || {
+        vec![
+            GrpcStep::AcceptRpc(MatchRpc::any()),
+            GrpcStep::SendInitialHeadersOverride(vec![
+                ("content-type", "application/grpc".to_string()),
+                ("x-set", "origin".to_string()),
+                ("x-remove", "leaked".to_string()),
+            ]),
+            GrpcStep::RespondMessage(Bytes::from_static(b"pong")),
+            GrpcStep::RespondStatusWithTrailers {
+                code: 0,
+                message: "",
+                trailers: vec![("x-trailer", "kept".to_string())],
+            },
+        ]
+    };
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .steps(rpc_script())
+        .steps(rpc_script())
+        .spawn()
+        .expect("spawn grpc backend");
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "GRPCRoute",
+        "metadata",
+        "default",
+        json!({
+            // No `hostnames`: the h2c client's `:authority` is the harness's
+            // ephemeral loopback address, and an added `host` header that
+            // disagreed with it would be refused by protocol validation before
+            // routing ever ran.
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [
+                {
+                    "matches": [{"method": {"service": "echo.Echo", "method": "Filtered"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                        "set": [{"name": "x-set", "value": "route"}],
+                        "add": [{"name": "x-added", "value": "route"}],
+                        "remove": ["x-remove"]
+                    }}]
+                },
+                {
+                    "matches": [{"method": {"service": "echo.Echo", "method": "Plain"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }
+            ]
+        }),
+    ));
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let target = harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .to_string();
+    let client = GrpcClient::h2c(target);
+
+    let filtered = client
+        .unary("/echo.Echo/Filtered", Bytes::from_static(b"ping"))
+        .await
+        .expect("filtered grpc call");
+    assert_eq!(filtered.http_status, 200);
+    assert_eq!(
+        filtered.headers.get("x-set").unwrap(),
+        "route",
+        "set must overwrite gRPC response metadata"
+    );
+    assert_eq!(filtered.headers.get("x-added").unwrap(), "route");
+    assert!(
+        filtered.headers.get("x-remove").is_none(),
+        "remove must apply to the initial metadata"
+    );
+    assert_eq!(filtered.grpc_status(), Some(0), "status must be preserved");
+    assert_eq!(
+        filtered.messages,
+        vec![Bytes::from_static(b"pong")],
+        "the message must be preserved"
+    );
+    let trailers = filtered.trailers.as_ref().expect("terminal trailers");
+    assert!(
+        trailers.get("x-trailer").is_none(),
+        "a response-header policy governs this rule's non-reserved trailers away: {trailers:?}"
+    );
+
+    let plain = client
+        .unary("/echo.Echo/Plain", Bytes::from_static(b"ping"))
+        .await
+        .expect("unfiltered grpc call");
+    assert_eq!(plain.http_status, 200);
+    assert_eq!(
+        plain.headers.get("x-set").unwrap(),
+        "origin",
+        "the sibling rule must not inherit the route filter"
+    );
+    assert_eq!(plain.headers.get("x-remove").unwrap(), "leaked");
+    assert!(plain.headers.get("x-added").is_none());
+    assert_eq!(plain.grpc_status(), Some(0));
+    assert_eq!(
+        plain
+            .trailers
+            .as_ref()
+            .and_then(|trailers| trailers.get("x-trailer")),
+        Some(&"kept".parse().unwrap()),
+        "a rule with no response-header filter keeps its application trailers"
+    );
+
+    assert_eq!(backend.received_stream_count(), 2);
+    assert_eq!(backend.matcher_mismatches(), 0);
+}
+
+/// Removing a rule filter must withdraw everything it generated — the dispatch
+/// action AND the auto-emitted consumer plugin — rather than leaving a stale
+/// resource behind.
+#[test]
+fn removing_a_rule_filter_withdraws_its_generated_resources() {
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+
+    let route_with = |filters: serde_json::Value| {
+        object(
+            "gateway.networking.k8s.io/v1",
+            "HTTPRoute",
+            "withdrawn",
+            "default",
+            json!({
+                "parentRefs": [{"name": "edge", "sectionName": "web"}],
+                "hostnames": ["withdraw.test"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": filters
+                }]
+            }),
+        )
+    };
+    let translate = |filters: serde_json::Value| {
+        let mut objects = route_filter_cluster_objects(19_999);
+        objects.push(route_with(filters));
+        let (translation, skipped) =
+            translate_k8s_objects_collecting_skips(&objects, options()).expect("translate route");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        translation.config
+    };
+
+    let with_filters = translate(json!([
+        {"type": "URLRewrite", "urlRewrite": {
+            "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/v2"}
+        }},
+        {"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-secret"]}}
+    ]));
+    let dispatch = |config: &ferrum_edge::config::types::GatewayConfig| {
+        config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .map(|plugin| plugin.config.clone())
+    };
+    let rules = dispatch(&with_filters).expect("dispatch plugin");
+    assert_eq!(rules["rules"][0]["rewrite"]["uri"], "/v2");
+    assert!(rules["rules"][0]["response_transform"].is_array());
+    assert!(
+        with_filters
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.plugin_name == "response_transformer")
+    );
+
+    let without_filters = translate(json!([]));
+    assert!(
+        without_filters
+            .plugin_configs
+            .iter()
+            .all(|plugin| plugin.plugin_name != "response_transformer"),
+        "the auto-emitted consumer must be withdrawn with its filter"
+    );
+    match dispatch(&without_filters) {
+        // A filter-less single-prefix rule needs no dispatch rule at all.
+        None => {}
+        Some(config) => {
+            let rule = &config["rules"][0];
+            assert!(rule.get("rewrite").is_none(), "{config}");
+            assert!(rule.get("response_transform").is_none(), "{config}");
+        }
+    }
+}
+
+/// Drive one filtered and one unfiltered gRPC call through translated routes
+/// that MERGE onto a single proxy, and prove the response-trailer cost of
+/// `ResponseHeaderModifier` stays on the rule that declared it.
+///
+/// Same-kind routes sharing a host, listener and path collapse into one proxy,
+/// one `mesh_route_dispatch`, and one rules-free `response_transformer`
+/// consumer. The consumer's unbounded trailer policy is request-conditional:
+/// it applies only when the matched dispatch rule published a response
+/// transform. The filtered call is selected by the `x-variant: filtered`
+/// request header; the plain call matches the sibling that declared no filter.
+async fn assert_merged_sibling_keeps_trailers(
+    filtered_route: ferrum_edge::config_sources::k8s::K8sObject,
+    plain_route: ferrum_edge::config_sources::k8s::K8sObject,
+    call_path: &str,
+) {
+    use crate::scaffolding::backends::grpc::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+    use crate::scaffolding::clients::grpc::GrpcClient;
+    use crate::scaffolding::ports::reserve_port;
+    use bytes::Bytes;
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+
+    let rpc_script = || {
+        vec![
+            GrpcStep::AcceptRpc(MatchRpc::any()),
+            GrpcStep::SendInitialHeadersOverride(vec![
+                ("content-type", "application/grpc".to_string()),
+                ("x-set", "origin".to_string()),
+            ]),
+            GrpcStep::RespondMessage(Bytes::from_static(b"pong")),
+            GrpcStep::RespondStatusWithTrailers {
+                code: 0,
+                message: "",
+                trailers: vec![("x-trailer", "kept".to_string())],
+            },
+        ]
+    };
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .steps(rpc_script())
+        .steps(rpc_script())
+        .spawn()
+        .expect("spawn grpc backend");
+
+    let kind = filtered_route.kind.clone();
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(filtered_route);
+    objects.push(plain_route);
+
+    // Premise: both routes really did merge onto ONE proxy that carries ONE
+    // consumer, and only the filtered rule publishes a response transform.
+    // Without this, two separate proxies would pass the traffic assertions
+    // below vacuously.
+    let (translation, skipped) = translate_k8s_objects_collecting_skips(
+        &objects,
+        options().with_pod_discovery_enabled(true),
+    )
+    .expect("translate merged routes");
+    assert!(skipped.is_empty(), "{kind}: {skipped:?}");
+    assert_eq!(
+        translation.config.proxies.len(),
+        1,
+        "{kind}: the two routes must merge onto one proxy: {:?}",
+        translation.config.proxies
+    );
+    let consumers: Vec<_> = translation
+        .config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "response_transformer")
+        .collect();
+    assert_eq!(consumers.len(), 1, "{kind}: one shared consumer");
+    assert_eq!(
+        consumers[0].proxy_id.as_deref(),
+        Some(translation.config.proxies[0].id.as_str())
+    );
+    let dispatch = translation
+        .config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .expect("merged dispatch plugin");
+    let transformed_rules = dispatch.config["rules"]
+        .as_array()
+        .expect("dispatch rules")
+        .iter()
+        .filter(|rule| rule.get("response_transform").is_some())
+        .count();
+    assert_eq!(transformed_rules, 1, "{kind}: {}", dispatch.config);
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let target = harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .to_string();
+    let client = GrpcClient::h2c(target);
+
+    let filtered = client
+        .unary_with_headers(
+            call_path,
+            Bytes::from_static(b"ping"),
+            &[("x-variant", "filtered".to_string())],
+        )
+        .await
+        .expect("filtered grpc call");
+    assert_eq!(filtered.http_status, 200, "{kind}");
+    assert_eq!(
+        filtered.headers.get("x-set").unwrap(),
+        "route",
+        "{kind}: the header-gated rule's filter must apply"
+    );
+    assert_eq!(filtered.grpc_status(), Some(0), "{kind}");
+    assert_eq!(filtered.messages, vec![Bytes::from_static(b"pong")]);
+    assert!(
+        filtered
+            .trailers
+            .as_ref()
+            .expect("terminal trailers")
+            .get("x-trailer")
+            .is_none(),
+        "{kind}: the rule that declared the filter pays the trailer cost"
+    );
+
+    let plain = client
+        .unary(call_path, Bytes::from_static(b"ping"))
+        .await
+        .expect("sibling grpc call");
+    assert_eq!(plain.http_status, 200, "{kind}");
+    assert_eq!(
+        plain.headers.get("x-set").unwrap(),
+        "origin",
+        "{kind}: the merged sibling must not inherit the filter"
+    );
+    assert_eq!(plain.grpc_status(), Some(0), "{kind}");
+    assert_eq!(plain.messages, vec![Bytes::from_static(b"pong")]);
+    assert_eq!(
+        plain
+            .trailers
+            .as_ref()
+            .and_then(|trailers| trailers.get("x-trailer")),
+        Some(&"kept".parse().unwrap()),
+        "{kind}: a merged sibling rule without the filter keeps its application trailers"
+    );
+
+    assert_eq!(backend.received_stream_count(), 2);
+    assert_eq!(backend.matcher_mismatches(), 0);
+}
+
+fn x_set_response_header_filter() -> serde_json::Value {
+    json!([{"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+        "set": [{"name": "x-set", "value": "route"}]
+    }}])
+}
+
+/// Two GRPCRoutes — possibly owned by different teams — on one listener with no
+/// hostnames: a header-only match and a match-less rule both materialize on
+/// `/`, so they merge onto one proxy. Only the header-gated rule declares a
+/// `ResponseHeaderModifier`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merged_grpc_route_sibling_without_response_header_modifier_keeps_trailers() {
+    let filtered = object(
+        "gateway.networking.k8s.io/v1",
+        "GRPCRoute",
+        "team-a",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{
+                "matches": [{"headers": [{"name": "x-variant", "value": "filtered"}]}],
+                "backendRefs": [{"name": "api", "port": 8080}],
+                "filters": x_set_response_header_filter()
+            }]
+        }),
+    );
+    let plain = object(
+        "gateway.networking.k8s.io/v1",
+        "GRPCRoute",
+        "team-b",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+        }),
+    );
+    assert_merged_sibling_keeps_trailers(filtered, plain, "/echo.Echo/Ping").await;
+}
+
+/// The HTTPRoute shape of the same merge: two routes on one shared `PathPrefix`,
+/// one of them header-gated with the filter. gRPC calls carry the traffic
+/// because they are the HTTP flavor whose application trailers reach a client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merged_http_route_sibling_without_response_header_modifier_keeps_trailers() {
+    let filtered = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "team-a",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{
+                "matches": [{
+                    "path": {"type": "PathPrefix", "value": "/echo.Echo"},
+                    "headers": [{"name": "x-variant", "value": "filtered"}]
+                }],
+                "backendRefs": [{"name": "api", "port": 8080}],
+                "filters": x_set_response_header_filter()
+            }]
+        }),
+    );
+    let plain = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "team-b",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/echo.Echo"}}],
+                "backendRefs": [{"name": "api", "port": 8080}]
+            }]
+        }),
+    );
+    assert_merged_sibling_keeps_trailers(filtered, plain, "/echo.Echo/Ping").await;
+}
+
+/// A `Service` + `EndpointSlice` pair naming one locally spawned backend, so a
+/// single HTTPRoute can reach backends with different scripted behavior.
+fn scripted_service_objects(
+    name: &str,
+    cluster_ip: &str,
+    backend_port: u16,
+) -> Vec<ferrum_edge::config_sources::k8s::K8sObject> {
+    let service = object(
+        "v1",
+        "Service",
+        name,
+        "default",
+        json!({
+            "clusterIP": cluster_ip,
+            "ports": [{"name": "http", "port": 8080, "targetPort": backend_port}]
+        }),
+    );
+    let mut endpoints = object(
+        "discovery.k8s.io/v1",
+        "EndpointSlice",
+        &format!("{name}-manual"),
+        "default",
+        json!({
+            "addressType": "IPv4",
+            "ports": [{"name": "http", "port": backend_port}],
+            "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
+        }),
+    );
+    endpoints
+        .metadata
+        .labels
+        .insert("kubernetes.io/service-name".to_string(), name.to_string());
+    vec![service, endpoints]
+}
+
+/// A backend that holds every request for `delay` before answering `200 pong`.
+async fn spawn_delayed_backend(
+    delay: std::time::Duration,
+) -> (u16, crate::scaffolding::backends::ScriptedHttp1Backend) {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+    use crate::scaffolding::ports::reserve_port;
+
+    let reservation = reserve_port().await.expect("reserve delayed backend");
+    let port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::Sleep(delay))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Connection".into(),
+            value: "close".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn delayed backend");
+    (port, backend)
+}
+
+/// A backend that answers response headers at once and then trickles a
+/// close-delimited body (no `Content-Length`, so the gateway streams it rather
+/// than eagerly buffering it) one byte every 100 ms for about four seconds.
+async fn spawn_trickling_backend() -> (u16, crate::scaffolding::backends::ScriptedHttp1Backend) {
+    use crate::scaffolding::backends::{HttpStep, ScriptedHttp1Backend};
+    use crate::scaffolding::ports::reserve_port;
+
+    let reservation = reserve_port().await.expect("reserve trickling backend");
+    let port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::TrickleBody {
+            status: 200,
+            reason: "OK".into(),
+            headers: vec![("Content-Type".into(), "text/plain".into())],
+            body: vec![b'x'; 40],
+            chunk_size: 1,
+            pause: std::time::Duration::from_millis(100),
+        })
+        .spawn()
+        .expect("spawn trickling backend");
+    (port, backend)
+}
+
+fn timeouts_route(rules: Value) -> ferrum_edge::config_sources::k8s::K8sObject {
+    object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "timeouts",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["timeouts.test"],
+            "rules": rules
+        }),
+    )
+}
+
+/// Rule-level `timeouts` must reach the data plane and apply to exactly the
+/// rule that declared them:
+///
+/// * `timeouts.request` bounds the whole transaction. Before the response head
+///   the client gets the gateway's `504`; once the head is committed a still
+///   streaming body is cut at the deadline, never completed cleanly.
+/// * `timeouts.backendRequest` bounds one backend attempt and answers the
+///   ordinary backend-timeout `504` before the head, while the rule's larger
+///   `request` budget still bounds the whole transaction. (Its bound on the
+///   attempt's body is covered by
+///   `gateway_route_backend_request_bounds_each_attempt_until_its_full_response`.)
+/// * `0s` disables either bound, and a sibling rule without `timeouts` keeps
+///   the proxy defaults.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_timeouts_reach_the_data_plane() {
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+    use std::time::{Duration, Instant};
+
+    let (slow_port, slow) = spawn_delayed_backend(Duration::from_millis(1500)).await;
+    let (trickle_port, _trickle) = spawn_trickling_backend().await;
+
+    let mut objects = route_filter_cluster_objects(slow_port);
+    let trickle_objects = scripted_service_objects("trickle", "10.96.0.12", trickle_port);
+    objects.extend(trickle_objects);
+    let route = timeouts_route(json!([
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/request"}}],
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "timeouts": {"request": "500ms"}
+        },
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/untimed"}}],
+            "backendRefs": [{"name": "api", "port": 8080}]
+        },
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/disabled"}}],
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "timeouts": {"request": "0s", "backendRequest": "0s"}
+        },
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/attempt"}}],
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "timeouts": {"request": "5s", "backendRequest": "300ms"}
+        },
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/stream"}}],
+            "backendRefs": [{"name": "trickle", "port": 8080}],
+            "timeouts": {"request": "800ms", "backendRequest": "800ms"}
+        }
+    ]));
+    objects.push(route);
+
+    // The policy stays on the emitted dispatch rules: no generated proxy
+    // carries it, so a merged or sibling rule cannot inherit it.
+    let (translation, skipped) = translate_k8s_objects_collecting_skips(
+        &objects,
+        options().with_pod_discovery_enabled(true),
+    )
+    .expect("translate timeouts route");
+    assert!(skipped.is_empty(), "{skipped:?}");
+    for proxy in &translation.config.proxies {
+        assert_eq!(
+            proxy.backend_read_timeout_ms, 30_000,
+            "{}: rule timeouts must not be promoted onto the proxy",
+            proxy.id
+        );
+    }
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let get = |path: &'static str| {
+        client
+            .get(harness.proxy_url(path))
+            .header("host", "timeouts.test")
+            .send()
+    };
+
+    // (a) The total deadline expires before the response head: gateway 504.
+    let started = Instant::now();
+    let response = get("/request/thing").await.expect("response");
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-gateway-error")
+            .and_then(|value| value.to_str().ok()),
+        Some("backend_timeout")
+    );
+    let body = response.text().await.unwrap();
+    assert_eq!(body, r#"{"error":"Request timeout"}"#);
+    // The body already proves the deadline answered rather than the 1.5s
+    // backend; the deadline is anchored at receipt, so it cannot fire early.
+    assert!(
+        elapsed >= Duration::from_millis(450) && elapsed < Duration::from_secs(5),
+        "the 500ms request deadline must answer at the deadline: {elapsed:?}"
+    );
+
+    // (d) The sibling rule declares no timeouts and waits out the backend.
+    let response = get("/untimed/thing").await.expect("sibling response");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "pong");
+
+    // `0s` disables both bounds, as the CRD specifies.
+    let response = get("/disabled/thing").await.expect("disabled response");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "pong");
+
+    // (c) `backendRequest` bounds the single attempt well inside the larger
+    // request budget, and answers the backend-timeout 504 rather than the
+    // request-deadline one.
+    let started = Instant::now();
+    let response = get("/attempt/thing").await.expect("response");
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    let body = response.text().await.unwrap();
+    // The backend-timeout body proves the per-attempt bound fired, not the
+    // 5s request budget or the backend's own 1.5s answer.
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the 300ms backendRequest bound must end the attempt: {elapsed:?}"
+    );
+
+    // (b) The head arrives at once and no idle gap of the 100ms trickle trips a
+    // read bound, but the 800ms deadlines still end the body with an error
+    // instead of a clean end of message.
+    let started = Instant::now();
+    let response = get("/stream/thing").await.expect("response head");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.bytes().await;
+    let elapsed = started.elapsed();
+    assert!(
+        body.is_err(),
+        "a body cut by the request deadline must not complete cleanly: {body:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(3_500),
+        "the 800ms request deadline must cut the ~4s trickle: {elapsed:?}"
+    );
+
+    // Every rule that reached the delayed backend dialed it exactly once.
+    let paths: Vec<String> = slow
+        .received_requests()
+        .await
+        .iter()
+        .map(|request| request.path.clone())
+        .collect();
+    for path in [
+        "/request/thing",
+        "/untimed/thing",
+        "/disabled/thing",
+        "/attempt/thing",
+    ] {
+        let dialed = paths.iter().filter(|seen| seen.as_str() == path).count();
+        assert_eq!(dialed, 1, "{path}: {paths:?}");
+    }
+}
+
+/// A global `http_logging` instance that ships every transaction summary to a
+/// local collector, one summary per batch, so a test can assert what the
+/// gateway recorded rather than only what the client saw.
+fn transaction_log_capture(endpoint_url: String) -> ferrum_edge::config::types::PluginConfig {
+    use ferrum_edge::config::types::{PluginConfig, PluginScope};
+    let now = chrono::Utc::now();
+    PluginConfig {
+        labels: Default::default(),
+        id: "timeouts-transaction-log".to_string(),
+        plugin_name: "http_logging".to_string(),
+        namespace: "default".to_string(),
+        config: json!({
+            "endpoint_url": endpoint_url,
+            "batch_size": 1,
+            "flush_interval_ms": 100
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// The first transaction summary the collector received for `path`.
+async fn wait_for_transaction_summary(collector: &wiremock::MockServer, path: &str) -> Value {
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let requests = collector.received_requests().await.unwrap_or_default();
+        let summary = requests
+            .iter()
+            .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+            .filter_map(|batch| batch.as_array().cloned())
+            .flatten()
+            .find(|summary| summary["request_path"] == path);
+        if let Some(summary) = summary {
+            return summary;
+        }
+        assert!(
+            std::time::Instant::now() < give_up,
+            "no transaction summary for {path} reached the collector"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// The request deadline is ONE absolute budget across every backend attempt
+/// and the retry backoff between them, whoever configured the retries: here the
+/// retry policy is operator configuration on the generated proxy, and the
+/// deadline comes from the translated rule. The same budget under a translated
+/// rule `retry` is `gateway_route_retry_backoff_stays_inside_the_request_budget`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_request_timeout_spans_retry_attempts_and_backoff() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+    use crate::scaffolding::ports::reserve_port;
+    use ferrum_edge::config::types::{BackoffStrategy, RetryConfig};
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 503,
+            reason: "Service Unavailable".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Connection".into(),
+            value: "close".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "0".into(),
+        })
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+    let collector = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&collector)
+        .await;
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    let route = timeouts_route(json!([
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/deadline"}}],
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "timeouts": {"request": "1900ms"}
+        },
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/retries"}}],
+            "backendRefs": [{"name": "api", "port": 8080}]
+        }
+    ]));
+    objects.push(route);
+    let log_capture = transaction_log_capture(format!("{}/logs", collector.uri()));
+    let harness = spawn_translated_route_gateway_with(&objects, vec![log_capture], |config| {
+        for proxy in &mut config.proxies {
+            proxy.retry = Some(RetryConfig {
+                max_retries: 2,
+                retryable_status_codes: vec![503],
+                retryable_methods: vec!["GET".to_string()],
+                backoff: BackoffStrategy::Fixed { delay_ms: 1_000 },
+                retry_on_connect_failure: false,
+            });
+        }
+    })
+    .await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+
+    // Each attempt answers at once, so attempts start at ~0ms and ~1000ms and
+    // the next backoff would end at ~2000ms, past the 1900ms budget: the
+    // budget expires INSIDE that backoff. The ~900ms between the second
+    // attempt and the deadline keeps that phase deterministic on a slow
+    // runner, and the deadline is anchored at receipt, so the response can
+    // never arrive before it.
+    let started = Instant::now();
+    let response = client
+        .get(harness.proxy_url("/deadline/thing"))
+        .header("host", "timeouts.test")
+        .send()
+        .await
+        .expect("deadline response");
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    let body = response.text().await.unwrap();
+    assert_eq!(body, r#"{"error":"Request timeout"}"#);
+    assert!(
+        elapsed >= Duration::from_millis(1_800) && elapsed < Duration::from_secs(4),
+        "the deadline must end the retry loop at ~1900ms: {elapsed:?}"
+    );
+
+    // Without a route deadline the same retry policy runs to exhaustion: the
+    // initial attempt plus two retries, ending with the backend's 503.
+    let response = client
+        .get(harness.proxy_url("/retries/thing"))
+        .header("host", "timeouts.test")
+        .send()
+        .await
+        .expect("retry-exhaustion response");
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+    let observed = backend.received_requests().await;
+    let attempts = |path: &str| {
+        observed
+            .iter()
+            .filter(|request| request.path == path)
+            .count()
+    };
+    assert_eq!(
+        attempts("/deadline/thing"),
+        2,
+        "the deadline must stop the retry planner before a third attempt"
+    );
+    assert_eq!(attempts("/retries/thing"), 3);
+
+    // The transaction log names the phase that expired, and the terminal is
+    // health-neutral: the budget ran out in the gateway's own backoff, and the
+    // attempts that led into it were already recorded on their own.
+    let summary = wait_for_transaction_summary(&collector, "/deadline/thing").await;
+    assert_eq!(summary["response_status_code"], 504, "{summary}");
+    assert_eq!(
+        summary["metadata"]["route_request_timeout"], "retry_backoff",
+        "{summary}"
+    );
+    assert_eq!(
+        summary["error_class"], "dispatch_policy_rejected",
+        "{summary}"
+    );
+}
+
+/// A breaker that opens on the first recorded failure, so one attribution
+/// decision is directly observable as the next request's status.
+fn trip_on_first_failure(config: &mut ferrum_edge::config::types::GatewayConfig) {
+    use ferrum_edge::config::types::CircuitBreakerConfig;
+    for proxy in &mut config.proxies {
+        proxy.circuit_breaker = Some(CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 60,
+            ..CircuitBreakerConfig::default()
+        });
+    }
+}
+
+/// The route deadline is charged to a backend only when that backend held the
+/// request. A client that stalls its upload while the gateway is still
+/// collecting it (retries force the request body to be buffered before any
+/// dial) is cut by the deadline, but the backend was never asked: the breaker
+/// records nothing, so the next request is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_request_timeout_does_not_charge_a_stalled_upload_to_the_backend() {
+    use ferrum_edge::config::types::{BackoffStrategy, RetryConfig};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (backend_port, backend) = spawn_delayed_backend(Duration::ZERO).await;
+    let mut objects = route_filter_cluster_objects(backend_port);
+    let route = timeouts_route(json!([
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/upload"}}],
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "timeouts": {"request": "700ms"}
+        }
+    ]));
+    objects.push(route);
+    let harness = spawn_translated_route_gateway_with(&objects, Vec::new(), |config| {
+        trip_on_first_failure(config);
+        for proxy in &mut config.proxies {
+            proxy.retry = Some(RetryConfig {
+                max_retries: 1,
+                retryable_status_codes: vec![503],
+                retryable_methods: vec!["GET".to_string(), "POST".to_string()],
+                backoff: BackoffStrategy::Fixed { delay_ms: 10 },
+                retry_on_connect_failure: false,
+            });
+        }
+    })
+    .await;
+
+    // Declare 64 body bytes, send 7, and stall.
+    let address = harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .to_string();
+    let mut upload = tokio::net::TcpStream::connect(&address)
+        .await
+        .expect("connect to the gateway");
+    let partial_upload = [
+        "POST /upload/thing HTTP/1.1\r\n",
+        "Host: timeouts.test\r\n",
+        "Content-Length: 64\r\n\r\n",
+        "partial",
+    ]
+    .concat();
+    upload
+        .write_all(partial_upload.as_bytes())
+        .await
+        .expect("write the partial upload");
+    let mut head = Vec::new();
+    let read_head = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = upload.read(&mut buf).await?;
+            if read == 0 {
+                break;
+            }
+            head.extend_from_slice(&buf[..read]);
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+    assert!(
+        matches!(read_head, Ok(Ok(()))),
+        "read the gateway's answer: {read_head:?}"
+    );
+    let head = String::from_utf8_lossy(&head);
+    assert!(
+        head.starts_with("HTTP/1.1 504"),
+        "the deadline must end the stalled upload with the gateway 504: {head}"
+    );
+
+    // A failure charged to the backend would have opened its breaker.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let response = client
+        .get(harness.proxy_url("/upload/thing"))
+        .header("host", "timeouts.test")
+        .send()
+        .await
+        .expect("follow-up response");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "pong");
+
+    let methods: Vec<String> = backend
+        .received_requests()
+        .await
+        .iter()
+        .map(|request| request.method.clone())
+        .collect();
+    assert_eq!(
+        methods,
+        vec!["GET".to_string()],
+        "the stalled upload must never reach the backend"
+    );
+}
+
+/// The other side of the same rule: a backend that holds the request and
+/// withholds its response head past the deadline IS charged, so its breaker
+/// opens and the next request is refused without a dial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_request_timeout_charges_a_backend_that_stalls_response_headers() {
+    use std::time::Duration;
+
+    let (backend_port, backend) = spawn_delayed_backend(Duration::from_millis(1_500)).await;
+    let mut objects = route_filter_cluster_objects(backend_port);
+    let route = timeouts_route(json!([
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/slow"}}],
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "timeouts": {"request": "500ms"}
+        }
+    ]));
+    objects.push(route);
+    let harness =
+        spawn_translated_route_gateway_with(&objects, Vec::new(), trip_on_first_failure).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let get = || {
+        client
+            .get(harness.proxy_url("/slow/thing"))
+            .header("host", "timeouts.test")
+            .send()
+    };
+
+    let response = get().await.expect("deadline response");
+    assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+
+    let response = get().await.expect("breaker response");
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-gateway-error")
+            .and_then(|value| value.to_str().ok()),
+        Some("circuit_breaker_open")
+    );
+    assert_eq!(
+        backend.received_requests().await.len(),
+        1,
+        "the open breaker must refuse the second request before any dial"
+    );
+}
+
+/// A body the route deadline cuts after the backend already answered is the
+/// route's own policy, not a backend fault: the breaker records nothing, and
+/// the next request is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_request_timeout_body_cut_is_not_charged_to_the_backend() {
+    use std::time::Duration;
+
+    let (trickle_port, _trickle) = spawn_trickling_backend().await;
+    let mut objects = route_filter_cluster_objects(trickle_port);
+    let route = timeouts_route(json!([
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/stream"}}],
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "timeouts": {"request": "800ms"}
+        }
+    ]));
+    objects.push(route);
+    let harness =
+        spawn_translated_route_gateway_with(&objects, Vec::new(), trip_on_first_failure).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let get = || {
+        client
+            .get(harness.proxy_url("/stream/thing"))
+            .header("host", "timeouts.test")
+            .send()
+    };
+
+    let response = get().await.expect("response head");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        response.bytes().await.is_err(),
+        "the deadline must cut the ~4s trickle"
+    );
+
+    // The cut was recorded before the client saw it end; a charged failure
+    // would have opened the breaker for this request.
+    let response = get().await.expect("follow-up response head");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+}
+
+/// A gRPC call routed by an HTTPRoute folds the rule's request deadline into
+/// its RPC deadline: the client gets `DEADLINE_EXCEEDED`, not an HTTP 504 it
+/// cannot parse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_request_timeout_ends_grpc_calls_with_deadline_exceeded() {
+    use crate::scaffolding::backends::grpc::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+    use crate::scaffolding::clients::grpc::GrpcClient;
+    use crate::scaffolding::ports::reserve_port;
+    use bytes::Bytes;
+    use std::time::{Duration, Instant};
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .steps(vec![
+            GrpcStep::AcceptRpc(MatchRpc::any()),
+            GrpcStep::Sleep(Duration::from_secs(3)),
+            GrpcStep::SendInitialHeaders,
+            GrpcStep::RespondMessage(Bytes::from_static(b"pong")),
+            GrpcStep::RespondStatus {
+                code: 0,
+                message: "",
+            },
+        ])
+        .spawn()
+        .expect("spawn grpc backend");
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "grpc-timeouts",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/echo.Echo"}}],
+                "backendRefs": [{"name": "api", "port": 8080}],
+                "timeouts": {"request": "500ms"}
+            }]
+        }),
+    ));
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let target = harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .to_string();
+    let client = GrpcClient::h2c(target);
+
+    let started = Instant::now();
+    let response = client
+        .unary("/echo.Echo/Ping", Bytes::from_static(b"ping"))
+        .await
+        .expect("grpc call");
+    let elapsed = started.elapsed();
+    assert_eq!(response.http_status, 200);
+    assert_eq!(response.grpc_status(), Some(4), "DEADLINE_EXCEEDED");
+    assert!(
+        elapsed < Duration::from_millis(2_900),
+        "the 500ms route deadline must end the call before the 3s backend: {elapsed:?}"
+    );
+}
+
+/// Removing a rule's `timeouts` withdraws the policy: the regenerated dispatch
+/// rule carries no deadline, and the same request that timed out is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_rule_timeouts_withdraws_the_deadline() {
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+    use std::time::Duration;
+
+    let (slow_port, _slow) = spawn_delayed_backend(Duration::from_millis(800)).await;
+    let rule = |timeouts: Option<Value>| {
+        let mut rule = json!({
+            "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+            "backendRefs": [{"name": "api", "port": 8080}]
+        });
+        if let Some(timeouts) = timeouts {
+            rule["timeouts"] = timeouts;
+        }
+        rule
+    };
+    let emitted_dispatch_rules = |objects: &[ferrum_edge::config_sources::k8s::K8sObject]| {
+        let (translation, skipped) = translate_k8s_objects_collecting_skips(
+            objects,
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("translate");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        translation
+            .config
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .flat_map(|plugin| plugin.config["rules"].as_array().cloned())
+            .flatten()
+            .collect::<Vec<Value>>()
+    };
+
+    let timed_timeouts = json!({"request": "300ms", "backendRequest": "250ms"});
+    let timed_rule = rule(Some(timed_timeouts));
+    let mut timed = route_filter_cluster_objects(slow_port);
+    timed.push(timeouts_route(json!([timed_rule])));
+    let rules = emitted_dispatch_rules(timed.as_slice());
+    let projected = rules.iter().any(|rule| {
+        rule["request_timeout_ms"] == json!(300)
+            && rule["timeout_ms"] == json!(250)
+            && rule["attempt_timeout_ms"] == json!(250)
+    });
+    assert!(projected, "{rules:?}");
+
+    let mut untimed = route_filter_cluster_objects(slow_port);
+    untimed.push(timeouts_route(json!([rule(None)])));
+    let rules = emitted_dispatch_rules(untimed.as_slice());
+    let withdrawn = rules.iter().all(|rule| {
+        [
+            "request_timeout_ms",
+            "timeout_ms",
+            "attempt_timeout_ms",
+            "timeout_disabled",
+        ]
+        .iter()
+        .all(|field| rule.get(field).is_none())
+    });
+    assert!(withdrawn, "{rules:?}");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    for (objects, expected) in [
+        (timed.as_slice(), reqwest::StatusCode::GATEWAY_TIMEOUT),
+        (untimed.as_slice(), reqwest::StatusCode::OK),
+    ] {
+        let harness = spawn_translated_route_gateway(objects, Vec::new()).await;
+        let response = client
+            .get(harness.proxy_url("/api/thing"))
+            .header("host", "timeouts.test")
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(response.status(), expected);
+    }
+}
+
+/// A backend that answers response headers at once and then paces a
+/// close-delimited body (no `Content-Length`, so the gateway streams it) one
+/// byte every `pause`. No idle gap ever reaches a read bound, so only a total
+/// bound can end the exchange early.
+async fn spawn_paced_backend(
+    bytes: usize,
+    pause: std::time::Duration,
+) -> (u16, crate::scaffolding::backends::ScriptedHttp1Backend) {
+    use crate::scaffolding::backends::ScriptedHttp1Backend;
+    use crate::scaffolding::ports::reserve_port;
+
+    let reservation = reserve_port().await.expect("reserve paced backend");
+    let port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(paced_body_step(bytes, pause))
+        .spawn()
+        .expect("spawn paced backend");
+    (port, backend)
+}
+
+fn paced_body_step(
+    bytes: usize,
+    pause: std::time::Duration,
+) -> crate::scaffolding::backends::HttpStep {
+    crate::scaffolding::backends::HttpStep::TrickleBody {
+        status: 200,
+        reason: "OK".into(),
+        headers: vec![("Content-Type".into(), "text/plain".into())],
+        body: vec![b'x'; bytes],
+        chunk_size: 1,
+        pause,
+    }
+}
+
+/// GET `path` on the `timeouts.test` host and read the whole body, returning
+/// the status, the body outcome, and how long the exchange took.
+async fn fetch_timed_body(
+    client: &reqwest::Client,
+    harness: &crate::scaffolding::harness::GatewayHarness,
+    path: &str,
+) -> (
+    reqwest::StatusCode,
+    Result<bytes::Bytes, reqwest::Error>,
+    std::time::Duration,
+) {
+    let started = std::time::Instant::now();
+    let response = client
+        .get(harness.proxy_url(path))
+        .header("host", "timeouts.test")
+        .send()
+        .await
+        .expect("response head");
+    let status = response.status();
+    let body = response.bytes().await;
+    (status, body, started.elapsed())
+}
+
+/// Upstream v1.5.1 defines `timeouts.backendRequest` as the timeout for one
+/// request from the gateway to the backend, until its FULL response has been
+/// received. A backend that answers its head at once and then trickles the
+/// body inside every idle gap must therefore still be cut per attempt, with no
+/// `request` budget at all:
+///
+/// * the rule carrying `backendRequest` cuts the body at the attempt budget,
+///   never completing it cleanly;
+/// * a sibling rule without `timeouts` streams the same body to the end;
+/// * the cut comes only from the new per-attempt field: with it removed from
+///   the translated rule (leaving `timeout_ms`, the header-wait and idle-gap
+///   bound, exactly as before), the same body streams to the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_backend_request_bounds_each_attempt_until_its_full_response() {
+    use std::time::Duration;
+
+    // One byte every 100ms for ~3s.
+    let (paced_port, _paced) = spawn_paced_backend(30, Duration::from_millis(100)).await;
+    let mut objects = route_filter_cluster_objects(paced_port);
+    objects.push(timeouts_route(json!([
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/attempt"}}],
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "timeouts": {"backendRequest": "600ms"}
+        },
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/untimed"}}],
+            "backendRefs": [{"name": "api", "port": 8080}]
+        }
+    ])));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let (status, body, elapsed) = fetch_timed_body(&client, &harness, "/attempt/thing").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        body.is_err(),
+        "a body cut by the attempt budget must not complete cleanly: {body:?}"
+    );
+    // The budget starts when the attempt is handed to the backend, so it
+    // cannot fire before 600ms; the ~3s trickle proves it fired at all.
+    assert!(
+        elapsed >= Duration::from_millis(550) && elapsed < Duration::from_millis(2_500),
+        "the 600ms backendRequest budget must cut the ~3s trickle: {elapsed:?}"
+    );
+
+    let (status, body, _) = fetch_timed_body(&client, &harness, "/untimed/thing").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body.expect("untimed body").len(), 30);
+    drop(harness);
+
+    // Without the per-attempt field the rule keeps only `timeout_ms`: the
+    // header wait and every 100ms idle gap stay inside 600ms, so nothing cuts.
+    let mut stripped = 0;
+    let harness = spawn_translated_route_gateway_with(&objects, Vec::new(), |config| {
+        for plugin in &mut config.plugin_configs {
+            if plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            let Some(Value::Array(rules)) = plugin.config.get_mut("rules") else {
+                continue;
+            };
+            for rule in rules.iter_mut().filter_map(Value::as_object_mut) {
+                if rule.remove("attempt_timeout_ms").is_some() {
+                    assert_eq!(rule.get("timeout_ms"), Some(&json!(600)), "{rule:?}");
+                    stripped += 1;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(stripped > 0, "the translated rule must carry the field");
+    let (status, body, _) = fetch_timed_body(&client, &harness, "/attempt/thing").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body.expect("body under timeout_ms alone").len(), 30);
+}
+
+/// Every retry attempt gets a FRESH `backendRequest` budget. The first attempt
+/// stalls its response head and times out; the retry answers at once and then
+/// streams its body for ~720ms. That body ends well inside the retry's own
+/// 1500ms budget but long after a budget anchored at the request (or the first
+/// attempt) would have expired, so it completes only if the budget is fresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_backend_request_gives_each_retry_attempt_a_fresh_budget() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher};
+    use std::time::Duration;
+
+    let stall = vec![
+        HttpStep::ExpectRequest(RequestMatcher::any()),
+        HttpStep::Sleep(Duration::from_secs(5)),
+    ];
+    let paced = vec![paced_body_step(12, Duration::from_millis(60))];
+    let (backend_port, backend) = spawn_connection_scripted_backend(vec![stall, paced]).await;
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(timeouts_route(json!([{
+        "matches": [{"path": {"type": "PathPrefix", "value": "/fresh"}}],
+        "backendRefs": [{"name": "api", "port": 8080}],
+        "timeouts": {"backendRequest": "1500ms"},
+        "retry": {"codes": [504], "attempts": 1, "backoff": "10ms"}
+    }])));
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+
+    let (status, body, elapsed) =
+        fetch_timed_body(&retry_test_client(), &harness, "/fresh/thing").await;
+
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let body = body.expect("the retry's body completes inside its own budget");
+    assert_eq!(body.as_ref(), [b'x'; 12].as_slice());
+    assert!(
+        elapsed >= Duration::from_millis(1_400),
+        "the first attempt must have spent its whole budget: {elapsed:?}"
+    );
+    assert_eq!(backend_attempts(&backend, "GET", "/fresh/thing").await, 2);
+}
+
+/// `timeouts.request` stays the TOTAL: a fresh `backendRequest` budget per
+/// retry never extends the transaction past it. Each attempt stalls its head;
+/// the first ends at its 600ms budget, the retry is cut by the 1s total, and
+/// the client gets the request-deadline `504` after exactly two attempts, not
+/// the four `attempts: 3` would allow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_request_timeout_still_bounds_backend_request_retries() {
+    use std::time::{Duration, Instant};
+
+    let (slow_port, slow) = spawn_delayed_backend(Duration::from_secs(5)).await;
+    let mut objects = route_filter_cluster_objects(slow_port);
+    objects.push(timeouts_route(json!([{
+        "matches": [{"path": {"type": "PathPrefix", "value": "/total"}}],
+        "backendRefs": [{"name": "api", "port": 8080}],
+        "timeouts": {"request": "1s", "backendRequest": "600ms"},
+        "retry": {"codes": [504], "attempts": 3, "backoff": "10ms"}
+    }])));
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+
+    let started = Instant::now();
+    let response = retry_test_client()
+        .get(harness.proxy_url("/total/thing"))
+        .header("host", "timeouts.test")
+        .send()
+        .await
+        .expect("response");
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    // The request-deadline body, not the per-attempt backend-timeout one.
+    assert_eq!(
+        response.text().await.unwrap(),
+        r#"{"error":"Request timeout"}"#
+    );
+    assert!(
+        elapsed >= Duration::from_millis(950) && elapsed < Duration::from_secs(4),
+        "the 1s request budget must end the retries: {elapsed:?}"
+    );
+    let attempts = slow
+        .received_requests()
+        .await
+        .iter()
+        .filter(|request| request.path == "/total/thing")
+        .count();
+    assert_eq!(attempts, 2, "the total budget must stop retrying");
+}
+
+/// A gRPC backend that answers `messages` messages `pause` apart and then
+/// `OK`, so no idle gap between its frames reaches a read bound.
+async fn spawn_paced_grpc_backend(
+    messages: usize,
+    pause: std::time::Duration,
+) -> (u16, crate::scaffolding::backends::grpc::ScriptedGrpcBackend) {
+    use crate::scaffolding::backends::grpc::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+    use crate::scaffolding::ports::reserve_port;
+    use bytes::Bytes;
+
+    let mut steps = vec![
+        GrpcStep::AcceptRpc(MatchRpc::any()),
+        GrpcStep::SendInitialHeaders,
+    ];
+    for _ in 0..messages {
+        steps.push(GrpcStep::RespondMessage(Bytes::from_static(b"tick")));
+        steps.push(GrpcStep::Sleep(pause));
+    }
+    steps.push(GrpcStep::RespondStatus {
+        code: 0,
+        message: "",
+    });
+    let reservation = reserve_port().await.expect("reserve grpc backend");
+    let port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .steps(steps)
+        .spawn()
+        .expect("spawn grpc backend");
+    (port, backend)
+}
+
+/// A gRPC call routed by an HTTPRoute folds `backendRequest` into its RPC
+/// deadline, so a server-streaming backend whose frames never leave an idle
+/// gap is still ended at the attempt budget with the RPC-deadline terminal
+/// (`DEADLINE_EXCEEDED`, or a stream reset once response messages were sent),
+/// never completed with `OK`. A sibling rule without `timeouts` streams the
+/// same RPC to its `OK` status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_backend_request_bounds_grpc_attempts_until_the_full_response() {
+    use crate::scaffolding::clients::grpc::GrpcClient;
+    use bytes::Bytes;
+    use std::time::{Duration, Instant};
+
+    // Five messages 400ms apart, then `OK`: ~2s in all.
+    let pause = Duration::from_millis(400);
+    let (timed_port, _timed) = spawn_paced_grpc_backend(5, pause).await;
+    let (untimed_port, _untimed) = spawn_paced_grpc_backend(5, pause).await;
+
+    let mut objects = route_filter_cluster_objects(timed_port);
+    objects.extend(scripted_service_objects(
+        "other",
+        "10.96.0.12",
+        untimed_port,
+    ));
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "grpc-backend-request",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/echo.Timed"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "timeouts": {"backendRequest": "800ms"}
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/echo.Untimed"}}],
+                    "backendRefs": [{"name": "other", "port": 8080}]
+                }
+            ]
+        }),
+    ));
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let target = harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .to_string();
+    let client = GrpcClient::h2c(target);
+
+    let started = Instant::now();
+    let response = client
+        .unary("/echo.Timed/Watch", Bytes::from_static(b"ping"))
+        .await
+        .expect("grpc call");
+    let elapsed = started.elapsed();
+    assert_eq!(response.http_status, 200);
+    let deadline_terminal = response.grpc_status() == Some(4)
+        || (response.grpc_status().is_none() && response.stream_error.is_some());
+    assert!(
+        deadline_terminal,
+        "the attempt budget must end the RPC with its deadline terminal: {response:?}"
+    );
+    assert!(response.messages.len() < 5, "{response:?}");
+    assert!(
+        elapsed < Duration::from_millis(1_800),
+        "the 800ms backendRequest budget must end the ~2s RPC: {elapsed:?}"
+    );
+
+    let response = client
+        .unary("/echo.Untimed/Watch", Bytes::from_static(b"ping"))
+        .await
+        .expect("sibling grpc call");
+    assert_eq!(response.grpc_status(), Some(0), "{response:?}");
+    assert_eq!(response.messages.len(), 5, "{response:?}");
+}
+
+/// A gRPC backend that holds the RPC past the `backendRequest` budget without
+/// sending response headers failed to answer within its per-attempt bound, so
+/// the expiry is charged to it exactly as a stalled HTTP backend is: the call
+/// ends with the backend `DEADLINE_EXCEEDED`, the breaker opens, and the next
+/// call is refused without reaching the backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_backend_request_charges_a_grpc_backend_that_stalls_response_headers() {
+    use crate::scaffolding::backends::grpc::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+    use crate::scaffolding::clients::grpc::GrpcClient;
+    use crate::scaffolding::ports::reserve_port;
+    use bytes::Bytes;
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .steps(vec![
+            GrpcStep::AcceptRpc(MatchRpc::any()),
+            GrpcStep::Sleep(std::time::Duration::from_millis(1_500)),
+            GrpcStep::SendInitialHeaders,
+            GrpcStep::RespondMessage(Bytes::from_static(b"pong")),
+            GrpcStep::RespondStatus {
+                code: 0,
+                message: "",
+            },
+        ])
+        .spawn()
+        .expect("spawn grpc backend");
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "grpc-backend-request",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/echo.Echo"}}],
+                "backendRefs": [{"name": "api", "port": 8080}],
+                "timeouts": {"backendRequest": "500ms"}
+            }]
+        }),
+    ));
+    let harness =
+        spawn_translated_route_gateway_with(&objects, Vec::new(), trip_on_first_failure).await;
+    let target = harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .to_string();
+    let client = GrpcClient::h2c(target);
+
+    let response = client
+        .unary("/echo.Echo/Ping", Bytes::from_static(b"ping"))
+        .await
+        .expect("grpc call");
+    assert_eq!(response.grpc_status(), Some(4), "{response:?}");
+    assert_eq!(
+        response.grpc_message(),
+        Some("Backend deadline exceeded"),
+        "the attempt budget is the backend's bound, not the client's deadline: {response:?}"
+    );
+
+    let response = client
+        .unary("/echo.Echo/Ping", Bytes::from_static(b"ping"))
+        .await
+        .expect("breaker grpc call");
+    assert_eq!(
+        response.grpc_status(),
+        Some(14),
+        "UNAVAILABLE: {response:?}"
+    );
+    assert_eq!(
+        backend.received_stream_count(),
+        1,
+        "the open breaker must refuse the second call before any dial"
+    );
+}
+
+/// Every retry attempt's budget starts with that attempt, and it bounds the
+/// retry's FULL response too. The first attempt stalls its head until its
+/// budget ends; the retry answers at once and then paces a ~3s body. That body
+/// is cut once the retry's own 800ms budget runs out — about 1.6s in — never
+/// completed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_backend_request_cuts_a_retry_body_at_its_own_budget() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher};
+    use std::time::{Duration, Instant};
+
+    let stall = vec![
+        HttpStep::ExpectRequest(RequestMatcher::any()),
+        HttpStep::Sleep(Duration::from_secs(5)),
+    ];
+    // One byte every 100ms for ~3s.
+    let paced = vec![paced_body_step(30, Duration::from_millis(100))];
+    let (backend_port, backend) = spawn_connection_scripted_backend(vec![stall, paced]).await;
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(timeouts_route(json!([{
+        "matches": [{"path": {"type": "PathPrefix", "value": "/cut"}}],
+        "backendRefs": [{"name": "api", "port": 8080}],
+        "timeouts": {"backendRequest": "800ms"},
+        "retry": {"codes": [504], "attempts": 1, "backoff": "10ms"}
+    }])));
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+
+    let started = Instant::now();
+    let mut response = retry_test_client()
+        .get(harness.proxy_url("/cut/thing"))
+        .header("host", "timeouts.test")
+        .send()
+        .await
+        .expect("response head");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut received = 0;
+    let completed = loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => received += chunk.len(),
+            Ok(None) => break true,
+            Err(_) => break false,
+        }
+    };
+    let elapsed = started.elapsed();
+
+    assert!(
+        !completed,
+        "the retry's budget must cut its body ({received} bytes received)"
+    );
+    assert!(received < 30, "{received} bytes received");
+    // Two whole budgets: the stalled first attempt's, then the retry's.
+    assert!(
+        elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_millis(3_000),
+        "the retry's body must be cut at retry start + 800ms: {elapsed:?}"
+    );
+    assert_eq!(backend_attempts(&backend, "GET", "/cut/thing").await, 2);
+}
+
+/// `mesh_route_dispatch` may bound an attempt's total duration more tightly
+/// than its response-head wait (`attempt_timeout_ms` < `timeout_ms`). The
+/// attempt budget then ends a stalled head itself: the ordinary retryable
+/// backend-timeout `504`, well before the header wait. The retry replays the
+/// request body the first attempt retained, although the budget cancelled
+/// that attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attempt_budget_shorter_than_the_header_wait_retries_with_the_retained_body() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher};
+    use std::time::{Duration, Instant};
+
+    let stall = vec![
+        HttpStep::ExpectRequest(RequestMatcher::any()),
+        HttpStep::Sleep(Duration::from_secs(5)),
+    ];
+    let stored = status_exchange(200, "OK", b"stored");
+    let (backend_port, backend) = spawn_connection_scripted_backend(vec![stall, stored]).await;
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(timeouts_route(json!([{
+        "matches": [{"path": {"type": "PathPrefix", "value": "/budget"}}],
+        "backendRefs": [{"name": "api", "port": 8080}],
+        "timeouts": {"backendRequest": "3s"},
+        "retry": {"codes": [504], "attempts": 1, "backoff": "10ms"}
+    }])));
+    let mut tightened = 0;
+    let harness = spawn_translated_route_gateway_with(&objects, Vec::new(), |config| {
+        for plugin in &mut config.plugin_configs {
+            if plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            let Some(Value::Array(rules)) = plugin.config.get_mut("rules") else {
+                continue;
+            };
+            for rule in rules.iter_mut().filter_map(Value::as_object_mut) {
+                if rule.contains_key("attempt_timeout_ms") {
+                    assert_eq!(rule.get("timeout_ms"), Some(&json!(3_000)), "{rule:?}");
+                    rule.insert("attempt_timeout_ms".to_string(), json!(400));
+                    tightened += 1;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(tightened > 0, "the translated rule must carry the field");
+
+    let started = Instant::now();
+    let response = retry_test_client()
+        .put(harness.proxy_url("/budget/thing"))
+        .header("host", "timeouts.test")
+        .body("payload")
+        .send()
+        .await
+        .expect("response");
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "stored");
+    assert!(
+        elapsed >= Duration::from_millis(350) && elapsed < Duration::from_millis(2_500),
+        "the 400ms attempt budget, not the 3s header wait, must end the first attempt: \
+         {elapsed:?}"
+    );
+
+    let bodies: Vec<Vec<u8>> = backend
+        .received_requests()
+        .await
+        .iter()
+        .filter(|request| request.method == "PUT" && request.path == "/budget/thing")
+        .map(|request| request.body.clone())
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![b"payload".to_vec(), b"payload".to_vec()],
+        "the retry must replay the retained request body"
+    );
+}
+
+/// One scripted HTTP/1.1 exchange: read a request, answer `status` with `body`,
+/// and close the connection, so every gateway attempt is its own connection
+/// and its own recorded request.
+fn status_exchange(
+    status: u16,
+    reason: &str,
+    body: &[u8],
+) -> Vec<crate::scaffolding::backends::HttpStep> {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher};
+    vec![
+        HttpStep::ExpectRequest(RequestMatcher::any()),
+        HttpStep::RespondStatus {
+            status,
+            reason: reason.into(),
+        },
+        HttpStep::RespondHeader {
+            name: "Connection".into(),
+            value: "close".into(),
+        },
+        HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: body.len().to_string(),
+        },
+        HttpStep::RespondBodyChunk(body.to_vec()),
+        HttpStep::RespondBodyEnd,
+    ]
+}
+
+/// A backend whose N-th connection runs `scripts[N]`; later connections repeat
+/// the last script.
+async fn spawn_connection_scripted_backend(
+    scripts: Vec<Vec<crate::scaffolding::backends::HttpStep>>,
+) -> (u16, crate::scaffolding::backends::ScriptedHttp1Backend) {
+    use crate::scaffolding::backends::ScriptedHttp1Backend;
+    use crate::scaffolding::ports::reserve_port;
+
+    let reservation = reserve_port().await.expect("reserve scripted backend");
+    let port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .connection_scripts(scripts)
+        .spawn()
+        .expect("spawn scripted backend");
+    (port, backend)
+}
+
+/// How many requests with `method` and `path` the backend received — one per
+/// gateway attempt, since every scripted exchange closes its connection.
+async fn backend_attempts(
+    backend: &crate::scaffolding::backends::ScriptedHttp1Backend,
+    method: &str,
+    path: &str,
+) -> usize {
+    backend
+        .received_requests()
+        .await
+        .iter()
+        .filter(|request| request.method == method && request.path == path)
+        .count()
+}
+
+fn retry_route(rules: Value) -> ferrum_edge::config_sources::k8s::K8sObject {
+    object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "retry",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["retry.test"],
+            "rules": rules
+        }),
+    )
+}
+
+fn retry_test_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("client")
+}
+
+/// Rule-level `retry` must reach the data plane and apply to exactly the rule
+/// that declared it, with exact backend attempt counts:
+///
+/// * `attempts` counts retries AFTER the initial attempt, so a listed status
+///   reaches the backend `attempts + 1` times and the client gets the last
+///   answer once they are spent.
+/// * A status not listed in `codes` is never retried.
+/// * A request whose method is not replay-safe (`POST`) reached the backend
+///   and is never replayed merely to honor the manifest.
+/// * `attempts: 0`, and a sibling rule without `retry`, send exactly one
+///   attempt.
+/// * A retry that succeeds returns the success, after exactly the attempts it
+///   took.
+/// * `backoff` is honored as the minimum wait before the next attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_retry_reaches_the_data_plane() {
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+    use std::time::{Duration, Instant};
+
+    let unavailable = status_exchange(503, "Service Unavailable", b"");
+    let (api_port, api) = spawn_connection_scripted_backend(vec![unavailable.clone()]).await;
+    let recovered = status_exchange(200, "OK", b"pong");
+    let (flaky_port, flaky) = spawn_connection_scripted_backend(vec![unavailable, recovered]).await;
+
+    let mut objects = route_filter_cluster_objects(api_port);
+    objects.extend(scripted_service_objects("flaky", "10.96.0.12", flaky_port));
+    let retry = |codes: Value, attempts: u32, backoff: &str| json!({"codes": codes, "attempts": attempts, "backoff": backoff});
+    let rule = |path: &str, service: &str, policy: Option<Value>| {
+        let mut rule = json!({
+            "matches": [{"path": {"type": "PathPrefix", "value": path}}],
+            "backendRefs": [{"name": service, "port": 8080}]
+        });
+        if let Some(policy) = policy {
+            rule["retry"] = policy;
+        }
+        rule
+    };
+    let rules = vec![
+        rule("/retry", "api", Some(retry(json!([503]), 2, "10ms"))),
+        rule("/unlisted", "api", Some(retry(json!([500]), 2, "10ms"))),
+        rule("/plain", "api", None),
+        rule("/disabled", "api", Some(retry(json!([503]), 0, "10ms"))),
+        rule("/backoff", "api", Some(retry(json!([503]), 1, "400ms"))),
+        rule("/recover", "flaky", Some(retry(json!([503]), 3, "10ms"))),
+    ];
+    objects.push(retry_route(Value::Array(rules)));
+
+    // The policy stays on the emitted dispatch rules: no generated proxy
+    // carries it, so a merged or sibling rule cannot inherit it.
+    let (translation, skipped) = translate_k8s_objects_collecting_skips(
+        &objects,
+        options().with_pod_discovery_enabled(true),
+    )
+    .expect("translate retry route");
+    assert!(skipped.is_empty(), "{skipped:?}");
+    for proxy in &translation.config.proxies {
+        assert!(
+            proxy.retry.is_none(),
+            "{}: rule retry must not be promoted onto the proxy",
+            proxy.id
+        );
+    }
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let client = retry_test_client();
+    let get = |path: &'static str| {
+        client
+            .get(harness.proxy_url(path))
+            .header("host", "retry.test")
+            .send()
+    };
+
+    // A listed status: the initial attempt plus exactly `attempts` retries,
+    // then the backend's own answer.
+    let response = get("/retry/thing").await.expect("retry response");
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(backend_attempts(&api, "GET", "/retry/thing").await, 3);
+
+    // The same rule never replays a POST that reached the backend.
+    let response = client
+        .post(harness.proxy_url("/retry/thing"))
+        .header("host", "retry.test")
+        .body("payload")
+        .send()
+        .await
+        .expect("post response");
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(backend_attempts(&api, "POST", "/retry/thing").await, 1);
+
+    // A status the rule does not list is returned after one attempt.
+    let response = get("/unlisted/thing").await.expect("unlisted response");
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(backend_attempts(&api, "GET", "/unlisted/thing").await, 1);
+
+    // A sibling rule without `retry`, and `attempts: 0`, dial exactly once.
+    for path in ["/plain/thing", "/disabled/thing"] {
+        let response = get(path).await.expect("single-attempt response");
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(backend_attempts(&api, "GET", path).await, 1, "{path}");
+    }
+
+    // `backoff` is the minimum wait before the retry is sent.
+    let started = Instant::now();
+    let response = get("/backoff/thing").await.expect("backoff response");
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(backend_attempts(&api, "GET", "/backoff/thing").await, 2);
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "the retry must not be sent before the 400ms backoff: {elapsed:?}"
+    );
+
+    // A retry that succeeds returns the success after exactly two attempts,
+    // well inside the three the rule allows.
+    let response = get("/recover/thing").await.expect("recovered response");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "pong");
+    assert_eq!(backend_attempts(&flaky, "GET", "/recover/thing").await, 2);
+}
+
+/// `retry` composes with the rule's `timeouts.request`: every attempt AND the
+/// backoff between them spend one absolute budget. With a 1s backoff the
+/// second retry would start at ~2000ms, past the 1900ms budget, so the budget
+/// expires inside that backoff: two attempts, then the gateway 504, logged as
+/// the `retry_backoff` phase. The same retry without a request budget runs to
+/// exhaustion, each backoff honored in full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_retry_backoff_stays_inside_the_request_budget() {
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let unavailable = status_exchange(503, "Service Unavailable", b"");
+    let (backend_port, backend) = spawn_connection_scripted_backend(vec![unavailable]).await;
+    let collector = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&collector)
+        .await;
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(retry_route(json!([
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/budget"}}],
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "timeouts": {"request": "1900ms"},
+            "retry": {"codes": [503], "attempts": 5, "backoff": "1s"}
+        },
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/drain"}}],
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "retry": {"codes": [503], "attempts": 2, "backoff": "1s"}
+        }
+    ])));
+    let log_capture = transaction_log_capture(format!("{}/logs", collector.uri()));
+    let harness = spawn_translated_route_gateway(&objects, vec![log_capture]).await;
+    let client = retry_test_client();
+
+    let started = Instant::now();
+    let response = client
+        .get(harness.proxy_url("/budget/thing"))
+        .header("host", "retry.test")
+        .send()
+        .await
+        .expect("budget response");
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    let body = response.text().await.unwrap();
+    assert_eq!(body, r#"{"error":"Request timeout"}"#);
+    assert!(
+        elapsed >= Duration::from_millis(1_800) && elapsed < Duration::from_secs(4),
+        "the request budget must end the retry loop at ~1900ms: {elapsed:?}"
+    );
+    assert_eq!(
+        backend_attempts(&backend, "GET", "/budget/thing").await,
+        2,
+        "the budget must stop the retry planner before a third attempt"
+    );
+    let summary = wait_for_transaction_summary(&collector, "/budget/thing").await;
+    assert_eq!(summary["response_status_code"], 504, "{summary}");
+    assert_eq!(
+        summary["metadata"]["route_request_timeout"], "retry_backoff",
+        "{summary}"
+    );
+
+    let started = Instant::now();
+    let response = client
+        .get(harness.proxy_url("/drain/thing"))
+        .header("host", "retry.test")
+        .send()
+        .await
+        .expect("exhaustion response");
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(backend_attempts(&backend, "GET", "/drain/thing").await, 3);
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "two retries must each wait out the 1s backoff: {elapsed:?}"
+    );
+}
+
+/// Retries are decided on the response head, before anything reaches the
+/// client. Once a non-retryable head has been committed and its body is
+/// streaming, a backend failure mid-body ends the client's response with an
+/// error and is NEVER replayed — even though the rule lists every gateway
+/// failure status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_retry_never_replays_after_response_commitment() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher};
+    use std::time::Duration;
+
+    // A close-delimited body (no `Content-Length`), so the gateway streams it
+    // instead of eagerly buffering it; the pause flushes the head and the first
+    // bytes before the reset.
+    let aborted_mid_body = vec![
+        HttpStep::ExpectRequest(RequestMatcher::any()),
+        HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        },
+        HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "text/plain".into(),
+        },
+        HttpStep::RespondBodyChunk(b"partial".to_vec()),
+        HttpStep::Sleep(Duration::from_millis(300)),
+        HttpStep::Reset,
+    ];
+    let (backend_port, backend) = spawn_connection_scripted_backend(vec![aborted_mid_body]).await;
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(retry_route(json!([{
+        "matches": [{"path": {"type": "PathPrefix", "value": "/stream"}}],
+        "backendRefs": [{"name": "api", "port": 8080}],
+        "retry": {"codes": [500, 502, 503, 504], "attempts": 3, "backoff": "10ms"}
+    }])));
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let client = retry_test_client();
+
+    let response = client
+        .get(harness.proxy_url("/stream/thing"))
+        .header("host", "retry.test")
+        .send()
+        .await
+        .expect("response head");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.bytes().await;
+    assert!(
+        body.is_err(),
+        "a body the backend aborted must not complete cleanly: {body:?}"
+    );
+    assert_eq!(
+        backend_attempts(&backend, "GET", "/stream/thing").await,
+        1,
+        "a committed response must never be replayed"
+    );
+}
+
+/// Two HTTPRoutes — possibly owned by different teams — on one shared
+/// `PathPrefix` merge onto ONE proxy. Only the header-gated rule declares
+/// `retry`; the merged sibling must not inherit it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merged_http_route_sibling_without_retry_is_never_retried() {
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+
+    let unavailable = status_exchange(503, "Service Unavailable", b"");
+    let (backend_port, backend) = spawn_connection_scripted_backend(vec![unavailable]).await;
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "team-a",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{
+                "matches": [{
+                    "path": {"type": "PathPrefix", "value": "/merged"},
+                    "headers": [{"name": "x-variant", "value": "retry"}]
+                }],
+                "backendRefs": [{"name": "api", "port": 8080}],
+                "retry": {"codes": [503], "attempts": 2, "backoff": "10ms"}
+            }]
+        }),
+    ));
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "team-b",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/merged"}}],
+                "backendRefs": [{"name": "api", "port": 8080}]
+            }]
+        }),
+    ));
+
+    // Premise: both routes really did merge onto one proxy, and only the
+    // header-gated rule carries a retry policy. Without this, two separate
+    // proxies would pass the traffic assertions below vacuously.
+    let (translation, skipped) = translate_k8s_objects_collecting_skips(
+        &objects,
+        options().with_pod_discovery_enabled(true),
+    )
+    .expect("translate merged routes");
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(
+        translation.config.proxies.len(),
+        1,
+        "the two routes must merge onto one proxy: {:?}",
+        translation.config.proxies
+    );
+    assert!(translation.config.proxies[0].retry.is_none());
+    let retry_rules: usize = translation
+        .config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .flat_map(|plugin| plugin.config["rules"].as_array().cloned())
+        .flatten()
+        .filter(|rule| rule.get("retry").is_some())
+        .count();
+    assert_eq!(retry_rules, 1);
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let client = retry_test_client();
+    let response = client
+        .get(harness.proxy_url("/merged/thing"))
+        .header("x-variant", "retry")
+        .send()
+        .await
+        .expect("retried response");
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let response = client
+        .get(harness.proxy_url("/merged/thing"))
+        .send()
+        .await
+        .expect("sibling response");
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+    let requests = backend.received_requests().await;
+    let retried = requests
+        .iter()
+        .filter(|request| request.header("x-variant") == Some("retry"))
+        .count();
+    let sibling = requests
+        .iter()
+        .filter(|request| request.header("x-variant").is_none())
+        .count();
+    assert_eq!(retried, 3, "the declaring rule retries twice");
+    assert_eq!(sibling, 1, "the merged sibling must not inherit the retry");
+}
+
+/// Removing a rule's `retry` withdraws the policy: the regenerated dispatch
+/// rule carries none, and the same request is sent exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_rule_retry_withdraws_the_policy() {
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+
+    let unavailable = status_exchange(503, "Service Unavailable", b"");
+    let (backend_port, backend) = spawn_connection_scripted_backend(vec![unavailable]).await;
+    let rule = |retry: Option<Value>| {
+        let mut rule = json!({
+            "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+            "backendRefs": [{"name": "api", "port": 8080}]
+        });
+        if let Some(retry) = retry {
+            rule["retry"] = retry;
+        }
+        rule
+    };
+    let emitted_dispatch_rules = |objects: &[ferrum_edge::config_sources::k8s::K8sObject]| {
+        let (translation, skipped) = translate_k8s_objects_collecting_skips(
+            objects,
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("translate");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        translation
+            .config
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .flat_map(|plugin| plugin.config["rules"].as_array().cloned())
+            .flatten()
+            .collect::<Vec<Value>>()
+    };
+
+    let retry = json!({"codes": [503], "attempts": 2, "backoff": "10ms"});
+    let mut retried = route_filter_cluster_objects(backend_port);
+    retried.push(retry_route(json!([rule(Some(retry))])));
+    let rules = emitted_dispatch_rules(retried.as_slice());
+    assert!(
+        rules
+            .iter()
+            .any(|rule| rule["retry"]["max_retries"] == json!(2)),
+        "{rules:?}"
+    );
+
+    let mut plain = route_filter_cluster_objects(backend_port);
+    plain.push(retry_route(json!([rule(None)])));
+    let rules = emitted_dispatch_rules(plain.as_slice());
+    assert!(
+        rules
+            .iter()
+            .all(|rule| rule.get("retry").is_none() && rule.get("retry_disabled").is_none()),
+        "{rules:?}"
+    );
+
+    let client = retry_test_client();
+    for (objects, expected_total) in [(retried.as_slice(), 3), (plain.as_slice(), 4)] {
+        let harness = spawn_translated_route_gateway(objects, Vec::new()).await;
+        let response = client
+            .get(harness.proxy_url("/api/thing"))
+            .header("host", "retry.test")
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            backend_attempts(&backend, "GET", "/api/thing").await,
+            expected_total
+        );
+    }
 }

@@ -1,9 +1,9 @@
 ---
 name: opus-agents
-description: Dispatch and orchestrate Claude Code Opus 5 1M CLI subagents (low|medium|high|xhigh|max effort) for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks Claude to delegate to Claude Code Opus 5 1M workers. Do not use when you are a dispatched worker or for ordinary single-agent edits.
+description: Dispatch and orchestrate Claude Code Opus 5.5 1M CLI subagents (low|medium|high|xhigh|max effort) for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks Claude to delegate to Claude Code Opus 5.5 1M workers. Do not use when you are a dispatched worker or for ordinary single-agent edits.
 ---
 
-# Claude Code Opus 5 1M agents
+# Claude Code Opus 5.5 1M agents
 
 Act as the orchestrator. Read and follow the shared workflow in
 [the canonical skill](../../../.agents/skills/opus-agents/SKILL.md), interpreting its Codex
@@ -18,7 +18,7 @@ do not duplicate them in this directory.
 ```
 
 Append `--fast` only when the user explicitly requests fast mode for that dispatch or fleet.
-The shared launcher pins `claude-opus-5[1m]`; use `--model 'opus[1m]'` only for an explicit
+The shared launcher pins `claude-opus-5-5[1m]`; use `--model 'opus[1m]'` only for an explicit
 rolling-latest Opus request.
 
 Read the canonical skill before dispatch for effort selection, preflight, isolation, failure

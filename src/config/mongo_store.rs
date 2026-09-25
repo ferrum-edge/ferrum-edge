@@ -10847,11 +10847,15 @@ mod inner {
         async fn list_plugin_configs_paginated(
             &self,
             namespace: &str,
+            proxy_id: Option<&str>,
             limit: i64,
             offset: i64,
         ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let ns_filter = doc! { "namespace": namespace };
+            let mut ns_filter = doc! { "namespace": namespace };
+            if let Some(proxy_id) = proxy_id {
+                ns_filter.insert("proxy_id", proxy_id);
+            }
             let total = self
                 .plugin_configs()
                 .count_documents(ns_filter.clone())

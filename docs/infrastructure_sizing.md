@@ -188,7 +188,7 @@ The load balancer maintains per-upstream state that varies by algorithm. This is
 |-----------|-------------------|-------|
 | Round-robin | ~64 bytes | Single atomic counter |
 | Weighted round-robin | ~64 bytes per target | Atomic weight counters per target |
-| Least-connections | ~128 bytes per target | Active connection counter per target via DashMap |
+| Least-connections / least-latency | ~56 bytes per target | One shared runtime-state slot per distinct `host:port`: active-connection count, latency EWMA, sample count (a 48-byte allocation plus an 8-byte pointer). Every algorithm keeps this slot, so it applies to all upstreams |
 | Consistent hashing | ~3.6 KB per target | 150 virtual nodes per target in the hash ring |
 | Random | ~0 bytes | Stateless |
 

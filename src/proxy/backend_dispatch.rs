@@ -1011,7 +1011,14 @@ pub(crate) fn run_backend_admission_plugins(
 /// - Circuit breaker (success/failure)
 /// - Passive health checks
 /// - Least-latency load balancer (backend TTFB)
-/// - Least-connections load balancer (connection end)
+///
+/// It never touches least-connections accounting: every path that counts a
+/// backend connection holds a `LoadBalancerConnectionGuard`, whose drop is
+/// the one release, so an early return between start and end cannot leak a
+/// count and an outcome record cannot release one twice. The name keeps its
+/// `_no_conn_end` suffix although no connection-ending variant remains:
+/// `record_backend_outcome(` is the admission-permit method, and several
+/// source-contract tests key on these exact call texts.
 ///
 /// Route-override plugins must pass the shadowed effective proxy so passive
 /// health and least-latency reporting attribute to the upstream that was
@@ -1026,47 +1033,6 @@ pub(crate) fn run_backend_admission_plugins(
 /// worrying about poisoning backend health — the neutral arm suppresses
 /// latency/passive regardless, and is evaluated before `connection_error` for
 /// the breaker.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn record_backend_outcome(
-    state: &ProxyState,
-    proxy: &Proxy,
-    lb_snapshot: &LoadBalancerCacheInner,
-    selected_balancer: Option<&Arc<LoadBalancer>>,
-    upstream_target: Option<&UpstreamTarget>,
-    final_cb_target_key: Option<&str>,
-    response_status: u16,
-    connection_error: bool,
-    error_class: Option<ErrorClass>,
-    is_half_open_probe: bool,
-    skip_circuit_breaker_record: bool,
-    backend_elapsed: Duration,
-) {
-    record_backend_outcome_inner(
-        state,
-        proxy,
-        lb_snapshot,
-        selected_balancer,
-        upstream_target,
-        final_cb_target_key,
-        response_status,
-        connection_error,
-        error_class,
-        is_half_open_probe,
-        skip_circuit_breaker_record,
-        backend_elapsed,
-        true,
-    );
-}
-
-/// Like [`record_backend_outcome`] but records everything EXCEPT ending
-/// least-connections connection tracking.
-///
-/// Use on dispatch paths where a `LoadBalancerConnectionGuard` already owns the
-/// connection-end (so it is correctly deferred until a streaming response body
-/// completes), or where the path never issued a matching
-/// `record_connection_start`. This prevents the double-decrement that occurs
-/// when both a guard and this function end the same connection — which silently
-/// undercounts active connections and biases least-connections balancing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_backend_outcome_no_conn_end(
     state: &ProxyState,
@@ -1095,7 +1061,6 @@ pub(crate) fn record_backend_outcome_no_conn_end(
         is_half_open_probe,
         skip_circuit_breaker_record,
         backend_elapsed,
-        false,
     );
 }
 
@@ -1316,14 +1281,7 @@ fn record_backend_outcome_inner(
     is_half_open_probe: bool,
     skip_circuit_breaker_record: bool,
     backend_elapsed: Duration,
-    end_connection: bool,
 ) {
-    // End connection tracking for least-connections. Skipped when a
-    // LoadBalancerConnectionGuard owns the end, or when no start was issued.
-    if end_connection && let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
-        balancer.record_connection_end(target);
-    }
-
     // Record backend TTFB for least-latency load balancing (passive path).
     // Only record when:
     //   1. The outcome is not a client-caused disconnect. A client that gave up
@@ -2516,11 +2474,12 @@ mod tests {
     async fn record_backend_outcome_no_conn_end_preserves_active_connection_count() {
         // F06 regression: the HTTP dispatch path holds a
         // LoadBalancerConnectionGuard (start in ctor, end on drop) AND used to
-        // call record_backend_outcome, which ALSO ended the connection -- so
-        // the least-connections gauge was decremented twice per request.
-        // record_backend_outcome_no_conn_end must record CB/health/latency
-        // WITHOUT ending the connection (the guard owns that); the full
-        // record_backend_outcome must still end it.
+        // call a connection-ending outcome record -- so the least-connections
+        // gauge was decremented twice per request. Outcome recording must
+        // record CB/health/latency WITHOUT ending the connection; the guard's
+        // drop is the one release (issue #5693). A second, concurrent
+        // connection keeps the gauge above zero, so a double release would
+        // show instead of saturating at zero.
         let mut config: crate::config::types::GatewayConfig =
             serde_json::from_value(serde_json::json!({
                 "version": "1",
@@ -2562,15 +2521,21 @@ mod tests {
 
         let active = || {
             balancer
-                .active_connections
+                .active_connection_counts()
                 .iter()
-                .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
+                .map(|(_, count)| count)
                 .sum::<i64>()
         };
 
-        // The guard's constructor would do this start.
-        balancer.record_connection_start(target.as_ref());
-        assert_eq!(active(), 1, "record_connection_start increments the gauge");
+        let concurrent = crate::proxy::LoadBalancerConnectionGuard::new(
+            Some(target.as_ref()),
+            Some(balancer.as_ref()),
+        );
+        let guard = crate::proxy::LoadBalancerConnectionGuard::new(
+            Some(target.as_ref()),
+            Some(balancer.as_ref()),
+        );
+        assert_eq!(active(), 2, "each guard's start increments the gauge");
 
         // no_conn_end must NOT decrement -- the guard owns the end.
         record_backend_outcome_no_conn_end(
@@ -2589,30 +2554,14 @@ mod tests {
         );
         assert_eq!(
             active(),
-            1,
+            2,
             "record_backend_outcome_no_conn_end must not end the connection"
         );
 
-        // The full variant DOES end it (used by the bare-start H3 paths).
-        record_backend_outcome(
-            &state,
-            proxy,
-            &epoch.load_balancer,
-            Some(&balancer),
-            Some(target.as_ref()),
-            None,
-            200,
-            false,
-            None,
-            false,
-            true,
-            std::time::Duration::ZERO,
-        );
-        assert_eq!(
-            active(),
-            0,
-            "record_backend_outcome must end the connection"
-        );
+        drop(guard);
+        assert_eq!(active(), 1, "the guard's drop releases one count");
+        drop(concurrent);
+        assert_eq!(active(), 0);
     }
 
     #[tokio::test]
@@ -2900,10 +2849,8 @@ mod tests {
         );
 
         let samples = balancer
-            .latency_sample_count
-            .get("10.0.0.1:8080")
-            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0);
+            .target_runtime_state(&target)
+            .map_or(0, |state| state.latency_sample_count());
         assert!(
             samples >= 1,
             "passive TTFB must sample until active probes are actually running, got {samples}"
@@ -2943,10 +2890,8 @@ mod tests {
             Duration::from_micros(2500),
         );
         let samples_after = balancer
-            .latency_sample_count
-            .get("10.0.0.1:8080")
-            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0);
+            .target_runtime_state(&target)
+            .map_or(0, |state| state.latency_sample_count());
         assert_eq!(
             samples_after, samples,
             "running active probes must suppress passive TTFB sampling"

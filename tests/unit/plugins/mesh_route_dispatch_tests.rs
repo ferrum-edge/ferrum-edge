@@ -2726,3 +2726,443 @@ fn mesh_route_rendered_action_errors_keep_fields_bounds_and_fixed_suggestions() 
         assert_rendered_route_diagnostic(json!({"rules": [rule]}), &expected);
     }
 }
+
+#[tokio::test]
+async fn mesh_route_dispatch_publishes_request_timeout_for_the_matched_rule_only() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [
+            {
+                "match": {"headers": {"x-variant": "timed"}},
+                "destination": {"upstream_id": "timed"},
+                "request_timeout_ms": 750
+            },
+            {
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "plain"}
+            }
+        ]
+    }))
+    .expect("request_timeout_ms is a valid rule field");
+
+    let mut timed = ctx();
+    let mut headers = HashMap::from([("x-variant".to_string(), "timed".to_string())]);
+    let result = plugin.before_proxy(&mut timed, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(timed.route_override_request_timeout_ms, Some(750));
+
+    // A request matching the sibling rule carries no route deadline.
+    let mut plain = ctx();
+    let result = plugin.before_proxy(&mut plain, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plain.route_override_upstream_id.as_deref(), Some("plain"));
+    assert_eq!(plain.route_override_request_timeout_ms, None);
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_timeout_only_rule_is_an_action_catch_all() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {},
+            "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+            "request_timeout_ms": 500,
+            "timeout_ms": 200
+        }]
+    }))
+    .expect("a timeout-only rule is a route-action catch-all");
+
+    let mut request = ctx();
+    let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(request.route_override_request_timeout_ms, Some(500));
+    assert_eq!(request.route_override_backend_read_timeout_ms, Some(200));
+}
+
+#[test]
+fn mesh_route_dispatch_rejects_a_zero_request_timeout() {
+    let error = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "request_timeout_ms": 0
+        }]
+    }))
+    .expect_err("a zero total deadline is refused");
+    assert!(
+        error.contains("`mesh_route_dispatch.rules[0].request_timeout_ms`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn route_request_timeout_is_request_scoped_and_never_clones_the_proxy() {
+    let proxy = test_proxy();
+    let mut request = ctx();
+    request.route_override_request_timeout_ms = Some(1_000);
+    assert!(!request.has_route_overrides());
+    let applied = request.apply_route_overrides(Arc::clone(&proxy));
+    assert!(Arc::ptr_eq(&proxy, &applied));
+    assert_eq!(
+        applied.backend_read_timeout_ms,
+        proxy.backend_read_timeout_ms
+    );
+}
+
+#[test]
+fn arming_a_route_request_timeout_anchors_a_non_grpc_deadline_at_receipt() {
+    let mut request = ctx();
+    let before = tokio::time::Instant::now();
+    request.route_override_request_timeout_ms = Some(2_000);
+    request.arm_route_request_deadline(false);
+    let deadline = request
+        .route_request_deadline_at()
+        .expect("a non-gRPC request carries the route deadline");
+    assert!(deadline <= before + std::time::Duration::from_millis(2_000));
+    assert!(deadline > before + std::time::Duration::from_millis(1_000));
+    // The gRPC deadline stays untouched for a non-gRPC request.
+    assert_eq!(request.grpc_deadline_at(), None);
+
+    // A request whose rule carries no deadline is unbounded.
+    let mut untimed = ctx();
+    untimed.arm_route_request_deadline(false);
+    assert_eq!(untimed.route_request_deadline_at(), None);
+}
+
+#[test]
+fn arming_a_route_request_timeout_folds_into_the_grpc_deadline() {
+    // No client `grpc-timeout`: the route budget becomes the RPC deadline.
+    let mut request = ctx();
+    request.route_override_request_timeout_ms = Some(2_000);
+    request.arm_route_request_deadline(true);
+    assert_eq!(request.route_request_deadline_at(), None);
+    let route_deadline = request
+        .grpc_deadline_at()
+        .expect("the route budget becomes the RPC deadline");
+
+    // A tighter client deadline wins; the fold only ever shortens it.
+    let mut tighter_client = ctx();
+    tighter_client
+        .headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    tighter_client
+        .headers
+        .insert("grpc-timeout".to_string(), "100m".to_string());
+    let prepared =
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&[], &mut tighter_client);
+    assert!(matches!(prepared, PluginResult::Continue));
+    let client_deadline = tighter_client.grpc_deadline_at().expect("client deadline");
+    tighter_client.route_override_request_timeout_ms = Some(2_000);
+    tighter_client.arm_route_request_deadline(true);
+    assert_eq!(tighter_client.grpc_deadline_at(), Some(client_deadline));
+
+    // A looser client deadline is shortened to the route budget, and re-arming
+    // is idempotent.
+    let mut looser_client = ctx();
+    looser_client
+        .headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    looser_client
+        .headers
+        .insert("grpc-timeout".to_string(), "60S".to_string());
+    let prepared =
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&[], &mut looser_client);
+    assert!(matches!(prepared, PluginResult::Continue));
+    let client_deadline = looser_client.grpc_deadline_at().expect("client deadline");
+    looser_client.route_override_request_timeout_ms = Some(2_000);
+    looser_client.arm_route_request_deadline(true);
+    let folded = looser_client.grpc_deadline_at().expect("folded deadline");
+    assert!(folded < client_deadline);
+    looser_client.arm_route_request_deadline(true);
+    assert_eq!(looser_client.grpc_deadline_at(), Some(folded));
+    assert!(route_deadline > tokio::time::Instant::now());
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_publishes_attempt_timeout_for_the_matched_rule_only() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [
+            {
+                "match": {"headers": {"x-variant": "timed"}},
+                "destination": {"upstream_id": "timed"},
+                "timeout_ms": 400,
+                "attempt_timeout_ms": 400
+            },
+            {
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "plain"}
+            }
+        ]
+    }))
+    .expect("attempt_timeout_ms is a valid rule field");
+
+    let mut timed = ctx();
+    let mut headers = HashMap::from([("x-variant".to_string(), "timed".to_string())]);
+    let result = plugin.before_proxy(&mut timed, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(timed.route_override_attempt_timeout_ms, Some(400));
+    assert_eq!(timed.route_override_backend_read_timeout_ms, Some(400));
+
+    // A request matching the sibling rule carries no attempt budget.
+    let mut plain = ctx();
+    let result = plugin.before_proxy(&mut plain, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plain.route_override_upstream_id.as_deref(), Some("plain"));
+    assert_eq!(plain.route_override_attempt_timeout_ms, None);
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_attempt_timeout_only_rule_is_an_action_catch_all() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {},
+            "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+            "attempt_timeout_ms": 250
+        }]
+    }))
+    .expect("an attempt-timeout-only rule is a route-action catch-all");
+
+    let mut request = ctx();
+    let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(request.route_override_attempt_timeout_ms, Some(250));
+    // Independent of the header/idle bound, which stays inherited.
+    assert_eq!(request.route_override_backend_read_timeout_ms, None);
+}
+
+#[test]
+fn mesh_route_dispatch_rejects_a_zero_attempt_timeout() {
+    let error = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "attempt_timeout_ms": 0
+        }]
+    }))
+    .expect_err("a zero attempt budget is refused");
+    assert!(
+        error.contains("`mesh_route_dispatch.rules[0].attempt_timeout_ms`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn route_attempt_timeout_is_request_scoped_and_never_clones_the_proxy() {
+    let proxy = test_proxy();
+    let mut request = ctx();
+    request.route_override_attempt_timeout_ms = Some(1_000);
+    assert!(!request.has_route_overrides());
+    let applied = request.apply_route_overrides(Arc::clone(&proxy));
+    assert!(Arc::ptr_eq(&proxy, &applied));
+    assert_eq!(
+        applied.backend_read_timeout_ms,
+        proxy.backend_read_timeout_ms
+    );
+}
+
+#[test]
+fn arming_a_route_attempt_timeout_carries_the_budget_for_non_grpc() {
+    let mut request = ctx();
+    request.route_override_attempt_timeout_ms = Some(300);
+    request.arm_route_request_deadline(false);
+    assert_eq!(
+        request.route_attempt_timeout(),
+        Some(std::time::Duration::from_millis(300))
+    );
+    // The budget runs per attempt, so it arms no request-wide deadline, and a
+    // non-gRPC request's RPC deadline stays untouched.
+    assert_eq!(request.route_request_deadline_at(), None);
+    assert_eq!(request.grpc_deadline_at(), None);
+
+    // Without the field nothing is armed.
+    let mut untimed = ctx();
+    untimed.arm_route_request_deadline(false);
+    assert_eq!(untimed.route_attempt_timeout(), None);
+    assert_eq!(untimed.grpc_deadline_at(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn arming_a_route_attempt_timeout_folds_a_fresh_budget_into_the_grpc_deadline() {
+    use std::time::Duration;
+
+    // No client `grpc-timeout`: the attempt budget becomes the RPC deadline,
+    // anchored when the rule is armed.
+    let mut request = ctx();
+    request.route_override_attempt_timeout_ms = Some(300);
+    let armed_at = tokio::time::Instant::now();
+    request.arm_route_request_deadline(true);
+    assert_eq!(request.route_attempt_timeout(), None);
+    assert_eq!(
+        request.grpc_deadline_at(),
+        Some(armed_at + Duration::from_millis(300))
+    );
+
+    // Between attempts the RPC falls back to its total budget (none here), and
+    // the next attempt starts a FRESH budget rather than inheriting the rest of
+    // the first one.
+    tokio::time::advance(Duration::from_millis(250)).await;
+    request.end_grpc_route_attempt();
+    assert_eq!(request.grpc_deadline_at(), None);
+    let retried_at = tokio::time::Instant::now();
+    request.begin_grpc_route_attempt();
+    assert_eq!(
+        request.grpc_deadline_at(),
+        Some(retried_at + Duration::from_millis(300))
+    );
+
+    // With a total `request` budget the total still wins once it is earlier
+    // than the fresh attempt budget, and backoff is bounded by it alone.
+    let mut both = ctx();
+    let received_at = tokio::time::Instant::now();
+    both.route_override_request_timeout_ms = Some(500);
+    both.route_override_attempt_timeout_ms = Some(300);
+    both.arm_route_request_deadline(true);
+    let total = received_at + Duration::from_millis(500);
+    assert!(both.grpc_deadline_at().expect("attempt budget") < total);
+    tokio::time::advance(Duration::from_millis(400)).await;
+    both.end_grpc_route_attempt();
+    assert_eq!(both.grpc_deadline_at(), Some(total));
+    both.begin_grpc_route_attempt();
+    assert_eq!(both.grpc_deadline_at(), Some(total));
+
+    // Re-arming a rule that no longer carries a budget restores the total.
+    both.route_override_attempt_timeout_ms = None;
+    both.arm_route_request_deadline(true);
+    assert_eq!(both.grpc_deadline_at(), Some(total));
+    both.begin_grpc_route_attempt();
+    assert_eq!(both.grpc_deadline_at(), Some(total));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_grpc_deadline_is_the_route_attempt_budget_only_while_it_binds() {
+    use std::time::Duration;
+
+    // With no other budget the attempt budget is the RPC deadline for each
+    // attempt, and not between attempts.
+    let mut request = ctx();
+    request.route_override_attempt_timeout_ms = Some(300);
+    request.arm_route_request_deadline(true);
+    assert!(request.grpc_deadline_is_route_attempt_budget());
+    request.end_grpc_route_attempt();
+    assert!(!request.grpc_deadline_is_route_attempt_budget());
+    request.begin_grpc_route_attempt();
+    assert!(request.grpc_deadline_is_route_attempt_budget());
+
+    // A total that ends first binds instead, and so does one that ends at the
+    // same instant: the total wins a tie.
+    let mut total_first = ctx();
+    total_first.route_override_request_timeout_ms = Some(200);
+    total_first.route_override_attempt_timeout_ms = Some(300);
+    total_first.arm_route_request_deadline(true);
+    assert!(!total_first.grpc_deadline_is_route_attempt_budget());
+    let mut tie = ctx();
+    tie.route_override_request_timeout_ms = Some(300);
+    tie.route_override_attempt_timeout_ms = Some(300);
+    tie.arm_route_request_deadline(true);
+    assert!(!tie.grpc_deadline_is_route_attempt_budget());
+
+    // A later attempt whose fresh budget outlasts the total is bound by the
+    // total.
+    let mut both = ctx();
+    both.route_override_request_timeout_ms = Some(500);
+    both.route_override_attempt_timeout_ms = Some(300);
+    both.arm_route_request_deadline(true);
+    assert!(both.grpc_deadline_is_route_attempt_budget());
+    tokio::time::advance(Duration::from_millis(400)).await;
+    both.end_grpc_route_attempt();
+    both.begin_grpc_route_attempt();
+    assert!(!both.grpc_deadline_is_route_attempt_budget());
+
+    // A non-gRPC request never folds its budget into the RPC deadline.
+    let mut plain = ctx();
+    plain.route_override_attempt_timeout_ms = Some(300);
+    plain.arm_route_request_deadline(false);
+    assert!(!plain.grpc_deadline_is_route_attempt_budget());
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_retry_only_rule_is_an_action_catch_all() {
+    // The Gateway API translator emits a path-only HTTPRoute rule whose only
+    // effect is its `retry` as an empty-match rule; it must admit and select
+    // the policy for the requests it matches.
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {},
+            "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+            "retry": {
+                "max_retries": 2,
+                "retryable_status_codes": [503],
+                "backoff": {"fixed": {"delay_ms": 25}},
+                "retry_on_connect_failure": true
+            }
+        }]
+    }))
+    .expect("a retry-only rule is a route-action catch-all");
+
+    let mut request = ctx();
+    let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let retry = request
+        .route_override_retry
+        .clone()
+        .flatten()
+        .expect("the matched rule publishes its retry policy");
+    assert_eq!(retry.max_retries, 2);
+    assert_eq!(retry.retryable_status_codes, vec![503]);
+    assert_eq!(
+        retry.retryable_methods,
+        RetryConfig::default().retryable_methods
+    );
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_retry_disabled_only_rule_is_an_action_catch_all() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {},
+            "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+            "retry_disabled": true
+        }]
+    }))
+    .expect("a retry_disabled-only rule is a route-action catch-all");
+
+    let mut request = ctx();
+    let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    // `Some(None)` explicitly clears an inherited proxy retry policy.
+    assert_eq!(request.route_override_retry, Some(None));
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_publishes_retry_for_the_matched_rule_only() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [
+            {
+                "match": {"headers": {"x-variant": "retry"}},
+                "destination": {"upstream_id": "retried"},
+                "retry": {"max_retries": 1, "retryable_status_codes": [502]}
+            },
+            {
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "plain"}
+            }
+        ]
+    }))
+    .expect("retry is a valid rule field");
+
+    let mut retried = ctx();
+    let mut headers = HashMap::from([("x-variant".to_string(), "retry".to_string())]);
+    let result = plugin.before_proxy(&mut retried, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let retry = retried
+        .route_override_retry
+        .clone()
+        .flatten()
+        .expect("the matched rule publishes its retry policy");
+    assert_eq!(retry.max_retries, 1);
+
+    // A request matching the sibling rule inherits the proxy policy untouched.
+    let mut plain = ctx();
+    let result = plugin.before_proxy(&mut plain, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plain.route_override_upstream_id.as_deref(), Some("plain"));
+    assert_eq!(plain.route_override_retry, None);
+}

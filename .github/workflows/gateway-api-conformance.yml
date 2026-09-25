@@ -21,7 +21,7 @@ on:
       supported_features:
         description: Comma-separated Gateway API conformance features
         required: false
-        default: Gateway,ReferenceGrant,HTTPRoute,GRPCRoute
+        default: Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,HTTPRouteResponseHeaderModification,HTTPRoutePathRewrite,HTTPRouteHostRewrite,HTTPRouteRequestTimeout,HTTPRouteBackendTimeout
       skip_tests:
         description: Optional space-separated upstream conformance tests to skip
         required: false
@@ -135,8 +135,16 @@ jobs:
     # Pin the build host so its glibc stays no newer than the runtime image.
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      KIND_CLUSTER_NAME: ferrum-gwapi
+      GATEWAY_API_LAB_CONTEXT: kind-ferrum-gwapi
 
     steps:
+      # `runner.temp` is not available to job-level `env`, so the lab's
+      # ownership record path is exported from the first step instead.
+      - name: Select the GatewayClass ownership record path
+        run: echo "GATEWAY_API_LAB_OWNERSHIP_FILE=$RUNNER_TEMP/gateway-api-gatewayclass-ownership.tsv" >> "$GITHUB_ENV"
+
       - name: Checkout Ferrum Edge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -155,7 +163,11 @@ jobs:
             conformance_profile="GATEWAY-HTTP,GATEWAY-GRPC"
           fi
           if [ -z "$supported_features" ]; then
-            supported_features="Gateway,ReferenceGrant,HTTPRoute,GRPCRoute"
+            # Extended feature names are declared only for filters and rule
+            # fields Ferrum implements end to end (issue #5646). Adding a name here makes
+            # the upstream suite RUN that feature's tests, so never declare
+            # one ahead of the implementation.
+            supported_features="Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,HTTPRouteResponseHeaderModification,HTTPRoutePathRewrite,HTTPRouteHostRewrite,HTTPRouteRequestTimeout,HTTPRouteBackendTimeout"
           fi
           {
             echo "gateway_api_version=$gateway_api_version"
@@ -193,6 +205,33 @@ jobs:
         env:
           GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
         run: bash scripts/gateway_api_conformance_lab_setup.sh setup
+
+      - name: Verify GatewayClass ownership refusals
+        run: |
+          set -euo pipefail
+          if GATEWAY_API_LAB_CONTEXT=kind-other \
+            bash scripts/gateway_api_gatewayclass_authority_conformance.sh blackbox; then
+            echo "GatewayClass check accepted the wrong Kind context" >&2
+            exit 1
+          fi
+
+          IFS=$'\t' read -r recorded_context nonce uid < "$GATEWAY_API_LAB_OWNERSHIP_FILE"
+          foreign_record="$RUNNER_TEMP/gateway-api-foreign-gatewayclass.tsv"
+          printf '%s\t%s\t%s\n' "$recorded_context" "$nonce" \
+            '00000000-0000-0000-0000-000000000000' > "$foreign_record"
+          if GATEWAY_API_LAB_OWNERSHIP_FILE="$foreign_record" \
+            bash scripts/gateway_api_gatewayclass_authority_conformance.sh blackbox; then
+            echo "GatewayClass check accepted a foreign UID" >&2
+            exit 1
+          fi
+
+          printf '%s\t%s\t%s\n' "$recorded_context" \
+            '00000000000000000000000000000000' "$uid" > "$foreign_record"
+          if GATEWAY_API_LAB_OWNERSHIP_FILE="$foreign_record" \
+            bash scripts/gateway_api_gatewayclass_authority_conformance.sh blackbox; then
+            echo "GatewayClass check accepted a foreign run marker" >&2
+            exit 1
+          fi
 
       - name: Run upstream Gateway API conformance
         id: conformance

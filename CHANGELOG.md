@@ -7,75 +7,170 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- Withhold supplied configuration values in early startup and reload diagnostics
-  (#5591), including SQL/Mongo quarantine, mesh consumers and revisions, capture
-  settings, CP trust identifiers, and listener conflicts. WAF regex failures keep
-  the field and rejection reason without exposing the pattern. Remaining plugin
-  families are tracked in #5594.
+- Native HTTP/3 now enforces Gateway API HTTPRoute rule `timeouts` (#5646)
+  instead of refusing a plain request routed under them with `503`. A rule's
+  `request` (`mesh_route_dispatch` `request_timeout_ms`) and `backendRequest`
+  (`attempt_timeout_ms`) bound HTTP/3 exactly as they bound HTTP/1.1 and
+  HTTP/2, on the bridge to HTTP/1.1 and HTTP/2 backends and on the native
+  HTTP/3 backend pool, buffered or streaming, with or without retries. Before
+  the response head the client gets the same `504`, `X-Gateway-Error:
+  backend_timeout` and transaction-log phase as on HTTP/1.1 and HTTP/2, and
+  an expiry is charged to a backend only when that backend held the attempt.
+  An attempt budget expiry is retried when the rule's `retry` lists `504`, and
+  the retry replays the retained request body. After the head, the response
+  body is cut with an `H3_REQUEST_CANCELLED` stream reset, never a clean
+  finish, and the cut is health-neutral. The HTTP/3 bridge to gRPC backends,
+  and its gRPC-Web pass-through to HTTP/1.1 and HTTP/2 backends, now also start
+  a fresh `backendRequest` budget for each retry attempt, end it before retry
+  backoff, and charge an expiry after the request was sent to the backend, as
+  HTTP/1.1 and HTTP/2 do.
+  HTTP/1.1 and HTTP/2 listeners again advertise HTTP/3 (`Alt-Svc`) on ports
+  that serve such a rule. A buffered response collected by the HTTP/3 bridge
+  that ends in a read timeout now also carries `X-Gateway-Error:
+  backend_timeout`, as on HTTP/1.1 and HTTP/2. A route-timeout `504` no longer
+  sets a mesh sticky-session cookie on the HTTP/3 bridge, and one raised while
+  an HTTP/3 upload is still buffered is logged under the
+  `route_request_timeout_h3_upload` rejection phase. One deviation remains: the
+  HTTP/3 bridge collects a buffered response body after its retry loop, so an
+  attempt budget that expires during that collection is answered with the
+  charged `504` but not retried. **Operator action:**
+  with `FERRUM_ENABLE_HTTP3=true`, clients may switch back to HTTP/3 on those
+  ports, so their UDP port must be reachable, and a response longer than the
+  rule's `request` or `backendRequest` is now cut on HTTP/3 as it already was
+  on HTTP/1.1 and HTTP/2.
 
-- Startup failures now print the full cause chain (#5589), including mesh field
-  paths and YAML/JSON positions, without requiring `-v`. Configuration parsers
-  classify serde families from the bare inner error, separately from document
-  paths, and withhold offending scalars before retaining errors. A second layer
-  sanitizes every cause independently at render time for both `run` and `validate`,
-  withholding double/single-quoted spans (including unterminated tails) while
-  keeping backticked schema names and the following cause. Validators must omit
-  document values or quote strings with Debug escaping; bare interpolation is a
-  defect. Converted mesh IP/host/name/target-reference/CIDR/header diagnostics,
-  gateway host/reference checks, plugin names and bounds follow this convention.
-  Audited plugin type errors quote the complete JSON rendering, including
-  numbers and containers. CORS and sibling regex validators omit pattern-reproducing
-  library errors; OpenAPI and AI tool JSON Schema errors use fixed reasons.
-  YAML duplicate keys retain their field names. Paths and unknown-field messages
-  echo document keys. Mesh, gateway migration (warnings and errors), and backup
-  version rejections withhold the supplied value. Database-mode `validate` also
-  checks the configured JSON backup without connecting to the database. Diagnostics
-  also redact credentials in exact configured database URLs and registered external
-  secret values. The URL inventory reads only raw settings, without fetching
-  dormant database TLS sources or creating PEM files. Owning loaders remain
-  responsible for derived URLs and other provider/driver error payloads.
-  Credential scrubbers now run on each original cause before quoted-span
-  withholding, including URLs and registered secrets containing quotes. If the
-  scrubbers change quote/escape syntax, the affected cause is withheld in full
-  without consuming the next cause. Backup,
-  SQL/Mongo validation and unknown-plugin warnings sanitize before emission.
-  WAF stream/rule IDs, exemption regexes, Basic-auth consumer IDs, gRPC-Web
-  header elements and remaining constructor scalar/type diagnostics follow the
-  same withholding convention. Version and credential schema names remain
-  visible in backticks. Real-binary regressions inspect both output streams.
+## [0.9.7] - 2026-09-25
 
-### Security
+This is the first published release after 0.9.5. It ships every change
+prepared as 0.9.6, which was tagged but never published (see below).
 
-- **Outbound registry reuse now follows CONNECT enforcement context** (PR #5595).
-  Distinct inbound and outbound bind addresses could share a numeric port,
-  causing the port-only registry gate to enforce egress membership on an
-  inbound HBONE CONNECT. Every registry instance now skips the listener-stamped
-  Inbound direction before any lookup, metric, or rejection; outbound and
-  non-mesh listeners retain the existing port scope. Reuse is advertised only
-  for CONNECTs the registry did not decide. The context-aware classifier uses
-  the SAME direction/port predicate as enforcement and retains those facts on
-  the admission snapshot for every sweep. A scoped registry on a matching
-  Outbound listener that terminates CONNECT now withholds reuse; withdrawing
-  its destination refuses the next CONNECT. A scope change that makes an
-  advertised tunnel's original listener enforce the registry revokes it with
-  `reuse_withdrawn`. Unscoped instances remain fail-closed. Inbound reuse and
-  live advertised tunnels still survive REGISTRY_ONLY publication.
-  As defense in depth, mesh startup and `ferrum-edge validate` now reject any
-  planned inbound/outbound TCP listeners sharing a nonzero port number, even
-  on different addresses; UDP capture and port `0` are excluded. **Operators
-  relying on same-port-number inbound/outbound binds must choose distinct TCP
-  ports before restarting.** This follow-up corrects #5583's assumption that
-  only inbound listeners terminate CONNECT; NodeWaypoint capture is Outbound
-  and can terminate an authenticated CONNECT against a configured route.
-- Bump the optional `cryptoki` dependency (feature `pkcs11`) from 0.12.0 to 0.12.1 for
-  RUSTSEC-2026-0286: `Session::get_attributes` could build an out-of-bounds slice when
-  decoding `CKA_ALLOWED_MECHANISMS` (crash or adjacent heap disclosure). Lockfile-only
-  change; the manifest's `0.12` requirement already admits the patch release.
+### Added
+
+- Gateway API HTTPRoute `timeouts.backendRequest` bounds each backend attempt
+  until its full response has been received, as upstream v1.5.1 defines it
+  (#5646). The budget starts when the attempt is handed to the backend, and
+  every retry attempt gets a fresh one; `timeouts.request` still bounds the
+  whole request. Before the response head the attempt ends with the ordinary
+  backend-timeout `504`, which the rule's `retry` may retry. A body still
+  streaming at the budget is cut exactly like a `request` cut (HTTP/2 stream
+  reset, HTTP/1.1 connection close) and is never retried. **Any response that
+  takes longer than the budget to deliver is cut, not only a trickled one**: a
+  large but fast download, a Server-Sent Events stream, a long poll, and a
+  server-streaming gRPC call all end at the budget, so size `backendRequest`
+  for the longest complete response the rule must serve. For a streamed
+  (unbuffered) upload, the upload time after the handoff counts against the
+  budget and its expiry is charged to the backend. gRPC calls fold the budget
+  into their RPC deadline, anchored when the rule is selected, and end with
+  `DEADLINE_EXCEEDED`; a backend that holds the call past it is charged to its
+  circuit breaker and passive health. `mesh_route_dispatch` rules gain the
+  matching `attempt_timeout_ms` field; rules without it behave exactly as
+  before. Like `request`, native HTTP/3 cannot enforce the per-attempt bound
+  for non-gRPC requests yet, so it refuses those requests with `503` and
+  HTTP/3 is not advertised (`Alt-Svc`) on a listener port that serves such a
+  rule.
+
+- Gateway API HTTPRoute rule-level `timeouts` (#5646). `timeouts.backendRequest`
+  bounds each backend attempt and `timeouts.request` is one total deadline for
+  the whole request, including retries, retry backoff and the streaming response
+  body. Both are validated like the pinned v1.5.1 CRD, and `0s` disables either.
+  A request that runs out of time before the response head gets a `504`. A
+  response body still streaming at the deadline is reset (HTTP/2) or its
+  connection closed (HTTP/1.1). gRPC calls end with `DEADLINE_EXCEEDED`. The
+  timeouts apply only to the rule that declares them. `mesh_route_dispatch`
+  rules gain the matching `request_timeout_ms` field. A `request` expiry counts
+  against a backend's health only when that backend held the request; expiry
+  while the gateway is still buffering a client upload, in retry backoff, or
+  after the response head does not. A body cut by the deadline keeps its
+  `Content-Length`. Native HTTP/3 cannot enforce the total deadline for
+  non-gRPC requests yet, so it refuses those requests with `503` instead of
+  serving them without the deadline, and HTTP/3 is no longer advertised
+  (`Alt-Svc`) on a listener port that serves such a rule. CI now declares
+  `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`; the per-attempt
+  semantics of `backendRequest` are the entry above.
+
+- Gateway API HTTPRoute rule-level `retry` (#5646). The experimental-channel
+  field, present in the pinned v1.5.1 experimental CRD bundle, is validated like
+  that CRD and projected onto the rule's own `mesh_route_dispatch` retry
+  override, the same one the Istio VirtualService translator uses, so sibling
+  and merged rules are never retried. `attempts` counts retries after the
+  initial attempt (`0` disables them), `codes` are the retried statuses, and
+  `backoff` is a fixed minimum wait. Out-of-range `attempts` (negative or above
+  100) and a `backoff` above `5m` are `UnsupportedValue`. A listed status is
+  retried only for `GET`, `HEAD`, `OPTIONS`, `PUT` and `DELETE`. A failure
+  before any byte reached the backend is retried for every method. A response
+  whose head reached the client is never replayed. Every attempt and backoff
+  spends the rule's `timeouts.request` budget. Upstream v1.5.1 has no retry
+  conformance feature, so none is declared. GRPCRoute `retry` stays refused.
+  An empty-match `mesh_route_dispatch` rule carrying only `retry` or
+  `retry_disabled: true` is now accepted as a route-action catch-all.
+
+- Gateway API rule-level `ResponseHeaderModifier` (HTTPRoute and GRPCRoute)
+  and HTTPRoute `URLRewrite` (#5646, PR #5650). Both were refused at admission
+  and are now translated onto the rule's own `mesh_route_dispatch` actions:
+  response-header filters become `response_transform` rules and `URLRewrite`
+  becomes a per-rule `rewrite` (hostname, `ReplaceFullPath`, and
+  `ReplacePrefixMatch` following the upstream rewrite table). Admission stays
+  fail-closed for `URLRewrite` combined with `RequestRedirect`, a repeated
+  filter, `URLRewrite` on a GRPCRoute, `ReplacePrefixMatch` without a
+  `PathPrefix` match, protocol-managed response headers, and malformed header
+  names, values, hostnames, or paths. A `RequestRedirect` with a root
+  `PathPrefix: /` match no longer fuses the replacement onto the first path
+  segment.
+
+- Conditional full-replacement writes (#5659). `GET` on proxies, upstreams,
+  consumers, and plugin configs returns a strong `ETag`; `PUT`/`DELETE` with a
+  non-matching `If-Match` is refused with `412` and writes nothing, so a draft
+  opened before another administrator's accepted change can no longer revert
+  it. The comparison runs under the namespace config admission lease the write
+  commits under, making it atomic against every admin writer, including other
+  control-plane replicas. Tags are keyed by the admin JWT secret so they reveal
+  nothing about redacted fields. A malformed `If-Match`, or one sent to a
+  mutating route that does not evaluate it, is `400` rather than ignored.
+  Requests without `If-Match` are unchanged.
+
+- Proxy filter on `GET /plugins/config` (#5726). An optional `proxy_id` query
+  parameter narrows the list to plugin configs whose `proxy_id` matches exactly,
+  so a caller (e.g. Nexus) no longer has to page the whole namespace and filter
+  client-side. Pagination and `pagination.total` apply over the filtered set,
+  and the filter is pushed into every backend (SQL, MongoDB, and the
+  in-memory/file path), respecting the caller's namespace and role the same as
+  the unfiltered list. An invalid `proxy_id` returns `400`; an unknown one
+  returns an empty page rather than `404`.
 
 ### Changed
 
+- **BREAKING (library API) — load-balancer runtime state** (issue #5693). The public
+  `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and
+  `LoadBalancer::latency_sample_count` `DashMap` fields are removed, along with
+  `LoadBalancerCache::record_connection_start` / `record_connection_end`, which
+  re-resolved the balancer at release time and could release a re-added
+  target's fresh count. Per-target state is now one shared
+  `TargetRuntimeState` slot per distinct `host:port`. Read it with
+  `LoadBalancer::target_runtime_state(target)` (`active_connections()`,
+  `latency_ewma_us()`, `latency_sample_count()`) or
+  `LoadBalancer::active_connection_counts()`. Count a connection with
+  `LoadBalancer::lease_connection(target)`, whose `TargetConnectionLease`
+  releases on drop. `LoadBalancer::record_connection_start` /
+  `record_connection_end` remain, but every start must be matched by an end on
+  the same balancer, because a rebuild no longer resets a leaked count. This
+  affects only code linking the `ferrum_edge` crate; configuration, the Admin
+  API and metrics are unchanged.
+- **BREAKING — malformed secret-fetch timeout and mesh DNS limits refuse to
+  start** (issues #5699 / #5700). `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` must be
+  a whole number of seconds from 1 to 600. Previously `0` made every secret
+  fetch that waited on I/O time out immediately, and a malformed or negative
+  value silently became 30. The same rule applies to startup secret resolution
+  (environment only), to later runtime fetches, and to the `ferrum.conf` value
+  when settings load. `FERRUM_MESH_DNS_TTL_SECONDS` (0–86400),
+  `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` (1–16384) and
+  `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` (1–262144) no longer fall back to
+  their defaults on a malformed, blank or overflowing value (or, for the two
+  capacity settings, zero). `run` and `validate` now fail with an error naming
+  the variable and its range, without echoing the value. Unset variables keep
+  their documented defaults. See
+  [docs/upgrade_guide.md](docs/upgrade_guide.md).
 - **MCP trailing-slash alias withdrawn** (#5582). The single-trailing-slash
   alias introduced for #5536 is no longer accepted. Authorization plugins
   evaluate the raw request path before MCP dispatch, so admitting and rewriting
@@ -377,6 +472,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Service-discovery target updates, modified upstreams, and full load-balancer
+  rebuilds no longer reset the live state of targets that stay in the set
+  (#5693). Each surviving `host:port` keeps its active-connection count, latency
+  EWMA, and latency sample count. The new balancer shares these counters with
+  the old one, so connections opened before the update are still counted and
+  release the same counter when they close. Previously a scale-up made a target
+  with 1,000 open sessions look idle to `least_connections`, sent
+  `least_latency` back into round-robin warm-up, and dropped those connections
+  from the per-target connection metrics. A removed target's state is dropped;
+  if the target is added again, it starts clean. Because counts now persist,
+  every HTTP/3 path (native streaming, buffered, native gRPC, and the
+  cross-protocol bridge) releases its connection count through an RAII guard,
+  as HTTP/1.1, HTTP/2, gRPC, WebSocket, TCP and UDP already did. An early
+  return between the start and the outcome record previously leaked one count,
+  and a retry that rotated to another target released the wrong one.
+- An HTTP/1.1 backend request no longer waits for `backend_read_timeout_ms`
+  and returns `504` when its pooled connection is reset or closed at the moment
+  the request is queued (#5714). The request never reached the backend, so it
+  now fails straight away: a reused connection is retried on a new one, and a
+  fresh connection returns `502` (`connection_pool_error`, pre-wire). The fix is
+  in a vendored hyper-util 0.1.20: its legacy client stops holding the closed
+  connection's only request sender, so the request stranded by tokio's
+  two-step channel send is dropped and fails as unsent. HTTP/1 pools that
+  Ferrum drives directly (HBONE inner HTTP/1, Unix-socket backends) get the same
+  release in Ferrum code (#5720).
+- Benchmark runners no longer `SIGKILL` unrelated host listeners on fixed ports
+  (#5702). `run_protocol_test.sh`, `run_gateway_protocol_bench.sh`,
+  `run_connection_saturation_bench.sh`, `run_perf_test.sh`, `run_payload_test.sh`,
+  and the `mesh-dns-e2e` / `mesh-hbone-e2e` `run.sh` harnesses now refuse to
+  start when any of their ports is already bound (printing the port and an
+  `lsof` command to inspect the listener), and on exit terminate only the PIDs
+  and Docker container IDs the current run recorded, with a graceful `SIGTERM`,
+  a bounded wait, and `SIGKILL` only as a last resort. Their `EXIT` traps also
+  stop deleting shared certificates/results unless the run created the exact
+  paths, so an early failure cannot kill another process or remove another run's
+  artifacts. A static contract test in the `Benchmark Harness Tests` lane fails
+  if any of these runners, or a CI workflow invoking them, regresses to a
+  port-wide kill.
+- Rust tests no longer write the gateway's TLS store into the checkout
+  (#5706). Only the `ferrum-edge` binary resolves an unconfigured
+  `FERRUM_TLS_MANAGED_STORE_PATH` to `./ferrum-managed-tls`; other processes
+  that link the library, including every test harness, use a private
+  per-process temporary directory. An empty value now counts as unset. The
+  accidentally committed `ferrum-managed-tls/` store is removed and ignored,
+  and the Unit and Integration Tests jobs fail when a test run changes or adds
+  files in the checkout. `basic_auth` tests no longer race env-isolated tests
+  for `FERRUM_BASIC_AUTH_HMAC_SECRET` (#5705).
+- Reject a health-check `active.http_path` that does not start with `/`
+  (#5683). The probe URL is `scheme://host:port` + path, so a path like
+  `@169.254.169.254/` turned the target into userinfo and sent the probe to a
+  different host that the egress screen never inspected.
+- A request on an HBONE inner HTTP/1.1 connection or a Unix-socket HTTP/1.1
+  backend connection no longer waits for `backend_read_timeout_ms` (`504`), or
+  forever when that timeout is `0`, when the pooled connection is reset or
+  closed at the moment the request is queued (#5720). The request never reached
+  the backend, so it now fails straight away: a reused connection is retried
+  once on a new one, and a fresh connection returns `502`
+  (`connection_pool_error`, pre-wire). Both dispatches watch the connection
+  while they wait for the response and release its only request sender once it
+  stops accepting requests, so the request stranded by tokio's two-step channel
+  send fails as unsent. A request handed back unsent on a fresh connection is
+  now `connection_pool_error` for a streaming request body too, not only for a
+  buffered one.
+- Reject non-finite (`NaN`, `inf`) floating-point env values (#5684). A `NaN`
+  `FERRUM_OVERLOAD_*_THRESHOLD` passed validation and silently disabled load
+  shedding.
+- `bot_detection` `allow_list` entries whose first or last character is
+  punctuation now match (#5685). Word-boundary anchors are applied only to
+  word-character edges, so embedded-token smuggling stays blocked.
+- `spec_expose` serves specs with `Content-Security-Policy: default-src 'none';
+  sandbox` (#5686), so an upstream-supplied `application/xml` document cannot
+  run XHTML-namespaced script on the gateway origin.
+- `ldap_auth` escapes NUL in bind DN values as `\00` (RFC 4514) (#5687).
+- Reject an `active.udp_probe_payload` that is not an even-length hex string
+  (#5688) instead of silently probing with a single zero byte.
+- `FERRUM_MAX_CREDENTIALS_PER_TYPE=0` now fails startup, and the enforced value
+  is parsed exactly as startup validated it (#5689).
+- `graphql` and `grpc_method_router` tag `limit_by: consumer` rate keys as
+  `consumer:` or `ip:` (#5692), so an identity that equals an IP no longer
+  shares the anonymous budget of that IP. Existing local and Redis counters for
+  these two plugins restart once after upgrading.
+
+- Flush the two writes that run just before a byte relay starts (#5588): the
+  TCP+TLS first-bytes prefix forwarded to the backend, and WebSocket tunnel
+  mode's forward of backend bytes that arrived with the `101`. The relay only
+  flushes bytes it handed over itself, so a `tokio-rustls` leg that accepted
+  either write but kept its ciphertext could hold it until the next relay write
+  in that direction. Each flush runs inside the existing bounds of its write,
+  and neither path does anything new when it has no bytes to forward.
+- Withhold supplied configuration values in early startup and reload diagnostics
+  (#5591), including SQL/Mongo quarantine, mesh consumers and revisions, capture
+  settings, CP trust identifiers, and listener conflicts. WAF regex failures keep
+  the field and rejection reason without exposing the pattern. Remaining plugin
+  families are tracked in #5594.
+
+- Startup failures now print the full cause chain (#5589), including mesh field
+  paths and YAML/JSON positions, without requiring `-v`. Configuration parsers
+  classify serde families from the bare inner error, separately from document
+  paths, and withhold offending scalars before retaining errors. A second layer
+  sanitizes every cause independently at render time for both `run` and `validate`,
+  withholding double/single-quoted spans (including unterminated tails) while
+  keeping backticked schema names and the following cause. Validators must omit
+  document values or quote strings with Debug escaping; bare interpolation is a
+  defect. Converted mesh IP/host/name/target-reference/CIDR/header diagnostics,
+  gateway host/reference checks, plugin names and bounds follow this convention.
+  Audited plugin type errors quote the complete JSON rendering, including
+  numbers and containers. CORS and sibling regex validators omit pattern-reproducing
+  library errors; OpenAPI and AI tool JSON Schema errors use fixed reasons.
+  YAML duplicate keys retain their field names. Paths and unknown-field messages
+  echo document keys. Mesh, gateway migration (warnings and errors), and backup
+  version rejections withhold the supplied value. Database-mode `validate` also
+  checks the configured JSON backup without connecting to the database. Diagnostics
+  also redact credentials in exact configured database URLs and registered external
+  secret values. The URL inventory reads only raw settings, without fetching
+  dormant database TLS sources or creating PEM files. Owning loaders remain
+  responsible for derived URLs and other provider/driver error payloads.
+  Credential scrubbers now run on each original cause before quoted-span
+  withholding, including URLs and registered secrets containing quotes. If the
+  scrubbers change quote/escape syntax, the affected cause is withheld in full
+  without consuming the next cause. Backup,
+  SQL/Mongo validation and unknown-plugin warnings sanitize before emission.
+  WAF stream/rule IDs, exemption regexes, Basic-auth consumer IDs, gRPC-Web
+  header elements and remaining constructor scalar/type diagnostics follow the
+  same withholding convention. Version and credential schema names remain
+  visible in backticks. Real-binary regressions inspect both output streams.
+
 - **A buffering relay writer no longer holds bytes while the reader is parked**
   (issue #5588). `poll_copy_direction` — the one byte pump behind userspace
   TCP/TLS, WebSocket tunnel mode, mesh TCP inbound/egress, and the HBONE
@@ -416,6 +637,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Half-close byte delivery, cancellation, the authorization-lifetime and
   admission-revocation bounds, and per-direction byte/error attribution are
   unchanged.
+
+### Security
+
+- **Outbound registry reuse now follows CONNECT enforcement context** (PR #5595).
+  Distinct inbound and outbound bind addresses could share a numeric port,
+  causing the port-only registry gate to enforce egress membership on an
+  inbound HBONE CONNECT. Every registry instance now skips the listener-stamped
+  Inbound direction before any lookup, metric, or rejection; outbound and
+  non-mesh listeners retain the existing port scope. Reuse is advertised only
+  for CONNECTs the registry did not decide. The context-aware classifier uses
+  the SAME direction/port predicate as enforcement and retains those facts on
+  the admission snapshot for every sweep. A scoped registry on a matching
+  Outbound listener that terminates CONNECT now withholds reuse; withdrawing
+  its destination refuses the next CONNECT. A scope change that makes an
+  advertised tunnel's original listener enforce the registry revokes it with
+  `reuse_withdrawn`. Unscoped instances remain fail-closed. Inbound reuse and
+  live advertised tunnels still survive REGISTRY_ONLY publication.
+  As defense in depth, mesh startup and `ferrum-edge validate` now reject any
+  planned inbound/outbound TCP listeners sharing a nonzero port number, even
+  on different addresses; UDP capture and port `0` are excluded. **Operators
+  relying on same-port-number inbound/outbound binds must choose distinct TCP
+  ports before restarting.** This follow-up corrects #5583's assumption that
+  only inbound listeners terminate CONNECT; NodeWaypoint capture is Outbound
+  and can terminate an authenticated CONNECT against a configured route.
+- Bump the optional `cryptoki` dependency (feature `pkcs11`) from 0.12.0 to 0.12.1 for
+  RUSTSEC-2026-0286: `Session::get_attributes` could build an out-of-bounds slice when
+  decoding `CKA_ALLOWED_MECHANISMS` (crash or adjacent heap disclosure). Lockfile-only
+  change; the manifest's `0.12` requirement already admits the patch release.
+- Re-evaluate the time-boxed `deny.toml` advisory exceptions before their
+  2026-09-30 expiry (#5721). `mongodb` now requires `>=3.7, <3.9` (the
+  lockfile moves from 3.6.0 to 3.8.2). 3.7 is the first release on hickory
+  0.26, which drops hickory-proto 0.25.2 (RUSTSEC-2026-0118,
+  RUSTSEC-2026-0119). The cap below 3.9 keeps MongoDB 4.2 and Cosmos DB
+  server-version-4.2 support, because 3.9 raised the driver's minimum wire
+  version to 9 (MongoDB 4.4). The optional `secrets-aws` build no longer
+  enables `aws-sdk-secretsmanager`'s legacy `rustls` feature, so hyper 0.14,
+  rustls 0.21 with rustls-webpki 0.101.7 (RUSTSEC-2026-0098, -0099, -0104)
+  and h2 0.3.27 (RUSTSEC-2026-0258) leave the tree. The client already used
+  the SDK's hyper 1.x HTTPS client. PEM parsing, in the gateway and in the
+  standalone performance harnesses, moves from the unmaintained
+  `rustls-pemfile` (RUSTSEC-2025-0134) to the `rustls-pki-types` PEM API.
+  Certificate, key, and CRL records are read the same way, but the wording of
+  the underlying parse error changes in the admin API TLS validation, the TLS
+  inventory, ACME certificate checks (`certificate_metadata`,
+  `validate_completed_certificate_pair`), and the managed TLS store.
+  `mtls_auth` is stricter: a `ca_certificate_pem` that also carries an
+  `ECHCONFIG` block was accepted before (the old parser skipped the block) and
+  is now rejected as containing another PEM item (fail-closed). `rsa`
+  (RUSTSEC-2023-0071) and `paste` (RUSTSEC-2024-0436) still have no upstream
+  fix and are re-affirmed until 2026-12-31.
+- **Route response-header policy is now part of the replay key** (PR #5709).
+  `response_caching`, `request_deduplication`, and `ai_semantic_cache` replay a
+  response whose headers were finalized when it was stored, so they skip the
+  matched route's response-header transforms. A route-only reload that changed
+  those transforms (for example, a new `ResponseHeaderModifier` removing a
+  sensitive header) could still replay entries finalized under the old rule.
+  The ordered transform list is now bound into the shared destination
+  partition, so such entries miss. Existing replay keys rotate once after
+  upgrading.
+- **Route-override backend TLS and DNS policy are now part of the replay key**
+  (issue #5710). Two dispatch rules can send the same request target to the
+  same backend host and port under different backend TLS, for example
+  per-tenant client certificates or one rule that verifies the origin and one
+  that does not. A `response_caching`, `request_deduplication`, or
+  `ai_semantic_cache` entry stored under one rule could be replayed to a
+  request routed under the other. The route-override TLS identity (client
+  certificate and key references, CA bundle, verification mode, SNI, and SAN
+  allow-list) and the route-override DNS policy are now bound into the shared
+  destination partition. Only identities are hashed, never key material.
+  Existing replay keys rotate once after upgrading.
+
+### Performance
+
+- `ws_frame_logging` builds its payload-fingerprint HMAC key once per plugin
+  instead of once per frame (#5690).
+- Circuit-breaker cache hits no longer allocate a key string (#5691).
+- `least_connections` and `least_latency` selection read each candidate's
+  counters by index instead of doing one or more `DashMap<String, _>` lookups
+  per candidate per request (#5693). Each balancer also no longer allocates
+  three default-sharded `DashMap`s.
+
+## [0.9.6] - 2026-09-25 [YANKED]
+
+`v0.9.6` was tagged but never published. The release workflow refused the
+tag target before building anything, so there is no GitHub Release, binary,
+or container image for it, and release tags are immutable. Every change
+listed under 0.9.7 above was prepared as 0.9.6 and ships unchanged in 0.9.7.
 
 ## [0.9.5] - 2026-09-13
 
@@ -3906,7 +4214,9 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.7...HEAD
+[0.9.7]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...v0.9.7
+[0.9.6]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.3...v0.9.4
 [0.9.0]: https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.0

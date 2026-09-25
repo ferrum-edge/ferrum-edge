@@ -7,11 +7,11 @@ set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$(pwd)}"
 RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/conformance-results}"
+. "$ROOT_DIR/scripts/gateway_api_gatewayclass_ownership.sh"
 DP_GATEWAY_NAMESPACE="${DP_GATEWAY_NAMESPACE:-gateway-conformance-infra}"
 GATEWAY_API_STATUS_ADDRESS="${GATEWAY_API_STATUS_ADDRESS:-127.0.0.1}"
 AUTHORITY_HOST="${AUTHORITY_HOST:-gatewayclass-authority.example}"
 AUTHORITY_PATH="${AUTHORITY_PATH:-/gatewayclass-authority}"
-FERRUM_CONTROLLER_NAME="ferrum.io/gateway-controller"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -38,19 +38,8 @@ wait_for_status() {
   return 1
 }
 
-apply_gateway_class() {
-  cat <<YAML | kubectl apply -f -
-apiVersion: gateway.networking.k8s.io/v1
-kind: GatewayClass
-metadata:
-  name: ferrum
-spec:
-  controllerName: ${FERRUM_CONTROLLER_NAME}
-YAML
-}
-
 apply_resources() {
-  cat <<YAML | kubectl apply -f -
+  cat <<YAML | kubectl --context "$GATEWAY_API_LAB_CONTEXT" apply -f -
 apiVersion: v1
 kind: Service
 metadata:
@@ -103,30 +92,35 @@ YAML
 
 run_blackbox() {
   local report="$RESULTS_DIR/gateway-api-gatewayclass-authority-blackbox.md"
+  gatewayclass_lab_require_identity
+  gatewayclass_lab_read_record
+  gatewayclass_lab_verify_owned
   : > "$report"
   echo "# GatewayClass Observed Authority Black-Box" >> "$report"
 
-  apply_gateway_class
   apply_resources
   wait_for_status "200" "owned-class-create" | tee -a "$report"
   echo "owned GatewayClass programmed ${AUTHORITY_HOST}${AUTHORITY_PATH}" >> "$report"
 
-  kubectl delete gatewayclass ferrum --wait=true
+  gatewayclass_lab_delete_owned
   wait_for_status "404" "owned-class-delete" | tee -a "$report"
   echo "deleting GatewayClass withdrew the listener without restarting Ferrum" >> "$report"
 
-  apply_gateway_class
+  gatewayclass_lab_create_owned "$GATEWAYCLASS_RUN_NONCE"
   wait_for_status "200" "owned-class-recreate" | tee -a "$report"
   echo "recreating the owned GatewayClass restored the listener" >> "$report"
 }
 
 collect_diagnostics() {
+  gatewayclass_lab_require_identity || return 1
   set +e
   mkdir -p "$RESULTS_DIR"
-  kubectl get gatewayclass ferrum -o yaml > "$RESULTS_DIR/gatewayclass-authority-gatewayclass.yaml"
-  kubectl -n "$DP_GATEWAY_NAMESPACE" get gateway,httproute ferrum-blackbox-gatewayclass -o yaml \
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" get gatewayclass ferrum -o yaml \
+    > "$RESULTS_DIR/gatewayclass-authority-gatewayclass.yaml"
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" -n "$DP_GATEWAY_NAMESPACE" \
+    get gateway,httproute ferrum-blackbox-gatewayclass -o yaml \
     > "$RESULTS_DIR/gatewayclass-authority-resources.yaml"
-  kubectl -n "$DP_GATEWAY_NAMESPACE" get events --sort-by=.lastTimestamp \
+  kubectl --context "$GATEWAY_API_LAB_CONTEXT" -n "$DP_GATEWAY_NAMESPACE" get events --sort-by=.lastTimestamp \
     > "$RESULTS_DIR/gatewayclass-authority-events.txt"
 }
 

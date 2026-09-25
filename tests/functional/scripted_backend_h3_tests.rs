@@ -220,6 +220,240 @@ async fn h3_forbidden_data_refined_cancels_and_preserves_response_policy() {
     assert_h3_forbidden_data_cancelled("stream", true).await;
 }
 
+/// Spawn a gateway whose single proxy dispatches to a native HTTP/3 backend
+/// under a matched `mesh_route_dispatch` rule carrying `timeouts` (#5646), and
+/// wait until the capability registry selects the native HTTP/3 pool.
+async fn spawn_h3_route_timeout_harness(
+    backend_port: u16,
+    timeouts: Value,
+    retry: Option<Value>,
+) -> (GatewayHarness, u16) {
+    let mut config: Value =
+        serde_yaml::from_str(&file_mode_yaml_for_h3(backend_port)).expect("fixture config");
+    // A read bound far past every route deadline below, so only the rule's
+    // timeouts can end an attempt.
+    config["proxies"][0]["backend_read_timeout_ms"] = json!(30_000);
+    if let Some(retry) = retry {
+        config["proxies"][0]["retry"] = retry;
+    }
+    // The rule's destination is the proxy's own backend, so the override is a
+    // no-op and only its timeouts apply.
+    let mut rule = json!({
+        "match": {},
+        "destination": {"backend_host": "127.0.0.1", "backend_port": backend_port}
+    });
+    if let (Some(rule), Some(timeouts)) = (rule.as_object_mut(), timeouts.as_object()) {
+        for (field, value) in timeouts {
+            rule.insert(field.clone(), value.clone());
+        }
+    }
+    config["proxies"][0]["plugins"] = json!([{"plugin_config_id": "h3-route-timeouts"}]);
+    config["plugin_configs"] = json!([{
+        "id": "h3-route-timeouts",
+        "plugin_name": "mesh_route_dispatch",
+        "scope": "proxy",
+        "proxy_id": "scripted-h3",
+        "enabled": true,
+        "config": {"rules": [rule]}
+    }]);
+    let (harness, _, https_port) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+        serde_yaml::to_string(&config).expect("yaml"),
+        true,
+        None,
+        &[("FERRUM_HTTP3_CONNECTIONS_PER_BACKEND", "1")],
+    )
+    .await;
+    wait_for_h3_class(&harness, "supported", Duration::from_secs(15))
+        .await
+        .expect("capability probe")
+        .expect("native H3 must be selected");
+    (harness, https_port)
+}
+
+/// A rule's total deadline (`request_timeout_ms`, Gateway API
+/// `timeouts.request`, #5646) ends an attempt the native HTTP/3 backend holds
+/// without answering: proxy core's route timeout `504`, long before the
+/// operator's read bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_pool_route_request_timeout_answers_504_before_the_response_head() {
+    let ca = TestCa::new("h3-route-deadline-head").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+    let backend_port = tcp.port;
+    let _h2 = spawn_h2_bridge_backend(tcp.into_listener(), &cert, &key, b"fallback");
+    // Accept the request and never answer it.
+    let backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::StallFor(Duration::from_secs(60)))
+        .spawn()
+        .expect("h3 backend");
+    let (_harness, https_port) =
+        spawn_h3_route_timeout_harness(backend_port, json!({"request_timeout_ms": 800}), None)
+            .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let started = Instant::now();
+    let resp = client
+        .get(&format!("https://127.0.0.1:{https_port}/api/stalled"))
+        .await
+        .expect("h3 request");
+    let elapsed = started.elapsed();
+    assert_eq!(resp.status.as_u16(), 504, "{resp:?}");
+    assert!(
+        resp.body_text().contains("Request timeout"),
+        "a total deadline answers proxy core's route timeout body: {:?}",
+        resp.body_text()
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-gateway-error")
+            .and_then(|value| value.to_str().ok()),
+        Some("backend_timeout")
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the 504 must arrive at the route deadline, not the operator's read bound: {elapsed:?}"
+    );
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "the native HTTP/3 backend must have held the one attempt: {requests:?}"
+    );
+}
+
+/// After the response head, the rule's total deadline cuts a native HTTP/3
+/// body with an `H3_REQUEST_CANCELLED` stream reset, never a clean finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_pool_route_request_timeout_resets_a_committed_body() {
+    let ca = TestCa::new("h3-route-deadline-body").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+    let backend_port = tcp.port;
+    let _h2 = spawn_h2_bridge_backend(tcp.into_listener(), &cert, &key, b"fallback");
+    // Commit the head and the first bytes, then pause forever.
+    let _backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+        ]))
+        .step(H3Step::RespondData(Bytes::from(vec![b'x'; 1024])))
+        .step(H3Step::StallFor(Duration::from_secs(60)))
+        .spawn()
+        .expect("h3 backend");
+    let (_harness, https_port) =
+        spawn_h3_route_timeout_harness(backend_port, json!({"request_timeout_ms": 800}), None)
+            .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let started = Instant::now();
+    let resp = client
+        .get(&format!("https://127.0.0.1:{https_port}/api/partial"))
+        .await
+        .expect("h3 request");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "the backend head was committed before the deadline: {resp:?}"
+    );
+    let body_error = resp.body_error.as_deref().unwrap_or_default();
+    assert!(
+        body_error.contains("H3_REQUEST_CANCELLED"),
+        "the committed body must end in an H3_REQUEST_CANCELLED reset, got {body_error:?}"
+    );
+    assert!(
+        resp.body_bytes.len() <= 1024,
+        "the cut body must be the committed prefix: {} bytes",
+        resp.body_bytes.len()
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the body must be cut at the route deadline: {elapsed:?}"
+    );
+}
+
+/// The per-attempt budget (`attempt_timeout_ms`, Gateway API
+/// `timeouts.backendRequest`) ends a native HTTP/3 attempt that never answers
+/// with the retryable backend-timeout `504`; the retry replays the retained
+/// request body on the same pooled QUIC connection, which answers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_pool_route_attempt_budget_retries_and_replays_the_body() {
+    let ca = TestCa::new("h3-route-deadline-retry").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+    let backend_port = tcp.port;
+    let _h2 = spawn_h2_bridge_backend(tcp.into_listener(), &cert, &key, b"fallback");
+    // The first request stream is accepted and never answered; the second
+    // (the retry) is read and answered.
+    let backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::AcceptStream)
+        .step(H3Step::ReadRequestData)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+        ]))
+        .step(H3Step::RespondData(Bytes::from_static(b"retried")))
+        .step(H3Step::RespondTrailers(vec![]))
+        .step(H3Step::StallFor(Duration::from_secs(30)))
+        .spawn()
+        .expect("h3 backend");
+    let (_harness, https_port) = spawn_h3_route_timeout_harness(
+        backend_port,
+        json!({"attempt_timeout_ms": 800}),
+        Some(json!({
+            "max_retries": 1,
+            "retryable_status_codes": [504],
+            "retryable_methods": ["POST"],
+            "retry_on_connect_failure": true
+        })),
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let payload = "replayed-request-body";
+    let started = Instant::now();
+    let resp = client
+        .get_with_options(
+            &format!("https://127.0.0.1:{https_port}/api/replayed"),
+            GetOptions::default()
+                .method(http::Method::POST)
+                .header("content-type", "text/plain")
+                .header("content-length", payload.len().to_string())
+                .body(Bytes::from_static(payload.as_bytes())),
+        )
+        .await
+        .expect("h3 request");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "the retry after the attempt budget must be served: {resp:?}"
+    );
+    assert_eq!(resp.body_text(), "retried");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the first attempt must end on its budget: {elapsed:?}"
+    );
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "one attempt and its retry must reach the backend: {requests:?}"
+    );
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(
+        requests[1].body,
+        payload.as_bytes(),
+        "the retry must replay the retained request body"
+    );
+}
+
 /// Spawn a protocol-honest H2-only TLS responder for capability probes,
 /// reqwest warmup, and H3 cross-protocol bridge requests.
 fn spawn_h2_bridge_backend(

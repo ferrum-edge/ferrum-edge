@@ -3,7 +3,7 @@
 #
 # Distroless has no shell; only this empty directory crosses into the runtime.
 # Use the same digest-pinned Debian base as Dockerfile's tooling stages.
-FROM debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132 AS data-dir
+FROM debian:13-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS data-dir
 RUN mkdir -m 0755 /data
 
 # Debian 13 (trixie) distroless has glibc 2.40. Published GNU binaries are

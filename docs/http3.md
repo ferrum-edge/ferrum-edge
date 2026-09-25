@@ -8,6 +8,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [Graceful shutdown and GOAWAY](#graceful-shutdown-and-goaway)
   - [GOAWAY under overload keepalive pressure (issue #4542)](#goaway-under-overload-keepalive-pressure-issue-4542)
 - [Dispatch model](#dispatch-model)
+  - [Route request deadline (`request_timeout_ms`, Gateway API `timeouts.request`)](#route-request-deadline-request_timeout_ms-gateway-api-timeoutsrequest)
 - [Native H3 fast path](#native-h3-fast-path)
 - [Cross-protocol bridge](#cross-protocol-bridge)
   - [Mesh transport dispatch for the H3→gRPC bridge](#mesh-transport-dispatch-for-the-h3grpc-bridge)
@@ -64,6 +65,12 @@ keeps the HTTPS TCP/H1/H2 listener and disables only QUIC/H3 for that port —
 `Alt-Svc` is omitted until a live QUIC task exists again. See
 [gateway_api_conformance.md](gateway_api_conformance.md) (HTTP/3 on Gateway
 listener ports).
+
+A route rule's timeouts (`mesh_route_dispatch` `request_timeout_ms` /
+`attempt_timeout_ms`, Gateway API `timeouts.request` / `timeouts.backendRequest`)
+do not affect the advertisement: the HTTP/3 frontend enforces both — see
+[Route request deadline](#route-request-deadline-request_timeout_ms-gateway-api-timeoutsrequest)
+below.
 
 ## Graceful shutdown and GOAWAY
 
@@ -159,6 +166,20 @@ The original wire `HttpFlavor` is computed once per request by `detect_http_flav
 The strict gRPC-Web media-type classifier recognizes only `application/grpc-web` and `application/grpc-web-text`, with an optional `+subtype` and optional media-type parameters. The shared wire classifier deliberately leaves those requests `Plain` so the `grpc_web` plugin retains ownership of binary/text request-body translation. The H3 frontend immediately promotes a recognized gRPC-Web request to an effective `Grpc` **policy** flavor while retaining both its `Http` plugin-cache key and original gRPC-Web response content type. Its precomputed request view contains the ordinary priority-ordered HTTP chain plus only `grpc_method_router` and `grpc_deadline` from the native-gRPC chain, without duplicate instances. POST validation, request limits, and fail-closed method/deadline policy consume the effective flavor; early and later rejections use the retained content type to emit the browser-facing gRPC-Web trailer-frame representation. Backend transport is promoted to native gRPC only when the `grpc_web` plugin stamps its trusted translation marker after rewriting the request. Without that plugin, the original `Plain` transport and gRPC-Web content type pass through to the backend, preserving existing deployments while policy recognition remains fail closed. When that pass-through request has an absolute RPC deadline, both H3 frontends and H1/H2 frontends bypass the native backend-H3 pool and use the deadline-aware reqwest bridge; the deadline covers client-pool acquisition, dispatch, upload, response headers, and response-body collection so the browser can receive the canonical status-4 trailer frame. Extended CONNECT classification takes precedence, so a WebSocket request cannot be promoted by a spoofed gRPC-Web content type.
 
 The native-gRPC composition is limited to the deadline and method-policy parity described here; it does not opt every gRPC-only plugin into gRPC-Web. Issue #2499 and advisory GHSA-m7x6-wqw2-3mvm remain the broader protocol-classification follow-up, and this deadline work does not claim or close either one.
+
+### Route request deadline (`request_timeout_ms`, Gateway API `timeouts.request`)
+
+A matched `mesh_route_dispatch` rule's total request deadline (`request_timeout_ms`) and per-attempt total bound (`attempt_timeout_ms`, Gateway API `timeouts.backendRequest`) are armed right after `before_proxy`, before target selection. A gRPC or gRPC-Web request folds both into its absolute RPC deadline, which the H3 gRPC dispatch paths and the bridge's gRPC-Web pass-through enforce; both bridges re-arm a fresh attempt budget for each retry (ending it before backoff) and charge an attempt-budget expiry after the request was sent to the backend, exactly as proxy core does. A `Plain` request is bounded on every H3 dispatch path at the same phases proxy core bounds HTTP/1.1 and HTTP/2 (`src/http3/route_deadline.rs`):
+
+| Phase | Total deadline (`request_timeout_ms`) | Attempt budget (`attempt_timeout_ms`) |
+|---|---|---|
+| Buffering the client upload, acquiring the backend client, retry backoff | `504` `{"error":"Request timeout"}`, health-neutral, logged `before_dispatch` / `retry_backoff` | — |
+| Backend attempt, before the response head (dial, streamed upload, header wait, buffered body) | `504` `{"error":"Request timeout"}`, charged to the backend that held the attempt (logged `dispatch`), never retried | Ordinary backend-timeout `504` `{"error":"Backend timeout"}`, charged, retried when the retry policy lists `504`; the next attempt runs under a fresh budget and replays the retained request body. Exception: on the cross-protocol bridge, a buffered response body is collected after the retry loop, so an expiry while collecting it is the same charged `504` but is not retried |
+| After the response head | Body cut: the stream is reset with `H3_REQUEST_CANCELLED` (never a clean FIN), `body_error_class: read_write_timeout`, health-neutral | Same cut, at the committed attempt's budget |
+
+The pre-head terminals carry `X-Gateway-Error: backend_timeout`, byte for byte proxy core's. The committed body is cut at the earlier of the two instants, and the total deadline wins a tie, so a spent transaction is never retried. This covers the cross-protocol bridge to HTTP/1.1 / HTTP/2 / mesh backends (buffered and streaming uploads, the retry loop, buffered collection, and both streaming relays) and the native H3 backend pool (streaming upload, buffered and refined dispatch, the retry loop, and every streaming relay and trailer read). A native H3 attempt dials and sends in one step, so it is handed to the backend from its first poll and its budget starts there, as for a proxy-core retry attempt. A gateway-local wait before an attempt starts (backend admission, request-body hooks) is not cancelled mid-wait; a total deadline spent there refuses the next attempt without dialing it (health-neutral `before_dispatch`). The route deadline is not raced against a client write parked in QUIC flow control: a relay whose client stops reading is cut the next time it waits on the backend, so a client that never grants flow control again keeps its stream until it reads, its connection closes, or an authenticated request's credential lifetime ends. HTTP/1.1 and HTTP/2 behave the same way — their body is cut only when the transport next polls it. RFC 9220 WebSocket and RFC 9298 CONNECT-UDP tunnels are exempt, as on the H1/H2 frontends. A rule's per-attempt `timeout_ms` is unaffected and applies on every H3 path. When the rule carries neither bound no timer is armed and nothing is allocated.
+
+Because every path enforces the rule's timeouts, HTTP/3 stays advertised (`Alt-Svc`) on every frontend port, including ports that serve timed rules.
 
 ## Native H3 fast path
 
@@ -623,6 +644,14 @@ them against the response-header policy actually in force for the request:
   | Plugin | Why the set is not enumerable |
   | --- | --- |
   | `response_transformer` | `after_proxy` also applies `mesh_route_dispatch` route overrides whose field names do not exist until the request runs |
+
+  The rules-free `response_transformer` route-override consumer
+  (`apply_route_overrides: true`, no static rules) and an enforcing `waf`
+  declare `ResponseTrailerPolicy::RequestConditionalUnbounded` instead: the same
+  drop, resolved per request against the finalized request context. The
+  consumer governs only requests whose matched dispatch rule published a
+  response route override; `waf` governs every request its `global_exemptions`
+  do not exempt.
 
   `ai_stream_router` does not need this arm: Anthropic SSE normalization
   declares the shared finite representation-metadata inventory plus the

@@ -630,6 +630,34 @@ async fn test_consumer_rate_limiting_uses_authenticated_identity_fallback() {
     assert_continue(result);
 }
 
+#[tokio::test]
+async fn test_consumer_identity_equal_to_ip_does_not_share_ip_budget() {
+    // An authenticated identity that happens to equal an IP must not drain
+    // the anonymous budget of the caller at that IP.
+    let config = json!({
+        "limit_by": "consumer",
+        "type_rate_limits": {
+            "mutation": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+    let query = "mutation { createUser(name: \"a\") { id } }";
+
+    let mut ctx = create_graphql_context(query, None);
+    ctx.client_ip = "203.0.113.7".to_string();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("203.0.113.7".to_string());
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mut ctx = create_graphql_context(query, None);
+    ctx.client_ip = "203.0.113.7".to_string();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = None;
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
 // ── Uninspectable transports (GHSA-762h) ──
 
 fn assert_uninspectable_reject(result: PluginResult) {

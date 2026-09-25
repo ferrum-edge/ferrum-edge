@@ -15,7 +15,7 @@ Companion documents:
 > **Build-out status.** Ferrum Edge is pre-1.0 and publishes semver releases on
 > the `v0.9.x` channel (see the [Releases
 > page](https://github.com/ferrum-edge/ferrum-edge/releases) for the current
-> tag). This document targets **v0.9.5**. Read
+> tag). This document targets **v0.9.7**. Read
 > [support_policy.md](support_policy.md) before treating any item here as a
 > stability commitment.
 >

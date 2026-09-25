@@ -1,8 +1,8 @@
 use ferrum_edge::fuzz_support::{
-    fuzz_decode_config_document, fuzz_drain_mesh_udp_frames, fuzz_parse_datagram_header,
-    fuzz_parse_proxy_protocol, fuzz_translate_k8s_json, fuzz_validate_plugin_config,
-    mesh_udp_frame_round_trip, smoke_invariants, traceparent_round_trip_invariant,
-    MAX_FUZZ_INPUT_BYTES,
+    MAX_FUZZ_INPUT_BYTES, fuzz_decode_config_document, fuzz_drain_mesh_udp_frames,
+    fuzz_parse_datagram_header, fuzz_parse_proxy_protocol, fuzz_translate_k8s_json,
+    fuzz_validate_plugin_config, mesh_udp_frame_round_trip, smoke_invariants,
+    traceparent_round_trip_invariant,
 };
 use ferrum_edge::proxy::mesh_udp_frame::MAX_FRAME_PAYLOAD;
 use proptest::prelude::*;

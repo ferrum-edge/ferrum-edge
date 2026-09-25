@@ -234,8 +234,9 @@ identity predicate on a stream-only plugin, an HTTP-only predicate (`method`,
 `path`, `host`, `header`, `query`, `cookie`) on a stream-only plugin — a
 datagram or byte stream has no request line, header block, query string, or
 cookie jar, so the field is named in the error instead of being reinterpreted as
-empty — fixed core request/response body ceilings, and contextless
-response-trailer ownership. An identity predicate (`consumer` / `auth_method` /
+empty — fixed core request/response body ceilings, contextless
+response-trailer ownership, and a response route-header finalizer (the rules-free
+`response_transformer` route-override consumer). An identity predicate (`consumer` / `auth_method` /
 `spiffe_id`) also never gates a stream connection at all — the one gated stream
 phase is where stream authentication itself runs — so on a plugin that serves
 both families it governs the HTTP half only. A triggered response-presentation
@@ -4918,7 +4919,7 @@ config:
   cache_ttl_seconds: 0
 ```
 
-**Content-Type handling:** Without an explicit override, the media type (case-insensitive, before any `;` parameters) must be one of `application/json`, `application/openapi+json`, `application/openapi+yaml`, `application/vnd.oai.openapi`, `application/vnd.oai.openapi+json`, `application/yaml`, `application/x-yaml`, `application/wsdl+xml`, `application/vnd.sun.wadl+xml`, `application/xml`, `text/yaml`, `text/xml`, or `text/plain`. Matching values are preserved verbatim, including parameters; all other or missing values become `application/octet-stream`. An explicit `content_type` is operator-trusted and bypasses this upstream allow-list. Every successful response includes `X-Content-Type-Options: nosniff`.
+**Content-Type handling:** Without an explicit override, the media type (case-insensitive, before any `;` parameters) must be one of `application/json`, `application/openapi+json`, `application/openapi+yaml`, `application/vnd.oai.openapi`, `application/vnd.oai.openapi+json`, `application/yaml`, `application/x-yaml`, `application/wsdl+xml`, `application/vnd.sun.wadl+xml`, `application/xml`, `text/yaml`, `text/xml`, or `text/plain`. Matching values are preserved verbatim, including parameters; all other or missing values become `application/octet-stream`. An explicit `content_type` is operator-trusted and bypasses this upstream allow-list. Every successful response includes `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'; sandbox`, so an allowed XML type cannot run XHTML-namespaced script on the gateway origin.
 
 **Error handling and admission:** If the upstream spec URL is unreachable, oversized, unreadable, returns a non-2xx status, or uses an unsupported/malformed `Content-Encoding`, the plugin returns a `502` JSON error with `Retry-After`. One outbound fetch is active per plugin instance, failed completions are negatively cached with exponential backoff from 1 to 30 seconds, and cached failures report the whole seconds remaining in that window. At most 32 cache-miss callers (including the fetcher) are admitted. Excess callers receive `503` with `Retry-After` immediately rather than accumulating behind the fetch. The `spec_url` hostname is pre-warmed via DNS; logs include only its credential-free origin, never the configured path, query, fragment, or URL userinfo.
 
@@ -5073,6 +5074,8 @@ Body rules support the same dot-notation features as `request_transformer`: nest
 Body transformation only applies to `application/json` content types (or any `+json` suffix). When body rules modify the payload, the gateway recomputes the forwarded `Content-Length` automatically. After an actual body rewrite, the shared body-transform lifecycle removes representation validators and integrity fields that described the origin bytes — `ETag`, `Last-Modified`, `Content-Digest`, `Repr-Digest`, legacy `Digest`, and `Content-MD5` (case-insensitive), along with related content-bound checksum / signature headers. `Last-Modified` is dropped (not rewritten) because it names when the origin representation changed, not the gateway-authored JSON rewrite. Those fields are preserved when the body is not JSON, parsing fails, or no rule changes the document (`transform_response_body` returns `None`). On buffered H1/H2/H3 paths, trailer integrity fields are handled the same way as other stale application trailers after a rewrite: native H3 drops backend trailers once the body is rewritten, and buffered gRPC retires application trailers (including digests) while preserving reserved terminal status metadata. Multiple `response_transformer` instances keep configured order; each instance that returns changed bytes re-runs the same finalize contract before the next transform. Cached responses stored by `response_caching` therefore retain only the post-rewrite header set, so a stale origin `ETag` / `Last-Modified` cannot satisfy a later conditional `304`. On a later `response_caching` HIT/REVALIDATED (or an idempotent replay), the shared synthetic finalizer skips re-applying these body and header sequences against the already-final stored representation while still running inspection and final-body hooks.
 
 **Route-level header precedence:** when `mesh_route_dispatch` publishes `response_transform` rules onto `RequestContext`, every enabled `response_transformer` instance applies only its static header rules first. Proxy core then applies the matched route list exactly once after the last eligible (enabled) instance — including on ordinary H1/H2/H3 responses, synthetic/rejection paths, header-capability simulation, and deadline provenance rebuilds — so route-level set/add/remove wins under multiple same-type instances. A disabled RTDS instance is not eligible and does not consume the list. `apply_route_overrides: true` allows an empty `rules` array for the auto-emitted VirtualService consumer. That exact translator-owned consumer composes with a same-name global transformer instead of shadowing its static rules; ordinary proxy-scoped transformers continue to override globals.
+
+**Response-trailer policy.** Because a route override can name any field at request time, `response_transformer` fails closed on trailer-forwarding paths and drops the non-reserved backend trailer section (native gRPC keeps `grpc-status` / `grpc-message` / `grpc-status-details-bin`). An instance with any static header or body rule applies that arm to every response it handles. A rules-free `apply_route_overrides: true` consumer has no policy of its own, so it applies the arm only to requests whose matched `mesh_route_dispatch` rule published a `response_transform`; other requests on the same proxy — for example a merged Gateway API route or rule that declares no `ResponseHeaderModifier` — keep their backend trailers. That consumer cannot carry a per-instance `trigger`: proxy core applies the route override at the last eligible transformer without consulting one.
 
 **RTDS runtime gate (mesh only).** `runtime_overlay_scope` + `ferrum.response_transformer.<scope>.enabled` work exactly as documented for [`request_transformer`](#request_transformer), including the reserved `runtime_overlay_resolved_enabled` binding and the guarantee that an in-flight response keeps the gate it started with. A disabled instance is ineligible for route-header finalization.
 
@@ -8726,11 +8729,13 @@ type column says so. Unknown keys are rejected at every level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `match` | Object | `{}` | Predicates, all-of across the fields below. An empty match is rejected **unless** the rule carries a route action (`request_transform`, `response_transform`, `fault`, `rewrite`, `redirect`), which makes it the deliberate action-only catch-all; otherwise it would silently shadow every later rule |
+| `match` | Object | `{}` | Predicates, all-of across the fields below. An empty match is rejected **unless** the rule carries a route action (`request_transform`, `response_transform`, `fault`, `rewrite`, `redirect`, `timeout_ms`, `timeout_disabled: true`, `request_timeout_ms`, `attempt_timeout_ms`, `retry`, `retry_disabled: true`), which makes it the deliberate action-only catch-all; otherwise it would silently shadow every later rule |
 | `destination` | Object | `{}` | Route override applied on match. At least one field must be set unless the rule carries a `redirect` |
 | `timeout_ms` | u64 \| null | omitted | Route-local backend response/read timeout. `0` means "no timeout". Cannot be combined with `timeout_disabled: true` |
 | `timeout_disabled` | bool | `false` | Clear the selected proxy's inherited backend read timeout for this route (resolves to `0`). Cannot be combined with `timeout_ms` |
-| `retry` | Object \| null | omitted | Route-local retry policy (below). Cannot be combined with `retry_disabled: true` |
+| `request_timeout_ms` | u64 \| null | omitted | Route-local **total** request deadline in milliseconds from request receipt (Gateway API `timeouts.request`). Spans every backend attempt, retry backoff, and the streaming response body; never re-armed by a retry and never promoted onto the proxy. `0` is rejected — omit it for no deadline. See [Route request deadline](#route-request-deadline) |
+| `attempt_timeout_ms` | u64 \| null | omitted | Route-local **total** bound on each backend attempt in milliseconds (Gateway API `timeouts.backendRequest`, which the translator also projects as `timeout_ms`). Starts when the attempt is handed to the backend and covers its response head and whole response body; every retry attempt gets a fresh budget, and `request_timeout_ms` still bounds the whole transaction. Independent of `timeout_ms` / `timeout_disabled`. Never promoted onto the proxy. `0` is rejected — omit it for no per-attempt total bound. See [Route attempt budget](#route-attempt-budget) |
+| `retry` | Object \| null | omitted | Route-local retry policy (below), applied only to requests this rule matches (Istio `http[].retries`, Gateway API `HTTPRoute.rules[].retry`). Cannot be combined with `retry_disabled: true` |
 | `retry_disabled` | bool | `false` | Clear the selected proxy's inherited retry policy for this route. Cannot be combined with `retry` |
 | `request_transform` | Object[] | `[]` | Route-level request header transforms (below). Requires an eligible consumer — see [Route transforms need a consumer](#route-transforms-need-a-consumer) |
 | `response_transform` | Object[] | `[]` | Route-level response header transforms. Same shape and same consumer requirement, plus the closed protocol-managed destination set described above |
@@ -8777,7 +8782,7 @@ type column says so. Unknown keys are rejected at every level.
 |---|---|---|---|
 | `uri` | String \| null | omitted | Replacement path. Must be a canonical absolute path with no query or fragment; percent escapes, dot segments, backslashes, and CRLF are rejected at load, and the composed path is re-checked before publication |
 | `authority` | String \| null | omitted | Replacement `Host` / `:authority`. Non-empty, CRLF-free, no whitespace |
-| `match_prefix` | String \| null | omitted | The literal prefix to replace with `uri`. Replacement is literal: the unmatched suffix is appended **verbatim**, so `match_prefix: /prefix/old` + `uri: /new` forwards `/prefix/oldtail` as `/newtail`, never `/new/tail`. A doubled separator is collapsed when both sides carry a `/` (`match_prefix: /prefix` + `uri: /` forwards `/prefix/etc` as `/etc`). A suffix whose first complete segment is `.` or `..` keeps its boundary so the canonical-path check refuses it (`/prefix/old../admin` composes `/new/../admin` and returns `400`); other dot-leading suffixes remain literal (`/prefix/old.env` becomes `/new.env`, and `..hidden` becomes `/new..hidden`). An empty string means "no prefix" — `uri` replaces the whole path |
+| `match_prefix` | String \| null | omitted | The literal prefix to replace with `uri`. Replacement is literal: the unmatched suffix is appended **verbatim**, so `match_prefix: /prefix/old` + `uri: /new` forwards `/prefix/oldtail` as `/newtail`, never `/new/tail`. A doubled separator is collapsed when both sides carry a `/` (`match_prefix: /prefix` + `uri: /` forwards `/prefix/etc` as `/etc`). A suffix whose first complete segment is `.` or `..` keeps its boundary so the canonical-path check refuses it (`/prefix/old../admin` composes `/new/../admin` and returns `400`); other dot-leading suffixes remain literal (`/prefix/old.env` becomes `/new.env`, and `..hidden` becomes `/new..hidden`). An empty string strips nothing and prepends `uri` (`match_prefix: ""` + `uri: /v2` forwards `/users` as `/v2/users`); the Gateway API translator emits it for a `URLRewrite` / `RequestRedirect` `ReplacePrefixMatch` under the root `PathPrefix: /`. Omit the field for whole-path replacement. A `match_prefix` with no `uri` is inert and dropped |
 
 **`rules[].redirect`** — every field is optional; a status-only redirect preserves the request URL.
 
@@ -8852,6 +8857,79 @@ still rejected at admission.
   way to clear a timeout or retry policy the selected proxy carries; leaving the
   field unset inherits it, which is the opposite of the operator's intent for a
   collapsed route.
+
+##### Route request deadline
+
+`timeout_ms` bounds ONE backend attempt: the wait for its response head and the
+idle gap between response frames (a steadily trickling body is not cut by it;
+`attempt_timeout_ms` is what bounds an attempt's total duration, see
+[Route attempt budget](#route-attempt-budget)). `request_timeout_ms` is the
+rule's TOTAL budget. Proxy core arms it once, after
+`before_proxy` has selected the rule, as one absolute instant anchored to request
+receipt, so request-phase time already spent counts against it and a retry can
+never re-arm it. It is request-scoped: it never changes the selected proxy,
+upstream, or pool key, and a request matching another rule (or none) is
+unaffected.
+
+| Request | Expiry before the response head | Expiry while the body streams |
+|---|---|---|
+| HTTP/1.1 / HTTP/2 / HTTP/3, not gRPC | The in-flight attempt or retry backoff is cancelled, no new attempt starts once the budget is spent, and the client gets `504` `{"error":"Request timeout"}` (`X-Gateway-Error: backend_timeout`). It is never retried. Transaction-log metadata `route_request_timeout` names the phase, which also decides backend-health attribution (see below): `dispatch` — the backend held the cancelled attempt — is error class `read_write_timeout`, charged to that backend; `before_dispatch` (the attempt had not been handed to a backend) and `retry_backoff` are the health-neutral `dispatch_policy_rejected` | The body ends with a timeout error, never a clean end of message: the HTTP/2 stream is reset, the HTTP/1.1 connection is closed, and the HTTP/3 stream is reset with `H3_REQUEST_CANCELLED`. On HTTP/1.1 and HTTP/2 a backend `Content-Length` stays advertised, so the cut reads as a short body. `body_error_class` is `read_write_timeout`, but the cut is **not** charged to the backend (see below). Native HTTP/3 phase details: [docs/http3.md](http3.md#route-request-deadline-request_timeout_ms-gateway-api-timeoutsrequest) |
+| gRPC / gRPC-Web on any frontend | The budget is folded into the request's RPC deadline (the earlier of it and any client `grpc-timeout` / `grpc_deadline` budget wins), so the existing deadline machinery answers `DEADLINE_EXCEEDED` and forwards the remaining budget as `grpc-timeout` | `DEADLINE_EXCEEDED` trailers before response DATA; a stream reset after it |
+
+**Backend-health attribution.** The deadline is charged to a backend (circuit
+breaker, passive health / outlier detection, least-latency and adaptive
+concurrency samples) only when that backend held the request. An attempt counts
+as handed to the backend once every gateway- and client-side step is done —
+buffered client-body collection, request-body hooks, DNS, and backend admission
+— and the dial, stream open, or send has begun; it is the same point where the
+attempt's latency sample starts. A retry attempt is handed over from its start,
+because the retry planner has already admitted it and replays the retained,
+already-transformed body. Expiry before that point — a client that stalls its
+upload while the gateway buffers it, for example — is recorded
+`before_dispatch` / `dispatch_policy_rejected` and feeds no failure and no
+latency sample. A streaming (unbuffered) upload is relayed as part of the
+backend exchange, so after the handoff it is attributed like the per-attempt
+header wait (`backend_read_timeout_ms`) already is. A cut **after** the response
+head is never charged: the backend has answered, and the total budget ends a
+long healthy download or a slow-reading client exactly as it ends a slow
+backend, so deferred accounting treats it like an expired client RPC deadline.
+
+Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
+not bounded by `request_timeout_ms`. Gateway-local plugin hooks are not
+cancelled mid-hook on a non-gRPC request: their time counts against the budget,
+which is enforced when each backend attempt starts, while it is awaited, in
+retry backoff, and while the response body streams. A client that stops reading
+a streamed response is not forced off by this deadline until the transport next
+polls the body.
+
+##### Route attempt budget
+
+`attempt_timeout_ms` bounds each backend attempt's TOTAL duration: from the
+moment the attempt is handed to the backend (the same point that starts its
+latency sample, described above) until its full response — head and body — has
+been received. A retry attempt is handed over from its start, and every attempt
+gets a fresh budget. `request_timeout_ms`, when set, still bounds the whole
+transaction: the earlier instant wins, and when both expire together the total
+deadline's terminal stands, so a spent transaction is never retried. Like the
+total deadline it is request-scoped: it never changes the selected proxy,
+upstream, or pool key. `timeout_ms` keeps bounding the header wait and idle
+gaps independently.
+
+| Request | Expiry before the response head | Expiry while the body streams |
+|---|---|---|
+| HTTP/1.1 / HTTP/2 / HTTP/3, not gRPC | The attempt is cancelled and answered with the ordinary backend-timeout `504` `{"error":"Backend timeout"}`, error class `read_write_timeout`, charged to the backend. Only the attempt ends: a route `retry` that lists `504` runs the next attempt under a fresh budget. An attempt still reading a buffered response body (a small `Content-Length` response, or one a response-body plugin buffers) ends the same way. The request body the attempt retained is published at the handoff, outside the cancelled attempt, so the retry replays it. Exception: the HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends collects a buffered response body after its retry loop, so an expiry there is the same charged `504` but is not retried | The body ends with the same timeout error as a `request_timeout_ms` cut (HTTP/2 stream reset, HTTP/1.1 connection close with `Content-Length` kept advertised, HTTP/3 `H3_REQUEST_CANCELLED` stream reset, `body_error_class: read_write_timeout`, not charged to the backend). A response whose head reached the client is never retried |
+| gRPC / gRPC-Web on any frontend | Folded into the RPC deadline when the rule is selected — earlier than the handoff, so a gRPC upload the gateway buffers counts against it — and the earliest of it, `request_timeout_ms`, and any client `grpc-timeout` / `grpc_deadline` budget wins. The backend is told the remaining budget in `grpc-timeout` and the client gets `DEADLINE_EXCEEDED`. When the attempt budget was the binding deadline and it expired after the request was sent (waiting for the response head, or collecting a buffered response body), the terminal is `Backend deadline exceeded`, charged to the backend like a stalled backend under `timeout_ms`; an expiry before that (buffered upload collection, DNS, admission, and on the native gRPC path connection acquisition) stays the health-neutral client-deadline terminal. The expiry is not retried: gRPC retries only connection failures. On every frontend — the HTTP/3 bridge's gRPC and gRPC-Web pass-through dispatch included — each retry attempt re-arms a fresh budget and retry backoff is bounded by the total alone | `DEADLINE_EXCEEDED` trailers before response DATA; a stream reset after it |
+
+A streamed (unbuffered) upload travels with the backend exchange, so the upload
+time after the handoff counts against the attempt budget, and an expiry while
+the upload is still streaming is charged to the backend like any other expiry
+after the handoff. Any response that takes longer than the budget to deliver is
+cut — a large but fast download, a Server-Sent Events stream, a long poll, or a
+server-streaming gRPC call, not only a trickled body — so size the budget for
+the longest complete response the rule must serve.
+
+With no `attempt_timeout_ms` the dispatch path is unchanged: no timer is armed
+and nothing is allocated for it.
 
 ##### Route transforms need a consumer
 

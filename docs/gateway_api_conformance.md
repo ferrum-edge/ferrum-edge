@@ -40,9 +40,30 @@ authoritative Gateway API conformance check, and it **gates** merges:
 |---|---|
 | Gateway API version | `v1.5.1` |
 | Conformance profile | `GATEWAY-HTTP,GATEWAY-GRPC` |
-| Supported features | `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute` |
+| Supported features | `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,HTTPRouteResponseHeaderModification,HTTPRoutePathRewrite,HTTPRouteHostRewrite,HTTPRouteRequestTimeout,HTTPRouteBackendTimeout` |
 | GatewayClass | `ferrum` |
 | Controller name | `ferrum.io/gateway-controller` |
+
+**Known deviations in the declared rule-timeout features** (details in
+[Rule timeouts](#rule-timeouts)). The upstream tests pass; these are the places
+where Ferrum's behavior differs from the upstream field definitions:
+
+- `HTTPRouteBackendTimeout`: upstream v1.5.1 defines `backendRequest` as the
+  time from when a request starts being sent to the backend until its full
+  response has been received. HTTP/1.1, HTTP/2 and HTTP/3 enforce exactly that,
+  per attempt, for non-gRPC requests. Where Ferrum differs:
+  - **gRPC and gRPC-Web** fold the budget into the RPC deadline **when the rule
+    is selected**, not at the handoff to the backend. That is stricter than
+    upstream: gateway-side time before the handoff (collecting a buffered
+    upload, DNS, admission, connection acquisition) counts against the first
+    attempt's budget. An expiry after the request was sent is charged to the
+    backend (`Backend deadline exceeded`); one before it stays health-neutral.
+  - **A gRPC budget expiry is not retried**: gRPC calls are retried only after
+    connection failures, never after `DEADLINE_EXCEEDED`, even when the rule's
+    `retry` lists `504`.
+- `HTTPRouteRequestTimeout`: no known deviation. HTTP/1.1, HTTP/2 and native
+  HTTP/3 enforce `request` fully, and HTTP/3 stays advertised (`Alt-Svc`) on a
+  listener port that serves a timed rule.
 
 Kick a manual run with:
 
@@ -50,7 +71,7 @@ Kick a manual run with:
 gh workflow run "Gateway API Conformance" \
   --field gateway_api_version=v1.5.1 \
   --field conformance_profile=GATEWAY-HTTP,GATEWAY-GRPC \
-  --field supported_features=Gateway,ReferenceGrant,HTTPRoute,GRPCRoute
+  --field supported_features=Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,HTTPRouteResponseHeaderModification,HTTPRoutePathRewrite,HTTPRouteHostRewrite,HTTPRouteRequestTimeout,HTTPRouteBackendTimeout
 ```
 
 ## Independent Validation
@@ -78,6 +99,10 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | `HTTPRoute` hostname, path, method, header, and query matching | Yes | Translated into proxies plus ordered `mesh_route_dispatch` rules where predicate matching is needed |
 | `HTTPRoute` `RequestHeaderModifier` | Yes | Route-level set/add/remove header filters are projected into request-transform rules and verified by black-box backend echo |
 | `HTTPRoute` `RequestRedirect` | Yes | Redirect filters materialize action-only dispatch rules with status, hostname, scheme, port, and path replacement support |
+| `HTTPRoute` / `GRPCRoute` `ResponseHeaderModifier` | Yes | Rule-level set/add/remove response-header filters are projected into route-local response-transform rules applied by a generated `response_transformer` consumer, and verified through the data plane on both kinds. Upstream `set` overwrites and `add` appends to an existing value. The generated consumer is additive to a same-name **global** `response_transformer`: global static rules run first, the matched route's rules run last and win on a shared name. A filter naming a protocol-managed (hop-by-hop or framing) response field, or setting, adding or removing a gRPC terminal status field (`grpc-status` / `grpc-message` / `grpc-status-details-bin`), is refused at admission. **Trailer cost:** a route override can name any field at request time, so the requests a filtered rule matches drop their non-reserved backend trailers. The generated consumer's trailer policy is request-conditional: sibling rules, and other routes merged onto the same proxy, that declare no response-header filter keep their trailers. For a native gRPC call the initial metadata is modified while `grpc-status` / `grpc-message` / `grpc-status-details-bin`, the message and streaming are preserved; application trailers on that rule are not. `ResponseHeaderModifier` never modifies trailers on any kind. See [ResponseHeaderModifier and response trailers](#responseheadermodifier-and-response-trailers) |
+| `HTTPRoute` `URLRewrite` | Yes | `hostname` rebases the backend-facing `Host` / `:authority` (backend selection, SNI, and `BackendTLSPolicy` are unaffected — the rewrite changes the forwarded authority only). `path.type: ReplaceFullPath` replaces the whole path; `path.type: ReplacePrefixMatch` replaces the matched `PathPrefix` and preserves the untouched suffix and the query string, reproducing the upstream rewrite table (`/foo/` and `/foo` rewrite identically, an empty replacement normalizes to `/`, and the root `PathPrefix: /` prepends rather than replacing). `ReplacePrefixMatch` requires every match in the rule to be a `PathPrefix` match. Gateway API proxies never strip their `listen_path` and carry no backend path prefix, so the rewrite is the only path mutation. `URLRewrite` is HTTPRoute-only upstream and stays refused on `GRPCRoute`, and combining it with `RequestRedirect` in one rule is refused rather than silently dropping one action. An HTTPRoute rule with no `backendRefs` whose only filters are `URLRewrite` and/or header modifiers answers HTTP 500, as upstream requires for a rule that forwards nowhere |
+| `HTTPRoute` rule `timeouts` (`request`, `backendRequest`) | Yes (`HTTPRouteRequestTimeout`, `HTTPRouteBackendTimeout`) | Standard-channel rule field, validated exactly as the pinned CRD does (GEP-2257 duration grammar; a non-zero `request` bounds `backendRequest`). `backendRequest` bounds ONE backend attempt until its full response has been received, with a fresh budget for every retry attempt; `request` is ONE absolute budget for the whole transaction — every attempt, retry backoff, and the streaming response body. Both stay on the rule's own dispatch entry, never on the shared proxy or upstream. `0s` disables either bound. HTTP/1.1, HTTP/2 and native HTTP/3 enforce both. Known deviations: a gRPC call's `backendRequest` budget starts when the rule is selected rather than at the handoff, and its expiry is not retried. See [Rule timeouts](#rule-timeouts). GRPCRoute defines no `timeouts` and stays refused |
+| `HTTPRoute` rule `retry` (`codes`, `attempts`, `backoff`) | No upstream feature exists on `v1.5.1`; Ferrum data-plane regressions | Experimental-channel rule field, present in the experimental CRD bundle the lab installs and validated exactly as that CRD does (codes 400–599, integer `attempts`, GEP-2257 `backoff`); CRD-valid values beyond Ferrum's limits (`attempts` outside 0–100, `backoff` over 5m) are `UnsupportedValue`. `attempts` counts retries after the initial attempt, `codes` are the retried statuses, and `backoff` is a fixed minimum wait. Status retries replay only `GET`/`HEAD`/`OPTIONS`/`PUT`/`DELETE`; a failure before any byte reached the backend is retried for every method. Every attempt and backoff stays inside the rule's `timeouts.request` budget, and a response whose head reached the client is never replayed. The policy stays on the rule's own dispatch entry, never on the shared proxy or upstream. See [Rule retry](#rule-retry). GRPCRoute defines no `retry` and stays refused |
 | `HTTPRoute` weighted `backendRefs` | Yes | Multiple non-zero backends create a weighted upstream; a rule whose backendRefs are **all** `weight: 0` remains traffic-capturing and returns HTTP 500 through a synthesized fault-abort — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Cross-namespace `HTTPRoute.backendRefs` | Yes | Requires an exact `ReferenceGrant`; missing grants are rejected and unresolved |
 | Cross-namespace `parentRefs` | Yes | Allowed only when the referenced Gateway listener permits the route namespace (`HTTPRoute`, `GRPCRoute`, `TCPRoute`, and `TLSRoute`). `allowedRoutes.namespaces.selector` is parsed atomically with Kubernetes label-key/value and operator-cardinality validation; a malformed component invalidates the listener and attaches no routes. ReferenceGrant is not used for parentRefs. |
@@ -574,6 +599,403 @@ since both are unbounded, attacker-influenceable input.
 A rule whose every match is dropped materializes no route, so its parent status
 is not reported as programmed.
 
+## Rule-filter admission
+
+Every rule in an `HTTPRoute` / `GRPCRoute` is validated before any route
+configuration is emitted, so a supported rule never makes an unsupported
+sibling look programmed. Beyond the per-filter field inventory, the shapes
+below are refused rather than partially honored.
+
+The status reason follows **what** is wrong, never which CRD mechanism
+(`Pattern`, a required field, or an `XValidation` CEL rule) forbids it. A file-
+or CP-delivered object never passed through the API server, so Ferrum re-checks
+every one of these itself.
+
+- **`IncompatibleFilters`** — the rule's filter *set* cannot be honored as
+  declared: filters that conflict with each other, a filter type the route kind
+  does not carry, or a filter type or field Ferrum does not implement. This is
+  upstream's own definition of the reason, whose documented example is
+  `URLRewrite` + `RequestRedirect` — a combination the CRD also forbids with CEL.
+- **`Invalid`** — a bad *value* inside one filter: malformed, missing where
+  required, or inconsistent with the rest of that filter or its rule.
+- **`UnsupportedValue`** — a CRD-valid value Ferrum declines to implement or
+  refuses by policy.
+
+| Shape | Status | Why |
+|---|---|---|
+| `URLRewrite` + `RequestRedirect` in one rule | `Accepted=False` / `IncompatibleFilters` | A redirect answers the request itself, so the rewrite could never be applied. Honoring one would silently drop the other. |
+| A repeated `RequestHeaderModifier`, `ResponseHeaderModifier`, `RequestRedirect` or `URLRewrite` in one rule | `Accepted=False` / `IncompatibleFilters` | Upstream declares these at most once per rule; a repeat is a conflicting declaration, and taking the first would discard the second. |
+| `URLRewrite` on a `GRPCRoute` | `Accepted=False` / `IncompatibleFilters` | Upstream's GRPCRoute filter enum carries no `URLRewrite`. |
+| An unknown field inside `URLRewrite.path` (for example `replaceQuery`) | `Accepted=False` / `IncompatibleFilters` | A filter field Ferrum does not implement, exactly like an unhandled field elsewhere in a filter. |
+| `URLRewrite` `path.type: ReplacePrefixMatch` with a non-`PathPrefix` match in the rule | `Accepted=False` / `Invalid` | There is no matched prefix to rebase. Upstream is stricter (exactly one `PathPrefix` match); Ferrum also accepts several `PathPrefix` matches and a match-less rule, each rebased against its own prefix. |
+| `URLRewrite.path` carrying the modifier field of the other `type` (`type: ReplaceFullPath` with `replacePrefixMatch`, or the reverse) | `Accepted=False` / `Invalid` | Only the selected type's field is honored, so the other replacement would be silently dropped. |
+| An unknown `URLRewrite` `path.type` | `Accepted=False` / `UnsupportedValue` | A newer channel may add an enum member Ferrum has not implemented yet. |
+| `ResponseHeaderModifier` naming a hop-by-hop or framing response field | `Accepted=False` / `UnsupportedValue` | Ferrum strips those from backend responses by design; reintroducing one from a route filter would punch a hole in the proxy boundary. |
+| `ResponseHeaderModifier` `set` / `add` / `remove` of `grpc-status`, `grpc-message` or `grpc-status-details-bin` (any case, either route kind) | `Accepted=False` / `UnsupportedValue` | A Trailers-Only gRPC response — how servers report most errors — carries its terminal status in the one HEADERS frame the filter edits, so the filter could turn a failed RPC into `grpc-status: 0` or strip its outcome. HTTPRoute is covered too because it can carry gRPC traffic. |
+| A malformed header name/value, rewrite hostname, or replacement path | `Accepted=False` / `Invalid` | The generated dispatch plugin applies the same gates, so admitting it would leave an "Accepted" route carrying configuration no data plane can load. |
+
+### `URLRewrite` prefix rewriting
+
+`ReplacePrefixMatch` reproduces the upstream `HTTPPathModifier` table. Upstream
+prefix matching is path-element aware, so `/foo/` and `/foo` select the same
+requests and must rewrite identically; Ferrum's dispatch plugin strips a literal
+byte prefix, so the translator canonicalizes the matched prefix by dropping a
+trailing separator and reducing the root `PathPrefix: /` to the empty prefix
+(strip nothing, prepend). An empty `replacePrefixMatch` normalizes to `/`.
+A `PathPrefix` match with no `value`, and a match with no (or a null) `path`,
+rebase against `/` — upstream's default, and where routing already places such
+an entry. The same prefix resolution applies to `RequestRedirect`
+`ReplacePrefixMatch`.
+
+| Request path | Prefix match | Replacement | Forwarded path |
+|---|---|---|---|
+| `/foo/bar` | `/foo` | `/xyz` | `/xyz/bar` |
+| `/foo/bar` | `/foo/` | `/xyz` | `/xyz/bar` |
+| `/foo/bar` | `/foo` | `/xyz/` | `/xyz/bar` |
+| `/foo` | `/foo` | `/xyz` | `/xyz` |
+| `/foo/` | `/foo` | `/xyz` | `/xyz/` |
+| `/foo/bar` | `/foo` | *(empty)* or `/` | `/bar` |
+| `/foo` | `/foo` | *(empty)* or `/` | `/` |
+| `/bar` | `/` | `/xyz` | `/xyz/bar` |
+
+The query string is carried separately and is never rewritten. Gateway API
+proxies are generated with `strip_listen_path: false` and no backend path
+prefix, so the rewrite is the only path mutation on the request — a path is
+never stripped and replaced twice. `hostname` rebases the forwarded
+`Host` / `:authority` only: it does not change backend selection, upstream SNI,
+or `BackendTLSPolicy` verification.
+
+### `ResponseHeaderModifier` and response trailers
+
+The translator projects the filter onto route-local response-transform rules
+carried by the rule's dispatch entry, and auto-emits a rules-free
+`response_transformer` on that proxy to consume them. That consumer is additive
+to a same-name **global** `response_transformer` (issue #4304): global static
+rules run first and the matched route's rules run last, so a route `set` wins a
+name the global also writes, while unrelated global rules keep applying.
+
+A response-header policy governs the response **trailers** of the requests it
+applies to, because a route override can name any field at request time and a
+field the backend sent only as a trailer would otherwise slip past it. The
+gateway's response-trailer governance therefore drops the non-reserved backend
+trailers of every request a filtered rule matches — this is a suppression, not a
+modification: `ResponseHeaderModifier` never rewrites a trailer.
+
+That cost is **per request, not per proxy**. The generated consumer carries no
+rules of its own, so it declares a request-conditional trailer policy
+(`RequestConditionalUnbounded`): the fail-closed drop applies only when the
+matched dispatch rule published a response transform for that request. This
+matters because same-kind routes that share a hostname, listener and path merge
+onto one proxy with one consumer — two GRPCRoutes whose method-only,
+header-only or match-less rules all land on `/`, or two HTTPRoutes on one
+`PathPrefix` where one rule is header-gated. A sibling there, possibly another
+team's route, keeps its application trailers.
+
+For a native gRPC call the practical contract is:
+
+- **Preserved**: the response message and streaming, and the terminal
+  `grpc-status` / `grpc-message` / `grpc-status-details-bin` fields.
+- **Modified**: the response's initial metadata (the HEADERS frame), which is
+  what upstream defines the filter to act on.
+- **Dropped**: other application trailers of the requests that rule matches.
+
+A sibling rule — on the same route, or on another route merged onto the same
+proxy — that declares no response-header filter keeps its application trailers,
+so the cost is scoped to the rules that opt in. Operators who need application
+trailers on a gRPC route should not attach a `ResponseHeaderModifier` to that
+rule. An operator-authored `response_transformer` with its own static rules is
+different: it governs every response on its proxy, as it always has.
+
+The filter may not name the terminal fields themselves: a response-side `set`,
+`add` or `remove` of `grpc-status`, `grpc-message` or `grpc-status-details-bin`
+is refused with `UnsupportedValue` (see the table above).
+
+## Rule timeouts
+
+`HTTPRoute.rules[].timeouts` is a standard-channel field on the pinned `v1.5.1`
+CRDs. GRPCRoute defines no such field, so a GRPCRoute rule carrying one keeps the
+`UnsupportedValue` refusal. Rule `retry` composes with it; see
+[Rule retry](#rule-retry).
+
+**Admission.** Both values are Gateway API durations (GEP-2257), checked against
+the CRD pattern `^([0-9]{1,5}(h|m|s|ms)){1,4}$` and summed the way Go's
+`time.ParseDuration` sums them (`1s1s` is two seconds). The CRD's CEL rule is
+re-checked too: when both are set and `request` is not the zero duration,
+`backendRequest` may not exceed it. A value outside the grammar, a non-string
+value, a non-object `timeouts`, and a CEL violation are `Accepted=False` /
+`Invalid`; a `timeouts` sub-field the CRD does not define is
+`UnsupportedValue`. No diagnostic echoes the offending value.
+
+**Projection.** Each rule's `timeouts` land on that rule's own
+`mesh_route_dispatch` entry: `request` as `request_timeout_ms`, `backendRequest`
+as both `timeout_ms` (the attempt's header wait and idle gap) and
+`attempt_timeout_ms` (the attempt's total duration), or as
+`timeout_disabled: true` alone for `0s`. A path-only rule that
+carries `timeouts` still emits its own dispatch entry, so the policy applies to
+exactly the requests the rule matches. Nothing is written onto the generated
+proxy or upstream, so a sibling rule — on the same route, or on another route
+merged onto the same proxy — keeps the proxy defaults (a 30 s per-attempt read
+bound and no total deadline). A rule with `timeouts` but no `backendRefs` and no
+`RequestRedirect` answers HTTP 500, like a filter-only rule. Removing `timeouts`
+withdraws the policy on the next reconcile.
+
+**`backendRequest`** bounds one backend attempt from the moment it is handed
+to the backend until its full response has been received, as upstream v1.5.1
+defines it. The budget starts once every gateway- and client-side step of the
+attempt is done (collecting a buffered client body, request-body hooks, DNS,
+backend admission) and the dial, stream open or send begins; a retry attempt is
+handed over from its start. It also keeps bounding the wait for the response
+head and every idle gap between response frames, as before.
+
+| Request | Expiry before the response head | Expiry while the body streams |
+|---|---|---|
+| HTTP/1.1, HTTP/2 or HTTP/3, not gRPC | The attempt is cancelled and the client gets the ordinary backend-timeout `504` (`{"error":"Backend timeout"}`), charged to the backend. Only the attempt ends: when the rule's `retry` lists `504`, the next attempt runs under a **fresh** budget | The body ends with a timeout error exactly like the `request` cut below: the HTTP/2 stream is reset, the HTTP/1.1 connection is closed and the HTTP/3 stream is reset with `H3_REQUEST_CANCELLED`; a backend `Content-Length` stays advertised on HTTP/1.1 and HTTP/2, `body_error_class` is `read_write_timeout`, and the cut is not charged to the backend. A response whose head reached the client is never retried |
+| gRPC / gRPC-Web, any frontend | Folded into the RPC deadline, anchored when the rule is selected (see the known deviations below): the earliest of that budget, `request` and any client `grpc-timeout` / `grpc_deadline` budget wins, the backend is told the remaining budget in `grpc-timeout`, and the client gets `DEADLINE_EXCEEDED`. When the attempt budget binds and expires after the request was sent — waiting for the response head, or collecting a buffered response body — the terminal is `Backend deadline exceeded`, charged to the backend's circuit breaker and passive health exactly like a stalled backend under the header wait. On every frontend — the HTTP/3 bridge's gRPC and gRPC-Web pass-through dispatch included — each retry attempt re-arms a fresh budget, and retry backoff is bounded by the total alone | `DEADLINE_EXCEEDED` trailers before response DATA, a stream reset after it |
+
+`request`, when set, still bounds the whole transaction: an attempt never runs
+past it, the earlier of the two instants wins, and when both expire together
+the `request` terminal stands, so a spent transaction is never retried. A cut
+that the gateway cannot tell apart from a slow-reading client is health-neutral,
+as for `request`. `0s` explicitly clears the proxy's default bound for the rule
+and sets no per-attempt budget. An attempt the gateway cancels while its
+response body is still being read into a buffer (a small `Content-Length`
+response, or one a response-body plugin buffers) is answered `504` like a
+pre-head expiry, and its retry replays the request body the attempt retained
+at the handoff.
+
+**Every response longer than the budget is cut.** The budget bounds the whole
+response, so a large but fast download, a Server-Sent Events stream, a long
+poll, and a server-streaming gRPC call all end at `backendRequest`, not only a
+body trickled inside the idle gap. Size it for the longest complete response
+the rule must serve. A streamed (unbuffered) upload travels with the backend
+exchange: the upload time after the handoff counts against the budget, and an
+expiry while it is still streaming is charged to the backend.
+
+**Known deviations:**
+
+- **gRPC budget start.** A gRPC or gRPC-Web budget is anchored when the rule is
+  selected, not when the attempt is handed to the backend, which is stricter
+  than upstream: gateway-side time before the handoff (collecting a buffered
+  upload, DNS, admission, connection acquisition) counts against the first
+  attempt. An expiry before the request was sent stays health-neutral.
+- **gRPC budget expiry is not retried.** gRPC calls are retried only after
+  connection failures, so a call whose attempt budget expired ends with
+  `DEADLINE_EXCEEDED` even when the rule's `retry` lists `504`.
+- **HTTP/3 bridge buffered collection is not retried.** The HTTP/3 bridge to
+  HTTP/1.1 and HTTP/2 backends collects a buffered response body (a
+  response-body plugin or `response_body_mode: buffer`) after its retry loop,
+  once `after_proxy` has run on the response head. An attempt budget that
+  expires while that body is collected ends the request with the same charged
+  backend-timeout `504`, but the rule's `retry` does not replay it, unlike
+  HTTP/1.1, HTTP/2 and the native HTTP/3 backend pool, which collect a buffered
+  body inside the attempt.
+
+The upstream `HTTPRouteTimeoutBackendRequest` test delays only the response
+head, which every frontend bounds.
+
+**`request`** is one absolute deadline, anchored to the instant the request was
+received and armed once the rule is selected, so request-phase time counts
+against it and no retry re-arms it:
+
+| Request | Expiry before the response head | Expiry while the body streams |
+|---|---|---|
+| HTTP/1.1, HTTP/2 or HTTP/3, not gRPC | The in-flight attempt or retry backoff is cancelled — and no new attempt starts once the budget is spent — and the client gets `504` `{"error":"Request timeout"}` with `X-Gateway-Error: backend_timeout`. Never retried. The transaction log names the phase in metadata `route_request_timeout`: `dispatch` when the backend held the cancelled attempt (error class `read_write_timeout`, charged to that backend), `before_dispatch` when the attempt had not yet been handed to a backend, and `retry_backoff` (both the health-neutral `dispatch_policy_rejected`) | The body ends with a timeout error: the HTTP/2 stream is reset, the HTTP/1.1 connection is closed, and the HTTP/3 stream is reset with `H3_REQUEST_CANCELLED`, rather than presenting a complete response; on HTTP/1.1 and HTTP/2 a backend `Content-Length` stays advertised, so the cut reads as a short body. `body_error_class` is `read_write_timeout`, and the cut is not charged to the backend |
+| gRPC / gRPC-Web, any frontend | Folded into the RPC deadline (the earlier of the route budget and any client `grpc-timeout` / `grpc_deadline` budget wins), so the existing deadline machinery answers `DEADLINE_EXCEEDED` and forwards the remaining budget upstream as `grpc-timeout` | `DEADLINE_EXCEEDED` trailers before response DATA, a stream reset after it |
+
+**Backend-health attribution.** A `request` expiry is charged to a backend —
+circuit breaker, passive health (Istio outlier detection included), and the
+latency samples — only when that backend held the request. An attempt is handed
+to the backend once the gateway has finished every gateway- and client-side step
+(collecting a buffered client body, request-body hooks, DNS, backend admission)
+and begun the dial, stream open, or send. Retry attempts are handed over from
+their start, since the retry planner admits them first and replays the already
+buffered body. So a client that stalls its upload while the gateway is buffering
+it — retries force that buffering — cannot open a healthy backend's breaker, and
+a backend that holds a request past the deadline without answering is charged.
+A streaming (unbuffered) upload travels with the backend exchange, so a stall
+after the handoff is attributed like the per-attempt header wait already is. A
+cut after the response head is never charged: the backend answered, and the
+total budget ends a long healthy download or a slow-reading client as surely as
+a slow backend. A gRPC request keeps the attribution of the client RPC deadline
+it was folded into.
+
+**HTTP/3.** The native HTTP/3 relays — the bridge to HTTP/1.1 and HTTP/2
+backends, and the native HTTP/3 backend pool, buffered or streaming, with or
+without retries — apply both bounds at the same phases as HTTP/1.1 and HTTP/2:
+every backend attempt runs under the total deadline and a fresh attempt budget,
+a buffered client upload is bounded by the total deadline, retry backoff spends
+it, and the committed attempt's response body is cut at the earlier of the two.
+A cut body ends with an `H3_REQUEST_CANCELLED` stream reset, never a clean
+finish, so an HTTP/3 client cannot mistake it for a complete response. HTTP/3
+therefore stays advertised (`Alt-Svc`) on every listener port, timed rules
+included. A native HTTP/3 attempt is handed to the backend from its first poll
+(the QUIC dial and the request go out together), exactly like a proxy-core retry
+attempt, so its budget starts there. A gateway-local wait before an attempt
+starts (backend admission, request-body hooks) is not cancelled mid-wait: a
+total deadline spent there refuses the next attempt without dialing it, with
+the health-neutral `before_dispatch` `504`. The route deadline is not raced
+against a client write parked in QUIC flow control: a relay whose client stops
+reading is cut the next time it waits on the backend, so a client that never
+grants flow control again keeps its stream until it reads, its connection
+closes, or an authenticated request's credential lifetime ends. HTTP/1.1 and
+HTTP/2 behave the same way — their body is cut only when the transport next
+polls it.
+
+Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
+not bounded by `request` on any frontend. Gateway-local
+plugin hooks on a non-gRPC request are not cancelled mid-hook; their time counts
+against the budget, which is enforced when each backend attempt starts, while it
+is awaited, in retry backoff, and while the body streams (the plugins the
+translator generates make no outbound calls). A client that stops reading a
+streamed response is cut when the transport next polls the body.
+
+The upstream `HTTPRouteTimeoutRequest` and `HTTPRouteTimeoutBackendRequest`
+tests exercise the HTTP/1.1 path. Ferrum's own data-plane regressions in
+`tests/integration/k8s_controller_gateway_status_tests.rs`
+(`gateway_route_timeouts_reach_the_data_plane`,
+`gateway_route_request_timeout_spans_retry_attempts_and_backoff`,
+`gateway_route_request_timeout_ends_grpc_calls_with_deadline_exceeded`,
+`removing_rule_timeouts_withdraws_the_deadline`,
+`gateway_route_request_timeout_does_not_charge_a_stalled_upload_to_the_backend`,
+`gateway_route_request_timeout_charges_a_backend_that_stalls_response_headers`,
+`gateway_route_request_timeout_body_cut_is_not_charged_to_the_backend`,
+`gateway_route_backend_request_bounds_each_attempt_until_its_full_response`,
+`gateway_route_backend_request_gives_each_retry_attempt_a_fresh_budget`,
+`gateway_route_request_timeout_still_bounds_backend_request_retries`,
+`gateway_route_backend_request_bounds_grpc_attempts_until_the_full_response`,
+`gateway_route_backend_request_charges_a_grpc_backend_that_stalls_response_headers`,
+`gateway_route_backend_request_cuts_a_retry_body_at_its_own_budget`,
+`attempt_budget_shorter_than_the_header_wait_retries_with_the_retained_body`)
+cover the pre-head `504`, the mid-body cut, the per-attempt bound inside a
+larger total budget, a trickled body cut by `backendRequest` alone (and left
+uncut once the per-attempt field is removed), a fresh `backendRequest` budget
+for each retry attempt that also cuts a retry's own body, `request` ending such
+retries, the `backendRequest` fold into a gRPC deadline and its circuit-breaker
+charge for a stalled gRPC backend, a per-attempt budget shorter than the header
+wait ending the attempt itself while its retry replays the retained request
+body, one budget across retry attempts and backoff with its
+`retry_backoff` transaction-log phase (with an operator-configured proxy retry;
+the same budget under a translated rule `retry` is covered in
+[Rule retry](#rule-retry)), the gRPC fold, `0s`, sibling
+isolation, withdrawal, and backend-health attribution through a live circuit
+breaker. The paused-clock unit tests in
+`tests/unit/gateway_core/route_request_deadline_tests.rs` pin the attempt
+wrapper (a spent budget refuses an attempt without polling it), the attribution
+rule, `Content-Length` preservation, native HTTP/3's pre-head terminals (byte
+for byte proxy core's), its committed-body bound and `H3_REQUEST_CANCELLED`
+cut, the HTTP/3 gRPC bridge re-arming the attempt budget for each retry, and
+`Alt-Svc` staying advertised where a timed rule is served;
+`tests/functional/functional_h3_local_policy_test.rs` drives an HTTP/3
+client through a live gateway's bridge to an HTTP/1.1 backend: a served
+request, the pre-head `504`, a reset committed body, an attempt budget retried
+with its request body replayed, and a fresh budget for each retry of a
+gRPC-Web pass-through call; `tests/functional/scripted_backend_h3_tests.rs`
+drives the same deadlines through the native HTTP/3 backend pool to a scripted
+HTTP/3 backend: the pre-head `504`, a committed body reset with
+`H3_REQUEST_CANCELLED`, and an attempt budget retried with its request body
+replayed;
+`tests/unit/gateway_core/route_attempt_budget_tests.rs` pins where the
+per-attempt budget starts (at the handoff, even when the attempt answers in the
+same poll, or a retry's first poll), that it
+ends only the attempt as a retryable backend timeout, that `request` wins when
+it is not later, that each attempt's budget is fresh, and that the committed
+attempt's budget cuts its body.
+
+## Rule retry
+
+`HTTPRoute.rules[].retry` is an **experimental-channel** field. The Gateway API
+lab installs the pinned `v1.5.1` experimental bundle (`experimental-install.yaml`,
+digest-pinned in `scripts/gateway_api_conformance_lab_setup.sh`), whose HTTPRoute
+CRD defines it as `codes`, `attempts` and `backoff`. The standard-channel CRDs do
+not carry it, so an API server serving only those prunes the field before
+Ferrum sees it. GRPCRoute defines no `retry` on any channel, so a GRPCRoute rule
+carrying one keeps the `UnsupportedValue` refusal. Upstream `v1.5.1` defines no
+retry conformance feature and no retry conformance test, so the workflow
+declares none; the behavior below is pinned by Ferrum's own data-plane
+regressions.
+
+**Admission.** The CRD's own checks are re-applied, because a file- or
+CP-delivered object never passed through the API server: `codes` is a list of
+integers from 400 to 599, `attempts` is an integer, and `backoff` is a GEP-2257
+duration (`^([0-9]{1,5}(h|m|s|ms)){1,4}$`). A wrong type, a code outside that
+range, a `backoff` outside the grammar, and a non-object `retry` are
+`Accepted=False` / `Invalid`. The CRD bounds neither `attempts` nor `backoff`.
+A negative `attempts`, one above 100 (Ferrum's per-request retry ceiling), and a
+`backoff` above `5m` (Ferrum's longest retry delay) are CRD-valid values Ferrum
+declines: `UnsupportedValue`. So is a `retry` sub-field the CRD does not define.
+No diagnostic echoes the offending value.
+
+**Projection.** Each rule's `retry` lands on that rule's own
+`mesh_route_dispatch` entry as a route-local `retry`. This is the same per-rule
+retry override the Istio VirtualService translator drives, not a parallel
+mechanism. Nothing is written onto the generated proxy or upstream, whose retry
+policy stays unset. A sibling rule without `retry` is never retried, whether it
+is on the same route or on another route merged onto the same proxy. A path-only
+rule carrying `retry` still emits its own dispatch entry, so the policy applies
+to exactly the requests the rule matches. A rule with `retry` but no
+`backendRefs` and no `RequestRedirect` answers HTTP 500. Removing `retry`
+withdraws the policy on the next reconcile.
+
+| Field | Ferrum behavior |
+|---|---|
+| `attempts` | The number of **retries** after the initial attempt. Upstream defines it as "the maximum number of times an individual request from the gateway to a backend should be retried", so it maps to `max_retries` unchanged and a request reaches the backend at most `attempts + 1` times. Once the retries are spent the client gets the last attempt's answer. `0` disables retries for the rule (`retry_disabled: true`). Omitted: Ferrum's default of 3 |
+| `codes` | The response statuses that trigger a retry (sorted and de-duplicated). A status not listed is returned after one attempt. Omitted or empty: no status is retried, only the connection failures below |
+| `backoff` | A **fixed** wait before every retry, never shorter. Upstream makes `backoff` the minimum wait between attempts, and Ferrum's exponential strategy jitters below its base, so it is not used here. Omitted: `100ms` |
+
+**Replay safety.** Honoring a manifest never makes an unsafe request replayable:
+
+- A retry on a listed status is sent only for `GET`, `HEAD`, `OPTIONS`, `PUT`
+  and `DELETE`. A `POST`, a `PATCH`, or any other method that reached the
+  backend is answered after one attempt, whatever `codes` lists.
+- Upstream says implementations SHOULD retry connection errors when `retry` is
+  configured. A failure before any request byte reached the backend (refused
+  connect, connect timeout, DNS failure, TLS handshake failure) is retried for
+  every method, since nothing was processed. To make that replay possible the
+  request body is buffered, bounded by the configured request-body limit. A
+  request whose declared body was never retained is never replayed.
+- **Known deviation:** a failure after the request reached the backend (a
+  reset, a disconnect, a `backendRequest` timeout) is not a retry class of its
+  own. The gateway answers it with a `502` or `504`, and it is retried only when
+  that status is in `codes`, and only for the methods above. So a `POST` the
+  backend may already have processed is never replayed.
+- Retries are decided on the response head, before anything reaches the client.
+  Once a head that is not retried has been sent, a backend failure mid-body ends
+  the client's response with an error and is never replayed. A small response
+  that declares `Content-Length` is read in full before its head is sent; a body
+  failure there becomes a gateway `502` / `504`, which nothing has committed,
+  and is retried only if listed.
+
+**Budget.** With `timeouts.request`, every attempt and every backoff spend one
+absolute budget (see [Rule timeouts](#rule-timeouts)). No attempt starts once the
+budget is spent. A backoff that would outlast it ends at the deadline with the
+gateway `504` (transaction-log metadata `route_request_timeout: retry_backoff`),
+so the transaction never exceeds `request`. `backendRequest` bounds each attempt
+separately, from its handoff until its full response has been received, and
+every retry attempt gets a fresh budget; its `504` is retried when `504` is
+listed, while a body it cuts after the head was sent is never replayed.
+
+**Transports.** The HTTP/1.1, HTTP/2 and HTTP/3 frontends apply the matched
+rule's policy to plain HTTP requests. A gRPC call routed by an HTTPRoute is
+retried only on pre-wire connection failures: its status travels in trailers,
+not in the HTTP status `codes` names. A WebSocket upgrade is also retried only
+on pre-wire connection failures. With several endpoints behind a backend, a
+retry may go to another endpoint.
+
+Ferrum's data-plane regressions in
+`tests/integration/k8s_controller_gateway_status_tests.rs` drive translated
+manifests through a real gateway and count backend attempts:
+`gateway_route_retry_reaches_the_data_plane` (a listed status sent exactly
+`attempts + 1` times, an unlisted status and a `POST` sent once, `attempts: 0`
+and a sibling rule sent once, a retry that recovers, and `backoff` as the
+minimum wait), `gateway_route_retry_backoff_stays_inside_the_request_budget`
+(two attempts and a `retry_backoff` `504` inside `request: 1900ms`, and full
+backoffs without a budget),
+`gateway_route_retry_never_replays_after_response_commitment`,
+`merged_http_route_sibling_without_retry_is_never_retried`, and
+`removing_rule_retry_withdraws_the_policy`. Admission and projection are pinned
+by `tests/unit/gateway_core/k8s_http_route_retry_tests.rs` and the status matrix
+in `unsupported_http_and_grpc_route_features_are_refused_before_materialization`.
+
 ## backendRef port and zero-weight semantics
 
 These behaviors are exercised by the black-box lab (invalid and weighted refs)
@@ -601,6 +1023,16 @@ single-cluster Gateway API behaviors, not cross-cluster or UDP mesh surfaces.
   (`http_route_keeps_all_zero_weight_rule_as_500_fault`) pins the route and
   fault shape; the black-box lab asserts `/zero-weight` returns `500` even with
   a later `/zero` backend route.
+- **Filter-only rule with no backendRefs.** An HTTPRoute rule with no
+  `backendRefs` and no `RequestRedirect`, whose only filters are header
+  modifiers and/or `URLRewrite`, forwards nowhere, so upstream requires a 500.
+  Ferrum attaches the same 100% fault-abort (`NoServiceableBackend`) rather than
+  forwarding to an unresolvable backend. A GRPCRoute rule in that shape keeps
+  the blackhole backend, exactly as its all-zero-weight rule does. The
+  translator test `http_route_filter_only_rule_without_backend_refs_answers_500`
+  pins the fault, and
+  `gateway_response_header_modifier_reaches_the_client_through_the_data_plane`
+  asserts the `500` through the gateway.
 - **backendRef port is numeric-only in the upstream CRD.** Gateway API v1.5
   defines `HTTPBackendRef.port` as `PortNumber`: for a Kubernetes Service it is
   the numeric Service port, not the target port. There is therefore no named
@@ -620,11 +1052,13 @@ The standalone `gateway-api-conformance.yml` workflow is the single owner that d
 - HTTP echo backend namespaces, the upstream suite's gRPC echo-basic fixtures,
   plus tagged TCP and TLS echo fixtures for live `TCPRoute` / `TLSRoute` checks.
 - `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, and `ReferenceGrant` resources for direct black-box checks.
-- The upstream Gateway API conformance suite pinned by `GATEWAY_API_VERSION`, defaulting to `v1.5.1`, running the complete `GATEWAY-HTTP` and `GATEWAY-GRPC` profiles with explicit supported features `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`. TCPRoute/TLSRoute remain gated by Ferrum black-box evidence, not by advertising upstream `GATEWAY-TCP` / `GATEWAY-TLS` profiles on this pin.
+- The upstream Gateway API conformance suite pinned by `GATEWAY_API_VERSION`, defaulting to `v1.5.1`, running the complete `GATEWAY-HTTP` and `GATEWAY-GRPC` profiles with explicit supported features `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute` plus the Extended features Ferrum implements end to end — the filter features `HTTPRouteResponseHeaderModification`, `HTTPRoutePathRewrite` and `HTTPRouteHostRewrite`, and the rule-timeout features `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout` (issue #5646) — which makes the suite RUN their tests rather than skip them. TCPRoute/TLSRoute remain gated by Ferrum black-box evidence, not by advertising upstream `GATEWAY-TCP` / `GATEWAY-TLS` profiles on this pin.
 
 Direct black-box checks cover hostname, path, method, headers, weighted backend selection, zero-weight-only HTTP 500 behavior, cross-namespace references, invalid references, backend failure, TLS, route updates, and route deletion for HTTP, plus TCPRoute parent/listener attachment, AllowedRoutes cross-namespace parentRefs (attach + tighten withdrawal), ReferenceGrant backend resolution, tagged echo traffic, fail-closed empty/missing/unpermitted backends, status, update, and deletion, plus TLSRoute AllowedRoutes cross-namespace parentRefs, Passthrough SNI selection, ReferenceGrant backend resolution, tagged TLS echo traffic, unmatched-SNI and empty/missing/unpermitted backend fail-closed behavior, status, update, and deletion, plus ListenerSet allowedListeners attachment, HTTPRoute parentRef traffic, NotAllowed default, Gateway `attachedListenerSets`, and delete withdrawal, plus GatewayClass observed-authority create/delete: a dedicated listener appears when the owned `GatewayClass` is created and withdraws without restarting Ferrum when that class is deleted. The pinned upstream suite owns live GRPCRoute conformance evidence. Diagnostics and the upstream conformance report are uploaded from `conformance-results/` as retained CI artifacts.
 
 Lab bootstrap uses `scripts/gateway_api_conformance_lab_setup.sh` (kind ports, experimental CRDs, TCP/TLS listener Service ports). The experimental CRD bundle is downloaded to a file with bounded retries and backoff and verified against a SHA-256 pinned next to `GATEWAY_API_VERSION` in that script before `kubectl apply`, so a transient gateway-api release CDN 5xx retries instead of failing this required gate, and a mismatched bundle fails closed. The version and the digest move together (recompute with `curl -fsSL <experimental-install.yaml URL> | shasum -a 256`); a dispatch run pinning a different tag must pass the matching `GATEWAY_API_EXPERIMENTAL_SHA256`. HTTP/GRPC upstream and black-box phases stay in `scripts/gateway_api_data_plane_conformance.sh`; TCPRoute, TLSRoute, ListenerSet, and GatewayClass-authority black-box and supplemental diagnostics run via `scripts/gateway_api_tcproute_conformance.sh`, `scripts/gateway_api_tlsroute_conformance.sh`, `scripts/gateway_api_listenerset_conformance.sh`, and `scripts/gateway_api_gatewayclass_authority_conformance.sh` so the Trusted Cross Build Policy frozen `gateway_api_data_plane_conformance.sh` surface on `main` stays untouched. `UDPRoute` evidence stays in the required `Tests` aggregate — translation/status/lifecycle in the Unit Tests job (`tests/unit/gateway_core/k8s_udproute_translation_tests.rs`) and the live UDP data path in the `protocols-data-plane` integration shard (`tests/integration/gateway_api_udproute_datapath_tests.rs`); this workflow does not add UDPRoute executable automation under the Trusted Cross Build Policy.
+
+The GatewayClass authority phase requires `GATEWAY_API_LAB_CONTEXT=kind-ferrum-gwapi` and an absolute `GATEWAY_API_LAB_OWNERSHIP_FILE` path shared with lab setup. For a local lab, export both before running setup, then keep the same values when running `scripts/gateway_api_gatewayclass_authority_conformance.sh blackbox` (and its `diagnostics` mode). For example, use `GATEWAY_API_LAB_OWNERSHIP_FILE="${TMPDIR:-/tmp}/gateway-api-gatewayclass-ownership-$$.tsv"` for a fresh run. Setup validates the context identity first, then pins every kubectl and Helm invocation to that context, so its CRD, namespace, secret, and control/data-plane writes cannot land on an ambient context that points at another cluster. Setup creates the class with a random run annotation and records its UID in that file. The authority phase checks the explicit Kind context, its control-plane node, the annotation, and the UID; deletion sends the UID as a Kubernetes delete precondition. An existing class or stale ownership record causes the run to stop rather than overwrite it. The hosted workflow sets these variables for the whole lab job.
 
 The standalone Gateway API conformance workflow triggers on every PR, but a lightweight `changes` job gates the heavy lab job internally: it runs the conformance suite only when the PR diff touches routing, Kubernetes translation/status, CP/DP sync, data-plane startup, plugins, charts, the conformance script, or related CI files, and otherwise skips it. Artifacts are retained for 90 days so the standard upstream report can be reproduced from the workflow inputs and preserved as release evidence.
 

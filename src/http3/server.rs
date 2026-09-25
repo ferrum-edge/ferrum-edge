@@ -211,13 +211,19 @@ where
 /// ONE composer for all seven native-H3 upload sites: the instant that is
 /// awaited and the owner that is reported are projections of the same
 /// composition, so they can never come from two different reads of the arbiter.
+///
+/// A plain request's matched route rule's total deadline (#5646) bounds the
+/// drain as well, exactly as proxy core bounds a buffered upload inside the
+/// attempt: a plain request carries no RPC deadline and a gRPC request no route
+/// deadline, so at most one of the two is ever present. Its expiry is proxy
+/// core's health-neutral route timeout (`finalize_h3_upload_deadline_rejection`).
 #[inline]
 pub(crate) fn h3_upload_authorization_bound(
     ctx: &RequestContext,
     authenticated_stream_max_lifetime_seconds: u64,
 ) -> crate::proxy::auth_lifetime::ComposedAuthBound {
     crate::proxy::auth_lifetime::ComposedAuthBound::compose(
-        ctx.grpc_deadline_at(),
+        crate::proxy::earliest_deadline(ctx.grpc_deadline_at(), ctx.route_request_deadline_at()),
         crate::proxy::auth_lifetime::effective_request_auth_deadline(
             ctx,
             authenticated_stream_max_lifetime_seconds,
@@ -802,6 +808,10 @@ enum H3TrailerFinishError {
     /// expiry records here; a parked write records through the shared write
     /// seam). Call sites reset the send half and latch the bounded class.
     AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    /// The matched route rule's body deadline (#5646) elapsed while the
+    /// backend trailer read was still outstanding. Call sites cut the body
+    /// exactly as the relay's own route deadline arm does.
+    RouteDeadline,
 }
 
 async fn finish_h3_response_with_backend_trailers<S>(
@@ -818,6 +828,9 @@ async fn finish_h3_response_with_backend_trailers<S>(
     // that parks past the credential cannot count a second termination for a
     // stream the relay's own arms already settled.
     auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    // The matched route rule's body deadline (#5646), or `None`. It bounds the
+    // trailer read exactly as it bounds every body frame of the relay.
+    route_body_deadline: Option<tokio::time::Instant>,
 ) -> Result<(), H3TrailerFinishError>
 where
     S: SendStream<Bytes>,
@@ -870,25 +883,26 @@ where
             Ok(recv_stream.recv_trailers().await)
         }
     };
-    let trailers_result = match crate::plugins::await_deadline_first(
-        auth_deadline.map(|plan| plan.at),
-        recv_trailers,
-    )
-    .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(err)) => return Err(err),
-        Err(()) => {
-            let termination = auth_deadline
-                .map(|plan| plan.termination)
-                .unwrap_or(crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired);
-            auth_latch.record_once(
-                termination,
-                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
-            );
-            return Err(H3TrailerFinishError::AuthorizationExpired(termination));
-        }
-    };
+    let trailer_wait_at =
+        crate::proxy::earliest_deadline(auth_deadline.map(|plan| plan.at), route_body_deadline);
+    let trailers_result =
+        match crate::plugins::await_deadline_first(trailer_wait_at, recv_trailers).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => return Err(err),
+            Err(()) => {
+                // Authorization wins an exact tie with the route deadline.
+                let Some(plan) = auth_deadline
+                    .filter(|plan| route_body_deadline.is_none_or(|route| plan.at <= route))
+                else {
+                    return Err(H3TrailerFinishError::RouteDeadline);
+                };
+                auth_latch.record_once(
+                    plan.termination,
+                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                );
+                return Err(H3TrailerFinishError::AuthorizationExpired(plan.termination));
+            }
+        };
     let trailers = match trailers_result {
         Ok(trailers) => trailers,
         Err(err) if crate::http3::client::is_h3_graceful_close(&err) => None,
@@ -4687,6 +4701,18 @@ async fn handle_h3_request(
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
         .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
+    // Arm the matched route rule's total request deadline (Gateway API
+    // `timeouts.request`) and per-attempt total bound (`backendRequest`). A
+    // gRPC request folds them into its RPC deadline, which the native-H3 gRPC
+    // relays enforce end to end. A plain request carries them in
+    // `route_request_deadline_at` / `route_attempt_timeout`, and every
+    // dispatch path below applies them at the same phases proxy core does for
+    // HTTP/1.1 and HTTP/2: each backend attempt runs under both, and the
+    // committed response body is cut at the earlier of the total deadline and
+    // that attempt's budget (see `crate::http3::route_deadline`). Upgraded
+    // tunnels (RFC 9220 WebSocket, RFC 9298 CONNECT-UDP) are not HTTP response
+    // bodies and are exempt, exactly as on the H1/H2 frontends.
+    ctx.arm_route_request_deadline(matches!(http_flavor, HttpFlavor::Grpc));
 
     // Preserve the client's original request path for access logging — the
     // transaction summaries below source `request_path` from this, not the
@@ -5087,6 +5113,12 @@ async fn handle_h3_request(
         let previous_routing_proxy = Arc::clone(&routing_proxy);
         routing_proxy = ctx
             .apply_route_overrides_with_upstreams(routing_proxy, epoch.load_balancer.upstreams());
+        // A deferred hook may have re-published route overrides, so re-arm the
+        // matched rule's deadlines (#5646) exactly as proxy core does here. The
+        // receipt-anchored total only ever shortens, but a gRPC rule's
+        // per-attempt budget restarts from now, which is still before the
+        // handoff to the backend.
+        ctx.arm_route_request_deadline(matches!(http_flavor, HttpFlavor::Grpc));
         // `apply_route_overrides_with_upstreams` is idempotent: it hands back
         // the SAME `Arc` when the already-baked proxy reflects every override,
         // so pointer identity against the retained pre-pass `Arc` is an exact,
@@ -6837,14 +6869,16 @@ async fn handle_h3_request(
             Err(()) => return Ok(()),
         };
 
-        // Track connection for least-connections LB (after all pre-dispatch rejects)
-        if let (Some(_upstream_id), Some(target), Some(balancer)) = (
-            &proxy.upstream_id,
-            &upstream_target,
-            upstream_balancer.as_ref(),
-        ) {
-            balancer.record_connection_start(target);
-        }
+        // Track connection for least-connections LB (after all pre-dispatch
+        // rejects). The guard is the one release: it drops when this branch
+        // exits, on every return, `?`, or unwind, so no early exit can leak
+        // the count (issue #5693).
+        let lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
+            upstream_target
+                .as_deref()
+                .filter(|_| proxy.upstream_id.is_some()),
+            upstream_balancer.as_deref(),
+        );
 
         let client_ip_owned = ctx.client_ip.clone();
         let h3_headers = build_h3_backend_headers(
@@ -6872,48 +6906,80 @@ async fn handle_h3_request(
             )
             .then(|| Arc::clone(&ctx.grpc_request_messages_observed));
 
-        let streaming_resp = if let Some(target) = upstream_target.as_deref() {
-            state
-                .h3_pool
-                .request_with_target_streaming_body(
-                    &proxy,
-                    &target.host,
-                    target.port,
-                    // DestinationRule policy port for `maxConnections` admission;
-                    // differs from the dial port only under a `targetPort` remap.
-                    target.dispatch_policy_port(),
-                    &method,
-                    &backend_url,
-                    &h3_headers,
-                    &mut stream,
-                    effective_max_request_body_size_bytes,
-                    Arc::clone(&request_body_bytes_seen),
-                    grpc_request_messages.clone(),
-                    proxy.backend_read_timeout_ms,
-                    Arc::clone(&request_stream_opened),
-                    Arc::clone(&request_upload_complete),
-                    tls_config_fn,
-                )
-                .await
-        } else {
-            state
-                .h3_pool
-                .request_streaming_body(
-                    &proxy,
-                    &method,
-                    &backend_url,
-                    &h3_headers,
-                    &mut stream,
-                    effective_max_request_body_size_bytes,
-                    Arc::clone(&request_body_bytes_seen),
-                    grpc_request_messages.clone(),
-                    proxy.backend_read_timeout_ms,
-                    Arc::clone(&request_stream_opened),
-                    Arc::clone(&request_upload_complete),
-                    tls_config_fn,
-                )
-                .await
+        // The matched route rule's deadlines (#5646). The streamed upload is
+        // handed to the backend as soon as the backend stream opens, so the
+        // attempt budget starts on the first poll and the upload time after the
+        // handoff counts against it, exactly as in proxy core. A route deadline
+        // that ends the attempt before the response head surfaces as a typed
+        // pool error and takes the ordinary dispatch-failure arm below.
+        let route = crate::http3::route_deadline::H3RouteDeadlines::from_ctx(&ctx);
+        let mut route_attempt_deadline = None;
+        // Pinned in place and awaited through the wrapper by reference, so the
+        // dispatch future is not copied again into this frame (see
+        // `h3_request_handler_boxes_its_largest_dispatch_relays`).
+        let dispatched = {
+            let attempt = async {
+                if let Some(target) = upstream_target.as_deref() {
+                    state
+                        .h3_pool
+                        .request_with_target_streaming_body(
+                            &proxy,
+                            &target.host,
+                            target.port,
+                            // DestinationRule policy port for `maxConnections` admission;
+                            // differs from the dial port only under a `targetPort` remap.
+                            target.dispatch_policy_port(),
+                            &method,
+                            &backend_url,
+                            &h3_headers,
+                            &mut stream,
+                            effective_max_request_body_size_bytes,
+                            Arc::clone(&request_body_bytes_seen),
+                            grpc_request_messages.clone(),
+                            proxy.backend_read_timeout_ms,
+                            Arc::clone(&request_stream_opened),
+                            Arc::clone(&request_upload_complete),
+                            tls_config_fn,
+                        )
+                        .await
+                } else {
+                    state
+                        .h3_pool
+                        .request_streaming_body(
+                            &proxy,
+                            &method,
+                            &backend_url,
+                            &h3_headers,
+                            &mut stream,
+                            effective_max_request_body_size_bytes,
+                            Arc::clone(&request_body_bytes_seen),
+                            grpc_request_messages.clone(),
+                            proxy.backend_read_timeout_ms,
+                            Arc::clone(&request_stream_opened),
+                            Arc::clone(&request_upload_complete),
+                            tls_config_fn,
+                        )
+                        .await
+                }
+            };
+            tokio::pin!(attempt);
+            crate::proxy::await_route_request_deadline(
+                route.total(),
+                crate::proxy::RouteAttemptBudget::from_start(
+                    route.attempt_timeout(),
+                    &mut route_attempt_deadline,
+                ),
+                attempt,
+            )
+            .await
         };
+        let streaming_resp = match dispatched {
+            Ok(result) => result,
+            Err(expiry) => Err(crate::http3::route_deadline::expiry_pool_error(
+                &mut ctx, expiry,
+            )),
+        };
+        let route_body_deadline = route.body_deadline(route_attempt_deadline);
 
         let mut h3_resp = match streaming_resp {
             Ok(r) => r,
@@ -6921,23 +6987,20 @@ async fn handle_h3_request(
                 let err_msg = e.to_string();
                 if err_msg.contains("exceeds maximum size") {
                     record_request(&state, 413);
-                    // Do NOT propagate a send error: record_backend_outcome
-                    // below releases the LB active-connection count, so a `?`
-                    // here would skip it and leak the count when the client
-                    // disconnects during the 413 write.
+                    // Do NOT propagate a send error: the outcome record below
+                    // releases the CB probe slot and the admission outcome, so
+                    // a `?` here would skip them when the client disconnects
+                    // during the 413 write.
                     let _ = send_h3_response(
                         &mut stream,
                         StatusCode::PAYLOAD_TOO_LARGE,
                         r#"{"error":"Request body exceeds maximum size"}"#,
                     )
                     .await;
-                    // Balance the record_connection_start above: this early
-                    // return was the only exit from this branch that did not
-                    // flow through record_backend_outcome, so the
-                    // least-connections gauge leaked one count for the selected
-                    // target on every oversized streaming upload. An oversized
-                    // client body is client-caused, which drives the two flags
-                    // below:
+                    // Record the outcome for this early return too (the
+                    // connection guard above releases the least-connections
+                    // count on its own). An oversized client body is
+                    // client-caused, which drives the two flags below:
                     //   * connection_error=false — accurate: no transport error
                     //     occurred; we chose to emit a 413 for a too-large body.
                     //     The ClientDisconnect class centrally suppresses the
@@ -6956,7 +7019,7 @@ async fn handle_h3_request(
                     //     and permanently wedging the breaker. Mirrors the
                     //     sibling 502 / oversized-response / after_proxy-reject
                     //     early returns below.
-                    crate::proxy::backend_dispatch::record_backend_outcome(
+                    crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                         &state,
                         &proxy,
                         &epoch.load_balancer,
@@ -7018,10 +7081,10 @@ async fn handle_h3_request(
                         e.is_read_timeout(),
                         h3_error_class,
                     );
-                // Do NOT propagate a send error: record_backend_outcome below
-                // releases the LB active-connection count, so a `?` here would
-                // skip it and leak the count when the client disconnects during
-                // the reject write.
+                // Do NOT propagate a send error: the outcome record below
+                // releases the CB probe slot and the admission outcome, so a `?`
+                // here would skip them when the client disconnects during the
+                // reject write.
                 let _ = send_h3_backend_failure_response(
                     &mut stream,
                     reject_status,
@@ -7029,7 +7092,7 @@ async fn handle_h3_request(
                     outcome_connection_error,
                 )
                 .await;
-                crate::proxy::backend_dispatch::record_backend_outcome(
+                crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                     &state,
                     &proxy,
                     &epoch.load_balancer,
@@ -7050,6 +7113,9 @@ async fn handle_h3_request(
                     outcome_error_class,
                     backend_admission_start.elapsed(),
                 );
+                // The backend exchange is settled: release the least-connections
+                // count now, not after the logging below.
+                drop(lb_connection_guard);
 
                 let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -7137,10 +7203,9 @@ async fn handle_h3_request(
                 max_response_body_size_bytes = effective_max_response_body_size_bytes,
                 "HTTP/3 backend response body exceeds configured size limit"
             );
-            // Do NOT propagate a send error: record_backend_outcome below
-            // releases the LB active-connection count, so a `?` here would skip
-            // it and leak the count when the client disconnects during the
-            // reject write.
+            // Do NOT propagate a send error: the outcome record below releases
+            // the CB probe slot and the admission outcome, so a `?` here would
+            // skip them when the client disconnects during the reject write.
             let _ = send_h3_response(
                 &mut stream,
                 StatusCode::BAD_GATEWAY,
@@ -7148,7 +7213,7 @@ async fn handle_h3_request(
             )
             .await;
 
-            crate::proxy::backend_dispatch::record_backend_outcome(
+            crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                 &state,
                 &proxy,
                 &epoch.load_balancer,
@@ -7245,7 +7310,7 @@ async fn handle_h3_request(
             // CB / passive-health must see the TRUE backend status: the plugin
             // override is a gateway policy decision and must neither penalize a
             // healthy backend nor mask a real backend failure.
-            crate::proxy::backend_dispatch::record_backend_outcome(
+            crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                 &state,
                 &proxy,
                 &epoch.load_balancer,
@@ -7266,6 +7331,9 @@ async fn handle_h3_request(
                 None,
                 backend_admission_response_elapsed,
             );
+            // The backend exchange is settled: release the least-connections
+            // count now, not after the logging below.
+            drop(lb_connection_guard);
 
             let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -7408,9 +7476,8 @@ async fn handle_h3_request(
         let resp = resp_builder
             .body(())
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
-        // Do NOT `?`-propagate a send_response failure: `record_connection_start`
-        // already ran above, so bailing out here would leak the least-connections
-        // count, a CB HALF_OPEN probe slot, the admission outcome, and the
+        // Do NOT `?`-propagate a send_response failure: bailing out here would
+        // leak a CB HALF_OPEN probe slot, the admission outcome, and the
         // transaction summary (the same client-disconnect case the sibling
         // relays in `proxy_to_backend_h3_streaming` /
         // `stream_h3_open_response_to_client` handle explicitly). Fall through
@@ -7500,6 +7567,11 @@ async fn handle_h3_request(
                 tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
             }));
         tokio::pin!(auth_deadline_sleep);
+        // The matched route rule's body deadline (#5646), absolute and armed
+        // once like the authorization deadline beside it. No timer without one.
+        let route_body_sleep = route_body_deadline.map(tokio::time::sleep_until);
+        tokio::pin!(route_body_sleep);
+        let mut route_deadline_cut = false;
         let mut stream_done = false;
         let mut bytes_streamed: u64 = 0;
         let mut body_completed = false;
@@ -7629,6 +7701,18 @@ async fn handle_h3_request(
                         termination,
                         crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                     );
+                    break 'outer;
+                }
+                // The matched route rule's deadline (#5646) ends the committed
+                // body with an `H3_REQUEST_CANCELLED` reset, never a clean
+                // finish. It is the route's own policy, not a backend fault: the
+                // body keeps the read-timeout class but is recorded neutrally.
+                _ = crate::proxy::optional_sleep_elapsed(route_body_sleep.as_mut()) => {
+                    coalesce_buf.clear();
+                    crate::http3::route_deadline::cancel_response_stream(&mut *stream);
+                    stream.abort_committed();
+                    body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                    route_deadline_cut = true;
                     break 'outer;
                 }
                 chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
@@ -7868,6 +7952,7 @@ async fn handle_h3_request(
                         },
                         auth_deadline_plan,
                         &auth_latch,
+                        route_body_deadline,
                     )
                     .await
                 };
@@ -7875,6 +7960,12 @@ async fn handle_h3_request(
                     Ok(_) => {
                         body_completed = true;
                         stream.record_clean_finish();
+                    }
+                    Err(H3TrailerFinishError::RouteDeadline) => {
+                        crate::http3::route_deadline::cancel_response_stream(&mut *stream);
+                        stream.abort_committed();
+                        body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                        route_deadline_cut = true;
                     }
                     Err(H3TrailerFinishError::AuthorizationExpired(termination)) => {
                         debug!(
@@ -7965,10 +8056,12 @@ async fn handle_h3_request(
                 .as_ref()
                 .is_some_and(|cb| cb.failure_status_codes.contains(&response_status));
         let body_outcome_error_class = match body_error_class {
+            // A route deadline cut is health-neutral (see the arm above).
+            _ if route_deadline_cut => Some(crate::retry::ErrorClass::DispatchPolicyRejected),
             Some(crate::retry::ErrorClass::ClientDisconnect) if backend_failure_status => None,
             other => other,
         };
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             &state,
             &proxy,
             &epoch.load_balancer,
@@ -7989,6 +8082,10 @@ async fn handle_h3_request(
             body_outcome_error_class,
             backend_admission_response_elapsed,
         );
+        // The backend exchange is settled: release the least-connections
+        // count here, as the outcome record used to, not after the logging
+        // below.
+        drop(lb_connection_guard);
 
         let backend_ttfb_ms = backend_admission_response_elapsed.as_secs_f64() * 1000.0;
         // Concurrent backend-body / client-delivery lifetime cannot be split on
@@ -8357,14 +8454,19 @@ async fn handle_h3_request(
     // Track connection for least-connections LB (after all pre-dispatch rejects).
     // Placed here so the streaming-request path above handles its own tracking,
     // and early returns from body collection/plugin rejects don't leak counts.
-    if let (Some(_upstream_id), Some(target), Some(balancer)) = (
-        &proxy.upstream_id,
-        &upstream_target,
-        upstream_balancer.as_ref(),
-    ) {
-        balancer.record_connection_start(target);
-    }
+    // The guard is the one release; it drops on every exit from this handler,
+    // and the retry loop below re-arms it for each attempt so the count
+    // follows the target actually dialed (issue #5693).
+    let mut lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
+        upstream_target
+            .as_deref()
+            .filter(|_| proxy.upstream_id.is_some()),
+        upstream_balancer.as_deref(),
+    );
 
+    // The matched route rule's deadlines (#5646) for every native attempt
+    // below; both `None` when the rule carries no timeouts.
+    let route = crate::http3::route_deadline::H3RouteDeadlines::from_ctx(&ctx);
     let can_refine_h3_response_buffering = needs_response_buffering
         && (!has_retry || retry_response_needs_header_refinement)
         && matches!(
@@ -8408,6 +8510,7 @@ async fn handle_h3_request(
                 None
             },
             response_trailer_governance,
+            route,
         )
         .await?
         {
@@ -8456,6 +8559,7 @@ async fn handle_h3_request(
                 &mut plugin_execution_ns,
                 backend_admission_start,
                 response_trailer_governance,
+                route,
             )
             .await;
 
@@ -8558,12 +8662,17 @@ async fn handle_h3_request(
                 .as_ref()
                 .is_some_and(|cb| cb.failure_status_codes.contains(&backend_status));
         let backend_outcome_error_class = match h3_stream_result.body_error_class {
+            // A route deadline cut of the committed body is the route's own
+            // policy, not evidence about the backend (#5646): health-neutral.
+            _ if h3_stream_result.route_deadline_cut => {
+                Some(crate::retry::ErrorClass::DispatchPolicyRejected)
+            }
             Some(crate::retry::ErrorClass::ClientDisconnect) if backend_failure_status => {
                 h3_error_class
             }
             other => other.or(h3_error_class),
         };
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             &state,
             &proxy,
             &epoch.load_balancer,
@@ -8584,6 +8693,10 @@ async fn handle_h3_request(
             backend_outcome_error_class,
             h3_stream_result.backend_admission_elapsed,
         );
+        // The backend exchange is settled: release the least-connections
+        // count here, as the outcome record used to, not after the logging
+        // below.
+        drop(lb_connection_guard);
 
         // Admission elapsed above still drives adaptive concurrency. TTFB is
         // only concrete when response headers were observed — pre-header
@@ -8722,24 +8835,47 @@ async fn handle_h3_request(
                 &selected_base_proxy,
                 current_target.as_deref(),
             );
+            // Every attempt below runs under the matched route rule's total
+            // deadline and a fresh attempt budget (#5646). A native attempt is
+            // handed to the backend from its first poll and retains its whole
+            // response, so a budget expiry is the ordinary, retryable backend
+            // timeout and the next attempt replays `body_data`.
+            let mut route_attempt_deadline = None;
             let mut result = match refined_buffered_response {
                 Some(result) => result,
                 None => {
-                    proxy_to_backend_h3(
-                        &state,
-                        attempt_dispatch_proxy.as_ref(),
-                        &current_url,
-                        &method,
-                        &proxy_headers,
-                        &body_data,
-                        &ctx.client_ip,
-                        socket_ip,
-                        current_target.as_deref(),
-                        ctx.request_is_secure,
-                        ctx.is_early_data,
-                        effective_max_response_body_size_bytes,
-                    )
-                    .await
+                    // Pinned in place so the wrapper does not copy the attempt
+                    // into this frame a second time.
+                    let dispatched = {
+                        let attempt = proxy_to_backend_h3(
+                            &state,
+                            attempt_dispatch_proxy.as_ref(),
+                            &current_url,
+                            &method,
+                            &proxy_headers,
+                            &body_data,
+                            &ctx.client_ip,
+                            socket_ip,
+                            current_target.as_deref(),
+                            ctx.request_is_secure,
+                            ctx.is_early_data,
+                            effective_max_response_body_size_bytes,
+                        );
+                        tokio::pin!(attempt);
+                        crate::proxy::await_route_request_deadline(
+                            route.total(),
+                            crate::proxy::RouteAttemptBudget::from_start(
+                                route.attempt_timeout(),
+                                &mut route_attempt_deadline,
+                            ),
+                            attempt,
+                        )
+                        .await
+                    };
+                    match dispatched {
+                        Ok(result) => result,
+                        Err(expiry) => h3_route_deadline_buffered_result(&mut ctx, expiry),
+                    }
                 }
             };
 
@@ -8762,6 +8898,11 @@ async fn handle_h3_request(
                 },
                 attempt,
             ) {
+                // The route's total request deadline already expired: no
+                // further attempt may start, and its `504` stands (#5646).
+                if crate::http3::route_deadline::total_expiry_recorded(route, &ctx) {
+                    break;
+                }
                 ctx.record_backend_dispatch_outcome(result.error_class, result.request_on_wire);
                 // Re-check the CURRENT target's DestinationRule maxRetries
                 // before authorizing another retry — use the original route
@@ -8883,8 +9024,20 @@ async fn handle_h3_request(
                     }
                 }
 
+                // Backoff spends the route's total budget too; its expiry here
+                // is the health-neutral route timeout (#5646).
                 let delay = crate::retry::retry_delay(retry_config, attempt);
-                tokio::time::sleep(delay).await;
+                if let Some(deadline) = route.total() {
+                    if tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+                        .await
+                        .is_err()
+                    {
+                        result = h3_route_backoff_timeout_result(&mut ctx);
+                        break;
+                    }
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
                 attempt += 1;
 
                 if let Some((next, next_url)) = next_retry_target {
@@ -9009,6 +9162,16 @@ async fn handle_h3_request(
                     "Retrying backend request (HTTP/3 frontend)"
                 );
 
+                // Count this attempt against the target it dials. The new
+                // lease is taken before the previous attempt's drops, so a
+                // rotation moves the count to the new target without a gap.
+                lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
+                    current_target
+                        .as_deref()
+                        .filter(|_| proxy.upstream_id.is_some()),
+                    upstream_balancer.as_deref(),
+                );
+
                 // Re-resolve the effective proxy for the (possibly rotated)
                 // retry target from the post-selection BASE proxy, so this
                 // attempt dials with ITS policy port's TLS/SNI/connectTimeout
@@ -9018,32 +9181,45 @@ async fn handle_h3_request(
                     &selected_base_proxy,
                     current_target.as_deref(),
                 );
-                result = if let Some(target) = current_target
+                // A fresh attempt budget, started on the attempt's first poll:
+                // admission already ran above and the attempt replays the
+                // retained body, so the backend holds it from its start. Each
+                // attempt is pinned in place so the wrapper does not copy it
+                // into this frame a second time.
+                let attempt_budget = crate::proxy::RouteAttemptBudget::from_start(
+                    route.attempt_timeout(),
+                    &mut route_attempt_deadline,
+                );
+                let attempt_result = if let Some(target) = current_target
                     .as_deref()
                     .filter(|target| crate::proxy::target_requires_http_mesh_egress(target))
                 {
                     // Mesh-tagged rotation: share the H1/H2 HBONE /
                     // Sidecar mesh-mTLS pools (issue #3620). Boxed out of
                     // line — see `boxed_proxy_h3_plain_http_mesh_buffered`.
-                    h3_buffered_result_from_backend_response(
-                        crate::proxy::boxed_proxy_h3_plain_http_mesh_buffered(
-                            &state,
-                            attempt_dispatch_proxy.as_ref(),
-                            &current_url,
-                            &method,
-                            &proxy_headers,
-                            Bytes::copy_from_slice(body_data.as_slice()),
-                            target,
-                            &plugins,
-                            &ctx,
-                            &ctx.client_ip,
-                            socket_ip,
-                            ctx.request_is_secure,
-                        )
-                        .await,
+                    let attempt = crate::proxy::boxed_proxy_h3_plain_http_mesh_buffered(
+                        &state,
+                        attempt_dispatch_proxy.as_ref(),
+                        &current_url,
+                        &method,
+                        &proxy_headers,
+                        Bytes::copy_from_slice(body_data.as_slice()),
+                        target,
+                        &plugins,
+                        &ctx,
+                        &ctx.client_ip,
+                        socket_ip,
+                        ctx.request_is_secure,
+                    );
+                    crate::proxy::await_route_request_deadline(
+                        route.total(),
+                        attempt_budget,
+                        attempt,
                     )
+                    .await
+                    .map(h3_buffered_result_from_backend_response)
                 } else if current_dispatch_h3 {
-                    proxy_to_backend_h3(
+                    let attempt = proxy_to_backend_h3(
                         &state,
                         attempt_dispatch_proxy.as_ref(),
                         &current_url,
@@ -9056,6 +9232,12 @@ async fn handle_h3_request(
                         ctx.request_is_secure,
                         ctx.is_early_data,
                         effective_max_response_body_size_bytes,
+                    );
+                    tokio::pin!(attempt);
+                    crate::proxy::await_route_request_deadline(
+                        route.total(),
+                        attempt_budget,
+                        attempt,
                     )
                     .await
                 } else {
@@ -9063,25 +9245,34 @@ async fn handle_h3_request(
                     // via the buffered reqwest path rather than a doomed QUIC
                     // dial. Same-target retries keep `current_dispatch_h3`
                     // locked (no cross-protocol same-target replay).
-                    h3_buffered_result_from_backend_response(
-                        crate::proxy::proxy_to_backend_retry(
-                            &state,
-                            selected_base_proxy.as_ref(),
-                            &current_url,
-                            &method,
-                            &proxy_headers,
-                            current_target.as_deref(),
-                            Some(body_data.as_slice()),
-                            false,
-                            &plugins,
-                            &ctx,
-                            &ctx.client_ip,
-                            socket_ip,
-                            ctx.request_is_secure,
-                            hyper::Version::HTTP_3,
-                        )
-                        .await,
+                    let attempt = crate::proxy::proxy_to_backend_retry(
+                        &state,
+                        selected_base_proxy.as_ref(),
+                        &current_url,
+                        &method,
+                        &proxy_headers,
+                        current_target.as_deref(),
+                        Some(body_data.as_slice()),
+                        false,
+                        &plugins,
+                        &ctx,
+                        &ctx.client_ip,
+                        socket_ip,
+                        ctx.request_is_secure,
+                        hyper::Version::HTTP_3,
+                    );
+                    tokio::pin!(attempt);
+                    crate::proxy::await_route_request_deadline(
+                        route.total(),
+                        attempt_budget,
+                        attempt,
                     )
+                    .await
+                    .map(h3_buffered_result_from_backend_response)
+                };
+                result = match attempt_result {
+                    Ok(result) => result,
+                    Err(expiry) => h3_route_deadline_buffered_result(&mut ctx, expiry),
                 };
             }
 
@@ -9107,22 +9298,41 @@ async fn handle_h3_request(
                 upstream_target.clone(),
             )
         } else {
-            // No retry configured — single attempt
-            let result = proxy_to_backend_h3(
-                &state,
-                &proxy,
-                &backend_url,
-                &method,
-                &proxy_headers,
-                &body_data,
-                &ctx.client_ip,
-                socket_ip,
-                upstream_target.as_deref(),
-                ctx.request_is_secure,
-                ctx.is_early_data,
-                effective_max_response_body_size_bytes,
-            )
-            .await;
+            // No retry configured — single attempt, under the matched route
+            // rule's deadlines (#5646).
+            let mut route_attempt_deadline = None;
+            // Pinned in place so the wrapper does not copy the attempt into
+            // this frame a second time.
+            let dispatched = {
+                let attempt = proxy_to_backend_h3(
+                    &state,
+                    &proxy,
+                    &backend_url,
+                    &method,
+                    &proxy_headers,
+                    &body_data,
+                    &ctx.client_ip,
+                    socket_ip,
+                    upstream_target.as_deref(),
+                    ctx.request_is_secure,
+                    ctx.is_early_data,
+                    effective_max_response_body_size_bytes,
+                );
+                tokio::pin!(attempt);
+                crate::proxy::await_route_request_deadline(
+                    route.total(),
+                    crate::proxy::RouteAttemptBudget::from_start(
+                        route.attempt_timeout(),
+                        &mut route_attempt_deadline,
+                    ),
+                    attempt,
+                )
+                .await
+            };
+            let result = match dispatched {
+                Ok(result) => result,
+                Err(expiry) => h3_route_deadline_buffered_result(&mut ctx, expiry),
+            };
             (
                 result.status,
                 result.body,
@@ -9135,6 +9345,11 @@ async fn handle_h3_request(
             )
         };
 
+        // A route timeout `504` is gateway-authored: no backend answered within
+        // the rule's deadline, so it must not mint session affinity (#5646).
+        if crate::http3::route_deadline::total_expiry_recorded(route, &ctx) {
+            sticky_dispatch_refused = true;
+        }
         ctx.record_backend_dispatch_outcome(h3_error_class, h3_request_on_wire);
         // Record outcome against the final target (may differ from initial after retries).
         // `connection_error` shares the same typed body-on-wire signal as the
@@ -9142,7 +9357,7 @@ async fn handle_h3_request(
         // accounting treats a graceful close (or any other post-`send_request`
         // fault) as a successful (post-wire) request for latency purposes —
         // the request did reach the backend.
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             &state,
             &proxy,
             &epoch.load_balancer,
@@ -9163,6 +9378,10 @@ async fn handle_h3_request(
             h3_error_class,
             backend_admission_start.elapsed(),
         );
+        // The backend exchange is settled: release the least-connections
+        // count here, as the outcome record used to, not after the logging
+        // below.
+        drop(lb_connection_guard);
 
         let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -10453,6 +10672,14 @@ fn h3_connection_error(
 }
 
 fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::ErrorClass {
+    // A matched route rule's deadline (#5646) ended the attempt, not the
+    // transport: `ReadWriteTimeout` when the backend held it, the
+    // health-neutral `DispatchPolicyRejected` when the total deadline was spent
+    // before it started. Neither is a transport class, so neither downgrades
+    // the cached H3 capability.
+    if let Some(expiry) = e.route_deadline_expiry() {
+        return crate::http3::route_deadline::expiry_error_class(expiry);
+    }
     // Graceful remote close (`H3_NO_ERROR` ApplicationClose / GOAWAY) at
     // the response read boundary is the peer's spec-legal teardown
     // signal — see RFC 9114 §8.1. Surface it as a distinct class so
@@ -10499,6 +10726,13 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
 fn h3_backend_failure_status_body(
     e: &crate::http3::client::H3PoolError,
 ) -> (StatusCode, &'static str) {
+    // A route deadline (#5646) answers with proxy core's route timeout body for
+    // the total deadline and the ordinary backend-timeout body for an attempt
+    // budget, both `504`.
+    if let Some(expiry) = e.route_deadline_expiry() {
+        let (_, body) = crate::http3::route_deadline::expiry_status_body(expiry);
+        return (StatusCode::GATEWAY_TIMEOUT, body);
+    }
     let (status_code, body) =
         crate::proxy::http_backend_failure_status_and_body(classify_h3_error(e));
     let status = if status_code == 504 {
@@ -10618,6 +10852,11 @@ struct H3StreamResult {
     /// callers reuse this after downstream body relay completes so adaptive
     /// concurrency samples backend health rather than client backpressure.
     backend_admission_elapsed: std::time::Duration,
+    /// The matched route rule's deadline (#5646) cut the committed body. The
+    /// body is logged as a `ReadWriteTimeout` exactly like proxy core's route
+    /// cut, but the cut is the route's own total-duration policy, not evidence
+    /// about the backend, so the caller records the outcome health-neutrally.
+    route_deadline_cut: bool,
 }
 
 enum H3RefinedResponse {
@@ -10632,11 +10871,10 @@ enum H3RefinedResponse {
 /// client (502 generic, or 504 for a `backend_read_timeout_ms` expiry — see
 /// [`h3_backend_failure_status_body`]). `reject_sent` is whether that write
 /// reached the client. A failed write is reported as `client_disconnected`
-/// rather than propagated as an error: these dispatch functions start
-/// least-connections LB tracking before dispatch and their caller releases
-/// the active-connection count via `record_backend_outcome` off the returned
-/// result, so returning `Err` on a failed reject write would skip that
-/// accounting and leak the count. The backend never produced a response here,
+/// rather than propagated as an error: the caller records the backend outcome
+/// (circuit breaker, passive health, admission) off the returned result, so
+/// returning `Err` on a failed reject write would skip that accounting. The
+/// backend never produced a response here,
 /// so `backend_status` is the same gateway-synthesized status.
 fn h3_backend_unavailable_stream_result(
     status: u16,
@@ -10655,6 +10893,7 @@ fn h3_backend_unavailable_stream_result(
         body_error_class: None,
         request_on_wire,
         backend_admission_elapsed,
+        route_deadline_cut: false,
     }
 }
 
@@ -10733,6 +10972,9 @@ async fn proxy_to_backend_h3_refined_response(
     backend_admission_start: std::time::Instant,
     retry_config: Option<&crate::config::types::RetryConfig>,
     trailer_governance: ResponseTrailerGovernance<'_>,
+    // The matched route rule's deadlines (#5646). This first attempt runs
+    // under both; its budget then bounds the committed response body.
+    route: crate::http3::route_deadline::H3RouteDeadlines,
 ) -> Result<H3RefinedResponse, anyhow::Error> {
     // Effective response ceiling for this request: the global knob narrowed by
     // any active route ceiling (`GHSA-xrfj-852f-645j`).
@@ -10750,29 +10992,56 @@ async fn proxy_to_backend_h3_refined_response(
     let body = Bytes::from(body_bytes);
     let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(proxy);
 
-    let streaming_resp = if let Some(target) = upstream_target {
-        state
-            .h3_pool
-            .request_with_target_streaming(
-                proxy,
-                &target.host,
-                target.port,
-                // DestinationRule policy port for `maxConnections` admission;
-                // differs from the dial port only under a `targetPort` remap.
-                target.dispatch_policy_port(),
-                method,
-                backend_url,
-                &h3_headers,
-                body,
-                tls_config_fn,
-            )
-            .await
-    } else {
-        state
-            .h3_pool
-            .request_streaming(proxy, method, backend_url, &h3_headers, body, tls_config_fn)
-            .await
+    // The attempt is handed to the backend from its first poll (the dial and
+    // the buffered request go out together), so its budget starts there. A
+    // route deadline that ends it before the response head surfaces as a
+    // typed pool error and takes the ordinary dispatch-failure arm below.
+    let mut route_attempt_deadline = None;
+    // Pinned in place and awaited through the wrapper by reference, so the
+    // dispatch future is not copied a second time.
+    let dispatched = {
+        let attempt = async {
+            if let Some(target) = upstream_target {
+                state
+                    .h3_pool
+                    .request_with_target_streaming(
+                        proxy,
+                        &target.host,
+                        target.port,
+                        // DestinationRule policy port for `maxConnections`
+                        // admission; differs from the dial port only under a
+                        // `targetPort` remap.
+                        target.dispatch_policy_port(),
+                        method,
+                        backend_url,
+                        &h3_headers,
+                        body,
+                        tls_config_fn,
+                    )
+                    .await
+            } else {
+                state
+                    .h3_pool
+                    .request_streaming(proxy, method, backend_url, &h3_headers, body, tls_config_fn)
+                    .await
+            }
+        };
+        tokio::pin!(attempt);
+        crate::proxy::await_route_request_deadline(
+            route.total(),
+            crate::proxy::RouteAttemptBudget::from_start(
+                route.attempt_timeout(),
+                &mut route_attempt_deadline,
+            ),
+            attempt,
+        )
+        .await
     };
+    let streaming_resp = match dispatched {
+        Ok(result) => result,
+        Err(expiry) => Err(crate::http3::route_deadline::expiry_pool_error(ctx, expiry)),
+    };
+    let route_body_deadline = route.body_deadline(route_attempt_deadline);
 
     let h3_resp = match streaming_resp {
         Ok(response) => response,
@@ -10802,14 +11071,11 @@ async fn proxy_to_backend_h3_refined_response(
                     request_on_wire,
                 }));
             }
-            // Do NOT propagate a send error here: this refined path already
-            // started least-connections LB tracking before dispatch, so
-            // returning `Err` would skip the caller's `record_backend_outcome`
-            // and leak the active-connection count for the selected target when
-            // the client disconnects during the reject write. Report the
-            // disconnect in the result so the caller still records the outcome
-            // and releases the connection — mirrors the size-limit / after_proxy
-            // reject paths in `stream_h3_open_response_to_client`.
+            // Do NOT propagate a send error here: returning `Err` would skip the
+            // caller's backend outcome record when the client disconnects during
+            // the reject write. Report the disconnect in the result so the
+            // caller still records the outcome — mirrors the size-limit /
+            // after_proxy reject paths in `stream_h3_open_response_to_client`.
             let reject_sent = send_h3_backend_failure_response(
                 h3_stream,
                 reject_status,
@@ -10883,13 +11149,18 @@ async fn proxy_to_backend_h3_refined_response(
                 plugin_execution_ns,
                 backend_admission_elapsed,
                 trailer_governance,
+                route_body_deadline,
             )
             .await?;
             return Ok(H3RefinedResponse::Streamed(result));
         }
     }
 
-    Ok(H3RefinedResponse::Buffered(
+    // A buffered body is still part of the attempt, exactly as proxy core
+    // collects it inside the attempt the route deadlines bound: expiry before
+    // the whole body arrived is a `504`, charged to the backend that held it.
+    let collected = crate::plugins::await_deadline_first(
+        route_body_deadline,
         collect_h3_open_response_body(
             state,
             proxy,
@@ -10899,9 +11170,13 @@ async fn proxy_to_backend_h3_refined_response(
             h3_resp.recv_stream,
             upstream_target,
             effective_max_response_body_size_bytes,
-        )
-        .await,
-    ))
+        ),
+    )
+    .await;
+    Ok(H3RefinedResponse::Buffered(match collected {
+        Ok(result) => result,
+        Err(()) => h3_route_deadline_buffered_result(ctx, route.body_expiry()),
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11194,6 +11469,9 @@ async fn stream_h3_open_response_to_client(
     plugin_execution_ns: &mut u64,
     backend_admission_elapsed: std::time::Duration,
     trailer_governance: ResponseTrailerGovernance<'_>,
+    // The matched route rule's body deadline (#5646): the earlier of its total
+    // request deadline and the committed attempt's budget, or `None`.
+    route_body_deadline: Option<tokio::time::Instant>,
 ) -> Result<H3StreamResult, anyhow::Error> {
     let response_omits_body = crate::http3::client::cancel_bodyless_h3_response(
         &mut recv_stream,
@@ -11235,6 +11513,7 @@ async fn stream_h3_open_response_to_client(
             body_error_class: None,
             request_on_wire: true,
             backend_admission_elapsed,
+            route_deadline_cut: false,
         });
     }
 
@@ -11294,6 +11573,7 @@ async fn stream_h3_open_response_to_client(
             },
             request_on_wire: true,
             backend_admission_elapsed,
+            route_deadline_cut: false,
         });
     }
 
@@ -11375,6 +11655,7 @@ async fn stream_h3_open_response_to_client(
                 body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
                 request_on_wire: true,
                 backend_admission_elapsed,
+                route_deadline_cut: false,
             });
         }
         crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(_) => {
@@ -11393,6 +11674,7 @@ async fn stream_h3_open_response_to_client(
                 body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
                 request_on_wire: true,
                 backend_admission_elapsed,
+                route_deadline_cut: false,
             });
         }
     }
@@ -11428,6 +11710,11 @@ async fn stream_h3_open_response_to_client(
             tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
         }));
     tokio::pin!(auth_deadline_sleep);
+    // The matched route rule's body deadline (#5646), absolute and armed once
+    // like the authorization deadline beside it. No timer exists without one.
+    let route_body_sleep = route_body_deadline.map(tokio::time::sleep_until);
+    tokio::pin!(route_body_sleep);
+    let mut route_deadline_cut = false;
     let mut stream_done = false;
     let mut bytes_streamed: u64 = 0;
     let mut client_disconnected = false;
@@ -11526,6 +11813,18 @@ async fn stream_h3_open_response_to_client(
                     termination,
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 );
+                break 'outer;
+            }
+            // The matched route rule's deadline (#5646) ends the committed body
+            // with an `H3_REQUEST_CANCELLED` reset, never a clean finish. It is
+            // the route's own policy, not a backend fault: the body keeps the
+            // read-timeout class while the caller records it health-neutrally.
+            _ = crate::proxy::optional_sleep_elapsed(route_body_sleep.as_mut()) => {
+                coalesce_buf.clear();
+                crate::http3::route_deadline::cancel_response_stream(&mut *h3_stream);
+                h3_stream.abort_committed();
+                body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                route_deadline_cut = true;
                 break 'outer;
             }
             chunk_result = recv_stream.recv_data(), if !stream_done => {
@@ -11672,12 +11971,19 @@ async fn stream_h3_open_response_to_client(
                 },
                 auth_deadline_plan,
                 &auth_latch,
+                route_body_deadline,
             )
             .await
             {
                 Ok(_) => {
                     body_completed = true;
                     h3_stream.record_clean_finish();
+                }
+                Err(H3TrailerFinishError::RouteDeadline) => {
+                    crate::http3::route_deadline::cancel_response_stream(&mut *h3_stream);
+                    h3_stream.abort_committed();
+                    body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                    route_deadline_cut = true;
                 }
                 Err(H3TrailerFinishError::AuthorizationExpired(termination)) => {
                     debug!(
@@ -11743,6 +12049,7 @@ async fn stream_h3_open_response_to_client(
         body_error_class,
         request_on_wire: true,
         backend_admission_elapsed,
+        route_deadline_cut,
     })
 }
 
@@ -12513,9 +12820,9 @@ where
             .mark_h3_unsupported(proxy, upstream_target);
     }
 
-    // Do NOT propagate a send error: `record_failed_h3_grpc_dispatch` releases
-    // the LB active-connection count through `record_backend_outcome`, so bailing
-    // here would leak it on a client disconnect during the error write. Capture
+    // Do NOT propagate a send error: `record_failed_h3_grpc_dispatch` records the
+    // backend outcome and admission, so bailing here would skip them on a client
+    // disconnect during the error write. Capture
     // whether the gRPC error actually reached the client so the transaction log's
     // `client_disconnected` stays accurate when the client already reset.
     let error_sent = await_h3_grpc_terminal_write_with_grace(send_h3_grpc_error_send(
@@ -12685,7 +12992,7 @@ async fn record_failed_h3_grpc_dispatch(
         outcome_connection_error,
         error_sent,
     } = failure;
-    crate::proxy::backend_dispatch::record_backend_outcome(
+    crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
         state,
         proxy,
         &epoch.load_balancer,
@@ -12992,12 +13299,14 @@ async fn dispatch_grpc_native_h3(
     };
     let backend_admission_start = std::time::Instant::now();
 
-    // Least-connections LB tracking (after all pre-dispatch rejects).
-    if let (Some(_upstream_id), Some(target), Some(balancer)) =
-        (&proxy.upstream_id, upstream_target, upstream_balancer)
-    {
-        balancer.record_connection_start(target);
-    }
+    // Least-connections LB tracking (after all pre-dispatch rejects). The
+    // guard is the one release (issue #5693). Every exit drops it explicitly
+    // once its backend outcome is recorded, so the count is never held across
+    // the awaited transaction logging; any other exit drops it on return.
+    let lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
+        upstream_target.filter(|_| proxy.upstream_id.is_some()),
+        upstream_balancer.map(Arc::as_ref),
+    );
 
     // Stream the gRPC request body to the native H3 backend. gRPC frames are
     // forwarded unchanged; the ceiling is the gRPC-specific recv limit so H3
@@ -13212,6 +13521,7 @@ async fn dispatch_grpc_native_h3(
             )
             .await;
             crate::http3::stream_util::halt_request_body(&mut stream);
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13236,6 +13546,7 @@ async fn dispatch_grpc_native_h3(
             let failure =
                 send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut stream, error).await;
             crate::http3::stream_util::halt_request_body(&mut stream);
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13348,6 +13659,7 @@ async fn dispatch_grpc_native_h3(
             )
             .await;
             pump_guard.retire().await;
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13368,6 +13680,7 @@ async fn dispatch_grpc_native_h3(
             let failure =
                 send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut send_half, error).await;
             pump_guard.retire().await;
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13489,7 +13802,7 @@ async fn dispatch_grpc_native_h3(
                 false
             };
             pump_guard.retire().await;
-            crate::proxy::backend_dispatch::record_backend_outcome(
+            crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                 state,
                 proxy,
                 &epoch.load_balancer,
@@ -13503,6 +13816,7 @@ async fn dispatch_grpc_native_h3(
                 false,
                 backend_start.elapsed(),
             );
+            drop(lb_connection_guard);
             record_h3_backend_admission_outcome(
                 &mut backend_admission_permits,
                 response_status,
@@ -13587,7 +13901,7 @@ async fn dispatch_grpc_native_h3(
         // before we found the body too large) but with `ResponseBodyTooLarge` so
         // the post-wire backend-failure path counts it — matching the streaming
         // overrun path below; the adaptive limiter likewise treats it as a failure.
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -13601,6 +13915,7 @@ async fn dispatch_grpc_native_h3(
             false,
             backend_start.elapsed(),
         );
+        drop(lb_connection_guard);
         record_h3_backend_admission_outcome(
             &mut backend_admission_permits,
             response_status,
@@ -13699,7 +14014,7 @@ async fn dispatch_grpc_native_h3(
         pump_guard.retire().await;
         // CB / passive-health must see the TRUE backend status, not the gateway
         // policy override.
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -13713,6 +14028,7 @@ async fn dispatch_grpc_native_h3(
             false,
             backend_start.elapsed(),
         );
+        drop(lb_connection_guard);
         // Train the adaptive limiter on the BACKEND's terminal gRPC status (a
         // Trailers-Only status rode in the initial headers, snapshotted pre-hook),
         // not the gateway policy reject — a failing backend must still shrink the
@@ -13941,7 +14257,7 @@ async fn dispatch_grpc_native_h3(
         } else {
             Some(crate::retry::ErrorClass::ClientDisconnect)
         };
-        crate::proxy::backend_dispatch::record_backend_outcome(
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -13955,6 +14271,7 @@ async fn dispatch_grpc_native_h3(
             false,
             backend_start.elapsed(),
         );
+        drop(lb_connection_guard);
         record_h3_backend_admission_outcome(
             &mut backend_admission_permits,
             response_status,
@@ -15056,7 +15373,7 @@ async fn dispatch_grpc_native_h3(
         Some(crate::retry::ErrorClass::ClientDisconnect) if backend_failure_status => None,
         other => other,
     };
-    crate::proxy::backend_dispatch::record_backend_outcome(
+    crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
         state,
         proxy,
         &epoch.load_balancer,
@@ -15070,6 +15387,7 @@ async fn dispatch_grpc_native_h3(
         false,
         backend_start.elapsed(),
     );
+    drop(lb_connection_guard);
     // The adaptive-concurrency limiter samples the backend gRPC terminal status:
     // a non-OK `grpc-status` (trailer or trailers-only header) maps to a 5xx so the
     // limiter shrinks, while a client-side status stays healthy. Mirrors the H2
@@ -15276,6 +15594,7 @@ fn boxed_proxy_to_backend_h3_streaming<'a>(
     plugin_execution_ns: &'a mut u64,
     backend_admission_start: std::time::Instant,
     trailer_governance: ResponseTrailerGovernance<'a>,
+    route: crate::http3::route_deadline::H3RouteDeadlines,
 ) -> BoxedH3StreamingDispatchFuture<'a> {
     Box::pin(async move {
         proxy_to_backend_h3_streaming(
@@ -15296,6 +15615,7 @@ fn boxed_proxy_to_backend_h3_streaming<'a>(
             plugin_execution_ns,
             backend_admission_start,
             trailer_governance,
+            route,
         )
         .await
     })
@@ -15328,6 +15648,9 @@ async fn proxy_to_backend_h3_streaming(
     plugin_execution_ns: &mut u64,
     backend_admission_start: std::time::Instant,
     trailer_governance: ResponseTrailerGovernance<'_>,
+    // The matched route rule's deadlines (#5646): the single attempt runs under
+    // both, and its budget then bounds the committed response body.
+    route: crate::http3::route_deadline::H3RouteDeadlines,
 ) -> Result<H3StreamResult, anyhow::Error> {
     // Effective response ceiling for this request: the global knob narrowed by
     // any active route ceiling (`GHSA-xrfj-852f-645j`). Hoisted so the streaming
@@ -15345,31 +15668,57 @@ async fn proxy_to_backend_h3_streaming(
     );
     let body = bytes::Bytes::from(body_bytes);
 
-    // Dispatch via the h3+quinn connection pool
+    // Dispatch via the h3+quinn connection pool. The attempt is handed to the
+    // backend from its first poll, so the route attempt budget starts there; a
+    // route deadline that ends it before the response head surfaces as a typed
+    // pool error and takes the ordinary dispatch-failure arm below.
     let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(proxy);
-    let streaming_resp = if let Some(target) = upstream_target {
-        state
-            .h3_pool
-            .request_with_target_streaming(
-                proxy,
-                &target.host,
-                target.port,
-                // DestinationRule policy port for `maxConnections` admission;
-                // differs from the dial port only under a `targetPort` remap.
-                target.dispatch_policy_port(),
-                method,
-                backend_url,
-                &h3_headers,
-                body,
-                tls_config_fn,
-            )
-            .await
-    } else {
-        state
-            .h3_pool
-            .request_streaming(proxy, method, backend_url, &h3_headers, body, tls_config_fn)
-            .await
+    let mut route_attempt_deadline = None;
+    // Pinned in place and awaited through the wrapper by reference, so the
+    // dispatch future is not copied a second time.
+    let dispatched = {
+        let attempt = async {
+            if let Some(target) = upstream_target {
+                state
+                    .h3_pool
+                    .request_with_target_streaming(
+                        proxy,
+                        &target.host,
+                        target.port,
+                        // DestinationRule policy port for `maxConnections`
+                        // admission; differs from the dial port only under a
+                        // `targetPort` remap.
+                        target.dispatch_policy_port(),
+                        method,
+                        backend_url,
+                        &h3_headers,
+                        body,
+                        tls_config_fn,
+                    )
+                    .await
+            } else {
+                state
+                    .h3_pool
+                    .request_streaming(proxy, method, backend_url, &h3_headers, body, tls_config_fn)
+                    .await
+            }
+        };
+        tokio::pin!(attempt);
+        crate::proxy::await_route_request_deadline(
+            route.total(),
+            crate::proxy::RouteAttemptBudget::from_start(
+                route.attempt_timeout(),
+                &mut route_attempt_deadline,
+            ),
+            attempt,
+        )
+        .await
     };
+    let streaming_resp = match dispatched {
+        Ok(result) => result,
+        Err(expiry) => Err(crate::http3::route_deadline::expiry_pool_error(ctx, expiry)),
+    };
+    let route_body_deadline = route.body_deadline(route_attempt_deadline);
 
     let mut h3_resp = match streaming_resp {
         Ok(r) => r,
@@ -15395,13 +15744,11 @@ async fn proxy_to_backend_h3_streaming(
                     .mark_h3_unsupported(proxy, upstream_target);
             }
             let (reject_status, reject_body) = h3_backend_failure_status_body(&e);
-            // Do NOT propagate a send error here: this path already started
-            // least-connections LB tracking before dispatch, so returning `Err`
-            // would skip the caller's `record_backend_outcome` and leak the
-            // active-connection count for the selected target when the client
-            // disconnects during the reject write. Report the disconnect so the
-            // caller still records the outcome and releases the connection —
-            // same contract as the size-limit / after_proxy reject paths below.
+            // Do NOT propagate a send error here: returning `Err` would skip the
+            // caller's backend outcome record when the client disconnects during
+            // the reject write. Report the disconnect so the caller still
+            // records the outcome — same contract as the size-limit /
+            // after_proxy reject paths below.
             let reject_sent = send_h3_backend_failure_response(
                 h3_stream,
                 reject_status,
@@ -15454,10 +15801,9 @@ async fn proxy_to_backend_h3_streaming(
             "Backend response body ({} bytes) exceeds limit ({} bytes)",
             len, effective_max_response_body_size_bytes
         );
-        // Same connection-accounting contract as the after_proxy reject below:
-        // never propagate a send error, or the caller's `record_backend_outcome`
-        // is skipped and the LB active-connection count leaks for a client that
-        // disconnected during the reject write.
+        // Same outcome-accounting contract as the after_proxy reject below:
+        // never propagate a send error, or the caller's backend outcome record
+        // is skipped for a client that disconnected during the reject write.
         let size_reject_sent = send_h3_response(
             h3_stream,
             StatusCode::BAD_GATEWAY,
@@ -15482,6 +15828,7 @@ async fn proxy_to_backend_h3_streaming(
             // policy rejection, not a transport failure.
             request_on_wire: true,
             backend_admission_elapsed,
+            route_deadline_cut: false,
         });
     }
 
@@ -15514,12 +15861,9 @@ async fn proxy_to_backend_h3_streaming(
     {
         let reject_status =
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
-        // Do NOT propagate a send error here: this path already started
-        // least-connections LB tracking before dispatch, so returning `Err`
-        // would skip the caller's `record_backend_outcome` and leak the
-        // active-connection count for the selected target. Report the
-        // disconnect in the result so the caller still records the (true
-        // backend) outcome and releases the connection.
+        // Do NOT propagate a send error here: returning `Err` would skip the
+        // caller's backend outcome record. Report the disconnect in the result
+        // so the caller still records the (true backend) outcome.
         let reject_sent = send_h3_reject_response(
             h3_stream,
             reject_status,
@@ -15553,6 +15897,7 @@ async fn proxy_to_backend_h3_streaming(
             },
             request_on_wire: true,
             backend_admission_elapsed,
+            route_deadline_cut: false,
         });
     }
 
@@ -15636,6 +15981,7 @@ async fn proxy_to_backend_h3_streaming(
                 body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
                 request_on_wire: true,
                 backend_admission_elapsed,
+                route_deadline_cut: false,
             });
         }
         crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(_) => {
@@ -15654,6 +16000,7 @@ async fn proxy_to_backend_h3_streaming(
                 body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
                 request_on_wire: true,
                 backend_admission_elapsed,
+                route_deadline_cut: false,
             });
         }
     }
@@ -15692,6 +16039,11 @@ async fn proxy_to_backend_h3_streaming(
             tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
         }));
     tokio::pin!(auth_deadline_sleep);
+    // The matched route rule's body deadline (#5646), absolute and armed once
+    // like the authorization deadline beside it. No timer exists without one.
+    let route_body_sleep = route_body_deadline.map(tokio::time::sleep_until);
+    tokio::pin!(route_body_sleep);
+    let mut route_deadline_cut = false;
     let mut stream_done = false;
     let mut bytes_streamed: u64 = 0;
     let mut client_disconnected = false;
@@ -15790,6 +16142,18 @@ async fn proxy_to_backend_h3_streaming(
                     termination,
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 );
+                break 'outer;
+            }
+            // The matched route rule's deadline (#5646) ends the committed body
+            // with an `H3_REQUEST_CANCELLED` reset, never a clean finish. It is
+            // the route's own policy, not a backend fault: the body keeps the
+            // read-timeout class while the caller records it health-neutrally.
+            _ = crate::proxy::optional_sleep_elapsed(route_body_sleep.as_mut()) => {
+                coalesce_buf.clear();
+                crate::http3::route_deadline::cancel_response_stream(&mut *h3_stream);
+                h3_stream.abort_committed();
+                body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                route_deadline_cut = true;
                 break 'outer;
             }
             chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
@@ -15951,12 +16315,19 @@ async fn proxy_to_backend_h3_streaming(
                 },
                 auth_deadline_plan,
                 &auth_latch,
+                route_body_deadline,
             )
             .await
             {
                 Ok(_) => {
                     body_completed = true;
                     h3_stream.record_clean_finish();
+                }
+                Err(H3TrailerFinishError::RouteDeadline) => {
+                    crate::http3::route_deadline::cancel_response_stream(&mut *h3_stream);
+                    h3_stream.abort_committed();
+                    body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                    route_deadline_cut = true;
                 }
                 Err(H3TrailerFinishError::AuthorizationExpired(termination)) => {
                     debug!(
@@ -16026,6 +16397,7 @@ async fn proxy_to_backend_h3_streaming(
         // by construction — we already have headers from the backend.
         request_on_wire: true,
         backend_admission_elapsed,
+        route_deadline_cut,
     })
 }
 
@@ -16068,6 +16440,44 @@ struct H3BufferedDispatchResult {
     trailers: Option<http::HeaderMap>,
     error_class: Option<crate::retry::ErrorClass>,
     request_on_wire: bool,
+}
+
+/// The buffered result for a backend attempt that a matched route rule's
+/// deadline (#5646) ended before the whole response arrived, in the shape a
+/// failed `proxy_to_backend_h3` returns: proxy core's route timeout `504` for
+/// the total deadline (its transaction-log phase recorded), the ordinary
+/// backend-timeout `504` for an attempt budget. Like proxy core's route
+/// terminal it is not a connection error, so it carries the `backend_timeout`
+/// `X-Gateway-Error` token and a retry policy never treats it as pre-wire.
+fn h3_route_deadline_buffered_result(
+    ctx: &mut RequestContext,
+    expiry: crate::proxy::RouteDeadlineExpiry,
+) -> H3BufferedDispatchResult {
+    crate::http3::route_deadline::mark_expiry_phase(ctx, expiry);
+    let (status, body) = crate::http3::route_deadline::expiry_status_body(expiry);
+    H3BufferedDispatchResult {
+        status,
+        body: Bytes::from_static(body.as_bytes()),
+        headers: h3_backend_failure_headers(false, status),
+        trailers: None,
+        error_class: Some(crate::http3::route_deadline::expiry_error_class(expiry)),
+        request_on_wire: true,
+    }
+}
+
+/// The buffered result for a matched route rule's total deadline (#5646) that
+/// expired in the native retry loop's backoff: proxy core's route timeout
+/// `504`, health-neutral because no backend held the request then.
+fn h3_route_backoff_timeout_result(ctx: &mut RequestContext) -> H3BufferedDispatchResult {
+    crate::http3::route_deadline::mark_backoff_expiry(ctx);
+    H3BufferedDispatchResult {
+        status: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+        body: Bytes::from_static(crate::proxy::ROUTE_REQUEST_TIMEOUT_BODY.as_bytes()),
+        headers: h3_backend_failure_headers(false, StatusCode::GATEWAY_TIMEOUT.as_u16()),
+        trailers: None,
+        error_class: Some(crate::retry::ErrorClass::DispatchPolicyRejected),
+        request_on_wire: true,
+    }
 }
 
 /// Convert a buffered cross-protocol (`proxy_to_backend_retry`) response into
@@ -16805,7 +17215,24 @@ async fn finalize_h3_upload_deadline_rejection(
     // contract instead of the deadline one.
     authorization_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
 ) -> Result<(), anyhow::Error> {
+    let route = crate::http3::route_deadline::H3RouteDeadlines::from_ctx(ctx);
+    let route_timeout = authorization_termination.is_none() && route.total_elapsed();
     let (rejection_phase, canonical_result) = match authorization_termination {
+        // A plain request's matched route rule's total deadline (#5646) expired
+        // while the gateway was still buffering the client upload: proxy core's
+        // health-neutral route timeout `504`, never the gRPC deadline shape,
+        // and logged under its own rejection phase rather than the caller's
+        // gRPC deadline label.
+        None if route_timeout => {
+            crate::http3::route_deadline::mark_phase_once(
+                ctx,
+                crate::proxy::ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH,
+            );
+            (
+                H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE,
+                h3_route_upload_timeout_plugin_result(),
+            )
+        }
         Some(termination) => {
             // Deliberately NOT `mark_gateway_deadline_response_selected()`: that
             // marker makes the shared writer replace the selected representation
@@ -16851,7 +17278,7 @@ async fn finalize_h3_upload_deadline_rejection(
         &mut reject.status_code,
         &mut reject.headers,
         &mut reject.body,
-        true,
+        !route_timeout,
         false,
     )
     .await;
@@ -16895,6 +17322,29 @@ async fn finalize_h3_upload_deadline_rejection(
         false,
     )
     .await
+}
+
+/// Transaction-log rejection phase of a route timeout `504` (#5646) raised
+/// while the gateway was still buffering an HTTP/3 client upload. Distinct from
+/// every `grpc_deadline_*` upload label, which name a client RPC deadline.
+const H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE: &str = "route_request_timeout_h3_upload";
+
+/// Proxy core's route timeout `504` (#5646) as a canonical gateway rejection:
+/// the fixed body and the `backend_timeout` `X-Gateway-Error` token. It names no
+/// route, rule, backend, or configured duration.
+fn h3_route_upload_timeout_plugin_result() -> PluginResult {
+    let mut headers = HashMap::with_capacity(2);
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    crate::proxy::insert_x_gateway_error_for_backend_failure(
+        &mut headers,
+        false,
+        StatusCode::GATEWAY_TIMEOUT.as_u16(),
+    );
+    PluginResult::Reject {
+        status_code: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+        body: crate::proxy::ROUTE_REQUEST_TIMEOUT_BODY.to_string(),
+        headers,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -19016,6 +19466,7 @@ mod h3_streaming_outcome_tests {
             body_error_class: None,
             request_on_wire: true,
             backend_admission_elapsed: std::time::Duration::from_millis(7),
+            route_deadline_cut: false,
         };
         assert!(
             (super::h3_stream_backend_ttfb_ms(&headers_ok) - 7.0).abs() < f64::EPSILON,
@@ -19034,6 +19485,7 @@ mod h3_streaming_outcome_tests {
             body_error_class: None,
             request_on_wire: true,
             backend_admission_elapsed: std::time::Duration::from_millis(11),
+            route_deadline_cut: false,
         };
         assert!(
             (super::h3_stream_backend_ttfb_ms(&oversized) - 11.0).abs() < f64::EPSILON,
@@ -19050,6 +19502,7 @@ mod h3_streaming_outcome_tests {
             body_error_class: Some(ErrorClass::ClientDisconnect),
             request_on_wire: true,
             backend_admission_elapsed: std::time::Duration::from_millis(5),
+            route_deadline_cut: false,
         };
         assert!(
             (super::h3_stream_backend_ttfb_ms(&body_abort) - 5.0).abs() < f64::EPSILON,
@@ -19800,6 +20253,8 @@ mod build_h3_quinn_server_config_mtls_tests {
     //! clients presenting no certificate. The function must now FAIL CLOSED:
     //! a configured-but-unloadable client CA returns `Err`; only an explicitly
     //! *unconfigured* client CA (`None`) yields no client auth.
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::sync::{Arc, Once};
 
     use super::build_h3_quinn_server_config;
@@ -19823,13 +20278,12 @@ mod build_h3_quinn_server_config_mtls_tests {
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
         let cert = params.self_signed(&key_pair).expect("self-sign cert");
         let cert_pem = cert.pem();
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .filter_map(Result::ok)
             .collect();
         let key_pem = key_pair.serialize_pem();
-        let private_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-            .expect("read private key")
-            .expect("private key present");
+        let private_key =
+            PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("read private key");
         Arc::new(
             rustls::ServerConfig::builder()
                 .with_no_client_auth()
@@ -19975,7 +20429,8 @@ mod h3_ocsp_staple_tests {
     use std::sync::{Arc, Mutex, Once};
 
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
     use super::{build_h3_quinn_server_config, build_h3_rustls_server_config};
     use crate::config::EnvConfig;
@@ -20005,9 +20460,8 @@ mod h3_ocsp_staple_tests {
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
         let cert = params.self_signed(&key_pair).expect("self-sign cert");
         let key_pem = key_pair.serialize_pem();
-        let private_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-            .expect("read private key")
-            .expect("private key present");
+        let private_key =
+            PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("read private key");
 
         let provider = crate::fips::base_crypto_provider();
         let mut certified_key = rustls::sign::CertifiedKey::from_der(

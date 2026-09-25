@@ -13211,6 +13211,55 @@ extensionProviders:
         );
     }
 
+    #[tokio::test]
+    async fn virtual_service_rewrite_empty_prefix_match_prepends_uri() {
+        // `uri: {prefix: ""}` is carried verbatim as an explicitly EMPTY
+        // `match_prefix`, which strips nothing and prepends the rewrite:
+        // `/users` -> `/v2/users`, matching Envoy's `prefix_rewrite` of an
+        // empty matched prefix. Before the Gateway API `URLRewrite` work the
+        // dispatch plugin cleared an empty prefix and replaced the whole path
+        // (`/users` -> `/v2`). The method predicate keeps this on the
+        // per-entry rule path; a URI-only match takes the catch-all path,
+        // which derives no prefix from a root listen path.
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        use crate::plugins::{Plugin, RequestContext};
+
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": ""}, "method": {"exact": "GET"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "rewrite": {"uri": "/v2"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = dispatch_plugin(&result);
+        let rewrite = dispatch_rules(plugin)
+            .iter()
+            .find_map(|r| r.get("rewrite"))
+            .expect("rewrite action present");
+        assert_eq!(rewrite["uri"].as_str(), Some("/v2"));
+        assert_eq!(rewrite["match_prefix"].as_str(), Some(""));
+
+        let dispatch =
+            MeshRouteDispatch::new(&plugin.config).expect("rewrite dispatch config is valid");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/users".to_string(),
+        );
+        let mut headers = std::collections::HashMap::new();
+        let _ = dispatch.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_path.as_deref(), Some("/v2/users"));
+    }
+
     #[test]
     fn virtual_service_redirect_projects_onto_dispatch_rule() {
         let result = translate_k8s_objects(

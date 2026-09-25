@@ -503,6 +503,66 @@ fn test_env_config_rejects_oversized_admin_jwt_max_ttl() {
 }
 
 #[test]
+fn test_env_config_rejects_non_finite_overload_thresholds() {
+    // `"NaN".parse::<f64>()` succeeds and NaN passes through `clamp`; every
+    // `ratio >= NaN` comparison is then false, silently disabling shedding.
+    for raw in ["NaN", "nan", "inf", "-inf", "infinity"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+                ("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD", raw),
+            ],
+            || {
+                let err = EnvConfig::from_env().expect_err("non-finite threshold must fail");
+                assert!(
+                    err.contains("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD"),
+                    "startup must name the offending setting for {raw:?}: {err}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_rejects_zero_max_credentials_per_type() {
+    // 0 is not "unlimited": credential arrays must be non-empty and at most
+    // this long, so 0 would make every consumer credential inadmissible.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_MAX_CREDENTIALS_PER_TYPE", "0"),
+        ],
+        || {
+            let err = EnvConfig::from_env().expect_err("zero limit must fail startup");
+            assert!(err.contains("FERRUM_MAX_CREDENTIALS_PER_TYPE"), "{err}");
+        },
+    );
+}
+
+#[test]
+fn test_max_credentials_per_type_runtime_parse_matches_env_config() {
+    // Startup trims the value; the runtime resolver must enforce the same
+    // number rather than silently falling back to the default.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_MAX_CREDENTIALS_PER_TYPE", " 5\n"),
+        ],
+        || {
+            let config = EnvConfig::from_env().expect("trimmed value is valid");
+            assert_eq!(config.max_credentials_per_type, 5);
+            assert_eq!(
+                ferrum_edge::config::types::max_credentials_per_type(),
+                config.max_credentials_per_type
+            );
+        },
+    );
+}
+
+#[test]
 fn test_env_config_accepts_admin_jwt_max_ttl_disable_sentinel() {
     with_env_vars(
         &[
@@ -8108,4 +8168,44 @@ fn test_env_config_shutdown_predrain_seconds_rejects_values_above_the_maximum() 
             },
         );
     }
+}
+
+/// Issue #5706: a process that has not opted into the gateway binary's
+/// working-directory default — every Rust test harness, which Cargo runs from
+/// the repository root — must not resolve the managed-TLS store (and the TLS
+/// event log beside it) into the checkout. An explicit path still wins.
+#[test]
+fn test_unconfigured_tls_managed_store_path_is_private_to_the_process() {
+    use ferrum_edge::config::env_config::{
+        DEFAULT_TLS_MANAGED_STORE_PATH, tls_managed_store_path_from_env,
+    };
+
+    for configured in [None, Some("")] {
+        let vars: Vec<(&str, &str)> = configured
+            .map(|value| ("FERRUM_TLS_MANAGED_STORE_PATH", value))
+            .into_iter()
+            .collect();
+        with_env_vars(&vars, || {
+            let resolved = tls_managed_store_path_from_env();
+            assert_ne!(resolved, DEFAULT_TLS_MANAGED_STORE_PATH);
+            assert_eq!(
+                resolved,
+                tls_managed_store_path_from_env(),
+                "the private default must be stable for the life of the process"
+            );
+            let resolved = std::path::Path::new(&resolved);
+            assert!(resolved.is_absolute(), "{}", resolved.display());
+            assert!(
+                !resolved.starts_with(env!("CARGO_MANIFEST_DIR")),
+                "the private default must stay outside the checkout: {}",
+                resolved.display()
+            );
+        });
+    }
+
+    const EXPLICIT: &str = "/srv/ferrum/managed-tls";
+    let explicit = [("FERRUM_TLS_MANAGED_STORE_PATH", EXPLICIT)];
+    with_env_vars(&explicit, || {
+        assert_eq!(tls_managed_store_path_from_env(), EXPLICIT);
+    });
 }

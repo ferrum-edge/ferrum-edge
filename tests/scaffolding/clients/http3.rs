@@ -14,7 +14,8 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Method, Request, StatusCode};
 use quinn::{ClientConfig, Endpoint};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::task::JoinHandle;
 
@@ -94,12 +95,12 @@ impl Http3Client {
         key_pem: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let certs: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut cert_chain_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+            CertificateDer::pem_slice_iter(cert_chain_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()?;
         if certs.is_empty() {
             return Err("client certificate chain is empty".into());
         }
-        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-            .ok_or("client private key not found")?;
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
         let provider = rustls::crypto::ring::default_provider();
         let verifier = Arc::new(DangerousAcceptAnyServer);
         let client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))

@@ -29,7 +29,8 @@ permissions:
 
 concurrency:
   group: h3-live-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
+  # Superseded pull-request pushes cancel; dispatched campaigns never do.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   prepare:

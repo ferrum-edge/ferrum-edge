@@ -148,11 +148,16 @@ impl MeshRouteDispatchConfig {
             // `rule_matches` treats empty match as "match all" only when
             // route-local actions are present, so this stays a no-op for any other
             // operator config.
+            // Rule-scoped timeouts and retry count as route-local actions too:
+            // the Gateway API translator emits a path-only rule whose only
+            // effect is its `timeouts` or `retry`, and that rule must still
+            // select the policy for exactly the requests it matches.
             let has_route_actions = !rule.request_transform.is_empty()
                 || !rule.response_transform.is_empty()
                 || rule.fault.is_some()
                 || rule.rewrite.is_some()
-                || rule.redirect.is_some();
+                || rule.redirect.is_some()
+                || rule.carries_attempt_policy();
             if rule.match_.is_empty() && !has_route_actions {
                 return Err(format!(
                     "`mesh_route_dispatch.rules[{idx}].match` requires at least one of \
@@ -181,6 +186,18 @@ impl MeshRouteDispatchConfig {
             if rule.timeout_ms.is_some() && rule.timeout_disabled {
                 return Err(format!(
                     "`mesh_route_dispatch.rules[{idx}]` cannot set both `timeout_ms` and `timeout_disabled`"
+                ));
+            }
+            if rule.request_timeout_ms == Some(0) {
+                return Err(format!(
+                    "`mesh_route_dispatch.rules[{idx}].request_timeout_ms` must be greater than zero; \
+                     omit it to leave the rule without a total request deadline"
+                ));
+            }
+            if rule.attempt_timeout_ms == Some(0) {
+                return Err(format!(
+                    "`mesh_route_dispatch.rules[{idx}].attempt_timeout_ms` must be greater than zero; \
+                     omit it to leave the rule's attempts without a total bound"
                 ));
             }
             if let Some(retry) = &rule.retry
@@ -456,12 +473,10 @@ fn validate_and_normalize_rewrite(
             ));
         }
     }
-    if let Some(prefix) = rewrite.match_prefix.as_deref()
-        && prefix.is_empty()
-    {
-        // An empty match_prefix would be a degenerate "strip nothing" prefix
-        // rewrite — treat as "no prefix" by clearing it so the hot path takes
-        // the whole-path replacement branch.
+    if rewrite.match_prefix.is_some() && rewrite.uri.is_none() {
+        // `match_prefix` only describes how `uri` rebases the path. Without a
+        // `uri` it is inert, and keeping it would imply a path rewrite that
+        // never happens.
         rewrite.match_prefix = None;
     }
     Ok(())
@@ -485,9 +500,10 @@ fn validate_and_normalize_redirect(
         }
         reject_crlf(rule_idx, "redirect.uri", uri)?;
     }
-    if let Some(prefix) = redirect.match_prefix.as_deref()
-        && prefix.is_empty()
-    {
+    // An explicitly empty `match_prefix` strips nothing and prepends `uri` —
+    // the root `PathPrefix: /` case of the Gateway API rewrite table. It is
+    // only inert (and therefore cleared) when there is no `uri` to rebase.
+    if redirect.match_prefix.is_some() && redirect.uri.is_none() {
         redirect.match_prefix = None;
     }
     if let Some(authority) = redirect.authority.as_mut() {
@@ -808,6 +824,37 @@ pub struct RouteRule {
     /// timeout-disabled and the selected fallback proxy may carry a timeout.
     #[serde(default, skip_serializing_if = "is_false")]
     pub timeout_disabled: bool,
+    /// Total request deadline for this rule, in milliseconds from request
+    /// receipt. Spans every backend attempt, retry backoff, and the streaming
+    /// response body — unlike `timeout_ms`, which bounds one attempt's wait for
+    /// response headers and the idle gap between response frames. Gateway API
+    /// `HTTPRoute.rules[].timeouts.request` is projected here. Must be greater
+    /// than zero when set; omit it for no route deadline.
+    ///
+    /// Expiry before a non-gRPC response head is a gateway `504`; expiry
+    /// mid-body resets the HTTP/2 stream, closes the HTTP/1.1 connection, or
+    /// resets the HTTP/3 stream with `H3_REQUEST_CANCELLED`. A gRPC request
+    /// folds it into its RPC deadline and ends with `DEADLINE_EXCEEDED`.
+    /// HTTP/1.1, HTTP/2 and native HTTP/3 enforce it alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
+    /// Total bound on EACH backend attempt for this rule, in milliseconds:
+    /// from the moment the attempt is handed to the backend until its full
+    /// response (head and body) has been received. Gateway API
+    /// `HTTPRoute.rules[].timeouts.backendRequest` is projected here as well as
+    /// onto `timeout_ms`, which keeps bounding the header wait and the idle
+    /// gap between frames. Every retry attempt gets a fresh budget, and
+    /// `request_timeout_ms` still bounds the whole transaction. Must be
+    /// greater than zero when set.
+    ///
+    /// Expiry before a non-gRPC response head is the ordinary backend-timeout
+    /// `504`, retryable like any other; expiry after the head has been sent
+    /// cuts the body exactly as `request_timeout_ms` does. A gRPC request
+    /// folds it into its RPC deadline and ends with `DEADLINE_EXCEEDED`, with a
+    /// fresh budget for each retry attempt. HTTP/1.1, HTTP/2 and native HTTP/3
+    /// enforce it alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_timeout_ms: Option<u64>,
     /// Override the proxy's retry policy for this rule.
     #[serde(
         default,
@@ -913,6 +960,20 @@ pub struct RouteRule {
     /// `ctx.path`.
     #[serde(skip)]
     uri_compiled: Option<UriMatcher>,
+}
+
+impl RouteRule {
+    /// Whether this rule carries its own backend-attempt policy: a per-attempt
+    /// or total request timeout, or a retry policy (including an explicit
+    /// `timeout_disabled` / `retry_disabled`).
+    fn carries_attempt_policy(&self) -> bool {
+        self.timeout_ms.is_some()
+            || self.timeout_disabled
+            || self.request_timeout_ms.is_some()
+            || self.attempt_timeout_ms.is_some()
+            || self.retry.is_some()
+            || self.retry_disabled
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1499,6 +1560,14 @@ pub struct RouteRewriteConfig {
     /// path and prepends `uri`, mirroring Istio's prefix-rewrite semantics.
     /// `None` (exact / regex match, or no `match.uri`) means `uri` replaces
     /// the whole path.
+    ///
+    /// An explicitly EMPTY prefix is the degenerate but meaningful "strip
+    /// nothing, prepend `uri`" rewrite. The Gateway API translator emits it for
+    /// a `URLRewrite` `ReplacePrefixMatch` whose rule matches the root
+    /// `PathPrefix: /`, where upstream's rewrite table requires
+    /// `/bar` -> `/xyz/bar` rather than a whole-path replacement. It is
+    /// normalized away only when no `uri` is present, because `match_prefix`
+    /// alone rewrites nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_prefix: Option<String>,
 }
@@ -2105,6 +2174,12 @@ impl Plugin for MeshRouteDispatch {
                     } else {
                         None
                     };
+                // The total request deadline is request-scoped policy for the
+                // matched rule only; proxy core arms it after `before_proxy`.
+                ctx.route_override_request_timeout_ms = rule.request_timeout_ms;
+                // Likewise the per-attempt total bound: request-scoped, read by
+                // proxy core for every attempt it dispatches for this rule.
+                ctx.route_override_attempt_timeout_ms = rule.attempt_timeout_ms;
                 ctx.route_override_retry = if rule.retry.is_some() || rule.retry_disabled {
                     Some(rule.retry.clone())
                 } else {
@@ -2119,6 +2194,8 @@ impl Plugin for MeshRouteDispatch {
                     rule.request_transform_compiled.as_ref().map(Arc::clone);
                 ctx.route_override_response_transform =
                     rule.response_transform_compiled.as_ref().map(Arc::clone);
+                ctx.route_override_response_transform_published =
+                    ctx.route_override_response_transform.is_some();
                 // Per-rule rewrite (Istio `http[].rewrite`): rebase the path /
                 // authority forwarded to the backend. A non-matching later
                 // instance must not stomp this, so — like the destination
@@ -2593,7 +2670,8 @@ fn rule_matches(
             || rule.response_transform_compiled.is_some()
             || rule.fault.is_some()
             || rule.rewrite.is_some()
-            || rule.redirect.is_some();
+            || rule.redirect.is_some()
+            || rule.carries_attempt_policy();
     }
     // URI predicate (when set): evaluate first because it cheaply rejects
     // requests that the broader (case-insensitive) `listen_path` lets
@@ -3364,6 +3442,10 @@ mod tests {
             .expect("request_transform must be published on match");
         assert_eq!(arc.len(), 3);
         assert!(ctx.route_override_response_transform.is_none());
+        assert!(
+            !ctx.route_override_response_transform_published,
+            "a request-only rule must not arm response-trailer governance"
+        );
     }
 
     #[tokio::test]
@@ -3382,6 +3464,7 @@ mod tests {
         let mut headers = HashMap::new();
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert!(ctx.route_override_request_transform.is_none());
+        assert!(ctx.route_override_response_transform_published);
         let arc = ctx
             .route_override_response_transform
             .expect("response_transform must be published on match");
@@ -5802,6 +5885,66 @@ mod tests {
             rewrite_request_path("/other/users", "/v2", Some("/Api")),
             "/v2"
         );
+    }
+
+    #[test]
+    fn rewrite_request_path_empty_prefix_prepends_without_stripping() {
+        // The Gateway API translator canonicalizes a root `PathPrefix: /`
+        // rewrite to the EMPTY prefix: nothing is stripped and the replacement
+        // is prepended. A literal `/` prefix would consume the leading
+        // separator and fuse the replacement onto the first segment.
+        assert_eq!(rewrite_request_path("/bar", "/xyz", Some("")), "/xyz/bar");
+        assert_eq!(rewrite_request_path("/bar", "/", Some("")), "/bar");
+        assert_eq!(rewrite_request_path("/", "/xyz", Some("")), "/xyz/");
+    }
+
+    #[test]
+    fn rewrite_request_path_reproduces_gateway_api_replace_prefix_table() {
+        // github.com/kubernetes-sigs/gateway-api v1.5.1 `HTTPPathModifier`
+        // `ReplacePrefixMatch` documentation table, in upstream's own prefix
+        // spelling. The Gateway API translator trims a trailing separator from
+        // the matched prefix before it becomes `match_prefix`
+        // (`gateway_prefix_rewrite_match_prefix`) and maps an empty
+        // replacement to `/`; `canonical` below mirrors that trim so the
+        // `/foo/` rows exercise the same composed behavior.
+        for (path, prefix, replacement, expected) in [
+            ("/foo/bar", "/foo", "/xyz", "/xyz/bar"),
+            ("/foo/bar", "/foo", "/xyz/", "/xyz/bar"),
+            ("/foo/bar", "/foo/", "/xyz", "/xyz/bar"),
+            ("/foo/bar", "/foo/", "/xyz/", "/xyz/bar"),
+            ("/foo", "/foo", "/xyz", "/xyz"),
+            ("/foo/", "/foo", "/xyz", "/xyz/"),
+            ("/foo/bar", "/foo", "/", "/bar"),
+            ("/foo/", "/foo", "/", "/"),
+            ("/foo", "/foo", "/", "/"),
+        ] {
+            let canonical = prefix.strip_suffix('/').unwrap_or(prefix);
+            assert_eq!(
+                rewrite_request_path(path, replacement, Some(canonical)),
+                expected,
+                "{path} + prefix {prefix} + replacement {replacement}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_match_prefix_survives_normalization_when_a_uri_is_present() {
+        let mut rewrite = RouteRewriteConfig {
+            uri: Some("/xyz".to_string()),
+            authority: None,
+            match_prefix: Some(String::new()),
+        };
+        validate_and_normalize_rewrite(0, &mut rewrite).expect("empty prefix is a valid rewrite");
+        assert_eq!(rewrite.match_prefix.as_deref(), Some(""));
+
+        // Without a `uri` the prefix rebases nothing and is cleared.
+        let mut inert = RouteRewriteConfig {
+            uri: None,
+            authority: Some("internal.example.com".to_string()),
+            match_prefix: Some("/api".to_string()),
+        };
+        validate_and_normalize_rewrite(0, &mut inert).expect("authority-only rewrite is valid");
+        assert!(inert.match_prefix.is_none());
     }
 
     #[tokio::test]

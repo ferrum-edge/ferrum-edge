@@ -13,6 +13,8 @@ use ferrum_edge::tls::managed::ManagedTlsRecord;
 use ferrum_edge::tls::san::{certificate_san_strings, format_general_name};
 use rcgen::string::Ia5String;
 use rcgen::{CertificateParams, DnType, KeyPair, SanType};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
@@ -56,7 +58,7 @@ fn generate_mixed_san_cert() -> (String, String) {
 }
 
 fn sans_from_pem(pem: &str) -> Vec<String> {
-    let certs = rustls_pemfile::certs(&mut pem.as_bytes())
+    let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse PEM");
     let der = certs.first().expect("leaf certificate");
