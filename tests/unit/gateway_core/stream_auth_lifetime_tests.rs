@@ -5897,6 +5897,74 @@ async fn a_stalled_aggregate_sse_headers_write_on_an_exact_tie_is_authorization(
     );
 }
 
+/// An authorization expiry that cancels the aggregate SSE HEADERS write after
+/// its first poll reports the head as offered, so the writer resets the stream
+/// instead of writing its `401` HEADERS (#5745). A bound that had already
+/// elapsed never offers the head, and the `401` is still legal after it.
+#[tokio::test(start_paused = true)]
+async fn an_aggregate_sse_headers_expiry_reports_whether_the_head_was_offered() {
+    use ferrum_edge::_test_support::await_offered_authorized_headers_write_for_test;
+
+    let now = tokio::time::Instant::now();
+    let bound = compose_aggregate_sse_bound_for_test(
+        now + Duration::from_secs(30),
+        Some(plan_at(
+            now + Duration::from_secs(2),
+            StreamAuthTermination::CredentialExpired,
+        )),
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::pending::<Result<(), &'static str>>();
+    let (outcome, offered) = await_offered_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(
+        offered,
+        "the parked head was offered before the expiry cancelled it"
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::pending::<Result<(), &'static str>>();
+    let (outcome, offered) = await_offered_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(!offered, "an elapsed bound must not poll the head");
+
+    let bound = compose_aggregate_sse_bound_for_test(now + Duration::from_secs(30), None);
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::ready(Ok::<(), &'static str>(()));
+    let (outcome, offered) = await_offered_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(outcome, H3AuthorizedHeadersWrite::Written);
+    assert!(offered);
+    assert_eq!(latch.observed(), None);
+}
+
 /// An already-elapsed authorization bound with a later listener lifetime must
 /// not poll send_response, so the protected 200/event-stream head cannot commit.
 #[tokio::test(start_paused = true)]

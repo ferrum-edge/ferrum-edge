@@ -989,6 +989,58 @@ async fn charged_deadline_rejection_keeps_its_wording_past_an_elapsed_rpc_deadli
     assert!(!gateway_deadline_response_selected_for_test(&ctx));
 }
 
+/// A charged gRPC-Web budget expiry must end the spent attempt budget before
+/// `after_proxy` runs (#5744). While that budget is still the RPC deadline in
+/// force, the first hook is refused as the gateway's own deadline and the
+/// charged `Backend deadline exceeded` terminal becomes `Deadline exceeded at
+/// gateway`. Proxy core and the HTTP/3 bridge's mesh-egress arm both end it
+/// after charging; once ended, the hooks decorate the charged terminal.
+#[tokio::test(start_paused = true)]
+async fn an_unended_charged_attempt_budget_rewords_the_backend_terminal() {
+    use ferrum_edge::_test_support::run_after_proxy_hooks_reject_for_test;
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ImmediateRejectHeaderDecorator)];
+    let with_attempt_budget = || {
+        let mut ctx = create_grpc_context_with_timeout(None);
+        ctx.route_override_attempt_timeout_ms = Some(300);
+        ctx.arm_route_request_deadline(true);
+        ctx
+    };
+    let mut still_in_force = with_attempt_budget();
+    let mut ended = with_attempt_budget();
+    tokio::time::advance(std::time::Duration::from_millis(301)).await;
+    assert!(still_in_force.grpc_deadline_is_route_attempt_budget());
+
+    let mut headers = charged_backend_deadline_headers();
+    let (status, _body, reworded) =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut still_in_force, 200, &mut headers)
+            .await
+            .expect("an elapsed attempt budget refuses the first after_proxy hook");
+    assert_eq!(status, 200);
+    assert_eq!(
+        reworded.get("grpc-message").map(String::as_str),
+        Some("Deadline exceeded at gateway")
+    );
+
+    ended.end_grpc_route_attempt();
+    assert_eq!(ended.grpc_deadline_at(), None);
+    let mut headers = charged_backend_deadline_headers();
+    let rejected =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ended, 200, &mut headers).await;
+    assert!(
+        rejected.is_none(),
+        "an ended attempt budget no longer bounds after_proxy"
+    );
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Backend deadline exceeded")
+    );
+    assert_eq!(
+        headers.get("x-before-deadline").map(String::as_str),
+        Some("trusted")
+    );
+}
+
 /// A charged budget expiry after `after_proxy` decorated the response head
 /// (#5744) carries that run's gateway decorations into the terminal, instead of
 /// running `after_proxy` a second time, and sheds every backend field.

@@ -566,7 +566,15 @@ the cancelled head was offered to the send half
 (`stream_util::await_offered_response_write_before_deadline`). An offered head
 is answered with a stream reset; only a head whose bound had already elapsed
 before the write began still gets the fixed `401` or the gRPC-Web
-`DEADLINE_EXCEEDED` HEADERS (#5745).
+`DEADLINE_EXCEEDED` HEADERS (#5745). The native aggregate MCP SSE writer
+applies the same rule to its protected event-stream head
+(`stream_util::await_offered_authorized_headers_write`). The gRPC-Web
+`DEADLINE_EXCEEDED` trailer frame the bridge appends after a committed head is
+subject to it too: the buffered body write reports whether it was offered, and
+both streaming relays mark each write in flight
+(`stream_util::track_response_write_in_flight`) because the client deadline
+cancels the whole relay from outside. A cut write is answered with a reset,
+never an appended frame.
 
 The committed-response observer is the one phase where an elapsed bound used to
 mean "continue in the background". That detach survives only for the

@@ -1024,8 +1024,8 @@ fn native_http3_plain_bridge_resets_after_an_offered_head_write() {
         dispatch
             .matches("stream_util::await_offered_response_write_before_deadline(")
             .count(),
-        2,
-        "the buffered and the streaming response HEADERS writes"
+        3,
+        "the buffered and the streaming response HEADERS writes, and the buffered body write"
     );
     for terminal in [
         "return write_plain_authorization_expired_terminal(",
@@ -1044,6 +1044,113 @@ fn native_http3_plain_bridge_resets_after_an_offered_head_write() {
             "`{terminal}` after a head write must first reset an offered head"
         );
     }
+}
+
+/// The plain bridge's gRPC-Web client deadline terminal is never appended
+/// after a body write the deadline cut after h3 took a frame (#5745): h3-quinn
+/// would fail that DATA write with a connection-level error and close every
+/// sibling stream. The buffered body write reports whether it was offered, the
+/// streaming relays report whether they were cancelled inside a write, and the
+/// terminal resets the stream in either case.
+#[test]
+fn native_http3_plain_bridge_resets_after_a_cut_grpc_web_body_write() {
+    let dispatch = plain_bridge_dispatch();
+    let buffered = dispatch
+        .find("let (body_write, body_offered) =")
+        .expect("the buffered body write reports whether it was offered");
+    let buffered_terminal = dispatch
+        .find("append_plain_grpc_web_client_deadline(stream, ctx, body_offered)")
+        .expect("the buffered terminal is told whether the body write was offered");
+    assert!(buffered < buffered_terminal);
+    let streaming_terminal =
+        "append_plain_grpc_web_client_deadline(stream, ctx, response_write_in_flight)";
+    assert!(
+        dispatch.contains(streaming_terminal),
+        "the streaming terminal is told whether the relay was inside a write"
+    );
+    assert_eq!(
+        dispatch.matches("&mut response_write_in_flight,").count(),
+        2,
+        "both streaming relays report an in-flight write"
+    );
+
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    assert_eq!(
+        bridge
+            .matches("stream_util::track_response_write_in_flight(")
+            .count(),
+        2,
+        "every write of both streaming relays is tracked"
+    );
+    let append = bridge
+        .split("async fn append_plain_grpc_web_client_deadline<S>(")
+        .nth(1)
+        .expect("append_plain_grpc_web_client_deadline")
+        .split("\n}\n")
+        .next()
+        .expect("bounded append_plain_grpc_web_client_deadline");
+    let reset = append
+        .find("if write_in_flight {")
+        .expect("a cut write resets the stream");
+    let data = append
+        .find("stream.send_data(")
+        .expect("the appended terminal");
+    assert!(reset < data, "the reset must come before any appended DATA");
+    assert!(
+        append[reset..data].contains("abort_response_stream(stream);"),
+        "a cut write must be answered with a reset"
+    );
+}
+
+/// A relay write cancelled from outside after its first poll stays marked in
+/// flight, so the caller resets instead of appending (#5745); a write that
+/// finished, successfully or not, is not in flight.
+#[tokio::test(start_paused = true)]
+async fn a_relay_write_cut_mid_flight_stays_marked_in_flight() {
+    use ferrum_edge::_test_support::track_response_write_in_flight_for_test;
+
+    let mut in_flight = false;
+    let cut = tokio::time::timeout(
+        Duration::from_secs(1),
+        track_response_write_in_flight_for_test(&mut in_flight, parked_client_write()),
+    )
+    .await;
+    assert!(cut.is_err(), "the parked write must be cut from outside");
+    assert!(in_flight, "the cut write was inside the send half");
+
+    let mut in_flight = false;
+    let ready = std::future::ready(Ok::<(), &'static str>(()));
+    let landed = track_response_write_in_flight_for_test(&mut in_flight, ready).await;
+    assert_eq!(landed, Ok(()));
+    assert!(!in_flight, "a finished write is no longer in flight");
+
+    let mut in_flight = false;
+    let failed = std::future::ready(Err::<(), &'static str>("client gone"));
+    let failed = track_response_write_in_flight_for_test(&mut in_flight, failed).await;
+    assert_eq!(failed, Err("client gone"));
+    assert!(!in_flight, "a failed write is no longer in flight");
+}
+
+/// The H3 bridge's mesh-egress arm ends a charged gRPC-Web attempt budget
+/// before the shared response pipeline, as proxy core does (#5744): the
+/// dispatch bounds are re-derived without it, so neither `after_proxy` nor the
+/// response write reads the spent budget as the gateway's own deadline.
+#[test]
+fn native_http3_plain_bridge_mesh_arm_ends_a_charged_attempt_budget() {
+    let dispatch = plain_bridge_dispatch();
+    let charge = dispatch
+        .find("if crate::proxy::charge_generic_grpc_route_attempt_budget_expiry(")
+        .expect("the mesh arm acts on whether it charged");
+    let retry = dispatch[charge..]
+        .find("crate::retry::should_retry(")
+        .map(|offset| charge + offset)
+        .expect("the mesh arm's retry decision");
+    let charged = &dispatch[charge..retry];
+    assert!(
+        charged.contains("(grpc_web_deadline_at, plain_write_bound, _) =")
+            && charged.contains("end_plain_route_attempt("),
+        "a charged mesh expiry must end the attempt budget and re-derive the bounds"
+    );
 }
 
 /// A route timeout `504` handed to the plain bridge's shared response pipeline

@@ -11810,6 +11810,34 @@ pub mod _test_support {
         crate::http3::stream_util::await_authorized_headers_write(bound, family, latch, write).await
     }
 
+    /// [`await_authorized_headers_write_for_test`], also returning whether the
+    /// write was offered to the send half first, as the aggregate SSE writer
+    /// races its protected head (#5745).
+    pub async fn await_offered_authorized_headers_write_for_test<F, T, E>(
+        bound: crate::proxy::auth_lifetime::ComposedAuthBound,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        write: F,
+    ) -> (H3AuthorizedHeadersWrite, bool)
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        use crate::http3::stream_util as seam;
+        seam::await_offered_authorized_headers_write(bound, family, latch, write).await
+    }
+
+    /// Drive `write` through the in-flight tracker a relay wraps each response
+    /// write in (#5745).
+    pub async fn track_response_write_in_flight_for_test<F, T, E>(
+        in_flight: &mut bool,
+        write: F,
+    ) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        crate::http3::stream_util::track_response_write_in_flight(in_flight, write).await
+    }
+
     /// Compose the aggregate MCP SSE listener lifetime with a captured
     /// authorization plan, matching the native-H3 aggregate SSE writer.
     pub fn compose_aggregate_sse_bound_for_test(

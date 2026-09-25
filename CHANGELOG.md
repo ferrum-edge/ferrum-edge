@@ -79,12 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ending every other request on it. The stream is now reset instead once the
   cancelled HEADERS had been handed to QUIC; a deadline that passed before the
   write began still answers with the `401` or `DEADLINE_EXCEEDED` terminal.
+  The same applies to the native aggregate MCP SSE listener's `401` after a
+  credential expiry cut its event-stream HEADERS, and to the bridge's gRPC-Web
+  `DEADLINE_EXCEEDED` trailer frame after a client deadline cut a response
+  body write, buffered or streamed: once the cut write had been handed to
+  QUIC, the stream is reset instead of writing more.
 - A gRPC-Web `backendRequest` budget expiry keeps its `Backend deadline
   exceeded` terminal when `after_proxy` plugins (for example CORS) run
-  (#5744). On HTTP/1.1 and HTTP/2 the first such plugin read the spent budget
-  as the gateway's own deadline and turned the terminal into `Deadline
-  exceeded at gateway`; the budget now ends when the expiry is charged, as on
-  the HTTP/3 bridge. On the HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends, the
+  (#5744). On HTTP/1.1 and HTTP/2, and on the HTTP/3 bridge's mesh backends,
+  the first such plugin read the spent budget as the gateway's own deadline
+  and turned the terminal into `Deadline exceeded at gateway`; the budget now
+  ends when the expiry is charged, as on the rest of the HTTP/3 bridge. On the
+  HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends, the
   charged terminal's `after_proxy` and response-committed plugins were awaited
   without a bound when no client `grpc-timeout` or route `request` timeout
   remained. They now get the bounded treatment of the gateway's own deadline

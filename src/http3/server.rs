@@ -17658,14 +17658,15 @@ async fn send_h3_aggregate_sse_response(
     let auth_latch = ctx.authorization_termination_latch();
     let auth_family = crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http;
 
-    match crate::http3::stream_util::await_authorized_headers_write(
-        aggregate_sse_bound,
-        auth_family,
-        &auth_latch,
-        stream.send_response(response),
-    )
-    .await
-    {
+    let (headers_write, head_offered) =
+        crate::http3::stream_util::await_offered_authorized_headers_write(
+            aggregate_sse_bound,
+            auth_family,
+            &auth_latch,
+            stream.send_response(response),
+        )
+        .await;
+    match headers_write {
         crate::http3::stream_util::H3AuthorizedHeadersWrite::Written => {}
         crate::http3::stream_util::H3AuthorizedHeadersWrite::ClientWriteFailed => {
             drop(body);
@@ -17686,6 +17687,18 @@ async fn send_h3_aggregate_sse_response(
         crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(termination) => {
             ctx.latch_authorization_termination(termination);
             drop(body);
+            if head_offered {
+                // h3 took the protected head before the expiry cancelled it
+                // (#5745). h3-quinn still holds that frame, so a `401` HEADERS
+                // would fail with a connection-level error and h3 would close
+                // the whole QUIC connection with every sibling stream. Part of
+                // the head may already be on the wire: reset this stream only.
+                crate::http3::stream_util::abort_response_stream(stream);
+                if halt_recv {
+                    crate::http3::stream_util::halt_request_body(stream);
+                }
+                return Ok(());
+            }
             let (status, terminal_headers, terminal_body) =
                 crate::proxy::authorization_expired_pre_commitment_response(
                     ctx,

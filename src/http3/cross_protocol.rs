@@ -1712,7 +1712,11 @@ async fn collect_plain_response_within_attempt(
         }
         Err(expiry @ crate::proxy::RouteDeadlineExpiry::AttemptBudget) => {
             let failure = route_collect_expiry_failure(ctx, expiry);
-            (Err(failure), timeout_result.status_code, timeout_result.error_class)
+            (
+                Err(failure),
+                timeout_result.status_code,
+                timeout_result.error_class,
+            )
         }
         // A spent total deadline is never retried.
         Err(expiry) => {
@@ -2799,14 +2803,27 @@ where
     Ok(outcome)
 }
 
+/// Append the gRPC-Web client deadline terminal after a committed response head,
+/// returning the bytes written and whether the terminal and FIN landed.
+///
+/// `write_in_flight` is whether the deadline cancelled a response body write
+/// after its first poll (#5745). h3-quinn then still holds that frame, so a
+/// further DATA write fails with a connection-level error and h3 closes the
+/// whole QUIC connection, every sibling stream with it; a message may also be
+/// cut mid-frame on the wire. That stream is reset instead.
 async fn append_plain_grpc_web_client_deadline<S>(
     stream: &mut RequestStream<S, Bytes>,
     ctx: &mut RequestContext,
+    write_in_flight: bool,
 ) -> (u64, bool)
 where
     S: SendStream<Bytes>,
 {
     ctx.mark_gateway_deadline_response_selected();
+    if write_in_flight {
+        crate::http3::stream_util::abort_response_stream(stream);
+        return (0, false);
+    }
     let deadline = normalized_h3_grpc_deadline();
     let (_, translated) = normalize_reject_for_client(
         ctx,
@@ -3354,13 +3371,27 @@ where
                         };
                         // A gRPC-Web budget expiry the mesh dispatch answered as
                         // the client's deadline is charged to this backend, as
-                        // proxy core charges its mesh retry attempts.
-                        crate::proxy::charge_generic_grpc_route_attempt_budget_expiry(
+                        // proxy core charges its mesh retry attempts. The charged
+                        // attempt's budget is spent and ends here, as in proxy
+                        // core (#5744): still in force, it would make
+                        // `after_proxy` and the response write read it as the
+                        // gateway's own deadline and replace `Backend deadline
+                        // exceeded` with `Deadline exceeded at gateway`. The
+                        // gateway-local bound is re-derived before any backoff.
+                        if crate::proxy::charge_generic_grpc_route_attempt_budget_expiry(
                             ctx,
                             proxy_headers,
                             true,
                             &mut attempt_result,
-                        );
+                        ) {
+                            (grpc_web_deadline_at, plain_write_bound, _) =
+                                end_plain_route_attempt(
+                                    ctx,
+                                    policy_flavor,
+                                    plain_auth_deadline_plan,
+                                    route,
+                                );
+                        }
                         if let Some(retry_config) = retry_config
                             && !crate::http3::route_deadline::total_expiry_recorded(route, ctx)
                             && crate::retry::should_retry(
@@ -5917,69 +5948,71 @@ where
             }
             stream.finish().await
         };
-        let (body_completed, client_disconnected) =
-            match crate::http3::stream_util::await_response_write_before_deadline(
+        // A body write the deadline cancels after h3 took a frame is never
+        // followed by the gRPC-Web deadline terminal (#5745).
+        let (body_write, body_offered) =
+            crate::http3::stream_util::await_offered_response_write_before_deadline(
                 plain_write_bound.deadline(),
                 buffered_write,
             )
-            .await
-            {
-                Ok(()) => (true, false),
-                Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => {
-                    debug!("cross-protocol H3 buffered body write failed: {error}");
-                    (false, true)
-                }
-                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    if let Some(termination) = plain_write_bound.expired_authorization() {
-                        // Post-commitment: response HEADERS are already on the
-                        // wire, so the deterministic terminal is a RESET — never
-                        // a fabricated clean finish and never an appended
-                        // gateway frame the client is no longer authorized to
-                        // receive. Recorded exactly once: this arm returns.
-                        ctx.record_authorization_termination_once(
-                            termination,
-                            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
-                        );
-                        crate::http3::stream_util::abort_response_stream(stream);
-                        return Ok(CrossProtocolOutcome {
-                            response_status,
-                            response_streamed: false,
-                            bytes_streamed: 0,
-                            bytes_sent,
-                            backend_target: Some(strip_query_from_backend_url(&current_url)),
-                            backend_resolved_ip: final_backend_resolved_ip.clone(),
-                            body_completed: false,
-                            client_disconnected: false,
-                            connection_error: false,
-                            error_class: None,
-                            // Health-neutral: a gateway policy expiry, not a
-                            // backend fault.
-                            body_error_class: Some(ErrorClass::ClientDisconnect),
-                            backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
-                            backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
-                            rejection_logged: false,
-                        });
-                    }
-                    let (deadline_bytes, deadline_written) =
-                        append_plain_grpc_web_client_deadline(stream, ctx).await;
+            .await;
+        let (body_completed, client_disconnected) = match body_write {
+            Ok(()) => (true, false),
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => {
+                debug!("cross-protocol H3 buffered body write failed: {error}");
+                (false, true)
+            }
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                if let Some(termination) = plain_write_bound.expired_authorization() {
+                    // Post-commitment: response HEADERS are already on the
+                    // wire, so the deterministic terminal is a RESET — never
+                    // a fabricated clean finish and never an appended
+                    // gateway frame the client is no longer authorized to
+                    // receive. Recorded exactly once: this arm returns.
+                    ctx.record_authorization_termination_once(
+                        termination,
+                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                    );
+                    crate::http3::stream_util::abort_response_stream(stream);
                     return Ok(CrossProtocolOutcome {
-                        response_status: StatusCode::OK.as_u16(),
+                        response_status,
                         response_streamed: false,
-                        bytes_streamed: bytes_streamed.saturating_add(deadline_bytes),
+                        bytes_streamed: 0,
                         bytes_sent,
                         backend_target: Some(strip_query_from_backend_url(&current_url)),
                         backend_resolved_ip: final_backend_resolved_ip.clone(),
-                        body_completed: deadline_written,
+                        body_completed: false,
                         client_disconnected: false,
-                        connection_error: terminal_connection_error,
-                        error_class: terminal_error_class,
+                        connection_error: false,
+                        error_class: None,
+                        // Health-neutral: a gateway policy expiry, not a
+                        // backend fault.
                         body_error_class: Some(ErrorClass::ClientDisconnect),
                         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                         rejection_logged: false,
                     });
                 }
-            };
+                let (deadline_bytes, deadline_written) =
+                    append_plain_grpc_web_client_deadline(stream, ctx, body_offered).await;
+                return Ok(CrossProtocolOutcome {
+                    response_status: StatusCode::OK.as_u16(),
+                    response_streamed: false,
+                    bytes_streamed: bytes_streamed.saturating_add(deadline_bytes),
+                    bytes_sent,
+                    backend_target: Some(strip_query_from_backend_url(&current_url)),
+                    backend_resolved_ip: final_backend_resolved_ip.clone(),
+                    body_completed: deadline_written,
+                    client_disconnected: false,
+                    connection_error: terminal_connection_error,
+                    error_class: terminal_error_class,
+                    body_error_class: Some(ErrorClass::ClientDisconnect),
+                    backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                    backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                    rejection_logged: false,
+                });
+            }
+        };
 
         return Ok(CrossProtocolOutcome {
             response_status,
@@ -6240,6 +6273,11 @@ where
     // body deadline fires, on its own arm or on a parked write, and reports
     // the cut here.
     let mut route_deadline_cut = false;
+    // Set while the relay is inside a response write: the gRPC-Web deadline
+    // below cancels the relay from outside, and a write it cut after h3 took
+    // the frame must be answered with a reset, never an appended terminal
+    // (#5745).
+    let mut response_write_in_flight = false;
     let stream_response = async {
         if let Some(inspector) = response_inspector {
             stream_inspected_reqwest_response(
@@ -6252,6 +6290,7 @@ where
                 &auth_latch,
                 route_body_deadline,
                 &mut route_deadline_cut,
+                &mut response_write_in_flight,
             )
             .await
         } else {
@@ -6265,6 +6304,7 @@ where
                 &auth_latch,
                 route_body_deadline,
                 &mut route_deadline_cut,
+                &mut response_write_in_flight,
             )
             .await
         }
@@ -6286,7 +6326,8 @@ where
                     backend_admission_elapsed,
                 );
                 let (deadline_bytes, deadline_written) =
-                    append_plain_grpc_web_client_deadline(stream, ctx).await;
+                    append_plain_grpc_web_client_deadline(stream, ctx, response_write_in_flight)
+                        .await;
                 return Ok(CrossProtocolOutcome {
                     response_status: StatusCode::OK.as_u16(),
                     response_streamed: true,
@@ -9733,6 +9774,9 @@ async fn stream_reqwest_response<S>(
     // `route_deadline_cut` when it ends the body.
     route_body_deadline: Option<tokio::time::Instant>,
     route_deadline_cut: &mut bool,
+    // Held set while a response write is in flight, for a caller that cancels
+    // this relay from outside (#5745).
+    write_in_flight: &mut bool,
 ) -> (
     u64,
     bool,
@@ -9793,7 +9837,10 @@ where
                 route_body_sleep.as_mut(),
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 auth_latch,
-                $write,
+                crate::http3::stream_util::track_response_write_in_flight(
+                    &mut *write_in_flight,
+                    $write,
+                ),
             )
             .await
             {
@@ -10032,6 +10079,9 @@ async fn stream_inspected_reqwest_response<S>(
     // `route_deadline_cut` when it ends the body.
     route_body_deadline: Option<tokio::time::Instant>,
     route_deadline_cut: &mut bool,
+    // Held set while a response write is in flight, for a caller that cancels
+    // this relay from outside (#5745).
+    write_in_flight: &mut bool,
 ) -> (
     u64,
     bool,
@@ -10086,7 +10136,10 @@ where
                 route_body_sleep.as_mut(),
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 auth_latch,
-                $write,
+                crate::http3::stream_util::track_response_write_in_flight(
+                    &mut *write_in_flight,
+                    $write,
+                ),
             )
             .await
             {

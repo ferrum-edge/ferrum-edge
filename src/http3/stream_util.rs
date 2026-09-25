@@ -274,6 +274,29 @@ where
     (result, offered)
 }
 
+/// Drive a response write, holding `in_flight` set from its first poll until
+/// it finishes (#5745).
+///
+/// A caller that cancels a whole relay from outside (the plain bridge's
+/// gRPC-Web RPC deadline) cannot see whether the relay was parked inside a
+/// write. If it was, h3-quinn still holds that frame and any further write on
+/// the stream closes the whole QUIC connection, exactly as
+/// [`await_offered_response_write_before_deadline`] describes, so the caller
+/// must reset instead of appending its terminal. A write that finished,
+/// successfully or not, clears the flag.
+pub(crate) async fn track_response_write_in_flight<F, T, E>(
+    in_flight: &mut bool,
+    write: F,
+) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    *in_flight = true;
+    let result = write.await;
+    *in_flight = false;
+    result
+}
+
 /// Outcome of a native-H3 streaming response HEADERS write raced against the
 /// composed authorization / client-RPC / route bound (issue #3815, #5646).
 ///
@@ -325,7 +348,40 @@ pub(crate) async fn await_authorized_headers_write<F, T, E>(
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    match await_response_write_before_deadline(bound.deadline(), write).await {
+    let result = await_response_write_before_deadline(bound.deadline(), write).await;
+    authorized_headers_write_outcome(bound, family, latch, result)
+}
+
+/// [`await_authorized_headers_write`], also reporting whether the write was
+/// offered to the H3 send half before it finished or was cancelled (#5745).
+///
+/// A caller that answers an authorization expiry with a terminal HEADERS must
+/// reset the stream instead when the protected head was offered: see
+/// [`await_offered_response_write_before_deadline`].
+pub(crate) async fn await_offered_authorized_headers_write<F, T, E>(
+    bound: crate::proxy::auth_lifetime::ComposedAuthBound,
+    family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    write: F,
+) -> (H3AuthorizedHeadersWrite, bool)
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let (result, offered) =
+        await_offered_response_write_before_deadline(bound.deadline(), write).await;
+    let outcome = authorized_headers_write_outcome(bound, family, latch, result);
+    (outcome, offered)
+}
+
+/// Attribute a HEADERS write raced against `bound` from the captured
+/// composition, latching an authorization expiry.
+fn authorized_headers_write_outcome<T, E>(
+    bound: crate::proxy::auth_lifetime::ComposedAuthBound,
+    family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    result: Result<T, H3ResponseWriteError<E>>,
+) -> H3AuthorizedHeadersWrite {
+    match result {
         Ok(_) => H3AuthorizedHeadersWrite::Written,
         Err(H3ResponseWriteError::Write(_)) => H3AuthorizedHeadersWrite::ClientWriteFailed,
         Err(H3ResponseWriteError::DeadlineExceeded) => {
