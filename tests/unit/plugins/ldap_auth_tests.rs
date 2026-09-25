@@ -16,6 +16,8 @@ use hickory_resolver::proto::{
     op::Message,
     rr::{RData, Record, RecordType},
 };
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
@@ -1515,12 +1517,11 @@ async fn test_ldaps_keeps_configured_hostname_for_certificate_verification() {
     ca_file
         .write_all(ca_cert.pem().as_bytes())
         .expect("write LDAP CA bundle");
-    let certs = rustls_pemfile::certs(&mut leaf_cert.pem().as_bytes())
+    let certs = CertificateDer::pem_slice_iter(leaf_cert.pem().as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse LDAP leaf certificate");
-    let key = rustls_pemfile::private_key(&mut leaf_key.serialize_pem().as_bytes())
-        .expect("parse LDAP leaf key")
-        .expect("LDAP leaf key present");
+    let key = PrivateKeyDer::from_pem_slice(leaf_key.serialize_pem().as_bytes())
+        .expect("parse LDAP leaf key");
     let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))

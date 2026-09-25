@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutating route that does not evaluate it, is `400` rather than ignored.
   Requests without `If-Match` are unchanged.
 
+- Proxy filter on `GET /plugins/config` (#5726). An optional `proxy_id` query
+  parameter narrows the list to plugin configs whose `proxy_id` matches exactly,
+  so a caller (e.g. Nexus) no longer has to page the whole namespace and filter
+  client-side. Pagination and `pagination.total` apply over the filtered set,
+  and the filter is pushed into every backend (SQL, MongoDB, and the
+  in-memory/file path), respecting the caller's namespace and role the same as
+  the unfiltered list. An invalid `proxy_id` returns `400`; an unknown one
+  returns an empty page rather than `404`.
+
 ### Fixed
 
 - Service-discovery target updates, modified upstreams, and full load-balancer
@@ -73,6 +82,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as HTTP/1.1, HTTP/2, gRPC, WebSocket, TCP and UDP already did. An early
   return between the start and the outcome record previously leaked one count,
   and a retry that rotated to another target released the wrong one.
+- An HTTP/1.1 backend request no longer waits for `backend_read_timeout_ms`
+  and returns `504` when its pooled connection is reset or closed at the moment
+  the request is queued (#5714). The request never reached the backend, so it
+  now fails straight away: a reused connection is retried on a new one, and a
+  fresh connection returns `502` (`connection_pool_error`, pre-wire). The fix is
+  in a vendored hyper-util 0.1.20: its legacy client stops holding the closed
+  connection's only request sender, so the request stranded by tokio's
+  two-step channel send is dropped and fails as unsent. HTTP/1 pools that
+  Ferrum drives directly (HBONE inner HTTP/1, Unix-socket backends) get the same
+  release in Ferrum code (#5720).
 - Benchmark runners no longer `SIGKILL` unrelated host listeners on fixed ports
   (#5702). `run_protocol_test.sh`, `run_gateway_protocol_bench.sh`,
   `run_connection_saturation_bench.sh`, `run_perf_test.sh`, `run_payload_test.sh`,
@@ -211,6 +230,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RUSTSEC-2026-0286: `Session::get_attributes` could build an out-of-bounds slice when
   decoding `CKA_ALLOWED_MECHANISMS` (crash or adjacent heap disclosure). Lockfile-only
   change; the manifest's `0.12` requirement already admits the patch release.
+- Re-evaluate the time-boxed `deny.toml` advisory exceptions before their
+  2026-09-30 expiry (#5721). `mongodb` now requires `>=3.7, <3.9` (the
+  lockfile moves from 3.6.0 to 3.8.2). 3.7 is the first release on hickory
+  0.26, which drops hickory-proto 0.25.2 (RUSTSEC-2026-0118,
+  RUSTSEC-2026-0119). The cap below 3.9 keeps MongoDB 4.2 and Cosmos DB
+  server-version-4.2 support, because 3.9 raised the driver's minimum wire
+  version to 9 (MongoDB 4.4). The optional `secrets-aws` build no longer
+  enables `aws-sdk-secretsmanager`'s legacy `rustls` feature, so hyper 0.14,
+  rustls 0.21 with rustls-webpki 0.101.7 (RUSTSEC-2026-0098, -0099, -0104)
+  and h2 0.3.27 (RUSTSEC-2026-0258) leave the tree. The client already used
+  the SDK's hyper 1.x HTTPS client. PEM parsing, in the gateway and in the
+  standalone performance harnesses, moves from the unmaintained
+  `rustls-pemfile` (RUSTSEC-2025-0134) to the `rustls-pki-types` PEM API.
+  Certificate, key, and CRL records are read the same way, but the wording of
+  the underlying parse error changes in the admin API TLS validation, the TLS
+  inventory, ACME certificate checks (`certificate_metadata`,
+  `validate_completed_certificate_pair`), and the managed TLS store.
+  `mtls_auth` is stricter: a `ca_certificate_pem` that also carries an
+  `ECHCONFIG` block was accepted before (the old parser skipped the block) and
+  is now rejected as containing another PEM item (fail-closed). `rsa`
+  (RUSTSEC-2023-0071) and `paste` (RUSTSEC-2024-0436) still have no upstream
+  fix and are re-affirmed until 2026-12-31.
 - **Route response-header policy is now part of the replay key** (PR #5709).
   `response_caching`, `request_deduplication`, and `ai_semantic_cache` replay a
   response whose headers were finalized when it was stored, so they skip the

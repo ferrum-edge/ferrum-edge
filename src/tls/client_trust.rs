@@ -152,6 +152,7 @@ use crate::fips::approved::Sha256;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rustls::client::danger::HandshakeSignatureValid;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
@@ -399,12 +400,11 @@ impl ClientTrustMaterial {
         let mut anchors = BTreeSet::new();
         let mut anchor_ders = Vec::new();
         if let Some(pem) = client_ca_pem {
-            let mut reader = pem;
             let mut parsed_any = false;
-            for cert in rustls_pemfile::certs(&mut reader) {
+            for cert in CertificateDer::pem_slice_iter(pem) {
                 let cert = cert.map_err(|_| ClientTrustMaterialError)?;
                 // PEM framing only proves the block was base64-decodable.
-                // `rustls_pemfile::certs` does not require those bytes to be a
+                // `CertificateDer::pem_slice_iter` does not require those bytes to be a
                 // complete X.509 certificate, so hashing here would invent a
                 // trust-anchor identity the verifier cannot accept. Parse
                 // errors and trailing/unconsumed DER fail the whole candidate
@@ -420,7 +420,7 @@ impl ClientTrustMaterial {
                 anchors.insert(digest_of(&[&der]));
                 anchor_ders.push(der);
             }
-            // `rustls_pemfile::certs` skips PEM sections it cannot recognize.
+            // `CertificateDer::pem_slice_iter` skips PEM sections it cannot recognize.
             // A configured client-CA source containing only malformed material
             // can therefore yield an empty successful iterator rather than an
             // item-level parse error. Treating that as an empty trust set would

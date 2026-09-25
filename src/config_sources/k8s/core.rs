@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::fips::approved::Sha256;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::Value;
 
 use crate::ebpf::pod_watcher::{EnrollmentDecision, evaluate_enrollment};
@@ -724,10 +726,9 @@ fn validate_inline_ca_bundle_pem(pem: &str) -> Option<&str> {
     if !pem.contains("-----BEGIN CERTIFICATE-----") {
         return None;
     }
-    let mut reader = std::io::Cursor::new(pem.as_bytes());
-    let Ok(certs) = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() else {
-        return None;
-    };
+    let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
     (!certs.is_empty()).then_some(pem)
 }
 
@@ -758,25 +759,17 @@ fn secret_data_decodes_to_valid_tls_pair(cert_value: &str, key_value: &str) -> b
     rustls::sign::CertifiedKey::from_der(certs, key, &provider).is_ok()
 }
 
-fn secret_data_decodes_to_certificate_chain(
-    value: &str,
-) -> Option<Vec<rustls::pki_types::CertificateDer<'static>>> {
+fn secret_data_decodes_to_certificate_chain(value: &str) -> Option<Vec<CertificateDer<'static>>> {
     secret_data_decodes_to_bytes(value, |bytes| {
-        let mut reader = std::io::Cursor::new(bytes);
-        let Ok(certs) = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() else {
-            return None;
-        };
+        let certs = CertificateDer::pem_slice_iter(bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
         (!certs.is_empty()).then_some(certs)
     })
 }
 
-fn secret_data_decodes_to_private_key(
-    value: &str,
-) -> Option<rustls::pki_types::PrivateKeyDer<'static>> {
-    secret_data_decodes_to_bytes(value, |bytes| {
-        let mut reader = std::io::Cursor::new(bytes);
-        rustls_pemfile::private_key(&mut reader).ok().flatten()
-    })
+fn secret_data_decodes_to_private_key(value: &str) -> Option<PrivateKeyDer<'static>> {
+    secret_data_decodes_to_bytes(value, |bytes| PrivateKeyDer::from_pem_slice(bytes).ok())
 }
 
 fn secret_data_decodes_to_bytes<T>(

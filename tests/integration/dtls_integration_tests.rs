@@ -6,6 +6,8 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use ferrum_edge::config::types::Proxy;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -722,11 +724,11 @@ fn test_dtls_loader_preserves_leaf_first_chain_and_validates_leaf_key() {
 
     let loaded = ferrum_edge::dtls::load_dtls_certificate(&cert_path, &key_path)
         .expect("load leaf-first chain");
-    let leaf_der = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
+    let leaf_der = CertificateDer::pem_slice_iter(leaf.cert_pem.as_bytes())
         .next()
         .expect("leaf PEM record")
         .expect("parse leaf");
-    let intermediate_der = rustls_pemfile::certs(&mut intermediate.cert_pem.as_bytes())
+    let intermediate_der = CertificateDer::pem_slice_iter(intermediate.cert_pem.as_bytes())
         .next()
         .expect("intermediate PEM record")
         .expect("parse intermediate");
@@ -763,10 +765,8 @@ fn test_dtls_loader_zeroizes_ferrum_managed_key_der_on_success_and_mismatch() {
     let mismatched_key_path = write_pem(&temp_dir, "other.key", &other.key_pem);
 
     let key_der_len = {
-        let mut key_reader = leaf.key_pem.as_bytes();
-        rustls_pemfile::private_key(&mut key_reader)
+        PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes())
             .expect("parse leaf key PEM")
-            .expect("leaf key present")
             .secret_der()
             .len()
     };
@@ -829,10 +829,8 @@ fn test_dtls_loader_zeroizes_ferrum_managed_key_der_on_success_and_mismatch() {
         "unexpected mismatch error: {error}"
     );
     let mismatched_key_der_len = {
-        let mut key_reader = other.key_pem.as_bytes();
-        rustls_pemfile::private_key(&mut key_reader)
+        PrivateKeyDer::from_pem_slice(other.key_pem.as_bytes())
             .expect("parse mismatched key PEM")
-            .expect("mismatched key present")
             .secret_der()
             .len()
     };

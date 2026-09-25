@@ -22,7 +22,8 @@ use std::time::Duration;
 
 use quinn::Endpoint;
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, private_key};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -141,13 +142,13 @@ impl QuicRefuser {
         tls: &H3TlsConfig,
         alpn: Vec<Vec<u8>>,
     ) -> Result<quinn::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
-        let mut cert_reader = tls.cert_pem.as_bytes();
-        let cert_chain: Vec<_> = certs(&mut cert_reader).filter_map(|c| c.ok()).collect();
+        let cert_chain: Vec<_> = CertificateDer::pem_slice_iter(tls.cert_pem.as_bytes())
+            .filter_map(|c| c.ok())
+            .collect();
         if cert_chain.is_empty() {
             return Err("no certificates in cert_pem".into());
         }
-        let mut key_reader = tls.key_pem.as_bytes();
-        let key = private_key(&mut key_reader)?.ok_or("no private key in key_pem")?;
+        let key = PrivateKeyDer::from_pem_slice(tls.key_pem.as_bytes())?;
 
         let provider = rustls::crypto::ring::default_provider();
         let mut server_tls_config = ServerConfig::builder_with_provider(Arc::new(provider))

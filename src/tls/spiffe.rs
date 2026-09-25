@@ -1279,6 +1279,7 @@ mod tests {
         BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
         IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SanType,
     };
+    use rustls::pki_types::pem::PemObject;
 
     /// An enforced CRL set carrying no records: revocation checking off, the
     /// posture these cache tests were written against (issue #5574).
@@ -1680,7 +1681,7 @@ mod tests {
             .pem()
             .expect("CRL pem");
         let crls: Vec<CertificateRevocationListDer<'static>> =
-            rustls_pemfile::crls(&mut crl_pem.as_bytes())
+            CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
                 .filter_map(|r| r.ok())
                 .collect();
         assert!(!crls.is_empty(), "should parse CRL from PEM");

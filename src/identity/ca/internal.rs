@@ -33,6 +33,8 @@ use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SerialNumber, SigningKey,
 };
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -487,8 +489,7 @@ impl CertificateAuthority for InternalCa {
 /// operator who put the intermediate first would issue with the intermediate
 /// as "root", breaking chain validation in subtle ways).
 fn pem_to_der(pem: &str) -> Result<Vec<u8>, CaError> {
-    let mut reader = pem.as_bytes();
-    let mut iter = rustls_pemfile::certs(&mut reader);
+    let mut iter = CertificateDer::pem_slice_iter(pem.as_bytes());
     let first = iter
         .next()
         .ok_or_else(|| CaError::Config("no CERTIFICATE block in root cert PEM".to_string()))?

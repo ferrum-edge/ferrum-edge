@@ -5772,10 +5772,26 @@ paths:
       summary: List plugin configurations (paginated)
       description: |
         Returns a paginated envelope with `data` and `pagination` fields.
+
+        An optional `proxy_id` query parameter narrows the result to plugin
+        configs whose `proxy_id` matches exactly, so a caller listing one
+        proxy's configs does not have to page through the whole namespace and
+        filter client-side. Pagination (and `pagination.total`) is applied over
+        the filtered set.
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
+        - name: proxy_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Exact match on the `proxy_id` field of the plugin config. Returns
+            only proxy-scoped configs targeting this proxy. Must satisfy the
+            same identifier rules as other resource ids; an invalid value is
+            rejected with `400`.
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"

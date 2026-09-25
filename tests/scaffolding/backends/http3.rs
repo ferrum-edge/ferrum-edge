@@ -41,7 +41,8 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use quinn::Endpoint;
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, private_key};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -144,13 +145,13 @@ impl H3TlsConfig {
     pub(crate) fn build_server_config(
         &self,
     ) -> Result<ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
-        let mut cert_reader = self.cert_pem.as_bytes();
-        let cert_chain: Vec<_> = certs(&mut cert_reader).filter_map(|c| c.ok()).collect();
+        let cert_chain: Vec<_> = CertificateDer::pem_slice_iter(self.cert_pem.as_bytes())
+            .filter_map(|c| c.ok())
+            .collect();
         if cert_chain.is_empty() {
             return Err("no certificates found in cert_pem".into());
         }
-        let mut key_reader = self.key_pem.as_bytes();
-        let key = private_key(&mut key_reader)?.ok_or("no private key found in key_pem")?;
+        let key = PrivateKeyDer::from_pem_slice(self.key_pem.as_bytes())?;
 
         let provider = rustls::crypto::ring::default_provider();
         let mut config = ServerConfig::builder_with_provider(Arc::new(provider))

@@ -8,9 +8,10 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::ServerConfig;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::convert::Infallible;
 use std::fs;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -141,9 +142,8 @@ fn load_tls_config(
     let key_file = fs::File::open(key_path)?;
 
     let certs: Vec<_> =
-        rustls_pemfile::certs(&mut BufReader::new(cert_file)).collect::<Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))?
-        .ok_or("no private key found")?;
+        CertificateDer::pem_reader_iter(cert_file).collect::<Result<Vec<_>, _>>()?;
+    let key = PrivateKeyDer::from_pem_reader(key_file)?;
 
     let config = ServerConfig::builder()
         .with_no_client_auth()

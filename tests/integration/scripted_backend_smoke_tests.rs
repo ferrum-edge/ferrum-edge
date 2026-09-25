@@ -177,7 +177,8 @@ async fn scripted_http1_backend_via_reqwest() {
 
 #[tokio::test]
 async fn scripted_tls_backend_alpn_negotiation() {
-    use rustls_pemfile::certs;
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
     let ca = TestCa::new("integration-test").expect("ca");
     let (cert_pem, key_pem) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("port");
@@ -197,8 +198,7 @@ async fn scripted_tls_backend_alpn_negotiation() {
 
     // Build a rustls client that advertises h2 first, then http/1.1.
     let mut root = rustls::RootCertStore::empty();
-    let mut reader = ca.cert_pem.as_bytes();
-    for cert in certs(&mut reader).filter_map(|c| c.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes()).filter_map(|c| c.ok()) {
         root.add(cert).expect("add ca");
     }
     let provider = rustls::crypto::ring::default_provider();

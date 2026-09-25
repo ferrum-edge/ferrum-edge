@@ -2605,15 +2605,14 @@ fn spawn_tls_echo_server(
     cert_pem: &str,
     key_pem: &str,
 ) -> tokio::task::JoinHandle<()> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .expect("parse echo server cert");
-    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key_pem.as_bytes()))
-        .expect("parse echo server key")
-        .expect("echo server key present");
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse echo server cert");
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("parse echo server key");
     let server_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
