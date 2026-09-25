@@ -777,18 +777,23 @@ expiry while it is still streaming is charged to the backend.
   selected, not when the attempt is handed to the backend, which is stricter
   than upstream: gateway-side time before the handoff (collecting a buffered
   upload, DNS, admission, connection acquisition) counts against the first
-  attempt. An expiry before the request was sent stays health-neutral.
+  attempt. An expiry before the request was sent stays health-neutral. The
+  budget rides the call's single absolute RPC deadline, which the `grpc_deadline`
+  plugin, the gRPC dispatchers and every gRPC-Web pass-through bound share from
+  before dispatch; starting it at the handoff needs each of those dispatchers
+  to re-arm that deadline from inside its own send path (tracked in #5734).
 - **gRPC budget expiry is not retried.** gRPC calls are retried only after
   connection failures, so a call whose attempt budget expired ends with
-  `DEADLINE_EXCEEDED` even when the rule's `retry` lists `504`.
-- **HTTP/3 bridge buffered collection is not retried.** The HTTP/3 bridge to
-  HTTP/1.1 and HTTP/2 backends collects a buffered response body (a
-  response-body plugin or `response_body_mode: buffer`) after its retry loop,
-  once `after_proxy` has run on the response head. An attempt budget that
-  expires while that body is collected ends the request with the same charged
-  backend-timeout `504`, but the rule's `retry` does not replay it, unlike
-  HTTP/1.1, HTTP/2 and the native HTTP/3 backend pool, which collect a buffered
-  body inside the attempt.
+  `DEADLINE_EXCEEDED` even when the rule's `retry` lists `504`. The gRPC retry
+  path replays only calls that never reached the backend; retrying an expiry
+  would replay a call the backend already received, which that policy does not
+  do (tracked in #5734).
+
+The HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends collects a buffered response
+body (a response-body plugin or `response_body_mode: buffer`) inside the
+attempt, as HTTP/1.1, HTTP/2 and the native HTTP/3 backend pool do, so an
+attempt budget that expires while that body is collected is retried like one
+that expires before the response head (#5738).
 
 The upstream `HTTPRouteTimeoutBackendRequest` test delays only the response
 head, which every frontend bounds.

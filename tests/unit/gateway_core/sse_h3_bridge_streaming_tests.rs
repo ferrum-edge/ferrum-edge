@@ -25,6 +25,17 @@ fn dispatch_plain_body() -> &'static str {
     &tail[..end]
 }
 
+/// The bridge's shared buffer/stream decision, which both the post-loop
+/// pipeline and the retry loop's in-attempt collection (#5738) consult.
+fn buffering_decision_body() -> &'static str {
+    let start = CROSS_PROTOCOL
+        .find("fn plain_bridge_buffers_response(")
+        .expect("plain_bridge_buffers_response not found");
+    let tail = &CROSS_PROTOCOL[start..];
+    let end = tail.find("\n}\n").expect("end of the buffering decision");
+    &tail[..end]
+}
+
 /// The buffer/stream refinement answers a question about the BACKEND's chosen
 /// representation, so it must run over the backend's own header map.
 ///
@@ -41,8 +52,13 @@ fn h3_plain_bridge_refines_the_response_decision_before_after_proxy() {
         .find("stamp_h3_original_response_metadata(ctx, status, &response_headers)")
         .expect("the pristine backend response stamp");
     let refine = body
-        .find("crate::proxy::refine_stream_response_for_content_type(")
+        .find("PlainBridgeBodySource::Reqwest(_) => plain_bridge_buffers_response(")
         .expect("the shared buffer/stream refinement");
+    assert!(
+        buffering_decision_body()
+            .contains("crate::proxy::refine_stream_response_for_content_type("),
+        "the shared buffering decision must refine through the H1/H2 helper"
+    );
     let after_proxy = body
         .find("crate::proxy::run_after_proxy_hooks(plugins, ctx, status, &mut response_headers)")
         .expect("the after_proxy chain");
@@ -122,9 +138,9 @@ fn h3_plain_bridge_response_buffering_is_not_gated_on_retry_configuration() {
 /// active buffering plugin gets its per-response say once headers arrive.
 #[test]
 fn h3_plain_bridge_still_uses_the_marked_retry_decision_context() {
-    let body = dispatch_plain_body();
+    let body = buffering_decision_body();
     assert!(
-        body.contains("crate::proxy::retry_response_decision_context(&*ctx)"),
+        body.contains("crate::proxy::retry_response_decision_context(ctx)"),
         "retry-enabled H3 plain dispatch must construct the shared marked context"
     );
     assert!(
