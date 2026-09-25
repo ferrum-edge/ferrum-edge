@@ -647,6 +647,47 @@ async fn finish(task: JoinHandle<H1Read>) -> H1Read {
     task.await.expect("HTTP/1.1 response read task panicked")
 }
 
+/// The gateway's own body for a backend call that failed without a timeout.
+const GATEWAY_BACKEND_UNAVAILABLE_BODY: &[u8] = br#"{"error":"Backend unavailable"}"#;
+
+/// Assert how a request the backend never answered ends once shutdown gives up
+/// on it.
+///
+/// Two endings are correct. The exit can tear the client connection down
+/// before any response head (`ClosedBeforeResponse` or `Transport`). Or the
+/// runtime teardown can drop the backend leg first, and the still-running
+/// handler answers with the gateway's own `502` Backend unavailable body,
+/// which drain marks `Connection: close`. Anything else fails: a stall means
+/// the exit left the socket open, and any other complete response, the
+/// backend's `200` above all, did not come from the abandoned request.
+fn expect_abandoned(read: H1Read, context: &str) {
+    match read {
+        H1Read::ClosedBeforeResponse | H1Read::Transport(_) => {}
+        H1Read::Complete(response) => {
+            assert_ne!(
+                response.body, HELD_BODY.as_bytes(),
+                "{context}: the unreleased backend body was delivered"
+            );
+            assert_eq!(
+                response.status, 502,
+                "{context}: only the gateway's 502 may answer an abandoned request"
+            );
+            assert_eq!(
+                response.body, GATEWAY_BACKEND_UNAVAILABLE_BODY,
+                "{context}: the 502 must be the gateway's Backend unavailable body"
+            );
+            assert!(
+                response.connection_close,
+                "{context}: a 502 written during shutdown must carry `Connection: close`"
+            );
+        }
+        other => panic!(
+            "{context}: expected the request cut off or answered with the gateway's 502, \
+             got: {other}"
+        ),
+    }
+}
+
 fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
     headers
         .get_all(name)
@@ -849,8 +890,10 @@ async fn test_new_connections_refused_during_drain() {
 }
 
 /// Case 3: `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` disables the drain wait. The
-/// process exits cleanly and promptly with a request still held, and that
-/// request is cut off rather than left open.
+/// process exits cleanly and promptly with a request still held. That request
+/// never gets the backend's response: it is cut off, or answered with the
+/// gateway's own `502` and `Connection: close` (see [`expect_abandoned`]),
+/// never left open.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_drain_zero_exits_immediately() {
@@ -866,13 +909,10 @@ async fn test_drain_zero_exits_immediately() {
         .expect_clean_exit(Duration::from_secs(2), "with drain=0 and a held request")
         .await;
 
-    // The backend was never released, so no response can exist. The exit must
-    // have torn the client connection down, not left it open and silent.
+    // The backend was never released, so its response cannot exist. The exit
+    // must have ended the client request, not left it open and silent.
     let read = finish(inflight).await;
-    assert!(
-        matches!(read, H1Read::ClosedBeforeResponse | H1Read::Transport(_)),
-        "held request after a drain=0 exit should be cut off, got: {read}"
-    );
+    expect_abandoned(read, "held request after a drain=0 exit");
 }
 
 /// Case 4: An HTTP/1.1 response the gateway produces during drain carries
@@ -920,7 +960,7 @@ async fn test_drain_sets_connection_close_header() {
 
 /// Case 5: Drain timeout is respected. With `FERRUM_SHUTDOWN_DRAIN_SECONDS=2`
 /// and a request held forever, the gateway waits out the drain window, then
-/// force-closes the request and exits cleanly.
+/// abandons the request (see [`expect_abandoned`]) and exits cleanly.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_drain_timeout_respected() {
@@ -946,10 +986,7 @@ async fn test_drain_timeout_respected() {
     );
 
     let read = finish(inflight).await;
-    assert!(
-        matches!(read, H1Read::ClosedBeforeResponse | H1Read::Transport(_)),
-        "held request after the drain timeout should be cut off, got: {read}"
-    );
+    expect_abandoned(read, "held request after the drain timeout");
 }
 
 /// Case 6: An idle keep-alive HTTP/1.1 connection is closed by the gateway when

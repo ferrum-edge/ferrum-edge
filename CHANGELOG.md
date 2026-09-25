@@ -75,7 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the server closes the connection. The held backend counts only real `GET`
   requests as arrivals. It used to count the gateway's startup h2c probe as
   one, so a drain case could send SIGTERM before its request reached the
-  gateway.
+  gateway. When shutdown gives up on a held request (`drain=0` or an expired
+  drain window), the request may be cut off or answered with the gateway's
+  own `502` Backend unavailable body and `Connection: close`, since exit can
+  drop the backend call first. Any other response, a stall, or the unreleased
+  backend body fails.
 - gRPC-Web pass-through on the HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends
   now matches HTTP/1.1 and HTTP/2 on two points (#5734). Every attempt tells
   the backend its remaining RPC budget, including the rule's `backendRequest`
