@@ -329,8 +329,10 @@ rdkafka = { version = "0.39", features = ["cmake-build", "zstd", "ssl-vendored"]
 # ring, so retain the non-crypto defaults explicitly and select the TLS provider
 # through `crypto-ring` / `fips` below.
 # 3.7 is the first release on hickory 0.26; older 3.x pin hickory-proto 0.25
-# (RUSTSEC-2026-0118 / RUSTSEC-2026-0119).
-mongodb = { version = "3.7", default-features = false, features = ["compat-3-0-0", "dns-resolver"] }
+# (RUSTSEC-2026-0118 / RUSTSEC-2026-0119). Capped below 3.9, which raised the
+# driver's minimum wire version to 9 (MongoDB 4.4) and would drop MongoDB 4.2 /
+# Cosmos DB server-version-4.2 support; 3.7 and 3.8 still accept wire version 8.
+mongodb = { version = ">=3.7, <3.9", default-features = false, features = ["compat-3-0-0", "dns-resolver"] }
 
 # DTLS 1.2/1.3 (secure UDP) — Sans-IO state machine
 # SYNC: version must match tests/performance/multi_protocol/Cargo.toml (cross-version DTLS handshakes hang)

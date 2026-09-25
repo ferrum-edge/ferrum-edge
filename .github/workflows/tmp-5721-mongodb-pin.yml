@@ -1,0 +1,106 @@
+# TEMPORARY (issue #5721): regenerate the lockfiles that carry mongodb after
+# capping it below 3.9, confirm no hickory 0.25 remains, and upload them.
+# Removed before the round is pushed as final.
+name: TEMP 5721 MongoDB Pin
+
+on:
+  push:
+    branches:
+      - fix/issue-5721-deny-exceptions-reeval
+
+permissions:
+  contents: read
+
+jobs:
+  pin:
+    name: TEMP 5721 mongodb pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        with:
+          tool: cargo-deny@0.19.9
+
+      - name: Pin mongodb
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          for manifest in Cargo.toml tests/performance/mesh/Cargo.toml fuzz/Cargo.toml; do
+            echo "=== ${manifest}" | tee -a "$RUNNER_TEMP/out/pin.log"
+            cargo update --manifest-path "$manifest" -p mongodb --precise 3.8.2 \
+              2>&1 | tee -a "$RUNNER_TEMP/out/pin.log"
+            cargo metadata --manifest-path "$manifest" --locked --format-version 1 > /dev/null
+            cargo tree --manifest-path "$manifest" -e normal -i mongodb --depth 0 \
+              2>&1 | tee -a "$RUNNER_TEMP/out/pin.log" || true
+            cargo tree --manifest-path "$manifest" --all-features -i hickory-proto --depth 1 \
+              2>&1 | tee -a "$RUNNER_TEMP/out/pin.log" || true
+          done
+          if grep -n -A1 'name = "hickory-proto"' Cargo.lock tests/performance/mesh/Cargo.lock \
+            fuzz/Cargo.lock | grep 'version = "0\.25'; then
+            echo "hickory-proto 0.25 still present" >&2
+            exit 1
+          fi
+          git diff --stat
+
+      - name: Standalone lockfiles still current
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/standalone_cargo_manifests.py > "$RUNNER_TEMP/manifests.txt"
+          mapfile -t manifests < "$RUNNER_TEMP/manifests.txt"
+          for manifest in "${manifests[@]}"; do
+            echo "=== ${manifest}"
+            cargo metadata --manifest-path "$manifest" --locked --format-version 1 > /dev/null
+          done
+
+      - name: Advisory scan
+        if: always()
+        run: |
+          set +e
+          set -uo pipefail
+          status=0
+          for manifest in tests/performance/mesh/Cargo.toml fuzz/Cargo.toml; do
+            echo "=== ${manifest}" | tee -a "$RUNNER_TEMP/out/deny.log"
+            cargo deny --manifest-path "$manifest" \
+              check --allow advisory-not-detected --config deny.toml advisories \
+              2>&1 | tee -a "$RUNNER_TEMP/out/deny.log"
+            rc="${PIPESTATUS[0]}"
+            echo "exit=${rc}" | tee -a "$RUNNER_TEMP/out/deny.log"
+            [ "$rc" -eq 0 ] || status=1
+          done
+          echo "=== root" | tee -a "$RUNNER_TEMP/out/deny.log"
+          cargo deny check advisories bans sources licenses 2>&1 | tee -a "$RUNNER_TEMP/out/deny.log"
+          rc="${PIPESTATUS[0]}"
+          echo "exit=${rc}" | tee -a "$RUNNER_TEMP/out/deny.log"
+          [ "$rc" -eq 0 ] || status=1
+          exit "$status"
+
+      - name: Collect lockfiles
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out/root" "$RUNNER_TEMP/out/mesh" "$RUNNER_TEMP/out/fuzz"
+          cp Cargo.lock "$RUNNER_TEMP/out/root/Cargo.lock"
+          cp tests/performance/mesh/Cargo.lock "$RUNNER_TEMP/out/mesh/Cargo.lock"
+          cp fuzz/Cargo.lock "$RUNNER_TEMP/out/fuzz/Cargo.lock"
+          git diff -- '*Cargo.lock' > "$RUNNER_TEMP/out/locks.patch"
+          git diff --stat -- '*Cargo.lock'
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mongodb-pin-5721
+          path: ${{ runner.temp }}/out/
+          retention-days: 3
