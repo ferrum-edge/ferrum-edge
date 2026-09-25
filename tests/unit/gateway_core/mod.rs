@@ -67,6 +67,7 @@ mod grpc_proxy_tests;
 mod gso_batch_buf_tests;
 #[cfg(feature = "bench-h1-profile")]
 mod h1_profile_tests;
+mod h1_send_release_tests;
 mod h3_cross_protocol_backend_header_tests;
 mod h3_cross_protocol_bytes_share_tests;
 mod h3_native_reject_bytes_share_tests;

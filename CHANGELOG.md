@@ -70,8 +70,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutating route that does not evaluate it, is `400` rather than ignored.
   Requests without `If-Match` are unchanged.
 
+- Proxy filter on `GET /plugins/config` (#5726). An optional `proxy_id` query
+  parameter narrows the list to plugin configs whose `proxy_id` matches exactly,
+  so a caller (e.g. Nexus) no longer has to page the whole namespace and filter
+  client-side. Pagination and `pagination.total` apply over the filtered set,
+  and the filter is pushed into every backend (SQL, MongoDB, and the
+  in-memory/file path), respecting the caller's namespace and role the same as
+  the unfiltered list. An invalid `proxy_id` returns `400`; an unknown one
+  returns an empty page rather than `404`.
+
 ### Fixed
 
+- An HTTP/1.1 backend request no longer waits for `backend_read_timeout_ms`
+  and returns `504` when its pooled connection is reset or closed at the moment
+  the request is queued (#5714). The request never reached the backend, so it
+  now fails straight away: a reused connection is retried on a new one, and a
+  fresh connection returns `502` (`connection_pool_error`, pre-wire). The fix is
+  in a vendored hyper-util 0.1.20: its legacy client stops holding the closed
+  connection's only request sender, so the request stranded by tokio's
+  two-step channel send is dropped and fails as unsent. HTTP/1 pools that
+  Ferrum drives directly (HBONE inner HTTP/1, Unix-socket backends) get the same
+  release in Ferrum code (#5720).
 - Benchmark runners no longer `SIGKILL` unrelated host listeners on fixed ports
   (#5702). `run_protocol_test.sh`, `run_gateway_protocol_bench.sh`,
   `run_connection_saturation_bench.sh`, `run_perf_test.sh`, `run_payload_test.sh`,
@@ -98,6 +117,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#5683). The probe URL is `scheme://host:port` + path, so a path like
   `@169.254.169.254/` turned the target into userinfo and sent the probe to a
   different host that the egress screen never inspected.
+- A request on an HBONE inner HTTP/1.1 connection or a Unix-socket HTTP/1.1
+  backend connection no longer waits for `backend_read_timeout_ms` (`504`), or
+  forever when that timeout is `0`, when the pooled connection is reset or
+  closed at the moment the request is queued (#5720). The request never reached
+  the backend, so it now fails straight away: a reused connection is retried
+  once on a new one, and a fresh connection returns `502`
+  (`connection_pool_error`, pre-wire). Both dispatches watch the connection
+  while they wait for the response and release its only request sender once it
+  stops accepting requests, so the request stranded by tokio's two-step channel
+  send fails as unsent. A request handed back unsent on a fresh connection is
+  now `connection_pool_error` for a streaming request body too, not only for a
+  buffered one.
 - Reject non-finite (`NaN`, `inf`) floating-point env values (#5684). A `NaN`
   `FERRUM_OVERLOAD_*_THRESHOLD` passed validation and silently disabled load
   shedding.

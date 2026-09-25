@@ -1187,7 +1187,7 @@ async fn proxy_has_scoped_plugin(
     const PAGE_SIZE: i64 = 1_000;
     loop {
         let page = db
-            .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+            .list_plugin_configs_paginated(namespace, None, PAGE_SIZE, offset)
             .await?;
         let items_len = page.items.len() as i64;
         if page
@@ -2664,6 +2664,29 @@ pub(crate) trait AdminResource:
         namespace: &str,
         pagination: &super::PaginationParams,
     ) -> DbResult<PaginatedResult<Self>>;
+
+    /// Optional query filter a list route accepts. Resources without one use `()`
+    /// (associated type defaults are unstable, so each impl names it).
+    type ListFilter: Send + Sync + Clone + Default + 'static;
+
+    /// Database list that applies `filter` inside the backend's own WHERE
+    /// clause / filter document so `total` and the selected page both reflect
+    /// the filtered set. Defaults to the unfiltered [`Self::db_list`].
+    async fn db_list_filtered(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        pagination: &super::PaginationParams,
+        _filter: &Self::ListFilter,
+    ) -> DbResult<PaginatedResult<Self>> {
+        Self::db_list(db, namespace, pagination).await
+    }
+
+    /// Whether a cached (in-memory / file) resource matches `filter`. Defaults
+    /// to always matching, keeping every unfiltered list unchanged.
+    fn matches_list_filter(_resource: &Self, _filter: &Self::ListFilter) -> bool {
+        true
+    }
+
     async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()>;
     /// Returns `Ok(false)` when no row/document matched `(namespace, id)` —
     /// a PUT racing a concurrent delete surfaces as not-found instead of a
@@ -2788,8 +2811,25 @@ pub(crate) async fn handle_list<R: AdminResource>(
     role: AdminRole,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    handle_list_filtered::<R>(
+        state,
+        pagination,
+        role,
+        namespace,
+        &R::ListFilter::default(),
+    )
+    .await
+}
+
+pub(crate) async fn handle_list_filtered<R: AdminResource>(
+    state: &AdminState,
+    pagination: &super::PaginationParams,
+    role: AdminRole,
+    namespace: &str,
+    filter: &R::ListFilter,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
-        match R::db_list(db.as_ref(), namespace, pagination).await {
+        match R::db_list_filtered(db.as_ref(), namespace, pagination, filter).await {
             Ok(result) => {
                 let items: Vec<Value> = result
                     .items
@@ -2809,9 +2849,9 @@ pub(crate) async fn handle_list<R: AdminResource>(
     }
 
     if let Some(config) = state.cached_gateway_config() {
-        let items = R::cached_items(&config)
-            .iter()
-            .filter(|resource| resource.namespace() == namespace);
+        let items = R::cached_items(&config).iter().filter(|resource| {
+            resource.namespace() == namespace && R::matches_list_filter(resource, filter)
+        });
         let body = super::paginate_mapped_response(items, pagination, |resource| {
             R::response_body_for_role(resource, role)
         });
@@ -3565,6 +3605,8 @@ pub(crate) async fn check_credential_value_uniqueness(
 
 #[async_trait::async_trait]
 impl AdminResource for Upstream {
+    type ListFilter = ();
+
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
     }
@@ -3809,6 +3851,8 @@ impl AdminResource for Upstream {
 /// database is unreachable would be worse than reporting the outage.
 #[async_trait::async_trait]
 impl AdminResource for GatewayTrustBundleRecord {
+    type ListFilter = ();
+
     const RESOURCE_NAME: &'static str = "gateway trust bundle";
     const RESOURCE_LABEL: &'static str = "Gateway trust bundle";
     const VALIDATION_ERROR_LABEL: &'static str = "gateway trust bundle fields";
@@ -4133,10 +4177,35 @@ impl AdminResource for PluginConfig {
     ) -> DbResult<PaginatedResult<Self>> {
         db.list_plugin_configs_paginated(
             namespace,
+            None,
             pagination.query_limit_i64(),
             pagination.query_offset_i64(),
         )
         .await
+    }
+
+    type ListFilter = Option<String>;
+
+    async fn db_list_filtered(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        pagination: &super::PaginationParams,
+        filter: &Self::ListFilter,
+    ) -> DbResult<PaginatedResult<Self>> {
+        db.list_plugin_configs_paginated(
+            namespace,
+            filter.as_deref(),
+            pagination.query_limit_i64(),
+            pagination.query_offset_i64(),
+        )
+        .await
+    }
+
+    fn matches_list_filter(resource: &Self, filter: &Self::ListFilter) -> bool {
+        match filter.as_deref() {
+            Some(proxy_id) => resource.proxy_id.as_deref() == Some(proxy_id),
+            None => true,
+        }
     }
 
     async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
@@ -4472,7 +4541,7 @@ async fn enabled_prometheus_metrics_owner_exists_inner(
         let mut offset = 0_i64;
         loop {
             let page = db
-                .list_plugin_configs_paginated(&candidate_namespace, PAGE_SIZE, offset)
+                .list_plugin_configs_paginated(&candidate_namespace, None, PAGE_SIZE, offset)
                 .await?;
             let items_len = page.items.len() as i64;
             if page.items.into_iter().any(|plugin| {
@@ -4497,6 +4566,8 @@ async fn enabled_prometheus_metrics_owner_exists_inner(
 
 #[async_trait::async_trait]
 impl AdminResource for Proxy {
+    type ListFilter = ();
+
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
     }
@@ -5208,6 +5279,8 @@ impl AdminResource for Proxy {
 
 #[async_trait::async_trait]
 impl AdminResource for Consumer {
+    type ListFilter = ();
+
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
     }
