@@ -2877,6 +2877,161 @@ fn arming_a_route_request_timeout_folds_into_the_grpc_deadline() {
 }
 
 #[tokio::test]
+async fn mesh_route_dispatch_publishes_attempt_timeout_for_the_matched_rule_only() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [
+            {
+                "match": {"headers": {"x-variant": "timed"}},
+                "destination": {"upstream_id": "timed"},
+                "timeout_ms": 400,
+                "attempt_timeout_ms": 400
+            },
+            {
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "plain"}
+            }
+        ]
+    }))
+    .expect("attempt_timeout_ms is a valid rule field");
+
+    let mut timed = ctx();
+    let mut headers = HashMap::from([("x-variant".to_string(), "timed".to_string())]);
+    let result = plugin.before_proxy(&mut timed, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(timed.route_override_attempt_timeout_ms, Some(400));
+    assert_eq!(timed.route_override_backend_read_timeout_ms, Some(400));
+
+    // A request matching the sibling rule carries no attempt budget.
+    let mut plain = ctx();
+    let result = plugin.before_proxy(&mut plain, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plain.route_override_upstream_id.as_deref(), Some("plain"));
+    assert_eq!(plain.route_override_attempt_timeout_ms, None);
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_attempt_timeout_only_rule_is_an_action_catch_all() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {},
+            "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+            "attempt_timeout_ms": 250
+        }]
+    }))
+    .expect("an attempt-timeout-only rule is a route-action catch-all");
+
+    let mut request = ctx();
+    let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(request.route_override_attempt_timeout_ms, Some(250));
+    // Independent of the header/idle bound, which stays inherited.
+    assert_eq!(request.route_override_backend_read_timeout_ms, None);
+}
+
+#[test]
+fn mesh_route_dispatch_rejects_a_zero_attempt_timeout() {
+    let error = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "attempt_timeout_ms": 0
+        }]
+    }))
+    .expect_err("a zero attempt budget is refused");
+    assert!(
+        error.contains("`mesh_route_dispatch.rules[0].attempt_timeout_ms`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn route_attempt_timeout_is_request_scoped_and_never_clones_the_proxy() {
+    let proxy = test_proxy();
+    let mut request = ctx();
+    request.route_override_attempt_timeout_ms = Some(1_000);
+    assert!(!request.has_route_overrides());
+    let applied = request.apply_route_overrides(Arc::clone(&proxy));
+    assert!(Arc::ptr_eq(&proxy, &applied));
+    assert_eq!(
+        applied.backend_read_timeout_ms,
+        proxy.backend_read_timeout_ms
+    );
+}
+
+#[test]
+fn arming_a_route_attempt_timeout_carries_the_budget_for_non_grpc() {
+    let mut request = ctx();
+    request.route_override_attempt_timeout_ms = Some(300);
+    request.arm_route_request_deadline(false);
+    assert_eq!(
+        request.route_attempt_timeout(),
+        Some(std::time::Duration::from_millis(300))
+    );
+    // The budget runs per attempt, so it arms no request-wide deadline, and a
+    // non-gRPC request's RPC deadline stays untouched.
+    assert_eq!(request.route_request_deadline_at(), None);
+    assert_eq!(request.grpc_deadline_at(), None);
+
+    // Without the field nothing is armed.
+    let mut untimed = ctx();
+    untimed.arm_route_request_deadline(false);
+    assert_eq!(untimed.route_attempt_timeout(), None);
+    assert_eq!(untimed.grpc_deadline_at(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn arming_a_route_attempt_timeout_folds_a_fresh_budget_into_the_grpc_deadline() {
+    use std::time::Duration;
+
+    // No client `grpc-timeout`: the attempt budget becomes the RPC deadline,
+    // anchored when the rule is armed.
+    let mut request = ctx();
+    request.route_override_attempt_timeout_ms = Some(300);
+    let armed_at = tokio::time::Instant::now();
+    request.arm_route_request_deadline(true);
+    assert_eq!(request.route_attempt_timeout(), None);
+    assert_eq!(
+        request.grpc_deadline_at(),
+        Some(armed_at + Duration::from_millis(300))
+    );
+
+    // Between attempts the RPC falls back to its total budget (none here), and
+    // the next attempt starts a FRESH budget rather than inheriting the rest of
+    // the first one.
+    tokio::time::advance(Duration::from_millis(250)).await;
+    request.end_grpc_route_attempt();
+    assert_eq!(request.grpc_deadline_at(), None);
+    let retried_at = tokio::time::Instant::now();
+    request.begin_grpc_route_attempt();
+    assert_eq!(
+        request.grpc_deadline_at(),
+        Some(retried_at + Duration::from_millis(300))
+    );
+
+    // With a total `request` budget the total still wins once it is earlier
+    // than the fresh attempt budget, and backoff is bounded by it alone.
+    let mut both = ctx();
+    let received_at = tokio::time::Instant::now();
+    both.route_override_request_timeout_ms = Some(500);
+    both.route_override_attempt_timeout_ms = Some(300);
+    both.arm_route_request_deadline(true);
+    let total = received_at + Duration::from_millis(500);
+    assert!(both.grpc_deadline_at().expect("attempt budget") < total);
+    tokio::time::advance(Duration::from_millis(400)).await;
+    both.end_grpc_route_attempt();
+    assert_eq!(both.grpc_deadline_at(), Some(total));
+    both.begin_grpc_route_attempt();
+    assert_eq!(both.grpc_deadline_at(), Some(total));
+
+    // Re-arming a rule that no longer carries a budget restores the total.
+    both.route_override_attempt_timeout_ms = None;
+    both.arm_route_request_deadline(true);
+    assert_eq!(both.grpc_deadline_at(), Some(total));
+    both.begin_grpc_route_attempt();
+    assert_eq!(both.grpc_deadline_at(), Some(total));
+}
+
+#[tokio::test]
 async fn mesh_route_dispatch_retry_only_rule_is_an_action_catch_all() {
     // The Gateway API translator emits a path-only HTTPRoute rule whose only
     // effect is its `retry` as an empty-match rule; it must admit and select

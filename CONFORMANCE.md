@@ -166,9 +166,12 @@ CRD does: each must match the GEP-2257 duration grammar, and a non-zero
 `request` must not be shorter than `backendRequest` (the CRD's CEL rule).
 Violations, a non-string value and a non-object `timeouts` are `Invalid`; an
 undefined `timeouts` sub-field is `UnsupportedValue`. `0s` disables either
-bound. `backendRequest` bounds one backend attempt (its wait for response
-headers and the idle gap between response frames) and answers the ordinary
-backend-timeout `504`. `request` is one absolute budget, anchored at request
+bound. `backendRequest` bounds each backend attempt from its handoff to the
+backend until its full response has been received, with a fresh budget for
+every retry attempt: expiry before the head answers the ordinary
+backend-timeout `504` (retried when the rule's `retry` lists `504`), expiry
+while the body streams cuts it like the `request` cut below, and a gRPC request
+folds it into its RPC deadline. `request` is one absolute budget, anchored at request
 receipt, covering every attempt, retry backoff and the streaming response body:
 before the response head a non-gRPC request gets a gateway `504`
 (`{"error":"Request timeout"}`), a body still streaming at the deadline is
@@ -184,13 +187,14 @@ body cut by `request` keeps a backend `Content-Length` advertised.
 
 **Known deviations in the declared rule-timeout features:**
 
-- **`HTTPRouteBackendTimeout`:** upstream v1.5.1 defines `backendRequest` as the
-  time from when a request starts being sent to the backend until its full
-  response is received, per attempt. Ferrum bounds each attempt's wait for the
-  response head and every idle gap between response frames, not the attempt's
-  total duration, so a backend trickling its body inside the idle gap is not cut
-  per attempt; only `request` cuts it, and a rule without a non-zero `request`
-  has no total bound. The upstream test delays only the response head.
+- **`HTTPRouteBackendTimeout` over HTTP/3:** upstream v1.5.1 defines
+  `backendRequest` as the time from when a request starts being sent to the
+  backend until its full response is received, per attempt. HTTP/1.1, HTTP/2
+  and every gRPC path enforce that. Native HTTP/3 does not yet bound a non-gRPC
+  attempt's total duration: it bounds only the response-head wait and each idle
+  gap between response frames, so a backend trickling its body inside the idle
+  gap there is cut only by `request`. The upstream test delays only the
+  response head, which every frontend bounds.
 - **`HTTPRouteRequestTimeout` over HTTP/3:** native HTTP/3 cannot yet enforce
   `request` on a non-gRPC request, so such a request is refused with `503`
   before any dial rather than served without its deadline. Because browsers
@@ -311,9 +315,16 @@ timeouts:
 `gateway_route_request_timeout_spans_retry_attempts_and_backoff` (one budget
 across attempts and backoff under an operator-configured proxy retry),
 `gateway_route_request_timeout_ends_grpc_calls_with_deadline_exceeded`,
-`removing_rule_timeouts_withdraws_the_deadline`, and three backend-health
+`removing_rule_timeouts_withdraws_the_deadline`, three backend-health
 attribution regressions through a live circuit breaker (a stalled client upload
-and a mid-body cut are not charged; a backend stalling its response head is).
+and a mid-body cut are not charged; a backend stalling its response head is),
+and four per-attempt `backendRequest` regressions:
+`gateway_route_backend_request_bounds_each_attempt_until_its_full_response` (a
+trickled body cut with no `request` budget, a sibling and the rule without the
+per-attempt field streaming it to the end),
+`gateway_route_backend_request_gives_each_retry_attempt_a_fresh_budget`,
+`gateway_route_request_timeout_still_bounds_backend_request_retries` and
+`gateway_route_backend_request_bounds_grpc_attempts_until_the_full_response`.
 Rule `retry` is covered by `gateway_route_retry_reaches_the_data_plane` (exact
 backend attempt counts for a listed status, one attempt for an unlisted status,
 a `POST`, `attempts: 0` and a sibling rule, a recovering retry, and `backoff` as

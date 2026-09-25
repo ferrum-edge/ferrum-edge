@@ -194,6 +194,12 @@ impl MeshRouteDispatchConfig {
                      omit it to leave the rule without a total request deadline"
                 ));
             }
+            if rule.attempt_timeout_ms == Some(0) {
+                return Err(format!(
+                    "`mesh_route_dispatch.rules[{idx}].attempt_timeout_ms` must be greater than zero; \
+                     omit it to leave the rule's attempts without a total bound"
+                ));
+            }
             if let Some(retry) = &rule.retry
                 && let Err(errors) = retry.validate_fields()
             {
@@ -834,6 +840,22 @@ pub struct RouteRule {
     /// frontend port that serves a rule carrying it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_ms: Option<u64>,
+    /// Total bound on EACH backend attempt for this rule, in milliseconds:
+    /// from the moment the attempt is handed to the backend until its full
+    /// response (head and body) has been received. Gateway API
+    /// `HTTPRoute.rules[].timeouts.backendRequest` is projected here as well as
+    /// onto `timeout_ms`, which keeps bounding the header wait and the idle
+    /// gap between frames. Every retry attempt gets a fresh budget, and
+    /// `request_timeout_ms` still bounds the whole transaction. Must be
+    /// greater than zero when set.
+    ///
+    /// Expiry before a non-gRPC response head is the ordinary backend-timeout
+    /// `504`, retryable like any other; expiry after the head has been sent
+    /// cuts the body exactly as `request_timeout_ms` does. A gRPC request
+    /// folds it into its RPC deadline and ends with `DEADLINE_EXCEEDED`.
+    /// Native HTTP/3 does not enforce it on a non-gRPC request yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_timeout_ms: Option<u64>,
     /// Override the proxy's retry policy for this rule.
     #[serde(
         default,
@@ -949,6 +971,7 @@ impl RouteRule {
         self.timeout_ms.is_some()
             || self.timeout_disabled
             || self.request_timeout_ms.is_some()
+            || self.attempt_timeout_ms.is_some()
             || self.retry.is_some()
             || self.retry_disabled
     }
@@ -2173,6 +2196,9 @@ impl Plugin for MeshRouteDispatch {
                 // The total request deadline is request-scoped policy for the
                 // matched rule only; proxy core arms it after `before_proxy`.
                 ctx.route_override_request_timeout_ms = rule.request_timeout_ms;
+                // Likewise the per-attempt total bound: request-scoped, read by
+                // proxy core for every attempt it dispatches for this rule.
+                ctx.route_override_attempt_timeout_ms = rule.attempt_timeout_ms;
                 ctx.route_override_retry = if rule.retry.is_some() || rule.retry_disabled {
                     Some(rule.retry.clone())
                 } else {

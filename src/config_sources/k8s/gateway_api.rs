@@ -7013,9 +7013,11 @@ struct RouteRuleTimeouts {
     /// the CRD defines as disabled (Ferrum has no default total deadline).
     request_ms: Option<u64>,
     /// `timeouts.backendRequest`: the per-attempt backend bound, projected as
-    /// `timeout_ms`. `Some(0)` is the zero duration and projects as
-    /// `timeout_disabled`, clearing the proxy's default read bound for this
-    /// rule. `None` when absent.
+    /// both `timeout_ms` (the attempt's response-head wait and idle gap) and
+    /// `attempt_timeout_ms` (the attempt's total duration, until its full
+    /// response has been received). `Some(0)` is the zero duration and
+    /// projects as `timeout_disabled` alone, clearing the proxy's default read
+    /// bound for this rule. `None` when absent.
     backend_request_ms: Option<u64>,
 }
 
@@ -7378,6 +7380,14 @@ fn gateway_api_dispatch_route_rule(
         Some(backend_request_ms) => {
             route_rule.insert(
                 "timeout_ms".to_string(),
+                serde_json::json!(backend_request_ms),
+            );
+            // Upstream bounds each attempt until its FULL response has been
+            // received, so the same budget also caps the attempt's total
+            // duration, body included; `timeout_ms` alone would let a backend
+            // trickling its body inside the idle gap run unbounded.
+            route_rule.insert(
+                "attempt_timeout_ms".to_string(),
                 serde_json::json!(backend_request_ms),
             );
         }

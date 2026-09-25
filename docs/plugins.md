@@ -8729,11 +8729,12 @@ type column says so. Unknown keys are rejected at every level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `match` | Object | `{}` | Predicates, all-of across the fields below. An empty match is rejected **unless** the rule carries a route action (`request_transform`, `response_transform`, `fault`, `rewrite`, `redirect`, `timeout_ms`, `timeout_disabled: true`, `request_timeout_ms`, `retry`, `retry_disabled: true`), which makes it the deliberate action-only catch-all; otherwise it would silently shadow every later rule |
+| `match` | Object | `{}` | Predicates, all-of across the fields below. An empty match is rejected **unless** the rule carries a route action (`request_transform`, `response_transform`, `fault`, `rewrite`, `redirect`, `timeout_ms`, `timeout_disabled: true`, `request_timeout_ms`, `attempt_timeout_ms`, `retry`, `retry_disabled: true`), which makes it the deliberate action-only catch-all; otherwise it would silently shadow every later rule |
 | `destination` | Object | `{}` | Route override applied on match. At least one field must be set unless the rule carries a `redirect` |
 | `timeout_ms` | u64 \| null | omitted | Route-local backend response/read timeout. `0` means "no timeout". Cannot be combined with `timeout_disabled: true` |
 | `timeout_disabled` | bool | `false` | Clear the selected proxy's inherited backend read timeout for this route (resolves to `0`). Cannot be combined with `timeout_ms` |
 | `request_timeout_ms` | u64 \| null | omitted | Route-local **total** request deadline in milliseconds from request receipt (Gateway API `timeouts.request`). Spans every backend attempt, retry backoff, and the streaming response body; never re-armed by a retry and never promoted onto the proxy. `0` is rejected — omit it for no deadline. See [Route request deadline](#route-request-deadline) |
+| `attempt_timeout_ms` | u64 \| null | omitted | Route-local **total** bound on each backend attempt in milliseconds (Gateway API `timeouts.backendRequest`, which the translator also projects as `timeout_ms`). Starts when the attempt is handed to the backend and covers its response head and whole response body; every retry attempt gets a fresh budget, and `request_timeout_ms` still bounds the whole transaction. Independent of `timeout_ms` / `timeout_disabled`. Never promoted onto the proxy. `0` is rejected — omit it for no per-attempt total bound. See [Route attempt budget](#route-attempt-budget) |
 | `retry` | Object \| null | omitted | Route-local retry policy (below), applied only to requests this rule matches (Istio `http[].retries`, Gateway API `HTTPRoute.rules[].retry`). Cannot be combined with `retry_disabled: true` |
 | `retry_disabled` | bool | `false` | Clear the selected proxy's inherited retry policy for this route. Cannot be combined with `retry` |
 | `request_transform` | Object[] | `[]` | Route-level request header transforms (below). Requires an eligible consumer — see [Route transforms need a consumer](#route-transforms-need-a-consumer) |
@@ -8860,8 +8861,10 @@ still rejected at admission.
 ##### Route request deadline
 
 `timeout_ms` bounds ONE backend attempt: the wait for its response head and the
-idle gap between response frames (a steadily trickling body is not cut by it).
-`request_timeout_ms` is the rule's TOTAL budget. Proxy core arms it once, after
+idle gap between response frames (a steadily trickling body is not cut by it;
+`attempt_timeout_ms` is what bounds an attempt's total duration, see
+[Route attempt budget](#route-attempt-budget)). `request_timeout_ms` is the
+rule's TOTAL budget. Proxy core arms it once, after
 `before_proxy` has selected the rule, as one absolute instant anchored to request
 receipt, so request-phase time already spent counts against it and a retry can
 never re-arm it. It is request-scoped: it never changes the selected proxy,
@@ -8899,6 +8902,28 @@ which is enforced when each backend attempt starts, while it is awaited, in
 retry backoff, and while the response body streams. A client that stops reading
 a streamed response is not forced off by this deadline until the transport next
 polls the body.
+
+##### Route attempt budget
+
+`attempt_timeout_ms` bounds each backend attempt's TOTAL duration: from the
+moment the attempt is handed to the backend (the same point that starts its
+latency sample, described above) until its full response — head and body — has
+been received. A retry attempt is handed over from its start, and every attempt
+gets a fresh budget. `request_timeout_ms`, when set, still bounds the whole
+transaction: the earlier instant wins, and when both expire together the total
+deadline's terminal stands, so a spent transaction is never retried. Like the
+total deadline it is request-scoped: it never changes the selected proxy,
+upstream, or pool key. `timeout_ms` keeps bounding the header wait and idle
+gaps independently.
+
+| Request | Expiry before the response head | Expiry while the body streams |
+|---|---|---|
+| HTTP/1.1 / HTTP/2, not gRPC | The attempt is cancelled and answered with the ordinary backend-timeout `504` `{"error":"Backend timeout"}`, error class `read_write_timeout`, charged to the backend. Only the attempt ends: a route `retry` that lists `504` runs the next attempt under a fresh budget. An attempt still reading a buffered response body (a small `Content-Length` response, or one a response-body plugin buffers) ends the same way; a request that declares a body is not replayed after it, because the cancelled attempt held its only retained copy | The body ends with the same timeout error as a `request_timeout_ms` cut (HTTP/2 stream reset, HTTP/1.1 connection close, `Content-Length` kept advertised, `body_error_class: read_write_timeout`, not charged to the backend). A response whose head reached the client is never retried |
+| gRPC / gRPC-Web on any frontend | Folded into the RPC deadline when the rule is selected (the earliest of it, `request_timeout_ms`, and any client `grpc-timeout` / `grpc_deadline` budget wins), so the backend is told the remaining budget in `grpc-timeout` and the client gets `DEADLINE_EXCEEDED`. On HTTP/1.1 and HTTP/2 each retry attempt re-arms a fresh budget and retry backoff is bounded by the total alone; an HTTP/3 retry does not re-arm it | `DEADLINE_EXCEEDED` trailers before response DATA; a stream reset after it |
+| HTTP/3, not gRPC | Not enforced yet: the native HTTP/3 relays write the response from inside the dispatch. The attempt stays bounded by `timeout_ms` (header wait and idle gaps) and by `request_timeout_ms` | Only idle gaps (`timeout_ms`) and `request_timeout_ms` |
+
+With no `attempt_timeout_ms` the dispatch path is unchanged: no timer is armed
+and nothing is allocated for it.
 
 ##### Route transforms need a consumer
 

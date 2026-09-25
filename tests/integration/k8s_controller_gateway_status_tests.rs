@@ -3914,10 +3914,11 @@ fn timeouts_route(rules: Value) -> ferrum_edge::config_sources::k8s::K8sObject {
 /// * `timeouts.request` bounds the whole transaction. Before the response head
 ///   the client gets the gateway's `504`; once the head is committed a still
 ///   streaming body is cut at the deadline, never completed cleanly.
-/// * `timeouts.backendRequest` bounds one backend attempt (the wait for its
-///   response head) and answers the ordinary backend-timeout `504`, while the
-///   rule's larger `request` budget still bounds the whole transaction —
-///   including a body the per-attempt bound never sees.
+/// * `timeouts.backendRequest` bounds one backend attempt and answers the
+///   ordinary backend-timeout `504` before the head, while the rule's larger
+///   `request` budget still bounds the whole transaction. (Its bound on the
+///   attempt's body is covered by
+///   `gateway_route_backend_request_bounds_each_attempt_until_its_full_response`.)
 /// * `0s` disables either bound, and a sibling rule without `timeouts` keeps
 ///   the proxy defaults.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4035,9 +4036,9 @@ async fn gateway_route_timeouts_reach_the_data_plane() {
         "the 300ms backendRequest bound must end the attempt: {elapsed:?}"
     );
 
-    // (b) The head arrives at once and the per-attempt bound never trips on the
-    // 100ms trickle, but the 800ms request deadline still ends the body with
-    // an error instead of a clean end of message.
+    // (b) The head arrives at once and no idle gap of the 100ms trickle trips a
+    // read bound, but the 800ms deadlines still end the body with an error
+    // instead of a clean end of message.
     let started = Instant::now();
     let response = get("/stream/thing").await.expect("response head");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
@@ -4566,18 +4567,25 @@ async fn removing_rule_timeouts_withdraws_the_deadline() {
     let mut timed = route_filter_cluster_objects(slow_port);
     timed.push(timeouts_route(json!([timed_rule])));
     let rules = emitted_dispatch_rules(timed.as_slice());
-    let projected = rules
-        .iter()
-        .any(|rule| rule["request_timeout_ms"] == json!(300) && rule["timeout_ms"] == json!(250));
+    let projected = rules.iter().any(|rule| {
+        rule["request_timeout_ms"] == json!(300)
+            && rule["timeout_ms"] == json!(250)
+            && rule["attempt_timeout_ms"] == json!(250)
+    });
     assert!(projected, "{rules:?}");
 
     let mut untimed = route_filter_cluster_objects(slow_port);
     untimed.push(timeouts_route(json!([rule(None)])));
     let rules = emitted_dispatch_rules(untimed.as_slice());
     let withdrawn = rules.iter().all(|rule| {
-        ["request_timeout_ms", "timeout_ms", "timeout_disabled"]
-            .iter()
-            .all(|field| rule.get(field).is_none())
+        [
+            "request_timeout_ms",
+            "timeout_ms",
+            "attempt_timeout_ms",
+            "timeout_disabled",
+        ]
+        .iter()
+        .all(|field| rule.get(field).is_none())
     });
     assert!(withdrawn, "{rules:?}");
 
@@ -4599,6 +4607,328 @@ async fn removing_rule_timeouts_withdraws_the_deadline() {
             .expect("response");
         assert_eq!(response.status(), expected);
     }
+}
+
+/// A backend that answers response headers at once and then paces a
+/// close-delimited body (no `Content-Length`, so the gateway streams it) one
+/// byte every `pause`. No idle gap ever reaches a read bound, so only a total
+/// bound can end the exchange early.
+async fn spawn_paced_backend(
+    bytes: usize,
+    pause: std::time::Duration,
+) -> (u16, crate::scaffolding::backends::ScriptedHttp1Backend) {
+    use crate::scaffolding::backends::ScriptedHttp1Backend;
+    use crate::scaffolding::ports::reserve_port;
+
+    let reservation = reserve_port().await.expect("reserve paced backend");
+    let port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(paced_body_step(bytes, pause))
+        .spawn()
+        .expect("spawn paced backend");
+    (port, backend)
+}
+
+fn paced_body_step(
+    bytes: usize,
+    pause: std::time::Duration,
+) -> crate::scaffolding::backends::HttpStep {
+    crate::scaffolding::backends::HttpStep::TrickleBody {
+        status: 200,
+        reason: "OK".into(),
+        headers: vec![("Content-Type".into(), "text/plain".into())],
+        body: vec![b'x'; bytes],
+        chunk_size: 1,
+        pause,
+    }
+}
+
+/// GET `path` on the `timeouts.test` host and read the whole body, returning
+/// the status, the body outcome, and how long the exchange took.
+async fn fetch_timed_body(
+    client: &reqwest::Client,
+    harness: &crate::scaffolding::harness::GatewayHarness,
+    path: &str,
+) -> (reqwest::StatusCode, Result<bytes::Bytes, reqwest::Error>, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let response = client
+        .get(harness.proxy_url(path))
+        .header("host", "timeouts.test")
+        .send()
+        .await
+        .expect("response head");
+    let status = response.status();
+    let body = response.bytes().await;
+    (status, body, started.elapsed())
+}
+
+/// Upstream v1.5.1 defines `timeouts.backendRequest` as the timeout for one
+/// request from the gateway to the backend, until its FULL response has been
+/// received. A backend that answers its head at once and then trickles the
+/// body inside every idle gap must therefore still be cut per attempt, with no
+/// `request` budget at all:
+///
+/// * the rule carrying `backendRequest` cuts the body at the attempt budget,
+///   never completing it cleanly;
+/// * a sibling rule without `timeouts` streams the same body to the end;
+/// * the cut comes only from the new per-attempt field: with it removed from
+///   the translated rule (leaving `timeout_ms`, the header-wait and idle-gap
+///   bound, exactly as before), the same body streams to the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_backend_request_bounds_each_attempt_until_its_full_response() {
+    use std::time::Duration;
+
+    // One byte every 100ms for ~3s.
+    let (paced_port, _paced) = spawn_paced_backend(30, Duration::from_millis(100)).await;
+    let mut objects = route_filter_cluster_objects(paced_port);
+    objects.push(timeouts_route(json!([
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/attempt"}}],
+            "backendRefs": [{"name": "api", "port": 8080}],
+            "timeouts": {"backendRequest": "600ms"}
+        },
+        {
+            "matches": [{"path": {"type": "PathPrefix", "value": "/untimed"}}],
+            "backendRefs": [{"name": "api", "port": 8080}]
+        }
+    ])));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let (status, body, elapsed) = fetch_timed_body(&client, &harness, "/attempt/thing").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        body.is_err(),
+        "a body cut by the attempt budget must not complete cleanly: {body:?}"
+    );
+    // The budget starts when the attempt is handed to the backend, so it
+    // cannot fire before 600ms; the ~3s trickle proves it fired at all.
+    assert!(
+        elapsed >= Duration::from_millis(550) && elapsed < Duration::from_millis(2_500),
+        "the 600ms backendRequest budget must cut the ~3s trickle: {elapsed:?}"
+    );
+
+    let (status, body, _) = fetch_timed_body(&client, &harness, "/untimed/thing").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body.expect("untimed body").len(), 30);
+    drop(harness);
+
+    // Without the per-attempt field the rule keeps only `timeout_ms`: the
+    // header wait and every 100ms idle gap stay inside 600ms, so nothing cuts.
+    let mut stripped = 0;
+    let harness = spawn_translated_route_gateway_with(&objects, Vec::new(), |config| {
+        for plugin in &mut config.plugin_configs {
+            if plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            let Some(Value::Array(rules)) = plugin.config.get_mut("rules") else {
+                continue;
+            };
+            for rule in rules.iter_mut().filter_map(Value::as_object_mut) {
+                if rule.remove("attempt_timeout_ms").is_some() {
+                    assert_eq!(rule.get("timeout_ms"), Some(&json!(600)), "{rule:?}");
+                    stripped += 1;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(stripped > 0, "the translated rule must carry the field");
+    let (status, body, _) = fetch_timed_body(&client, &harness, "/attempt/thing").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body.expect("body under timeout_ms alone").len(), 30);
+}
+
+/// Every retry attempt gets a FRESH `backendRequest` budget. The first attempt
+/// stalls its response head and times out; the retry answers at once and then
+/// streams its body for ~720ms. That body ends well inside the retry's own
+/// 1500ms budget but long after a budget anchored at the request (or the first
+/// attempt) would have expired, so it completes only if the budget is fresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_backend_request_gives_each_retry_attempt_a_fresh_budget() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher};
+    use std::time::Duration;
+
+    let stall = vec![
+        HttpStep::ExpectRequest(RequestMatcher::any()),
+        HttpStep::Sleep(Duration::from_secs(5)),
+    ];
+    let paced = vec![paced_body_step(12, Duration::from_millis(60))];
+    let (backend_port, backend) = spawn_connection_scripted_backend(vec![stall, paced]).await;
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(timeouts_route(json!([{
+        "matches": [{"path": {"type": "PathPrefix", "value": "/fresh"}}],
+        "backendRefs": [{"name": "api", "port": 8080}],
+        "timeouts": {"backendRequest": "1500ms"},
+        "retry": {"codes": [504], "attempts": 1, "backoff": "10ms"}
+    }])));
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+
+    let (status, body, elapsed) =
+        fetch_timed_body(&retry_test_client(), &harness, "/fresh/thing").await;
+
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let body = body.expect("the retry's body completes inside its own budget");
+    assert_eq!(body.as_ref(), [b'x'; 12].as_slice());
+    assert!(
+        elapsed >= Duration::from_millis(1_400),
+        "the first attempt must have spent its whole budget: {elapsed:?}"
+    );
+    assert_eq!(backend_attempts(&backend, "GET", "/fresh/thing").await, 2);
+}
+
+/// `timeouts.request` stays the TOTAL: a fresh `backendRequest` budget per
+/// retry never extends the transaction past it. Each attempt stalls its head;
+/// the first ends at its 600ms budget, the retry is cut by the 1s total, and
+/// the client gets the request-deadline `504` after exactly two attempts, not
+/// the four `attempts: 3` would allow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_request_timeout_still_bounds_backend_request_retries() {
+    use std::time::{Duration, Instant};
+
+    let (slow_port, slow) = spawn_delayed_backend(Duration::from_secs(5)).await;
+    let mut objects = route_filter_cluster_objects(slow_port);
+    objects.push(timeouts_route(json!([{
+        "matches": [{"path": {"type": "PathPrefix", "value": "/total"}}],
+        "backendRefs": [{"name": "api", "port": 8080}],
+        "timeouts": {"request": "1s", "backendRequest": "600ms"},
+        "retry": {"codes": [504], "attempts": 3, "backoff": "10ms"}
+    }])));
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+
+    let started = Instant::now();
+    let response = retry_test_client()
+        .get(harness.proxy_url("/total/thing"))
+        .header("host", "timeouts.test")
+        .send()
+        .await
+        .expect("response");
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    // The request-deadline body, not the per-attempt backend-timeout one.
+    assert_eq!(
+        response.text().await.unwrap(),
+        r#"{"error":"Request timeout"}"#
+    );
+    assert!(
+        elapsed >= Duration::from_millis(950) && elapsed < Duration::from_secs(4),
+        "the 1s request budget must end the retries: {elapsed:?}"
+    );
+    let attempts = slow
+        .received_requests()
+        .await
+        .iter()
+        .filter(|request| request.path == "/total/thing")
+        .count();
+    assert_eq!(attempts, 2, "the total budget must stop retrying");
+}
+
+/// A gRPC backend that answers `messages` messages `pause` apart and then
+/// `OK`, so no idle gap between its frames reaches a read bound.
+async fn spawn_paced_grpc_backend(
+    messages: usize,
+    pause: std::time::Duration,
+) -> (u16, crate::scaffolding::backends::grpc::ScriptedGrpcBackend) {
+    use crate::scaffolding::backends::grpc::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+    use crate::scaffolding::ports::reserve_port;
+    use bytes::Bytes;
+
+    let mut steps = vec![
+        GrpcStep::AcceptRpc(MatchRpc::any()),
+        GrpcStep::SendInitialHeaders,
+    ];
+    for _ in 0..messages {
+        steps.push(GrpcStep::RespondMessage(Bytes::from_static(b"tick")));
+        steps.push(GrpcStep::Sleep(pause));
+    }
+    steps.push(GrpcStep::RespondStatus {
+        code: 0,
+        message: "",
+    });
+    let reservation = reserve_port().await.expect("reserve grpc backend");
+    let port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .steps(steps)
+        .spawn()
+        .expect("spawn grpc backend");
+    (port, backend)
+}
+
+/// A gRPC call routed by an HTTPRoute folds `backendRequest` into its RPC
+/// deadline, so a server-streaming backend whose frames never leave an idle
+/// gap is still ended at the attempt budget with the RPC-deadline terminal
+/// (`DEADLINE_EXCEEDED`, or a stream reset once response messages were sent),
+/// never completed with `OK`. A sibling rule without `timeouts` streams the
+/// same RPC to its `OK` status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_backend_request_bounds_grpc_attempts_until_the_full_response() {
+    use crate::scaffolding::clients::grpc::GrpcClient;
+    use bytes::Bytes;
+    use std::time::{Duration, Instant};
+
+    // Five messages 400ms apart, then `OK`: ~2s in all.
+    let pause = Duration::from_millis(400);
+    let (timed_port, _timed) = spawn_paced_grpc_backend(5, pause).await;
+    let (untimed_port, _untimed) = spawn_paced_grpc_backend(5, pause).await;
+
+    let mut objects = route_filter_cluster_objects(timed_port);
+    objects.extend(scripted_service_objects("other", "10.96.0.12", untimed_port));
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "grpc-backend-request",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/echo.Timed"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "timeouts": {"backendRequest": "800ms"}
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/echo.Untimed"}}],
+                    "backendRefs": [{"name": "other", "port": 8080}]
+                }
+            ]
+        }),
+    ));
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let target = harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .to_string();
+    let client = GrpcClient::h2c(target);
+
+    let started = Instant::now();
+    let response = client
+        .unary("/echo.Timed/Watch", Bytes::from_static(b"ping"))
+        .await
+        .expect("grpc call");
+    let elapsed = started.elapsed();
+    assert_eq!(response.http_status, 200);
+    let deadline_terminal = response.grpc_status() == Some(4)
+        || (response.grpc_status().is_none() && response.stream_error.is_some());
+    assert!(
+        deadline_terminal,
+        "the attempt budget must end the RPC with its deadline terminal: {response:?}"
+    );
+    assert!(response.messages.len() < 5, "{response:?}");
+    assert!(
+        elapsed < Duration::from_millis(1_800),
+        "the 800ms backendRequest budget must end the ~2s RPC: {elapsed:?}"
+    );
+
+    let response = client
+        .unary("/echo.Untimed/Watch", Bytes::from_static(b"ping"))
+        .await
+        .expect("sibling grpc call");
+    assert_eq!(response.grpc_status(), Some(0), "{response:?}");
+    assert_eq!(response.messages.len(), 5, "{response:?}");
 }
 
 /// One scripted HTTP/1.1 exchange: read a request, answer `status` with `body`,
