@@ -11413,8 +11413,7 @@ where
     // charged backend deadline terminal (`post_deadline_write`) is not the
     // gateway's deadline response but is written after a deadline passed too,
     // so it takes the same bounded write.
-    let terminal_gateway_deadline =
-        post_deadline_write || ctx.gateway_deadline_response_selected();
+    let terminal_gateway_deadline = post_deadline_write || ctx.gateway_deadline_response_selected();
     if let Some(translated) = grpc_web_reject {
         if terminal_gateway_deadline {
             let write = write_reject_with_headers_and_recv_halt(
