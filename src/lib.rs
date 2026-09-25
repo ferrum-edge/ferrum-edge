@@ -7698,6 +7698,43 @@ pub mod _test_support {
         .await;
     }
 
+    /// Build the gRPC-Web error terminal proxy core's native gRPC branch
+    /// returns for a gateway-generated backend error (#5747), through the same
+    /// out-of-line builder both of that arm's gRPC-Web call sites use.
+    pub async fn grpc_web_gateway_error_response_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_content_type: &str,
+        grpc_status: u32,
+        message: &str,
+        initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    ) -> http::Response<crate::proxy::ProxyBody> {
+        crate::proxy::boxed_grpc_web_gateway_error_response(
+            plugins,
+            ctx,
+            response_content_type,
+            grpc_status,
+            message,
+            initial_response_header_policy_plugins,
+        )
+        .await
+    }
+
+    /// The HTTP/3 plain bridge's header map for a gRPC-Web gateway error
+    /// terminal selected after `after_proxy` decorated `head_headers` (#5747),
+    /// here a response found too large while its body is collected.
+    pub fn h3_grpc_web_gateway_error_after_head_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        head_headers: &HashMap<String, String>,
+        terminal_headers: HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        crate::http3::cross_protocol::plain_grpc_web_gateway_error_after_head_headers(
+            ctx,
+            head_headers,
+            terminal_headers,
+        )
+    }
+
     /// The HTTP/3 plain bridge's charged gRPC-Web terminal for a budget expiry
     /// after `after_proxy` added `gateway_headers` to the backend's response
     /// head (#5744): its status and header map.

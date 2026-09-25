@@ -2716,6 +2716,24 @@ pub(crate) fn plain_grpc_web_backend_deadline_after_head(
     plain_grpc_web_backend_deadline_plugin_result(decorations)
 }
 
+/// The header map of a gRPC-Web gateway error terminal selected after
+/// `after_proxy` decorated the response head: a response found too large, or
+/// unretainable, while its body is collected (#5747). The head's
+/// provenance-known gateway decorations (CORS) are carried over without
+/// running `after_proxy` a second time, every backend field is shed, and the
+/// terminal's own fields win. `run_after_proxy_hooks` arms that provenance for
+/// every gRPC-Web head, so this holds with no RPC deadline and no body policy.
+pub(crate) fn plain_grpc_web_gateway_error_after_head_headers(
+    ctx: &mut RequestContext,
+    head_headers: &HashMap<String, String>,
+    terminal_headers: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut decorations = head_headers.clone();
+    ctx.retain_deadline_response_gateway_headers(&mut decorations);
+    decorations.extend(terminal_headers);
+    decorations
+}
+
 /// The trailers-only rejection [`write_plain_grpc_web_deadline_after_handoff`]
 /// hands the final reject writer for a charged budget expiry, over any gateway
 /// decorations already applied to the response head. The terminal's own fields
@@ -5614,10 +5632,11 @@ where
                 // carries its provenance-known gateway decorations (CORS)
                 // instead of running the hooks a second time (#5747).
                 if crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
-                    let mut decorations = response_headers.clone();
-                    ctx.retain_deadline_response_gateway_headers(&mut decorations);
-                    decorations.extend(reject_headers);
-                    reject_headers = decorations;
+                    reject_headers = plain_grpc_web_gateway_error_after_head_headers(
+                        ctx,
+                        &response_headers,
+                        reject_headers,
+                    );
                 }
                 let mut outcome = write_plain_gateway_reject(
                     stream,
@@ -11281,6 +11300,11 @@ where
 /// CORS headers to read its gRPC status, no replacer may rewrite the terminal,
 /// and a hook still pending after its one poll detaches alone under the
 /// credential's lifetime. Every other client keeps the undecorated terminal.
+///
+/// An elapsed credential makes the hooks select the authorization terminal in
+/// place of the gateway's own. That terminal is written as every other
+/// authorization terminal on this bridge is, under the bounded post-deadline
+/// write grace, never through the unbounded gateway reject writer.
 #[allow(clippy::too_many_arguments)]
 async fn write_plain_gateway_error_terminal<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -11309,6 +11333,15 @@ where
             ),
         )
         .await;
+        if ctx.authorization_termination().is_some() {
+            return write_plain_authorization_expired_terminal(
+                stream,
+                ctx,
+                backend_start,
+                bytes_sent,
+            )
+            .await;
+        }
     }
     let status = StatusCode::from_u16(status_code).unwrap_or(status);
     write_plain_gateway_reject(

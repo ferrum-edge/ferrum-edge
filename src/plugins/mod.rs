@@ -6906,6 +6906,16 @@ impl PrecommitResponsePhaseBound {
     ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
         self.bound.expired_authorization()
     }
+
+    /// The credential's termination class once its authorization deadline
+    /// has elapsed, whether or not it is the winning bound. Gates work that
+    /// has not been polled yet; attribution of an ended phase stays with
+    /// [`Self::expired_authorization`].
+    pub(crate) fn elapsed_authorization(
+        self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        self.bound.elapsed_authorization()
+    }
 }
 
 /// Outcome of one awaited PRE-COMMITMENT response phase.

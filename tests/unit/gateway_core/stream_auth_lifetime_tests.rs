@@ -2720,7 +2720,10 @@ fn every_precommit_response_phase_composes_the_authorization_lifetime() {
         .split("\n}\n")
         .next()
         .expect("reject-path after_proxy runner bounded");
-    let settles_expiry = "charged_bound.and_then(|bound| bound.expired_authorization())";
+    // The reject path gates on the credential's own elapsed deadline, not the
+    // winning bound, so an earlier RPC deadline cannot buy an expired
+    // credential one more poll (#5747).
+    let settles_expiry = "charged_bound.and_then(|bound| bound.elapsed_authorization())";
     assert!(
         charged_reject_path.contains(settles_expiry)
             && charged_reject_path.contains("replace_rejection_with_authorization_terminal("),
@@ -4780,6 +4783,68 @@ fn the_authorization_expired_rejection_future_is_built_out_of_line() {
         factory.ends_with("#[allow(clippy::too_many_arguments)]\n#[inline(never)]\n"),
         "the factory must stay `#[inline(never)]`: inlining it back into the \
          caller restores the frame slot it exists to remove"
+    );
+}
+
+/// The same stack-budget invariant for the gateway-generated gRPC-Web error
+/// terminals that `after_proxy` now decorates (#5747). Proxy core's native gRPC
+/// branch builds them through one `#[inline(never)]` factory, and the HTTP/3
+/// bridge keeps their hook runner boxed so the cold arms of `dispatch_plain`
+/// carry only a pointer. An authorization terminal those hooks select on the
+/// bridge is written under the bounded post-deadline grace, never through the
+/// unbounded gateway reject writer.
+#[test]
+fn gateway_error_terminals_are_built_out_of_line_and_bound_the_authorization_write() {
+    const CROSS_PROTOCOL_SOURCE: &str = include_str!("../../../src/http3/cross_protocol.rs");
+
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("let response = boxed_grpc_web_gateway_error_response(")
+            .count(),
+        2,
+        "both gRPC-Web arms of the native gRPC error branch must use the out-of-line builder"
+    );
+    let factory = PROXY_SOURCE
+        .split("pub(crate) fn boxed_grpc_web_gateway_error_response<'a>(")
+        .next()
+        .expect("the out-of-line gRPC-Web gateway error builder");
+    assert!(
+        factory.ends_with("#[inline(never)]\n"),
+        "the builder must stay `#[inline(never)]`: inlining it back into the \
+         caller restores the frame slot it exists to remove"
+    );
+
+    let writer = CROSS_PROTOCOL_SOURCE
+        .split("async fn write_plain_gateway_error_terminal<S>(")
+        .nth(1)
+        .expect("the HTTP/3 gateway error terminal writer")
+        .split("\n}\n")
+        .next()
+        .expect("bounded HTTP/3 gateway error terminal writer");
+    let boxed_hooks = concat!(
+        "Box::pin(\n",
+        "            crate::proxy::apply_after_proxy_hooks_to_gateway_error_terminal(",
+    );
+    assert!(
+        writer.contains(boxed_hooks),
+        "the bridge must keep the gateway error terminal hook runner boxed"
+    );
+    let hooks = writer
+        .find("apply_after_proxy_hooks_to_gateway_error_terminal(")
+        .expect("the hooks run first");
+    let authorization = writer
+        .find("if ctx.authorization_termination().is_some() {")
+        .expect("an authorization terminal the hooks selected is detected");
+    let bounded = writer
+        .find("return write_plain_authorization_expired_terminal(")
+        .expect("and written under the bounded post-deadline grace");
+    let unbounded = writer
+        .find("write_plain_gateway_reject(")
+        .expect("every other terminal keeps the gateway reject writer");
+    assert!(
+        hooks < authorization && authorization < bounded && bounded < unbounded,
+        "an authorization terminal must be written through the bounded writer, \
+         before the unbounded gateway reject writer is reached"
     );
 }
 

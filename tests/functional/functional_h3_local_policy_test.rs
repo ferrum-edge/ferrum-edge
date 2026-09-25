@@ -1267,6 +1267,80 @@ async fn functional_h3_grpc_web_backend_unavailable_carries_cors() {
     gateway.shutdown().await;
 }
 
+/// A gRPC-Web response too large for the gateway's response ceiling is a
+/// gateway error terminal the HTTP/3 bridge decorates too (#5747), with no RPC
+/// deadline and no body policy in force. A declared length is refused before
+/// `after_proxy` runs, so the terminal runs the reject-path hooks. A chunked
+/// body is refused while it is collected, after `after_proxy` decorated its
+/// head, so the terminal carries that head's gateway decorations. Either way
+/// the browser client gets the CORS headers it needs to read the gRPC status.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_grpc_web_too_large_response_carries_cors() {
+    for chunked in [false, true] {
+        assert_h3_grpc_web_too_large_response_carries_cors(chunked).await;
+    }
+}
+
+async fn assert_h3_grpc_web_too_large_response_carries_cors(chunked: bool) {
+    let leg = if chunked {
+        "chunked, refused after the head"
+    } else {
+        "declared length, refused before the head"
+    };
+    let (backend_port, backend_task) = if chunked {
+        spawn_grpc_web_chunked_bulk_backend().await
+    } else {
+        spawn_grpc_web_bulk_backend().await
+    };
+    let mut config = grpc_web_cors_config(backend_port);
+    if chunked {
+        // Buffered, so the collector finds the body too large only after
+        // `after_proxy` decorated the response head.
+        buffer_every_response(&mut config);
+    }
+    let gateway = start_h3_policy_gateway_with_env(config, |env| {
+        env.max_response_body_size_bytes = GRPC_WEB_TOO_LARGE_RESPONSE_LIMIT;
+    })
+    .await
+    .expect("start h3 gRPC-Web CORS gateway");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/echo.Echo/Bulk",
+        gateway.https_port
+    );
+    let frame = grpc_web_data_frame(b"bulk");
+    let resp = retry_h3_post_with_headers(
+        &client,
+        &url,
+        "application/grpc-web+proto",
+        &frame,
+        &[("origin", GRPC_WEB_CORS_ORIGIN)],
+    )
+    .await;
+    assert_eq!(
+        resp.status,
+        StatusCode::OK,
+        "{leg}: gRPC-Web errors ride HTTP 200, got {resp:?}"
+    );
+    assert_eq!(
+        resp.headers
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some(GRPC_WEB_CORS_ORIGIN),
+        "{leg}: the too-large terminal must carry the CORS decoration: {resp:?}"
+    );
+    let body = resp.body_text();
+    assert!(
+        body.contains("grpc-status:") && !body.contains("grpc-status: 0"),
+        "{leg}: a too-large response must end in a gRPC error: {body:?}"
+    );
+
+    gateway.shutdown().await;
+    backend_task.abort();
+}
+
 /// A backend port nothing listens on, so every dial to it is refused.
 async fn refused_backend_port() -> u16 {
     let listener = TcpListener::bind_test("127.0.0.1:0")
@@ -1635,13 +1709,22 @@ impl RunningH3Gateway {
 async fn start_h3_policy_gateway(
     config: GatewayConfig,
 ) -> Result<RunningH3Gateway, Box<dyn std::error::Error + Send + Sync>> {
+    start_h3_policy_gateway_with_env(config, |_| {}).await
+}
+
+/// [`start_h3_policy_gateway`] with `configure` applied to the gateway's
+/// environment before it starts.
+async fn start_h3_policy_gateway_with_env(
+    config: GatewayConfig,
+    configure: impl FnOnce(&mut EnvConfig),
+) -> Result<RunningH3Gateway, Box<dyn std::error::Error + Send + Sync>> {
     let (https_tcp, https_udp) = reserve_colocated_tcp_udp().await?;
     let admin = reserve_port().await?;
     let https_port = https_tcp.port;
     let admin_port = admin.port;
     assert_eq!(https_port, https_udp.port);
 
-    let env_config = EnvConfig {
+    let mut env_config = EnvConfig {
         mode: OperatingMode::File,
         log_level: "warn".to_string(),
         proxy_http_port: 0,
@@ -1659,6 +1742,7 @@ async fn start_h3_policy_gateway(
         namespace: H3_POLICY_NAMESPACE.to_string(),
         ..EnvConfig::default()
     };
+    configure(&mut env_config);
     let prepared = prepare_gateway_config_for_mesh(config, &mesh_runtime_config()?).map_err(
         |e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("mesh preparation failed: {e}").into()
@@ -2327,6 +2411,54 @@ async fn spawn_grpc_web_bulk_backend() -> (u16, JoinHandle<()>) {
                     return;
                 }
                 let _ = stream.write_all(&body).await;
+                let _ = stream.flush().await;
+                // Hold the connection until the gateway drops it.
+                let mut probe = [0u8; 1];
+                let _ = stream.read(&mut probe).await;
+            });
+        }
+    });
+    (port, task)
+}
+
+/// Response ceiling of the too-large gRPC-Web tests: far below the
+/// [`GRPC_WEB_BULK_MESSAGE_LEN`] message the bulk backends answer with.
+const GRPC_WEB_TOO_LARGE_RESPONSE_LIMIT: usize = 64 * 1024;
+
+/// [`spawn_grpc_web_bulk_backend`] with its one large message sent chunked, so
+/// no declared length refuses it before its body is collected.
+async fn spawn_grpc_web_chunked_bulk_backend() -> (u16, JoinHandle<()>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind chunked gRPC-Web bulk backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                if read_http_request_body(&mut stream).await.is_err() {
+                    return;
+                }
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/grpc-web+proto\r\n\
+                            Transfer-Encoding: chunked\r\n\r\n";
+                if stream.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                let body = grpc_web_data_frame(&b"x".repeat(GRPC_WEB_BULK_MESSAGE_LEN));
+                for chunk in body.chunks(16 * 1024) {
+                    let size = format!("{:x}\r\n", chunk.len());
+                    if stream.write_all(size.as_bytes()).await.is_err()
+                        || stream.write_all(chunk).await.is_err()
+                        || stream.write_all(b"\r\n").await.is_err()
+                    {
+                        // The gateway refused the body and dropped the
+                        // connection.
+                        return;
+                    }
+                }
+                let _ = stream.write_all(b"0\r\n\r\n").await;
                 let _ = stream.flush().await;
                 // Hold the connection until the gateway drops it.
                 let mut probe = [0u8; 1];

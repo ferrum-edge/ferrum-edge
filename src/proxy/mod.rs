@@ -23350,10 +23350,13 @@ async fn run_after_proxy_hooks_on_rejection(
         let result = if post_deadline_terminal {
             // A charged terminal composes the credential's lifetime: an elapsed
             // one answers with the fixed authorization terminal before the hook
-            // is polled, and a pending hook detaches only under it.
+            // is polled, and a pending hook detaches only under it. The gate is
+            // the credential's own deadline, not the winning bound: when an
+            // earlier RPC deadline won the composition, a credential that has
+            // since elapsed still gets no further poll (#5747).
             let charged_bound =
                 charged_backend_deadline.then(|| ctx.precommit_response_phase_bound());
-            let expired = charged_bound.and_then(|bound| bound.expired_authorization());
+            let expired = charged_bound.and_then(|bound| bound.elapsed_authorization());
             if let Some(termination) = expired {
                 replace_rejection_with_authorization_terminal(
                     ctx,
@@ -25174,10 +25177,19 @@ pub(crate) async fn run_after_proxy_hooks(
     // selected by header name. Body-policy provenance is also required without
     // an RPC deadline: the eventual rejection must preserve gateway decorators
     // while shedding the rejected backend representation.
-    if plugins.iter().any(|plugin| {
-        plugin.may_enforce_response_body_policy(ctx)
-            || plugin.enforces_final_client_visible_response_headers(ctx)
-    }) {
+    //
+    // A gRPC-Web client needs the same without an RPC deadline (#5747): a
+    // gateway error terminal selected after this head was decorated (a
+    // response found too large while its body is collected, for example) must
+    // keep the gateway's CORS decorations, or the browser cannot read its gRPC
+    // status. Provenance only records here; it changes no header of a response
+    // that is served, so the cost is one snapshot per decorated gRPC-Web head.
+    if crate::plugins::grpc_web::client_uses_grpc_web(ctx)
+        || plugins.iter().any(|plugin| {
+            plugin.may_enforce_response_body_policy(ctx)
+                || plugin.enforces_final_client_visible_response_headers(ctx)
+        })
+    {
         ctx.begin_buffered_replacement_response_header_provenance(response_headers);
     } else {
         ctx.begin_buffered_deadline_response_header_provenance(response_headers);
@@ -29519,13 +29531,19 @@ fn boxed_finalize_authorization_expired_rejection<'a>(
 /// continues detached under the credential's lifetime. A browser client gets
 /// the CORS headers that let it read the gRPC status, and the terminal keeps
 /// its wording.
+///
+/// An elapsed credential replaces the terminal with the authorization one
+/// before any hook runs. The initial response-header policy (security
+/// headers), which this terminal carried unconditionally before it was
+/// decorated, is then applied here, so that terminal is not left without it.
 #[inline(never)]
-fn boxed_grpc_web_gateway_error_response<'a>(
+pub(crate) fn boxed_grpc_web_gateway_error_response<'a>(
     plugins: &'a [Arc<dyn Plugin>],
     ctx: &'a mut RequestContext,
     response_content_type: &'a str,
     grpc_status: u32,
     message: &'a str,
+    initial_response_header_policy_plugins: &'a [Arc<dyn Plugin>],
 ) -> BoxedRejectionResponseFuture<'a> {
     Box::pin(async move {
         let mut status_code = StatusCode::OK.as_u16();
@@ -29535,6 +29553,12 @@ fn boxed_grpc_web_gateway_error_response<'a>(
             ("grpc-status".to_string(), grpc_status.to_string()),
             ("grpc-message".to_string(), message.to_string()),
         ]);
+        // A non-replacing hook can still write `grpc-status` or `grpc-message`
+        // into this map (a `response_transformer` rule, for example), and the
+        // normalization below reads the terminal status from it. That is
+        // operator-configured header policy, not a replacement: replacers are
+        // skipped, so only a decorator the operator configured can rewrite the
+        // gateway's own status fields, and it is honored as on any reject.
         apply_after_proxy_hooks_to_gateway_error_terminal(
             plugins,
             ctx,
@@ -29543,13 +29567,24 @@ fn boxed_grpc_web_gateway_error_response<'a>(
             &mut headers,
         )
         .await;
+        if ctx.authorization_termination().is_some() {
+            crate::plugins::apply_initial_response_header_policies(
+                initial_response_header_policy_plugins,
+                &mut headers,
+            );
+        }
         let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
         let reject = normalize_reject_response(http_status, body, &headers, true);
         // The backend-error arm runs no committed observers, so none run here.
         let response =
             build_grpc_web_reject_response(&[], ctx, Some(response_content_type), &reject).await;
         response.unwrap_or_else(|| {
-            build_grpc_web_error_response(response_content_type, grpc_status, message, &[])
+            build_grpc_web_error_response(
+                response_content_type,
+                grpc_status,
+                message,
+                initial_response_header_policy_plugins,
+            )
         })
     })
 }
@@ -37916,6 +37951,7 @@ async fn handle_proxy_request_inner(
                         content_type,
                         grpc_code,
                         msg,
+                        initial_response_header_policy_plugins.as_ref(),
                     )
                     .await;
                     return Ok(grpc_proxy::attach_held_frontend_grpc_upload(
@@ -37934,6 +37970,7 @@ async fn handle_proxy_request_inner(
                         &content_type,
                         grpc_code,
                         msg,
+                        initial_response_header_policy_plugins.as_ref(),
                     )
                     .await;
                     return Ok(grpc_proxy::attach_held_frontend_grpc_upload(
