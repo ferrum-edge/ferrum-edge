@@ -66,11 +66,7 @@ fn run_selections(lb: &LoadBalancer, iterations: usize) {
 /// Steady-state parallel batch: workers are spawned once per Criterion
 /// `iter_custom` call and reused across samples so wall time measures
 /// selection contention, not thread create/teardown.
-fn measure_parallel_batches(
-    lb: &Arc<LoadBalancer>,
-    threads: usize,
-    batches: u64,
-) -> Duration {
+fn measure_parallel_batches(lb: &Arc<LoadBalancer>, threads: usize, batches: u64) -> Duration {
     let start_line = Arc::new(Barrier::new(threads + 1));
     let end_line = Arc::new(Barrier::new(threads + 1));
     let stop = Arc::new(AtomicBool::new(false));
@@ -135,24 +131,21 @@ fn bench_wrr_selection(c: &mut Criterion) {
             group.throughput(Throughput::Elements(
                 (ITERATIONS_PER_THREAD * threads) as u64,
             ));
-            group.bench_function(
-                format!("{targets}_targets_{threads}_threads"),
-                |b| {
-                    b.iter_custom(|iters| {
-                        if threads == 1 {
-                            let mut total = Duration::ZERO;
-                            for _ in 0..iters {
-                                let started = Instant::now();
-                                run_selections(&lb, ITERATIONS_PER_THREAD);
-                                total += started.elapsed();
-                            }
-                            total
-                        } else {
-                            measure_parallel_batches(&lb, threads, iters)
+            group.bench_function(format!("{targets}_targets_{threads}_threads"), |b| {
+                b.iter_custom(|iters| {
+                    if threads == 1 {
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            let started = Instant::now();
+                            run_selections(&lb, ITERATIONS_PER_THREAD);
+                            total += started.elapsed();
                         }
-                    });
-                },
-            );
+                        total
+                    } else {
+                        measure_parallel_batches(&lb, threads, iters)
+                    }
+                });
+            });
         }
     }
     group.finish();

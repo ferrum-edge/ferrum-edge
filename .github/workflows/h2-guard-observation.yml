@@ -12,6 +12,28 @@ on:
       - tests/performance/multi_protocol/run_gateway_protocol_bench.sh
       - tests/performance/multi_protocol/tests/test_h2_guard_observation.py
       - .github/workflows/h2-guard-observation.yml
+      - Cargo.toml
+      - Cargo.lock
+      - Dockerfile
+  # prepare.py fails closed when a repository file it pins drifts: the
+  # src/admin/mod.rs SHA-256 in h2_guard/source.json, the h2 entry in
+  # Cargo.lock, the single [patch.crates-io] table in Cargo.toml, and the two
+  # Dockerfile cargo build calls. Ordinary source PRs do not run this lane, so
+  # re-verify every main push that touches a pinned input; a stale pin turns
+  # that push's run red instead of surfacing on a later unrelated PR.
+  push:
+    branches: [main]
+    paths:
+      - tests/performance/multi_protocol/h2_guard/**
+      - tests/performance/multi_protocol/h2_guard_observation.py
+      - tests/performance/multi_protocol/h2_guard_snapshot.py
+      - tests/performance/multi_protocol/h2_diagnostics.py
+      - tests/performance/multi_protocol/experiment_arms.py
+      - tests/performance/multi_protocol/run_gateway_protocol_bench.sh
+      - tests/performance/multi_protocol/tests/test_h2_guard_observation.py
+      - .github/workflows/h2-guard-observation.yml
+      - src/admin/mod.rs
+      - Cargo.toml
       - Cargo.lock
       - Dockerfile
   workflow_dispatch:
@@ -24,6 +46,12 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: h2-guard-observation-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  # Only superseded PR runs are cancelled. Main pushes and manual campaigns
+  # run to completion (see docs/ci_cd.md "Main-push concurrency").
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   guard-checks:

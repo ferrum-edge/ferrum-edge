@@ -1502,8 +1502,7 @@ async fn run_udp_egress_session(
     // Setup-only snapshot: release the epoch now so a long-lived UDP session does
     // not pin an old config generation in memory (codex r7 P2).
     drop(epoch);
-    let _lb_guard =
-        LoadBalancerConnectionGuard::new(Some(std::sync::Arc::clone(&target)), balancer);
+    let _lb_guard = LoadBalancerConnectionGuard::new(Some(target.as_ref()), balancer.as_deref());
     if let Some(observability) = observability.as_mut() {
         observability.set_target(&target);
     }

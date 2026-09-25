@@ -29,7 +29,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`Alt-Svc`) on a listener port that serves such a rule. CI now declares
   `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`; `backendRequest`
   bounds an attempt's response-head wait and idle gaps rather than its total
-  duration, a documented deviation. `rules[].retry` is still refused.
+  duration, a documented deviation.
+
+- Gateway API HTTPRoute rule-level `retry` (#5646). The experimental-channel
+  field, present in the pinned v1.5.1 experimental CRD bundle, is validated like
+  that CRD and projected onto the rule's own `mesh_route_dispatch` retry
+  override, the same one the Istio VirtualService translator uses, so sibling
+  and merged rules are never retried. `attempts` counts retries after the
+  initial attempt (`0` disables them), `codes` are the retried statuses, and
+  `backoff` is a fixed minimum wait. Out-of-range `attempts` (negative or above
+  100) and a `backoff` above `5m` are `UnsupportedValue`. A listed status is
+  retried only for `GET`, `HEAD`, `OPTIONS`, `PUT` and `DELETE`. A failure
+  before any byte reached the backend is retried for every method. A response
+  whose head reached the client is never replayed. Every attempt and backoff
+  spends the rule's `timeouts.request` budget. Upstream v1.5.1 has no retry
+  conformance feature, so none is declared. GRPCRoute `retry` stays refused.
+  An empty-match `mesh_route_dispatch` rule carrying only `retry` or
+  `retry_disabled: true` is now accepted as a route-action catch-all.
 
 - Conditional full-replacement writes (#5659). `GET` on proxies, upstreams,
   consumers, and plugin configs returns a strong `ETag`; `PUT`/`DELETE` with a
@@ -42,7 +58,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutating route that does not evaluate it, is `400` rather than ignored.
   Requests without `If-Match` are unchanged.
 
+- Proxy filter on `GET /plugins/config` (#5726). An optional `proxy_id` query
+  parameter narrows the list to plugin configs whose `proxy_id` matches exactly,
+  so a caller (e.g. Nexus) no longer has to page the whole namespace and filter
+  client-side. Pagination and `pagination.total` apply over the filtered set,
+  and the filter is pushed into every backend (SQL, MongoDB, and the
+  in-memory/file path), respecting the caller's namespace and role the same as
+  the unfiltered list. An invalid `proxy_id` returns `400`; an unknown one
+  returns an empty page rather than `404`.
+
 ### Fixed
+
+- Service-discovery target updates, modified upstreams, and full load-balancer
+  rebuilds no longer reset the live state of targets that stay in the set
+  (#5693). Each surviving `host:port` keeps its active-connection count, latency
+  EWMA, and latency sample count. The new balancer shares these counters with
+  the old one, so connections opened before the update are still counted and
+  release the same counter when they close. Previously a scale-up made a target
+  with 1,000 open sessions look idle to `least_connections`, sent
+  `least_latency` back into round-robin warm-up, and dropped those connections
+  from the per-target connection metrics. A removed target's state is dropped;
+  if the target is added again, it starts clean. Because counts now persist,
+  every HTTP/3 path (native streaming, buffered, native gRPC, and the
+  cross-protocol bridge) releases its connection count through an RAII guard,
+  as HTTP/1.1, HTTP/2, gRPC, WebSocket, TCP and UDP already did. An early
+  return between the start and the outcome record previously leaked one count,
+  and a retry that rotated to another target released the wrong one.
+- An HTTP/1.1 backend request no longer waits for `backend_read_timeout_ms`
+  and returns `504` when its pooled connection is reset or closed at the moment
+  the request is queued (#5714). The request never reached the backend, so it
+  now fails straight away: a reused connection is retried on a new one, and a
+  fresh connection returns `502` (`connection_pool_error`, pre-wire). The fix is
+  in a vendored hyper-util 0.1.20: its legacy client stops holding the closed
+  connection's only request sender, so the request stranded by tokio's
+  two-step channel send is dropped and fails as unsent. HTTP/1 pools that
+  Ferrum drives directly (HBONE inner HTTP/1, Unix-socket backends) get the same
+  release in Ferrum code (#5720).
+- Benchmark runners no longer `SIGKILL` unrelated host listeners on fixed ports
+  (#5702). `run_protocol_test.sh`, `run_gateway_protocol_bench.sh`,
+  `run_connection_saturation_bench.sh`, `run_perf_test.sh`, `run_payload_test.sh`,
+  and the `mesh-dns-e2e` / `mesh-hbone-e2e` `run.sh` harnesses now refuse to
+  start when any of their ports is already bound (printing the port and an
+  `lsof` command to inspect the listener), and on exit terminate only the PIDs
+  and Docker container IDs the current run recorded, with a graceful `SIGTERM`,
+  a bounded wait, and `SIGKILL` only as a last resort. Their `EXIT` traps also
+  stop deleting shared certificates/results unless the run created the exact
+  paths, so an early failure cannot kill another process or remove another run's
+  artifacts. A static contract test in the `Benchmark Harness Tests` lane fails
+  if any of these runners, or a CI workflow invoking them, regresses to a
+  port-wide kill.
+- Rust tests no longer write the gateway's TLS store into the checkout
+  (#5706). Only the `ferrum-edge` binary resolves an unconfigured
+  `FERRUM_TLS_MANAGED_STORE_PATH` to `./ferrum-managed-tls`; other processes
+  that link the library, including every test harness, use a private
+  per-process temporary directory. An empty value now counts as unset. The
+  accidentally committed `ferrum-managed-tls/` store is removed and ignored,
+  and the Unit and Integration Tests jobs fail when a test run changes or adds
+  files in the checkout. `basic_auth` tests no longer race env-isolated tests
+  for `FERRUM_BASIC_AUTH_HMAC_SECRET` (#5705).
+- Reject a health-check `active.http_path` that does not start with `/`
+  (#5683). The probe URL is `scheme://host:port` + path, so a path like
+  `@169.254.169.254/` turned the target into userinfo and sent the probe to a
+  different host that the egress screen never inspected.
+- A request on an HBONE inner HTTP/1.1 connection or a Unix-socket HTTP/1.1
+  backend connection no longer waits for `backend_read_timeout_ms` (`504`), or
+  forever when that timeout is `0`, when the pooled connection is reset or
+  closed at the moment the request is queued (#5720). The request never reached
+  the backend, so it now fails straight away: a reused connection is retried
+  once on a new one, and a fresh connection returns `502`
+  (`connection_pool_error`, pre-wire). Both dispatches watch the connection
+  while they wait for the response and release its only request sender once it
+  stops accepting requests, so the request stranded by tokio's two-step channel
+  send fails as unsent. A request handed back unsent on a fresh connection is
+  now `connection_pool_error` for a streaming request body too, not only for a
+  buffered one.
+- Reject non-finite (`NaN`, `inf`) floating-point env values (#5684). A `NaN`
+  `FERRUM_OVERLOAD_*_THRESHOLD` passed validation and silently disabled load
+  shedding.
+- `bot_detection` `allow_list` entries whose first or last character is
+  punctuation now match (#5685). Word-boundary anchors are applied only to
+  word-character edges, so embedded-token smuggling stays blocked.
+- `spec_expose` serves specs with `Content-Security-Policy: default-src 'none';
+  sandbox` (#5686), so an upstream-supplied `application/xml` document cannot
+  run XHTML-namespaced script on the gateway origin.
+- `ldap_auth` escapes NUL in bind DN values as `\00` (RFC 4514) (#5687).
+- Reject an `active.udp_probe_payload` that is not an even-length hex string
+  (#5688) instead of silently probing with a single zero byte.
+- `FERRUM_MAX_CREDENTIALS_PER_TYPE=0` now fails startup, and the enforced value
+  is parsed exactly as startup validated it (#5689).
+- `graphql` and `grpc_method_router` tag `limit_by: consumer` rate keys as
+  `consumer:` or `ip:` (#5692), so an identity that equals an IP no longer
+  shares the anonymous budget of that IP. Existing local and Redis counters for
+  these two plugins restart once after upgrading.
 
 - Flush the two writes that run just before a byte relay starts (#5588): the
   TCP+TLS first-bytes prefix forwarded to the backend, and WebSocket tunnel
@@ -88,6 +195,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same withholding convention. Version and credential schema names remain
   visible in backticks. Real-binary regressions inspect both output streams.
 
+### Performance
+
+- `ws_frame_logging` builds its payload-fingerprint HMAC key once per plugin
+  instead of once per frame (#5690).
+- Circuit-breaker cache hits no longer allocate a key string (#5691).
+- `least_connections` and `least_latency` selection read each candidate's
+  counters by index instead of doing one or more `DashMap<String, _>` lookups
+  per candidate per request (#5693). Each balancer also no longer allocates
+  three default-sharded `DashMap`s.
+
 ### Security
 
 - **Outbound registry reuse now follows CONNECT enforcement context** (PR #5595).
@@ -115,9 +232,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RUSTSEC-2026-0286: `Session::get_attributes` could build an out-of-bounds slice when
   decoding `CKA_ALLOWED_MECHANISMS` (crash or adjacent heap disclosure). Lockfile-only
   change; the manifest's `0.12` requirement already admits the patch release.
+- Re-evaluate the time-boxed `deny.toml` advisory exceptions before their
+  2026-09-30 expiry (#5721). `mongodb` now requires `>=3.7, <3.9` (the
+  lockfile moves from 3.6.0 to 3.8.2). 3.7 is the first release on hickory
+  0.26, which drops hickory-proto 0.25.2 (RUSTSEC-2026-0118,
+  RUSTSEC-2026-0119). The cap below 3.9 keeps MongoDB 4.2 and Cosmos DB
+  server-version-4.2 support, because 3.9 raised the driver's minimum wire
+  version to 9 (MongoDB 4.4). The optional `secrets-aws` build no longer
+  enables `aws-sdk-secretsmanager`'s legacy `rustls` feature, so hyper 0.14,
+  rustls 0.21 with rustls-webpki 0.101.7 (RUSTSEC-2026-0098, -0099, -0104)
+  and h2 0.3.27 (RUSTSEC-2026-0258) leave the tree. The client already used
+  the SDK's hyper 1.x HTTPS client. PEM parsing, in the gateway and in the
+  standalone performance harnesses, moves from the unmaintained
+  `rustls-pemfile` (RUSTSEC-2025-0134) to the `rustls-pki-types` PEM API.
+  Certificate, key, and CRL records are read the same way, but the wording of
+  the underlying parse error changes in the admin API TLS validation, the TLS
+  inventory, ACME certificate checks (`certificate_metadata`,
+  `validate_completed_certificate_pair`), and the managed TLS store.
+  `mtls_auth` is stricter: a `ca_certificate_pem` that also carries an
+  `ECHCONFIG` block was accepted before (the old parser skipped the block) and
+  is now rejected as containing another PEM item (fail-closed). `rsa`
+  (RUSTSEC-2023-0071) and `paste` (RUSTSEC-2024-0436) still have no upstream
+  fix and are re-affirmed until 2026-12-31.
+- **Route response-header policy is now part of the replay key** (PR #5709).
+  `response_caching`, `request_deduplication`, and `ai_semantic_cache` replay a
+  response whose headers were finalized when it was stored, so they skip the
+  matched route's response-header transforms. A route-only reload that changed
+  those transforms (for example, a new `ResponseHeaderModifier` removing a
+  sensitive header) could still replay entries finalized under the old rule.
+  The ordered transform list is now bound into the shared destination
+  partition, so such entries miss. Existing replay keys rotate once after
+  upgrading.
+- **Route-override backend TLS and DNS policy are now part of the replay key**
+  (issue #5710). Two dispatch rules can send the same request target to the
+  same backend host and port under different backend TLS, for example
+  per-tenant client certificates or one rule that verifies the origin and one
+  that does not. A `response_caching`, `request_deduplication`, or
+  `ai_semantic_cache` entry stored under one rule could be replayed to a
+  request routed under the other. The route-override TLS identity (client
+  certificate and key references, CA bundle, verification mode, SNI, and SAN
+  allow-list) and the route-override DNS policy are now bound into the shared
+  destination partition. Only identities are hashed, never key material.
+  Existing replay keys rotate once after upgrading.
 
 ### Changed
 
+- **BREAKING (library API) — load-balancer runtime state** (issue #5693). The public
+  `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and
+  `LoadBalancer::latency_sample_count` `DashMap` fields are removed, along with
+  `LoadBalancerCache::record_connection_start` / `record_connection_end`, which
+  re-resolved the balancer at release time and could release a re-added
+  target's fresh count. Per-target state is now one shared
+  `TargetRuntimeState` slot per distinct `host:port`. Read it with
+  `LoadBalancer::target_runtime_state(target)` (`active_connections()`,
+  `latency_ewma_us()`, `latency_sample_count()`) or
+  `LoadBalancer::active_connection_counts()`. Count a connection with
+  `LoadBalancer::lease_connection(target)`, whose `TargetConnectionLease`
+  releases on drop. `LoadBalancer::record_connection_start` /
+  `record_connection_end` remain, but every start must be matched by an end on
+  the same balancer, because a rebuild no longer resets a leaked count. This
+  affects only code linking the `ferrum_edge` crate; configuration, the Admin
+  API and metrics are unchanged.
+- **BREAKING — malformed secret-fetch timeout and mesh DNS limits refuse to
+  start** (issues #5699 / #5700). `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` must be
+  a whole number of seconds from 1 to 600. Previously `0` made every secret
+  fetch that waited on I/O time out immediately, and a malformed or negative
+  value silently became 30. The same rule applies to startup secret resolution
+  (environment only), to later runtime fetches, and to the `ferrum.conf` value
+  when settings load. `FERRUM_MESH_DNS_TTL_SECONDS` (0–86400),
+  `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` (1–16384) and
+  `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` (1–262144) no longer fall back to
+  their defaults on a malformed, blank or overflowing value (or, for the two
+  capacity settings, zero). `run` and `validate` now fail with an error naming
+  the variable and its range, without echoing the value. Unset variables keep
+  their documented defaults. See
+  [docs/upgrade_guide.md](docs/upgrade_guide.md).
 - **MCP trailing-slash alias withdrawn** (#5582). The single-trailing-slash
   alias introduced for #5536 is no longer accepted. Authorization plugins
   evaluate the raw request path before MCP dispatch, so admitting and rewriting

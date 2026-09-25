@@ -1,9 +1,9 @@
 //! Drift guard: every functional test module must be assigned to a CI shard.
 //!
-//! `.github/workflows/ci.yml` runs the `functional_tests` binary in 3 parallel
-//! shards (`application`, `protocols`, `data-plane`) by passing each shard a
-//! list of cargo test name filters. A
-//! new `tests/functional/*_test.rs` file that is not added to any shard's
+//! `.github/workflows/ci.yml` runs the `functional_tests` binary in 4 parallel
+//! shards (`application`, `protocols`, `data-plane`, `data-plane-runtime`) by
+//! passing each shard a list of cargo test name filters. A new
+//! `tests/functional/*_test.rs` file that is not added to any shard's
 //! filter list will compile and link into the binary but never run in CI.
 //!
 //! This test parses the workflow, enumerates the test files on disk, and

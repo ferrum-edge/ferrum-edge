@@ -42,18 +42,59 @@ BACKEND_PID=""
 SIDECAR_PID=""
 GATEWAY_PID=""
 BACKEND_PORT=""
+ARTIFACTS_OWNED=false
+
+# Gracefully stop a PID this run started: TERM, bounded wait, then KILL.
+stop_pid() {
+    local pid="$1"
+    local attempt
+    [ -z "$pid" ] && return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for attempt in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+# Refuse a port that is already bound instead of killing its owner.
+check_port_available() {
+    local port="$1"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo -e "${RED}Required TCP port $port is already in use. Inspect it with: lsof -nP -iTCP:$port -sTCP:LISTEN${NC}"
+        return 1
+    fi
+    if lsof -nP -iUDP:"$port" >/dev/null 2>&1; then
+        echo -e "${RED}Required UDP port $port is already in use. Inspect it with: lsof -nP -iUDP:$port${NC}"
+        return 1
+    fi
+}
+
+check_ports_available() {
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo -e "${RED}lsof is required to detect port conflicts before starting.${NC}"
+        return 1
+    fi
+    local port
+    for port in "$GATEWAY_HTTP_PORT" "$SIDECAR_PORT" "$GATEWAY_ADMIN_PORT"; do
+        check_port_available "$port" || return 1
+    done
+}
 
 cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
     archive_failure_diagnostics
-    [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
-    [ -n "$SIDECAR_PID" ] && kill "$SIDECAR_PID" 2>/dev/null || true
-    [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
-    for port in "$GATEWAY_HTTP_PORT" "$SIDECAR_PORT" "$GATEWAY_ADMIN_PORT" ${BACKEND_PORT:-0}; do
-        [ "$port" = "0" ] && continue
-        lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    done
-    rm -rf "$RUNTIME_DIR"
+    stop_pid "$GATEWAY_PID"
+    stop_pid "$SIDECAR_PID"
+    stop_pid "$BACKEND_PID"
+    if $ARTIFACTS_OWNED; then
+        rm -rf "$RUNTIME_DIR"
+    fi
     echo -e "${GREEN}Cleanup complete${NC}"
 }
 trap cleanup EXIT
@@ -215,7 +256,9 @@ echo -e "${BLUE}=================================================${NC}"
 echo -e "${BLUE}  Ferrum Edge HBONE E2E Throughput Harness      ${NC}"
 echo -e "${BLUE}=================================================${NC}"
 
+check_ports_available || exit 1
 mkdirs
+ARTIFACTS_OWNED=true
 build
 generate_certs
 start_backend

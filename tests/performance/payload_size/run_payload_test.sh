@@ -172,12 +172,30 @@ get_config_and_flags() {
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 
+# Gracefully stop a PID this run started: TERM, bounded wait, then KILL.
+stop_pid() {
+    local pid="$1"
+    local attempt
+    [ -z "$pid" ] && return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for attempt in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
 cleanup() {
     echo ""
-    echo "[cleanup] Stopping processes..."
-    [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null && wait "$GATEWAY_PID" 2>/dev/null || true
-    [ -n "$ENVOY_PID" ] && kill "$ENVOY_PID" 2>/dev/null && wait "$ENVOY_PID" 2>/dev/null || true
-    [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null && wait "$BACKEND_PID" 2>/dev/null || true
+    echo "[cleanup] Stopping processes this run started..."
+    stop_pid "$GATEWAY_PID"
+    stop_pid "$ENVOY_PID"
+    stop_pid "$BACKEND_PID"
     GATEWAY_PID=""
     ENVOY_PID=""
     BACKEND_PID=""
@@ -185,16 +203,28 @@ cleanup() {
 
 trap cleanup EXIT
 
-kill_stale_processes() {
+# Refuse a port that is already bound instead of killing its owner.
+check_port_available() {
+    local port="$1"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "[ERROR] Required TCP port $port is already in use. Inspect it with: lsof -nP -iTCP:$port -sTCP:LISTEN"
+        return 1
+    fi
+    if lsof -nP -iUDP:"$port" >/dev/null 2>&1; then
+        echo "[ERROR] Required UDP port $port is already in use. Inspect it with: lsof -nP -iUDP:$port"
+        return 1
+    fi
+}
+
+check_ports_available() {
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo "[ERROR] lsof is required to detect port conflicts before starting."
+        return 1
+    fi
     local ports=(4001 4003 4004 4005 4010 4443 4445 5003 5010 8000 8443 9000 15000 50053)
+    local port
     for port in "${ports[@]}"; do
-        local pids
-        pids=$(lsof -ti ":$port" 2>/dev/null || true)
-        if [ -n "$pids" ]; then
-            echo "[cleanup] Killing stale process on port $port (PIDs: $pids)"
-            echo "$pids" | xargs kill -9 2>/dev/null || true
-            sleep 0.5
-        fi
+        check_port_available "$port" || return 1
     done
 }
 
@@ -269,15 +299,8 @@ start_envoy() {
 }
 
 stop_envoy() {
-    if [ -n "$ENVOY_PID" ]; then
-        kill "$ENVOY_PID" 2>/dev/null && wait "$ENVOY_PID" 2>/dev/null || true
-        ENVOY_PID=""
-    fi
-    # Clean up envoy ports
-    for port in 8000 8443 5010 5003 $ENVOY_ADMIN_PORT; do
-        lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    done
-    sleep 0.5
+    stop_pid "$ENVOY_PID"
+    ENVOY_PID=""
 }
 
 # ── Health check ──────────────────────────────────────────────────────────────
@@ -361,11 +384,9 @@ start_gateway() {
 }
 
 stop_gateway() {
-    if [ -n "$GATEWAY_PID" ]; then
-        kill "$GATEWAY_PID" 2>/dev/null && wait "$GATEWAY_PID" 2>/dev/null || true
-        GATEWAY_PID=""
-        sleep 0.5
-    fi
+    stop_pid "$GATEWAY_PID"
+    GATEWAY_PID=""
+    sleep 0.5
 }
 
 # ── Run benchmark ─────────────────────────────────────────────────────────────
@@ -713,7 +734,7 @@ main() {
     echo "╚══════════════════════════════════════════════════════════╝"
     echo ""
 
-    kill_stale_processes
+    check_ports_available || exit 1
     build_all
     mkdir -p "$RESULTS_DIR"
 

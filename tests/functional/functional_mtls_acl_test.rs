@@ -21,6 +21,8 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use crate::common::TestGateway;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -432,12 +434,11 @@ async fn tcp_mtls_send(
     cli: &GeneratedCert,
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let chain: Vec<_> = rustls_pemfile::certs(&mut cli.cert_pem.as_bytes())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(cli.cert_pem.as_bytes())
         .filter_map(|r| r.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut cli.key_pem.as_bytes())
-        .map_err(|e| format!("parse key: {e}"))?
-        .ok_or_else(|| "no private key".to_string())?;
+    let key = PrivateKeyDer::from_pem_slice(cli.key_pem.as_bytes())
+        .map_err(|e| format!("parse key: {e}"))?;
     let prov = rustls::crypto::ring::default_provider();
     let tls = rustls::ClientConfig::builder_with_provider(Arc::new(prov))
         .with_safe_default_protocol_versions()

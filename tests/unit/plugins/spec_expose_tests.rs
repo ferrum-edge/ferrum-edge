@@ -1050,6 +1050,64 @@ async fn test_specz_sanitizes_untrusted_upstream_content_type() {
     }
 }
 
+/// `application/xml` is an allowed spec media type, but browsers execute
+/// XHTML-namespaced `<script>` elements inside XML documents, so `nosniff`
+/// alone does not stop an untrusted upstream from running script on the
+/// gateway origin. Every served spec must carry a sandboxing CSP.
+#[tokio::test]
+async fn test_specz_xml_upstream_is_sandboxed_by_csp() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(
+                    br#"<x:script xmlns:x="http://www.w3.org/1999/xhtml">alert(1)</x:script>"#
+                        .to_vec(),
+                )
+                .insert_header("content-type", "application/xml"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "cache_ttl_seconds": 60
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/xml")
+            );
+            assert_eq!(
+                headers.get("content-security-policy").map(String::as_str),
+                Some(ferrum_edge::plugins::spec_expose::SPEC_RESPONSE_CSP)
+            );
+            assert_eq!(
+                ferrum_edge::plugins::spec_expose::SPEC_RESPONSE_CSP,
+                "default-src 'none'; sandbox"
+            );
+        }
+        other => panic!("expected RejectBinary, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_explicit_content_type_override_bypasses_upstream_allow_list() {
     use wiremock::matchers::{method, path};

@@ -46,6 +46,8 @@ use ferrum_edge::tls::{
     NoVerifier, accept_with_optional_deadline, frontend_tls_handshake_deadline,
 };
 use rustls::pki_types::ServerName;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, ClientConnection};
 
 /// Produce a real ClientHello for a client restricted to `versions`.
@@ -637,12 +639,11 @@ fn test_acceptor() -> tokio_rustls::TlsAcceptor {
     let params = rcgen::CertificateParams::new(names).expect("params");
     let cert = params.self_signed(&key).expect("self-signed leaf");
 
-    let certs = rustls_pemfile::certs(&mut cert.pem().as_bytes())
+    let certs = CertificateDer::pem_slice_iter(cert.pem().as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse test leaf certificate");
-    let private_key = rustls_pemfile::private_key(&mut key.serialize_pem().as_bytes())
-        .expect("parse test leaf key")
-        .expect("test leaf key present");
+    let private_key =
+        PrivateKeyDer::from_pem_slice(key.serialize_pem().as_bytes()).expect("parse test leaf key");
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ServerConfig::builder_with_provider(provider)

@@ -50,7 +50,10 @@ fn tcp_framing_round_trip_and_hostile_lengths() {
         decode_tcp_dns_length([0, 0]),
         Err(TcpDnsFrameError::EmptyLength)
     );
-    assert_eq!(unframe_from_tcp(&[0, 0]), Err(TcpDnsFrameError::EmptyLength));
+    assert_eq!(
+        unframe_from_tcp(&[0, 0]),
+        Err(TcpDnsFrameError::EmptyLength)
+    );
     assert_eq!(unframe_from_tcp(&[0]), Err(TcpDnsFrameError::Incomplete));
     assert_eq!(
         unframe_from_tcp(&[0, 5, 1, 2]),
@@ -68,7 +71,10 @@ fn stub_answers_a_and_aaaa_and_rejects_truncated() {
     assert!(parsed.is_response);
     assert_eq!(parsed.txid, 7);
     assert_eq!(parsed.rcode, 0);
-    assert_eq!(parsed.answers, vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]);
+    assert_eq!(
+        parsed.answers,
+        vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]
+    );
 
     let aaaa = build_query("example.com", QTYPE_AAAA, 8);
     let reply = build_stub_response(&aaaa).expect("AAAA query");
@@ -85,9 +91,8 @@ fn selected_reports_fail_on_zero_success_or_errors() {
     let classes = [NameClass::UpstreamForward];
     let transports = [Transport::Tcp];
     assert!(selected_reports_failure(&[], &classes, &transports).is_some());
-    let zero_success =
-        selected_reports_failure(&[sample_report(0, 12, 0)], &classes, &transports)
-            .expect("zero successful queries must fail");
+    let zero_success = selected_reports_failure(&[sample_report(0, 12, 0)], &classes, &transports)
+        .expect("zero successful queries must fail");
     assert!(zero_success.contains("zero successful queries"));
     assert!(selected_reports_failure(&[sample_report(10, 1, 0)], &classes, &transports).is_some());
     assert!(selected_reports_failure(&[sample_report(10, 0, 1)], &classes, &transports).is_some());
@@ -144,7 +149,10 @@ async fn tcp_stub_serves_length_framed_query() {
         .expect("payload read");
     let parsed = parse_response(&payload).expect("dns response");
     assert_eq!(parsed.txid, 42);
-    assert_eq!(parsed.answers, vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]);
+    assert_eq!(
+        parsed.answers,
+        vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]
+    );
 
     drop(client);
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;

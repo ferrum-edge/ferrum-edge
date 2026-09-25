@@ -22,16 +22,42 @@ WRK_DURATION=${WRK_DURATION:-30s}
 WRK_THREADS=${WRK_THREADS:-8}
 WRK_CONNECTIONS=${WRK_CONNECTIONS:-100}
 
+# PIDs created by this run, so cleanup never touches an unrelated listener.
+BACKEND_PID=""
+GATEWAY_PID=""
+
 echo -e "${BLUE}Starting Ferrum Edge Performance Test${NC}"
 echo "=================================================="
 
-# Kill any existing processes on test ports to prevent conflicts
-kill_existing() {
-    echo -e "${YELLOW}Cleaning up existing processes on ports $BACKEND_PORT and $GATEWAY_PORT...${NC}"
-    lsof -ti:$BACKEND_PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
-    lsof -ti:$GATEWAY_PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
-    sleep 1
-    echo -e "${GREEN}Ports cleared${NC}"
+# Refuse a port that is already bound instead of killing its owner.
+check_port_available() {
+    local port="$1"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo -e "${RED}Required TCP port $port is already in use. Inspect it with: lsof -nP -iTCP:$port -sTCP:LISTEN${NC}"
+        return 1
+    fi
+    if lsof -nP -iUDP:"$port" >/dev/null 2>&1; then
+        echo -e "${RED}Required UDP port $port is already in use. Inspect it with: lsof -nP -iUDP:$port${NC}"
+        return 1
+    fi
+}
+
+# Gracefully stop a PID this run started: TERM, bounded wait, then KILL.
+stop_pid() {
+    local pid="$1"
+    local attempt
+    [ -z "$pid" ] && return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for attempt in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
 }
 
 # Check if required tools are installed
@@ -42,6 +68,13 @@ check_dependencies() {
         echo -e "${RED}❌ wrk is not installed. Please install wrk for load testing:${NC}"
         echo "  macOS: brew install wrk"
         echo "  Ubuntu: sudo apt-get install wrk"
+        exit 1
+    fi
+
+    if ! command -v lsof &> /dev/null; then
+        echo -e "${RED}❌ lsof is not installed. It is required to detect port conflicts.${NC}"
+        echo "  macOS: brew install lsof"
+        echo "  Ubuntu: sudo apt-get install lsof"
         exit 1
     fi
     
@@ -206,15 +239,8 @@ generate_report() {
 cleanup() {
     echo -e "${YELLOW}🧹 Cleaning up...${NC}"
     
-    if [ ! -z "$BACKEND_PID" ]; then
-        kill $BACKEND_PID 2>/dev/null || true
-        echo -e "${GREEN}✅ Backend server stopped${NC}"
-    fi
-    
-    if [ ! -z "$GATEWAY_PID" ]; then
-        kill $GATEWAY_PID 2>/dev/null || true
-        echo -e "${GREEN}✅ Gateway stopped${NC}"
-    fi
+    stop_pid "$GATEWAY_PID"
+    stop_pid "$BACKEND_PID"
 }
 
 # Main execution
@@ -222,7 +248,8 @@ main() {
     trap cleanup EXIT
     
     check_dependencies
-    kill_existing
+    check_port_available "$BACKEND_PORT" || exit 1
+    check_port_available "$GATEWAY_PORT" || exit 1
     build_project
     start_backend
     start_gateway

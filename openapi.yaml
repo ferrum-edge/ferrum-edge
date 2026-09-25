@@ -5772,10 +5772,26 @@ paths:
       summary: List plugin configurations (paginated)
       description: |
         Returns a paginated envelope with `data` and `pagination` fields.
+
+        An optional `proxy_id` query parameter narrows the result to plugin
+        configs whose `proxy_id` matches exactly, so a caller listing one
+        proxy's configs does not have to page through the whole namespace and
+        filter client-side. Pagination (and `pagination.total`) is applied over
+        the filtered set.
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
+        - name: proxy_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Exact match on the `proxy_id` field of the plugin config. Returns
+            only proxy-scoped configs targeting this proxy. Must satisfy the
+            same identifier rules as other resource ids; an invalid value is
+            rejected with `400`.
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"
@@ -13982,7 +13998,9 @@ components:
         http_path:
           type: string
           default: /health
-          description: HTTP path to probe
+          maxLength: 2048
+          pattern: "^/"
+          description: HTTP path to probe; must start with `/`
         interval_seconds:
           type: integer
           format: uint64
@@ -14033,6 +14051,8 @@ components:
             `grpc` — gRPC health check using `grpc.health.v1.Health/Check`.
         udp_probe_payload:
           type: [string, "null"]
+          maxLength: 2048
+          pattern: "^([0-9a-fA-F]{2})*$"
           description: |
             Hex-encoded payload to send for UDP probes (e.g., "0000").
             If omitted, a single zero byte is sent.
@@ -23747,6 +23767,10 @@ components:
                     properties: {timeout_disabled: {const: true}}
                   - required: [request_timeout_ms]
                     properties: {request_timeout_ms: {type: integer}}
+                  - required: [retry]
+                    properties: {retry: {type: object}}
+                  - required: [retry_disabled]
+                    properties: {retry_disabled: {const: true}}
               - if:
                   required: [timeout_disabled]
                   properties:
@@ -23775,7 +23799,9 @@ components:
                   `query_params`/`authority`/`source_namespace`/`uri` must be
                   configured, UNLESS the rule carries a route action
                   (`request_transform`, `response_transform`, `fault`,
-                  `rewrite`, or `redirect`), which makes an empty match the
+                  `rewrite`, `redirect`, `timeout_ms`,
+                  `timeout_disabled: true`, `request_timeout_ms`, `retry`, or
+                  `retry_disabled: true`), which makes an empty match the
                   translator's deliberate action-only catch-all. An empty
                   match with no route action is rejected at load time because
                   it would silently shadow every later rule. `ignore_uri_case`
@@ -24117,7 +24143,16 @@ components:
                   - type: "null"
                 description: |
                   Optional route-local retry policy. Mutually exclusive with
-                  `retry_disabled: true`.
+                  `retry_disabled: true`. Request-scoped: it replaces the
+                  selected proxy's retry policy only for requests this rule
+                  matches. Istio `VirtualService.http[].retries` and Gateway
+                  API `HTTPRoute.rules[].retry` are projected here; the Gateway
+                  API translator emits `max_retries` = `attempts` (retries
+                  after the initial attempt), `retryable_status_codes` =
+                  `codes`, a `fixed` backoff of `backoff`, the default
+                  replay-safe `retryable_methods`, and
+                  `retry_on_connect_failure: true`. Backoff and every attempt
+                  stay inside the rule's `request_timeout_ms` budget.
               retry_disabled:
                 type: boolean
                 default: false

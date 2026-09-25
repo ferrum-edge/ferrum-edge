@@ -28,6 +28,8 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
 };
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -311,12 +313,10 @@ async fn start_https_echo_on(
     let cert = cert_pem.to_string();
     let key = key_pem.to_string();
     let h = tokio::spawn(async move {
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert.as_bytes())
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert.as_bytes())
             .filter_map(|r| r.ok())
             .collect();
-        let pk = rustls_pemfile::private_key(&mut key.as_bytes())
-            .unwrap()
-            .unwrap();
+        let pk = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
         let provider = rustls::crypto::ring::default_provider();
         let builder = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
             .with_safe_default_protocol_versions()
@@ -1056,15 +1056,14 @@ fn mtls_client_config(
     alpn: &[&[u8]],
 ) -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut server_ca_pem.as_bytes()) {
+    for cert in CertificateDer::pem_slice_iter(server_ca_pem.as_bytes()) {
         roots.add(cert.expect("parse server CA")).expect("add root");
     }
-    let client_chain: Vec<_> = rustls_pemfile::certs(&mut client.cert_pem.as_bytes())
+    let client_chain: Vec<_> = CertificateDer::pem_slice_iter(client.cert_pem.as_bytes())
         .map(|c| c.expect("parse client cert"))
         .collect();
-    let client_key = rustls_pemfile::private_key(&mut client.key_pem.as_bytes())
-        .expect("read client key")
-        .expect("client key present");
+    let client_key =
+        PrivateKeyDer::from_pem_slice(client.key_pem.as_bytes()).expect("read client key");
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

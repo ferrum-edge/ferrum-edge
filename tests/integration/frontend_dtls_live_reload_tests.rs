@@ -31,6 +31,7 @@ use rcgen::{
     KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
 };
 use rustls::pki_types::CertificateRevocationListDer;
+use rustls::pki_types::pem::PemObject;
 use tokio::net::UdpSocket;
 use tokio::sync::{oneshot, watch};
 
@@ -384,7 +385,7 @@ fn build_crl(ca: &TestCa, revoked: &[SerialNumber]) -> Vec<CertificateRevocation
         .expect("sign CRL")
         .pem()
         .expect("encode CRL pem");
-    rustls_pemfile::crls(&mut crl_pem.as_bytes())
+    CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
         .filter_map(|r| r.ok())
         .collect()
 }

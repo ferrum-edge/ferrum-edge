@@ -21,7 +21,8 @@
 use super::http2::is_benign_script_step_error;
 use super::tcp::{ExecutionMode, StepError, TcpStep};
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, private_key};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -74,13 +75,13 @@ impl TlsConfig {
     pub(crate) fn build_server_config(
         &self,
     ) -> Result<ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
-        let mut cert_reader = self.cert_pem.as_bytes();
-        let cert_chain: Vec<_> = certs(&mut cert_reader).filter_map(|c| c.ok()).collect();
+        let cert_chain: Vec<_> = CertificateDer::pem_slice_iter(self.cert_pem.as_bytes())
+            .filter_map(|c| c.ok())
+            .collect();
         if cert_chain.is_empty() {
             return Err("no certificates found in cert_pem".into());
         }
-        let mut key_reader = self.key_pem.as_bytes();
-        let key = private_key(&mut key_reader)?.ok_or("no private key found in key_pem")?;
+        let key = PrivateKeyDer::from_pem_slice(self.key_pem.as_bytes())?;
 
         let provider = rustls::crypto::ring::default_provider();
         let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
@@ -519,8 +520,7 @@ mod tests {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let mut root = rustls::RootCertStore::empty();
-        let mut reader = ca_pem.as_bytes();
-        for cert in certs(&mut reader).filter_map(|c| c.ok()) {
+        for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()).filter_map(|c| c.ok()) {
             root.add(cert)?;
         }
         let provider = rustls::crypto::ring::default_provider();

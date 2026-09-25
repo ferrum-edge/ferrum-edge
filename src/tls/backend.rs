@@ -1107,6 +1107,7 @@ mod tests {
         KeyPair, KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
     };
     use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::pem::PemObject;
     use tempfile::TempDir;
 
     use crate::config::types::{AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy};
@@ -1161,7 +1162,7 @@ mod tests {
         params.serial_number = Some(serial.clone());
         let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign leaf");
         let cert_pem = cert.pem();
-        let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        let cert_der = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .expect("parse leaf PEM")
             .into_iter()
@@ -1210,7 +1211,7 @@ mod tests {
     }
 
     fn parse_crls(pem: &str) -> Vec<CertificateRevocationListDer<'static>> {
-        rustls_pemfile::crls(&mut pem.as_bytes())
+        CertificateRevocationListDer::pem_slice_iter(pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .expect("parse CRLs")
     }

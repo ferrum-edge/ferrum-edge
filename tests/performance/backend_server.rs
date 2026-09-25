@@ -2,25 +2,28 @@
 //! Uses hyper for fast HTTP responses
 //! Supports both HTTP (port 3001) and HTTPS (port 3443)
 
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use rustls::ServerConfig;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::convert::Infallible;
 use std::fs;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::time::{Duration, sleep};
 use tokio::net::TcpListener;
+use tokio::time::{Duration, sleep};
 use tokio_rustls::TlsAcceptor;
 
 const MAX_ECHO_BODY_BYTES: usize = 16 * 1024;
 
-async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn handle_request(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let start_time = Instant::now();
 
     let method = req.method().clone();
@@ -28,26 +31,31 @@ async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<
 
     // Simulate different response types based on path
     let response: Response<Full<Bytes>> = match (&method, path.as_str()) {
-        (&Method::GET, "/health") => {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from(r#"{"status":"healthy","timestamp":"2024-01-01T00:00:00Z"}"#)))
-                .unwrap()
-        }
+        (&Method::GET, "/health") => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(
+                r#"{"status":"healthy","timestamp":"2024-01-01T00:00:00Z"}"#,
+            )))
+            .unwrap(),
         (&Method::GET, "/api/users") => {
             // Simulate some processing time
             sleep(Duration::from_micros(100)).await;
             Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from(r#"{"users":[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]}"#)))
+                .body(Full::new(Bytes::from(
+                    r#"{"users":[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]}"#,
+                )))
                 .unwrap()
         }
         (&Method::GET, p) if p.starts_with("/api/users/") => {
             // Extract user ID from path
             let user_id = p.trim_start_matches("/api/users/");
-            let response = format!(r#"{{"id":{},"name":"User {}","email":"user{}@example.com"}}"#, user_id, user_id, user_id);
+            let response = format!(
+                r#"{{"id":{},"name":"User {}","email":"user{}@example.com"}}"#,
+                user_id, user_id, user_id
+            );
             Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "application/json")
@@ -60,7 +68,9 @@ async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<
             Response::builder()
                 .status(StatusCode::CREATED)
                 .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from(r#"{"id":3,"name":"New User","created":true}"#)))
+                .body(Full::new(Bytes::from(
+                    r#"{"id":3,"name":"New User","created":true}"#,
+                )))
                 .unwrap()
         }
         (&Method::POST, "/api/echo") => {
@@ -74,7 +84,11 @@ async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<
                     .header("Content-Type", "application/json")
                     .body(Full::new(collected.to_bytes()))
                     .unwrap(),
-                Err(error) if error.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+                Err(error)
+                    if error
+                        .downcast_ref::<http_body_util::LengthLimitError>()
+                        .is_some() =>
+                {
                     Response::builder()
                         .status(StatusCode::PAYLOAD_TOO_LARGE)
                         .body(Full::new(Bytes::from_static(b"request body too large")))
@@ -82,13 +96,18 @@ async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<
                 }
                 Err(_) => Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(Full::new(Bytes::from_static(b"failed to read request body")))
+                    .body(Full::new(Bytes::from_static(
+                        b"failed to read request body",
+                    )))
                     .unwrap(),
             }
         }
         (&Method::GET, "/api/data") => {
             // Larger payload for testing
-            let data = (0..100).map(|i| format!(r#"{{"id":{},"value":"data_{}"}}"#, i, i)).collect::<Vec<_>>().join(",");
+            let data = (0..100)
+                .map(|i| format!(r#"{{"id":{},"value":"data_{}"}}"#, i, i))
+                .collect::<Vec<_>>()
+                .join(",");
             let response = format!(r#"{{"data":[{}]}}"#, data);
             Response::builder()
                 .status(StatusCode::OK)
@@ -96,33 +115,35 @@ async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<
                 .body(Full::new(Bytes::from(response)))
                 .unwrap()
         }
-        _ => {
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from(r#"{"error":"Not Found"}"#)))
-                .unwrap()
-        }
+        _ => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(r#"{"error":"Not Found"}"#)))
+            .unwrap(),
     };
 
     let elapsed = start_time.elapsed();
 
     // Add timing headers for monitoring
     let mut response_with_timing = response;
-    response_with_timing.headers_mut().insert("X-Backend-Processing-Time",
-        format!("{}μs", elapsed.as_micros()).parse().unwrap());
+    response_with_timing.headers_mut().insert(
+        "X-Backend-Processing-Time",
+        format!("{}μs", elapsed.as_micros()).parse().unwrap(),
+    );
 
     Ok(response_with_timing)
 }
 
-fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+fn load_tls_config(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let cert_file = fs::File::open(cert_path)?;
     let key_file = fs::File::open(key_path)?;
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))?
-        .ok_or("no private key found")?;
+    let certs: Vec<_> =
+        CertificateDer::pem_reader_iter(cert_file).collect::<Result<Vec<_>, _>>()?;
+    let key = PrivateKeyDer::from_pem_reader(key_file)?;
 
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -193,10 +214,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   GET  /api/data - Large dataset");
 
     // Try to load TLS config from well-known cert paths
-    let cert_path = std::env::var("BACKEND_TLS_CERT")
-        .unwrap_or_default();
-    let key_path = std::env::var("BACKEND_TLS_KEY")
-        .unwrap_or_default();
+    let cert_path = std::env::var("BACKEND_TLS_CERT").unwrap_or_default();
+    let key_path = std::env::var("BACKEND_TLS_KEY").unwrap_or_default();
 
     if !cert_path.is_empty() && !key_path.is_empty() {
         let tls_config = load_tls_config(&cert_path, &key_path)?;

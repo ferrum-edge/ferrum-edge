@@ -25,7 +25,7 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - Ferrum carries vendored upstream crates under `vendor/**`, wired via
   `[patch.crates-io]` in `Cargo.toml`: `sqlx-core 0.8.6`, `reqwest 0.13.3`,
   `h3 0.0.8` (three patches), `h3-quinn 0.0.10`, `tungstenite 0.29.0`,
-  `tokio-tungstenite 0.29.0`, and `dimpl 0.6.1`.
+  `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, and `hyper-util 0.1.20`.
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
   `docs/vendored-patch-lifecycle.json`. Keep them, the
@@ -99,7 +99,18 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   freezes `needs`/`if` only on `production-dockerfile-smoke-default`,
   `production-dockerfile-smoke-ebpf`, and `node-waypoint-ebpf-live`; deleting
   the workflow is rejected. Editing any of this is a direct-to-`main` change:
-  no pull request may modify `verify_cross_build_policy.py`. The temporary
+  no pull request may modify `verify_cross_build_policy.py`. The contract
+  freezes the planner job, not the path list: the `node-waypoint-ebpf-live`
+  patterns live in `ci_runtime_plan.py` `SUITE_PATTERNS`, change by ordinary PR,
+  and take effect once on the trusted base. On a PR that suite is scoped to
+  NodeWaypoint-owned paths only (`ebpf/`, `src/ebpf/`, `src/capture/`,
+  `src/proxy/node_waypoint_*`, `tests/k8s/node_waypoint_ebpf_live/`, the
+  workflow and its Dockerfiles/local actions). Broad mesh trees
+  (`src/modes/mesh/`, `src/plugins/mesh/`, `src/k8s_controller/`,
+  `charts/ferrum-mesh/`, HBONE/mesh TCP proxy files, `node_agent.rs`,
+  `tests/k8s/lib/`) are PR-gated by the required mesh live suites and
+  validated by NodeWaypoint on push to `main`. Do not widen it back without a
+  replay (`ci_runtime_plan.decide_relevance` over merged PRs). The temporary
   `--list-suites` bootstrap handshake is deleted from
   `live_suite_path_filter.py`. The classifier refuses to classify
   any change-set record that is not a normal repository-relative pathname and
@@ -259,6 +270,14 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   name, so the store must start from `RootCertStore::empty()` whenever a CA is
   configured. `EnvConfig::validate` additionally refuses
   `FERRUM_DB_TLS_MODE=verify-ca` with no configured CA.
+- hyper-util HTTP/1 sender release (issue #5714): the vendored
+  `--lib ferrum_release_on_close_tests` in
+  `vendor/hyper-util-0.1.20-ferrum-patched/src/client/legacy/client.rs` plus
+  the vendored `--test legacy_client` suite, run by the `test-vendor-patches`
+  job. A request enqueued while its pooled HTTP/1 connection closes can miss
+  the dispatcher's drain; releasing the only sender lets tokio drop the stranded
+  envelope, so the request fails as unsent instead of hanging until
+  `backend_read_timeout_ms`.
 - Per-request connect timeout across shared pool keys:
   `tests/integration/connection_pool_tests.rs`.
 - HTTP/3 graceful close with a buffered response is not a false 502:

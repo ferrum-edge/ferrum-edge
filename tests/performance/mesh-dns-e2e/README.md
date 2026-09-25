@@ -63,6 +63,11 @@ A direct-stub baseline run is appended for the `upstream-forward` class so opera
 
 ## Caveats and known limitations
 
+- **Port conflicts fail closed.** `run.sh` refuses to start if any of its fixed
+  ports (15053, 17053, 17070, 17006, 17001, 17008, 17443, 17090) is already
+  bound, and cleanup stops only the gateway/CP-stub/upstream-stub PIDs this run
+  started (graceful `SIGTERM`, bounded wait, then `SIGKILL`). It never kills an
+  unrelated listener sharing one of those ports.
 - **Localhost-only.** The default DNS listener is `127.0.0.1:15053`. The harness binds load gen, gateway, CP stub, and upstream stub all on `127.0.0.1`, so this is single-host. No remote-client measurements.
 - **No baseline for mesh-internal traffic.** Mesh-internal hostnames are synthesised by `DnsResolutionTable::from_mesh_slice` from the slice — they don't exist anywhere else. Report numbers absolute, not comparative.
 - **macOS vs Linux UDP recv.** Linux uses `recvmmsg` for the gateway UDP frontend recv; macOS falls back to `recvfrom`. Same query/response shape but somewhat different cliff-edge throughput. Capture baselines per-OS.

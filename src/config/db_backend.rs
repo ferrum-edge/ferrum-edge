@@ -2022,12 +2022,14 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         namespace: &str,
         id: &str,
     ) -> Result<Option<PluginConfig>, anyhow::Error>;
-    /// Return a stable, backend-paginated plugin-config page and namespace total.
-    /// Callers must pass a positive bounded `limit` and an `offset` in
-    /// `0..=i64::MAX`; admin callers satisfy this through validated pagination.
+    /// Return a stable, backend-paginated plugin-config page and namespace
+    /// total, optionally narrowed to a single `proxy_id`. Callers must pass a
+    /// positive bounded `limit` and an `offset` in `0..=i64::MAX`; admin
+    /// callers satisfy this through validated pagination.
     async fn list_plugin_configs_paginated(
         &self,
         namespace: &str,
+        proxy_id: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error>;

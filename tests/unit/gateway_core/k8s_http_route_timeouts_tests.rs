@@ -275,9 +275,10 @@ fn http_route_timeouts_reject_malformed_shapes_with_field_specific_reasons() {
 }
 
 #[test]
-fn grpc_route_timeouts_and_http_route_retry_stay_refused() {
-    // GRPCRoute defines no `timeouts`; `retry` is not implemented on either
-    // kind. Both keep the fail-closed `UnsupportedValue` refusal.
+fn grpc_route_timeouts_stay_refused() {
+    // GRPCRoute defines no `timeouts`, so it keeps the fail-closed
+    // `UnsupportedValue` refusal. (HTTPRoute `retry`, which composes with
+    // `timeouts`, is covered in `k8s_http_route_retry_tests.rs`.)
     let grpc = translate_route_error(
         "GRPCRoute",
         json!([{
@@ -286,15 +287,6 @@ fn grpc_route_timeouts_and_http_route_retry_stay_refused() {
         }]),
     );
     assert!(grpc.contains(UNSUPPORTED_SHAPE_MARKER), "{grpc}");
-    let retry = translate_route_error(
-        "HTTPRoute",
-        json!([{
-            "backendRefs": [{"name": "api", "port": 8080}],
-            "timeouts": {"request": "1s"},
-            "retry": {"attempts": 2}
-        }]),
-    );
-    assert!(retry.contains(UNSUPPORTED_SHAPE_MARKER), "{retry}");
 }
 
 #[test]

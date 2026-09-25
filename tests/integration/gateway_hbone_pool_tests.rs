@@ -30,6 +30,7 @@ use rcgen::{
     PKCS_ECDSA_P256_SHA256, RevocationReason, RevokedCertParams, SerialNumber,
 };
 use rustls::pki_types::CertificateRevocationListDer;
+use rustls::pki_types::pem::PemObject;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -116,7 +117,7 @@ fn crl_revoking(
         .pem()
         .expect("crl pem");
     let crls: Vec<CertificateRevocationListDer<'static>> =
-        rustls_pemfile::crls(&mut pem.as_bytes())
+        CertificateRevocationListDer::pem_slice_iter(pem.as_bytes())
             .collect::<Result<_, _>>()
             .expect("parse crl");
     Arc::new(crls)

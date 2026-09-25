@@ -330,10 +330,13 @@ the GRPCRoute filter-type contract that lists response-header modification as Co
 **Update (issue [#5646](https://github.com/ferrum-edge/ferrum-edge/issues/5646)):**
 rule-level `ResponseHeaderModifier` (HTTPRoute and GRPCRoute) and HTTPRoute
 `URLRewrite` are now translated and enforced, and HTTPRoute `rules[].timeouts`
-(`request`, `backendRequest`) is now enforced. `rules[].retry`, `RequestMirror`,
-`ExtensionRef`, `CORS`, `ExternalAuth` and backend-reference filters are still
-refused as described above. The current admission contract, including the
-remaining refusals and the HTTP/3 `request`-timeout limitation, is
+(`request`, `backendRequest`) and `rules[].retry` (experimental channel) are now
+enforced. GRPCRoute `timeouts` and `retry`, `RequestMirror`, `ExtensionRef`,
+`CORS`, `ExternalAuth` and backend-reference filters are still refused as
+described above. An HTTPRoute that carried `retry` and was previously refused
+is now accepted and retries the requests its rule matches. The current
+admission contract, including the remaining refusals and the HTTP/3
+`request`-timeout limitation, is
 [`docs/gateway_api_conformance.md`](gateway_api_conformance.md).
 
 ### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
@@ -464,6 +467,29 @@ TLS handshake offload is not implemented. A nonzero `FERRUM_TLS_OFFLOAD_THREADS`
 `FERRUM_GRPC_POOL_READY_WAIT_MS` was parsed, documented, and accepted by `run`/`validate`, but the gRPC pool selection path never read it. Ferrum uses an immediate `now_or_never` readiness probe when choosing among shard senders — there is no configurable wait, and reintroducing one would regress gRPC tail latency under burst concurrency.
 
 **Operator action:** remove `FERRUM_GRPC_POOL_READY_WAIT_MS` from your configuration; it never had a runtime effect. There is no replacement knob.
+
+### Malformed secret-fetch timeout and mesh DNS limits refuse to start (issues [#5699](https://github.com/ferrum-edge/ferrum-edge/issues/5699) / [#5700](https://github.com/ferrum-edge/ferrum-edge/issues/5700))
+
+These settings used to fall back silently when their value could not be used:
+
+- `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS=0` was accepted and made every external secret fetch that waited on I/O time out at once. A malformed or negative value, such as `30s` or `-1`, silently became the 30-second default.
+- `FERRUM_MESH_DNS_TTL_SECONDS`, `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` and `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` used their defaults (60, 1024, 4096) when the value was malformed or overflowed. The two capacity settings also ignored `0`.
+
+Each of these now fails `ferrum-edge run` and `ferrum-edge validate` with an error that names the variable and its accepted range. The value itself is not echoed. Accepted ranges are whole numbers from 1 to 600 seconds for the secret-fetch timeout, 0 to 86400 seconds for the mesh DNS TTL, 1 to 16384 for mesh DNS concurrency, and 1 to 262144 for the per-slice mesh DNS response cache. Unset variables keep their defaults.
+
+The secret-fetch timeout is checked at startup secret resolution, which reads only the process environment. It is checked again when settings load, which also reads `ferrum.conf`, and on each later runtime fetch. A bad value in either place stops startup.
+
+**Operator action:** run `ferrum-edge validate` with the production environment and `ferrum.conf` before upgrading. Correct any value it reports, or remove the variable to use its default.
+
+### Load-balancer runtime-state library API (issue [#5693](https://github.com/ferrum-edge/ferrum-edge/issues/5693))
+
+This only affects code that links the `ferrum-edge` library, such as custom plugins or embedding crates. Gateway configuration, the Admin API and metrics are unchanged, apart from the fix itself: least-connections counts and least-latency averages now survive service-discovery and upstream updates for targets that remain.
+
+The public `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and `LoadBalancer::latency_sample_count` `DashMap` fields are removed, along with `LoadBalancerCache::record_connection_start` / `record_connection_end`.
+
+**Operator action:** none for gateway deployments. Library users read per-target state through `LoadBalancer::target_runtime_state(&target)` (`active_connections()`, `latency_ewma_us()`, `latency_sample_count()`), and count a connection with `LoadBalancer::lease_connection(&target)`, whose lease releases on drop, instead of pairing `record_connection_start` and `record_connection_end` by hand.
+
+`LoadBalancer::record_connection_start` and `LoadBalancer::record_connection_end` remain, but they must now be strictly paired: every start needs exactly one end, on the same balancer, on every exit path. A rebuild no longer resets a leaked count, so a missed end keeps the target looking busier than it is to least-connections, and to the per-target connection metrics, until the target leaves the upstream.
 
 ## Database Mode (`FERRUM_MODE=database`)
 ## Build-Out Database Upgrade (PostgreSQL, MySQL, SQLite, MongoDB)

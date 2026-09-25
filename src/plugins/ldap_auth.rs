@@ -1636,6 +1636,7 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
 ///
 /// Characters that have special meaning in a DN — `,`, `+`, `"`, `\`, `<`, `>`, `;`
 /// — are backslash-escaped. Leading/trailing spaces and a leading `#` are also escaped.
+/// NUL has no single-character escape and must be hex-escaped as `\00`.
 pub fn escape_dn_value(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 8);
     // `input.len()` is a *byte* length but `enumerate()` yields a *character*
@@ -1646,6 +1647,10 @@ pub fn escape_dn_value(input: &str) -> String {
     let total_chars = input.chars().count();
     for (i, ch) in input.chars().enumerate() {
         let is_last = i + 1 == total_chars;
+        if ch == '\0' {
+            out.push_str("\\00");
+            continue;
+        }
         let needs_escape = matches!(ch, ',' | '+' | '"' | '\\' | '<' | '>' | ';')
             || (i == 0 && (ch == ' ' || ch == '#'))
             || (is_last && ch == ' ');
@@ -2102,6 +2107,7 @@ mod tests {
     use super::*;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
     use rustls::pki_types::ServerName;
+    use rustls::pki_types::pem::PemObject;
     use std::io::Write;
     use std::sync::Once;
     use tempfile::NamedTempFile;
@@ -2322,12 +2328,12 @@ mod tests {
     /// Build a rustls server `ServerConfig` from leaf PEM cert + PEM key.
     fn build_server_config(cert_pem: &str, key_pem: &str) -> Arc<rustls::ServerConfig> {
         let certs: Vec<CertificateDer<'static>> = must(
-            rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>(),
+            CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>(),
             "parse leaf cert",
         );
         let key: rustls::pki_types::PrivateKeyDer<'static> = must_some(
             must(
-                rustls_pemfile::private_key(&mut key_pem.as_bytes()),
+                crate::tls::first_pem_private_key(key_pem.as_bytes()),
                 "parse private key",
             ),
             "private key should be present",

@@ -24,7 +24,9 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
 };
+use rustls::pki_types::CertificateDer;
 use rustls::pki_types::CertificateRevocationListDer;
+use rustls::pki_types::pem::PemObject;
 
 /// The one lock every test in this binary that touches the process-global trust
 /// registry must hold. `frontend_trust_binding_tests` shares it, because
@@ -106,13 +108,13 @@ fn crl_pem_with_key_id(
 }
 
 fn parse_crls(pem: &str) -> Vec<CertificateRevocationListDer<'static>> {
-    rustls_pemfile::crls(&mut pem.as_bytes())
+    CertificateRevocationListDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse CRLs")
 }
 
 fn first_cert_der(pem: &str) -> Vec<u8> {
-    rustls_pemfile::certs(&mut pem.as_bytes())
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .next()
         .expect("certificate block")
         .expect("PEM-decode")

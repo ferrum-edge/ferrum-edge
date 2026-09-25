@@ -59,6 +59,7 @@ jobs:
       run_platform_build: ${{ steps.plan.outputs.run_platform_build }}
       run_vendor_patches: ${{ steps.plan.outputs.run_vendor_patches }}
       run_dependency_audit: ${{ steps.plan.outputs.run_dependency_audit }}
+      run_standalone_cargo: ${{ steps.plan.outputs.run_standalone_cargo }}
       binary-matrix: ${{ steps.binary-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -274,7 +275,7 @@ jobs:
           # after the new planner proves the NUL stream classifiable.
           # Missing/invalid individual outputs still fail closed to true.
           gate_fallbacks=()
-          for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit; do
+          for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_standalone_cargo; do
             value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
             if [ "$paths_classifiable" != "true" ]; then
               value=true
@@ -308,7 +309,7 @@ jobs:
             echo ""
             echo "| Gate | Scheduled |"
             echo "| --- | --- |"
-            for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit; do
+            for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_standalone_cargo; do
               value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
               if [ "$paths_classifiable" != "true" ]; then
                 value=true
@@ -719,6 +720,30 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Check the test run left the checkout clean
+        # Tests keep runtime state in temporary directories (issue #5706).
+        # Fail if this shard's tests modified a tracked file, left an
+        # untracked one, or recreated the gateway's working-directory TLS
+        # store, which .gitignore hides so a locally run gateway cannot commit
+        # it. Build output stays under the ignored target/ and .cache/ trees.
+        # File names only: a leaked store can hold private keys.
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          leaked=0
+          changes="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$changes" ]; then
+            echo "::error::the test run modified or created files in the checkout"
+            printf '%s\n' "$changes"
+            leaked=1
+          fi
+          if [ -e ferrum-managed-tls ]; then
+            echo "::error::the test run wrote the working-directory TLS store ./ferrum-managed-tls"
+            find ferrum-managed-tls -maxdepth 1 -print
+            leaked=1
+          fi
+          exit "$leaked"
+
       - name: Preserve unit compile diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -1041,23 +1066,27 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Build gateway binary
-        # Match ferrum-cni and the nextest archives below: a separate pr-build
-        # directory compiles the dependency graph again before shards can run.
-        # This binary is used only for tests; release producers keep their
-        # shipping profile and all consumers keep the target/debug contract.
-        run: cargo build --bin ferrum-edge
-
-      - name: Build ferrum-cni binary
+      - name: Build test targets and binaries
+        # One Cargo invocation compiles both nextest targets, so the two test
+        # crates build concurrently once the shared library is done. Cargo
+        # also builds every package bin for integration tests (for
+        # `CARGO_BIN_EXE_*`) and uplifts them to target/debug/ferrum-edge and
+        # target/debug/ferrum-cni, the paths the upload steps below publish.
+        # The archive steps then find every unit fresh and only package it.
+        #
+        # Do not add a separate `cargo build --bin` step. Without
+        # dev-dependencies Cargo resolves a different feature set (tokio
+        # `test-util`, rustls `aws-lc-rs`), which misses the test-built
+        # `ci-debug` lane and compiles the dependency graph and the library a
+        # second time. The test build then overwrote that binary anyway.
+        #
         # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, which
         # Cargo bakes in as target/debug/ferrum-cni under the workspace path
         # used to build the archive. Keep archive builders and shard runners on
         # matching OS/arch + checkout layout, or update this artifact/path with
-        # any future runner/workspace/target-dir change.
-        #
-        # This debug-path binary is transferred to every integration shard;
-        # omit DWARF from the transfer-only build to keep the artifact small.
-        run: cargo build --bin ferrum-cni
+        # any future runner/workspace/target-dir change. These binaries are
+        # used only for tests; release producers keep their shipping profile.
+        run: cargo test --no-run --test integration_tests --test functional_tests
 
       - name: Build integration tests archive
         # Nextest archives are native binaries, so the file and artifact names
@@ -1070,8 +1099,7 @@ jobs:
             --archive-file "$archive_file"
 
       - name: Build functional tests archive
-        # Build the second test target in the same job and shared Cargo cache,
-        # reusing the leaf-crate compilation from the integration archive.
+        # Packages the functional target compiled by the step above.
         run: |
           archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
@@ -1353,6 +1381,28 @@ jobs:
           RUST_BACKTRACE: 1
         timeout-minutes: 30
 
+      - name: Check the test run left the checkout clean
+        # Same guard as the Unit Tests job (issue #5706). The downloaded
+        # nextest archive is this job's only expected untracked file; the
+        # prebuilt ferrum-cni binary lands in the ignored target/ tree.
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          leaked=0
+          changes="$(git status --porcelain --untracked-files=all -- . \
+            ":(exclude)integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst")"
+          if [ -n "$changes" ]; then
+            echo "::error::the test run modified or created files in the checkout"
+            printf '%s\n' "$changes"
+            leaked=1
+          fi
+          if [ -e ferrum-managed-tls ]; then
+            echo "::error::the test run wrote the working-directory TLS store ./ferrum-managed-tls"
+            find ferrum-managed-tls -maxdepth 1 -print
+            leaked=1
+          fi
+          exit "$leaked"
+
       - name: Summarize integration shard
         if: always()
         run: |
@@ -1460,6 +1510,32 @@ jobs:
           cargo deny --manifest-path ebpf/Cargo.toml
           check --allow advisory-not-detected --config deny.toml advisories bans sources licenses
 
+      - name: cargo-deny advisories (standalone Cargo workspaces)
+        # BLOCKING advisory scan over every standalone Cargo workspace the
+        # inventory discovers (fuzz/, tests/performance/**, and any crate added
+        # later). Each carries its own Cargo.lock that neither step above can
+        # see (issues #5704, #5708). Advisories only: these are fuzz and
+        # benchmark harnesses that never ship, so the shipped-artifact license
+        # and ban policy does not apply to them. Same shared deny.toml and the
+        # same `--allow advisory-not-detected` rationale as the eBPF step.
+        run: |
+          set -euo pipefail
+          inventory="$RUNNER_TEMP/standalone-cargo-manifests.txt"
+          python3 .github/scripts/standalone_cargo_manifests.py --self-test
+          python3 .github/scripts/standalone_cargo_manifests.py > "$inventory"
+          mapfile -t manifests < "$inventory"
+          failed=0
+          for manifest in "${manifests[@]}"; do
+            echo "::group::cargo deny advisories ${manifest}"
+            if ! cargo deny --manifest-path "$manifest" \
+              check --allow advisory-not-detected --config deny.toml advisories; then
+              echo "::error file=${manifest}::cargo-deny advisories failed for ${manifest}"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+
       - name: Advisory-exception expiry self-test
         # The [expires:] convention is a repo rule cargo-deny knows nothing
         # about, so the checker is the only thing enforcing it. Run its synthetic
@@ -1493,6 +1569,100 @@ jobs:
         # vendor/, dependency-policy.md, or per-patch READMEs. The checker runs
         # synthetic self-tests before repository parity.
         run: python3 scripts/check_vendored_patch_lifecycle.py
+
+  standalone-cargo:
+    # Formatting and compile gate for every standalone Cargo workspace (issues
+    # #5703 and #5707). The root package declares no [workspace], so the root
+    # `cargo fmt --all` in CI Plan and every root compile/lint job see only
+    # `ferrum-edge`; fuzz/, tests/performance/**, and any crate added later
+    # resolve as separate workspaces with their own Cargo.lock. The manifest
+    # list comes from .github/scripts/standalone_cargo_manifests.py (not a
+    # hand-maintained list), so a new standalone crate is covered on the pull
+    # request that adds it. `--locked` also enforces that each committed
+    # lockfile matches its manifests (issue #5708).
+    name: Standalone Cargo Workspaces
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_standalone_cargo == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      # One shared target directory: fuzz/ and tests/performance/mesh both
+      # compile the root `ferrum-edge` library by path, and the harnesses share
+      # most of their third-party graph, so identical units are reused across
+      # workspaces instead of being rebuilt once per manifest.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/standalone-cargo
+      # Type-checking needs no DWARF; keep peak memory and cache size down.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_BENCH_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-standalone-cargo"
+          save: "true"
+          components: rustfmt
+          workspaces: ". -> target/standalone-cargo"
+
+      - id: inventory
+        name: Inventory standalone Cargo workspaces
+        run: |
+          set -euo pipefail
+          inventory="$RUNNER_TEMP/standalone-cargo-manifests.txt"
+          python3 .github/scripts/standalone_cargo_manifests.py --self-test
+          python3 .github/scripts/standalone_cargo_manifests.py > "$inventory"
+          {
+            echo "## Standalone Cargo workspaces"
+            echo ""
+            while IFS= read -r manifest; do
+              echo "- \`${manifest}\`"
+            done < "$inventory"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$inventory"
+
+      - name: Check standalone formatting
+        # rustfmt prints the full diff for every drifted file; apply it with
+        # `cargo fmt --manifest-path <manifest> --all` from the repository root
+        # (the root rust-toolchain.toml selects the same stable rustfmt).
+        run: |
+          set -euo pipefail
+          mapfile -t manifests < "$RUNNER_TEMP/standalone-cargo-manifests.txt"
+          failed=0
+          for manifest in "${manifests[@]}"; do
+            echo "::group::cargo fmt --check ${manifest}"
+            if ! cargo fmt --manifest-path "$manifest" --all -- --check; then
+              echo "::error file=${manifest}::rustfmt drift; run cargo fmt --manifest-path ${manifest} --all"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+
+      - name: Check standalone builds
+        # Every target (bins, libs, tests, benches, examples) of every
+        # standalone workspace against its committed lockfile. A config-model
+        # change in the root crate that a bench initializes field by field
+        # fails here instead of on the next manual benchmark run. Runs even
+        # when formatting failed so one push reports both verdicts.
+        if: ${{ !cancelled() && steps.inventory.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mapfile -t manifests < "$RUNNER_TEMP/standalone-cargo-manifests.txt"
+          failed=0
+          for manifest in "${manifests[@]}"; do
+            echo "::group::cargo check --locked --all-targets ${manifest}"
+            if ! cargo check --locked --manifest-path "$manifest" --workspace --all-targets; then
+              echo "::error file=${manifest}::cargo check --locked --all-targets failed for ${manifest}"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
 
   test-vendor-patches:
     name: Vendored Patch Regressions
@@ -1534,6 +1704,17 @@ jobs:
         # list is empty, so the rustls TLS module is only built when a runtime
         # and a rustls backend are named explicitly.
         run: cargo test --manifest-path vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests
+
+      - name: Run vendored hyper-util HTTP/1 dispatch-close regressions
+        # An HTTP/1 request queued while the connection closes can miss the
+        # dispatcher's drain; the legacy client must release the connection's
+        # only sender so the stranded request fails as unsent instead of
+        # waiting for backend_read_timeout_ms (issue #5714). The legacy_client
+        # suite re-checks ordinary keep-alive, reuse, and close behavior
+        # through the patched send path.
+        run: |
+          cargo test --manifest-path vendor/hyper-util-0.1.20-ferrum-patched/Cargo.toml --features full --lib ferrum_release_on_close_tests
+          cargo test --manifest-path vendor/hyper-util-0.1.20-ferrum-patched/Cargo.toml --features full --test legacy_client
 
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1718,27 +1899,43 @@ jobs:
               functional_response_mock_semantics_test
               functional_response_protocol_managed_headers_test
               functional_websocket_limits_test
+          # The service-backed shards run serially (`nextest_jobs: 1`) against
+          # one set of Redis/MongoDB/PostgreSQL/MySQL containers per runner, so
+          # the old single data-plane shard was the functional critical path
+          # (~15 min of serial test time after Build Test Artifacts). Two
+          # runners, each with its own containers, halve it. Balance by the
+          # hosted per-module durations recorded in
+          # docs/ci_pr_validation_review_2026_09_24.md; `data_services` (not
+          # the shard name) gates the containers and backend URLs.
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and
-            # race when nextest runs this shard in parallel. Also hosts the
-            # required PostgreSQL/MySQL/MongoDB/Redis persistence-parity cells
-            # documented in docs/functional_testing_database.md.
+            # race when nextest runs this shard in parallel. Hosts the required
+            # PostgreSQL/MySQL/MongoDB/Redis persistence-parity cells documented
+            # in docs/functional_testing_database.md.
             nextest_jobs: 1
+            data_services: true
             filters: |
-              functional_capability_registry_test
               functional_admin_crud_resources_test
-              functional_cp_dp_resilience_test
-              functional_cp_dp_test
               functional_database_parity_test
               functional_database_test
               functional_db_failover_test
-              functional_db_outage_test
               functional_db_tls_test
               functional_db_upstream_test
+              functional_mongodb_test
+          - shard: data-plane-runtime
+            # Same serialization and service containers as `data-plane`: DB
+            # outage/pause, Redis rate limiting, namespace, CP/DP and mesh-mode
+            # suites.
+            nextest_jobs: 1
+            data_services: true
+            filters: |
+              functional_capability_registry_test
+              functional_cp_dp_resilience_test
+              functional_cp_dp_test
+              functional_db_outage_test
               functional_gateway_trust_bundle_ha_test
               functional_mesh_mode_test
               functional_mesh_stock_xds_test
-              functional_mongodb_test
               functional_namespace_test
               functional_plugin_quarantine_test
               functional_redis_rate_limiting_test
@@ -1779,13 +1976,13 @@ jobs:
           path: .
 
       - name: Start data-plane service containers
-        # Only the data-plane shard runs redis/mongo/postgres/mysql-backed
+        # Only the data-plane shards run redis/mongo/postgres/mysql-backed
         # functional persistence tests. These services were previously declared
         # job-wide (or omitted for SQL), so either every shard paid the Docker
         # cost or PostgreSQL/MySQL suites silently skipped. Start them only
         # where they're used, set explicit URLs, and fail closed when readiness
         # fails. Ports map to the runner's localhost exactly as the tests expect.
-        if: matrix.shard == 'data-plane'
+        if: matrix.data_services == true
         #
         # Four mongod instances on purpose:
         # - standalone 27017: documented `POST /batch` 501 refusal + plaintext matrix,
@@ -2257,21 +2454,21 @@ jobs:
           FERRUM_SKIP_GATEWAY_BUILD: "1"
           RUST_BACKTRACE: 1
           # Explicit backend URLs for the data-plane persistence matrix. Empty
-          # on non-data-plane shards (harmless — those filters never consult them).
-          FERRUM_TEST_POSTGRES_URL: ${{ matrix.shard == 'data-plane' && 'postgres://ferrum:ferrum@127.0.0.1:5432/ferrum' || '' }}
-          FERRUM_TEST_MYSQL_URL: ${{ matrix.shard == 'data-plane' && 'mysql://ferrum:ferrum@127.0.0.1:3306/ferrum' || '' }}
-          FERRUM_TEST_MONGO_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27017/ferrum_test' || '' }}
-          FERRUM_TEST_MONGO_TLS_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
-          FERRUM_TEST_MONGO_TLS_REQUIRE_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
-          FERRUM_TEST_MONGO_MTLS_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27019/ferrum_test' || '' }}
-          FERRUM_TEST_MONGO_CERT_DIR: ${{ matrix.shard == 'data-plane' && format('{0}/ferrum-mongo-tls-certs', runner.temp) || '' }}
-          FERRUM_TEST_CERT_DIR: ${{ matrix.shard == 'data-plane' && format('{0}/ferrum-db-tls-certs', runner.temp) || '' }}
-          FERRUM_DB_BACKENDS_REQUIRED: ${{ matrix.shard == 'data-plane' && '1' || '' }}
-          FERRUM_DB_TLS_REQUIRED: ${{ matrix.shard == 'data-plane' && '1' || '' }}
+          # on shards without data_services (harmless — those filters never consult them).
+          FERRUM_TEST_POSTGRES_URL: ${{ matrix.data_services == true && 'postgres://ferrum:ferrum@127.0.0.1:5432/ferrum' || '' }}
+          FERRUM_TEST_MYSQL_URL: ${{ matrix.data_services == true && 'mysql://ferrum:ferrum@127.0.0.1:3306/ferrum' || '' }}
+          FERRUM_TEST_MONGO_URL: ${{ matrix.data_services == true && 'mongodb://127.0.0.1:27017/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_TLS_URL: ${{ matrix.data_services == true && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_TLS_REQUIRE_URL: ${{ matrix.data_services == true && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_MTLS_URL: ${{ matrix.data_services == true && 'mongodb://127.0.0.1:27019/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_CERT_DIR: ${{ matrix.data_services == true && format('{0}/ferrum-mongo-tls-certs', runner.temp) || '' }}
+          FERRUM_TEST_CERT_DIR: ${{ matrix.data_services == true && format('{0}/ferrum-db-tls-certs', runner.temp) || '' }}
+          FERRUM_DB_BACKENDS_REQUIRED: ${{ matrix.data_services == true && '1' || '' }}
+          FERRUM_DB_TLS_REQUIRED: ${{ matrix.data_services == true && '1' || '' }}
         timeout-minutes: 45
 
       - name: Stop data-plane service containers
-        if: always() && matrix.shard == 'data-plane'
+        if: always() && matrix.data_services == true
         run: |
           set +e
           for name in ferrum-ci-redis ferrum-ci-mongo ferrum-ci-mongo-rs \
@@ -2288,7 +2485,7 @@ jobs:
         run: |
           echo "## Functional Test Shard: ${{ matrix.shard }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ matrix.shard }}" = "data-plane" ]; then
+          if [ "${{ matrix.data_services }}" = "true" ]; then
             # Keep parity mapping as plain prose (no Markdown table pipes beside
             # workflow expressions). Trusted Cross otherwise treats a piped
             # expression cell as an opaque command outside build-arm64-cross.
@@ -5926,6 +6123,7 @@ jobs:
       - netns-capture-live
       - two-cluster-mesh-live
       - build-binaries
+      - standalone-cargo
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -5998,6 +6196,7 @@ jobs:
           add_row "Netns capture live" "${{ needs.netns-capture-live.result }}"
           add_row "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}"
           add_row "Native platform binaries" "${{ needs.build-binaries.result }}"
+          add_row "Standalone Cargo workspaces" "${{ needs.standalone-cargo.result }}"
 
           # These gates are mandatory even in light mode. The output is only
           # emitted after the complete verifier command succeeds.
@@ -6027,6 +6226,7 @@ jobs:
           require_planned_gate "Netns capture live" "${{ needs.netns-capture-live.result }}" "${{ needs.ci-plan.outputs.run_netns_capture_live }}"
           require_planned_gate "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}" "${{ needs.ci-plan.outputs.run_two_cluster_live }}"
           require_planned_gate "Native platform binaries" "${{ needs.build-binaries.result }}" "${{ needs.ci-plan.outputs.run_platform_build }}"
+          require_planned_gate "Standalone Cargo workspaces" "${{ needs.standalone-cargo.result }}" "${{ needs.ci-plan.outputs.run_standalone_cargo }}"
 
           if [ "$failures" -ne 0 ]; then
             exit 1

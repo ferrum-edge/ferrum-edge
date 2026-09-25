@@ -674,12 +674,13 @@ mod tests {
     /// Spawn a one-shot TLS server that completes the handshake (or fails) and
     /// returns the bound port.
     async fn spawn_tls_server(cert_pem: &str, key_pem: &str) -> u16 {
-        let cert_chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-            .filter_map(|c| c.ok())
-            .collect();
+        let cert_chain: Vec<_> =
+            rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+                .filter_map(|c| c.ok())
+                .collect();
         let key = must_some(
             must(
-                rustls_pemfile::private_key(&mut key_pem.as_bytes()),
+                crate::tls::first_pem_private_key(key_pem.as_bytes()),
                 "parse private key",
             ),
             "private key should be present",
