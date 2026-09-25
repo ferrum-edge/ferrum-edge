@@ -1,13 +1,13 @@
 # Coverage
 
-Ferrum Edge uses `cargo-llvm-cov` for Rust line coverage. The CI scope is
-`--lib`, the four unit targets (`--test unit_tests`,
+Ferrum Edge uses `cargo-llvm-cov` for Rust line coverage. The default local
+and CI scope is `--lib`, the four unit targets (`--test unit_tests`,
 `--test unit_plugins_a_tests`, `--test unit_plugins_b_tests`,
-`--test unit_gateway_core_tests`), `--test integration_tests`, and the
-subprocess `--test functional_tests` suite run against the instrumented
-`ferrum-edge` binary (see [Functional coverage shards](#functional-coverage-shards)).
-The default local `scripts/coverage.sh` run omits the functional suite; pass
-`--functional` to include a curated subset. Conformance tests, custom plugins,
+`--test unit_gateway_core_tests`), and `--test integration_tests`. CI full
+plans also run the subprocess `functional_tests` suite against the
+instrumented `ferrum-edge` binary in dedicated shards (see
+[Functional coverage shards](#functional-coverage-shards)); the default local
+`scripts/coverage.sh` run omits it, and `--functional` adds a curated subset. Conformance tests, custom plugins,
 vendored crates, and performance workspaces stay outside the baseline because
 they use separate coverage reporters or are not actionable for the core proxy
 codebase. Build inputs such as `build.rs`, `proto/**`, and
