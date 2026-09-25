@@ -19,9 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend_timeout` and transaction-log phase as on HTTP/1.1 and HTTP/2, and
   an expiry is charged to a backend only when that backend held the attempt.
   An attempt budget expiry is retried when the rule's `retry` lists `504`, and
-  the retry replays the retained request body. After the head, the response
-  body is cut with an `H3_REQUEST_CANCELLED` stream reset, never a clean
-  finish, and the cut is health-neutral. The HTTP/3 bridge to gRPC backends,
+  the retry replays the retained request body. The HTTP/3 bridge to HTTP/1.1
+  and HTTP/2 backends collects a buffered response body (a response-body
+  plugin or `response_body_mode: buffer`) inside the attempt when a failure
+  there could be retried, as HTTP/1.1, HTTP/2 and the native HTTP/3 backend
+  pool do (#5738), so a backend that sends its response head and then stalls
+  the body is retried too, and so is a read timeout or reset while that body
+  is read. The discarded attempt releases its buffered bytes and backend
+  connection, and `after_proxy` runs once, for the served response, after its
+  body was read. Without a `backendRequest` budget the bridge still reads a
+  buffered body after its retry loop, so a read timeout or reset there is not
+  retried, unlike HTTP/1.1 and HTTP/2. After the head, the response body is
+  cut with an `H3_REQUEST_CANCELLED` stream reset, never a clean finish, and
+  the cut is health-neutral. The HTTP/3 bridge to gRPC backends,
   and its gRPC-Web pass-through to HTTP/1.1 and HTTP/2 backends, now also start
   a fresh `backendRequest` budget for each retry attempt, end it before retry
   backoff, and charge an expiry after the request was sent to the backend, as
@@ -40,30 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends now collects a buffered
-  response body (a response-body plugin or `response_body_mode: buffer`) inside
-  its backend attempt when the rule's `retry` would retry a `backendRequest`
-  (`attempt_timeout_ms`) expiry, as HTTP/1.1, HTTP/2 and the native HTTP/3
-  backend pool do (#5738). A backend that sends its response head and then
-  stalls the body is now retried under a fresh budget within the same
-  `request` deadline, instead of ending the request with the charged `504`.
-  The discarded attempt releases its buffered bytes and backend connection,
-  and `after_proxy` still runs once, for the response that is served, now
-  after its body has been read. A total `request` expiry, an exhausted retry
-  count, a method the policy does not retry, and a streamed response whose head
-  already reached the client are unchanged.
-- A gRPC-Web pass-through call on the HTTP/3 bridge whose `backendRequest`
-  budget expires after the request was sent now gets the charged backend
-  terminal, `grpc-message: Backend deadline exceeded`, as on HTTP/1.1 and
-  HTTP/2, instead of the gateway's own `Deadline exceeded at gateway` terminal
-  (#5734). Health and circuit-breaker charging were already correct.
-- The HTTP/3 bridge now tells a gRPC-Web pass-through backend its remaining RPC
-  budget, including the rule's `backendRequest` budget, in `grpc-timeout` on
-  every attempt, replacing the client's relative value, as HTTP/1.1 and HTTP/2
-  already did (#5734). Before, the client's header was forwarded unchanged or
-  none was sent, so the backend could not cancel work the gateway had already
-  abandoned. A gRPC call's budget still starts when the rule is selected and
-  its expiry is still not retried; both stay documented deviations.
+- gRPC-Web pass-through on the HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends
+  now matches HTTP/1.1 and HTTP/2 on two points (#5734). Every attempt tells
+  the backend its remaining RPC budget, including the rule's `backendRequest`
+  budget, in `grpc-timeout`, replacing the client's relative value; before, the
+  client's header was forwarded unchanged or none was sent, so the backend
+  could not cancel work the gateway had already abandoned. A `backendRequest`
+  budget that expires after the request was sent now answers the charged
+  backend terminal, `grpc-message: Backend deadline exceeded`, instead of the
+  gateway's own `Deadline exceeded at gateway`; `after_proxy` (for example
+  CORS headers) and response-committed plugins still run over it, and health
+  and circuit-breaker charging were already correct. A gRPC call's budget
+  still starts when the rule is selected and its expiry is still not retried;
+  both stay documented deviations.
 
 ## [0.9.7] - 2026-09-25
 

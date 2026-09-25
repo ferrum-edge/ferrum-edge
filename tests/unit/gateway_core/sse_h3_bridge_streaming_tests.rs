@@ -99,10 +99,12 @@ fn the_native_h3_sibling_also_refines_from_the_pristine_backend_headers() {
 
 /// Retry configuration must not force the RESPONSE onto the buffered path.
 ///
-/// This bridge decides every retry from the response STATUS the instant `send()`
-/// resolves — with an explicitly empty `BackendResponse` body — and breaks out
-/// of the loop before a single body byte is read. Replay therefore needs the
-/// REQUEST body preserved, never the response buffered. The gRPC arm of this
+/// This bridge decides a retry from the response STATUS the instant `send()`
+/// resolves — with an explicitly empty `BackendResponse` body — and reads a body
+/// inside the loop only when this decision already buffers it and a failure
+/// while collecting it could be retried under a route attempt budget (#5738).
+/// Replay therefore needs the REQUEST body preserved, never the response
+/// buffered because retries are configured. The gRPC arm of this
 /// same file already carries that correction (`stream_grpc_response` is
 /// deliberately not gated on `grpc_has_retry`); the plain arm used to keep the
 /// coupling, so a default `sse` proxy with `retry.max_retries` set collected an

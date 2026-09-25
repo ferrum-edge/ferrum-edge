@@ -791,9 +791,9 @@ expiry while it is still streaming is charged to the backend.
 
 The HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends collects a buffered response
 body (a response-body plugin or `response_body_mode: buffer`) inside the
-attempt, as HTTP/1.1, HTTP/2 and the native HTTP/3 backend pool do, so an
-attempt budget that expires while that body is collected is retried like one
-that expires before the response head (#5738).
+attempt under an attempt budget, as HTTP/1.1, HTTP/2 and the native HTTP/3
+backend pool do, so an attempt budget that expires while that body is
+collected is retried like one that expires before the response head (#5738).
 
 The upstream `HTTPRouteTimeoutBackendRequest` test delays only the response
 head, which every frontend bounds.
