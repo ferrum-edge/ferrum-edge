@@ -1705,6 +1705,17 @@ jobs:
         # and a rustls backend are named explicitly.
         run: cargo test --manifest-path vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests
 
+      - name: Run vendored hyper-util HTTP/1 dispatch-close regressions
+        # An HTTP/1 request queued while the connection closes can miss the
+        # dispatcher's drain; the legacy client must release the connection's
+        # only sender so the stranded request fails as unsent instead of
+        # waiting for backend_read_timeout_ms (issue #5714). The legacy_client
+        # suite re-checks ordinary keep-alive, reuse, and close behavior
+        # through the patched send path.
+        run: |
+          cargo test --manifest-path vendor/hyper-util-0.1.20-ferrum-patched/Cargo.toml --features full --lib ferrum_release_on_close_tests
+          cargo test --manifest-path vendor/hyper-util-0.1.20-ferrum-patched/Cargo.toml --features full --test legacy_client
+
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:

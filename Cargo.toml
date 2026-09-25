@@ -638,6 +638,24 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # line, drop `vendor/sqlx-core-0.8.6-ferrum-patched/`, and update both
 # lockfiles and the drift manifest. See
 # `docs/upstream-sqlx-patches/001-verify-ca-name-context/README.md`.
+#
+# We also carry a vendored copy of hyper-util 0.1.20 whose legacy client stops
+# holding an HTTP/1 connection's only request sender once that connection's
+# dispatcher has stopped reading requests (issue #5714). hyper queues a request
+# on a tokio unbounded channel, and tokio checks for closure and publishes the
+# message as two steps. A backend reset or FIN that closes an idle connection
+# between them strands the request in a channel nobody reads. Its callback
+# fires only when the channel drops, and hyper-util held the last sender, so
+# reqwest's `send()` hung until `backend_read_timeout_ms` (a 504) instead of
+# failing as an unsent request. Ferrum cannot reach the pooled sender through
+# reqwest, so the fix has to live in hyper-util.
+#
+# Retirement plan: when a hyper-util release no longer holds the only HTTP/1
+# sender while waiting (or hyper's dispatcher no longer strands a racing send),
+# remove the `[patch.crates-io]` line, drop
+# `vendor/hyper-util-0.1.20-ferrum-patched/`, and update both lockfiles and the
+# drift manifest. See
+# `docs/upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md`.
 [patch.crates-io]
 sqlx-core = { path = "vendor/sqlx-core-0.8.6-ferrum-patched" }
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
@@ -646,3 +664,4 @@ h3-quinn = { path = "vendor/h3-quinn-0.0.10-ferrum-patched" }
 tungstenite = { path = "vendor/tungstenite-0.29.0-ferrum-patched" }
 tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
 dimpl = { path = "vendor/dimpl-0.6.1-ferrum-patched" }
+hyper-util = { path = "vendor/hyper-util-0.1.20-ferrum-patched" }

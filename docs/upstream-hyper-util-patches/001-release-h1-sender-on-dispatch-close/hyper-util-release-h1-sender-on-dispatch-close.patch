@@ -1,0 +1,762 @@
+--- a/src/client/legacy/client.rs
++++ b/src/client/legacy/client.rs
+@@ -321,23 +321,15 @@
+             authority_form(req.uri_mut());
+         }
+ 
+-        let mut res = match pooled.try_send_request(req).await {
+-            Ok(res) => res,
+-            Err(mut err) => {
+-                return if let Some(req) = err.take_message() {
+-                    Err(TrySendError::Retryable {
+-                        connection_reused: pooled.is_reused(),
+-                        error: e!(Canceled, err.into_error())
+-                            .with_connect_info(pooled.conn_info.clone()),
+-                        req,
+-                    })
+-                } else {
+-                    Err(TrySendError::Nope(
+-                        e!(SendRequest, err.into_error())
+-                            .with_connect_info(pooled.conn_info.clone()),
+-                    ))
+-                };
+-            }
++        // Ferrum Edge patch (hyper-util-001): do not hold the connection's
++        // only request sender while it cannot be read any more. See
++        // `await_response_or_release`.
++        let sent = pooled.try_send_request(req);
++        let (mut res, mut pooled) = match await_pooled_response(sent, pooled).await? {
++            (res, Some(pooled)) => (res, pooled),
++            // The connection is already closed, so there is nothing to return
++            // to the pool.
++            (res, None) => return Ok(res),
+         };
+ 
+         // If the Connector included 'extra' info, add to Response...
+@@ -879,9 +871,177 @@
+ 
+     fn can_share(&self) -> bool {
+         self.is_http2()
++    }
++}
++
++// ===== Ferrum Edge patch hyper-util-001 =====
++
++/// The connection handle a request was sent on: still held, or released after
++/// its dispatcher stopped reading requests, keeping only what the caller still
++/// needs (`R`).
++enum ConnSlot<T, R> {
++    Held(T),
++    Released(R),
++}
++
++type PoolConn<B> = pool::Pooled<PoolClient<B>, PoolKey>;
++
++/// What `try_send_request` still needs from a released connection: whether it
++/// was reused, and its connection info.
++type ReleasedConn = (bool, Connected);
++
++/// Waits for the response to a request `try_send_request` queued on `pooled`,
++/// releasing the connection once its HTTP/1 dispatcher stops reading requests
++/// (see `await_response_or_release`).
++///
++/// A request handed back unsent is retryable, with the reuse flag recorded
++/// before any release. A response on a released connection comes back with its
++/// extras set and no handle, because a closed connection has nothing to return
++/// to the pool.
++async fn await_pooled_response<B, R, F>(
++    sent: F,
++    pooled: PoolConn<B>,
++) -> Result<(Response<R>, Option<PoolConn<B>>), TrySendError<B>>
++where
++    B: Send + 'static,
++    F: Future<Output = Result<Response<R>, ConnTrySendError<Request<B>>>>,
++{
++    let (sent, slot) = await_response_or_release(
++        sent,
++        pooled,
++        poll_h1_dispatch_open::<B>,
++        release_pool_conn::<B>,
++    )
++    .await;
++
++    let mut res = match sent {
++        Ok(res) => res,
++        Err(mut err) => {
++            let (connection_reused, conn_info) = match slot {
++                ConnSlot::Held(pooled) => release_pool_conn(&pooled),
++                ConnSlot::Released(released) => released,
++            };
++            return if let Some(req) = err.take_message() {
++                Err(TrySendError::Retryable {
++                    connection_reused,
++                    error: e!(Canceled, err.into_error()).with_connect_info(conn_info),
++                    req,
++                })
++            } else {
++                Err(TrySendError::Nope(
++                    e!(SendRequest, err.into_error()).with_connect_info(conn_info),
++                ))
++            };
++        }
++    };
++
++    match slot {
++        ConnSlot::Held(pooled) => Ok((res, Some(pooled))),
++        ConnSlot::Released((_, conn_info)) => {
++            if let Some(extra) = &conn_info.extra {
++                extra.set(res.extensions_mut());
++            }
++            Ok((res, None))
++        }
+     }
+ }
+ 
++/// The readiness watch `await_pooled_response` runs on a pooled connection.
++///
++/// An HTTP/2 sender is a clone shared with the pool, so releasing this one
++/// would not drop the channel; the watch covers HTTP/1 only.
++fn poll_h1_dispatch_open<B>(
++    pooled: &mut PoolConn<B>,
++    cx: &mut task::Context<'_>,
++) -> Poll<Result<(), ()>>
++where
++    B: Send + 'static,
++{
++    if pooled.is_http1() {
++        pooled.poll_ready(cx).map_err(|_| ())
++    } else {
++        Poll::Ready(Ok(()))
++    }
++}
++
++fn release_pool_conn<B>(pooled: &PoolConn<B>) -> ReleasedConn
++where
++    B: Send + 'static,
++{
++    (pooled.is_reused(), pooled.conn_info.clone())
++}
++
++/// Waits for the response to a request already queued on `conn`, releasing
++/// `conn` as soon as its HTTP/1 dispatcher has stopped reading requests.
++///
++/// hyper queues an HTTP/1 request on a tokio unbounded channel. Tokio's
++/// `UnboundedSender::send` checks that the channel is open and publishes the
++/// message as two separate steps. If the connection task closes the channel
++/// between them (the backend reset or closed an idle connection), the
++/// dispatcher's `try_recv` sees nothing and dropping its receiver drains only
++/// messages that were already published. The request is then published into a
++/// channel nobody reads. Its callback resolves only when the channel itself is
++/// dropped, and `conn` holds the channel's only sender, so without this the
++/// response future waits for whatever timeout the caller has.
++///
++/// `poll_conn` returns `Ready(Err(()))` once the dispatcher is gone or has
++/// closed its queue. Dropping `conn` at that point drops the last sender, and
++/// the channel's destructor drops the stranded envelope, which fails the
++/// callback with a canceled error carrying the unsent request. That is the
++/// same outcome hyper gives a request its dispatcher dequeues after the
++/// connection failed, so the caller retries it or fails fast.
++///
++/// `Ready(Ok(()))` means the dispatcher asked for more work after this request
++/// was published, so it was not closed when the request arrived and will
++/// either serve it or cancel it; the watch ends there. `release` records what
++/// the caller still needs from `conn` before it is dropped.
++///
++/// `sent` is polled first on every wake, so a response or error the dispatcher
++/// delivered before closing always wins.
++async fn await_response_or_release<F, T, R>(
++    sent: F,
++    conn: T,
++    mut poll_conn: impl FnMut(&mut T, &mut task::Context<'_>) -> Poll<Result<(), ()>>,
++    release: impl FnOnce(&T) -> R,
++) -> (F::Output, ConnSlot<T, R>)
++where
++    F: Future,
++{
++    futures_util::pin_mut!(sent);
++    let mut slot = ConnSlot::Held(conn);
++    let mut release = Some(release);
++    let mut watching = true;
++    let output = poll_fn(|cx| loop {
++        if let Poll::Ready(output) = sent.as_mut().poll(cx) {
++            return Poll::Ready(output);
++        }
++        if !watching {
++            return Poll::Pending;
++        }
++        let released = match &mut slot {
++            ConnSlot::Held(conn) => match poll_conn(&mut *conn, &mut *cx) {
++                Poll::Pending => return Poll::Pending,
++                Poll::Ready(Ok(())) => {
++                    watching = false;
++                    return Poll::Pending;
++                }
++                Poll::Ready(Err(())) => match release.take() {
++                    Some(release) => release(&*conn),
++                    None => return Poll::Pending,
++                },
++            },
++            ConnSlot::Released(_) => return Poll::Pending,
++        };
++        watching = false;
++        trace!("connection closed with a request queued; releasing its sender");
++        // Dropping the held handle drops the channel's last sender, which may
++        // resolve `sent` synchronously. Poll it again before parking.
++        slot = ConnSlot::Released(released);
++    })
++    .await;
++    (output, slot)
++}
++
+ enum ClientConnectError {
+     Normal(Error),
+     CheckoutIsClosed(pool::Error),
+@@ -1668,3 +1828,548 @@
+         e!(ChannelClosed, src)
+     }
+ }
++
++// Ferrum Edge patch hyper-util-001 regressions. The race itself sits between
++// two instructions inside tokio's `UnboundedSender::send`, so no public API can
++// schedule it. These tests build the state it leaves behind directly: a queued
++// request whose callback only fires when the last sender drops, on a
++// connection whose dispatcher has stopped reading.
++#[cfg(test)]
++mod ferrum_release_on_close_tests {
++    use super::{await_response_or_release, ConnSlot};
++    use std::future::Future;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::sync::{Arc, Mutex};
++    use std::task::{Context, Poll, Waker};
++    use tokio::sync::oneshot;
++
++    type Callback = oneshot::Sender<Result<&'static str, &'static str>>;
++
++    const CANCELED: &str = "canceled: connection closed";
++
++    #[derive(Clone, Copy, PartialEq)]
++    enum DispatchState {
++        /// Serving or about to serve; has not asked for more work.
++        Busy,
++        /// Asked for another request after the queued one was published.
++        Wanting,
++        /// Closed its queue, or is gone.
++        Closed,
++    }
++
++    /// The dispatcher side of hyper's `want` handshake.
++    struct Dispatcher {
++        state: DispatchState,
++        waker: Option<Waker>,
++        polls: usize,
++    }
++
++    impl Dispatcher {
++        fn new(state: DispatchState) -> Arc<Mutex<Self>> {
++            Arc::new(Mutex::new(Dispatcher {
++                state,
++                waker: None,
++                polls: 0,
++            }))
++        }
++
++        fn set(this: &Arc<Mutex<Self>>, state: DispatchState) {
++            let waker = {
++                let mut dispatcher = this.lock().unwrap();
++                dispatcher.state = state;
++                dispatcher.waker.take()
++            };
++            if let Some(waker) = waker {
++                waker.wake();
++            }
++        }
++    }
++
++    /// The pooled connection: it owns the only sender of the request queue,
++    /// and the stranded envelope in that queue. Dropping it drops the queue,
++    /// and the envelope fails its callback, as `hyper`'s `Envelope::drop` does.
++    struct Conn {
++        dispatcher: Arc<Mutex<Dispatcher>>,
++        stranded: Option<Callback>,
++        dropped: Arc<AtomicUsize>,
++    }
++
++    impl Drop for Conn {
++        fn drop(&mut self) {
++            self.dropped.fetch_add(1, Ordering::SeqCst);
++            if let Some(callback) = self.stranded.take() {
++                let _ = callback.send(Err(CANCELED));
++            }
++        }
++    }
++
++    fn poll_conn(conn: &mut Conn, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
++        let mut dispatcher = conn.dispatcher.lock().unwrap();
++        dispatcher.polls += 1;
++        let state = dispatcher.state;
++        match state {
++            DispatchState::Busy => {
++                dispatcher.waker = Some(cx.waker().clone());
++                Poll::Pending
++            }
++            DispatchState::Wanting => Poll::Ready(Ok(())),
++            DispatchState::Closed => Poll::Ready(Err(())),
++        }
++    }
++
++    struct Fixture {
++        dispatcher: Arc<Mutex<Dispatcher>>,
++        dropped: Arc<AtomicUsize>,
++        conn: Conn,
++        response: oneshot::Receiver<Result<&'static str, &'static str>>,
++        /// `Some` when the dispatcher took the request; `None` when the request
++        /// is stranded in the queue the connection owns.
++        in_flight: Option<Callback>,
++    }
++
++    fn fixture(state: DispatchState, stranded: bool) -> Fixture {
++        let dispatcher = Dispatcher::new(state);
++        let dropped = Arc::new(AtomicUsize::new(0));
++        let (callback, response) = oneshot::channel();
++        let (stranded, in_flight) = if stranded {
++            (Some(callback), None)
++        } else {
++            (None, Some(callback))
++        };
++        Fixture {
++            conn: Conn {
++                dispatcher: dispatcher.clone(),
++                stranded,
++                dropped: dropped.clone(),
++            },
++            dispatcher,
++            dropped,
++            response,
++            in_flight,
++        }
++    }
++
++    fn sent(
++        response: oneshot::Receiver<Result<&'static str, &'static str>>,
++    ) -> impl Future<Output = Result<&'static str, &'static str>> {
++        async move { response.await.unwrap_or(Err("callback dropped")) }
++    }
++
++    #[test]
++    fn stranded_request_without_release_never_resolves() {
++        // The bug: the requester holds the only sender, so the envelope that
++        // missed the dispatcher's drain is never dropped.
++        let f = fixture(DispatchState::Busy, true);
++        let mut task = tokio_test::task::spawn(sent(f.response));
++        assert!(task.poll().is_pending());
++        Dispatcher::set(&f.dispatcher, DispatchState::Closed);
++        assert!(!task.is_woken());
++        assert!(task.poll().is_pending());
++        drop(f.conn);
++        assert!(task.is_woken());
++        assert_eq!(task.poll(), Poll::Ready(Err(CANCELED)));
++    }
++
++    #[test]
++    fn stranded_request_resolves_when_dispatcher_closes() {
++        let f = fixture(DispatchState::Busy, true);
++        let dropped = f.dropped.clone();
++        let mut task = tokio_test::task::spawn(await_response_or_release(
++            sent(f.response),
++            f.conn,
++            poll_conn,
++            |_conn| "released",
++        ));
++        assert!(task.poll().is_pending());
++        assert_eq!(dropped.load(Ordering::SeqCst), 0);
++
++        // The dispatcher closes its queue without having seen the request.
++        Dispatcher::set(&f.dispatcher, DispatchState::Closed);
++        assert!(task.is_woken());
++        match task.poll() {
++            Poll::Ready((Err(err), ConnSlot::Released(released))) => {
++                assert_eq!(err, CANCELED);
++                assert_eq!(released, "released");
++            }
++            Poll::Ready((res, ConnSlot::Held(_))) => {
++                panic!("connection not released; response {res:?}")
++            }
++            Poll::Ready((res, ConnSlot::Released(_))) => panic!("unexpected response {res:?}"),
++            Poll::Pending => panic!("stranded request still pending after close"),
++        }
++        assert_eq!(dropped.load(Ordering::SeqCst), 1);
++    }
++
++    #[test]
++    fn stranded_request_on_already_closed_connection_resolves_on_first_poll() {
++        let f = fixture(DispatchState::Closed, true);
++        let mut task = tokio_test::task::spawn(await_response_or_release(
++            sent(f.response),
++            f.conn,
++            poll_conn,
++            |_conn| (),
++        ));
++        assert!(matches!(
++            task.poll(),
++            Poll::Ready((Err(CANCELED), ConnSlot::Released(())))
++        ));
++    }
++
++    #[test]
++    fn response_delivered_before_close_wins_and_keeps_connection() {
++        let mut f = fixture(DispatchState::Closed, false);
++        let dropped = f.dropped.clone();
++        let _ = f.in_flight.take().unwrap().send(Ok("response"));
++        let mut task = tokio_test::task::spawn(await_response_or_release(
++            sent(f.response),
++            f.conn,
++            poll_conn,
++            |_conn| (),
++        ));
++        match task.poll() {
++            Poll::Ready((Ok("response"), ConnSlot::Held(conn))) => drop(conn),
++            _ => panic!("expected the delivered response with the connection held"),
++        }
++        assert_eq!(f.dispatcher.lock().unwrap().polls, 0);
++        assert_eq!(dropped.load(Ordering::SeqCst), 1);
++    }
++
++    #[test]
++    fn in_flight_request_keeps_connection_until_response() {
++        let mut f = fixture(DispatchState::Busy, false);
++        let mut task = tokio_test::task::spawn(await_response_or_release(
++            sent(f.response),
++            f.conn,
++            poll_conn,
++            |_conn| (),
++        ));
++        assert!(task.poll().is_pending());
++        assert!(task.poll().is_pending());
++        let _ = f.in_flight.take().unwrap().send(Ok("response"));
++        assert!(task.is_woken());
++        assert!(matches!(
++            task.poll(),
++            Poll::Ready((Ok("response"), ConnSlot::Held(_)))
++        ));
++    }
++
++    #[test]
++    fn wanting_dispatcher_ends_the_watch() {
++        // The dispatcher asked for more work after the request was published,
++        // so it saw the request; a later close is its business, not a strand.
++        let mut f = fixture(DispatchState::Wanting, false);
++        let dropped = f.dropped.clone();
++        let mut task = tokio_test::task::spawn(await_response_or_release(
++            sent(f.response),
++            f.conn,
++            poll_conn,
++            |_conn| (),
++        ));
++        assert!(task.poll().is_pending());
++        Dispatcher::set(&f.dispatcher, DispatchState::Closed);
++        assert!(task.poll().is_pending());
++        assert_eq!(f.dispatcher.lock().unwrap().polls, 1);
++        assert_eq!(dropped.load(Ordering::SeqCst), 0);
++        let _ = f.in_flight.take().unwrap().send(Err("connection reset"));
++        assert!(matches!(
++            task.poll(),
++            Poll::Ready((Err("connection reset"), ConnSlot::Held(_)))
++        ));
++    }
++
++    #[test]
++    fn release_happens_once() {
++        // The dispatcher is gone but the request is still in flight on its
++        // way to a canceled callback; releasing twice would be a bug.
++        let mut f = fixture(DispatchState::Busy, false);
++        let releases = Arc::new(AtomicUsize::new(0));
++        let counted = releases.clone();
++        let mut task = tokio_test::task::spawn(await_response_or_release(
++            sent(f.response),
++            f.conn,
++            poll_conn,
++            move |_conn| {
++                counted.fetch_add(1, Ordering::SeqCst);
++            },
++        ));
++        assert!(task.poll().is_pending());
++        Dispatcher::set(&f.dispatcher, DispatchState::Closed);
++        assert!(task.poll().is_pending());
++        assert!(task.poll().is_pending());
++        assert_eq!(releases.load(Ordering::SeqCst), 1);
++        // One poll while busy, one that saw the close, none after the release.
++        assert_eq!(f.dispatcher.lock().unwrap().polls, 2);
++        let _ = f.in_flight.take().unwrap().send(Err("dispatch gone"));
++        assert!(matches!(
++            task.poll(),
++            Poll::Ready((Err("dispatch gone"), ConnSlot::Released(())))
++        ));
++    }
++
++    /// The watch relies on a real `hyper` HTTP/1 sender reporting closure
++    /// through `poll_ready` once its dispatcher is gone, with a request still
++    /// queued, and on that request failing with the unsent message.
++    #[cfg(all(feature = "http1", feature = "tokio"))]
++    #[tokio::test]
++    async fn hyper_http1_sender_reports_closed_with_request_queued() {
++        use http_body_util::Empty;
++        use hyper::body::Bytes;
++
++        let io = tokio_test::io::Builder::new().build();
++        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(
++            crate::rt::TokioIo::new(io),
++        )
++        .await
++        .expect("handshake");
++        let sent = sender.try_send_request(super::Request::new(Empty::new()));
++        // The dispatcher never ran, so the request is queued, not dequeued.
++        drop(conn);
++
++        let (result, slot) = await_response_or_release(
++            sent,
++            sender,
++            |sender, cx| sender.poll_ready(cx).map_err(|_| ()),
++            |_sender| (),
++        )
++        .await;
++        let mut err = match result {
++            Ok(_) => panic!("request on a dropped connection must fail"),
++            Err(err) => err,
++        };
++        assert!(err.take_message().is_some());
++        assert!(err.into_error().is_canceled());
++        match slot {
++            ConnSlot::Held(mut sender) => {
++                let closed = std::future::poll_fn(|cx| sender.poll_ready(cx)).await;
++                assert!(closed.is_err());
++            }
++            ConnSlot::Released(()) => {}
++        }
++    }
++
++    /// `await_pooled_response`, the step `Client::try_send_request` runs after
++    /// queuing a request, against a real pooled HTTP/1 `PoolClient`.
++    #[cfg(all(feature = "http1", feature = "tokio"))]
++    mod pooled_http1 {
++        use super::super::{
++            await_pooled_response, pool, poll_h1_dispatch_open, release_pool_conn,
++            ConnTrySendError, Connected, ErrorKind, PoolClient, PoolConn, PoolKey, PoolTx,
++            Request, Response, TrySendError, Ver,
++        };
++        use crate::common::timer;
++        use crate::rt::{TokioExecutor, TokioIo};
++        use http_body_util::Empty;
++        use hyper::body::Bytes;
++        use hyper::client::conn::http1;
++        use std::future::{poll_fn, Future};
++        use std::pin::Pin;
++        use std::task::Poll;
++        use std::time::Duration;
++
++        type Body = Empty<Bytes>;
++        type Conn = Pin<Box<http1::Connection<TokioIo<tokio_test::io::Mock>, Body>>>;
++        type Pool = pool::Pool<PoolClient<Body>, PoolKey>;
++
++        #[derive(Clone, Debug, PartialEq)]
++        struct ConnTag(&'static str);
++
++        fn key() -> PoolKey {
++            (
++                http::uri::Scheme::HTTP,
++                http::uri::Authority::from_static("backend.test"),
++            )
++        }
++
++        fn new_pool() -> Pool {
++            pool::Pool::new(
++                pool::Config {
++                    idle_timeout: None,
++                    max_idle_per_host: usize::MAX,
++                },
++                TokioExecutor::new(),
++                Option::<timer::Timer>::None,
++            )
++        }
++
++        fn tag(conn_info: &Connected) -> Option<ConnTag> {
++            let mut extensions = http::Extensions::new();
++            conn_info.get_extras(&mut extensions);
++            extensions.get::<ConnTag>().cloned()
++        }
++
++        /// A real HTTP/1 connection whose dispatcher has run once and now
++        /// waits for a request, as an idle pooled connection does. The backend
++        /// never answers or closes; dropping `Conn` drops the dispatcher.
++        async fn http1_client(conn_tag: &'static str) -> (PoolClient<Body>, Conn) {
++            let io = tokio_test::io::Builder::new()
++                .wait(Duration::from_secs(3600))
++                .build();
++            let (sender, conn) = http1::handshake::<_, Body>(TokioIo::new(io))
++                .await
++                .expect("handshake");
++            let mut conn = Box::pin(conn);
++            poll_fn(|cx| {
++                assert!(conn.as_mut().poll(cx).is_pending());
++                Poll::Ready(())
++            })
++            .await;
++            let client = PoolClient {
++                conn_info: Connected::new().extra(ConnTag(conn_tag)),
++                tx: PoolTx::Http1(sender),
++            };
++            assert!(client.is_ready());
++            (client, conn)
++        }
++
++        fn fresh(pool: &Pool, client: PoolClient<Body>) -> PoolConn<Body> {
++            let connecting = pool.connecting(&key(), Ver::Auto).expect("connecting");
++            pool.pooled(connecting, client)
++        }
++
++        /// Pools `client` and checks it out again, so it counts as reused.
++        async fn reused(pool: &Pool, client: PoolClient<Body>) -> PoolConn<Body> {
++            drop(fresh(pool, client));
++            let pooled = pool.checkout(key()).await.expect("idle connection");
++            assert!(pooled.is_reused());
++            pooled
++        }
++
++        async fn watch(pooled: &mut PoolConn<Body>) -> Poll<Result<(), ()>> {
++            poll_fn(|cx| Poll::Ready(poll_h1_dispatch_open(&mut *pooled, cx))).await
++        }
++
++        /// Resolves on its second poll. A stranded request resolves once the
++        /// release drops the last sender, and `await_response_or_release` polls
++        /// the response again right after releasing, within the same poll.
++        /// Nothing else polls it twice in one poll.
++        fn resolves_after_release<T>(output: T) -> impl Future<Output = T> {
++            let mut output = Some(output);
++            let mut polled = false;
++            poll_fn(move |_cx| {
++                if std::mem::replace(&mut polled, true) {
++                    Poll::Ready(output.take().expect("polled after completion"))
++                } else {
++                    Poll::Pending
++                }
++            })
++        }
++
++        #[tokio::test]
++        async fn watch_reports_when_the_http1_dispatcher_is_gone() {
++            let pool = new_pool();
++            let (client, conn) = http1_client("reused").await;
++            let mut pooled = reused(&pool, client).await;
++            assert_eq!(watch(&mut pooled).await, Poll::Ready(Ok(())));
++
++            drop(conn);
++            assert_eq!(watch(&mut pooled).await, Poll::Ready(Err(())));
++        }
++
++        #[tokio::test]
++        async fn release_records_reuse_and_conn_info() {
++            let (client, _fresh_conn) = http1_client("fresh").await;
++            let (connection_reused, conn_info) = release_pool_conn(&fresh(&new_pool(), client));
++            assert!(!connection_reused);
++            assert_eq!(tag(&conn_info), Some(ConnTag("fresh")));
++
++            let pool = new_pool();
++            let (client, _reused_conn) = http1_client("reused").await;
++            let (connection_reused, conn_info) = release_pool_conn(&reused(&pool, client).await);
++            assert!(connection_reused);
++            assert_eq!(tag(&conn_info), Some(ConnTag("reused")));
++        }
++
++        #[tokio::test]
++        async fn unsent_request_on_released_connection_is_retryable_as_reused() {
++            let pool = new_pool();
++            let (client, conn) = http1_client("reused").await;
++            let mut pooled = reused(&pool, client).await;
++            drop(conn);
++            // What the stranded request's callback yields once the channel
++            // drops: a canceled error carrying the unsent request.
++            let unsent = pooled.try_send_request(Request::new(Empty::new())).await;
++            assert!(unsent.is_err());
++
++            let mut task = tokio_test::task::spawn(await_pooled_response(
++                resolves_after_release(unsent),
++                pooled,
++            ));
++            match task.poll() {
++                Poll::Ready(Err(TrySendError::Retryable {
++                    error,
++                    connection_reused,
++                    ..
++                })) => {
++                    // Recorded before the release dropped the connection.
++                    assert!(connection_reused);
++                    assert!(matches!(error.kind, ErrorKind::Canceled));
++                    assert_eq!(
++                        error.connect_info().and_then(tag),
++                        Some(ConnTag("reused"))
++                    );
++                }
++                Poll::Ready(Err(TrySendError::Nope(error))) => {
++                    panic!("unsent request is not retryable: {error:?}")
++                }
++                Poll::Ready(Ok(_)) => panic!("unsent request resolved as a response"),
++                Poll::Pending => panic!("closed connection was not released"),
++            }
++        }
++
++        #[tokio::test]
++        async fn response_on_released_connection_is_not_handed_back_for_the_pool() {
++            let pool = new_pool();
++            let (client, conn) = http1_client("reused").await;
++            let pooled = reused(&pool, client).await;
++            drop(conn);
++
++            let response = Ok::<_, ConnTrySendError<Request<Body>>>(Response::new(()));
++            let mut task = tokio_test::task::spawn(await_pooled_response(
++                resolves_after_release(response),
++                pooled,
++            ));
++            match task.poll() {
++                Poll::Ready(Ok((res, None))) => {
++                    assert_eq!(
++                        res.extensions().get::<ConnTag>(),
++                        Some(&ConnTag("reused"))
++                    );
++                }
++                Poll::Ready(Ok((_, Some(_)))) => {
++                    panic!("released connection handed back for the pool")
++                }
++                Poll::Ready(Err(_)) => panic!("response lost"),
++                Poll::Pending => panic!("closed connection was not released"),
++            }
++        }
++
++        #[tokio::test]
++        async fn request_queued_when_reused_connection_closes_is_retryable() {
++            let pool = new_pool();
++            let (client, conn) = http1_client("reused").await;
++            let mut pooled = reused(&pool, client).await;
++            let sent = pooled.try_send_request(Request::new(Empty::new()));
++            let mut task = tokio_test::task::spawn(await_pooled_response(sent, pooled));
++            assert!(task.poll().is_pending());
++
++            // The dispatcher goes away before it dequeues the request.
++            drop(conn);
++            assert!(task.is_woken());
++            match task.poll() {
++                Poll::Ready(Err(TrySendError::Retryable {
++                    error,
++                    connection_reused,
++                    ..
++                })) => {
++                    assert!(connection_reused);
++                    assert!(matches!(error.kind, ErrorKind::Canceled));
++                }
++                Poll::Ready(Err(TrySendError::Nope(error))) => {
++                    panic!("unsent request is not retryable: {error:?}")
++                }
++                Poll::Ready(Ok(_)) => panic!("unsent request resolved as a response"),
++                Poll::Pending => panic!("request still pending after its connection closed"),
++            }
++        }
++    }
++}
