@@ -265,7 +265,7 @@ FERRUM_TRUSTED_PROXIES="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 ```yaml
 services:
   gateway:
-    image: docker.io/ferrumedge/ferrum-edge:0.9.6
+    image: docker.io/ferrumedge/ferrum-edge:0.9.7
     environment:
       FERRUM_MODE: file
       FERRUM_FILE_CONFIG_PATH: /config/gateway.yaml
