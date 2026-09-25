@@ -1867,6 +1867,40 @@ fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<F
     Ok(PaginationParams { offset, limit })
 }
 
+/// Parse the optional `proxy_id` query filter for `GET /plugins/config`.
+///
+/// The value is validated with the same resource-id rules as every other id in
+/// the admin API (invalid → 400 with the shared `{"error": ...}` shape);
+/// duplicate `proxy_id` parameters are rejected rather than silently
+/// last-wins, matching other strict query-parameter parsers.
+fn parse_plugin_config_proxy_id(
+    uri: &hyper::Uri,
+) -> Result<Option<String>, Box<Response<Full<Bytes>>>> {
+    let Some(query) = uri.query() else {
+        return Ok(None);
+    };
+    let mut proxy_id: Option<String> = None;
+    for (key, val) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key.as_ref() != "proxy_id" {
+            continue;
+        }
+        if proxy_id.is_some() {
+            return Err(Box::new(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "proxy_id must not be supplied more than once"}),
+            )));
+        }
+        if let Err(error) = crate::config::types::validate_resource_id(&val) {
+            return Err(Box::new(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": error}),
+            )));
+        }
+        proxy_id = Some(val.into_owned());
+    }
+    Ok(proxy_id)
+}
+
 /// Narrow a shared `i64` pagination offset to the `u32` the audit store
 /// indexes by, producing the documented audit 400 when it does not fit.
 ///
@@ -4140,7 +4174,18 @@ async fn handle_admin_request_inner(
         (Method::GET, ["plugins"]) => handle_list_plugin_types().await,
         (Method::GET, ["plugins", "config"]) => {
             let pagination = route_pagination!();
-            crud::handle_list::<PluginConfig>(&state, &pagination, auth.role, &namespace).await
+            let proxy_id = match parse_plugin_config_proxy_id(&uri) {
+                Ok(proxy_id) => proxy_id,
+                Err(response) => return Ok(*response),
+            };
+            crud::handle_list_filtered::<PluginConfig>(
+                &state,
+                &pagination,
+                auth.role,
+                &namespace,
+                &proxy_id,
+            )
+            .await
         }
         (Method::POST, ["plugins", "config"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {

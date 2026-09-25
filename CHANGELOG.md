@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutating route that does not evaluate it, is `400` rather than ignored.
   Requests without `If-Match` are unchanged.
 
+- Proxy filter on `GET /plugins/config` (#5726). An optional `proxy_id` query
+  parameter narrows the list to plugin configs whose `proxy_id` matches exactly,
+  so a caller (e.g. Nexus) no longer has to page the whole namespace and filter
+  client-side. Pagination and `pagination.total` apply over the filtered set,
+  and the filter is pushed into every backend (SQL, MongoDB, and the
+  in-memory/file path), respecting the caller's namespace and role the same as
+  the unfiltered list. An invalid `proxy_id` returns `400`; an unknown one
+  returns an empty page rather than `404`.
+
 ### Fixed
 
 - An HTTP/1.1 backend request no longer waits for `backend_read_timeout_ms`
