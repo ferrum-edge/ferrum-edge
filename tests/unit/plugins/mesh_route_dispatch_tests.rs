@@ -3031,6 +3031,53 @@ async fn arming_a_route_attempt_timeout_folds_a_fresh_budget_into_the_grpc_deadl
     assert_eq!(both.grpc_deadline_at(), Some(total));
 }
 
+#[tokio::test(start_paused = true)]
+async fn the_grpc_deadline_is_the_route_attempt_budget_only_while_it_binds() {
+    use std::time::Duration;
+
+    // With no other budget the attempt budget is the RPC deadline for each
+    // attempt, and not between attempts.
+    let mut request = ctx();
+    request.route_override_attempt_timeout_ms = Some(300);
+    request.arm_route_request_deadline(true);
+    assert!(request.grpc_deadline_is_route_attempt_budget());
+    request.end_grpc_route_attempt();
+    assert!(!request.grpc_deadline_is_route_attempt_budget());
+    request.begin_grpc_route_attempt();
+    assert!(request.grpc_deadline_is_route_attempt_budget());
+
+    // A total that ends first binds instead, and so does one that ends at the
+    // same instant: the total wins a tie.
+    let mut total_first = ctx();
+    total_first.route_override_request_timeout_ms = Some(200);
+    total_first.route_override_attempt_timeout_ms = Some(300);
+    total_first.arm_route_request_deadline(true);
+    assert!(!total_first.grpc_deadline_is_route_attempt_budget());
+    let mut tie = ctx();
+    tie.route_override_request_timeout_ms = Some(300);
+    tie.route_override_attempt_timeout_ms = Some(300);
+    tie.arm_route_request_deadline(true);
+    assert!(!tie.grpc_deadline_is_route_attempt_budget());
+
+    // A later attempt whose fresh budget outlasts the total is bound by the
+    // total.
+    let mut both = ctx();
+    both.route_override_request_timeout_ms = Some(500);
+    both.route_override_attempt_timeout_ms = Some(300);
+    both.arm_route_request_deadline(true);
+    assert!(both.grpc_deadline_is_route_attempt_budget());
+    tokio::time::advance(Duration::from_millis(400)).await;
+    both.end_grpc_route_attempt();
+    both.begin_grpc_route_attempt();
+    assert!(!both.grpc_deadline_is_route_attempt_budget());
+
+    // A non-gRPC request never folds its budget into the RPC deadline.
+    let mut plain = ctx();
+    plain.route_override_attempt_timeout_ms = Some(300);
+    plain.arm_route_request_deadline(false);
+    assert!(!plain.grpc_deadline_is_route_attempt_budget());
+}
+
 #[tokio::test]
 async fn mesh_route_dispatch_retry_only_rule_is_an_action_catch_all() {
     // The Gateway API translator emits a path-only HTTPRoute rule whose only

@@ -853,7 +853,10 @@ pub struct RouteRule {
     /// `504`, retryable like any other; expiry after the head has been sent
     /// cuts the body exactly as `request_timeout_ms` does. A gRPC request
     /// folds it into its RPC deadline and ends with `DEADLINE_EXCEEDED`.
-    /// Native HTTP/3 does not enforce it on a non-gRPC request yet.
+    /// Native HTTP/3 cannot enforce it on a non-gRPC request, so, exactly as
+    /// for `request_timeout_ms`, the HTTP/3 frontend refuses such a request
+    /// with `503` and `Alt-Svc` is withheld on every frontend port that serves
+    /// a rule carrying it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_timeout_ms: Option<u64>,
     /// Override the proxy's retry policy for this rule.
@@ -978,21 +981,25 @@ impl RouteRule {
 }
 
 /// Whether a `mesh_route_dispatch` config document carries any rule with a
-/// total request deadline (`request_timeout_ms`).
+/// total request deadline (`request_timeout_ms`) or a per-attempt total bound
+/// (`attempt_timeout_ms`) — the route timeouts the native HTTP/3 relays cannot
+/// enforce on a non-gRPC request.
 ///
 /// Read once per published configuration generation to withhold the HTTP/3
 /// `Alt-Svc` advertisement on the frontend ports that serve such a rule
 /// (`crate::proxy::RouteTimeoutAltSvc`). Deliberately conservative: any
 /// non-null value counts, since a document the plugin later rejects never
 /// serves at all.
-pub(crate) fn config_sets_request_timeout(config: &Value) -> bool {
+pub(crate) fn config_sets_request_or_attempt_timeout(config: &Value) -> bool {
     let Some(rules) = config.get("rules").and_then(Value::as_array) else {
         return false;
     };
-    rules
-        .iter()
-        .filter_map(|rule| rule.get("request_timeout_ms"))
-        .any(|value| !value.is_null())
+    rules.iter().any(|rule| {
+        ["request_timeout_ms", "attempt_timeout_ms"]
+            .iter()
+            .filter_map(|field| rule.get(*field))
+            .any(|value| !value.is_null())
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

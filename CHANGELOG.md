@@ -9,19 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Gateway API HTTPRoute `timeouts.backendRequest` now bounds each backend
-  attempt until its full response has been received, as upstream v1.5.1
-  defines it, instead of only the response-head wait and the idle gap between
-  frames (#5646). The budget starts when the attempt is handed to the backend,
-  and every retry attempt gets a fresh one; `timeouts.request` still bounds the
+- Gateway API HTTPRoute `timeouts.backendRequest` bounds each backend attempt
+  until its full response has been received, as upstream v1.5.1 defines it
+  (#5646). The budget starts when the attempt is handed to the backend, and
+  every retry attempt gets a fresh one; `timeouts.request` still bounds the
   whole request. Before the response head the attempt ends with the ordinary
   backend-timeout `504`, which the rule's `retry` may retry. A body still
   streaming at the budget is cut exactly like a `request` cut (HTTP/2 stream
-  reset, HTTP/1.1 connection close) and is never retried. gRPC calls fold the
-  budget into their RPC deadline and end with `DEADLINE_EXCEEDED`.
-  `mesh_route_dispatch` rules gain the matching `attempt_timeout_ms` field;
-  rules without it behave exactly as before. Native HTTP/3 does not yet bound a
-  non-gRPC attempt's total duration, which remains a documented deviation.
+  reset, HTTP/1.1 connection close) and is never retried. **Any response that
+  takes longer than the budget to deliver is cut, not only a trickled one**: a
+  large but fast download, a Server-Sent Events stream, a long poll, and a
+  server-streaming gRPC call all end at the budget, so size `backendRequest`
+  for the longest complete response the rule must serve. For a streamed
+  (unbuffered) upload, the upload time after the handoff counts against the
+  budget and its expiry is charged to the backend. gRPC calls fold the budget
+  into their RPC deadline, anchored when the rule is selected, and end with
+  `DEADLINE_EXCEEDED`; a backend that holds the call past it is charged to its
+  circuit breaker and passive health. `mesh_route_dispatch` rules gain the
+  matching `attempt_timeout_ms` field; rules without it behave exactly as
+  before. Like `request`, native HTTP/3 cannot enforce the per-attempt bound
+  for non-gRPC requests yet, so it refuses those requests with `503` and
+  HTTP/3 is not advertised (`Alt-Svc`) on a listener port that serves such a
+  rule.
 
 - Gateway API HTTPRoute rule-level `timeouts` (#5646). `timeouts.backendRequest`
   bounds each backend attempt and `timeouts.request` is one total deadline for
@@ -39,9 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-gRPC requests yet, so it refuses those requests with `503` instead of
   serving them without the deadline, and HTTP/3 is no longer advertised
   (`Alt-Svc`) on a listener port that serves such a rule. CI now declares
-  `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`. (`backendRequest`
-  initially bounded only an attempt's response-head wait and idle gaps; the
-  per-attempt total bound above replaces that deviation.)
+  `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`; the per-attempt
+  semantics of `backendRequest` are the entry above.
 
 - Gateway API HTTPRoute rule-level `retry` (#5646). The experimental-channel
   field, present in the pinned v1.5.1 experimental CRD bundle, is validated like

@@ -94,6 +94,25 @@ async fn an_initial_attempt_budget_starts_only_at_the_handoff() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_attempt_handed_over_and_answered_in_one_poll_still_arms_its_budget() {
+    let handed_to_backend = AtomicBool::new(false);
+    // A backend that answers the head within the same poll as the handoff: the
+    // wrapper never sees the attempt pending, yet the committed attempt's
+    // streaming body must still be bounded by the budget.
+    let attempt = async {
+        handed_to_backend.store(true, Ordering::Relaxed);
+        "head"
+    };
+    let started = Instant::now();
+
+    let (outcome, armed) =
+        await_route_attempt_budget_for_test(None, BUDGET, Some(&handed_to_backend), attempt).await;
+
+    assert_eq!(outcome, Ok("head"));
+    assert_eq!(armed, Some(started + BUDGET));
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_attempt_that_never_reaches_a_backend_runs_no_budget() {
     let handed_to_backend = AtomicBool::new(false);
     // Longer than the budget, but answered by the gateway itself (an egress

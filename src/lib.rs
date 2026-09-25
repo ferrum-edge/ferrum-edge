@@ -11846,8 +11846,8 @@ pub mod _test_support {
 
     /// Whether `config` withholds the HTTP/3 `Alt-Svc` advertisement on
     /// `frontend_port` because a route rule reachable there carries a total
-    /// request deadline — the rule `ProxyState::alt_svc_for_frontend_port`
-    /// applies to every response.
+    /// request deadline or a per-attempt total bound — the rule
+    /// `ProxyState::alt_svc_for_frontend_port` applies to every response.
     pub fn route_timeout_withholds_alt_svc_for_test(
         config: &crate::config::types::GatewayConfig,
         frontend_port: Option<u16>,

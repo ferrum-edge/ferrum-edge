@@ -4688,13 +4688,14 @@ async fn handle_h3_request(
         .plugin_cache
         .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
     // Arm the matched route rule's total request deadline (Gateway API
-    // `timeouts.request`). A gRPC request folds it into its RPC deadline, which
-    // the native-H3 gRPC relays already enforce end to end. The native-H3
-    // HTTP relays write the response head and body from inside the dispatch,
-    // so they cannot yet turn this deadline into a `504` or a mid-body reset:
-    // refuse such a request before any target selection, breaker admission, or
-    // dial rather than serve it without the policy it was routed under. The
-    // H1/H2 frontends withhold `Alt-Svc` on every port that serves such a rule
+    // `timeouts.request`) and per-attempt total bound (`backendRequest`). A
+    // gRPC request folds them into its RPC deadline, which the native-H3 gRPC
+    // relays already enforce end to end. The native-H3 HTTP relays write the
+    // response head and body from inside the dispatch, so they cannot yet turn
+    // either bound into a `504` or a mid-body reset: refuse such a request
+    // before any target selection, breaker admission, or dial rather than
+    // serve it without the policy it was routed under. The H1/H2 frontends
+    // withhold `Alt-Svc` on every port that serves such a rule
     // (`ProxyState::route_timeout_alt_svc`), so the gateway never steers a
     // client here; only a client that reaches HTTP/3 on its own sees this.
     // Upgraded tunnels (RFC 9220 WebSocket, RFC 9298 CONNECT-UDP) are not HTTP
@@ -4707,7 +4708,7 @@ async fn handle_h3_request(
     ctx.arm_route_request_deadline(matches!(http_flavor, HttpFlavor::Grpc));
     if matches!(http_flavor, HttpFlavor::Plain)
         && !is_connect_udp_request
-        && ctx.route_request_deadline_at().is_some()
+        && (ctx.route_request_deadline_at().is_some() || ctx.route_attempt_timeout().is_some())
     {
         // Heap-pinned like the other reject ladders in this handler: its state
         // machine is already close to the worker stack budget of a debug
@@ -4715,7 +4716,7 @@ async fn handle_h3_request(
         Box::pin(async {
             crate::warn_sampled!(
                 proxy_id = %proxy.id,
-                "Refusing HTTP/3 request: its route rule sets a total request timeout that the native HTTP/3 relay cannot enforce"
+                "Refusing HTTP/3 request: its route rule sets a request or attempt timeout that the native HTTP/3 relay cannot enforce"
             );
             record_h3_flavor_aware_reject(&state, http_flavor, 503);
             log_rejected_request(

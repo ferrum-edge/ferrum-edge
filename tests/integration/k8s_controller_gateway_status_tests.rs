@@ -4939,6 +4939,217 @@ async fn gateway_route_backend_request_bounds_grpc_attempts_until_the_full_respo
     assert_eq!(response.messages.len(), 5, "{response:?}");
 }
 
+/// A gRPC backend that holds the RPC past the `backendRequest` budget without
+/// sending response headers failed to answer within its per-attempt bound, so
+/// the expiry is charged to it exactly as a stalled HTTP backend is: the call
+/// ends with the backend `DEADLINE_EXCEEDED`, the breaker opens, and the next
+/// call is refused without reaching the backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_backend_request_charges_a_grpc_backend_that_stalls_response_headers() {
+    use crate::scaffolding::backends::grpc::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+    use crate::scaffolding::clients::grpc::GrpcClient;
+    use crate::scaffolding::ports::reserve_port;
+    use bytes::Bytes;
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .steps(vec![
+            GrpcStep::AcceptRpc(MatchRpc::any()),
+            GrpcStep::Sleep(std::time::Duration::from_millis(1_500)),
+            GrpcStep::SendInitialHeaders,
+            GrpcStep::RespondMessage(Bytes::from_static(b"pong")),
+            GrpcStep::RespondStatus {
+                code: 0,
+                message: "",
+            },
+        ])
+        .spawn()
+        .expect("spawn grpc backend");
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "grpc-backend-request",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/echo.Echo"}}],
+                "backendRefs": [{"name": "api", "port": 8080}],
+                "timeouts": {"backendRequest": "500ms"}
+            }]
+        }),
+    ));
+    let harness =
+        spawn_translated_route_gateway_with(&objects, Vec::new(), trip_on_first_failure).await;
+    let target = harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .to_string();
+    let client = GrpcClient::h2c(target);
+
+    let response = client
+        .unary("/echo.Echo/Ping", Bytes::from_static(b"ping"))
+        .await
+        .expect("grpc call");
+    assert_eq!(response.grpc_status(), Some(4), "{response:?}");
+    assert_eq!(
+        response.grpc_message(),
+        Some("Backend deadline exceeded"),
+        "the attempt budget is the backend's bound, not the client's deadline: {response:?}"
+    );
+
+    let response = client
+        .unary("/echo.Echo/Ping", Bytes::from_static(b"ping"))
+        .await
+        .expect("breaker grpc call");
+    assert_eq!(
+        response.grpc_status(),
+        Some(14),
+        "UNAVAILABLE: {response:?}"
+    );
+    assert_eq!(
+        backend.received_stream_count(),
+        1,
+        "the open breaker must refuse the second call before any dial"
+    );
+}
+
+/// Every retry attempt's budget starts with that attempt, and it bounds the
+/// retry's FULL response too. The first attempt stalls its head until its
+/// budget ends; the retry answers at once and then paces a ~3s body. That body
+/// is cut once the retry's own 800ms budget runs out — about 1.6s in — never
+/// completed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_route_backend_request_cuts_a_retry_body_at_its_own_budget() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher};
+    use std::time::{Duration, Instant};
+
+    let stall = vec![
+        HttpStep::ExpectRequest(RequestMatcher::any()),
+        HttpStep::Sleep(Duration::from_secs(5)),
+    ];
+    // One byte every 100ms for ~3s.
+    let paced = vec![paced_body_step(30, Duration::from_millis(100))];
+    let (backend_port, backend) = spawn_connection_scripted_backend(vec![stall, paced]).await;
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(timeouts_route(json!([{
+        "matches": [{"path": {"type": "PathPrefix", "value": "/cut"}}],
+        "backendRefs": [{"name": "api", "port": 8080}],
+        "timeouts": {"backendRequest": "800ms"},
+        "retry": {"codes": [504], "attempts": 1, "backoff": "10ms"}
+    }])));
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+
+    let started = Instant::now();
+    let mut response = retry_test_client()
+        .get(harness.proxy_url("/cut/thing"))
+        .header("host", "timeouts.test")
+        .send()
+        .await
+        .expect("response head");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut received = 0;
+    let completed = loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => received += chunk.len(),
+            Ok(None) => break true,
+            Err(_) => break false,
+        }
+    };
+    let elapsed = started.elapsed();
+
+    assert!(
+        !completed,
+        "the retry's budget must cut its body ({received} bytes received)"
+    );
+    assert!(received < 30, "{received} bytes received");
+    // Two whole budgets: the stalled first attempt's, then the retry's.
+    assert!(
+        elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_millis(3_000),
+        "the retry's body must be cut at retry start + 800ms: {elapsed:?}"
+    );
+    assert_eq!(backend_attempts(&backend, "GET", "/cut/thing").await, 2);
+}
+
+/// `mesh_route_dispatch` may bound an attempt's total duration more tightly
+/// than its response-head wait (`attempt_timeout_ms` < `timeout_ms`). The
+/// attempt budget then ends a stalled head itself: the ordinary retryable
+/// backend-timeout `504`, well before the header wait. The retry replays the
+/// request body the first attempt retained, although the budget cancelled
+/// that attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attempt_budget_shorter_than_the_header_wait_retries_with_the_retained_body() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher};
+    use std::time::{Duration, Instant};
+
+    let stall = vec![
+        HttpStep::ExpectRequest(RequestMatcher::any()),
+        HttpStep::Sleep(Duration::from_secs(5)),
+    ];
+    let stored = status_exchange(200, "OK", b"stored");
+    let (backend_port, backend) = spawn_connection_scripted_backend(vec![stall, stored]).await;
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(timeouts_route(json!([{
+        "matches": [{"path": {"type": "PathPrefix", "value": "/budget"}}],
+        "backendRefs": [{"name": "api", "port": 8080}],
+        "timeouts": {"backendRequest": "3s"},
+        "retry": {"codes": [504], "attempts": 1, "backoff": "10ms"}
+    }])));
+    let mut tightened = 0;
+    let harness = spawn_translated_route_gateway_with(&objects, Vec::new(), |config| {
+        for plugin in &mut config.plugin_configs {
+            if plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            let Some(Value::Array(rules)) = plugin.config.get_mut("rules") else {
+                continue;
+            };
+            for rule in rules.iter_mut().filter_map(Value::as_object_mut) {
+                if rule.contains_key("attempt_timeout_ms") {
+                    assert_eq!(rule.get("timeout_ms"), Some(&json!(3_000)), "{rule:?}");
+                    rule.insert("attempt_timeout_ms".to_string(), json!(400));
+                    tightened += 1;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(tightened > 0, "the translated rule must carry the field");
+
+    let started = Instant::now();
+    let response = retry_test_client()
+        .put(harness.proxy_url("/budget/thing"))
+        .header("host", "timeouts.test")
+        .body("payload")
+        .send()
+        .await
+        .expect("response");
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "stored");
+    assert!(
+        elapsed >= Duration::from_millis(350) && elapsed < Duration::from_millis(2_500),
+        "the 400ms attempt budget, not the 3s header wait, must end the first attempt: \
+         {elapsed:?}"
+    );
+
+    let bodies: Vec<Vec<u8>> = backend
+        .received_requests()
+        .await
+        .iter()
+        .filter(|request| request.method == "PUT" && request.path == "/budget/thing")
+        .map(|request| request.body.clone())
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![b"payload".to_vec(), b"payload".to_vec()],
+        "the retry must replay the retained request body"
+    );
+}
+
 /// One scripted HTTP/1.1 exchange: read a request, answer `status` with `body`,
 /// and close the connection, so every gateway attempt is its own connection
 /// and its own recorded request.
