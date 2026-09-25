@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.6] - 2026-09-25
+## [0.9.7] - 2026-09-25
+
+This is the first published release after 0.9.5. It ships every change
+prepared as 0.9.6, which was tagged but never published (see below).
 
 ### Added
 
@@ -680,6 +683,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counters by index instead of doing one or more `DashMap<String, _>` lookups
   per candidate per request (#5693). Each balancer also no longer allocates
   three default-sharded `DashMap`s.
+
+## [0.9.6] - 2026-09-25 [YANKED]
+
+`v0.9.6` was tagged but never published. The release workflow refused the
+tag target before building anything, so there is no GitHub Release, binary,
+or container image for it, and release tags are immutable. Every change
+listed under 0.9.7 above was prepared as 0.9.6 and ships unchanged in 0.9.7.
 
 ## [0.9.5] - 2026-09-13
 
@@ -4170,7 +4180,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.6...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.7...HEAD
+[0.9.7]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...v0.9.7
 [0.9.6]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.3...v0.9.4
