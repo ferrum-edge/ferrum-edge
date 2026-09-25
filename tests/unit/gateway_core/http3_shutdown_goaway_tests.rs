@@ -66,8 +66,7 @@ fn connection_guard_is_constructed_once_in_the_spawn_wrapper() {
         })
         .count();
     assert_eq!(
-        guard_constructions,
-        1,
+        guard_constructions, 1,
         "exactly one ConnectionGuard::new in server.rs, inside run_h3_connection_with_guard"
     );
     let helper = src
