@@ -48,8 +48,9 @@ unused-ignored-advisory = "deny"
 # upstream fix became reachable (see docs/dependency-policy.md, "Advisory
 # exception register"):
 #   - RUSTSEC-2026-0118 / RUSTSEC-2026-0119 (hickory-proto 0.25.2): mongodb 3.7
-#     moved its SRV resolver to hickory 0.26; Cargo.toml now requires >= 3.7
-#     (the lockfile resolves 3.9.1).
+#     moved its SRV resolver to hickory 0.26; Cargo.toml now requires
+#     >=3.7, <3.9 (the lockfile resolves 3.8.2). The cap keeps MongoDB 4.2:
+#     3.9 raised the driver's minimum wire version to 9 (MongoDB 4.4).
 #   - RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and
 #     RUSTSEC-2026-0258 (h2 0.3.27): all came from the AWS SDK's legacy
 #     `rustls` feature (hyper 0.14 / rustls 0.21 connector), which
@@ -72,9 +73,11 @@ ignore = [
     #     verification is a public-key operation, but RSA *signing* of outbound
     #     client assertions (`private_key_jwt` in oidc_relying_party and
     #     oauth2_introspection, ai_federation service-account JWTs) runs on the
-    #     non-constant-time implementation. EC/EdDSA assertion keys or the
-    #     `fips` profile avoid it.
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side-channel; no fixed release (patched = [], 0.9.10 latest stable, 0.10.0-rc.18 still affected, checked 2026-09-24). sqlx-mysql does public-key encryption only; jsonwebtoken rust_crypto (crypto-ring profile) signs RSA client assertions, avoided with EC/EdDSA keys or the fips profile. Re-evaluate on an rsa fix. [expires:2026-12-31]" },
+    #     non-constant-time implementation. For oidc_relying_party and
+    #     oauth2_introspection, EC/EdDSA assertion keys or the `fips` profile
+    #     avoid it. ai_federation always signs RS256 (GCP service-account keys
+    #     are RSA), so only the `fips` profile avoids it there.
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side-channel; no fixed release (patched = [], 0.9.10 latest stable, 0.10.0-rc.18 still affected, checked 2026-09-24). sqlx-mysql does public-key encryption only; jsonwebtoken rust_crypto (crypto-ring profile) signs RSA client assertions (avoided with EC/EdDSA keys or the fips profile for oidc_relying_party/oauth2_introspection; ai_federation always signs RS256, so only fips avoids it there). Re-evaluate on an rsa fix. [expires:2026-12-31]" },
 
     # ── paste 1.0.15 — RUSTSEC-2024-0436, unmaintained (repository archived).
     # A proc-macro only: it runs at compile time and has no runtime or network
