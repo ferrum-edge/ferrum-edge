@@ -7603,12 +7603,66 @@ mod configsync_size_bounds {
         );
     }
 
+    /// The DP side of one live ConfigSync subscription, observed from outside
+    /// so a failed wait says what happened instead of timing out bare
+    /// (issue #5730).
+    ///
+    /// `connect_and_subscribe_with_startup_ready` runs exactly one subscription
+    /// and returns on ANY stream end, a refused snapshot included, so a
+    /// finished DP task is terminal and is reported at once rather than after
+    /// the rest of the budget. The report names the generation the DP serves,
+    /// the task outcome, the connection state, whether the CP still holds the
+    /// subscription, and the DP's own ConfigSync log, which records every
+    /// update it received and why a refused one ended the stream.
+    struct DpProbe<'a, T> {
+        state: &'a ProxyState,
+        connection: &'a ArcSwap<DpCpConnectionState>,
+        tx: &'a tokio::sync::broadcast::Sender<ConfigUpdate>,
+        logs: &'a CapturedLogs,
+        dp_task: &'a mut tokio::task::JoinHandle<T>,
+    }
+
+    impl<T: std::fmt::Debug> DpProbe<'_, T> {
+        /// Wait for the DP to serve `proxies` proxies after the CP published
+        /// generation `version`.
+        async fn wait_for(&mut self, stage: &str, proxies: usize, version: &str) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if self.state.config.load().proxies.len() == proxies {
+                    return;
+                }
+                let finished = self.dp_task.is_finished();
+                if finished || std::time::Instant::now() >= deadline {
+                    let outcome = if finished {
+                        format!("finished with {:?}", (&mut *self.dp_task).await)
+                    } else {
+                        "still running after 30s".to_string()
+                    };
+                    let serving = self.state.config.load();
+                    panic!(
+                        "{stage}: DP never served {proxies} proxies published as \
+                         generation {version}\n  serving: {} proxies, generation {}\n  \
+                         DP task: {outcome}\n  CP subscribers: {}\n  connection: {}\n  \
+                         DP ConfigSync log:\n{}",
+                        serving.proxies.len(),
+                        serving.loaded_at.to_rfc3339(),
+                        self.tx.receiver_count(),
+                        serde_json::to_string(&**self.connection.load()).unwrap(),
+                        self.logs.contents(),
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn configsync_large_cold_start_and_growth_reach_ready_and_serve() {
         use bytes::Bytes;
         use http_body_util::Full;
         use hyper::service::service_fn;
         use hyper_util::rt::{TokioExecutor, TokioIo};
+        use tracing::instrument::WithSubscriber;
 
         let backend = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
@@ -7646,7 +7700,10 @@ mod configsync_size_bounds {
         let initial = make_config(count);
         let bytes = serde_json::to_vec(&initial).unwrap().len();
         assert!(bytes > 4 * 1024 * 1024 && bytes < LIMIT);
-        let (cp_addr, tx, cp_task) = start_test_cp_server(initial).await;
+        // The default capacity (128), plus the authoritative config slot the
+        // CP serves subscribe and lag-recovery snapshots from.
+        let (cp_addr, tx, cp_config, cp_task) =
+            start_test_cp_server_with_capacity(initial, 128).await;
         let state = create_test_proxy_state();
         let ready = Arc::new(AtomicBool::new(false));
         let connection = Arc::new(ArcSwap::from_pointee(
@@ -7655,21 +7712,28 @@ mod configsync_size_bounds {
         let dp_state = state.clone();
         let dp_ready = ready.clone();
         let dp_connection = connection.clone();
-        let dp_task = tokio::spawn(async move {
-            dp_client::connect_and_subscribe_with_startup_ready(
-                &format!("http://{cp_addr}"),
-                &test_secret(),
-                "size-bound-dp",
-                &dp_state,
-                None,
-                Some(dp_ready),
-                "ferrum",
-                Some(&dp_connection),
-                true,
-                None,
-            )
-            .await
-        });
+        // Capture the DP's own ConfigSync decisions so a failed wait can say
+        // whether an update arrived, was refused, or ended the stream.
+        let logs = CapturedLogs::default();
+        let dp_subscriber = logs.subscriber();
+        let mut dp_task = tokio::spawn(
+            async move {
+                dp_client::connect_and_subscribe_with_startup_ready(
+                    &format!("http://{cp_addr}"),
+                    &test_secret(),
+                    "size-bound-dp",
+                    &dp_state,
+                    None,
+                    Some(dp_ready),
+                    "ferrum",
+                    Some(&dp_connection),
+                    true,
+                    None,
+                )
+                .await
+            }
+            .with_subscriber(dp_subscriber),
+        );
         timeout(Duration::from_secs(30), async {
             while !ready.load(Ordering::Acquire) {
                 assert!(
@@ -7716,22 +7780,47 @@ mod configsync_size_bounds {
         };
         assert_serves(count - 1).await;
 
-        assert!(CpGrpcServer::broadcast_update(&tx, &make_config(1)));
-        assert!(wait_for_proxy_count(&state, 1, Duration::from_secs(30)).await);
+        // Publish the way the CP runtime does: store the authoritative snapshot,
+        // then broadcast it. A recovery snapshot (broadcast lag or resubscribe)
+        // then carries this generation rather than the cold-start one.
+        // `broadcast_update` reports false both for an over-limit message and
+        // for a missing subscriber, so every publication is also proven to fit
+        // the ConfigSync size bound and to reach the DP's subscription.
+        let publish = |config: GatewayConfig| {
+            let config = Arc::new(config);
+            cp_config.store(Arc::clone(&config));
+            assert!(
+                CpGrpcServer::broadcast_update(&tx, &config),
+                "publication refused or undelivered; CP subscribers: {}",
+                tx.receiver_count()
+            );
+            config.loaded_at.to_rfc3339()
+        };
+        let mut probe = DpProbe {
+            state: &state,
+            connection: &connection,
+            tx: &tx,
+            logs: &logs,
+            dp_task: &mut dp_task,
+        };
+        let shrunk = publish(make_config(1));
+        probe.wait_for("shrink", 1, &shrunk).await;
         assert_serves(0).await;
-        let grown = make_config(count + 1);
-        assert!(CpGrpcServer::broadcast_update(&tx, &grown));
-        assert!(wait_for_proxy_count(&state, count + 1, Duration::from_secs(30)).await);
+        let grown = publish(make_config(count + 1));
+        probe.wait_for("growth", count + 1, &grown).await;
         assert_serves(count).await;
-        let growth_delta = delta(make_config(count + 2).proxies);
+        let grown_again = make_config(count + 2);
+        let growth_delta = delta(grown_again.proxies.clone());
+        let delta_version = growth_delta.poll_timestamp.to_rfc3339();
         assert!(serde_json::to_vec(&growth_delta).unwrap().len() > 4 * 1024 * 1024);
+        cp_config.store(Arc::new(grown_again));
         assert!(CpGrpcServer::broadcast_delta_with_trust_bundles(
             &tx,
             &growth_delta,
-            &growth_delta.poll_timestamp.to_rfc3339(),
+            &delta_version,
             GatewayTrustPublication::Unchanged,
         ));
-        assert!(wait_for_proxy_count(&state, count + 2, Duration::from_secs(30)).await);
+        probe.wait_for("delta", count + 2, &delta_version).await;
         assert_serves(count + 1).await;
         assert!(!connection.load().config_diverged);
         assert!(!dp_task.is_finished());
