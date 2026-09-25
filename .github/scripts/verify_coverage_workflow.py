@@ -141,7 +141,9 @@ FUNCTIONAL_STEP_TOKENS = (
     "nextest --test functional_tests",
     "--run-ignored all",
     '-E "$FUNCTIONAL_FILTERSET"',
-    "ln -sfn ../llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge",
+    "-E 'none()'",
+    "ln -f target/llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge",
+    "cargo llvm-cov --no-report --no-clean",
     "FERRUM_EDGE_TEST_BIN: ${{ github.workspace }}/target/llvm-cov-target/debug/ferrum-edge",
     'FERRUM_SKIP_GATEWAY_BUILD: "1"',
     "LLVM_PROFILE_FILE_NAME: ferrum-edge-functional-%4m.profraw",
@@ -698,8 +700,9 @@ jobs:
         run: docker run -d mongo:7
       - if: matrix.kind == 'functional'
         run: |
-          ln -sfn ../llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge
-          cargo llvm-cov --no-report nextest --test functional_tests --run-ignored all -E "$FUNCTIONAL_FILTERSET"
+          cargo llvm-cov --no-report nextest --test functional_tests --no-tests=pass -E 'none()'
+          ln -f target/llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge
+          cargo llvm-cov --no-report --no-clean nextest --test functional_tests --run-ignored all -E "$FUNCTIONAL_FILTERSET"
         env:
           FUNCTIONAL_FILTERSET: ${{ matrix.filterset }}
           FUNCTIONAL_PARTITION: ${{ matrix.partition }}
@@ -803,9 +806,14 @@ jobs:
             "narrowed lib-unit coverage set",
         ),
         (
+            "ln -f target/llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge",
             "ln -sfn ../llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge",
-            "true",
-            "uninstrumented fixed-path gateway binary",
+            "symlinked fixed-path gateway binary",
+        ),
+        (
+            "cargo llvm-cov --no-report --no-clean",
+            "cargo llvm-cov --no-report",
+            "test run cleans the pre-built gateway",
         ),
         (
             'FERRUM_SKIP_GATEWAY_BUILD: "1"',

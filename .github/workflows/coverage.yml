@@ -370,12 +370,19 @@ jobs:
         if: matrix.kind == 'functional'
         run: |
           set -euo pipefail
+          # Build the test binary and the instrumented gateway first, running
+          # no test, so a compile failure fails the shard outright.
+          cargo llvm-cov --no-report \
+            nextest --test functional_tests \
+            --no-tests=pass \
+            -E 'none()'
           # Several functional suites resolve the gateway through the fixed
-          # ./target/debug/ferrum-edge path rather than FERRUM_EDGE_TEST_BIN.
-          # Point that path at the instrumented binary; the link dangles until
-          # the nextest build below produces it.
+          # ./target/debug/ferrum-edge path rather than FERRUM_EDGE_TEST_BIN,
+          # and the CLI suite hard-links that path into temp directories.
+          # A symlink would be linked as a dangling relative link there, so
+          # hard-link the real instrumented binary instead.
           mkdir -p target/debug
-          ln -sfn ../llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge
+          ln -f target/llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge
           filters=()
           while IFS= read -r filter; do
             [ -z "$filter" ] && continue
@@ -391,7 +398,9 @@ jobs:
           started="${RUNNER_TEMP}/functional-coverage-started"
           touch "$started"
           status=0
-          cargo llvm-cov --no-report \
+          # `--no-clean`: every cargo-llvm-cov invocation otherwise runs
+          # `cargo clean -p ferrum-edge` and rebuilds the binary linked above.
+          cargo llvm-cov --no-report --no-clean \
             nextest --test functional_tests \
             --run-ignored all \
             --no-fail-fast \
@@ -399,10 +408,6 @@ jobs:
             -E "$FUNCTIONAL_FILTERSET" \
             "${nextest_args[@]}" \
             "${filters[@]}" || status=$?
-          if [ ! -x target/llvm-cov-target/debug/ferrum-edge ]; then
-            echo "::error::the instrumented ferrum-edge binary was not built"
-            exit 1
-          fi
           profiles="$(find target/llvm-cov-target -name '*.profraw' -newer "$started" | wc -l)"
           echo "functional coverage profiles written: ${profiles}"
           if [ "$profiles" -eq 0 ]; then

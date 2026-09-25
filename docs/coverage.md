@@ -267,12 +267,17 @@ Path-scoped plans never select the functional shards; a scoped plan that
 selects every integration shard is promoted to the full matrix, which includes
 them.
 
-Each functional shard builds `functional_tests` under `cargo llvm-cov nextest`,
-which also builds the instrumented `ferrum-edge` binary into
-`target/llvm-cov-target/debug/`. The step exports it as `FERRUM_EDGE_TEST_BIN`,
-links the fixed `target/debug/ferrum-edge` path several suites still use to
-it, and sets `FERRUM_SKIP_GATEWAY_BUILD=1` so no test process rebuilds an
-uninstrumented binary. The spawned gateways inherit `LLVM_PROFILE_FILE` and
+Each functional shard first builds `functional_tests` under
+`cargo llvm-cov nextest` with a filter that selects no test, which also builds
+the instrumented `ferrum-edge` binary into `target/llvm-cov-target/debug/`. The
+step exports it as `FERRUM_EDGE_TEST_BIN` and hard-links it to the fixed
+`target/debug/ferrum-edge` path several suites still use. It is a hard link, not
+a symlink, because `functional_cli_test` hard-links that path into temp
+directories, and a relative symlink copied that way dangles. The test run then
+passes `--no-clean`, since every cargo-llvm-cov invocation otherwise runs
+`cargo clean -p ferrum-edge` and rebuilds the linked binary. The step sets
+`FERRUM_SKIP_GATEWAY_BUILD=1` so no test process rebuilds an uninstrumented
+binary. The spawned gateways inherit `LLVM_PROFILE_FILE` and
 write their profiles next to the test binaries' profiles when they exit. The
 step sets `LLVM_PROFILE_FILE_NAME=ferrum-edge-functional-%4m.profraw`: the
 default cargo-llvm-cov name carries `%p`, which would write one multi-megabyte
