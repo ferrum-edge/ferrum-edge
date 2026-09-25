@@ -26649,12 +26649,19 @@ components:
           minimum: 1
           maximum: 18446744073709551615
           description: Successful backend samples required before latency-based limit changes are applied.
+        baseline_window_samples:
+          type: integer
+          format: uint64
+          default: 1000
+          minimum: 1
+          maximum: 18446744073709551615
+          description: Healthy backend samples per latency-baseline window, counted per target key. The learned baseline is the minimum latency of the current and the previous window, so an unusually fast outlier stops tightening the latency target once two windows have closed after it (at most `2 × baseline_window_samples` healthy samples), and saturated healthy traffic can then regain capacity. A sustained latency increase is measured against the older, faster window and keeps shrinking the limit until that window rolls out; explicit backend failures always shrink it. Changing this value is a compatible reload that keeps learned state.
         target_latency_multiplier:
           type: number
           format: double
           default: 1.5
           exclusiveMinimum: 1
-          description: Target latency threshold as a multiple of the learned minimum observed backend latency.
+          description: Target latency threshold as a multiple of the learned windowed-minimum backend latency (see `baseline_window_samples`).
         decrease_ratio:
           type: number
           format: double

@@ -12233,6 +12233,7 @@ fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
         "initial_limit",
         "max_limit",
         "min_samples",
+        "baseline_window_samples",
         "increase_step",
     ] {
         assert_eq!(
