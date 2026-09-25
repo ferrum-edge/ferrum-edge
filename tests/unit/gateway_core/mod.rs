@@ -169,6 +169,7 @@ mod response_pipeline_ordering_tests;
 mod response_representation_tests;
 mod response_trailer_policy_tests;
 mod retry_tests;
+mod route_attempt_budget_tests;
 mod route_body_size_ceiling_tests;
 mod route_request_deadline_tests;
 mod router_cache_tests;

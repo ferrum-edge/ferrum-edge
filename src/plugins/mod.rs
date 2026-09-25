@@ -2522,6 +2522,28 @@ pub struct RequestContext {
     /// this: their route deadline is folded into `grpc_deadline_at` instead, so
     /// the existing absolute-deadline machinery owns their terminals.
     pub(crate) route_request_deadline_at: Option<tokio::time::Instant>,
+    /// Route-scoped per-attempt TOTAL budget for a NON-gRPC request, armed by
+    /// [`Self::arm_route_request_deadline`] from the matched rule's
+    /// [`Self::route_override_attempt_timeout_ms`]. Proxy core starts a fresh
+    /// budget for every backend attempt once that attempt is handed to the
+    /// backend. gRPC-flavored requests never set this: they fold the budget
+    /// into `grpc_deadline_at` instead (see
+    /// [`Self::grpc_route_attempt_timeout`]).
+    pub(crate) route_attempt_timeout: Option<Duration>,
+    /// The same per-attempt budget for a gRPC-flavored request. While it is
+    /// set, `grpc_deadline_at` is the earlier of the receipt-anchored total
+    /// budget and the current attempt's budget, so the existing RPC deadline
+    /// machinery owns its terminals and the backend is told the attempt's
+    /// remaining budget in `grpc-timeout`.
+    pub(crate) grpc_route_attempt_timeout: Option<Duration>,
+    /// The current gRPC attempt's budget instant while it is the BINDING RPC
+    /// deadline (strictly earlier than the receipt-anchored total), set by
+    /// [`Self::begin_grpc_route_attempt`] and cleared by
+    /// [`Self::end_grpc_route_attempt`]. An RPC-deadline expiry after the
+    /// request was sent is then the rule's per-attempt backend bound, charged
+    /// to the backend, not the client's deadline
+    /// ([`Self::grpc_deadline_is_route_attempt_budget`]).
+    pub(crate) grpc_route_attempt_deadline_at: Option<tokio::time::Instant>,
     /// Once any `grpc_deadline` instance requests gateway-time subtraction,
     /// every later instance forwards the same remaining budget instead of
     /// subtracting receipt-to-hook elapsed time again.
@@ -3220,6 +3242,17 @@ pub struct RequestContext {
     /// matching `mesh_route_dispatch` rule replaces it like every other
     /// override field.
     pub route_override_request_timeout_ms: Option<u64>,
+    /// Plugin-set TOTAL bound on each backend attempt for the matched rule, in
+    /// milliseconds (Gateway API `HTTPRoute.rules[].timeouts.backendRequest`).
+    ///
+    /// Where [`Self::route_override_backend_read_timeout_ms`] bounds an
+    /// attempt's header wait and the idle gap between frames, this bounds the
+    /// attempt's whole duration, response body included. Every retry attempt
+    /// gets a fresh budget, and [`Self::route_override_request_timeout_ms`]
+    /// still bounds the whole transaction. Request-scoped policy only, like
+    /// the total deadline: it never changes the effective `Proxy` and is not
+    /// part of [`Self::has_route_overrides`].
+    pub route_override_attempt_timeout_ms: Option<u64>,
     /// Plugin-set override for the proxy's backend connect timeout.
     ///
     /// Counterpart to [`Self::route_override_backend_read_timeout_ms`] for
@@ -3816,6 +3849,9 @@ impl RequestContext {
             grpc_deadline_budget_ms: None,
             grpc_deadline_at: None,
             route_request_deadline_at: None,
+            route_attempt_timeout: None,
+            grpc_route_attempt_timeout: None,
+            grpc_route_attempt_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
@@ -3910,6 +3946,7 @@ impl RequestContext {
             route_override_resolved_tls: None,
             route_override_backend_read_timeout_ms: None,
             route_override_request_timeout_ms: None,
+            route_override_attempt_timeout_ms: None,
             route_override_backend_connect_timeout_ms: None,
             route_override_retry: None,
             route_override_request_transform: None,
@@ -4320,31 +4357,124 @@ impl RequestContext {
     /// the route budget wins), so the existing gRPC deadline machinery owns its
     /// dispatch, backoff, response-body, and `DEADLINE_EXCEEDED` terminals and
     /// the remaining budget is what is forwarded upstream as `grpc-timeout`.
-    /// Folding only ever shortens the budget, so re-arming is idempotent. Every
-    /// other request carries the instant in [`Self::route_request_deadline_at`].
+    /// Folding the total only ever shortens that budget. Every other request
+    /// carries the instant in [`Self::route_request_deadline_at`].
+    ///
+    /// The rule's per-attempt budget ([`Self::route_override_attempt_timeout_ms`])
+    /// is armed here too. A non-gRPC request carries it in
+    /// [`Self::route_attempt_timeout`], and proxy core starts it for each
+    /// attempt at the handoff to the backend. A gRPC-flavored request folds it
+    /// into its RPC deadline, anchored now (once the rule is selected); proxy
+    /// core re-arms a fresh budget for each retry attempt
+    /// ([`Self::begin_grpc_route_attempt`]).
+    ///
+    /// Re-arming is therefore NOT idempotent for a gRPC-flavored rule that
+    /// carries an attempt budget: every arm restarts that budget from now (it
+    /// can move later, never past the total), which is still before the
+    /// attempt is handed to the backend.
     ///
     /// Public only for external contract tests; proxy core is the only
     /// production caller.
     #[doc(hidden)]
     pub fn arm_route_request_deadline(&mut self, grpc_flavored: bool) {
-        let Some(timeout_ms) = self
+        let request_timeout_ms = self
             .route_override_request_timeout_ms
+            .filter(|timeout_ms| *timeout_ms > 0);
+        let attempt_timeout = self
+            .route_override_attempt_timeout_ms
             .filter(|timeout_ms| *timeout_ms > 0)
-        else {
-            self.route_request_deadline_at = None;
-            return;
-        };
+            .map(Duration::from_millis);
         if grpc_flavored {
             self.route_request_deadline_at = None;
-            let budget_ms = self
-                .grpc_deadline_budget_ms
-                .map_or(timeout_ms, |current| current.min(timeout_ms));
-            self.set_grpc_deadline_budget(Some(budget_ms));
+            self.route_attempt_timeout = None;
+            // Drop the fold of an earlier arm first, so a re-arm whose rule no
+            // longer carries an attempt budget restores the total deadline.
+            self.end_grpc_route_attempt();
+            if let Some(timeout_ms) = request_timeout_ms {
+                let budget_ms = self
+                    .grpc_deadline_budget_ms
+                    .map_or(timeout_ms, |current| current.min(timeout_ms));
+                self.set_grpc_deadline_budget(Some(budget_ms));
+            }
+            self.grpc_route_attempt_timeout = attempt_timeout;
+            self.begin_grpc_route_attempt();
             return;
         }
-        self.route_request_deadline_at = self
-            .grpc_deadline_received_at
-            .checked_add(Duration::from_millis(timeout_ms));
+        self.end_grpc_route_attempt();
+        self.grpc_route_attempt_timeout = None;
+        self.route_attempt_timeout = attempt_timeout;
+        self.route_request_deadline_at = request_timeout_ms.and_then(|timeout_ms| {
+            self.grpc_deadline_received_at
+                .checked_add(Duration::from_millis(timeout_ms))
+        });
+    }
+
+    /// The matched route rule's per-attempt total budget for this NON-gRPC
+    /// request, armed by [`Self::arm_route_request_deadline`]. Always `None`
+    /// for a gRPC-flavored request, whose attempt budget is folded into
+    /// [`Self::grpc_deadline_at`] instead.
+    pub fn route_attempt_timeout(&self) -> Option<Duration> {
+        self.route_attempt_timeout
+    }
+
+    /// Start a fresh per-attempt budget on a gRPC-flavored request: the RPC
+    /// deadline becomes the earlier of the receipt-anchored total budget and
+    /// `now + attempt budget`. On a tie the total binds, exactly as a
+    /// non-gRPC request reports a total-deadline expiry when both elapse
+    /// together. A no-op unless the matched rule carries an attempt budget.
+    ///
+    /// Public only for external contract tests; proxy core is the only
+    /// production caller.
+    #[doc(hidden)]
+    pub fn begin_grpc_route_attempt(&mut self) {
+        let Some(attempt_timeout) = self.grpc_route_attempt_timeout else {
+            return;
+        };
+        let total = self.grpc_total_deadline_at();
+        let attempt = tokio::time::Instant::now().checked_add(attempt_timeout);
+        self.grpc_route_attempt_deadline_at =
+            attempt.filter(|attempt| total.is_none_or(|total| *attempt < total));
+        self.grpc_deadline_at = match (total, attempt) {
+            (Some(total), Some(attempt)) => Some(total.min(attempt)),
+            (total, attempt) => total.or(attempt),
+        };
+    }
+
+    /// Whether the RPC deadline in force is the current attempt's route budget
+    /// (`attempt_timeout_ms`, Gateway API `timeouts.backendRequest`) rather
+    /// than the receipt-anchored total (the client `grpc-timeout`, a
+    /// `grpc_deadline` policy, or the route's `timeouts.request`). Proxy core
+    /// charges an expiry raised after the request was sent to the backend
+    /// while this holds, exactly as it charges a stalled backend under
+    /// `timeout_ms` alone.
+    pub fn grpc_deadline_is_route_attempt_budget(&self) -> bool {
+        self.grpc_route_attempt_deadline_at
+            .is_some_and(|attempt| self.grpc_deadline_at == Some(attempt))
+    }
+
+    /// End the current gRPC attempt's budget: the RPC deadline reverts to the
+    /// receipt-anchored total, so retry backoff is bounded by the total budget
+    /// alone and never by the attempt that just failed. A no-op unless the
+    /// matched rule carries an attempt budget.
+    ///
+    /// Public only for external contract tests; proxy core is the only
+    /// production caller.
+    #[doc(hidden)]
+    pub fn end_grpc_route_attempt(&mut self) {
+        if self.grpc_route_attempt_timeout.is_some() {
+            self.grpc_deadline_at = self.grpc_total_deadline_at();
+        }
+        self.grpc_route_attempt_deadline_at = None;
+    }
+
+    /// The receipt-anchored total RPC deadline — the client / `grpc_deadline`
+    /// policy budget with any route total folded in — without the current
+    /// attempt's budget.
+    fn grpc_total_deadline_at(&self) -> Option<tokio::time::Instant> {
+        self.grpc_deadline_budget_ms.and_then(|budget| {
+            self.grpc_deadline_received_at
+                .checked_add(Duration::from_millis(budget))
+        })
     }
 
     /// Attribute a gateway-authored route-deadline terminal in the transaction
@@ -5158,6 +5288,9 @@ impl RequestContext {
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
             grpc_deadline_at: self.grpc_deadline_at,
             route_request_deadline_at: self.route_request_deadline_at,
+            route_attempt_timeout: self.route_attempt_timeout,
+            grpc_route_attempt_timeout: self.grpc_route_attempt_timeout,
+            grpc_route_attempt_deadline_at: self.grpc_route_attempt_deadline_at,
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             backend_dispatch_state: self.backend_dispatch_state,
@@ -5354,6 +5487,7 @@ impl RequestContext {
             route_override_resolved_tls: self.route_override_resolved_tls.clone(),
             route_override_backend_read_timeout_ms: self.route_override_backend_read_timeout_ms,
             route_override_request_timeout_ms: self.route_override_request_timeout_ms,
+            route_override_attempt_timeout_ms: self.route_override_attempt_timeout_ms,
             route_override_backend_connect_timeout_ms: self
                 .route_override_backend_connect_timeout_ms,
             route_override_retry: self.route_override_retry.clone(),

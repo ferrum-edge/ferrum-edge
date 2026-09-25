@@ -23767,6 +23767,8 @@ components:
                     properties: {timeout_disabled: {const: true}}
                   - required: [request_timeout_ms]
                     properties: {request_timeout_ms: {type: integer}}
+                  - required: [attempt_timeout_ms]
+                    properties: {attempt_timeout_ms: {type: integer}}
                   - required: [retry]
                     properties: {retry: {type: object}}
                   - required: [retry_disabled]
@@ -23800,7 +23802,8 @@ components:
                   configured, UNLESS the rule carries a route action
                   (`request_transform`, `response_transform`, `fault`,
                   `rewrite`, `redirect`, `timeout_ms`,
-                  `timeout_disabled: true`, `request_timeout_ms`, `retry`, or
+                  `timeout_disabled: true`, `request_timeout_ms`,
+                  `attempt_timeout_ms`, `retry`, or
                   `retry_disabled: true`), which makes an empty match the
                   translator's deliberate action-only catch-all. An empty
                   match with no route action is rejected at load time because
@@ -24137,6 +24140,35 @@ components:
                   rule carrying this field. Upgraded WebSocket / CONNECT-UDP
                   tunnels are not bounded by it. `0` is rejected; omit the field
                   for no route deadline.
+              attempt_timeout_ms:
+                type: [integer, "null"]
+                format: uint64
+                minimum: 1
+                description: |
+                  Optional TOTAL bound on each backend attempt for this rule, in
+                  milliseconds (Gateway API
+                  `HTTPRoute.rules[].timeouts.backendRequest`, which the
+                  translator also projects as `timeout_ms`). The budget starts
+                  when the attempt is handed to the backend and covers its
+                  response head and its whole response body; every retry
+                  attempt gets a fresh budget, and `request_timeout_ms`, when
+                  set, still bounds the whole transaction. It is independent of
+                  `timeout_ms` / `timeout_disabled`, which keep bounding the
+                  header wait and the idle gap between frames. Expiry before a
+                  non-gRPC response head answers the ordinary backend-timeout
+                  `504` (retried when the rule's `retry` lists `504`); expiry
+                  after the head has been sent is never retried and cuts the
+                  body exactly like `request_timeout_ms` does (HTTP/2 stream
+                  reset, HTTP/1.1 connection close, health-neutral). A gRPC
+                  request folds it into its RPC deadline, anchored when the rule
+                  is selected and re-armed for each retry attempt, and ends with
+                  `DEADLINE_EXCEEDED`. Request-scoped: it never changes the
+                  selected proxy or upstream. Like `request_timeout_ms`, a
+                  non-gRPC request on the native HTTP/3 frontend is refused
+                  with `503` because that relay cannot yet enforce it, and
+                  HTTP/3 is not advertised (`Alt-Svc`) on a frontend port that
+                  serves such a rule. `0` is rejected; omit the field for no
+                  per-attempt total bound.
               retry:
                 oneOf:
                   - $ref: "#/components/schemas/MeshRouteRetryConfig"

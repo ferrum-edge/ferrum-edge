@@ -433,9 +433,14 @@ rule-level `ResponseHeaderModifier` (HTTPRoute and GRPCRoute) and HTTPRoute
 enforced. GRPCRoute `timeouts` and `retry`, `RequestMirror`, `ExtensionRef`,
 `CORS`, `ExternalAuth` and backend-reference filters are still refused as
 described above. An HTTPRoute that carried `retry` and was previously refused
-is now accepted and retries the requests its rule matches. The current
-admission contract, including the remaining refusals and the HTTP/3
-`request`-timeout limitation, is
+is now accepted and retries the requests its rule matches. `backendRequest`
+bounds each attempt until its full response has been received (a fresh budget
+per retry attempt). **Any response that takes longer than that budget to
+deliver is cut** — not only a trickled body, but also a large fast download, a
+Server-Sent Events stream, a long poll, and a server-streaming gRPC call — so
+size `backendRequest` for the longest complete response the rule must serve,
+or omit it. The current admission contract, including the remaining refusals
+and the HTTP/3 `request`- and `backendRequest`-timeout limitations, is
 [`docs/gateway_api_conformance.md`](gateway_api_conformance.md).
 
 ### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))

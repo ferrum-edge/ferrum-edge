@@ -302,6 +302,39 @@ fn alt_svc_is_withheld_only_where_a_timed_rule_is_served() {
     assert!(!withholds(&disabled, Some(TIMED_PORT)));
 }
 
+#[test]
+fn alt_svc_is_withheld_where_a_rule_bounds_each_attempt() {
+    // Gateway API `backendRequest` projects `attempt_timeout_ms` beside
+    // `timeout_ms`. Native HTTP/3 cannot enforce that per-attempt total bound
+    // on a non-gRPC request either, so it withholds HTTP/3 exactly like a
+    // total request deadline.
+    let attempt_bounded_rule = json!({
+        "match": {},
+        "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+        "timeout_ms": 500,
+        "attempt_timeout_ms": 500
+    });
+    let scoped = config(
+        vec![
+            proxy("api", Some(TIMED_PORT)),
+            proxy("web", Some(OTHER_PORT)),
+        ],
+        vec![dispatch_plugin(
+            "proxy",
+            Some("api"),
+            attempt_bounded_rule.clone(),
+        )],
+    );
+    assert!(withholds(&scoped, Some(TIMED_PORT)));
+    assert!(!withholds(&scoped, Some(OTHER_PORT)));
+
+    let global = config(
+        vec![proxy("api", Some(TIMED_PORT))],
+        vec![dispatch_plugin("global", None, attempt_bounded_rule)],
+    );
+    assert!(withholds(&global, Some(OTHER_PORT)));
+}
+
 #[tokio::test]
 async fn the_gateway_stops_advertising_http3_where_a_timed_rule_is_served() {
     use ferrum_edge::config::env_config::EnvConfig;

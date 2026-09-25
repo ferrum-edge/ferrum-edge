@@ -149,6 +149,9 @@ fn http_route_timeouts_project_onto_the_selected_dispatch_rule_only() {
     assert_eq!(timed.len(), 1, "{rules:?}");
     assert_eq!(timed[0]["request_timeout_ms"], 120_000);
     assert_eq!(timed[0]["timeout_ms"], 60_500);
+    // `backendRequest` also bounds each attempt's TOTAL duration (until its
+    // full response has been received), not only its header wait and idle gap.
+    assert_eq!(timed[0]["attempt_timeout_ms"], 60_500);
     assert!(timed[0].get("timeout_disabled").is_none());
 
     // `0s` disables both bounds: no total deadline, and the per-attempt bound
@@ -160,6 +163,7 @@ fn http_route_timeouts_project_onto_the_selected_dispatch_rule_only() {
     assert_eq!(disabled.len(), 1, "{rules:?}");
     assert_eq!(disabled[0]["timeout_disabled"], true);
     assert!(disabled[0].get("timeout_ms").is_none());
+    assert!(disabled[0].get("attempt_timeout_ms").is_none());
     assert!(disabled[0].get("request_timeout_ms").is_none());
 
     // The sibling rule carries no timeout policy of its own.
@@ -167,7 +171,12 @@ fn http_route_timeouts_project_onto_the_selected_dispatch_rule_only() {
         .iter()
         .find(|rule| rule["match"]["headers"]["x-variant"] == "one")
         .expect("untimed sibling rule");
-    for field in ["request_timeout_ms", "timeout_ms", "timeout_disabled"] {
+    for field in [
+        "request_timeout_ms",
+        "timeout_ms",
+        "attempt_timeout_ms",
+        "timeout_disabled",
+    ] {
         assert!(untimed.get(field).is_none(), "{field}: {untimed}");
     }
 

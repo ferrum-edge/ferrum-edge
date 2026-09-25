@@ -12887,6 +12887,30 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             parity_rule(json!({"request_timeout_ms": 0})),
             false,
         ),
+        // `backendRequest` projects a per-attempt total bound as well.
+        (
+            "attempt_timeout_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "attempt_timeout_ms": 250
+            }]}),
+            true,
+        ),
+        (
+            "attempt_timeout_with_backend_and_request_timeouts",
+            parity_rule(json!({
+                "request_timeout_ms": 10_000,
+                "timeout_ms": 2_000,
+                "attempt_timeout_ms": 2_000
+            })),
+            true,
+        ),
+        (
+            "attempt_timeout_zero",
+            parity_rule(json!({"attempt_timeout_ms": 0})),
+            false,
+        ),
     ] {
         assert_component_validity(&spec, "MeshRouteDispatchConfig", &config, accepted);
         assert_eq!(

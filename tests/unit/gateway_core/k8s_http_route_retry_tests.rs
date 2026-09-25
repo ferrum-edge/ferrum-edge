@@ -224,6 +224,8 @@ fn http_route_retry_composes_with_rule_timeouts() {
         .expect("timed retry rule");
     assert_eq!(rule["request_timeout_ms"], 2_000, "{rule}");
     assert_eq!(rule["timeout_ms"], 500, "{rule}");
+    // Each retry attempt runs under its own `backendRequest` budget.
+    assert_eq!(rule["attempt_timeout_ms"], 500, "{rule}");
     assert_eq!(rule["retry"]["max_retries"], 3, "{rule}");
     assert_every_plugin_constructs(&plugins);
 }

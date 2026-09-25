@@ -166,10 +166,17 @@ CRD does: each must match the GEP-2257 duration grammar, and a non-zero
 `request` must not be shorter than `backendRequest` (the CRD's CEL rule).
 Violations, a non-string value and a non-object `timeouts` are `Invalid`; an
 undefined `timeouts` sub-field is `UnsupportedValue`. `0s` disables either
-bound. `backendRequest` bounds one backend attempt (its wait for response
-headers and the idle gap between response frames) and answers the ordinary
-backend-timeout `504`. `request` is one absolute budget, anchored at request
-receipt, covering every attempt, retry backoff and the streaming response body:
+bound. `backendRequest` bounds each backend attempt from its handoff to the
+backend until its full response has been received, with a fresh budget for
+every retry attempt: expiry before the head answers the ordinary
+backend-timeout `504` (retried when the rule's `retry` lists `504`, replaying
+the request body the attempt retained), expiry while the body streams cuts it
+like the `request` cut below, and a gRPC request folds it into its RPC deadline
+and charges an expiry after the request was sent to the backend. Any response
+longer than the budget is cut — a large fast download, Server-Sent Events, a
+long poll or a server-streaming gRPC call, not only a trickled body — and a
+streamed upload's time after the handoff counts against it. `request` is one
+absolute budget, anchored at request receipt, covering every attempt, retry backoff and the streaming response body:
 before the response head a non-gRPC request gets a gateway `504`
 (`{"error":"Request timeout"}`), a body still streaming at the deadline is
 reset (HTTP/2) or its connection closed (HTTP/1.1), and a gRPC request folds the
@@ -184,13 +191,18 @@ body cut by `request` keeps a backend `Content-Length` advertised.
 
 **Known deviations in the declared rule-timeout features:**
 
-- **`HTTPRouteBackendTimeout`:** upstream v1.5.1 defines `backendRequest` as the
-  time from when a request starts being sent to the backend until its full
-  response is received, per attempt. Ferrum bounds each attempt's wait for the
-  response head and every idle gap between response frames, not the attempt's
-  total duration, so a backend trickling its body inside the idle gap is not cut
-  per attempt; only `request` cuts it, and a rule without a non-zero `request`
-  has no total bound. The upstream test delays only the response head.
+- **`HTTPRouteBackendTimeout`:** upstream v1.5.1 defines `backendRequest` as
+  the time from when a request starts being sent to the backend until its full
+  response is received, per attempt. HTTP/1.1 and HTTP/2 enforce that for
+  non-gRPC requests. A gRPC or gRPC-Web call folds the budget into its RPC
+  deadline when the rule is selected rather than at the handoff (stricter:
+  gateway-side time before the handoff counts against the first attempt), and a
+  gRPC budget expiry is not retried, since gRPC calls are retried only after
+  connection failures. Native HTTP/3 cannot bound a non-gRPC attempt's total
+  duration, so, exactly as for `request` below, it refuses such a request with
+  `503` and `Alt-Svc` is withheld on every listener port that serves such a
+  rule. The upstream test delays only the response head, which every frontend
+  bounds.
 - **`HTTPRouteRequestTimeout` over HTTP/3:** native HTTP/3 cannot yet enforce
   `request` on a non-gRPC request, so such a request is refused with `503`
   before any dial rather than served without its deadline. Because browsers
@@ -311,9 +323,19 @@ timeouts:
 `gateway_route_request_timeout_spans_retry_attempts_and_backoff` (one budget
 across attempts and backoff under an operator-configured proxy retry),
 `gateway_route_request_timeout_ends_grpc_calls_with_deadline_exceeded`,
-`removing_rule_timeouts_withdraws_the_deadline`, and three backend-health
+`removing_rule_timeouts_withdraws_the_deadline`, three backend-health
 attribution regressions through a live circuit breaker (a stalled client upload
-and a mid-body cut are not charged; a backend stalling its response head is).
+and a mid-body cut are not charged; a backend stalling its response head is),
+and seven per-attempt `backendRequest` regressions:
+`gateway_route_backend_request_bounds_each_attempt_until_its_full_response` (a
+trickled body cut with no `request` budget, a sibling and the rule without the
+per-attempt field streaming it to the end),
+`gateway_route_backend_request_gives_each_retry_attempt_a_fresh_budget`,
+`gateway_route_request_timeout_still_bounds_backend_request_retries`,
+`gateway_route_backend_request_bounds_grpc_attempts_until_the_full_response`,
+`gateway_route_backend_request_charges_a_grpc_backend_that_stalls_response_headers`,
+`gateway_route_backend_request_cuts_a_retry_body_at_its_own_budget` and
+`attempt_budget_shorter_than_the_header_wait_retries_with_the_retained_body`.
 Rule `retry` is covered by `gateway_route_retry_reaches_the_data_plane` (exact
 backend attempt counts for a listed status, one attempt for an unlisted status,
 a `POST`, `attempts: 0` and a sibling rule, a recovering retry, and `backoff` as

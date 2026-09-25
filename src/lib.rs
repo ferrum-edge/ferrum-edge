@@ -11758,12 +11758,71 @@ pub mod _test_support {
         deadline: Option<tokio::time::Instant>,
         attempt: F,
     ) -> Result<F::Output, &'static str> {
-        crate::proxy::await_route_request_deadline(deadline, attempt)
+        crate::proxy::await_route_request_deadline(deadline, None, attempt)
             .await
-            .map_err(|expiry| match expiry {
-                crate::proxy::RouteDeadlineExpiry::BeforeDispatch => "not_started",
-                crate::proxy::RouteDeadlineExpiry::InFlight => "in_flight",
-            })
+            .map_err(route_deadline_expiry_label)
+    }
+
+    /// Drive one backend attempt through the route deadline wrapper with a
+    /// per-attempt budget (`attempt_timeout_ms`), exactly as proxy core does.
+    /// `handed_to_backend` is the attempt's dispatch marker: `None` starts the
+    /// budget on the first poll (a retry attempt), `Some` once the marker is
+    /// set (an initial attempt). Returns the outcome — `Err` additionally
+    /// names `"attempt_budget"` — and the instant the budget expires at, once
+    /// it started, which proxy core also applies to the committed body.
+    pub async fn await_route_attempt_budget_for_test<F: std::future::Future>(
+        deadline: Option<tokio::time::Instant>,
+        attempt_timeout: std::time::Duration,
+        handed_to_backend: Option<&std::sync::atomic::AtomicBool>,
+        attempt: F,
+    ) -> (
+        Result<F::Output, &'static str>,
+        Option<tokio::time::Instant>,
+    ) {
+        let mut armed_deadline = None;
+        let budget = match handed_to_backend {
+            Some(marker) => crate::proxy::RouteAttemptBudget::from_handoff(
+                Some(attempt_timeout),
+                marker,
+                &mut armed_deadline,
+            ),
+            None => crate::proxy::RouteAttemptBudget::from_start(
+                Some(attempt_timeout),
+                &mut armed_deadline,
+            ),
+        };
+        let outcome = crate::proxy::await_route_request_deadline(deadline, budget, attempt)
+            .await
+            .map_err(route_deadline_expiry_label);
+        (outcome, armed_deadline)
+    }
+
+    fn route_deadline_expiry_label(expiry: crate::proxy::RouteDeadlineExpiry) -> &'static str {
+        match expiry {
+            crate::proxy::RouteDeadlineExpiry::BeforeDispatch => "not_started",
+            crate::proxy::RouteDeadlineExpiry::InFlight => "in_flight",
+            crate::proxy::RouteDeadlineExpiry::AttemptBudget => "attempt_budget",
+        }
+    }
+
+    /// The response proxy core builds for an attempt a route deadline
+    /// cancelled, and the transaction-log phase it records (`None` for a
+    /// per-attempt budget expiry, which is an ordinary retryable backend
+    /// timeout rather than a spent transaction). `expiry` is one of
+    /// `"not_started"`, `"in_flight"`, or `"attempt_budget"`.
+    pub fn route_deadline_expiry_response_for_test(
+        expiry: &str,
+        handed_to_backend: bool,
+    ) -> (crate::retry::BackendResponse, Option<&'static str>) {
+        let expiry = match expiry {
+            "not_started" => crate::proxy::RouteDeadlineExpiry::BeforeDispatch,
+            "in_flight" => crate::proxy::RouteDeadlineExpiry::InFlight,
+            _ => crate::proxy::RouteDeadlineExpiry::AttemptBudget,
+        };
+        let mut phase = None;
+        let response =
+            crate::proxy::route_deadline_expiry_response(expiry, handed_to_backend, &mut phase);
+        (response, phase)
     }
 
     /// The transaction-log phase and dispatch error class proxy core records
@@ -11787,8 +11846,8 @@ pub mod _test_support {
 
     /// Whether `config` withholds the HTTP/3 `Alt-Svc` advertisement on
     /// `frontend_port` because a route rule reachable there carries a total
-    /// request deadline — the rule `ProxyState::alt_svc_for_frontend_port`
-    /// applies to every response.
+    /// request deadline or a per-attempt total bound — the rule
+    /// `ProxyState::alt_svc_for_frontend_port` applies to every response.
     pub fn route_timeout_withholds_alt_svc_for_test(
         config: &crate::config::types::GatewayConfig,
         frontend_port: Option<u16>,
