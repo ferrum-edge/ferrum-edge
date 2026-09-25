@@ -344,6 +344,11 @@ pub(crate) fn attribute_streaming_headers_deadline(
     route_deadline: Option<tokio::time::Instant>,
 ) -> H3AuthorizedHeadersWrite {
     let route_owns_expiry = match (route_deadline, grpc_deadline) {
+        // Defensive: unreachable on today's callers. Only native streaming
+        // HTTP/SSE relays commit HEADERS here, and a gRPC-flavored request
+        // folds its route bounds into its RPC deadline instead of carrying a
+        // route body deadline, so the two never coexist. Were they to, the
+        // route would own a tie: it is the bound whose cut this path applies.
         (Some(route), Some(grpc)) => route <= grpc,
         (Some(_), None) => true,
         (None, _) => false,

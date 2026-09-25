@@ -407,8 +407,9 @@ async fn functional_h3_route_request_timeout_cuts_a_client_that_stops_reading() 
         "https://localhost:{}/h3-local-policy/stalled-reader",
         gateway.https_port
     );
-    let started = Instant::now();
-    let mut stream = retry_open_response_stream(&client, &url).await;
+    // `started` is taken just before the attempt that opened the stream, so
+    // gateway-startup retries cannot pad the lower bound below.
+    let (started, mut stream) = retry_open_response_stream(&client, &url).await;
     let (status, _) = stream.recv_response().await.expect("response head");
     assert_eq!(status, StatusCode::OK);
     let first = stream
@@ -433,11 +434,19 @@ async fn functional_h3_route_request_timeout_cuts_a_client_that_stops_reading() 
         started.elapsed()
     );
 
-    // The truncated body ends in a stream reset, never a clean finish.
+    // The truncated body ends in the route cut's `H3_REQUEST_CANCELLED` reset,
+    // never a clean finish or any other reset code.
     let reset_by = Instant::now() + Duration::from_secs(5);
     loop {
         match tokio::time::timeout(Duration::from_secs(5), stream.recv_data()).await {
-            Ok(Err(_)) => break,
+            Ok(Err(err)) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains("H3_REQUEST_CANCELLED"),
+                    "the cut body must end in an H3_REQUEST_CANCELLED reset, got {err:?}"
+                );
+                break;
+            }
             Ok(Ok(Some(_))) => assert!(
                 Instant::now() < reset_by,
                 "the stalled stream kept receiving past the route deadline"
@@ -2029,11 +2038,20 @@ async fn retry_h3_post_with_headers(
     }
 }
 
-async fn retry_open_response_stream(client: &Http3Client, url: &str) -> Http3ResponseStream {
+/// Open a response stream, retrying while the gateway starts. Returns the
+/// instant taken immediately before the attempt that succeeded.
+async fn retry_open_response_stream(
+    client: &Http3Client,
+    url: &str,
+) -> (Instant, Http3ResponseStream) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match client.open_response_stream(url, GetOptions::default()).await {
-            Ok(stream) => return stream,
+        let attempt_started = Instant::now();
+        match client
+            .open_response_stream(url, GetOptions::default())
+            .await
+        {
+            Ok(stream) => return (attempt_started, stream),
             Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
             Err(err) => panic!("H3 response stream did not open: {err}"),
         }

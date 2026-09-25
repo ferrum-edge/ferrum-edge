@@ -8901,8 +8901,8 @@ not bounded by `request_timeout_ms`. Gateway-local plugin hooks are not
 cancelled mid-hook on a non-gRPC request: their time counts against the budget,
 which is enforced when each backend attempt starts, while it is awaited, in
 retry backoff, and while the response body streams. A client that stops reading
-a streamed response is not forced off by this deadline until the transport next
-polls the body.
+a streamed response is cut when the transport next polls the body on HTTP/1.1
+and HTTP/2, and at the deadline itself on HTTP/3.
 
 ##### Route attempt budget
 

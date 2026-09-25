@@ -486,8 +486,8 @@ async fn an_unbounded_response_write_passes_straight_through() {
 /// A native streaming HEADERS write that outlives its bound is the route's cut
 /// unless a client RPC deadline was strictly earlier; every other outcome is
 /// left alone.
-#[tokio::test(start_paused = true)]
-async fn a_parked_streaming_headers_write_is_attributed_to_the_route_deadline() {
+#[test]
+fn a_parked_streaming_headers_write_is_attributed_to_the_route_deadline() {
     let attribute = attribute_streaming_headers_deadline_for_test;
     let protocol = H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded;
     let route_cut = H3AuthorizedHeadersWrite::RouteDeadlineExceeded;
@@ -506,6 +506,22 @@ async fn a_parked_streaming_headers_write_is_attributed_to_the_route_deadline() 
     ] {
         assert_eq!(attribute(outcome, None, Some(now)), outcome);
     }
+}
+
+/// A native route cut resets with `H3_REQUEST_CANCELLED` BEFORE
+/// `abort_committed()`: the first reset code is the one on the wire, so the
+/// committed guard's own reset would otherwise replace the route cut's code.
+fn assert_route_cancel_precedes_abort(arm: &str, what: &str) {
+    let cancel = arm
+        .find("cancel_response_stream(")
+        .unwrap_or_else(|| panic!("{what}: no H3_REQUEST_CANCELLED reset"));
+    let abort = arm
+        .find("abort_committed()")
+        .unwrap_or_else(|| panic!("{what}: no committed reset"));
+    assert!(
+        cancel < abort,
+        "{what}: H3_REQUEST_CANCELLED must be sent before abort_committed()"
+    );
 }
 
 /// The source of each match arm that starts with `arm`, up to the next
@@ -568,7 +584,26 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
                     || arm.contains("H3TrailerFinishError::RouteDeadline"),
                 "http3/{file}.rs: a route expiry on a parked write must stay health-neutral"
             );
+            if file == "server" && !arm.contains("H3TrailerFinishError::RouteDeadline") {
+                assert_route_cancel_precedes_abort(arm, "http3/server.rs write seam");
+            }
         }
+    }
+
+    // The trailer/FIN seam reports its route expiry to the relay, which cuts.
+    let trailer_cuts = match_arms(
+        server,
+        "Err(H3TrailerFinishError::RouteDeadline) =>",
+        "Err(H3TrailerFinishError::",
+    );
+    assert_eq!(
+        trailer_cuts.len(),
+        3,
+        "every native relay must cut a trailer/FIN route expiry"
+    );
+    for arm in trailer_cuts {
+        assert!(arm.contains("route_deadline_cut = true"));
+        assert_route_cancel_precedes_abort(arm, "http3/server.rs trailer/FIN route cut");
     }
 
     // Native streaming HEADERS: the shared commit helper, with the route
@@ -596,6 +631,11 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
         header_cuts, 3,
         "every native HEADERS route expiry must be a route cut"
     );
+    for arm in &header_arms {
+        if arm.contains("cancel_response_stream(") {
+            assert_route_cancel_precedes_abort(arm, "http3/server.rs HEADERS route cut");
+        }
+    }
 
     // Bridge streaming HEADERS: the route deadline is composed into the write
     // bound, and its expiry is the route cut, not the gRPC-Web deadline
@@ -627,6 +667,68 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
     assert!(helper.contains("Some(ErrorClass::DispatchPolicyRejected)"));
     assert!(helper.contains("body_error_class: Some(ErrorClass::ReadWriteTimeout)"));
     assert!(helper.contains("client_disconnected: false"));
+}
+
+/// The bridge's buffered writer settles the backend exchange BEFORE its first
+/// downstream write, as the native HTTP/3 buffered writer does (PR #5741): the
+/// backend outcome and admission are recorded, with the backend's own
+/// classification, and the least-connections count is released, so a client
+/// that parks the HEADERS or body write in QUIC flow control cannot hold the
+/// backend admission permit. No client terminal after it records again.
+#[test]
+fn the_bridge_buffered_writer_settles_the_backend_before_the_client_write() {
+    let buffered = plain_bridge_dispatch()
+        .split("if should_buffer_response {")
+        .nth(1)
+        .expect("bridge buffered writer")
+        .split("// Only a live reqwest body can be streamed.")
+        .next()
+        .expect("bounded bridge buffered writer");
+    let first_write = buffered
+        .find("send_response_headers_with_framing(")
+        .expect("bridge buffered HEADERS write");
+    let (before_write, after_write) = buffered.split_at(first_write);
+
+    let outcome = before_write
+        .rfind("record_backend_outcome_no_conn_end(")
+        .expect("the backend outcome is settled before the client write");
+    let admission = before_write
+        .rfind("record_cross_protocol_backend_admission_outcome(")
+        .expect("admission is settled before the client write");
+    let guard = before_write
+        .rfind("drop(lb_connection_guard.take());")
+        .expect("the least-connections count is released before the client write");
+    assert!(outcome < admission && admission < guard);
+
+    // The backend's own classification: passive health takes the served
+    // status, the limiter the original backend status, and neither a
+    // client-side class.
+    let args = |at: usize| before_write[at..].split(");").next().unwrap_or_default();
+    let outcome_args = args(outcome);
+    assert!(outcome_args.contains("response_status,"));
+    assert!(outcome_args.contains("terminal_connection_error,"));
+    assert!(outcome_args.contains("terminal_error_class,"));
+    assert!(!outcome_args.contains("ErrorClass::"));
+    let admission_args = args(admission);
+    assert!(admission_args.contains("status,"));
+    assert!(!admission_args.contains("response_status"));
+    assert!(admission_args.contains("terminal_connection_error,"));
+    assert!(admission_args.contains("terminal_error_class,"));
+    assert!(!admission_args.contains("ErrorClass::"));
+
+    for record in [
+        "record_backend_outcome_no_conn_end(",
+        "record_cross_protocol_backend_admission_outcome(",
+        "record_cross_protocol_header_write_disconnect(",
+        "record_plain_grpc_web_client_deadline_after_backend_response(",
+        "backend_admission_permits",
+        "lb_connection_guard",
+    ] {
+        assert!(
+            !after_write.contains(record),
+            "the buffered client write must not settle the backend again: {record}"
+        );
+    }
 }
 
 /// The cross-protocol HTTP/3 → gRPC bridge re-arms the matched rule's attempt

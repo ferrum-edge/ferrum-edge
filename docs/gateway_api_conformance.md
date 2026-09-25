@@ -846,8 +846,9 @@ control is cut at the deadline with the same `H3_REQUEST_CANCELLED` reset,
 backend stream and admission permit (PR #5741). A parked HEADERS write is cut
 the same way, since part of the head may already be on the wire. A buffered
 response is already complete when it is written and is not cut, as on HTTP/1.1
-and HTTP/2. HTTP/1.1 and HTTP/2 cut a streamed body only when the transport
-next polls it.
+and HTTP/2; its backend outcome and admission permit are settled before the
+client write, so a client parking it holds no backend resource. HTTP/1.1 and
+HTTP/2 cut a streamed body only when the transport next polls it.
 
 Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
 not bounded by `request` on any frontend. Gateway-local

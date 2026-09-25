@@ -63,7 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `body_error_class: read_write_timeout`, and no charge to the backend's
   circuit breaker or passive health. Routes without timeouts arm no extra
   timer. A buffered response is complete when written and is not cut, as on
-  HTTP/1.1 and HTTP/2.
+  HTTP/1.1 and HTTP/2; the bridge's buffered writer now settles the backend
+  outcome and releases the admission permit and least-connections count before
+  its client write, as the native HTTP/3 buffered writer already did, so a
+  client parking that write no longer holds them.
 - The graceful-shutdown functional tests no longer pass on evidence that does
   not show a working drain (#5739). A proxy or TCP stream port now counts as
   closed only when the connect is refused, or when the peer closes or resets

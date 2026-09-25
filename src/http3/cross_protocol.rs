@@ -5748,6 +5748,41 @@ where
             response_via,
             &mut response_headers,
         );
+        // The backend exchange is settled: its whole body is in hand. Record
+        // its outcome and release the admission permit and least-connections
+        // count BEFORE the client write, as the native H3 buffered writer does,
+        // so a client that parks the write in QUIC flow control cannot hold
+        // them. Passive health takes `response_status` and the limiter the
+        // ORIGINAL backend `status`: response-body/final-body plugin rejects
+        // above may have rewritten `response_status` to a gateway policy code
+        // (e.g. a 503/4xx reject of a healthy backend 200), and recording that
+        // would make the adaptive limiter shrink/grow on a signal that does not
+        // reflect backend health. Matches the streaming path below and the
+        // H1/H2 path, which capture the backend status before response-body
+        // hooks run. A downstream write outcome is the client's, not the
+        // backend's, so no client terminal below can overwrite this record.
+        record_backend_outcome_no_conn_end(
+            state,
+            proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
+            current_target.as_deref(),
+            current_cb_target_key.as_deref(),
+            response_status,
+            terminal_connection_error,
+            terminal_error_class,
+            cb_probe.take_slot(),
+            false,
+            backend_start.elapsed(),
+        );
+        record_cross_protocol_backend_admission_outcome(
+            &mut backend_admission_permits,
+            status,
+            terminal_connection_error,
+            terminal_error_class,
+            backend_admission_elapsed,
+        );
+        drop(lb_connection_guard.take());
         if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
             plain_write_bound.deadline(),
             send_response_headers_with_framing(
@@ -5763,21 +5798,6 @@ where
                 error,
                 crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
             ) {
-                record_plain_grpc_web_client_deadline_after_backend_response(
-                    state,
-                    epoch,
-                    proxy,
-                    upstream_balancer,
-                    current_target.as_deref(),
-                    current_cb_target_key.as_deref(),
-                    cb_probe,
-                    backend_start,
-                    &mut backend_admission_permits,
-                    backend_admission_elapsed,
-                    status,
-                    terminal_connection_error,
-                    terminal_error_class,
-                );
                 if let Some(termination) = plain_write_bound.expired_authorization() {
                     // Pre-commitment: no response HEADERS reached the client, so
                     // the protocol-correct terminal is the FIXED redacted 401.
@@ -5812,44 +5832,6 @@ where
                 ?error,
                 "cross-protocol H3 buffered response header write failed"
             );
-            if terminal_connection_error || terminal_error_class.is_some() {
-                record_backend_outcome_no_conn_end(
-                    state,
-                    proxy,
-                    &epoch.load_balancer,
-                    upstream_balancer,
-                    current_target.as_deref(),
-                    current_cb_target_key.as_deref(),
-                    status,
-                    terminal_connection_error,
-                    terminal_error_class,
-                    cb_probe.take_slot(),
-                    false,
-                    backend_start.elapsed(),
-                );
-                record_cross_protocol_backend_admission_outcome(
-                    &mut backend_admission_permits,
-                    status,
-                    terminal_connection_error,
-                    terminal_error_class,
-                    backend_admission_elapsed,
-                );
-            } else {
-                record_cross_protocol_header_write_disconnect(
-                    state,
-                    proxy,
-                    epoch,
-                    upstream_balancer,
-                    current_target.as_ref(),
-                    current_cb_target_key.as_deref(),
-                    response_status,
-                    status,
-                    cb_probe,
-                    backend_start,
-                    &mut backend_admission_permits,
-                    backend_admission_elapsed,
-                );
-            }
             let mut outcome = cross_protocol_header_write_disconnect_outcome(
                 response_status,
                 false,
@@ -5882,21 +5864,6 @@ where
                     (false, true)
                 }
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    record_plain_grpc_web_client_deadline_after_backend_response(
-                        state,
-                        epoch,
-                        proxy,
-                        upstream_balancer,
-                        current_target.as_deref(),
-                        current_cb_target_key.as_deref(),
-                        cb_probe,
-                        backend_start,
-                        &mut backend_admission_permits,
-                        backend_admission_elapsed,
-                        status,
-                        terminal_connection_error,
-                        terminal_error_class,
-                    );
                     if let Some(termination) = plain_write_bound.expired_authorization() {
                         // Post-commitment: response HEADERS are already on the
                         // wire, so the deterministic terminal is a RESET — never
@@ -5947,37 +5914,6 @@ where
                     });
                 }
             };
-
-        record_backend_outcome_no_conn_end(
-            state,
-            proxy,
-            &epoch.load_balancer,
-            upstream_balancer,
-            current_target.as_deref(),
-            current_cb_target_key.as_deref(),
-            response_status,
-            terminal_connection_error,
-            terminal_error_class,
-            cb_probe.take_slot(),
-            false,
-            backend_start.elapsed(),
-        );
-        // Feed the limiter the ORIGINAL backend `status`, not `response_status`:
-        // response-body/final-body plugin rejects above may have rewritten
-        // `response_status` to a gateway policy code (e.g. a 503/4xx reject of a
-        // healthy backend 200). Recording the policy status would make the
-        // adaptive limiter shrink/grow on a signal that does not reflect backend
-        // health. Matches the streaming path below and the H1/H2 path, which
-        // capture the backend status before response-body hooks run.
-        let admission_error_class = terminal_error_class
-            .or_else(|| (!body_completed).then_some(ErrorClass::ClientDisconnect));
-        record_cross_protocol_backend_admission_outcome(
-            &mut backend_admission_permits,
-            status,
-            terminal_connection_error,
-            admission_error_class,
-            backend_admission_elapsed,
-        );
 
         return Ok(CrossProtocolOutcome {
             response_status,
@@ -6113,8 +6049,7 @@ where
         ) {
             // Authorization wins a tie; otherwise a plain request's only
             // non-authorization bound here is the route deadline.
-            if route_body_deadline.is_some()
-                && plain_write_bound.expired_authorization().is_none()
+            if route_body_deadline.is_some() && plain_write_bound.expired_authorization().is_none()
             {
                 let mut outcome = cut_plain_response_head_at_route_deadline(
                     stream,
@@ -10217,8 +10152,7 @@ where
                         }
                         // The terminal FIN races the same plan: a non-reading
                         // client would otherwise park it indefinitely.
-                        let _ = authorized_send!(stream.finish());
-                        finished = auth_termination.is_none();
+                        finished = authorized_send!(stream.finish());
                         break;
                     }
                 }
@@ -10273,8 +10207,7 @@ where
                     }
                 }
                 // The terminal FIN races the same plan.
-                let _ = authorized_send!(stream.finish());
-                finished = auth_termination.is_none();
+                finished = authorized_send!(stream.finish());
                 break;
             }
             Err(e) => {
