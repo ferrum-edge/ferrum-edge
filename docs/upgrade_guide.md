@@ -26,10 +26,11 @@ over production traffic.** File-mode config version bumps still use in-memory or
 `FERRUM_MODE=migrate` config migration; that is separate from the database
 baseline contract above.
 
-## Upgrading to 0.9.6
+## Upgrading to 0.9.7
 
-v0.9.6 adds Gateway API `ResponseHeaderModifier` and `URLRewrite` filters, plus
-HTTPRoute rule-level `timeouts` and `retry` (#5646). `timeouts.request` bounds
+v0.9.7 is the first published release after 0.9.5 (`v0.9.6` was tagged but
+never published). It adds Gateway API `ResponseHeaderModifier` and `URLRewrite`
+filters, plus HTTPRoute rule-level `timeouts` and `retry` (#5646). `timeouts.request` bounds
 the full request, including retries and the streaming response body;
 `timeouts.backendRequest` bounds each backend attempt until its full response
 has been received, with a fresh budget per retry attempt. Any response that
