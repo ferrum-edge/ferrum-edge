@@ -10,6 +10,7 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::PluginCache;
 use ferrum_edge::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
+    AdaptiveConcurrencySnapshot,
 };
 use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::{GatewayConfig, Proxy, UpstreamTarget};
@@ -39,6 +40,7 @@ fn limiter_config(initial_limit: u64) -> Arc<AdaptiveConcurrencyConfig> {
         initial_limit,
         max_limit: initial_limit.max(1),
         min_samples: 1,
+        baseline_window_samples: 1000,
         target_latency_multiplier: 1.5,
         decrease_ratio: 0.5,
         increase_step: 1,
@@ -55,6 +57,7 @@ fn growth_config(initial_limit: u64, max_limit: u64) -> Arc<AdaptiveConcurrencyC
         initial_limit,
         max_limit,
         min_samples: 1,
+        baseline_window_samples: 1000,
         target_latency_multiplier: 1.5,
         decrease_ratio: 0.5,
         increase_step: 1,
@@ -363,6 +366,7 @@ fn adaptive_concurrency_caps_tracked_target_keys() {
         initial_limit: 2,
         max_limit: 2,
         min_samples: 1,
+        baseline_window_samples: 1000,
         target_latency_multiplier: 1.5,
         decrease_ratio: 0.5,
         increase_step: 1,
@@ -434,6 +438,17 @@ fn adaptive_concurrency_validates_bounds() {
         Err(err) => err,
     };
     assert!(err.contains("unsupported `key_by`"));
+
+    let err = match AdaptiveConcurrency::new(
+        &json!({
+            "baseline_window_samples": 0
+        }),
+        PluginHttpClient::default(),
+    ) {
+        Ok(_) => panic!("an empty baseline window should be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("`baseline_window_samples` must be greater than 0"));
 }
 
 #[test]
@@ -571,6 +586,7 @@ fn adaptive_concurrency_shrinks_on_high_latency_samples() {
         initial_limit: 4,
         max_limit: 4,
         min_samples: 2,
+        baseline_window_samples: 1000,
         target_latency_multiplier: 1.5,
         decrease_ratio: 0.5,
         increase_step: 1,
@@ -625,6 +641,7 @@ fn adaptive_concurrency_shadow_mode_admits_past_limit() {
         initial_limit: 1,
         max_limit: 1,
         min_samples: 1,
+        baseline_window_samples: 1000,
         target_latency_multiplier: 1.5,
         decrease_ratio: 0.5,
         increase_step: 1,
@@ -664,6 +681,7 @@ fn adaptive_concurrency_shadow_mode_fails_open_at_key_cap() {
         initial_limit: 1,
         max_limit: 1,
         min_samples: 1,
+        baseline_window_samples: 1000,
         target_latency_multiplier: 1.5,
         decrease_ratio: 0.5,
         increase_step: 1,
@@ -712,6 +730,7 @@ fn adaptive_concurrency_upstream_scope_shares_limit_across_proxies() {
         initial_limit: 1,
         max_limit: 1,
         min_samples: 1,
+        baseline_window_samples: 1000,
         target_latency_multiplier: 1.5,
         decrease_ratio: 0.5,
         increase_step: 1,
@@ -745,6 +764,7 @@ fn adaptive_concurrency_rejects_every_unknown_policy_key() {
         "initial_limt",
         "max_limt",
         "min_sample",
+        "baseline_window_sample",
         "target_latency_multipler",
         "decrease_raio",
         "increase_setp",
@@ -781,6 +801,7 @@ fn adaptive_concurrency_old_cohort_cannot_undo_failure_decrease() {
         initial_limit: 100,
         max_limit: 100,
         min_samples: 1,
+        baseline_window_samples: 1000,
         target_latency_multiplier: 1.5,
         decrease_ratio: 0.8,
         increase_step: 10,
@@ -2494,4 +2515,316 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
     }
+}
+
+fn baseline_window_config(
+    initial_limit: u64,
+    max_limit: u64,
+    min_samples: u64,
+    baseline_window_samples: u64,
+) -> Arc<AdaptiveConcurrencyConfig> {
+    Arc::new(AdaptiveConcurrencyConfig {
+        key_by: AdaptiveConcurrencyKeyBy::Proxy,
+        max_tracked_keys: 10_000,
+        min_limit: 1,
+        initial_limit,
+        max_limit,
+        min_samples,
+        baseline_window_samples,
+        target_latency_multiplier: 1.5,
+        decrease_ratio: 0.8,
+        increase_step: 1,
+        shadow_mode: false,
+        expose_headers: false,
+    })
+}
+
+fn healthy_outcome(latency_ms: u64) -> BackendAdmissionOutcome {
+    BackendAdmissionOutcome {
+        response_status: 200,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(latency_ms),
+    }
+}
+
+fn target_snapshot(
+    limiter: &AdaptiveConcurrencyLimiter,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> AdaptiveConcurrencySnapshot {
+    limiter
+        .snapshot(proxy, upstream_target, AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("target state should exist")
+}
+
+/// Acquire one request, complete it healthily with `latency_ms`, release it.
+fn complete_healthy_request(
+    limiter: &AdaptiveConcurrencyLimiter,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    config: &Arc<AdaptiveConcurrencyConfig>,
+    latency_ms: u64,
+) {
+    let permit = limiter
+        .try_acquire(proxy, upstream_target, Arc::clone(config))
+        .expect("a sequential healthy request must be admitted");
+    permit.record_backend_outcome(healthy_outcome(latency_ms));
+    drop(permit);
+}
+
+/// Fill the current limit with concurrent requests, then complete them all
+/// healthily. The first completion observes saturation, which is the only
+/// point where a within-target success may grow the limit.
+fn complete_saturated_cohort(
+    limiter: &AdaptiveConcurrencyLimiter,
+    proxy: &Proxy,
+    config: &Arc<AdaptiveConcurrencyConfig>,
+    latency_ms: u64,
+) {
+    let limit = target_snapshot(limiter, proxy, None).limit;
+    let cohort: Vec<_> = (0..limit)
+        .map(|_| {
+            limiter
+                .try_acquire(proxy, None, Arc::clone(config))
+                .expect("the cohort fits within the current limit")
+        })
+        .collect();
+    for permit in &cohort {
+        permit.record_backend_outcome(healthy_outcome(latency_ms));
+    }
+    drop(cohort);
+}
+
+/// Acquire one request through the cached plugin, complete it healthily with
+/// `latency_ms`, release it.
+fn complete_cached_request(cache: &PluginCache, config: &GatewayConfig, latency_ms: u64) {
+    let permit = expect_admitted(acquire_from_cache(cache, config));
+    permit.record_backend_outcome(healthy_outcome(latency_ms));
+    drop(permit);
+}
+
+/// Issue #5737: the latency baseline used to be an all-time minimum, so one
+/// unusually fast success pinned a healthy target at `min_limit` forever and
+/// concurrent traffic kept receiving 503s. The windowed baseline forgets the
+/// outlier once two baseline windows close after it, and saturated healthy
+/// traffic then regains capacity.
+#[test]
+fn adaptive_concurrency_relearns_obsolete_fast_outlier_baseline() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = baseline_window_config(32, 32, 20, 50);
+
+    complete_healthy_request(&limiter, &proxy, None, &config, 1);
+    // Samples 2..=40 are an ordinary, stable 10ms. Past `min_samples` the
+    // EWMA is far above the 1.5ms target derived from the outlier, so every
+    // healthy completion shrinks the limit.
+    for _ in 2..=40 {
+        complete_healthy_request(&limiter, &proxy, None, &config, 10);
+    }
+    let pinned = target_snapshot(&limiter, &proxy, None);
+    assert_eq!(
+        pinned.limit, 1,
+        "the fast outlier drives a healthy target to min_limit"
+    );
+    assert_eq!(pinned.baseline_latency_us, 1_000);
+
+    // While pinned, a concurrent request is shed.
+    let held = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("the single slot admits one request");
+    assert!(
+        limiter
+            .try_acquire(&proxy, None, Arc::clone(&config))
+            .is_err(),
+        "a pinned target sheds concurrent traffic"
+    );
+    held.record_backend_outcome(healthy_outcome(10));
+    drop(held);
+
+    // Samples 42..=100 close the outlier's window (sample 50) and the next
+    // one (sample 100); only ordinary 10ms samples remain in the baseline.
+    for _ in 42..=100 {
+        complete_healthy_request(&limiter, &proxy, None, &config, 10);
+    }
+    let relearned = target_snapshot(&limiter, &proxy, None);
+    assert_eq!(
+        relearned.baseline_latency_us, 10_000,
+        "the obsolete outlier must age out of the baseline within two windows"
+    );
+    assert_eq!(relearned.samples, 100);
+    assert_eq!(
+        relearned.in_flight, 0,
+        "relearning keeps in-flight accounting"
+    );
+
+    // Saturated, within-target traffic now regains the full capacity.
+    let mut cohorts = 0;
+    while target_snapshot(&limiter, &proxy, None).limit < 32 {
+        assert!(cohorts < 32, "capacity must recover in bounded cohorts");
+        complete_saturated_cohort(&limiter, &proxy, &config, 10);
+        cohorts += 1;
+    }
+    let concurrent: Vec<_> = (0..32)
+        .map(|_| {
+            limiter
+                .try_acquire(&proxy, None, Arc::clone(&config))
+                .expect("a recovered target admits concurrent traffic again")
+        })
+        .collect();
+
+    // An explicit backend failure still backs off after relearning.
+    concurrent[0].record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 503,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(10),
+    });
+    assert_eq!(target_snapshot(&limiter, &proxy, None).limit, 25);
+    drop(concurrent);
+    assert_eq!(target_snapshot(&limiter, &proxy, None).in_flight, 0);
+}
+
+/// A windowed baseline must not hide genuine congestion: a sustained latency
+/// increase is measured against the older, faster window and still shrinks
+/// admission.
+#[test]
+fn adaptive_concurrency_windowed_baseline_still_backs_off_sustained_latency_increase() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = baseline_window_config(32, 32, 20, 50);
+
+    for _ in 0..40 {
+        complete_healthy_request(&limiter, &proxy, None, &config, 10);
+    }
+    let steady = target_snapshot(&limiter, &proxy, None);
+    assert_eq!(steady.limit, 32, "stable latency keeps the limit");
+    assert_eq!(steady.baseline_latency_us, 10_000);
+
+    // Samples 41..=50: sustained 100ms congestion, each above the 15ms target.
+    for _ in 0..10 {
+        complete_healthy_request(&limiter, &proxy, None, &config, 100);
+    }
+    let congested = target_snapshot(&limiter, &proxy, None);
+    assert_eq!(
+        congested.baseline_latency_us, 10_000,
+        "the closed window keeps the pre-congestion baseline"
+    );
+    assert_eq!(
+        congested.limit, 2,
+        "every congested sample applies its multiplicative decrease"
+    );
+
+    let first = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("the reduced limit admits its first request");
+    let second = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("the reduced limit admits its second request");
+    assert!(
+        limiter
+            .try_acquire(&proxy, None, Arc::clone(&config))
+            .is_err(),
+        "congestion backoff sheds traffic beyond the reduced limit"
+    );
+    drop(first);
+    drop(second);
+}
+
+/// Baseline windows belong to one target key: an outlier on one target never
+/// tightens another target's baseline, and each target relearns on its own
+/// sample count.
+#[test]
+fn adaptive_concurrency_baseline_windows_are_isolated_per_target() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = baseline_window_config(8, 8, 5, 10);
+    let fast_outlier_target = target("a1.example.com", 8080);
+    let steady_target = target("a2.example.com", 8080);
+    let outlier = Some(&fast_outlier_target);
+    let steady = Some(&steady_target);
+
+    complete_healthy_request(&limiter, &proxy, outlier, &config, 1);
+    for _ in 2..=10 {
+        complete_healthy_request(&limiter, &proxy, outlier, &config, 10);
+    }
+    for _ in 1..=10 {
+        complete_healthy_request(&limiter, &proxy, steady, &config, 10);
+    }
+
+    let pinned = target_snapshot(&limiter, &proxy, outlier);
+    assert_eq!(pinned.limit, 1);
+    assert_eq!(pinned.baseline_latency_us, 1_000);
+    let unaffected = target_snapshot(&limiter, &proxy, steady);
+    assert_eq!(
+        unaffected.baseline_latency_us, 10_000,
+        "another target's outlier must not tighten this baseline"
+    );
+    assert_eq!(unaffected.limit, 8);
+
+    // Samples 11..=20 on the outlier target close its second window; the
+    // saturated completion at sample 20 already sees the relearned target.
+    for _ in 11..=20 {
+        complete_healthy_request(&limiter, &proxy, outlier, &config, 10);
+    }
+    let relearned = target_snapshot(&limiter, &proxy, outlier);
+    assert_eq!(relearned.baseline_latency_us, 10_000);
+    assert_eq!(
+        relearned.limit, 2,
+        "a saturated healthy success grows the relearned target"
+    );
+    let untouched = target_snapshot(&limiter, &proxy, steady);
+    assert_eq!(untouched.samples, 10);
+    assert_eq!(untouched.limit, 8);
+}
+
+/// Compatible reloads keep learned limits and baseline windows, so a pinned
+/// target stays pinned across the reload and still relearns afterwards.
+#[test]
+fn adaptive_concurrency_compatible_reload_keeps_relearning_baseline() {
+    let config = cache_config(
+        "proxy",
+        json!({
+            "min_limit": 1,
+            "initial_limit": 4,
+            "max_limit": 4,
+            "min_samples": 5,
+            "baseline_window_samples": 10,
+            "decrease_ratio": 0.5
+        }),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    complete_cached_request(&cache, &config, 1);
+    for _ in 2..=8 {
+        complete_cached_request(&cache, &config, 10);
+    }
+    let held = expect_admitted(acquire_from_cache(&cache, &config));
+    assert_rejected(acquire_from_cache(&cache, &config));
+    held.record_backend_outcome(healthy_outcome(10));
+    drop(held);
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[0].config["initial_limit"] = json!(3);
+    reloaded.plugin_configs[0].config["max_limit"] = json!(3);
+    cache
+        .rebuild(&reloaded)
+        .expect("compatible bounds change should publish");
+
+    // A fresh tracking space would start at the new initial limit of 3; the
+    // retained state is still pinned by the outlier.
+    let held = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    held.record_backend_outcome(healthy_outcome(10));
+    drop(held);
+
+    // Samples 11..=20 close the window after the outlier's; the saturated
+    // completion at sample 20 grows the relearned target.
+    for _ in 11..=20 {
+        complete_cached_request(&cache, &reloaded, 10);
+    }
+    let first = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    let second = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    drop(first);
+    drop(second);
 }

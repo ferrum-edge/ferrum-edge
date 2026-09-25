@@ -186,6 +186,10 @@ pub struct AdaptiveConcurrencyConfig {
     pub initial_limit: u64,
     pub max_limit: u64,
     pub min_samples: u64,
+    /// Healthy samples per latency-baseline window. The baseline is the
+    /// minimum of the current and the previous window, so an obsolete
+    /// low-latency outlier is forgotten within two windows.
+    pub baseline_window_samples: u64,
     pub target_latency_multiplier: f64,
     pub decrease_ratio: f64,
     pub increase_step: u64,
@@ -226,7 +230,10 @@ struct AdaptiveConcurrencyState {
     /// before the decrease cannot use their later successes to immediately
     /// restore the old limit.
     feedback_epoch: AtomicU64,
-    baseline_latency_us: AtomicU64,
+    /// Minimum healthy latency observed in the current baseline window.
+    window_baseline_us: AtomicU64,
+    /// Minimum healthy latency of the most recently closed baseline window.
+    prior_window_baseline_us: AtomicU64,
     latency_ewma_us: AtomicU64,
     samples: AtomicU64,
     rejections: AtomicU64,
@@ -238,7 +245,8 @@ impl AdaptiveConcurrencyState {
             in_flight: CachePadded::new(AtomicU64::new(0)),
             limit: CachePadded::new(AtomicU64::new(initial_limit)),
             feedback_epoch: AtomicU64::new(1),
-            baseline_latency_us: AtomicU64::new(0),
+            window_baseline_us: AtomicU64::new(0),
+            prior_window_baseline_us: AtomicU64::new(0),
             latency_ewma_us: AtomicU64::new(0),
             samples: AtomicU64::new(0),
             rejections: AtomicU64::new(0),
@@ -929,7 +937,7 @@ impl AdaptiveConcurrencySnapshot {
             key,
             in_flight: state.in_flight.load(Ordering::Relaxed),
             limit: state.limit.load(Ordering::Acquire),
-            baseline_latency_us: state.baseline_latency_us.load(Ordering::Acquire),
+            baseline_latency_us: effective_baseline_latency_us(state),
             latency_ewma_us: state.latency_ewma_us.load(Ordering::Acquire),
             samples: state.samples.load(Ordering::Acquire),
             rejections: state.rejections.load(Ordering::Relaxed),
@@ -1004,21 +1012,29 @@ impl AdaptiveConcurrencyPermit {
     /// why streaming keeps `allow_increase = true` rather than using the holding
     /// variant.
     ///
-    /// Heuristic caveat: `baseline_latency_us` is a monotonically-decreasing
-    /// minimum that never decays back up, so a single unusually-fast response
-    /// (a tiny 200, a 304, a cache hit) permanently lowers `target_latency` and
-    /// can keep the limit pinned low. A windowed/decaying minimum would avoid
-    /// this; it is left as a documented sensitivity for now.
+    /// The latency baseline is a windowed minimum (issue #5737): every
+    /// `baseline_window_samples` healthy samples the current window closes and
+    /// a new one starts empty, and the baseline is the minimum of the current
+    /// and the previous window. A single unusually-fast response (a tiny 200, a
+    /// 304, a cache hit) therefore tightens `target_latency` for at most two
+    /// windows instead of pinning the limit low forever. A genuine sustained
+    /// latency increase still reads as congestion and shrinks the limit until
+    /// the window that contained the older, faster samples has rolled out.
     fn record_success_latency(&self, backend_elapsed: Duration, allow_increase: bool) {
         let latency_us = (backend_elapsed.as_micros() as u64).max(1);
-        update_min(&self.state.baseline_latency_us, latency_us);
+        update_min(&self.state.window_baseline_us, latency_us);
         let ewma = update_ewma(&self.state.latency_ewma_us, latency_us);
         let samples = self.state.samples.fetch_add(1, Ordering::AcqRel) + 1;
+        // `is_multiple_of` never panics: a zero window (only reachable by a
+        // hand-built config that bypassed validation) simply never rotates.
+        if samples.is_multiple_of(self.config.baseline_window_samples) {
+            rotate_baseline_window(&self.state);
+        }
         if samples < self.config.min_samples {
             return;
         }
 
-        let baseline = self.state.baseline_latency_us.load(Ordering::Acquire);
+        let baseline = effective_baseline_latency_us(&self.state);
         if baseline == 0 {
             return;
         }
@@ -1171,6 +1187,31 @@ fn update_min(atomic: &AtomicU64, candidate: u64) {
             Ok(_) => return,
             Err(observed) => current = observed,
         }
+    }
+}
+
+/// Close the current baseline window. Its minimum becomes the previous window
+/// and the next window starts empty, so a sample stops influencing the baseline
+/// once two windows have closed after it. Samples racing the rotation land in
+/// either window; both are genuine recent observations, so that is benign.
+fn rotate_baseline_window(state: &AdaptiveConcurrencyState) {
+    let closed_window_min = state.window_baseline_us.swap(0, Ordering::AcqRel);
+    if closed_window_min != 0 {
+        state
+            .prior_window_baseline_us
+            .store(closed_window_min, Ordering::Release);
+    }
+}
+
+/// Minimum of the current and previous baseline windows; `0` means no healthy
+/// sample has been recorded yet.
+fn effective_baseline_latency_us(state: &AdaptiveConcurrencyState) -> u64 {
+    let prior = state.prior_window_baseline_us.load(Ordering::Acquire);
+    let current = state.window_baseline_us.load(Ordering::Acquire);
+    match (prior, current) {
+        (0, current) => current,
+        (prior, 0) => prior,
+        (prior, current) => prior.min(current),
     }
 }
 
