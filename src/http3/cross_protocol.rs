@@ -983,6 +983,7 @@ where
                             backend_start,
                             bytes_sent: raw_prebuffered_body_bytes,
                         },
+                        false,
                     )
                     .await;
                 }
@@ -1094,7 +1095,7 @@ where
 // Plain flavor — reqwest + streaming response with coalescing
 // ---------------------------------------------------------------------------
 
-// `#[inline(never)]`: 89 lines with 11 parameters, called twice from the
+// `#[inline(never)]`: 99 lines with 12 parameters, called twice from the
 // prebuffered arm of `dispatch_plain` and 13 times in this file. At
 // `opt-level = 0` every temporary it inlines becomes a permanent frame slot in
 // each caller, and `dispatch_plain` is the largest coroutine on the H3 path —
@@ -1115,6 +1116,7 @@ fn build_plain_request_builder(
     xff_append_ip: &str,
     request_is_secure: bool,
     is_early_data: bool,
+    grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> reqwest::RequestBuilder {
     let mut req_builder = client.request(req_method, backend_url);
 
@@ -1136,6 +1138,13 @@ fn build_plain_request_builder(
     let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
     let peer_trusted =
         crate::proxy::forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
+    // A gRPC-Web pass-through attempt tells the backend the remaining RPC
+    // budget, the matched rule's per-attempt budget included, in place of the
+    // client's relative `grpc-timeout`, exactly as proxy core's reqwest
+    // dispatch does (#5734). `None` for a plain request, which forwards its
+    // headers untouched.
+    let remaining_grpc_timeout =
+        grpc_deadline_at.map(grpc_proxy::remaining_grpc_timeout_header_value);
     for (k, v) in proxy_headers {
         match k.as_str() {
             "host" => {
@@ -1153,10 +1162,14 @@ fn build_plain_request_builder(
             _ if k.as_str() == "early-data" => {}
             _ if should_skip_cross_protocol_backend_header(k.as_str()) => {}
             _ if is_untrusted_real_ip_header(k.as_str(), peer_trusted) => {}
+            "grpc-timeout" if remaining_grpc_timeout.is_some() => {}
             _ => {
                 req_builder = req_builder.header(k, v);
             }
         }
+    }
+    if let Some(value) = remaining_grpc_timeout {
+        req_builder = req_builder.header("grpc-timeout", value);
     }
 
     let xff_val = crate::proxy::build_xff_value(
@@ -1394,23 +1407,253 @@ async fn collect_under_route_deadline<F>(
     route: crate::http3::route_deadline::H3RouteDeadlines,
     deadline: Option<tokio::time::Instant>,
     collect: F,
-) -> Result<bytes::Bytes, (u16, Vec<u8>, Option<ErrorClass>)>
+) -> PlainCollectedBody
 where
-    F: std::future::Future<Output = Result<bytes::Bytes, (u16, Vec<u8>, Option<ErrorClass>)>>,
+    F: std::future::Future<Output = PlainCollectedBody>,
 {
-    match crate::plugins::await_deadline_first(deadline, collect).await {
-        Ok(result) => result,
-        Err(()) => {
-            let expiry = route.body_expiry();
-            crate::http3::route_deadline::mark_expiry_phase(ctx, expiry);
-            let (status, body) = crate::http3::route_deadline::expiry_status_body(expiry);
-            Err((
-                status,
-                body.as_bytes().to_vec(),
-                Some(ErrorClass::ReadWriteTimeout),
-            ))
-        }
+    collect_before_route_deadline(route, deadline, collect)
+        .await
+        .unwrap_or_else(|expiry| Err(route_collect_expiry_failure(ctx, expiry)))
+}
+
+/// Collect a buffered plain response before the matched route rule's body
+/// deadline (#5646), returning how that deadline ended the collection when it
+/// fired first: the total deadline when it has elapsed (it wins a tie), the
+/// committed attempt's budget otherwise.
+async fn collect_before_route_deadline<F>(
+    route: crate::http3::route_deadline::H3RouteDeadlines,
+    deadline: Option<tokio::time::Instant>,
+    collect: F,
+) -> Result<PlainCollectedBody, crate::proxy::RouteDeadlineExpiry>
+where
+    F: std::future::Future<Output = PlainCollectedBody>,
+{
+    crate::plugins::await_deadline_first(deadline, collect)
+        .await
+        .map_err(|()| route.body_expiry())
+}
+
+/// The collector's `504` failure for a route deadline that ended a buffered
+/// collection, with a total-deadline expiry's phase recorded.
+fn route_collect_expiry_failure(
+    ctx: &mut RequestContext,
+    expiry: crate::proxy::RouteDeadlineExpiry,
+) -> (u16, Vec<u8>, Option<ErrorClass>) {
+    crate::http3::route_deadline::mark_expiry_phase(ctx, expiry);
+    let (status, body) = crate::http3::route_deadline::expiry_status_body(expiry);
+    (
+        status,
+        body.as_bytes().to_vec(),
+        Some(ErrorClass::ReadWriteTimeout),
+    )
+}
+
+/// Whether the plain bridge buffers a response with this head: the pre-header
+/// decision (`buffer_before_head`) refined by the response's status and
+/// content type, exactly as the H1/H2 dispatch refines it. Retry-enabled
+/// requests use the same marked decision context as H1/H2, allowing
+/// inherently streaming responses such as MCP SSE to opt out conservatively
+/// after headers arrive. Shared by the retry loop's in-attempt collection
+/// (#5738) and the post-loop pipeline, so the two cannot disagree.
+#[allow(clippy::too_many_arguments)]
+fn plain_bridge_buffers_response(
+    proxy: &Proxy,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    method: &str,
+    route_retry_ceiling: u32,
+    current_target: Option<&UpstreamTarget>,
+    buffer_before_head: bool,
+    status: u16,
+    response_headers: &HashMap<String, String>,
+) -> bool {
+    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method)
+        && crate::proxy::current_retry_attempt_allowed(
+            route_retry_ceiling,
+            proxy,
+            current_target,
+            0,
+        );
+    let retry_ctx = has_retry.then(|| crate::proxy::retry_response_decision_context(ctx));
+    let response_decision_ctx = retry_ctx.as_ref().unwrap_or(ctx);
+    !crate::proxy::refine_stream_response_for_content_type(
+        !buffer_before_head,
+        proxy,
+        plugins,
+        Some(response_decision_ctx),
+        status,
+        response_headers,
+    )
+}
+
+/// The retry policy's view of an attempt that answered with this response
+/// head.
+fn plain_attempt_head_result(status: u16) -> crate::retry::BackendResponse {
+    crate::retry::BackendResponse {
+        status_code: status,
+        body: crate::retry::ResponseBody::buffered(Vec::new()),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: None,
+        error_class: None,
     }
+}
+
+/// Whether the retry policy would retry a failure while collecting the
+/// buffered body of this attempt, whose response head (`status`) it does not
+/// retry: a route attempt budget or operator read timeout expiry (`504`), or a
+/// backend reset (`502`), each as HTTP/1.1 and HTTP/2 classify a buffered read
+/// failure. A head the policy retries never has its body read.
+///
+/// Only a prediction: whether the next attempt can actually be dispatched
+/// (its target, that target's `maxRetries`) is decided by the retry loop
+/// itself, which falls back to serving the collected failure.
+fn plain_collection_failure_would_retry(
+    state: &ProxyState,
+    retry_config: &crate::config::types::RetryConfig,
+    method: &str,
+    status: u16,
+    attempt: u32,
+) -> bool {
+    let head_result = plain_attempt_head_result(status);
+    if crate::retry::should_retry(retry_config, method, &head_result, attempt) {
+        return false;
+    }
+    let timeout_result = PlainAttemptFailure::AttemptBudget.attempt_result(state);
+    let (reset_status, reset_class) =
+        crate::proxy::eager_buffer_body_read_status_and_class(ErrorClass::ConnectionReset);
+    let reset_result = crate::retry::BackendResponse {
+        error_class: Some(reset_class),
+        ..plain_attempt_head_result(reset_status)
+    };
+    crate::retry::should_retry(retry_config, method, &timeout_result, attempt)
+        || crate::retry::should_retry(retry_config, method, &reset_result, attempt)
+}
+
+/// Collect a prebuffered plain-bridge attempt's buffered response body inside
+/// that attempt when a failure during collection could be retried (#5738), as
+/// HTTP/1.1, HTTP/2 and the native HTTP/3 pool collect a buffered body inside
+/// the attempt.
+///
+/// The response stays [`PlainAttemptResponse::Live`], for the post-loop
+/// pipeline to collect exactly as before, unless all of these hold: the
+/// matched rule started an attempt budget (`route_attempt_deadline`), the
+/// head itself is not retried, the rule's retry policy would retry a
+/// collection failure at this attempt, the declared length is within the
+/// limit, and the response is buffered rather than streamed. Then the body is
+/// collected under the attempt's body deadline (the earlier of the total
+/// deadline and the attempt's budget, which keeps running from the handoff)
+/// and returned as [`PlainAttemptResponse::Collected`], carrying how the retry
+/// policy sees the attempt:
+///
+/// * An attempt budget expiry is the same retryable backend timeout as an
+///   expiry before the head, and an operator read timeout or backend reset is
+///   the backend failure HTTP/1.1 and HTTP/2 report for a buffered read.
+/// * A body collected in full, or a total-deadline expiry (its phase
+///   recorded), is seen as its response head, which is not retried.
+///
+/// When the retry loop retries, the discarded response is dropped there,
+/// releasing its retained-body reservation and backend connection, and no
+/// response hook has seen it. Otherwise the pipeline serves the collected body
+/// or its failure exactly as it serves a body collected after the loop, and
+/// runs `after_proxy` and every later phase once, for this committed response,
+/// after the body has been read instead of before.
+#[allow(clippy::too_many_arguments)]
+async fn collect_plain_response_within_attempt(
+    state: &ProxyState,
+    proxy: &Proxy,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    method: &str,
+    retry_config: Option<&crate::config::types::RetryConfig>,
+    route_retry_ceiling: u32,
+    current_target: Option<&UpstreamTarget>,
+    attempt: u32,
+    route: crate::http3::route_deadline::H3RouteDeadlines,
+    route_attempt_deadline: Option<tokio::time::Instant>,
+    buffer_before_head: bool,
+    max_response_body_size_bytes: usize,
+    response: reqwest::Response,
+) -> PlainAttemptResponse {
+    let (Some(retry_config), Some(_)) = (retry_config, route_attempt_deadline) else {
+        return PlainAttemptResponse::Live(response);
+    };
+    let status = response.status().as_u16();
+    let retry_allowed = crate::proxy::current_retry_attempt_allowed(
+        route_retry_ceiling,
+        proxy,
+        current_target,
+        attempt,
+    );
+    if !retry_allowed
+        || !plain_collection_failure_would_retry(state, retry_config, method, status, attempt)
+    {
+        return PlainAttemptResponse::Live(response);
+    }
+    let headers = collect_reqwest_response_headers(&response);
+    let declared_over_limit = crate::proxy::declared_response_length_exceeds_limit(
+        method,
+        status,
+        &headers,
+        max_response_body_size_bytes,
+    )
+    .is_some();
+    if declared_over_limit
+        || !plain_bridge_buffers_response(
+            proxy,
+            plugins,
+            ctx,
+            method,
+            route_retry_ceiling,
+            current_target,
+            buffer_before_head,
+            status,
+            &headers,
+        )
+    {
+        // The pipeline collects these headers and refines the decision again.
+        // Only an oversized or streamed response under a retryable attempt
+        // budget pays that twice, so the live head is not re-plumbed for it.
+        return PlainAttemptResponse::Live(response);
+    }
+    let version = response.version();
+    // Boxed so the collector occupies the heap only for the requests that
+    // reach it, not a slot in every `dispatch_plain` coroutine.
+    let collected_body = collect_before_route_deadline(
+        route,
+        route.body_deadline(route_attempt_deadline),
+        Box::pin(collect_reqwest_response_body_with_limit(
+            response,
+            max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
+        )),
+    )
+    .await;
+    let (body, retry_status, retry_error_class) = match collected_body {
+        Ok(Ok(body)) => (Ok(body), status, None),
+        Ok(Err(failure)) => {
+            let (failure_status, class) = (failure.0, failure.2);
+            (Err(failure), failure_status, class)
+        }
+        Err(expiry @ crate::proxy::RouteDeadlineExpiry::AttemptBudget) => {
+            let result = PlainAttemptFailure::AttemptBudget.attempt_result(state);
+            let failure = route_collect_expiry_failure(ctx, expiry);
+            (Err(failure), result.status_code, result.error_class)
+        }
+        // A spent total deadline is never retried.
+        Err(expiry) => {
+            let failure = route_collect_expiry_failure(ctx, expiry);
+            (Err(failure), status, None)
+        }
+    };
+    PlainAttemptResponse::Collected(PlainBridgeCollectedResponse {
+        status,
+        headers,
+        version,
+        body,
+        retry_status,
+        retry_error_class,
+    })
 }
 
 /// Headers for a buffered-collection failure. A read or route timeout `504`
@@ -1581,6 +1824,57 @@ enum PlainBridgeResponse {
     Reqwest(reqwest::Response),
     /// Fully buffered response from a mesh-egress dispatch.
     MeshBuffered(PlainBridgeMeshResponse),
+    /// Reqwest response whose buffered body was collected inside its attempt
+    /// (#5738); see [`collect_plain_response_within_attempt`].
+    Collected(PlainBridgeCollectedResponse),
+}
+
+/// A reqwest response whose body the prebuffered retry loop collected inside
+/// its attempt, so a failure during collection reached the retry policy
+/// (#5738). `body` is the collector's result: a failure the loop does not
+/// retry is carried to the shared pipeline, which answers it exactly as it
+/// answers a body collected after the loop.
+struct PlainBridgeCollectedResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    version: http::Version,
+    body: PlainCollectedBody,
+    /// The status and class the retry policy sees for this attempt: the
+    /// response head's, or those of the collection failure that ended it.
+    retry_status: u16,
+    retry_error_class: Option<ErrorClass>,
+}
+
+/// A buffered plain response body, or the collector's `(status, body, class)`
+/// failure.
+type PlainCollectedBody = Result<Bytes, (u16, Vec<u8>, Option<ErrorClass>)>;
+
+/// The accepted response head of one prebuffered plain-bridge attempt: still
+/// live, or with its body already collected inside the attempt (#5738).
+enum PlainAttemptResponse {
+    Live(reqwest::Response),
+    Collected(PlainBridgeCollectedResponse),
+}
+
+impl PlainAttemptResponse {
+    /// The attempt's result as the retry policy sees it: its response head,
+    /// or the failure that ended a body collected inside the attempt.
+    fn attempt_result(&self) -> crate::retry::BackendResponse {
+        match self {
+            Self::Live(response) => plain_attempt_head_result(response.status().as_u16()),
+            Self::Collected(collected) => crate::retry::BackendResponse {
+                error_class: collected.retry_error_class,
+                ..plain_attempt_head_result(collected.retry_status)
+            },
+        }
+    }
+
+    fn into_bridge_response(self) -> PlainBridgeResponse {
+        match self {
+            Self::Live(response) => PlainBridgeResponse::Reqwest(response),
+            Self::Collected(collected) => PlainBridgeResponse::Collected(collected),
+        }
+    }
 }
 
 /// Buffered mesh-egress response plus the backend metadata the shared pipeline
@@ -1601,6 +1895,8 @@ struct PlainBridgeMeshResponse {
 enum PlainBridgeBodySource {
     Reqwest(reqwest::Response),
     MeshBuffered(Bytes),
+    /// Collected inside its attempt (#5738), or the collector's failure.
+    Collected(PlainCollectedBody),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2005,19 +2301,6 @@ fn record_plain_grpc_web_deadline_after_handoff(
     class
 }
 
-/// Log a gRPC-Web deadline terminal under the backend read timeout when
-/// [`record_plain_grpc_web_deadline_after_handoff`] charged the backend.
-#[inline]
-fn apply_plain_grpc_web_deadline_charge(
-    outcome: &mut CrossProtocolOutcome,
-    charged: Option<ErrorClass>,
-) {
-    if charged.is_some() {
-        outcome.error_class = charged;
-        outcome.body_error_class = None;
-    }
-}
-
 /// The plain bridge's dispatch bounds for the RPC deadline in force NOW: the
 /// gRPC-Web pass-through deadline (`None` for a plain request), the write bound
 /// that composes it with the authorization plan, and the gateway-local bound
@@ -2231,11 +2514,105 @@ where
             backend_start,
             bytes_sent,
         },
+        false,
     )
     .await?;
     outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
     outcome.body_error_class = Some(ErrorClass::ClientDisconnect);
     Ok(outcome)
+}
+
+/// Write the terminal for a gRPC-Web pass-through RPC deadline that fired
+/// after the attempt was handed to the backend, as
+/// [`record_plain_grpc_web_deadline_after_handoff`] recorded it.
+///
+/// A deadline the backend was charged for (`charged`: the matched rule's
+/// per-attempt budget, #5646) is the backend read timeout, so the client gets
+/// the same `DEADLINE_EXCEEDED` / `Backend deadline exceeded` terminal proxy
+/// core's `charge_generic_grpc_route_attempt_budget_expiry` gives it on
+/// HTTP/1.1 and HTTP/2, and the H3 gRPC bridge gives a backend timeout (#5734).
+/// It is not the gateway's own deadline, so it does not select the
+/// gateway-deadline response or its `Deadline exceeded at gateway` wording.
+/// It is still a final reject: `after_proxy` (CORS, response headers) and the
+/// response-committed observers run over it exactly as over the client
+/// deadline terminal. The expired attempt budget ends first, so those hooks
+/// are bounded by the RPC's total deadline, as retry backoff is, instead of
+/// reading the charged expiry as the gateway's own. The backend's deadline has
+/// already passed, so the write gets the shared post-deadline grace instead of
+/// an unbounded wait. Any other deadline is the client's and keeps
+/// [`write_plain_grpc_web_client_deadline`].
+#[allow(clippy::too_many_arguments)]
+async fn write_plain_grpc_web_deadline_after_handoff<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_committed_plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    backend_start: Instant,
+    bytes_sent: u64,
+    backend_target_url: &str,
+    charged: Option<ErrorClass>,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let Some(class) = charged else {
+        return write_plain_grpc_web_client_deadline(
+            stream,
+            plugins,
+            ctx,
+            response_committed_plugins,
+            initial_response_header_policy_plugins,
+            backend_start,
+            bytes_sent,
+            backend_target_url,
+        )
+        .await;
+    };
+    ctx.end_grpc_route_attempt();
+    let mut outcome = write_final_body_reject(
+        stream,
+        HttpFlavor::Grpc,
+        plugins,
+        ctx,
+        plain_grpc_web_backend_deadline_plugin_result(),
+        response_committed_plugins,
+        initial_response_header_policy_plugins,
+        RejectWriteAccounting {
+            backend_start,
+            bytes_sent,
+        },
+        /* post_deadline_write = */ true,
+    )
+    .await?;
+    outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
+    outcome.error_class = Some(class);
+    outcome.body_error_class = None;
+    Ok(outcome)
+}
+
+/// `grpc-message` of a charged gRPC-Web pass-through budget expiry: proxy
+/// core's and the H3 gRPC bridge's backend read-timeout wording.
+const PLAIN_GRPC_WEB_BACKEND_DEADLINE_MESSAGE: &str = "Backend deadline exceeded";
+
+/// The trailers-only rejection [`write_plain_grpc_web_deadline_after_handoff`]
+/// hands the final reject writer for a charged budget expiry.
+fn plain_grpc_web_backend_deadline_plugin_result() -> PluginResult {
+    PluginResult::Reject {
+        status_code: StatusCode::OK.as_u16(),
+        body: String::new(),
+        headers: HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            (
+                "grpc-status".to_string(),
+                grpc_proxy::grpc_status::DEADLINE_EXCEEDED.to_string(),
+            ),
+            (
+                "grpc-message".to_string(),
+                PLAIN_GRPC_WEB_BACKEND_DEADLINE_MESSAGE.to_string(),
+            ),
+        ]),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2606,7 +2983,9 @@ where
     // needs the REQUEST body preserved — never the response buffered. Coupling
     // the two is what made a plain `sse` proxy with `retry.max_retries`
     // configured collect a backend event stream to EOF before the client saw
-    // its first event, while the same configuration streamed on H1/H2.
+    // its first event, while the same configuration streamed on H1/H2. The
+    // one body the loop reads is a response this decision already buffers,
+    // collected inside its attempt under a route attempt budget (#5738).
     let should_buffer_response = !crate::proxy::should_stream_response_body(
         proxy,
         plugins,
@@ -3199,6 +3578,22 @@ where
                     // future is polled FIRST, so an authorization/client
                     // deadline, a peer-gone, and a completed exchange all still
                     // win over the watermark.
+                    //
+                    // The attempt is handed to the backend once this request is
+                    // built, so a gRPC-Web retry restarts the rule's attempt
+                    // budget (#5646) folded into its RPC deadline first, and the
+                    // request tells the backend that attempt's remaining budget
+                    // in `grpc-timeout` (#5734). The gateway-local bound is not
+                    // consulted again before this attempt ends, so only the
+                    // dispatch bounds move.
+                    if attempt > 0 {
+                        (grpc_web_deadline_at, plain_write_bound, _) = begin_plain_route_attempt(
+                            ctx,
+                            policy_flavor,
+                            plain_auth_deadline_plan,
+                            route,
+                        );
+                    }
                     let plain_request_builder = build_plain_request_builder(
                         &client,
                         state,
@@ -3211,6 +3606,7 @@ where
                         xff_append_ip,
                         ctx.request_is_secure,
                         ctx.is_early_data,
+                        grpc_web_deadline_at,
                     );
                     let plain_upload_bytes = Bytes::from(buffered_body.clone());
                     let (plain_upload_body, mut plain_upload_pump) =
@@ -3233,18 +3629,8 @@ where
                     // route rule's attempt budget (#5646) starts now. It and the
                     // route's total deadline end the response-head wait below
                     // like the operator's header bound; see the typed arms. A
-                    // gRPC-Web retry restarts the budget folded into its RPC
-                    // deadline instead, which the write bound below races.
-                    // The gateway-local bound is not consulted again before this
-                    // attempt ends, so only the dispatch bounds move.
-                    if attempt > 0 {
-                        (grpc_web_deadline_at, plain_write_bound, _) = begin_plain_route_attempt(
-                            ctx,
-                            policy_flavor,
-                            plain_auth_deadline_plan,
-                            route,
-                        );
-                    }
+                    // gRPC-Web retry restarted the budget folded into its RPC
+                    // deadline above instead, which the write bound below races.
                     route_attempt_deadline = route.start_attempt();
                     let operator_header_deadline_at =
                         absolute_response_header_read_bound(dispatch_proxy.backend_read_timeout_ms);
@@ -3418,7 +3804,7 @@ where
                                 &mut backend_admission_permits,
                                 backend_admission_start.elapsed(),
                             );
-                            let mut outcome = write_plain_grpc_web_client_deadline(
+                            return write_plain_grpc_web_deadline_after_handoff(
                                 stream,
                                 plugins,
                                 ctx,
@@ -3427,10 +3813,9 @@ where
                                 backend_start,
                                 bytes_sent,
                                 &current_url,
+                                charged,
                             )
-                            .await?;
-                            apply_plain_grpc_web_deadline_charge(&mut outcome, charged);
-                            return Ok(outcome);
+                            .await;
                         }
                         Ok(Ok(H3BackendOrPeer::PeerGone)) => {
                             drop(pending_slot);
@@ -3455,16 +3840,37 @@ where
                         }
                     };
                     drop(pending_slot);
+                    // A buffered body is part of its attempt (#5738): collect it
+                    // here when a failure during collection could be retried, so
+                    // a route attempt budget expiry, read timeout or reset there
+                    // reaches the retry policy below like one before the head.
+                    // Without an attempt budget the head passes straight through.
+                    let send_result = match send_result {
+                        Ok(response) if route_attempt_deadline.is_some() => {
+                            let response = collect_plain_response_within_attempt(
+                                state,
+                                proxy,
+                                plugins,
+                                ctx,
+                                method,
+                                retry_config,
+                                route_retry_ceiling,
+                                current_target.as_deref(),
+                                attempt,
+                                route,
+                                route_attempt_deadline,
+                                should_buffer_response,
+                                effective_max_response_body_size_bytes,
+                                response,
+                            )
+                            .await;
+                            Ok(response)
+                        }
+                        send_result => send_result.map(PlainAttemptResponse::Live),
+                    };
                     match send_result {
                         Ok(response) => {
-                            let attempt_result = crate::retry::BackendResponse {
-                                status_code: response.status().as_u16(),
-                                body: crate::retry::ResponseBody::buffered(Vec::new()),
-                                headers: HashMap::new(),
-                                connection_error: false,
-                                backend_resolved_ip: None,
-                                error_class: None,
-                            };
+                            let attempt_result = response.attempt_result();
                             if let Some(retry_config) = retry_config
                                 && crate::retry::should_retry(
                                     retry_config,
@@ -3503,8 +3909,8 @@ where
                                     record_cross_protocol_backend_admission_outcome(
                                         &mut backend_admission_permits,
                                         attempt_result.status_code,
-                                        false,
-                                        None,
+                                        attempt_result.connection_error,
+                                        attempt_result.error_class,
                                         backend_admission_start.elapsed(),
                                     );
                                     record_cross_protocol_retry_failure(
@@ -3513,7 +3919,7 @@ where
                                         &mut lb_connection_guard,
                                         current_cb_target_key.as_deref(),
                                         attempt_result.status_code,
-                                        false,
+                                        attempt_result.connection_error,
                                         cb_probe.take_slot(),
                                     );
                                     // A gRPC-Web route attempt budget (#5646) ends with the failed
@@ -3586,7 +3992,7 @@ where
                             }
                             final_backend_admission_elapsed = backend_admission_start.elapsed();
                             final_backend_admission_permits = backend_admission_permits;
-                            break PlainBridgeResponse::Reqwest(response);
+                            break response.into_bridge_response();
                         }
                         Err(e) => {
                             let attempt_result = e.attempt_result(state);
@@ -3992,6 +4398,7 @@ where
                     xff_append_ip,
                     ctx.request_is_secure,
                     ctx.is_early_data,
+                    grpc_web_deadline_at,
                 );
 
                 let max_req_bytes = effective_max_request_body_size_bytes;
@@ -4567,7 +4974,7 @@ where
                         );
                         None
                     };
-                    let mut outcome = write_plain_grpc_web_client_deadline(
+                    return write_plain_grpc_web_deadline_after_handoff(
                         stream,
                         plugins,
                         ctx,
@@ -4576,10 +4983,9 @@ where
                         backend_start,
                         bytes_sent,
                         &current_url,
+                        charged,
                     )
-                    .await?;
-                    apply_plain_grpc_web_deadline_charge(&mut outcome, charged);
-                    return Ok(outcome);
+                    .await;
                 };
                 if oversized.load(Ordering::Relaxed) {
                     record_cross_protocol_backend_admission_outcome(
@@ -4685,6 +5091,9 @@ where
         PlainBridgeResponse::Reqwest(response) => {
             crate::proxy::via_header_for_inbound_version(state, response.version()).as_deref()
         }
+        PlainBridgeResponse::Collected(collected) => {
+            crate::proxy::via_header_for_inbound_version(state, collected.version).as_deref()
+        }
         // Preserve the shared H1/H2 buffered-response convention for mesh
         // dispatches whose retained response no longer carries a wire version.
         PlainBridgeResponse::MeshBuffered(_) => state.via_header_http11.as_deref(),
@@ -4733,6 +5142,16 @@ where
                 backend_resolved_ip,
             )
         }
+        // Collected inside its attempt (#5738); the head succeeded like a live
+        // reqwest response, and any collection failure is still in `body`.
+        PlainBridgeResponse::Collected(collected) => (
+            PlainBridgeBodySource::Collected(collected.body),
+            collected.status,
+            collected.headers,
+            false,
+            None,
+            None,
+        ),
     };
     let final_backend_resolved_ip = match mesh_backend_resolved_ip {
         Some(resolved_ip) => Some(resolved_ip),
@@ -4821,9 +5240,7 @@ where
     // known — same downgrade the H1/H2 path applies. `inspect` mode buffers by
     // default (so a JSON response is inspected via `on_response_body`); this
     // downgrades only a response every active body plugin can release to the
-    // windowed streaming path. Retry-enabled requests use the same marked
-    // decision context as H1/H2, allowing inherently streaming responses such
-    // as MCP SSE to opt out conservatively after headers arrive.
+    // windowed streaming path (see `plain_bridge_buffers_response`).
     //
     // Runs BEFORE `after_proxy`, exactly as the H1/H2 dispatch and the native
     // H3 refined path do, and over the same pristine backend header map the
@@ -4833,35 +5250,32 @@ where
     // `text/event-stream` in `after_proxy` and then releases its own body
     // (nothing left to wrap in an already-SSE response), so the bytes streamed
     // out unframed under the event-stream label the wrap was supposed to fill.
-    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method)
-        && crate::proxy::current_retry_attempt_allowed(
-            route_retry_ceiling,
-            proxy,
-            current_target.as_deref(),
-            0,
-        );
     // A mesh-egress response is already fully retained, so it is pinned to the
     // buffered pipeline: there is no live body left to stream, and buffering is
-    // the strictly more inspected of the two paths.
-    let should_buffer_response = {
-        let retry_ctx = has_retry.then(|| crate::proxy::retry_response_decision_context(&*ctx));
-        let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx);
-        matches!(body_source, PlainBridgeBodySource::MeshBuffered(_))
-            || !crate::proxy::refine_stream_response_for_content_type(
-                !should_buffer_response,
-                proxy,
-                plugins,
-                Some(response_decision_ctx),
-                status,
-                &response_headers,
-            )
+    // the strictly more inspected of the two paths. A response collected inside
+    // its attempt (#5738) was collected because this same decision buffers it.
+    let should_buffer_response = match &body_source {
+        PlainBridgeBodySource::MeshBuffered(_) | PlainBridgeBodySource::Collected(_) => true,
+        PlainBridgeBodySource::Reqwest(_) => plain_bridge_buffers_response(
+            proxy,
+            plugins,
+            ctx,
+            method,
+            route_retry_ceiling,
+            current_target.as_deref(),
+            should_buffer_response,
+            status,
+            &response_headers,
+        ),
     };
 
     // Run `after_proxy` hooks so response-transformer, CORS, compression-
     // advertise, and other hooks that modify response headers see the
     // cross-protocol path. A rejection here cancels the backend response
     // before we buffer or stream the body — matches
-    // `run_after_proxy_hooks` semantics in `proxy/mod.rs`.
+    // `run_after_proxy_hooks` semantics in `proxy/mod.rs`. A body the retry
+    // loop collected inside its attempt (#5738) is already read and is dropped
+    // instead; the hooks still run exactly once, for the committed response.
     if !plugins.is_empty()
         && let Some(reject) =
             crate::proxy::run_after_proxy_hooks(plugins, ctx, status, &mut response_headers).await
@@ -4974,6 +5388,7 @@ where
         // re-collected.
         let collected_response_body = match body_source {
             PlainBridgeBodySource::MeshBuffered(body) => Ok(Ok(body)),
+            PlainBridgeBodySource::Collected(body) => Ok(body),
             PlainBridgeBodySource::Reqwest(response) => {
                 crate::plugins::await_grpc_deadline(
                     grpc_web_deadline_at,
@@ -5054,7 +5469,7 @@ where
                     &mut backend_admission_permits,
                     backend_admission_elapsed,
                 );
-                let mut outcome = write_plain_grpc_web_client_deadline(
+                return write_plain_grpc_web_deadline_after_handoff(
                     stream,
                     plugins,
                     ctx,
@@ -5063,10 +5478,9 @@ where
                     backend_start,
                     bytes_sent,
                     &current_url,
+                    charged,
                 )
-                .await?;
-                apply_plain_grpc_web_deadline_charge(&mut outcome, charged);
-                return Ok(outcome);
+                .await;
             }
         };
 
@@ -5521,19 +5935,20 @@ where
         });
     }
 
-    // Only a live reqwest body can be streamed. A mesh-egress response is always
-    // buffered and the refinement above pins it to the buffered pipeline, so
-    // reaching here means that invariant broke: fail closed with a gateway error
-    // rather than continue on a path that skips the buffered body-policy phases.
-    // The backend's own classification is still recorded once, so a gateway-side
+    // Only a live reqwest body can be streamed. A mesh-egress response, and one
+    // collected inside its attempt (#5738), is always buffered and the
+    // refinement above pins it to the buffered pipeline, so reaching here means
+    // that invariant broke: fail closed with a gateway error rather than
+    // continue on a path that skips the buffered body-policy phases. The
+    // backend's own classification is still recorded once, so a gateway-side
     // structural failure is not charged to backend health as a transport error.
     let response = match body_source {
         PlainBridgeBodySource::Reqwest(response) => response,
-        PlainBridgeBodySource::MeshBuffered(_) => {
+        PlainBridgeBodySource::MeshBuffered(_) | PlainBridgeBodySource::Collected(_) => {
             warn!(
                 proxy_id = %proxy.id,
                 status = status,
-                "cross-protocol H3→HTTP mesh response reached the streaming path; failing closed"
+                "cross-protocol H3→HTTP buffered response reached streaming path; failing closed"
             );
             record_backend_outcome_no_conn_end(
                 state,
@@ -7081,6 +7496,7 @@ where
                         backend_start,
                         bytes_sent: 0,
                     },
+                    false,
                 )
                 .await?;
                 crate::proxy::log_rejected_request(
@@ -7588,6 +8004,7 @@ where
                         backend_start,
                         bytes_sent,
                     },
+                    false,
                 )
                 .await
                 {
@@ -10925,6 +11342,7 @@ async fn write_final_body_reject<S>(
     response_committed_plugins: &[Arc<dyn Plugin>],
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     accounting: RejectWriteAccounting,
+    post_deadline_write: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -10991,8 +11409,11 @@ where
     // absolute deadline) so HEADERS can become visible without unbounded
     // retention. The send-only inner writer keeps response-before-teardown
     // ordering; the full-stream branch halts the request direction after the
-    // bounded write settles, including after a mid-recv_data cancel.
-    let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+    // bounded write settles, including after a mid-recv_data cancel. A
+    // charged backend deadline terminal (`post_deadline_write`) is not the
+    // gateway's deadline response but is written after a deadline passed too,
+    // so it takes the same bounded write.
+    let terminal_gateway_deadline = post_deadline_write || ctx.gateway_deadline_response_selected();
     if let Some(translated) = grpc_web_reject {
         if terminal_gateway_deadline {
             let write = write_reject_with_headers_and_recv_halt(
@@ -12819,6 +13240,7 @@ mod tests {
             "203.0.113.1",
             /* request_is_secure = */ false,
             /* is_early_data = */ false,
+            /* grpc_deadline_at = */ None,
         )
         .build()
         .expect("request should build");
@@ -12872,6 +13294,7 @@ mod tests {
             "203.0.113.1",
             /* request_is_secure = */ true,
             /* is_early_data = */ true,
+            /* grpc_deadline_at = */ None,
         );
 
         let req = builder.build().expect("request should build");
@@ -12908,6 +13331,7 @@ mod tests {
             "203.0.113.1",
             /* request_is_secure = */ true,
             /* is_early_data = */ false,
+            /* grpc_deadline_at = */ None,
         );
 
         let req = builder.build().expect("request should build");
@@ -12942,6 +13366,7 @@ mod tests {
             "203.0.113.1",
             /* request_is_secure = */ true,
             /* is_early_data = */ true,
+            /* grpc_deadline_at = */ None,
         );
 
         let req = builder.build().expect("request should build");
@@ -12982,6 +13407,7 @@ mod tests {
             "203.0.113.1",
             /* request_is_secure = */ true,
             /* is_early_data = */ false,
+            /* grpc_deadline_at = */ None,
         );
 
         let req = builder.build().expect("request should build");
@@ -12991,6 +13417,82 @@ mod tests {
             "client-supplied Early-Data must be stripped, and no value \
              injected when is_early_data == false"
         );
+    }
+
+    /// A gRPC-Web pass-through attempt tells the backend its remaining RPC
+    /// budget in `grpc-timeout`, replacing the client's relative value with a
+    /// single header, as proxy core's reqwest dispatch does (#5734).
+    #[tokio::test(start_paused = true)]
+    async fn build_plain_request_builder_replaces_grpc_timeout_with_remaining_budget() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert(
+            "content-type".to_string(),
+            "application/grpc-web+proto".to_string(),
+        );
+        headers.insert("grpc-timeout".to_string(), "30S".to_string());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(5000);
+
+        let req = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::POST,
+            &headers,
+            "https://backend.example/echo.Echo/Call",
+            "backend.example",
+            "203.0.113.1",
+            "203.0.113.1",
+            /* request_is_secure = */ true,
+            /* is_early_data = */ false,
+            /* grpc_deadline_at = */ Some(deadline),
+        )
+        .build()
+        .expect("request should build");
+        assert_eq!(
+            header_value(&req, "grpc-timeout"),
+            Some(&b"5000m"[..]),
+            "the backend must be told the remaining budget, not the client's 30S"
+        );
+        assert_eq!(
+            count_header(&req, "grpc-timeout"),
+            1,
+            "the client's grpc-timeout must be replaced, not duplicated"
+        );
+    }
+
+    /// Without an RPC deadline (a plain request) the client's `grpc-timeout`,
+    /// like every other forwarded header, passes through untouched.
+    #[tokio::test]
+    async fn build_plain_request_builder_forwards_client_grpc_timeout_without_deadline() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("grpc-timeout".to_string(), "30S".to_string());
+
+        let req = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::POST,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            "203.0.113.1",
+            /* request_is_secure = */ true,
+            /* is_early_data = */ false,
+            /* grpc_deadline_at = */ None,
+        )
+        .build()
+        .expect("request should build");
+        assert_eq!(header_value(&req, "grpc-timeout"), Some(&b"30S"[..]));
+        assert_eq!(count_header(&req, "grpc-timeout"), 1);
     }
 
     /// H1/H2/H3 XFF parity on the cross-protocol bridge: drop a spoofed
@@ -13026,6 +13528,7 @@ mod tests {
             "203.0.113.1",
             true,
             false,
+            None,
         )
         .build()
         .expect("request should build");
@@ -13079,6 +13582,7 @@ mod tests {
             "10.0.0.7",     // immediate QUIC peer (the LB)
             true,
             false,
+            None,
         )
         .build()
         .expect("request should build");
@@ -13129,6 +13633,7 @@ mod tests {
             "10.0.0.7",    // immediate QUIC peer (the LB)
             true,
             false,
+            None,
         )
         .build()
         .expect("request should build");
@@ -13151,6 +13656,7 @@ mod tests {
             "203.0.113.1",
             true,
             false,
+            None,
         )
         .build()
         .expect("request should build");
@@ -13545,14 +14051,30 @@ mod tests {
         let end = tail
             .find("\n#[allow(clippy::too_many_arguments)]\nasync fn dispatch_grpc<S>")
             .expect("end of dispatch_plain not found");
+        let dispatch = &tail[..end];
+        assert!(
+            dispatch
+                .contains("PlainBridgeBodySource::Reqwest(_) => plain_bridge_buffers_response(",),
+            "H3 plain dispatch must refine a live response through the shared decision"
+        );
+
+        // The shared decision also gates the retry loop's in-attempt
+        // collection (#5738), so both sites refine under the same context.
+        let start = src
+            .find("fn plain_bridge_buffers_response(")
+            .expect("plain_bridge_buffers_response not found");
+        let tail = &src[start..];
+        let end = tail
+            .find("\n}\n")
+            .expect("end of refinement helper not found");
         let body = &tail[..end];
 
         assert!(
-            body.contains("crate::proxy::retry_response_decision_context(&*ctx)"),
+            body.contains("crate::proxy::retry_response_decision_context(ctx)"),
             "retry-enabled H3 plain dispatch must construct the shared marked context"
         );
         assert!(
-            body.contains("let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx)"),
+            body.contains("let response_decision_ctx = retry_ctx.as_ref().unwrap_or(ctx)"),
             "H3 plain dispatch must select the marked retry context after response headers"
         );
         assert!(
@@ -13560,7 +14082,7 @@ mod tests {
             "H3 plain response refinement must receive the marked retry context"
         );
         assert!(
-            !body.contains("if has_retry { None } else { Some(&*ctx) }"),
+            !body.contains("if has_retry { None } else { Some(ctx) }"),
             "retry-enabled H3 plain dispatch must not suppress content-type refinement"
         );
     }
