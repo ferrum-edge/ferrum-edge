@@ -1,85 +1,214 @@
 //! Functional tests for graceful shutdown & connection draining (P0-3).
 //!
 //! These tests start the real `ferrum-edge` binary in file mode, send SIGTERM,
-//! and verify drain semantics per CLAUDE.md "Graceful Shutdown & Connection
-//! Draining":
+//! and verify drain semantics per CLAUDE.md "Startup And Shutdown":
 //!
 //!   * In-flight requests complete within `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
 //!   * New TCP connections are refused once the accept loops exit.
 //!   * `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` forces immediate exit (no drain wait).
-//!   * HTTP/1.1 responses carry `Connection: close` during drain.
-//!   * Drain timeout is respected — the gateway exits even if requests don't
-//!     complete in time.
+//!   * An HTTP/1.1 response produced during drain carries `Connection: close`.
+//!   * An idle keep-alive connection is closed when shutdown begins.
+//!   * Drain timeout is respected — the gateway waits out the window, then
+//!     exits even though the request did not complete.
+//!   * A streaming response body keeps the drain open until it finishes, over
+//!     HTTP/1.1 and over HTTP/2 (h2c prior knowledge).
 //!
-//! The H2-streams drain case is intentionally not covered here: setting up a
-//! real H2 client + long-lived stream over the gateway binary is fragile, and
-//! the underlying `RequestGuard` is already covered by unit tests in
-//! `src/overload.rs`. TODO: add H2 streaming drain coverage once a harness
-//! exists.
+//! Issue #5739: every observation here must be positive evidence. A connected
+//! socket that stays silent is not a refused connection, a read that stalls or
+//! ends early is not a response, and a wait that times out is not a graceful
+//! exit. In-flight requests are held by an explicit backend barrier instead of
+//! a sleep that "should" cover the signal. The non-ignored `harness_*` tests at
+//! the bottom pin these helpers against fake peers, so an assertion cannot
+//! silently become vacuous.
 //!
-//! All tests are `#[ignore]` — run with:
-//!   cargo test --test functional_tests -- --ignored functional_graceful_shutdown --nocapture
+//! The gateway tests are `#[ignore]` — run with:
+//!   cargo test --test functional_tests functional_graceful_shutdown -- --include-ignored
 
 #![cfg(unix)]
 
+use crate::common::{GatewayChildGuard, SpawnedGatewayIdentity};
 use crate::scaffolding::port_registry::TestSocket;
+use crate::scaffolding::ports::{
+    REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY, reserve_refused_tcp_port,
+};
 
-use std::io::Write;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty};
+use hyper::client::conn::http1;
+use hyper::header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, TRANSFER_ENCODING};
+use hyper_util::rt::TokioIo;
+use std::fmt;
+use std::io::{ErrorKind, Write};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 // ============================================================================
-// Slow Echo Backend
+// Held Backend
 // ============================================================================
 
-/// Start a slow HTTP/1.1 backend that reads the request, sleeps for
-/// `backend_sleep_ms`, then writes a 200 OK response and closes.
+/// Body of a [`HeldResponse::HeadAfterRelease`] response.
+const HELD_BODY: &str = "held-ok";
+/// First part of a [`HeldResponse::StreamAcrossRelease`] body, sent at once.
+const STREAM_FIRST_PART: &str = "stream-part-1;";
+/// Rest of a streamed body, sent only after the barrier is released.
+const STREAM_SECOND_PART: &str = "stream-part-2";
+
+/// How a [`HeldBackend`] places its response around the release barrier.
+#[derive(Clone, Copy)]
+enum HeldResponse {
+    /// Write nothing until released, then a complete `Content-Length`
+    /// response. The gateway can only produce the client-facing response head
+    /// after the release.
+    HeadAfterRelease,
+    /// Write the head and a first chunk at once, then finish the chunked body
+    /// only after release, so the response body is open across the barrier.
+    StreamAcrossRelease,
+}
+
+/// An HTTP/1.1 backend whose responses wait on an explicit barrier.
 ///
-/// The listener is pre-bound by the caller to avoid port races with other
-/// in-process servers (per the functional-test playbook in CLAUDE.md).
-async fn start_slow_backend_on(listener: TcpListener, backend_sleep_ms: u64) {
-    loop {
-        match listener.accept().await {
-            Ok((mut stream, _)) => {
-                tokio::spawn(async move {
-                    // Read request headers (consume until CRLFCRLF or up to 8 KiB).
-                    let mut buf = vec![0u8; 8192];
-                    let mut total = 0;
-                    loop {
-                        match stream.read(&mut buf[total..]).await {
-                            Ok(0) => return,
-                            Ok(n) => {
-                                total += n;
-                                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-                                    break;
-                                }
-                                if total >= buf.len() {
-                                    break;
-                                }
-                            }
-                            Err(_) => return,
-                        }
-                    }
+/// Each client request is reported on `arrivals` as soon as its head is read.
+/// That report, not a sleep, proves a request is in flight through the gateway,
+/// and the barrier keeps it in flight until the test calls
+/// [`HeldBackend::release`]. Only HTTP/1.1 `GET` heads count: the gateway's own
+/// backend probes are closed unanswered (see [`is_client_request`]).
+struct HeldBackend {
+    port: u16,
+    arrivals: mpsc::UnboundedReceiver<()>,
+    release_tx: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
 
-                    // Simulate a slow backend.
-                    sleep(Duration::from_millis(backend_sleep_ms)).await;
-
-                    let body = "slow-ok";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                });
-            }
-            Err(_) => return,
+impl HeldBackend {
+    async fn start(shape: HeldResponse) -> Self {
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind held backend");
+        let port = listener.local_addr().expect("held backend addr").port();
+        let (arrival_tx, arrivals) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = watch::channel(false);
+        let task = tokio::spawn(serve_held_backend(listener, shape, arrival_tx, release_rx));
+        Self {
+            port,
+            arrivals,
+            release_tx,
+            task,
         }
     }
+
+    /// Wait until the gateway has forwarded a request to this backend.
+    async fn wait_for_arrival(&mut self) {
+        match timeout(Duration::from_secs(10), self.arrivals.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) => panic!("held backend stopped before a request arrived"),
+            Err(_) => panic!("no request reached the held backend within 10s"),
+        }
+    }
+
+    /// Let every held and future response proceed.
+    fn release(&self) {
+        let _ = self.release_tx.send_replace(true);
+    }
+}
+
+impl Drop for HeldBackend {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn serve_held_backend(
+    listener: TcpListener,
+    shape: HeldResponse,
+    arrival_tx: mpsc::UnboundedSender<()>,
+    release_rx: watch::Receiver<bool>,
+) {
+    while let Ok((mut stream, _)) = listener.accept().await {
+        let arrival_tx = arrival_tx.clone();
+        let mut release_rx = release_rx.clone();
+        tokio::spawn(async move {
+            let Some(head) = read_request_head(&mut stream).await else {
+                return;
+            };
+            if !is_client_request(&head) {
+                return;
+            }
+            let _ = arrival_tx.send(());
+            if matches!(shape, HeldResponse::StreamAcrossRelease) {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\
+                     Connection: close\r\n\r\n{:x}\r\n{STREAM_FIRST_PART}\r\n",
+                    STREAM_FIRST_PART.len()
+                );
+                if stream.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            let released = release_rx.wait_for(|released| *released).await.is_ok();
+            if !released {
+                return;
+            }
+            let rest = match shape {
+                HeldResponse::HeadAfterRelease => format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{HELD_BODY}",
+                    HELD_BODY.len()
+                ),
+                HeldResponse::StreamAcrossRelease => format!(
+                    "{:x}\r\n{STREAM_SECOND_PART}\r\n0\r\n\r\n",
+                    STREAM_SECOND_PART.len()
+                ),
+            };
+            let _ = stream.write_all(rest.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+}
+
+/// The HTTP/2 connection preface, which the gateway sends to a plaintext
+/// backend when it probes for h2c support.
+const H2C_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Read one request head, through its blank line. Returns `None` if the peer
+/// closed or failed first, or the head grew past 16 KiB.
+async fn read_request_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut head = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => {
+                head.extend_from_slice(&chunk[..n]);
+                if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    return Some(head);
+                }
+                if head.len() > 16 * 1024 {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Whether `head` is a proxied client request rather than a gateway probe.
+///
+/// With pool warmup off, the gateway still runs one backend capability refresh
+/// as soon as it is ready, and for a plaintext backend that refresh dials with
+/// the h2c preface ([`H2C_PREFACE`]). The preface contains a blank line, so it
+/// reads as a complete head. Counting it as an arrival let a test send SIGTERM
+/// before its client request reached the gateway, whose version sniff then
+/// cancelled the connection: the "in-flight" request was never in flight.
+/// Every held request in this file is a `GET`.
+fn is_client_request(head: &[u8]) -> bool {
+    head.starts_with(b"GET ")
 }
 
 // ============================================================================
@@ -96,128 +225,199 @@ fn gateway_binary_path() -> &'static str {
     }
 }
 
-fn start_gateway(
-    config_path: &str,
-    http_port: u16,
-    admin_port: u16,
-    drain_seconds: u64,
-    identity: &crate::common::SpawnedGatewayIdentity,
-) -> std::process::Child {
-    let binary_path = gateway_binary_path();
-
-    let mut cmd = std::process::Command::new(binary_path);
-    cmd.arg("run");
-    cmd.env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path)
-        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("FERRUM_PROXY_HTTPS_PORT", "0")
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
-        .env("FERRUM_SHUTDOWN_DRAIN_SECONDS", drain_seconds.to_string())
-        .env("FERRUM_LOG_LEVEL", "error")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    identity.apply_to_command(&mut cmd);
-    cmd.spawn().expect("Failed to start gateway binary")
-}
-
-async fn wait_for_owned_gateway(
-    child: &mut std::process::Child,
-    admin_port: u16,
-    identity: &crate::common::SpawnedGatewayIdentity,
-) -> bool {
-    crate::common::wait_for_owned_gateway_identity(
-        child,
-        admin_port,
-        identity,
-        Duration::from_secs(15),
-    )
-    .await
-    .is_ok()
-}
-
 async fn ephemeral_port() -> u16 {
     crate::scaffolding::ports::unbound_port()
         .await
         .expect("lease test port")
 }
 
-/// Start the gateway with retry against ephemeral-port races.
-async fn start_gateway_with_retry(
-    config_path: &str,
+/// A spawned gateway owned by an RAII guard (issue #4991): a failed assertion
+/// or timeout anywhere kills and reaps it. That teardown is cleanup only; it is
+/// never evidence of a graceful exit.
+struct DrainGateway {
+    guard: GatewayChildGuard,
+    proxy_port: u16,
+    _state_dir: TempDir,
+}
+
+impl DrainGateway {
+    fn proxy_addr(&self) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], self.proxy_port))
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.proxy_port)
+    }
+
+    async fn connect_h1(&self) -> H1Connection {
+        H1Connection::connect(self.proxy_addr(), GATEWAY_READ_BOUNDS).await
+    }
+
+    /// Deliver SIGTERM and fail unless the kernel accepted it for this child.
+    /// A signal that never reached the gateway would make every drain
+    /// assertion after it meaningless.
+    fn send_sigterm(&self) {
+        let pid = self
+            .guard
+            .id()
+            .expect("gateway child was reaped before SIGTERM");
+        let pid = libc::pid_t::try_from(pid).expect("pid fits in pid_t");
+        // SAFETY: kill(2) only reads its two integer arguments.
+        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            panic!("SIGTERM delivery to gateway pid {pid} failed: {error}");
+        }
+    }
+
+    async fn expect_proxy_port_closed(&self, context: &str) {
+        expect_listener_closed(self.proxy_addr(), HTTP_PROBE, context).await;
+    }
+
+    /// Assert that the gateway exits on its own, with status 0, within `bound`.
+    async fn expect_clean_exit(&mut self, bound: Duration, context: &str) {
+        let result = wait_for_clean_exit(self.guard.child_mut(), bound).await;
+        if let Err(failure) = result {
+            panic!(
+                "{context}: gateway did not exit cleanly within {bound:?}: {failure}\n{}",
+                self.guard.startup_diagnostics()
+            );
+        }
+    }
+}
+
+/// Spawn the gateway in file mode. Pool warmup is off so no startup `HEAD /`
+/// reaches the held backend (its startup h2c probe is filtered by
+/// [`is_client_request`]), and the managed-TLS store stays in the attempt's
+/// temp dir instead of the checkout (issue #5706).
+fn spawn_gateway(
+    config_path: &Path,
+    state_dir: &Path,
+    http_port: u16,
+    admin_port: u16,
     drain_seconds: u64,
-) -> (std::process::Child, u16, u16) {
+) -> std::io::Result<GatewayChildGuard> {
+    let mut cmd = Command::new(gateway_binary_path());
+    cmd.arg("run");
+    cmd.env("FERRUM_MODE", "file")
+        .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
+        .env("FERRUM_PROXY_HTTPS_PORT", "0")
+        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
+        .env("FERRUM_SHUTDOWN_DRAIN_SECONDS", drain_seconds.to_string())
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            state_dir.join("managed-tls"),
+        )
+        .env("FERRUM_LOG_LEVEL", "info")
+        .stdin(std::process::Stdio::null());
+    // Deliberately no `configure_coverage_gateway_command`: it pins the drain
+    // to 0, and the drain window is what these tests measure.
+    GatewayChildGuard::spawn_with_identity(
+        &mut cmd,
+        admin_port,
+        SpawnedGatewayIdentity::mint("graceful-shutdown"),
+    )
+}
+
+/// Start the gateway, retrying with fresh ports and a fresh state dir when a
+/// nonparticipating process wins a port race. `write_config` writes the
+/// attempt's config into the attempt's directory.
+async fn start_gateway_with_retry<F>(write_config: F, drain_seconds: u64) -> DrainGateway
+where
+    F: Fn(&Path) -> PathBuf,
+{
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
-
-        let identity = crate::common::SpawnedGatewayIdentity::mint("graceful-shutdown");
-        let mut child = start_gateway(
-            config_path,
+        let state_dir = TempDir::new().expect("gateway state dir");
+        let config_path = write_config(state_dir.path());
+        let mut guard = spawn_gateway(
+            &config_path,
+            state_dir.path(),
             proxy_port,
             admin_port,
             drain_seconds,
-            &identity,
-        );
-
-        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
-            return (child, proxy_port, admin_port);
+        )
+        .expect("spawn ferrum-edge");
+        match guard.wait_for_owned_ready(Duration::from_secs(15)).await {
+            Ok(()) => {
+                return DrainGateway {
+                    guard,
+                    proxy_port,
+                    _state_dir: state_dir,
+                };
+            }
+            Err(error) => {
+                eprintln!(
+                    "Gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
+                     (proxy_port={proxy_port}, admin_port={admin_port}): {error}\n{}",
+                    guard.startup_diagnostics()
+                );
+                guard.shutdown();
+            }
         }
-
-        eprintln!(
-            "Gateway startup attempt {}/{} failed (proxy_port={}, admin_port={})",
-            attempt, MAX_ATTEMPTS, proxy_port, admin_port
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
         }
     }
-    panic!(
-        "Gateway did not start after {} attempts (drain_seconds={})",
-        MAX_ATTEMPTS, drain_seconds
-    );
+    panic!("Gateway did not start after {MAX_ATTEMPTS} attempts (drain_seconds={drain_seconds})");
 }
 
-/// Send SIGTERM to a child process via the `kill` shell command. Using the
-/// shell avoids pulling in `libc` / `nix` for portability and matches the
-/// SIGHUP pattern used elsewhere in functional tests.
-fn send_sigterm(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .output();
+async fn start_http_gateway(backend_port: u16, drain_seconds: u64) -> DrainGateway {
+    start_gateway_with_retry(|dir| write_http_config(dir, backend_port), drain_seconds).await
 }
 
-/// Poll a child process until it exits or the timeout elapses. Returns
-/// `Some(status)` if the process exited, `None` on timeout.
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    deadline: Duration,
-) -> Option<std::process::ExitStatus> {
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) => {
-                if start.elapsed() >= deadline {
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => return None,
+/// Why a child was not shown to exit cleanly.
+enum ExitFailure {
+    /// Still running at the deadline.
+    TimedOut,
+    /// `try_wait` itself failed.
+    WaitFailed(std::io::Error),
+    /// Exited, but not with status 0.
+    Unsuccessful(ExitStatus),
+}
+
+impl fmt::Display for ExitFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut => f.write_str("still running at the deadline"),
+            Self::WaitFailed(error) => write!(f, "try_wait failed: {error}"),
+            Self::Unsuccessful(status) => write!(f, "exited unsuccessfully: {status}"),
         }
     }
 }
 
-/// Build a file-mode YAML config with one echo proxy pointed at `backend_port`.
-fn write_config(dir: &TempDir, backend_port: u16) -> std::path::PathBuf {
-    let config_path = dir.path().join("config.yaml");
-    let config_content = format!(
-        r#"
+/// Poll `child` until it exits or `bound` elapses. Only an exit with status 0
+/// inside the bound succeeds; a timeout is a failure, never a pass.
+async fn wait_for_clean_exit(child: &mut Child, bound: Duration) -> Result<(), ExitFailure> {
+    let deadline = Instant::now() + bound;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(ExitFailure::Unsuccessful(status)),
+            Ok(None) if Instant::now() >= deadline => return Err(ExitFailure::TimedOut),
+            Ok(None) => sleep(Duration::from_millis(25)).await,
+            Err(error) => return Err(ExitFailure::WaitFailed(error)),
+        }
+    }
+}
+
+fn write_config_file(dir: &Path, content: &str) -> PathBuf {
+    let config_path = dir.join("config.yaml");
+    let mut file = std::fs::File::create(&config_path).expect("create config");
+    file.write_all(content.as_bytes()).expect("write config");
+    config_path
+}
+
+/// File-mode config with one HTTP proxy at `/slow` pointed at `backend_port`.
+fn write_http_config(dir: &Path, backend_port: u16) -> PathBuf {
+    write_config_file(
+        dir,
+        &format!(
+            r#"
 version: "1"
 proxies:
   - id: "slow-proxy"
@@ -230,416 +430,685 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-    );
-    let mut f = std::fs::File::create(&config_path).expect("create config");
-    f.write_all(config_content.as_bytes())
-        .expect("write config");
-    drop(f);
-    config_path
+        ),
+    )
+}
+
+// ============================================================================
+// Listener Closure Probe
+// ============================================================================
+
+/// Probe bytes for an HTTP listener; a live gateway answers them.
+const HTTP_PROBE: &[u8] = b"GET / HTTP/1.1\r\nHost: probe\r\n\r\n";
+/// Probe bytes for a TCP stream listener; the echo backend answers them.
+const TCP_PROBE: &[u8] = b"x";
+/// Bound on each connect and read. Long enough that a loaded CI gateway
+/// answering a probe is not mistaken for a silent socket.
+const PROBE_STEP_BOUND: Duration = Duration::from_secs(2);
+/// Deadline for a listener to show closure after SIGTERM.
+const LISTENER_CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Positive evidence that a listener stopped accepting.
+enum ListenerClosed {
+    /// The kernel refused the connect: nothing listens on the port.
+    Refused,
+    /// The connect completed, but the peer closed or reset it without
+    /// answering: a backlog connection of a listener that has since closed.
+    ClosedWithoutAnswer,
+}
+
+/// Why a listener was not shown to be closed.
+enum ListenerStillOpen {
+    /// `connect()` neither completed nor failed within the step bound.
+    ConnectStalled,
+    /// The connect or the probe read failed with something other than a
+    /// refusal, a reset, or a close.
+    Failed(ErrorKind),
+    /// The connect completed and the peer held the socket open without
+    /// answering or closing it. A hung listener is not a closed one.
+    AcceptedButSilent,
+    /// The peer kept answering probes until the deadline.
+    StillServing,
+}
+
+impl fmt::Display for ListenerStillOpen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConnectStalled => f.write_str("connect() neither completed nor failed"),
+            Self::Failed(kind) => write!(f, "probe failed without refusal or close: {kind:?}"),
+            Self::AcceptedButSilent => {
+                f.write_str("accepted the connection but neither answered nor closed it")
+            }
+            Self::StillServing => f.write_str("kept answering probes until the deadline"),
+        }
+    }
+}
+
+/// One probe's result: closure evidence, or a peer that is still serving.
+enum ProbeStep {
+    Closed(ListenerClosed),
+    Answered,
+}
+
+async fn probe_listener_once(
+    addr: SocketAddr,
+    probe: &[u8],
+) -> Result<ProbeStep, ListenerStillOpen> {
+    let mut stream = match timeout(PROBE_STEP_BOUND, TcpStream::connect(addr)).await {
+        Err(_) => return Err(ListenerStillOpen::ConnectStalled),
+        Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
+            return Ok(ProbeStep::Closed(ListenerClosed::Refused));
+        }
+        // A listener that closes while the handshake is completing resets
+        // the half-open connection, so connect() itself reports the reset.
+        Ok(Err(error)) if is_peer_close(error.kind()) => {
+            return Ok(ProbeStep::Closed(ListenerClosed::ClosedWithoutAnswer));
+        }
+        Ok(Err(error)) => return Err(ListenerStillOpen::Failed(error.kind())),
+        Ok(Ok(stream)) => stream,
+    };
+    // A reset peer can fail this write; the read below observes the same
+    // reset, so the write result adds no evidence either way.
+    let _ = stream.write_all(probe).await;
+    let mut buf = [0u8; 64];
+    match timeout(PROBE_STEP_BOUND, stream.read(&mut buf)).await {
+        Err(_) => Err(ListenerStillOpen::AcceptedButSilent),
+        Ok(Ok(0)) => Ok(ProbeStep::Closed(ListenerClosed::ClosedWithoutAnswer)),
+        Ok(Ok(_)) => Ok(ProbeStep::Answered),
+        Ok(Err(error)) if is_peer_close(error.kind()) => {
+            Ok(ProbeStep::Closed(ListenerClosed::ClosedWithoutAnswer))
+        }
+        Ok(Err(error)) => Err(ListenerStillOpen::Failed(error.kind())),
+    }
+}
+
+fn is_peer_close(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe
+    )
+}
+
+/// Probe `addr` until it shows closure evidence or `deadline` elapses. A peer
+/// that answers is probed again (its accept loop may not have observed the
+/// shutdown yet); every other outcome is final.
+async fn wait_for_listener_closed(
+    addr: SocketAddr,
+    probe: &[u8],
+    deadline: Duration,
+) -> Result<ListenerClosed, ListenerStillOpen> {
+    let start = Instant::now();
+    loop {
+        match probe_listener_once(addr, probe).await? {
+            ProbeStep::Closed(closed) => return Ok(closed),
+            ProbeStep::Answered if start.elapsed() >= deadline => {
+                return Err(ListenerStillOpen::StillServing);
+            }
+            ProbeStep::Answered => sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+async fn expect_listener_closed(addr: SocketAddr, probe: &[u8], context: &str) {
+    if let Err(failure) = wait_for_listener_closed(addr, probe, LISTENER_CLOSE_DEADLINE).await {
+        panic!("{context}: listener at {addr} was not shown closed: {failure}");
+    }
+}
+
+// ============================================================================
+// Typed HTTP/1.1 Response Reader
+// ============================================================================
+
+/// Per-phase bounds for [`read_h1_response`].
+#[derive(Clone, Copy)]
+struct ReadBounds {
+    /// Until the complete response head arrives.
+    head: Duration,
+    /// Between consecutive body frames.
+    body: Duration,
+}
+
+/// Bounds for responses through the gateway; `head` covers the longest
+/// barrier hold in these tests.
+const GATEWAY_READ_BOUNDS: ReadBounds = ReadBounds {
+    head: Duration::from_secs(20),
+    body: Duration::from_secs(10),
+};
+
+/// How long [`H1Connection::wait_for_peer_close`] waits.
+const PEER_CLOSE_BOUND: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+enum ReadPhase {
+    Head,
+    Body,
+}
+
+/// A response whose declared framing was fully honoured.
+struct CompleteResponse {
+    status: u16,
+    /// A `Connection` header carried the `close` token.
+    connection_close: bool,
+    body: Vec<u8>,
+}
+
+/// Every way reading one HTTP/1.1 response can end (issue #5739). Only
+/// [`H1Read::Complete`] is evidence of a response; each failure keeps its own
+/// variant so a stall or a truncation can never pass as a clean close.
+enum H1Read {
+    Complete(CompleteResponse),
+    /// The peer closed before a complete response head arrived.
+    ClosedBeforeResponse,
+    /// Nothing more arrived within the phase bound while the socket stayed
+    /// open.
+    Stalled(ReadPhase),
+    /// The response head is not valid HTTP/1.1, for example a malformed
+    /// `Content-Length`.
+    Malformed(String),
+    /// Neither `Content-Length` nor chunked framing: the body could only end at
+    /// a socket close, which cannot be told apart from truncation.
+    UnsupportedFraming,
+    /// The body ended before its declared framing completed.
+    TruncatedBody {
+        received: usize,
+        error: String,
+    },
+    /// Any other transport failure before the response head.
+    Transport(String),
+}
+
+impl fmt::Display for H1Read {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Complete(response) => write!(
+                f,
+                "complete response (status {}, connection_close={}, {} body bytes)",
+                response.status,
+                response.connection_close,
+                response.body.len()
+            ),
+            Self::ClosedBeforeResponse => f.write_str("closed before the response head"),
+            Self::Stalled(ReadPhase::Head) => f.write_str("stalled before the response head"),
+            Self::Stalled(ReadPhase::Body) => f.write_str("stalled inside the response body"),
+            Self::Malformed(error) => write!(f, "malformed response head: {error}"),
+            Self::UnsupportedFraming => f.write_str("body delimited only by connection close"),
+            Self::TruncatedBody { received, error } => {
+                write!(f, "body truncated after {received} bytes: {error}")
+            }
+            Self::Transport(error) => write!(f, "transport failure: {error}"),
+        }
+    }
+}
+
+fn expect_complete(read: H1Read, context: &str) -> CompleteResponse {
+    match read {
+        H1Read::Complete(response) => response,
+        other => panic!("{context}: expected a complete HTTP/1.1 response, got: {other}"),
+    }
+}
+
+/// Join a response-read task. Every read phase is bounded, so this returns.
+async fn finish(task: JoinHandle<H1Read>) -> H1Read {
+    task.await.expect("HTTP/1.1 response read task panicked")
+}
+
+/// The gateway's own body for a backend call that failed without a timeout.
+const GATEWAY_BACKEND_UNAVAILABLE_BODY: &[u8] = br#"{"error":"Backend unavailable"}"#;
+
+/// Assert how a request the backend never answered ends once shutdown gives up
+/// on it.
+///
+/// Two endings are correct. The exit can tear the client connection down
+/// before any response head (`ClosedBeforeResponse` or `Transport`). Or the
+/// runtime teardown can drop the backend leg first, and the still-running
+/// handler answers with the gateway's own `502` Backend unavailable body,
+/// which drain marks `Connection: close`. Anything else fails: a stall means
+/// the exit left the socket open, and any other complete response, the
+/// backend's `200` above all, did not come from the abandoned request.
+fn expect_abandoned(read: H1Read, context: &str) {
+    match read {
+        H1Read::ClosedBeforeResponse | H1Read::Transport(_) => {}
+        H1Read::Complete(response) => {
+            assert_ne!(
+                response.body,
+                HELD_BODY.as_bytes(),
+                "{context}: the unreleased backend body was delivered"
+            );
+            assert_eq!(
+                response.status, 502,
+                "{context}: only the gateway's 502 may answer an abandoned request"
+            );
+            assert_eq!(
+                response.body, GATEWAY_BACKEND_UNAVAILABLE_BODY,
+                "{context}: the 502 must be the gateway's Backend unavailable body"
+            );
+            assert!(
+                response.connection_close,
+                "{context}: a 502 written during shutdown must carry `Connection: close`"
+            );
+        }
+        other => panic!(
+            "{context}: expected the request cut off or answered with the gateway's 502, \
+             got: {other}"
+        ),
+    }
+}
+
+fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|item| item.trim().eq_ignore_ascii_case(token))
+}
+
+fn classify_head_error(error: &hyper::Error) -> H1Read {
+    if error.is_parse() {
+        H1Read::Malformed(error.to_string())
+    } else if error.is_incomplete_message() || error.is_canceled() || error.is_closed() {
+        H1Read::ClosedBeforeResponse
+    } else {
+        H1Read::Transport(error.to_string())
+    }
+}
+
+/// Classify how one HTTP/1.1 response ends, using hyper's client parser
+/// rather than a permissive hand-rolled one. Hyper verifies that
+/// `Content-Length` and chunked bodies are complete; any other ending is
+/// reported as its own variant, never collapsed into "closed".
+async fn read_h1_response<F>(response: F, bounds: ReadBounds) -> H1Read
+where
+    F: Future<Output = hyper::Result<hyper::Response<hyper::body::Incoming>>>,
+{
+    let response = match timeout(bounds.head, response).await {
+        Err(_) => return H1Read::Stalled(ReadPhase::Head),
+        Ok(Err(error)) => return classify_head_error(&error),
+        Ok(Ok(response)) => response,
+    };
+    let status = response.status().as_u16();
+    let headers = response.headers();
+    let chunked = header_has_token(headers, TRANSFER_ENCODING, "chunked");
+    if !chunked && !headers.contains_key(CONTENT_LENGTH) {
+        return H1Read::UnsupportedFraming;
+    }
+    let connection_close = header_has_token(headers, CONNECTION, "close");
+    let mut incoming = response.into_body();
+    let mut body = Vec::new();
+    loop {
+        match timeout(bounds.body, incoming.frame()).await {
+            Err(_) => return H1Read::Stalled(ReadPhase::Body),
+            Ok(None) => break,
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    body.extend_from_slice(&data);
+                }
+            }
+            Ok(Some(Err(error))) => {
+                return H1Read::TruncatedBody {
+                    received: body.len(),
+                    error: error.to_string(),
+                };
+            }
+        }
+    }
+    H1Read::Complete(CompleteResponse {
+        status,
+        connection_close,
+        body,
+    })
+}
+
+/// One client HTTP/1.1 connection, driven by hyper. Responses are read through
+/// [`read_h1_response`].
+struct H1Connection {
+    sender: http1::SendRequest<Empty<Bytes>>,
+    driver: JoinHandle<hyper::Result<()>>,
+    bounds: ReadBounds,
+}
+
+impl H1Connection {
+    async fn connect(addr: SocketAddr, bounds: ReadBounds) -> Self {
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("connect HTTP/1.1 client");
+        let _ = stream.set_nodelay(true);
+        let (sender, connection) = http1::handshake(TokioIo::new(stream))
+            .await
+            .expect("HTTP/1.1 client handshake");
+        Self {
+            sender,
+            driver: tokio::spawn(connection),
+            bounds,
+        }
+    }
+
+    /// Send `GET path` and read its response on a task, so the test can act
+    /// (signal, release) before awaiting the result.
+    async fn start_get(&mut self, path: &str) -> JoinHandle<H1Read> {
+        if let Err(error) = self.sender.ready().await {
+            let read = classify_head_error(&error);
+            return tokio::spawn(async move { read });
+        }
+        let request = hyper::Request::get(path)
+            .header(HOST, "127.0.0.1")
+            .body(Empty::new())
+            .expect("build HTTP/1.1 request");
+        let response = self.sender.send_request(request);
+        tokio::spawn(read_h1_response(response, self.bounds))
+    }
+
+    /// Wait for the peer to close this connection. The request sender stays
+    /// alive meanwhile: dropping it would let hyper close the connection
+    /// itself, which proves nothing about the peer.
+    async fn wait_for_peer_close(&mut self) -> Result<(), String> {
+        match timeout(PEER_CLOSE_BOUND, &mut self.driver).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(format!("client connection task panicked: {error}")),
+            Err(_) => Err(format!("still open {PEER_CLOSE_BOUND:?} after shutdown")),
+        }
+    }
 }
 
 // ============================================================================
 // Tests
 // ============================================================================
 
-/// Case 1: An in-flight request at SIGTERM time must complete successfully
-/// within the drain window.
+/// Case 1: A request proven in flight at SIGTERM (it reached the backend and is
+/// held there) completes with its full body once drain has begun, and the
+/// gateway then exits cleanly. Uses a pooled reqwest client, as real callers
+/// do.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_inflight_request_completes_during_drain() {
-    let temp_dir = TempDir::new().unwrap();
+    let mut backend = HeldBackend::start(HeldResponse::HeadAfterRelease).await;
+    let mut gateway = start_http_gateway(backend.port, 10).await;
 
-    // Backend sleeps 3s so the request is definitively in flight when we
-    // send SIGTERM 500ms later.
-    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    let backend_task = tokio::spawn(start_slow_backend_on(backend_listener, 3_000));
-    sleep(Duration::from_millis(200)).await;
-
-    let config_path = write_config(&temp_dir, backend_port);
-    let (mut gateway, proxy_port, _admin_port) =
-        start_gateway_with_retry(config_path.to_str().unwrap(), 10).await;
-
-    // Fire the slow request in the background.
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30))
         .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{}/slow", proxy_port);
-    let inflight = tokio::spawn(async move { client.get(&url).send().await });
+        .expect("build client");
+    let url = gateway.url("/slow");
+    let inflight = tokio::spawn(async move {
+        let response = client.get(&url).send().await?;
+        let status = response.status();
+        Ok::<_, reqwest::Error>((status, response.bytes().await?))
+    });
+    backend.wait_for_arrival().await;
 
-    // Let the request reach the backend and start sleeping.
-    sleep(Duration::from_millis(500)).await;
+    gateway.send_sigterm();
+    // Drain has provably begun once the accept loop is gone; only then may the
+    // held response proceed.
+    gateway.expect_proxy_port_closed("after SIGTERM").await;
+    backend.release();
 
-    // SIGTERM the gateway. Drain window is 10s; backend sleep + reply is ~3s.
-    let start = Instant::now();
-    send_sigterm(gateway.id());
+    let (status, body) = match timeout(Duration::from_secs(10), inflight).await {
+        Ok(Ok(Ok(outcome))) => outcome,
+        // `{error:?}` keeps the hyper cause (closed, incomplete, reset) that
+        // reqwest's Display drops.
+        Ok(Ok(Err(error))) => panic!(
+            "in-flight request failed during drain: {error:?}\ngateway exited: {}\n{}",
+            gateway.guard.has_exited(),
+            gateway.guard.startup_diagnostics()
+        ),
+        Ok(Err(error)) => panic!("in-flight request task panicked: {error}"),
+        Err(_) => panic!("in-flight request did not finish within 10s of its release"),
+    };
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(&body[..], HELD_BODY.as_bytes());
 
-    // The in-flight request must still return 200.
-    let result = timeout(Duration::from_secs(8), inflight).await;
-    match result {
-        Ok(Ok(Ok(resp))) => {
-            assert!(
-                resp.status().is_success(),
-                "in-flight request should complete with 200, got {}",
-                resp.status()
-            );
-            let body = resp.bytes().await.unwrap_or_default();
-            assert_eq!(&body[..], b"slow-ok");
-        }
-        Ok(Ok(Err(e))) => panic!("in-flight request errored during drain: {e}"),
-        Ok(Err(e)) => panic!("in-flight task panicked: {e}"),
-        Err(_) => panic!("in-flight request did not finish within 8s during drain"),
-    }
-
-    // The gateway must exit shortly after the request completes (drain complete).
-    let status = wait_with_timeout(&mut gateway, Duration::from_secs(6));
-    assert!(
-        status.is_some(),
-        "gateway did not exit within 6s after drain (elapsed={:?})",
-        start.elapsed()
-    );
-
-    backend_task.abort();
+    gateway
+        .expect_clean_exit(Duration::from_secs(6), "after the in-flight drain")
+        .await;
 }
 
-/// Case 2: Once SIGTERM fires and accept loops close, new TCP connections
-/// to the proxy port must be refused.
+/// Case 2: Once SIGTERM fires and the accept loops close, new TCP connections
+/// to the proxy port are refused (or closed unanswered), never accepted and
+/// left silent, for as long as a held request keeps the gateway draining. The
+/// request then completes and the gateway exits cleanly.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_new_connections_refused_during_drain() {
-    let temp_dir = TempDir::new().unwrap();
+    let mut backend = HeldBackend::start(HeldResponse::HeadAfterRelease).await;
+    let mut gateway = start_http_gateway(backend.port, 10).await;
 
-    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    let backend_task = tokio::spawn(start_slow_backend_on(backend_listener, 3_000));
-    sleep(Duration::from_millis(200)).await;
+    let mut connection = gateway.connect_h1().await;
+    let inflight = connection.start_get("/slow").await;
+    backend.wait_for_arrival().await;
 
-    let config_path = write_config(&temp_dir, backend_port);
-    let (mut gateway, proxy_port, _admin_port) =
-        start_gateway_with_retry(config_path.to_str().unwrap(), 10).await;
-
-    // Fire an in-flight request to keep the drain alive.
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{}/slow", proxy_port);
-    let inflight = tokio::spawn(async move { client.get(&url).send().await });
-
-    sleep(Duration::from_millis(500)).await;
-
-    send_sigterm(gateway.id());
-
-    // Give the accept loops a brief moment to exit. The drain path begins
-    // immediately on signal receipt but listener shutdown is async.
-    sleep(Duration::from_millis(500)).await;
-
-    // Attempt a fresh TCP connection — it must fail (RST/refused) OR close
-    // immediately. We try a few times over ~2s to survive any OS-level
-    // residual backlog.
-    let addr = format!("127.0.0.1:{}", proxy_port);
-    let mut refused = false;
-    for _ in 0..20 {
-        match timeout(Duration::from_millis(500), TcpStream::connect(&addr)).await {
-            Err(_) => {
-                // Timeout on connect — count as refused.
-                refused = true;
-                break;
-            }
-            Ok(Err(_)) => {
-                refused = true;
-                break;
-            }
-            Ok(Ok(mut s)) => {
-                // Connection succeeded at the syscall level but the listener
-                // may have closed it immediately. Try a minimal write + read;
-                // if the server dropped the socket this will EOF quickly.
-                let _ = s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
-                let mut buf = [0u8; 64];
-                match timeout(Duration::from_millis(500), s.read(&mut buf)).await {
-                    Ok(Ok(0)) => {
-                        refused = true;
-                        break;
-                    }
-                    Err(_) => {
-                        // Hung, but listener definitely isn't handling new
-                        // connections normally; accept as "refused enough".
-                        refused = true;
-                        break;
-                    }
-                    _ => {
-                        // Got a real response — listener still alive. Sleep
-                        // and retry to give the drain more time to close it.
-                        sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        }
-    }
+    gateway.send_sigterm();
+    gateway.expect_proxy_port_closed("after SIGTERM").await;
     assert!(
-        refused,
-        "proxy listener continued accepting new connections during drain"
+        !gateway.guard.has_exited(),
+        "gateway exited while a request was still held in flight"
     );
+    // Closure must hold for the whole drain, not be a transient blip.
+    gateway.expect_proxy_port_closed("while draining").await;
 
-    // Let the in-flight request finish and the gateway exit.
-    let _ = timeout(Duration::from_secs(10), inflight).await;
-    let _ = wait_with_timeout(&mut gateway, Duration::from_secs(6));
+    backend.release();
+    let response = expect_complete(finish(inflight).await, "in-flight request after refusal");
+    assert_eq!(response.status, 200, "in-flight request after refusal");
+    assert_eq!(response.body, HELD_BODY.as_bytes());
 
-    backend_task.abort();
+    gateway
+        .expect_clean_exit(Duration::from_secs(6), "after refusing new connections")
+        .await;
 }
 
-/// Case 3: `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` disables draining — the process
-/// exits almost immediately, even with a slow in-flight request.
+/// Case 3: `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` disables the drain wait. The
+/// process exits cleanly and promptly with a request still held. That request
+/// never gets the backend's response: it is cut off, or answered with the
+/// gateway's own `502` and `Connection: close` (see [`expect_abandoned`]),
+/// never left open.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_drain_zero_exits_immediately() {
-    let temp_dir = TempDir::new().unwrap();
+    let mut backend = HeldBackend::start(HeldResponse::HeadAfterRelease).await;
+    let mut gateway = start_http_gateway(backend.port, 0).await;
 
-    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    let backend_task = tokio::spawn(start_slow_backend_on(backend_listener, 5_000));
-    sleep(Duration::from_millis(200)).await;
+    let mut connection = gateway.connect_h1().await;
+    let inflight = connection.start_get("/slow").await;
+    backend.wait_for_arrival().await;
 
-    let config_path = write_config(&temp_dir, backend_port);
-    let (mut gateway, proxy_port, _admin_port) =
-        start_gateway_with_retry(config_path.to_str().unwrap(), 0).await;
+    gateway.send_sigterm();
+    gateway
+        .expect_clean_exit(Duration::from_secs(2), "with drain=0 and a held request")
+        .await;
 
-    // Start an in-flight request against a 5s backend sleep. We intentionally
-    // don't assert it succeeds — with drain=0 the gateway may cut it off.
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{}/slow", proxy_port);
-    let inflight = tokio::spawn(async move { client.get(&url).send().await });
-
-    sleep(Duration::from_millis(500)).await;
-
-    let start = Instant::now();
-    send_sigterm(gateway.id());
-
-    // With drain=0 the gateway should exit within ~2s total (accept loops
-    // close + background cleanup 5s budget is bypassed by the zero drain).
-    let status = wait_with_timeout(&mut gateway, Duration::from_secs(2));
-    assert!(
-        status.is_some(),
-        "gateway with drain=0 did not exit within 2s (elapsed={:?})",
-        start.elapsed()
-    );
-
-    // The in-flight request should either error or return — but we don't
-    // assert its specific outcome.
-    let _ = timeout(Duration::from_secs(2), inflight).await;
-
-    backend_task.abort();
+    // The backend was never released, so its response cannot exist. The exit
+    // must have ended the client request, not left it open and silent.
+    let read = finish(inflight).await;
+    expect_abandoned(read, "held request after a drain=0 exit");
 }
 
-/// Case 4: During drain, HTTP/1.1 responses must advertise `Connection: close`
-/// so clients don't reuse the connection. Because new TCP connections are
-/// refused during drain, we open a keep-alive connection BEFORE SIGTERM,
-/// send a first request, then send a second request over the same socket
-/// after SIGTERM and inspect its Connection header.
+/// Case 4: An HTTP/1.1 response the gateway produces during drain carries
+/// `Connection: close` together with its complete body.
+///
+/// The held backend proves the request is in flight before SIGTERM, and it
+/// releases the response only after the proxy listener is shown closed, so the
+/// response head is written while draining. An idle socket that shutdown
+/// closes fails this case because it has no response; idle closure is covered
+/// by `test_idle_keepalive_connection_closed_on_drain`.
+///
+/// On this path the close token has two producers: the drain hint in the proxy
+/// response builder, and hyper's keep-alive disable from the per-connection
+/// `graceful_shutdown()`. This case pins the wire contract that either one
+/// satisfies; it cannot tell them apart. The gateway's own drain hint is
+/// isolated by `drain_flag_marks_inflight_h1_response_connection_close` in
+/// `tests/integration/graceful_shutdown_tests.rs`, which begins drain without
+/// signalling the listener so hyper keep-alive stays on.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_drain_sets_connection_close_header() {
-    let temp_dir = TempDir::new().unwrap();
+    let mut backend = HeldBackend::start(HeldResponse::HeadAfterRelease).await;
+    let mut gateway = start_http_gateway(backend.port, 10).await;
 
-    // Use a fast backend (100ms sleep) so request turnaround is quick.
-    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    let backend_task = tokio::spawn(start_slow_backend_on(backend_listener, 100));
-    sleep(Duration::from_millis(200)).await;
+    let mut connection = gateway.connect_h1().await;
+    let inflight = connection.start_get("/slow").await;
+    backend.wait_for_arrival().await;
 
-    let config_path = write_config(&temp_dir, backend_port);
-    let (mut gateway, proxy_port, _admin_port) =
-        start_gateway_with_retry(config_path.to_str().unwrap(), 10).await;
+    gateway.send_sigterm();
+    gateway.expect_proxy_port_closed("after SIGTERM").await;
+    backend.release();
 
-    // Open a raw keep-alive HTTP/1.1 connection.
-    let addr = format!("127.0.0.1:{}", proxy_port);
-    let mut conn = TcpStream::connect(&addr).await.expect("connect to proxy");
-
-    // Request 1: normal keep-alive.
-    let req1 = format!(
-        "GET /slow HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: keep-alive\r\n\r\n",
-        proxy_port
-    );
-    conn.write_all(req1.as_bytes()).await.unwrap();
-
-    // Read response 1 fully.
-    let response1 = read_http_response(&mut conn).await.expect("read resp1");
+    let response = expect_complete(finish(inflight).await, "response released during drain");
+    assert_eq!(response.status, 200, "response released during drain");
+    assert_eq!(response.body, HELD_BODY.as_bytes());
     assert!(
-        response1.starts_with("HTTP/1.1 200"),
-        "first response should be 200: {}",
-        response1.lines().next().unwrap_or("")
+        response.connection_close,
+        "a response produced during drain must carry `Connection: close`"
     );
 
-    // Backend closes the gateway<->backend hop (its response set
-    // `Connection: close`), but the gateway's FRONTEND response is what we
-    // care about — and it does not re-emit backend hop-by-hop. Check whether
-    // the frontend already marked the connection closed (if so, we'll need
-    // to open a new connection pre-SIGTERM; do that now).
-    let first_has_close = response1
-        .to_ascii_lowercase()
-        .contains("\r\nconnection: close");
-
-    // If the gateway told us to close after response 1, we can't reuse this
-    // socket. Open a second keep-alive socket before SIGTERM.
-    let mut conn2 = if first_has_close {
-        let mut c = TcpStream::connect(&addr)
-            .await
-            .expect("reconnect pre-SIGTERM");
-        // Warm the connection with one request so we know it's alive.
-        let probe = format!(
-            "GET /slow HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: keep-alive\r\n\r\n",
-            proxy_port
-        );
-        c.write_all(probe.as_bytes()).await.unwrap();
-        let probe_resp = read_http_response(&mut c).await.expect("read probe resp");
-        assert!(probe_resp.starts_with("HTTP/1.1 200"));
-        c
-    } else {
-        conn
-    };
-
-    // Now SIGTERM the gateway — from this point on responses should carry
-    // `Connection: close`.
-    send_sigterm(gateway.id());
-
-    // Give the signal handler time to flip the `draining` atomic.
-    sleep(Duration::from_millis(300)).await;
-
-    // Send a second request over the pre-opened keep-alive socket.
-    let req2 = format!(
-        "GET /slow HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: keep-alive\r\n\r\n",
-        proxy_port
-    );
-    // If the write fails the server has already torn down the socket — which
-    // is effectively the same signal (connection won't be reused). Treat
-    // that as a pass for this case.
-    let write_ok = conn2.write_all(req2.as_bytes()).await.is_ok();
-
-    if write_ok {
-        match timeout(Duration::from_secs(5), read_http_response(&mut conn2)).await {
-            Ok(Some(response2)) => {
-                let lower = response2.to_ascii_lowercase();
-                assert!(
-                    lower.contains("\r\nconnection: close"),
-                    "second response during drain should include Connection: close, got:\n{}",
-                    response2
-                );
-            }
-            Ok(None) => {
-                // Socket closed without a response — also acceptable: the
-                // gateway won't keep it alive during drain.
-            }
-            Err(_) => panic!("timed out reading second response during drain"),
-        }
-    }
-
-    // Cleanup.
-    let _ = wait_with_timeout(&mut gateway, Duration::from_secs(8));
-    backend_task.abort();
+    gateway
+        .expect_clean_exit(Duration::from_secs(6), "after the close-marked response")
+        .await;
 }
 
-/// Case 5: Drain timeout is respected — with `FERRUM_SHUTDOWN_DRAIN_SECONDS=2`
-/// and a 10-second backend, the gateway must exit within ~4s total even
-/// though the in-flight request has not yet completed.
+/// Case 5: Drain timeout is respected. With `FERRUM_SHUTDOWN_DRAIN_SECONDS=2`
+/// and a request held forever, the gateway waits out the drain window, then
+/// abandons the request (see [`expect_abandoned`]) and exits cleanly.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_drain_timeout_respected() {
-    let temp_dir = TempDir::new().unwrap();
+    let mut backend = HeldBackend::start(HeldResponse::HeadAfterRelease).await;
+    let mut gateway = start_http_gateway(backend.port, 2).await;
 
-    // Backend sleeps 10s — longer than the drain timeout of 2s.
-    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    let backend_task = tokio::spawn(start_slow_backend_on(backend_listener, 10_000));
-    sleep(Duration::from_millis(200)).await;
+    let mut connection = gateway.connect_h1().await;
+    let inflight = connection.start_get("/slow").await;
+    backend.wait_for_arrival().await;
 
-    let config_path = write_config(&temp_dir, backend_port);
-    let (mut gateway, proxy_port, _admin_port) =
-        start_gateway_with_retry(config_path.to_str().unwrap(), 2).await;
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{}/slow", proxy_port);
-    let inflight = tokio::spawn(async move { client.get(&url).send().await });
-
-    sleep(Duration::from_millis(500)).await;
-
-    let start = Instant::now();
-    send_sigterm(gateway.id());
-
-    // Drain timeout 2s + background-cleanup 5s gives a hard upper bound of
-    // ~7s, but with nothing else to wait on the process should exit very
-    // close to 2s (drain deadline). We allow 4s to cover CI jitter.
-    let status = wait_with_timeout(&mut gateway, Duration::from_secs(4));
+    let signalled = Instant::now();
+    gateway.send_sigterm();
+    // The drain wait is 2s and background cleanup normally adds little; 4s
+    // covers CI jitter.
+    gateway
+        .expect_clean_exit(Duration::from_secs(4), "after the drain timeout")
+        .await;
+    let elapsed = signalled.elapsed();
     assert!(
-        status.is_some(),
-        "gateway did not honor drain timeout (elapsed={:?})",
-        start.elapsed()
+        elapsed >= Duration::from_millis(1_500),
+        "gateway exited {elapsed:?} after SIGTERM, before its 2s drain window: the held \
+         request was not waited for"
     );
 
-    // The in-flight request should have errored because the gateway exited.
-    let _ = timeout(Duration::from_secs(2), inflight).await;
-
-    backend_task.abort();
+    let read = finish(inflight).await;
+    expect_abandoned(read, "held request after the drain timeout");
 }
 
-// ============================================================================
-// Raw HTTP/1.1 response reader
-// ============================================================================
+/// Case 6: An idle keep-alive HTTP/1.1 connection is closed by the gateway when
+/// shutdown begins, and the gateway then exits cleanly. This is the
+/// idle-connection contract, kept apart from the in-flight `Connection: close`
+/// case above.
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_idle_keepalive_connection_closed_on_drain() {
+    let backend = HeldBackend::start(HeldResponse::HeadAfterRelease).await;
+    backend.release();
+    let mut gateway = start_http_gateway(backend.port, 10).await;
 
-/// Read a complete HTTP/1.1 response (status line + headers + body, where body
-/// length is determined by `Content-Length`). Returns `None` if the socket
-/// closed before a full response was seen.
-async fn read_http_response(conn: &mut TcpStream) -> Option<String> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 1024];
+    let mut connection = gateway.connect_h1().await;
+    let first = expect_complete(
+        finish(connection.start_get("/slow").await).await,
+        "keep-alive request before SIGTERM",
+    );
+    assert_eq!(first.status, 200, "keep-alive request before SIGTERM");
+    assert!(
+        !first.connection_close,
+        "the pre-shutdown response closed the connection, so this case cannot observe an \
+         idle close"
+    );
 
-    // Read until we have the full header block.
-    let header_end = loop {
-        match timeout(Duration::from_secs(5), conn.read(&mut tmp)).await {
-            Ok(Ok(0)) => return None,
-            Ok(Ok(n)) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-                    break pos + 4;
-                }
-            }
-            _ => return None,
-        }
+    gateway.send_sigterm();
+    if let Err(failure) = connection.wait_for_peer_close().await {
+        panic!("idle keep-alive connection after SIGTERM: {failure}");
+    }
+    gateway
+        .expect_clean_exit(Duration::from_secs(6), "after the idle close")
+        .await;
+}
+
+/// How long a held stream is observed after the listener closes. A gateway
+/// that stopped counting the open body would finish its drain and exit well
+/// inside this window.
+const HELD_STREAM_OBSERVATION: Duration = Duration::from_secs(1);
+
+/// Case 7: A streaming HTTP/1.1 response body that is open when SIGTERM
+/// arrives keeps the drain open until it finishes.
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_h1_streaming_response_survives_drain() {
+    assert_streaming_response_survives_drain(reqwest::Version::HTTP_11).await;
+}
+
+/// Case 8: The same over HTTP/2 (h2c prior knowledge), whose connection gets a
+/// GOAWAY on shutdown instead of `Connection: close`. This is the real-process
+/// H2 drain regression; `tests/integration/graceful_shutdown_tests.rs` covers
+/// the in-process GOAWAY.
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_h2_streaming_response_survives_drain() {
+    assert_streaming_response_survives_drain(reqwest::Version::HTTP_2).await;
+}
+
+/// The gateway stays up while the body is held, relays the rest of the body
+/// after release, and exits cleanly only then.
+async fn assert_streaming_response_survives_drain(version: reqwest::Version) {
+    let mut backend = HeldBackend::start(HeldResponse::StreamAcrossRelease).await;
+    let mut gateway = start_http_gateway(backend.port, 10).await;
+
+    let builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+    let builder = if version == reqwest::Version::HTTP_2 {
+        builder.http2_prior_knowledge()
+    } else {
+        builder.http1_only()
     };
+    let client = builder.build().expect("build streaming client");
+    let request = client.get(gateway.url("/slow")).send();
+    let mut response = timeout(Duration::from_secs(10), request)
+        .await
+        .expect("streaming response head did not arrive within 10s")
+        .expect("streaming request failed before its head");
+    backend.wait_for_arrival().await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.version(), version, "negotiated protocol");
 
-    // Parse Content-Length if present.
-    let header_str = std::str::from_utf8(&buf[..header_end]).ok()?;
-    let content_length: usize = header_str
-        .lines()
-        .find_map(|l| {
-            let lower = l.to_ascii_lowercase();
-            lower
-                .strip_prefix("content-length:")
-                .map(|v| v.trim().parse::<usize>().ok())
-        })
-        .flatten()
-        .unwrap_or(0);
-
-    let total_needed = header_end + content_length;
-    while buf.len() < total_needed {
-        match timeout(Duration::from_secs(5), conn.read(&mut tmp)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
-            _ => break,
+    // The first part proves the body is open and flowing before shutdown.
+    let mut body = Vec::new();
+    while body.len() < STREAM_FIRST_PART.len() {
+        match next_chunk(&mut response).await {
+            Some(chunk) => body.extend_from_slice(&chunk),
+            None => panic!("stream ended before its first part"),
         }
     }
+    assert_eq!(body, STREAM_FIRST_PART.as_bytes());
 
-    String::from_utf8(buf).ok()
+    gateway.send_sigterm();
+    gateway.expect_proxy_port_closed("after SIGTERM").await;
+    sleep(HELD_STREAM_OBSERVATION).await;
+    assert!(
+        !gateway.guard.has_exited(),
+        "gateway exited while a streaming response body was still open"
+    );
+
+    backend.release();
+    while let Some(chunk) = next_chunk(&mut response).await {
+        body.extend_from_slice(&chunk);
+    }
+    let expected = format!("{STREAM_FIRST_PART}{STREAM_SECOND_PART}");
+    assert_eq!(body, expected.as_bytes(), "streamed body across the drain");
+
+    gateway
+        .expect_clean_exit(Duration::from_secs(6), "after the streamed body finished")
+        .await;
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+/// Next body chunk. A transport error or a 10s stall fails the test.
+async fn next_chunk(response: &mut reqwest::Response) -> Option<Bytes> {
+    match timeout(Duration::from_secs(10), response.chunk()).await {
+        Ok(Ok(chunk)) => chunk,
+        Ok(Err(error)) => panic!("streaming body failed: {error}"),
+        Err(_) => panic!("streaming body stalled for 10s"),
+    }
 }
 
 // ============================================================================
@@ -655,11 +1124,11 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // Each test starts the real binary in file mode with a TCP or UDP stream
 // proxy, sends SIGTERM, and asserts that:
 //   * The proxy port stops accepting connections / datagrams reasonably soon.
-//   * The gateway process exits within `FERRUM_SHUTDOWN_DRAIN_SECONDS` plus
-//     a small overhead.
+//   * The gateway process exits cleanly within `FERRUM_SHUTDOWN_DRAIN_SECONDS`
+//     plus a small overhead.
 
 /// Spawn a basic TCP echo backend on a pre-bound listener.
-async fn start_tcp_echo_backend_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+async fn start_tcp_echo_backend_on(listener: TcpListener) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -685,7 +1154,7 @@ async fn start_tcp_echo_backend_on(listener: TcpListener) -> tokio::task::JoinHa
 }
 
 /// Spawn a basic UDP echo backend on a pre-bound socket.
-async fn start_udp_echo_backend_on(socket: tokio::net::UdpSocket) -> tokio::task::JoinHandle<()> {
+async fn start_udp_echo_backend_on(socket: tokio::net::UdpSocket) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
@@ -699,17 +1168,12 @@ async fn start_udp_echo_backend_on(socket: tokio::net::UdpSocket) -> tokio::task
     })
 }
 
-/// Build a file-mode YAML config with one TCP stream proxy + one HTTP echo
-/// proxy. The HTTP proxy gives us an admin-port-style health check target so
-/// `wait_for_gateway` works the same way as the existing tests.
-fn write_tcp_stream_config(
-    dir: &TempDir,
-    tcp_listen_port: u16,
-    tcp_backend_port: u16,
-) -> std::path::PathBuf {
-    let config_path = dir.path().join("config.yaml");
-    let config_content = format!(
-        r#"
+/// File-mode config with one TCP stream proxy.
+fn write_tcp_stream_config(dir: &Path, tcp_listen_port: u16, tcp_backend_port: u16) -> PathBuf {
+    write_config_file(
+        dir,
+        &format!(
+            r#"
 version: "1"
 proxies:
   - id: "tcp-echo"
@@ -721,23 +1185,16 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-    );
-    let mut f = std::fs::File::create(&config_path).expect("create config");
-    f.write_all(config_content.as_bytes())
-        .expect("write config");
-    drop(f);
-    config_path
+        ),
+    )
 }
 
 /// Same as [`write_tcp_stream_config`] but for a UDP stream proxy.
-fn write_udp_stream_config(
-    dir: &TempDir,
-    udp_listen_port: u16,
-    udp_backend_port: u16,
-) -> std::path::PathBuf {
-    let config_path = dir.path().join("config.yaml");
-    let config_content = format!(
-        r#"
+fn write_udp_stream_config(dir: &Path, udp_listen_port: u16, udp_backend_port: u16) -> PathBuf {
+    write_config_file(
+        dir,
+        &format!(
+            r#"
 version: "1"
 proxies:
   - id: "udp-echo"
@@ -749,61 +1206,12 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-    );
-    let mut f = std::fs::File::create(&config_path).expect("create config");
-    f.write_all(config_content.as_bytes())
-        .expect("write config");
-    drop(f);
-    config_path
-}
-
-/// Start the gateway binary with a stream proxy listen port pre-known. We
-/// can't reuse `start_gateway_with_retry` because it always allocates a fresh
-/// proxy listen port at retry time, but stream proxies need the listen port
-/// embedded in the config file, so we accept a pre-allocated `stream_port`.
-async fn start_gateway_with_stream_port<F>(
-    write_config: F,
-    stream_port: u16,
-    drain_seconds: u64,
-) -> Option<(std::process::Child, u16, u16, TempDir)>
-where
-    F: Fn(&TempDir, u16) -> std::path::PathBuf,
-{
-    const MAX_ATTEMPTS: u32 = 3;
-    for attempt in 1..=MAX_ATTEMPTS {
-        let dir = TempDir::new().unwrap();
-        let proxy_port = ephemeral_port().await;
-        let admin_port = ephemeral_port().await;
-        let config_path = write_config(&dir, stream_port);
-
-        let identity = crate::common::SpawnedGatewayIdentity::mint("graceful-shutdown-stream");
-        let mut child = start_gateway(
-            config_path.to_str().unwrap(),
-            proxy_port,
-            admin_port,
-            drain_seconds,
-            &identity,
-        );
-
-        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
-            return Some((child, proxy_port, admin_port, dir));
-        }
-
-        let _ = child.kill();
-        let _ = child.wait();
-        eprintln!(
-            "Gateway startup attempt {}/{} failed (stream_port={}, http={}, admin={})",
-            attempt, MAX_ATTEMPTS, stream_port, proxy_port, admin_port
-        );
-        if attempt < MAX_ATTEMPTS {
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
-    None
+        ),
+    )
 }
 
 /// Verify TCP stream listener stops accepting after SIGTERM and the gateway
-/// exits within the drain window.
+/// exits cleanly within the drain window.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_tcp_stream_listener_stops_on_sigterm() {
@@ -814,28 +1222,19 @@ async fn test_tcp_stream_listener_stops_on_sigterm() {
 
     // Pre-allocate the stream listener port.
     let stream_port = ephemeral_port().await;
-
-    let (mut gateway, _proxy_port, _admin_port, _dir) = match start_gateway_with_stream_port(
-        |dir, port| write_tcp_stream_config(dir, port, backend_port),
-        stream_port,
+    let mut gateway = start_gateway_with_retry(
+        |dir| write_tcp_stream_config(dir, stream_port, backend_port),
         5,
     )
-    .await
-    {
-        Some(v) => v,
-        None => {
-            backend_task.abort();
-            panic!("gateway failed to start with TCP stream listener");
-        }
-    };
+    .await;
 
     // Give the stream listener a moment to bind.
     sleep(Duration::from_millis(500)).await;
 
     // Open a long-lived TCP connection through the stream proxy and exchange
     // a frame so we know the relay is up.
-    let addr = format!("127.0.0.1:{}", stream_port);
-    let mut conn = TcpStream::connect(&addr)
+    let addr = SocketAddr::from(([127, 0, 0, 1], stream_port));
+    let mut conn = TcpStream::connect(addr)
         .await
         .expect("connect to stream listener");
     conn.write_all(b"hello").await.expect("write first frame");
@@ -847,67 +1246,26 @@ async fn test_tcp_stream_listener_stops_on_sigterm() {
     assert_eq!(n, 5);
     assert_eq!(&buf, b"hello");
 
-    // Send SIGTERM.
-    let start = Instant::now();
-    send_sigterm(gateway.id());
+    gateway.send_sigterm();
 
-    // Give the listener a moment to react to the global shutdown.
-    sleep(Duration::from_millis(500)).await;
-
-    // New TCP connections to the stream port must be refused (or closed
-    // immediately) — the accept loop should have exited. Retry for ~3s to
-    // survive OS-level residual backlog.
-    let mut refused = false;
-    for _ in 0..30 {
-        match timeout(Duration::from_millis(300), TcpStream::connect(&addr)).await {
-            Err(_) => {
-                refused = true;
-                break;
-            }
-            Ok(Err(_)) => {
-                refused = true;
-                break;
-            }
-            Ok(Ok(mut s)) => {
-                // Either the socket was closed immediately by the OS backlog
-                // drain, or it was accepted by a not-yet-exited loop. Try a
-                // small write+read; if the relay tears it down quickly, count
-                // as refused.
-                let _ = s.write_all(b"x").await;
-                let mut tmp = [0u8; 8];
-                match timeout(Duration::from_millis(300), s.read(&mut tmp)).await {
-                    Ok(Ok(0)) | Err(_) => {
-                        refused = true;
-                        break;
-                    }
-                    _ => {
-                        sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        }
-    }
-    assert!(
-        refused,
-        "TCP stream listener continued accepting new connections after SIGTERM"
-    );
+    // New TCP connections to the stream port must be refused or closed
+    // unanswered: the accept loop should have exited. An accepted connection
+    // that stays silent fails.
+    expect_listener_closed(addr, TCP_PROBE, "TCP stream listener after SIGTERM").await;
 
     // The gateway must exit cleanly within the drain window plus a small
     // overhead (background task drain caps at 5s). Drain is 5s, total budget
     // 12s.
-    let status = wait_with_timeout(&mut gateway, Duration::from_secs(12));
-    assert!(
-        status.is_some(),
-        "gateway did not exit within 12s of SIGTERM (elapsed={:?})",
-        start.elapsed()
-    );
+    gateway
+        .expect_clean_exit(Duration::from_secs(12), "after closing the TCP listener")
+        .await;
 
     drop(conn);
     backend_task.abort();
 }
 
 /// Verify UDP stream listener stops receiving after SIGTERM and the gateway
-/// exits within the drain window.
+/// exits cleanly within the drain window.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_udp_stream_listener_stops_on_sigterm() {
@@ -918,24 +1276,14 @@ async fn test_udp_stream_listener_stops_on_sigterm() {
     let backend_port = backend_socket.local_addr().unwrap().port();
     let backend_task = start_udp_echo_backend_on(backend_socket).await;
 
-    // Pre-allocate the stream listener port. We pre-bind a TCP listener to
-    // grab a port — the OS treats TCP/UDP ports independently so the same
-    // number can be used for the UDP listener once we drop the TCP one.
+    // Pre-allocate the stream listener port. The OS treats TCP/UDP ports
+    // independently, so the leased number serves the UDP listener.
     let stream_port = ephemeral_port().await;
-
-    let (mut gateway, _proxy_port, _admin_port, _dir) = match start_gateway_with_stream_port(
-        |dir, port| write_udp_stream_config(dir, port, backend_port),
-        stream_port,
+    let mut gateway = start_gateway_with_retry(
+        |dir| write_udp_stream_config(dir, stream_port, backend_port),
         5,
     )
-    .await
-    {
-        Some(v) => v,
-        None => {
-            backend_task.abort();
-            panic!("gateway failed to start with UDP stream listener");
-        }
-    };
+    .await;
 
     // Give the listener a moment to bind.
     sleep(Duration::from_millis(500)).await;
@@ -956,17 +1304,13 @@ async fn test_udp_stream_listener_stops_on_sigterm() {
         .expect("recv echo");
     assert_eq!(&buf[..n], b"ping");
 
-    let start = Instant::now();
-    send_sigterm(gateway.id());
-
-    // Give the listener a moment to react.
-    sleep(Duration::from_millis(500)).await;
+    gateway.send_sigterm();
 
     // After shutdown, the listener should not be bound to the stream port
     // anymore. We confirm by binding a fresh UDP socket on that port — it
     // must succeed.
     let mut released = false;
-    for _ in 0..30 {
+    for _ in 0..50 {
         match tokio::net::UdpSocket::bind_test(format!("127.0.0.1:{}", stream_port)).await {
             Ok(_) => {
                 released = true;
@@ -982,12 +1326,285 @@ async fn test_udp_stream_listener_stops_on_sigterm() {
     );
 
     // The gateway must exit cleanly within the drain window + overhead.
-    let status = wait_with_timeout(&mut gateway, Duration::from_secs(12));
-    assert!(
-        status.is_some(),
-        "gateway did not exit within 12s of SIGTERM (elapsed={:?})",
-        start.elapsed()
-    );
+    gateway
+        .expect_clean_exit(Duration::from_secs(12), "after releasing the UDP port")
+        .await;
 
     backend_task.abort();
+}
+
+// ============================================================================
+// Harness Negative Controls (issue #5739)
+// ============================================================================
+//
+// Not `#[ignore]`: these need no gateway binary and run in every CI shard that
+// selects this module. Each pins one helper against a fake peer, so a helper
+// that silently accepts a stall, a truncation, or a missing exit cannot keep
+// the gateway cases above green.
+
+/// Bounds for scripted peers: short, so stall cases finish quickly.
+const HARNESS_READ_BOUNDS: ReadBounds = ReadBounds {
+    head: Duration::from_millis(500),
+    body: Duration::from_millis(500),
+};
+
+#[derive(Clone, Copy)]
+enum FakePeer {
+    /// Accept and hold every connection open without reading, answering, or
+    /// closing it: a listener that is up but hung.
+    Silent,
+    /// Answer every probe.
+    Answering,
+    /// Accept, then close at once without answering.
+    CloseOnAccept,
+}
+
+async fn spawn_fake_peer(kind: FakePeer) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind fake peer");
+    let addr = listener.local_addr().expect("fake peer addr");
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            match kind {
+                FakePeer::Silent => held.push(stream),
+                FakePeer::Answering => {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 64];
+                        if matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {
+                            let _ = stream.write_all(b"answer").await;
+                        }
+                    });
+                }
+                FakePeer::CloseOnAccept => drop(stream),
+            }
+        }
+    });
+    (addr, task)
+}
+
+#[tokio::test]
+async fn harness_listener_probe_fails_on_accepted_silent_peer() {
+    let (addr, peer) = spawn_fake_peer(FakePeer::Silent).await;
+    let result = wait_for_listener_closed(addr, HTTP_PROBE, LISTENER_CLOSE_DEADLINE).await;
+    peer.abort();
+    assert!(
+        matches!(result, Err(ListenerStillOpen::AcceptedButSilent)),
+        "a peer that accepts, then neither answers nor closes, must fail the closure check"
+    );
+}
+
+#[tokio::test]
+async fn harness_listener_probe_fails_on_peer_that_keeps_answering() {
+    let (addr, peer) = spawn_fake_peer(FakePeer::Answering).await;
+    let result = wait_for_listener_closed(addr, TCP_PROBE, Duration::from_millis(500)).await;
+    peer.abort();
+    assert!(
+        matches!(result, Err(ListenerStillOpen::StillServing)),
+        "a peer that keeps answering must fail the closure check at the deadline"
+    );
+}
+
+#[tokio::test]
+async fn harness_listener_probe_accepts_close_without_answer() {
+    let (addr, peer) = spawn_fake_peer(FakePeer::CloseOnAccept).await;
+    let result = wait_for_listener_closed(addr, HTTP_PROBE, LISTENER_CLOSE_DEADLINE).await;
+    peer.abort();
+    assert!(
+        matches!(result, Ok(ListenerClosed::ClosedWithoutAnswer)),
+        "a peer that closes without answering is closure evidence"
+    );
+}
+
+#[tokio::test]
+async fn harness_listener_probe_accepts_kernel_refusal() {
+    if !REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY {
+        eprintln!("skipping: unlistened ports do not refuse on this host");
+        return;
+    }
+    let refused = reserve_refused_tcp_port().expect("reserve refused port");
+    let addr = refused.local_addr();
+    let result = wait_for_listener_closed(addr, HTTP_PROBE, LISTENER_CLOSE_DEADLINE).await;
+    assert!(
+        matches!(result, Ok(ListenerClosed::Refused)),
+        "a refused connect is closure evidence"
+    );
+}
+
+/// The gateway's startup capability refresh sends the h2c preface to a
+/// plaintext backend. The held backend must close that probe unanswered and
+/// not report it as the client request a drain test waits for; a real `GET`
+/// on the same backend still counts.
+#[tokio::test]
+async fn harness_held_backend_ignores_h2c_probe() {
+    let mut backend = HeldBackend::start(HeldResponse::HeadAfterRelease).await;
+    let addr = SocketAddr::from(([127, 0, 0, 1], backend.port));
+
+    let mut probe = TcpStream::connect(addr).await.expect("connect h2c probe");
+    probe
+        .write_all(H2C_PREFACE)
+        .await
+        .expect("write h2c preface");
+    let mut buf = [0u8; 16];
+    let read = timeout(PROBE_STEP_BOUND, probe.read(&mut buf)).await;
+    assert!(
+        matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+        "the held backend must close an h2c probe unanswered, got: {read:?}"
+    );
+    assert!(
+        backend.arrivals.try_recv().is_err(),
+        "an h2c probe must not count as a held-request arrival"
+    );
+
+    let mut client = TcpStream::connect(addr).await.expect("connect client");
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: backend\r\n\r\n")
+        .await
+        .expect("write client request");
+    backend.wait_for_arrival().await;
+}
+
+/// Serve `reply` to one request, then close the socket or hold it open and
+/// silent, and return how [`read_h1_response`] classified the exchange.
+async fn read_scripted_reply(reply: &'static [u8], then_close: bool) -> H1Read {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind scripted peer");
+    let addr = listener.local_addr().expect("scripted peer addr");
+    let peer = tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        if read_request_head(&mut stream).await.is_none() || stream.write_all(reply).await.is_err()
+        {
+            return;
+        }
+        if then_close {
+            let _ = stream.shutdown().await;
+        } else {
+            // Hold the socket open and silent until the test aborts this task.
+            std::future::pending::<()>().await;
+        }
+    });
+    let mut connection = H1Connection::connect(addr, HARNESS_READ_BOUNDS).await;
+    let read = finish(connection.start_get("/scripted").await).await;
+    peer.abort();
+    read
+}
+
+#[tokio::test]
+async fn harness_h1_reader_accepts_complete_framed_responses() {
+    let read = read_scripted_reply(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        true,
+    )
+    .await;
+    let response = expect_complete(read, "complete Content-Length response");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hello");
+    assert!(response.connection_close, "`Connection: close` expected");
+
+    // Chunked and kept open: completion comes from the framing, not a close.
+    let read = read_scripted_reply(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        false,
+    )
+    .await;
+    let response = expect_complete(read, "complete chunked response");
+    assert_eq!(response.body, b"hello");
+    assert!(!response.connection_close, "no close token was sent");
+}
+
+#[tokio::test]
+async fn harness_h1_reader_rejects_truncated_stalled_and_malformed_responses() {
+    type Case = (&'static str, &'static [u8], bool, fn(&H1Read) -> bool);
+    let cases: [Case; 8] = [
+        (
+            "Content-Length body cut short by a close",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhel",
+            true,
+            |read| matches!(read, H1Read::TruncatedBody { .. }),
+        ),
+        (
+            "chunked body cut short by a close",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel",
+            true,
+            |read| matches!(read, H1Read::TruncatedBody { .. }),
+        ),
+        (
+            "Content-Length body that stalls with the socket open",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhel",
+            false,
+            |read| matches!(read, H1Read::Stalled(ReadPhase::Body)),
+        ),
+        ("no response and the socket held open", b"", false, |read| {
+            matches!(read, H1Read::Stalled(ReadPhase::Head))
+        }),
+        (
+            "partial head and the socket held open",
+            b"HTTP/1.1 200 OK\r\nContent-Le",
+            false,
+            |read| matches!(read, H1Read::Stalled(ReadPhase::Head)),
+        ),
+        ("close before any response", b"", true, |read| {
+            matches!(read, H1Read::ClosedBeforeResponse)
+        }),
+        (
+            "malformed Content-Length",
+            b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\nhello",
+            true,
+            |read| matches!(read, H1Read::Malformed(_)),
+        ),
+        (
+            "body delimited only by close",
+            b"HTTP/1.1 200 OK\r\n\r\nhello",
+            true,
+            |read| matches!(read, H1Read::UnsupportedFraming),
+        ),
+    ];
+    for (label, reply, then_close, expected) in cases {
+        let read = read_scripted_reply(reply, then_close).await;
+        assert!(expected(&read), "{label}: misclassified as: {read}");
+    }
+}
+
+/// Spawn `command`, apply [`wait_for_clean_exit`], then kill and reap whatever
+/// is left. That cleanup is never the result under test.
+async fn exit_check(command: &mut Command, bound: Duration) -> Result<(), ExitFailure> {
+    let mut child = command.spawn().expect("spawn exit-check child");
+    let result = wait_for_clean_exit(&mut child, bound).await;
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+#[tokio::test]
+async fn harness_exit_wait_rejects_timeout_and_unsuccessful_exit() {
+    let mut sleeper = Command::new("sleep");
+    sleeper.arg("30");
+    let hung = exit_check(&mut sleeper, Duration::from_millis(300)).await;
+    assert!(
+        matches!(hung, Err(ExitFailure::TimedOut)),
+        "a child still running at the deadline must fail the exit check"
+    );
+
+    let mut failing = Command::new("sh");
+    failing.args(["-c", "exit 3"]);
+    let failed = exit_check(&mut failing, Duration::from_secs(5)).await;
+    let failed_code = match failed {
+        Err(ExitFailure::Unsuccessful(status)) => status.code(),
+        _ => None,
+    };
+    assert_eq!(
+        failed_code,
+        Some(3),
+        "a non-zero exit must fail the clean-exit check"
+    );
+
+    let clean = exit_check(&mut Command::new("true"), Duration::from_secs(5)).await;
+    assert!(
+        clean.is_ok(),
+        "a zero exit within the bound must pass the exit check"
+    );
 }
