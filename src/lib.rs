@@ -11775,7 +11775,10 @@ pub mod _test_support {
         attempt_timeout: std::time::Duration,
         handed_to_backend: Option<&std::sync::atomic::AtomicBool>,
         attempt: F,
-    ) -> (Result<F::Output, &'static str>, Option<tokio::time::Instant>) {
+    ) -> (
+        Result<F::Output, &'static str>,
+        Option<tokio::time::Instant>,
+    ) {
         let mut armed_deadline = None;
         let budget = match handed_to_backend {
             Some(marker) => crate::proxy::RouteAttemptBudget::from_handoff(

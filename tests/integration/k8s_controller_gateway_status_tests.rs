@@ -4649,7 +4649,11 @@ async fn fetch_timed_body(
     client: &reqwest::Client,
     harness: &crate::scaffolding::harness::GatewayHarness,
     path: &str,
-) -> (reqwest::StatusCode, Result<bytes::Bytes, reqwest::Error>, std::time::Duration) {
+) -> (
+    reqwest::StatusCode,
+    Result<bytes::Bytes, reqwest::Error>,
+    std::time::Duration,
+) {
     let started = std::time::Instant::now();
     let response = client
         .get(harness.proxy_url(path))
@@ -4876,7 +4880,11 @@ async fn gateway_route_backend_request_bounds_grpc_attempts_until_the_full_respo
     let (untimed_port, _untimed) = spawn_paced_grpc_backend(5, pause).await;
 
     let mut objects = route_filter_cluster_objects(timed_port);
-    objects.extend(scripted_service_objects("other", "10.96.0.12", untimed_port));
+    objects.extend(scripted_service_objects(
+        "other",
+        "10.96.0.12",
+        untimed_port,
+    ));
     objects.push(object(
         "gateway.networking.k8s.io/v1",
         "HTTPRoute",
