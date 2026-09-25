@@ -665,7 +665,8 @@ fn expect_abandoned(read: H1Read, context: &str) {
         H1Read::ClosedBeforeResponse | H1Read::Transport(_) => {}
         H1Read::Complete(response) => {
             assert_ne!(
-                response.body, HELD_BODY.as_bytes(),
+                response.body,
+                HELD_BODY.as_bytes(),
                 "{context}: the unreleased backend body was delivered"
             );
             assert_eq!(
