@@ -26,13 +26,18 @@
 
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
-    await_route_request_deadline_for_test, h3_route_attempt_bounds_for_test,
-    h3_route_deadline_reset_code_for_test, h3_route_deadline_terminal_for_test,
-    h3_route_deadlines_armed_for_test, proxy_body_streaming_for_test,
-    proxy_body_with_client_grpc_deadline_for_test, proxy_body_with_route_request_deadline_for_test,
-    route_deadline_expiry_response_for_test, route_request_deadline_outcome_for_test,
+    H3AuthorizedHeadersWrite, H3AuthorizedWrite, attribute_streaming_headers_deadline_for_test,
+    await_authorized_response_write_for_test, await_route_request_deadline_for_test,
+    h3_route_attempt_bounds_for_test, h3_route_deadline_reset_code_for_test,
+    h3_route_deadline_terminal_for_test, h3_route_deadlines_armed_for_test,
+    proxy_body_streaming_for_test, proxy_body_with_client_grpc_deadline_for_test,
+    proxy_body_with_route_request_deadline_for_test, route_deadline_expiry_response_for_test,
+    route_request_deadline_outcome_for_test,
 };
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
+use ferrum_edge::proxy::auth_lifetime::{
+    StreamAuthDeadline, StreamAuthTermination, StreamAuthTerminationLatch,
+};
 use ferrum_edge::proxy::body::ProxyBodyError;
 use ferrum_edge::retry::{ErrorClass, ResponseBody};
 use http_body::{Body, Frame, SizeHint};
@@ -339,6 +344,391 @@ fn native_http3_relays_enforce_the_route_deadline() {
         !server.contains("not supported over HTTP/3"),
         "the native HTTP/3 refusal of timed routes must stay retired"
     );
+}
+
+// ── A client that stops reading (PR #5741) ─────────────────────────────────
+
+/// A downstream write the client never grants QUIC flow control for.
+fn parked_client_write() -> std::future::Pending<Result<(), &'static str>> {
+    std::future::pending()
+}
+
+/// A client that stops reading parks every relay write in QUIC flow control,
+/// so the relay never returns to its own route deadline arm. The shared write
+/// seam races the route body deadline itself: the parked write is cut exactly
+/// at the deadline, and a route expiry is not an authorization termination.
+#[tokio::test(start_paused = true)]
+async fn a_parked_h3_response_write_is_cut_at_the_route_deadline() {
+    let started = Instant::now();
+    let route_deadline = started + Duration::from_millis(300);
+    let latch = StreamAuthTerminationLatch::default();
+
+    let outcome = await_authorized_response_write_for_test(
+        None,
+        Some(route_deadline),
+        &latch,
+        parked_client_write(),
+    )
+    .await;
+
+    assert_eq!(outcome, H3AuthorizedWrite::RouteDeadlineExceeded);
+    assert_eq!(Instant::now() - started, Duration::from_millis(300));
+    assert_eq!(
+        latch.observed(),
+        None,
+        "a route cut must not record an authorization termination"
+    );
+}
+
+/// An already-elapsed route deadline never polls the write, so no frame can
+/// reach the client after the route budget is spent.
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_route_deadline_never_polls_the_response_write() {
+    let polled = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&polled);
+    let write = std::future::poll_fn(move |_cx| {
+        flag.store(true, Ordering::SeqCst);
+        Poll::Ready(Ok::<(), &'static str>(()))
+    });
+    let latch = StreamAuthTerminationLatch::default();
+
+    let outcome =
+        await_authorized_response_write_for_test(None, Some(Instant::now()), &latch, write).await;
+
+    assert_eq!(outcome, H3AuthorizedWrite::RouteDeadlineExceeded);
+    assert!(!polled.load(Ordering::SeqCst));
+}
+
+/// The seam races the EARLIER of the authorization plan and the route
+/// deadline, attributes the winner from the captured instants, and gives an
+/// exact tie to authorization, as every composed bound does.
+#[tokio::test(start_paused = true)]
+async fn the_response_write_seam_attributes_the_earlier_of_authorization_and_route() {
+    let started = Instant::now();
+    let plan = |at| StreamAuthDeadline {
+        at,
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+
+    // The route deadline is earlier: a route cut, the latch untouched.
+    let latch = StreamAuthTerminationLatch::default();
+    let outcome = await_authorized_response_write_for_test(
+        Some(plan(started + Duration::from_secs(5))),
+        Some(started + Duration::from_secs(1)),
+        &latch,
+        parked_client_write(),
+    )
+    .await;
+    assert_eq!(outcome, H3AuthorizedWrite::RouteDeadlineExceeded);
+    assert_eq!(Instant::now() - started, Duration::from_secs(1));
+    assert_eq!(latch.observed(), None);
+
+    // Authorization is earlier: the authorization terminal, recorded once.
+    let started = Instant::now();
+    let latch = StreamAuthTerminationLatch::default();
+    let outcome = await_authorized_response_write_for_test(
+        Some(plan(started + Duration::from_secs(1))),
+        Some(started + Duration::from_secs(5)),
+        &latch,
+        parked_client_write(),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3AuthorizedWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    assert_eq!(Instant::now() - started, Duration::from_secs(1));
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+
+    // An exact tie goes to authorization.
+    let started = Instant::now();
+    let tie = started + Duration::from_secs(1);
+    let latch = StreamAuthTerminationLatch::default();
+    let outcome = await_authorized_response_write_for_test(
+        Some(plan(tie)),
+        Some(tie),
+        &latch,
+        parked_client_write(),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3AuthorizedWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+/// Without a route deadline or an authorization plan the write is awaited
+/// straight through; a ready write lands and a failed one is a disconnect.
+#[tokio::test(start_paused = true)]
+async fn an_unbounded_response_write_passes_straight_through() {
+    let latch = StreamAuthTerminationLatch::default();
+    let written = await_authorized_response_write_for_test(
+        None,
+        None,
+        &latch,
+        std::future::ready(Ok::<(), &'static str>(())),
+    )
+    .await;
+    assert_eq!(written, H3AuthorizedWrite::Written);
+    let failed = await_authorized_response_write_for_test(
+        None,
+        None,
+        &latch,
+        std::future::ready(Err::<(), &'static str>("reset")),
+    )
+    .await;
+    assert_eq!(failed, H3AuthorizedWrite::ClientWriteFailed);
+}
+
+/// A native streaming HEADERS write that outlives its bound is the route's cut
+/// unless a client RPC deadline was strictly earlier; every other outcome is
+/// left alone.
+#[test]
+fn a_parked_streaming_headers_write_is_attributed_to_the_route_deadline() {
+    let attribute = attribute_streaming_headers_deadline_for_test;
+    let protocol = H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded;
+    let route_cut = H3AuthorizedHeadersWrite::RouteDeadlineExceeded;
+    let now = Instant::now();
+    let later = now + Duration::from_secs(1);
+
+    assert_eq!(attribute(protocol, None, Some(now)), route_cut);
+    assert_eq!(attribute(protocol, Some(later), Some(now)), route_cut);
+    assert_eq!(attribute(protocol, Some(now), Some(now)), route_cut);
+    assert_eq!(attribute(protocol, Some(now), Some(later)), protocol);
+    assert_eq!(attribute(protocol, Some(now), None), protocol);
+    for outcome in [
+        H3AuthorizedHeadersWrite::Written,
+        H3AuthorizedHeadersWrite::ClientWriteFailed,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired),
+    ] {
+        assert_eq!(attribute(outcome, None, Some(now)), outcome);
+    }
+}
+
+/// A native route cut resets with `H3_REQUEST_CANCELLED` BEFORE
+/// `abort_committed()`: the first reset code is the one on the wire, so the
+/// committed guard's own reset would otherwise replace the route cut's code.
+fn assert_route_cancel_precedes_abort(arm: &str, what: &str) {
+    let cancel = arm
+        .find("cancel_response_stream(")
+        .unwrap_or_else(|| panic!("{what}: no H3_REQUEST_CANCELLED reset"));
+    let abort = arm
+        .find("abort_committed()")
+        .unwrap_or_else(|| panic!("{what}: no committed reset"));
+    assert!(
+        cancel < abort,
+        "{what}: H3_REQUEST_CANCELLED must be sent before abort_committed()"
+    );
+}
+
+/// The source of each match arm that starts with `arm`, up to the next
+/// variant of the same enum.
+fn match_arms<'a>(source: &'a str, arm: &str, next_variant: &str) -> Vec<&'a str> {
+    let mut arms = Vec::new();
+    for rest in source.split(arm).skip(1) {
+        arms.push(rest.split(next_variant).next().unwrap_or_default());
+    }
+    arms
+}
+
+/// Every write seam of every streaming relay races the route body deadline,
+/// not only the relay's idle `select!` arm (PR #5741): HEADERS, DATA,
+/// trailers, and FIN, on the native HTTP/3 relays and the bridge. A route
+/// expiry there is the relay's own route cut: `H3_REQUEST_CANCELLED`, the
+/// `read_write_timeout` body class, and health-neutral accounting.
+#[test]
+fn native_http3_route_deadline_races_every_parked_client_write() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+
+    // DATA / trailers / FIN: the shared seam, called with the route deadline.
+    for (file, source, seams) in [("server", server, 4), ("cross_protocol", bridge, 2)] {
+        let calls: Vec<&str> = source
+            .split("stream_util::await_authorized_response_write(\n")
+            .skip(1)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            seams,
+            "http3/{file}.rs: update the H3 write-seam parity table"
+        );
+        for call in calls {
+            let args = call.split(".await").next().unwrap_or_default();
+            assert!(
+                args.contains("route_body_deadline,"),
+                "http3/{file}.rs: a write seam does not race the route deadline"
+            );
+        }
+        let cuts = match_arms(
+            source,
+            "H3AuthorizedWrite::RouteDeadlineExceeded =>",
+            "H3AuthorizedWrite::",
+        );
+        assert_eq!(
+            cuts.len(),
+            seams,
+            "http3/{file}.rs: every write seam must handle a route expiry"
+        );
+        for arm in cuts {
+            assert!(
+                arm.contains("cancel_response_stream(")
+                    || arm.contains("H3TrailerFinishError::RouteDeadline"),
+                "http3/{file}.rs: a route expiry on a parked write must cut with \
+                 H3_REQUEST_CANCELLED"
+            );
+            assert!(
+                arm.contains("route_deadline_cut = true")
+                    || arm.contains("H3TrailerFinishError::RouteDeadline"),
+                "http3/{file}.rs: a route expiry on a parked write must stay health-neutral"
+            );
+            if file == "server" && !arm.contains("H3TrailerFinishError::RouteDeadline") {
+                assert_route_cancel_precedes_abort(arm, "http3/server.rs write seam");
+            }
+        }
+    }
+
+    // The trailer/FIN seam reports its route expiry to the relay, which cuts.
+    let trailer_cuts = match_arms(
+        server,
+        "Err(H3TrailerFinishError::RouteDeadline) =>",
+        "Err(H3TrailerFinishError::",
+    );
+    assert_eq!(
+        trailer_cuts.len(),
+        3,
+        "every native relay must cut a trailer/FIN route expiry"
+    );
+    for arm in trailer_cuts {
+        assert!(arm.contains("route_deadline_cut = true"));
+        assert_route_cancel_precedes_abort(arm, "http3/server.rs trailer/FIN route cut");
+    }
+
+    // Native streaming HEADERS: the shared commit helper, with the route
+    // deadline, and a route cut on its expiry.
+    let commits: Vec<&str> = server
+        .split("commit_authorized_streaming_response_headers(\n")
+        .skip(1)
+        .collect();
+    assert_eq!(commits.len(), 3, "update the HEADERS parity table");
+    for commit in commits {
+        let args = commit.split(".await").next().unwrap_or_default();
+        assert!(args.contains("route_body_deadline,"));
+    }
+    let header_arms = match_arms(
+        server,
+        "H3AuthorizedHeadersWrite::RouteDeadlineExceeded =>",
+        "H3AuthorizedHeadersWrite::",
+    );
+    let header_cuts = header_arms
+        .iter()
+        .filter(|arm| arm.contains("cancel_response_stream("))
+        .filter(|arm| arm.contains("route_deadline_cut"))
+        .count();
+    assert_eq!(
+        header_cuts, 3,
+        "every native HEADERS route expiry must be a route cut"
+    );
+    for arm in &header_arms {
+        if arm.contains("cancel_response_stream(") {
+            assert_route_cancel_precedes_abort(arm, "http3/server.rs HEADERS route cut");
+        }
+    }
+
+    // Bridge streaming HEADERS: the route deadline is composed into the write
+    // bound, and its expiry is the route cut, not the gRPC-Web deadline
+    // terminal.
+    let dispatch = plain_bridge_dispatch();
+    let compose = dispatch
+        .find("plain_write_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(")
+        .expect("the bridge recomposes its HEADERS bound");
+    let head_write = dispatch
+        .find("send_response_headers(stream, &ctx.method, status, &response_headers)")
+        .expect("bridge streaming HEADERS write");
+    let head_cut = dispatch
+        .find("cut_plain_response_head_at_route_deadline(")
+        .expect("bridge HEADERS route cut");
+    let grpc_web_terminal = dispatch[head_write..]
+        .find("write_plain_grpc_web_client_deadline_without_hooks(")
+        .map(|at| head_write + at)
+        .expect("gRPC-Web HEADERS deadline terminal");
+    assert!(compose < head_write && head_write < head_cut && head_cut < grpc_web_terminal);
+    assert!(dispatch[compose..head_write].contains("route_body_deadline"));
+    let helper = bridge
+        .split("fn cut_plain_response_head_at_route_deadline<S>(")
+        .nth(1)
+        .expect("bridge HEADERS route cut helper")
+        .split("\n}\n")
+        .next()
+        .unwrap_or_default();
+    assert!(helper.contains("cancel_response_stream(stream)"));
+    assert!(helper.contains("Some(ErrorClass::DispatchPolicyRejected)"));
+    assert!(helper.contains("body_error_class: Some(ErrorClass::ReadWriteTimeout)"));
+    assert!(helper.contains("client_disconnected: false"));
+}
+
+/// The bridge's buffered writer settles the backend exchange BEFORE its first
+/// downstream write, as the native HTTP/3 buffered writer does (PR #5741): the
+/// backend outcome and admission are recorded, with the backend's own
+/// classification, and the least-connections count is released, so a client
+/// that parks the HEADERS or body write in QUIC flow control cannot hold the
+/// backend admission permit. No client terminal after it records again.
+#[test]
+fn the_bridge_buffered_writer_settles_the_backend_before_the_client_write() {
+    let buffered = plain_bridge_dispatch()
+        .split("if should_buffer_response {")
+        .nth(1)
+        .expect("bridge buffered writer")
+        .split("// Only a live reqwest body can be streamed.")
+        .next()
+        .expect("bounded bridge buffered writer");
+    let first_write = buffered
+        .find("send_response_headers_with_framing(")
+        .expect("bridge buffered HEADERS write");
+    let (before_write, after_write) = buffered.split_at(first_write);
+
+    let outcome = before_write
+        .rfind("record_backend_outcome_no_conn_end(")
+        .expect("the backend outcome is settled before the client write");
+    let admission = before_write
+        .rfind("record_cross_protocol_backend_admission_outcome(")
+        .expect("admission is settled before the client write");
+    let guard = before_write
+        .rfind("drop(lb_connection_guard.take());")
+        .expect("the least-connections count is released before the client write");
+    assert!(outcome < admission && admission < guard);
+
+    // The backend's own classification: passive health takes the served
+    // status, the limiter the original backend status, and neither a
+    // client-side class.
+    let args = |at: usize| before_write[at..].split(");").next().unwrap_or_default();
+    let outcome_args = args(outcome);
+    assert!(outcome_args.contains("response_status,"));
+    assert!(outcome_args.contains("terminal_connection_error,"));
+    assert!(outcome_args.contains("terminal_error_class,"));
+    assert!(!outcome_args.contains("ErrorClass::"));
+    let admission_args = args(admission);
+    assert!(admission_args.contains("status,"));
+    assert!(!admission_args.contains("response_status"));
+    assert!(admission_args.contains("terminal_connection_error,"));
+    assert!(admission_args.contains("terminal_error_class,"));
+    assert!(!admission_args.contains("ErrorClass::"));
+
+    for record in [
+        "record_backend_outcome_no_conn_end(",
+        "record_cross_protocol_backend_admission_outcome(",
+        "record_cross_protocol_header_write_disconnect(",
+        "record_plain_grpc_web_client_deadline_after_backend_response(",
+        "backend_admission_permits",
+        "lb_connection_guard",
+    ] {
+        assert!(
+            !after_write.contains(record),
+            "the buffered client write must not settle the backend again: {record}"
+        );
+    }
 }
 
 /// The cross-protocol HTTP/3 → gRPC bridge re-arms the matched rule's attempt

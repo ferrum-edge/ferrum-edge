@@ -882,10 +882,15 @@ receives no post-expiry bytes in any case, because it is not reading.
 
 **Every** H3 downstream write shares that seam, not only the gRPC ones. A single
 helper, `http3::stream_util::await_authorized_response_write`, races one
-`send_data` / `send_trailers` / `finish` against the admitted stream's absolute
-authorization plan and reports one of three outcomes (written, client write
-failed, authorization expired); it is the sole recorder of the
-fixed-cardinality counter for a parked write. It is used by:
+`send_data` / `send_trailers` / `finish` against the earlier of the admitted
+stream's absolute authorization plan and the matched route rule's body deadline
+(`request_timeout_ms` / `attempt_timeout_ms`, PR #5741), and reports one of four
+outcomes (written, client write failed, authorization expired, route deadline
+exceeded); authorization wins an exact tie. A route expiry is cut like the
+relay's own route deadline arm — an `H3_REQUEST_CANCELLED` reset, the
+`read_write_timeout` body class, and health-neutral accounting — so a client
+that stops reading is cut at the deadline itself. The helper is the sole
+recorder of the fixed-cardinality counter for a parked write. It is used by:
 
 - `http3::server`'s inline native-H3 → native-H3 streaming relay, including the
   plugin-inspected and SSE variants and the terminal

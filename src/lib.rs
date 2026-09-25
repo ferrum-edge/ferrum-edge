@@ -11936,6 +11936,45 @@ pub mod _test_support {
         code.value()
     }
 
+    /// Outcome of the shared downstream H3 DATA/trailers/FIN write seam.
+    pub use crate::http3::stream_util::H3AuthorizedWrite;
+
+    /// Race one downstream H3 DATA/trailers/FIN write through the shared seam
+    /// every streaming relay uses, against the earlier of the captured
+    /// authorization plan and the route body deadline (#5646).
+    pub async fn await_authorized_response_write_for_test<F, T, E>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        route_deadline: Option<tokio::time::Instant>,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        write: F,
+    ) -> H3AuthorizedWrite
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        crate::http3::stream_util::await_authorized_response_write(
+            plan,
+            route_deadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+            latch,
+            write,
+        )
+        .await
+    }
+
+    /// Attribute a native-H3 streaming HEADERS write's protocol-deadline
+    /// expiry between the client RPC deadline and the route body deadline.
+    pub fn attribute_streaming_headers_deadline_for_test(
+        outcome: H3AuthorizedHeadersWrite,
+        grpc_deadline: Option<tokio::time::Instant>,
+        route_deadline: Option<tokio::time::Instant>,
+    ) -> H3AuthorizedHeadersWrite {
+        crate::http3::stream_util::attribute_streaming_headers_deadline(
+            outcome,
+            grpc_deadline,
+            route_deadline,
+        )
+    }
+
     pub fn proxy_body_into_grpc_web_streaming_for_test(
         body: crate::proxy::ProxyBody,
         content_type: &str,

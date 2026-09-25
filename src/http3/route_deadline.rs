@@ -26,6 +26,10 @@
 //!   `H3_REQUEST_CANCELLED` (the HTTP/3 counterpart of the HTTP/2 stream
 //!   reset), never finished cleanly. The cut is health-neutral and is logged
 //!   with `body_error_class: read_write_timeout`.
+//! * That bound also races every downstream write of a streaming relay
+//!   (HEADERS, DATA, trailers, FIN), so a client that stops reading cannot
+//!   park the relay in QUIC flow control past it: the parked write is cut the
+//!   same way.
 //!
 //! gRPC-flavored requests fold both bounds into their RPC deadline instead
 //! (`RequestContext::arm_route_request_deadline`), which the native-H3 gRPC

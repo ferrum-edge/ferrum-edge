@@ -22,9 +22,22 @@ infinite loop.
 The same change is applied to FrameStream::poll_data to recover body
 bytes that were already buffered before the close.
 
-Two regression tests are added covering both paths:
+A peer RESET_STREAM (StreamErrorIncoming::StreamTerminated) is never
+hoisted. Quinn reports a stream reset exactly once: it frees the receive
+stream as it returns ReadError::Reset, and every later read is
+ClosedStream. Holding it back would lose the reset code. When the reset
+truncated a DATA frame whose tail is still buffered, holding it back
+would also end the body in UnexpectedEnd, which the request stream
+escalates to a connection-level H3_FRAME_ERROR, although RFC 9114 7.1
+applies that rule only to a stream that terminates cleanly. The reset
+surfaces on the poll that observed it, exactly as before this patch.
+
+Four regression tests are added covering both paths and the reset
+exemption:
   - poll_next_drains_buffered_headers_before_quic_close
   - poll_data_drains_buffered_body_before_quic_close
+  - poll_data_surfaces_stream_reset_over_a_truncated_buffered_body
+  - poll_next_surfaces_stream_reset_over_a_buffered_frame
 
 The FakeRecv test helper is extended with `chunk_then_error` so the
 synthetic `StreamErrorIncoming::ConnectionErrorIncoming` can be queued
@@ -42,10 +55,12 @@ after a chunk — modelling the coalesced-datagram race directly.
 +            // chance through the decoder. Without this hoist, a
 +            // CONNECTION_CLOSE frame coalesced with stream data in the
 +            // same recv batch wins the race and discards a fully-
-+            // decodable HEADERS frame.
++            // decodable HEADERS frame. A peer RESET_STREAM is never
++            // hoisted: see `FrameStreamError::is_stream_reset`.
 +            let (end, pending_quic_err) = match self.try_recv(cx) {
 +                Poll::Ready(Ok(end)) => (Poll::Ready(end), None),
 +                Poll::Pending => (Poll::Pending, None),
++                Poll::Ready(Err(e)) if e.is_stream_reset() => return Poll::Ready(Err(e)),
 +                Poll::Ready(Err(e)) => (Poll::Ready(true), Some(e)),
 +            };
 
@@ -82,9 +97,12 @@ after a chunk — modelling the coalesced-datagram race directly.
 -            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
 -            Poll::Pending => false,
 +        // Mirror the hoist from poll_next: a QUIC-level error must not
-+        // discard already-buffered body bytes for the current frame.
++        // discard already-buffered body bytes for the current frame. A peer
++        // RESET_STREAM is never hoisted: see
++        // `FrameStreamError::is_stream_reset`.
 +        let (end, pending_quic_err) = match self.try_recv(cx) {
 +            Poll::Ready(Ok(end)) => (end, None),
++            Poll::Ready(Err(e)) if e.is_stream_reset() => return Poll::Ready(Err(e)),
 +            Poll::Ready(Err(e)) => (true, Some(e)),
 +            Poll::Pending => (false, None),
          };
@@ -120,6 +138,37 @@ after a chunk — modelling the coalesced-datagram race directly.
                  self.remaining_data -= d.remaining();
                  Poll::Ready(Ok(Some(d)))
              }
+@@ -260,6 +292,33 @@ pub enum FrameStreamError {
+     Quic(StreamErrorIncoming),
+     UnexpectedEnd,
+ }
++
++impl FrameStreamError {
++    /// Whether this is the peer's `RESET_STREAM` for the stream being read.
++    ///
++    /// The frame-drain hoist in [`FrameStream::poll_next`] and
++    /// [`FrameStream::poll_data`] holds a QUIC error back so that buffered
++    /// bytes are decoded first. That only works for an error the transport
++    /// reports again on the next read, such as a connection error. Quinn
++    /// reports a stream reset exactly ONCE: it frees the receive stream as it
++    /// returns `ReadError::Reset`, and every later read is `ClosedStream`.
++    /// Holding a reset back therefore loses its code. Worse, a DATA frame the
++    /// reset truncated then ends in [`FrameStreamError::UnexpectedEnd`], which
++    /// the request stream escalates to a connection-level `H3_FRAME_ERROR` and
++    /// so tears down every other stream on the connection. RFC 9114 §7.1
++    /// makes a truncated frame a connection error only when the stream
++    /// "terminates cleanly". A reset is not a clean termination.
++    ///
++    /// A reset therefore surfaces on the poll that observed it, ahead of any
++    /// buffered bytes. That is stock h3 behaviour, and Quinn itself discards
++    /// its own unread data on a reset (RFC 9000 §3.2).
++    fn is_stream_reset(&self) -> bool {
++        matches!(
++            self,
++            FrameStreamError::Quic(StreamErrorIncoming::StreamTerminated { .. })
++        )
++    }
++}
 @@ -593,6 +623,18 @@ mod tests {
          }
      }

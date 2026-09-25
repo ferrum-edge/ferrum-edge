@@ -313,23 +313,35 @@ fn h3_plain_bridge_preserves_mesh_outcomes_across_client_terminals() {
         plain
             .matches("record_plain_grpc_web_client_deadline_after_backend_response(")
             .count(),
-        3,
-        "plugin, header-write, and body-write deadlines after a terminal \
-         backend response must preserve its classification"
+        1,
+        "a plugin deadline after a terminal backend response must preserve its \
+         classification"
+    );
+    // The buffered writer settles the backend with its own classification
+    // before the first client write (PR #5741), so no header-write or
+    // body-write terminal can reach the accounting afterwards.
+    let buffered = plain
+        .split("if should_buffer_response {")
+        .nth(1)
+        .expect("buffered writer")
+        .split("// Only a live reqwest body can be streamed.")
+        .next()
+        .expect("bounded buffered writer");
+    let first_write = buffered
+        .find("send_response_headers_with_framing(")
+        .expect("buffered HEADERS write");
+    let (settle, client_write) = buffered.split_at(first_write);
+    assert!(
+        settle.contains("record_cross_protocol_backend_admission_outcome(")
+            && !client_write.contains("record_cross_protocol_backend_admission_outcome(")
+            && !client_write.contains("record_backend_outcome_no_conn_end("),
+        "the buffered backend outcome must be settled before the client write"
     );
     assert!(
-        plain.contains("if terminal_connection_error || terminal_error_class.is_some() {")
-            && plain.contains("outcome.connection_error = terminal_connection_error;")
-            && plain.contains("outcome.error_class = terminal_error_class;"),
+        client_write.contains("outcome.connection_error = terminal_connection_error;")
+            && client_write.contains("outcome.error_class = terminal_error_class;"),
         "client write failures must keep backend transport classification on \
-         accounting and the cross-protocol outcome"
-    );
-    assert!(
-        plain.contains("let admission_error_class = terminal_error_class")
-            && plain
-                .contains(".or_else(|| (!body_completed).then_some(ErrorClass::ClientDisconnect))"),
-        "a downstream body failure may supply the admission fallback only when \
-         no backend classification already exists"
+         the cross-protocol outcome"
     );
 }
 

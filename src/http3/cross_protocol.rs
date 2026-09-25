@@ -362,6 +362,72 @@ fn record_cross_protocol_header_write_disconnect(
     );
 }
 
+/// Cut a plain bridge response whose HEADERS write outlived the matched route
+/// rule's body deadline (#5646) while QPACK/QUIC flow control parked it. The
+/// cut is the streaming relay's own route cut: the stream is reset with
+/// `H3_REQUEST_CANCELLED`, the body logs `read_write_timeout`, and backend
+/// health and admission record it neutrally, because the client withheld the
+/// credit, not the backend.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn cut_plain_response_head_at_route_deadline<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    state: &ProxyState,
+    proxy: &Proxy,
+    epoch: &RequestEpoch,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&UpstreamTarget>,
+    cb_target_key: Option<&str>,
+    status: u16,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+) -> CrossProtocolOutcome
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    crate::http3::route_deadline::cancel_response_stream(stream);
+    let class = Some(ErrorClass::DispatchPolicyRejected);
+    record_backend_outcome_no_conn_end(
+        state,
+        proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
+        current_target,
+        cb_target_key,
+        status,
+        false,
+        class,
+        cb_probe.take_slot(),
+        false,
+        backend_start.elapsed(),
+    );
+    record_cross_protocol_backend_admission_outcome(
+        backend_admission_permits,
+        status,
+        false,
+        class,
+        backend_admission_elapsed,
+    );
+    CrossProtocolOutcome {
+        response_status: status,
+        response_streamed: true,
+        bytes_streamed: 0,
+        bytes_sent: 0,
+        backend_target: None,
+        backend_resolved_ip: None,
+        body_completed: false,
+        client_disconnected: false,
+        connection_error: false,
+        error_class: None,
+        body_error_class: Some(ErrorClass::ReadWriteTimeout),
+        backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
+        rejection_logged: false,
+    }
+}
+
 pub(crate) enum H3BackendOrPeer<T> {
     Ready(T),
     Deadline,
@@ -5682,6 +5748,41 @@ where
             response_via,
             &mut response_headers,
         );
+        // The backend exchange is settled: its whole body is in hand. Record
+        // its outcome and release the admission permit and least-connections
+        // count BEFORE the client write, as the native H3 buffered writer does,
+        // so a client that parks the write in QUIC flow control cannot hold
+        // them. Passive health takes `response_status` and the limiter the
+        // ORIGINAL backend `status`: response-body/final-body plugin rejects
+        // above may have rewritten `response_status` to a gateway policy code
+        // (e.g. a 503/4xx reject of a healthy backend 200), and recording that
+        // would make the adaptive limiter shrink/grow on a signal that does not
+        // reflect backend health. Matches the streaming path below and the
+        // H1/H2 path, which capture the backend status before response-body
+        // hooks run. A downstream write outcome is the client's, not the
+        // backend's, so no client terminal below can overwrite this record.
+        record_backend_outcome_no_conn_end(
+            state,
+            proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
+            current_target.as_deref(),
+            current_cb_target_key.as_deref(),
+            response_status,
+            terminal_connection_error,
+            terminal_error_class,
+            cb_probe.take_slot(),
+            false,
+            backend_start.elapsed(),
+        );
+        record_cross_protocol_backend_admission_outcome(
+            &mut backend_admission_permits,
+            status,
+            terminal_connection_error,
+            terminal_error_class,
+            backend_admission_elapsed,
+        );
+        drop(lb_connection_guard.take());
         if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
             plain_write_bound.deadline(),
             send_response_headers_with_framing(
@@ -5697,21 +5798,6 @@ where
                 error,
                 crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
             ) {
-                record_plain_grpc_web_client_deadline_after_backend_response(
-                    state,
-                    epoch,
-                    proxy,
-                    upstream_balancer,
-                    current_target.as_deref(),
-                    current_cb_target_key.as_deref(),
-                    cb_probe,
-                    backend_start,
-                    &mut backend_admission_permits,
-                    backend_admission_elapsed,
-                    status,
-                    terminal_connection_error,
-                    terminal_error_class,
-                );
                 if let Some(termination) = plain_write_bound.expired_authorization() {
                     // Pre-commitment: no response HEADERS reached the client, so
                     // the protocol-correct terminal is the FIXED redacted 401.
@@ -5746,44 +5832,6 @@ where
                 ?error,
                 "cross-protocol H3 buffered response header write failed"
             );
-            if terminal_connection_error || terminal_error_class.is_some() {
-                record_backend_outcome_no_conn_end(
-                    state,
-                    proxy,
-                    &epoch.load_balancer,
-                    upstream_balancer,
-                    current_target.as_deref(),
-                    current_cb_target_key.as_deref(),
-                    status,
-                    terminal_connection_error,
-                    terminal_error_class,
-                    cb_probe.take_slot(),
-                    false,
-                    backend_start.elapsed(),
-                );
-                record_cross_protocol_backend_admission_outcome(
-                    &mut backend_admission_permits,
-                    status,
-                    terminal_connection_error,
-                    terminal_error_class,
-                    backend_admission_elapsed,
-                );
-            } else {
-                record_cross_protocol_header_write_disconnect(
-                    state,
-                    proxy,
-                    epoch,
-                    upstream_balancer,
-                    current_target.as_ref(),
-                    current_cb_target_key.as_deref(),
-                    response_status,
-                    status,
-                    cb_probe,
-                    backend_start,
-                    &mut backend_admission_permits,
-                    backend_admission_elapsed,
-                );
-            }
             let mut outcome = cross_protocol_header_write_disconnect_outcome(
                 response_status,
                 false,
@@ -5816,21 +5864,6 @@ where
                     (false, true)
                 }
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    record_plain_grpc_web_client_deadline_after_backend_response(
-                        state,
-                        epoch,
-                        proxy,
-                        upstream_balancer,
-                        current_target.as_deref(),
-                        current_cb_target_key.as_deref(),
-                        cb_probe,
-                        backend_start,
-                        &mut backend_admission_permits,
-                        backend_admission_elapsed,
-                        status,
-                        terminal_connection_error,
-                        terminal_error_class,
-                    );
                     if let Some(termination) = plain_write_bound.expired_authorization() {
                         // Post-commitment: response HEADERS are already on the
                         // wire, so the deterministic terminal is a RESET — never
@@ -5881,37 +5914,6 @@ where
                     });
                 }
             };
-
-        record_backend_outcome_no_conn_end(
-            state,
-            proxy,
-            &epoch.load_balancer,
-            upstream_balancer,
-            current_target.as_deref(),
-            current_cb_target_key.as_deref(),
-            response_status,
-            terminal_connection_error,
-            terminal_error_class,
-            cb_probe.take_slot(),
-            false,
-            backend_start.elapsed(),
-        );
-        // Feed the limiter the ORIGINAL backend `status`, not `response_status`:
-        // response-body/final-body plugin rejects above may have rewritten
-        // `response_status` to a gateway policy code (e.g. a 503/4xx reject of a
-        // healthy backend 200). Recording the policy status would make the
-        // adaptive limiter shrink/grow on a signal that does not reflect backend
-        // health. Matches the streaming path below and the H1/H2 path, which
-        // capture the backend status before response-body hooks run.
-        let admission_error_class = terminal_error_class
-            .or_else(|| (!body_completed).then_some(ErrorClass::ClientDisconnect));
-        record_cross_protocol_backend_admission_outcome(
-            &mut backend_admission_permits,
-            status,
-            terminal_connection_error,
-            admission_error_class,
-            backend_admission_elapsed,
-        );
 
         return Ok(CrossProtocolOutcome {
             response_status,
@@ -6024,6 +6026,16 @@ where
         &mut response_headers,
     );
 
+    // The matched route rule's body deadline (#5646): the earlier of its total
+    // deadline and the committed attempt's budget. It bounds the HEADERS write
+    // below as well as the relay, because QPACK/QUIC flow control can park
+    // `send_response` exactly as it parks DATA or FIN. `None` for gRPC-Web,
+    // whose route bounds are folded into `grpc_web_deadline_at` instead.
+    let route_body_deadline = route.body_deadline(route_attempt_deadline);
+    plain_write_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        crate::proxy::earliest_deadline(grpc_web_deadline_at, route_body_deadline),
+        plain_auth_deadline_plan,
+    );
     // Send response headers, then stream the body.
     if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
         plain_write_bound.deadline(),
@@ -6035,6 +6047,29 @@ where
             error,
             crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
         ) {
+            // Authorization wins a tie; otherwise a plain request's only
+            // non-authorization bound here is the route deadline.
+            if route_body_deadline.is_some() && plain_write_bound.expired_authorization().is_none()
+            {
+                let mut outcome = cut_plain_response_head_at_route_deadline(
+                    stream,
+                    state,
+                    proxy,
+                    epoch,
+                    upstream_balancer,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
+                    status,
+                    cb_probe,
+                    backend_start,
+                    &mut backend_admission_permits,
+                    backend_admission_elapsed,
+                );
+                outcome.bytes_sent = bytes_sent;
+                outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
+                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                return Ok(outcome);
+            }
             record_plain_grpc_web_client_deadline(
                 state,
                 epoch,
@@ -6117,10 +6152,9 @@ where
     // blocked-write exit inside it records through the REQUEST's shared latch
     // rather than the bare counter.
     let auth_latch = ctx.authorization_termination_latch();
-    // The matched route rule's body deadline (#5646): the earlier of its total
-    // deadline and the committed attempt's budget. The relay resets the stream
-    // with `H3_REQUEST_CANCELLED` when it fires and reports the cut here.
-    let route_body_deadline = route.body_deadline(route_attempt_deadline);
+    // The relay resets the stream with `H3_REQUEST_CANCELLED` when the route
+    // body deadline fires, on its own arm or on a parked write, and reports
+    // the cut here.
     let mut route_deadline_cut = false;
     let stream_response = async {
         if let Some(inspector) = response_inspector {
@@ -9672,6 +9706,7 @@ where
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline,
+                route_body_deadline,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 auth_latch,
                 $write,
@@ -9682,6 +9717,13 @@ where
                 crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
                     client_disconnected = true;
                     body_error_class = Some(ErrorClass::ClientDisconnect);
+                    false
+                }
+                crate::http3::stream_util::H3AuthorizedWrite::RouteDeadlineExceeded => {
+                    coalesce_buf.clear();
+                    crate::http3::route_deadline::cancel_response_stream(stream);
+                    body_error_class = Some(ErrorClass::ReadWriteTimeout);
+                    *route_deadline_cut = true;
                     false
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
@@ -9957,6 +9999,7 @@ where
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline,
+                route_body_deadline,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 auth_latch,
                 $write,
@@ -9967,6 +10010,12 @@ where
                 crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
                     client_disconnected = true;
                     body_error_class = Some(ErrorClass::ClientDisconnect);
+                    false
+                }
+                crate::http3::stream_util::H3AuthorizedWrite::RouteDeadlineExceeded => {
+                    crate::http3::route_deadline::cancel_response_stream(stream);
+                    body_error_class = Some(ErrorClass::ReadWriteTimeout);
+                    *route_deadline_cut = true;
                     false
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
@@ -10103,8 +10152,7 @@ where
                         }
                         // The terminal FIN races the same plan: a non-reading
                         // client would otherwise park it indefinitely.
-                        let _ = authorized_send!(stream.finish());
-                        finished = auth_termination.is_none();
+                        finished = authorized_send!(stream.finish());
                         break;
                     }
                 }
@@ -10159,8 +10207,7 @@ where
                     }
                 }
                 // The terminal FIN races the same plan.
-                let _ = authorized_send!(stream.finish());
-                finished = auth_termination.is_none();
+                finished = authorized_send!(stream.finish());
                 break;
             }
             Err(e) => {

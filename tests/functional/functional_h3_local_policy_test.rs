@@ -7,7 +7,7 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use crate::scaffolding::backends::{H2Step, MatchHeaders, ScriptedH2Backend};
 use crate::scaffolding::certs::TestCa;
-use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
+use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response, Http3ResponseStream};
 use crate::scaffolding::{reserve_colocated_tcp_udp, reserve_port};
 
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
@@ -378,6 +378,83 @@ async fn functional_h3_route_request_timeout_resets_a_committed_body() {
         elapsed < Duration::from_secs(5),
         "the body must be cut at the route deadline: {elapsed:?}"
     );
+
+    gateway.shutdown().await;
+    backend_task.abort();
+}
+
+/// A client that stops reading a streamed response parks the gateway's
+/// response write in QUIC flow control, where the relay never reaches its own
+/// route-deadline arm. The write races the route deadline itself (PR #5741):
+/// at the deadline the stream is reset and the backend stream is released,
+/// instead of both being held until the client reads again.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_route_request_timeout_cuts_a_client_that_stops_reading() {
+    let (backend_port, backend_released, backend_task) = spawn_endless_body_backend().await;
+    let config = route_timeout_config(
+        plaintext_backend_tls_sni_config(backend_port),
+        json!({"request_timeout_ms": 1500}),
+    );
+    let gateway = start_h3_policy_gateway(config)
+        .await
+        .expect("start h3 route-deadline gateway");
+
+    // A tiny per-stream receive window makes the flow-control stall
+    // deterministic instead of depending on Quinn's default.
+    let client = Http3Client::insecure_with_stream_receive_window(4 * 1024).expect("h3 client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/stalled-reader",
+        gateway.https_port
+    );
+    // `started` is taken just before the attempt that opened the stream, so
+    // gateway-startup retries cannot pad the lower bound below.
+    let (started, mut stream) = retry_open_response_stream(&client, &url).await;
+    let (status, _) = stream.recv_response().await.expect("response head");
+    assert_eq!(status, StatusCode::OK);
+    let first = stream
+        .recv_data()
+        .await
+        .expect("the body must start before the deadline")
+        .expect("the body must not end before the deadline");
+    assert!(!first.is_empty());
+
+    // From here the client never reads, so the relay's next write parks.
+    let release_by = Instant::now() + Duration::from_secs(5);
+    while !backend_released.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < release_by,
+            "the backend stream outlived the route deadline while the client stalled"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        started.elapsed() >= Duration::from_millis(1_400),
+        "the backend stream was released before the route deadline: {:?}",
+        started.elapsed()
+    );
+
+    // The truncated body ends in the route cut's `H3_REQUEST_CANCELLED` reset,
+    // never a clean finish or any other reset code.
+    let reset_by = Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.recv_data()).await {
+            Ok(Err(err)) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains("H3_REQUEST_CANCELLED"),
+                    "the cut body must end in an H3_REQUEST_CANCELLED reset, got {err:?}"
+                );
+                break;
+            }
+            Ok(Ok(Some(_))) => assert!(
+                Instant::now() < reset_by,
+                "the stalled stream kept receiving past the route deadline"
+            ),
+            Ok(Ok(None)) => panic!("the cut body must be reset, not finished cleanly"),
+            Err(_) => panic!("the stalled stream was not reset after the route deadline"),
+        }
+    }
 
     gateway.shutdown().await;
     backend_task.abort();
@@ -1688,6 +1765,57 @@ async fn spawn_partial_body_backend() -> (u16, JoinHandle<()>) {
     (port, task)
 }
 
+/// Declared length of [`spawn_endless_body_backend`]'s response body: inside
+/// the default 10 MiB response ceiling, and far more than a stalled client's
+/// receive window admits.
+const ENDLESS_BODY_DECLARED_LEN: usize = 8 << 20;
+
+/// A backend that commits a response head and then writes its body as fast as
+/// the gateway accepts it. The flag is set once the gateway drops the
+/// connection.
+async fn spawn_endless_body_backend() -> (u16, Arc<AtomicBool>, JoinHandle<()>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind endless-body backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let released = Arc::new(AtomicBool::new(false));
+    let task_released = Arc::clone(&released);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let released = Arc::clone(&task_released);
+            tokio::spawn(async move {
+                if read_http_request_body(&mut stream).await.is_err() {
+                    return;
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                     Content-Length: {ENDLESS_BODY_DECLARED_LEN}\r\n\r\n"
+                );
+                if stream.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                let chunk = [b'x'; 16 * 1024];
+                let mut written = 0;
+                while written < ENDLESS_BODY_DECLARED_LEN {
+                    if stream.write_all(&chunk).await.is_err() {
+                        released.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    written += chunk.len();
+                }
+                // The whole body is queued: wait for the gateway to close.
+                let mut probe = [0u8; 1];
+                let _ = stream.read(&mut probe).await;
+                released.store(true, Ordering::SeqCst);
+            });
+        }
+    });
+    (port, released, task)
+}
+
 /// A backend that stalls the first `hold_first` requests forever and answers
 /// every later one by echoing its request body.
 async fn spawn_echo_backend(hold_first: usize) -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
@@ -1906,6 +2034,26 @@ async fn retry_h3_post_with_headers(
                     "H3 request did not complete; last startup error={last_err:?}; final error={err}"
                 );
             }
+        }
+    }
+}
+
+/// Open a response stream, retrying while the gateway starts. Returns the
+/// instant taken immediately before the attempt that succeeded.
+async fn retry_open_response_stream(
+    client: &Http3Client,
+    url: &str,
+) -> (Instant, Http3ResponseStream) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let attempt_started = Instant::now();
+        match client
+            .open_response_stream(url, GetOptions::default())
+            .await
+        {
+            Ok(stream) => return (attempt_started, stream),
+            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
+            Err(err) => panic!("H3 response stream did not open: {err}"),
         }
     }
 }

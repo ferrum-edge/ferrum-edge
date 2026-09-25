@@ -838,13 +838,17 @@ included. A native HTTP/3 attempt is handed to the backend from its first poll
 attempt, so its budget starts there. A gateway-local wait before an attempt
 starts (backend admission, request-body hooks) is not cancelled mid-wait: a
 total deadline spent there refuses the next attempt without dialing it, with
-the health-neutral `before_dispatch` `504`. The route deadline is not raced
-against a client write parked in QUIC flow control: a relay whose client stops
-reading is cut the next time it waits on the backend, so a client that never
-grants flow control again keeps its stream until it reads, its connection
-closes, or an authenticated request's credential lifetime ends. HTTP/1.1 and
-HTTP/2 behave the same way — their body is cut only when the transport next
-polls it.
+the health-neutral `before_dispatch` `504`. Every downstream write of a
+streaming relay — response HEADERS, DATA, trailers, and FIN — also races the
+route deadline, so a client that stops reading and parks a write in QUIC flow
+control is cut at the deadline with the same `H3_REQUEST_CANCELLED` reset,
+`read_write_timeout` body class, and health-neutral accounting, releasing the
+backend stream and admission permit (PR #5741). A parked HEADERS write is cut
+the same way, since part of the head may already be on the wire. A buffered
+response is already complete when it is written and is not cut, as on HTTP/1.1
+and HTTP/2; its backend outcome and admission permit are settled before the
+client write, so a client parking it holds no backend resource. HTTP/1.1 and
+HTTP/2 cut a streamed body only when the transport next polls it.
 
 Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
 not bounded by `request` on any frontend. Gateway-local
@@ -852,7 +856,8 @@ plugin hooks on a non-gRPC request are not cancelled mid-hook; their time counts
 against the budget, which is enforced when each backend attempt starts, while it
 is awaited, in retry backoff, and while the body streams (the plugins the
 translator generates make no outbound calls). A client that stops reading a
-streamed response is cut when the transport next polls the body.
+streamed response is cut when the transport next polls the body on HTTP/1.1
+and HTTP/2, and at the deadline itself on HTTP/3.
 
 The upstream `HTTPRouteTimeoutRequest` and `HTTPRouteTimeoutBackendRequest`
 tests exercise the HTTP/1.1 path. Ferrum's own data-plane regressions in
