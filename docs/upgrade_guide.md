@@ -459,19 +459,11 @@ per retry attempt). **Any response that takes longer than that budget to
 deliver is cut** — not only a trickled body, but also a large fast download, a
 Server-Sent Events stream, a long poll, and a server-streaming gRPC call — so
 size `backendRequest` for the longest complete response the rule must serve,
-or omit it. Native HTTP/3 now enforces both timeouts too: a plain HTTP/3
-request routed under a rule carrying `request` or `backendRequest` is served
-under them instead of refused with `503`, a response body the deadline cuts is
-reset with `H3_REQUEST_CANCELLED`, and the HTTP/1.1 and HTTP/2 listeners
-advertise HTTP/3 (`Alt-Svc`) again on every port that serves such a rule.
-
-**Operator action (HTTP/3):** with `FERRUM_ENABLE_HTTP3=true`, clients that
-fell back to TCP while `Alt-Svc` was withheld start using HTTP/3 on those ports
-again, so the listener's UDP port must be reachable wherever its TCP port is. A
-route whose `request` or `backendRequest` is shorter than its longest response
-now cuts that response on HTTP/3 exactly as on HTTP/1.1 and HTTP/2. The current
-admission contract, including the remaining refusals, is
+or omit it. The current admission contract, including the remaining refusals
+and the HTTP/3 `request`- and `backendRequest`-timeout limitations, is
 [`docs/gateway_api_conformance.md`](gateway_api_conformance.md).
+Native HTTP/3 enforcement of these timeouts lands after 0.9.7; see
+[Upgrading to the next release](#upgrading-to-the-next-release).
 
 ### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
 
