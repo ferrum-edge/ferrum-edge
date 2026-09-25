@@ -2410,7 +2410,8 @@ pub(crate) async fn handle_h3_connect_udp(
                 "H3 CONNECT-UDP send_response failed: client write failed"
             ));
         }
-        crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded => {
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded
+        | crate::http3::stream_util::H3AuthorizedHeadersWrite::RouteDeadlineExceeded => {
             // compose(None, auth_deadline) never produces a protocol-only bound:
             // either authorization owns the instant, or there is no deadline at
             // all. Treat this as a failed write rather than counting a 200.

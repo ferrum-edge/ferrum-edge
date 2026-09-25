@@ -362,6 +362,72 @@ fn record_cross_protocol_header_write_disconnect(
     );
 }
 
+/// Cut a plain bridge response whose HEADERS write outlived the matched route
+/// rule's body deadline (#5646) while QPACK/QUIC flow control parked it. The
+/// cut is the streaming relay's own route cut: the stream is reset with
+/// `H3_REQUEST_CANCELLED`, the body logs `read_write_timeout`, and backend
+/// health and admission record it neutrally, because the client withheld the
+/// credit, not the backend.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn cut_plain_response_head_at_route_deadline<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    state: &ProxyState,
+    proxy: &Proxy,
+    epoch: &RequestEpoch,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&UpstreamTarget>,
+    cb_target_key: Option<&str>,
+    status: u16,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+) -> CrossProtocolOutcome
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    crate::http3::route_deadline::cancel_response_stream(stream);
+    let class = Some(ErrorClass::DispatchPolicyRejected);
+    record_backend_outcome_no_conn_end(
+        state,
+        proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
+        current_target,
+        cb_target_key,
+        status,
+        false,
+        class,
+        cb_probe.take_slot(),
+        false,
+        backend_start.elapsed(),
+    );
+    record_cross_protocol_backend_admission_outcome(
+        backend_admission_permits,
+        status,
+        false,
+        class,
+        backend_admission_elapsed,
+    );
+    CrossProtocolOutcome {
+        response_status: status,
+        response_streamed: true,
+        bytes_streamed: 0,
+        bytes_sent: 0,
+        backend_target: None,
+        backend_resolved_ip: None,
+        body_completed: false,
+        client_disconnected: false,
+        connection_error: false,
+        error_class: None,
+        body_error_class: Some(ErrorClass::ReadWriteTimeout),
+        backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
+        rejection_logged: false,
+    }
+}
+
 pub(crate) enum H3BackendOrPeer<T> {
     Ready(T),
     Deadline,
@@ -6024,16 +6090,17 @@ where
         &mut response_headers,
     );
 
-    // Send response headers, then stream the body. Recompose the write bound
-    // with the committed attempt's route deadline: QPACK/QUIC flow control can
-    // park this write just like DATA or FIN.
+    // The matched route rule's body deadline (#5646): the earlier of its total
+    // deadline and the committed attempt's budget. It bounds the HEADERS write
+    // below as well as the relay, because QPACK/QUIC flow control can park
+    // `send_response` exactly as it parks DATA or FIN. `None` for gRPC-Web,
+    // whose route bounds are folded into `grpc_web_deadline_at` instead.
+    let route_body_deadline = route.body_deadline(route_attempt_deadline);
     plain_write_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
-        crate::proxy::earliest_deadline(
-            grpc_web_deadline_at,
-            route.body_deadline(route_attempt_deadline),
-        ),
+        crate::proxy::earliest_deadline(grpc_web_deadline_at, route_body_deadline),
         plain_auth_deadline_plan,
     );
+    // Send response headers, then stream the body.
     if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
         plain_write_bound.deadline(),
         send_response_headers(stream, &ctx.method, status, &response_headers),
@@ -6044,6 +6111,30 @@ where
             error,
             crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
         ) {
+            // Authorization wins a tie; otherwise a plain request's only
+            // non-authorization bound here is the route deadline.
+            if route_body_deadline.is_some()
+                && plain_write_bound.expired_authorization().is_none()
+            {
+                let mut outcome = cut_plain_response_head_at_route_deadline(
+                    stream,
+                    state,
+                    proxy,
+                    epoch,
+                    upstream_balancer,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
+                    status,
+                    cb_probe,
+                    backend_start,
+                    &mut backend_admission_permits,
+                    backend_admission_elapsed,
+                );
+                outcome.bytes_sent = bytes_sent;
+                outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
+                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                return Ok(outcome);
+            }
             record_plain_grpc_web_client_deadline(
                 state,
                 epoch,
@@ -6126,10 +6217,9 @@ where
     // blocked-write exit inside it records through the REQUEST's shared latch
     // rather than the bare counter.
     let auth_latch = ctx.authorization_termination_latch();
-    // The matched route rule's body deadline (#5646): the earlier of its total
-    // deadline and the committed attempt's budget. The relay resets the stream
-    // with `H3_REQUEST_CANCELLED` when it fires and reports the cut here.
-    let route_body_deadline = route.body_deadline(route_attempt_deadline);
+    // The relay resets the stream with `H3_REQUEST_CANCELLED` when the route
+    // body deadline fires, on its own arm or on a parked write, and reports
+    // the cut here.
     let mut route_deadline_cut = false;
     let stream_response = async {
         if let Some(inspector) = response_inspector {
@@ -9988,7 +10078,6 @@ where
                     false
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::RouteDeadlineExceeded => {
-                    coalesce_buf.clear();
                     crate::http3::route_deadline::cancel_response_stream(stream);
                     body_error_class = Some(ErrorClass::ReadWriteTimeout);
                     *route_deadline_cut = true;

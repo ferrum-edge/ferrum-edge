@@ -141,7 +141,7 @@ where
 /// and cross-protocol relays cannot drift apart in how they treat a write that
 /// parks past the credential's deadline.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum H3AuthorizedWrite {
+pub enum H3AuthorizedWrite {
     /// The frame reached the QUIC send half.
     Written,
     /// The client's stream is gone; this is an ordinary disconnect.
@@ -209,7 +209,7 @@ where
 }
 
 /// Outcome of a native-H3 streaming response HEADERS write raced against the
-/// composed authorization / client-RPC bound (issue #3815).
+/// composed authorization / client-RPC / route bound (issue #3815, #5646).
 ///
 /// Distinct from [`H3AuthorizedWrite`] because a HEADERS write can also lose
 /// to a strictly earlier protocol deadline, and because an authorization
@@ -230,6 +230,11 @@ pub enum H3AuthorizedHeadersWrite {
     /// A strictly earlier protocol deadline (for example a client
     /// `grpc-timeout`) elapsed. Not an authorization termination.
     ProtocolDeadlineExceeded,
+    /// The matched route rule's body deadline (#5646) elapsed while HEADERS
+    /// were parked in QPACK/QUIC flow control. Only
+    /// `commit_authorized_streaming_response_headers` reports it; the caller
+    /// cuts the response exactly as its relay's route deadline arm does.
+    RouteDeadlineExceeded,
 }
 
 /// Race a native-H3 streaming response HEADERS write against the composed
@@ -287,9 +292,10 @@ pub(crate) fn compose_aggregate_sse_bound(
 }
 
 /// Capture the admitted stream's authorization plan, race `send_response`
-/// against that exact plan composed with any client RPC/route deadline, and latch
-/// an authorization expiry through the request. Used by every native-H3
-/// streaming HTTP/SSE backend relay so those three call sites cannot drift.
+/// against that exact plan composed with any client RPC deadline and the
+/// matched route's body deadline (#5646), and latch an authorization expiry
+/// through the request. Used by every native-H3 streaming HTTP/SSE backend
+/// relay so those three call sites cannot drift.
 /// The aggregate MCP SSE listener composes against its broker lifetime
 /// instead and calls [`await_authorized_headers_write`] directly.
 pub(crate) async fn commit_authorized_streaming_response_headers<S>(
@@ -305,8 +311,9 @@ where
     let plan =
         crate::proxy::auth_lifetime::effective_request_auth_deadline(ctx, max_lifetime_seconds);
     let latch = ctx.authorization_termination_latch();
+    let grpc_deadline = ctx.grpc_deadline_at();
     let bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
-        crate::proxy::earliest_deadline(ctx.grpc_deadline_at(), route_deadline),
+        crate::proxy::earliest_deadline(grpc_deadline, route_deadline),
         plan,
     );
     let outcome = await_authorized_headers_write(
@@ -316,6 +323,7 @@ where
         stream.send_response(resp),
     )
     .await;
+    let outcome = attribute_streaming_headers_deadline(outcome, grpc_deadline, route_deadline);
     if let H3AuthorizedHeadersWrite::AuthorizationExpired(termination) = outcome {
         ctx.latch_authorization_termination(termination);
     }
@@ -323,6 +331,28 @@ where
         plan,
         latch,
         outcome,
+    }
+}
+
+/// Attribute a streaming HEADERS write's protocol-deadline expiry from the
+/// captured instants: the route body deadline (#5646) owns it unless a client
+/// RPC deadline is strictly earlier. Every other outcome passes through.
+#[inline]
+pub(crate) fn attribute_streaming_headers_deadline(
+    outcome: H3AuthorizedHeadersWrite,
+    grpc_deadline: Option<tokio::time::Instant>,
+    route_deadline: Option<tokio::time::Instant>,
+) -> H3AuthorizedHeadersWrite {
+    let route_owns_expiry = match (route_deadline, grpc_deadline) {
+        (Some(route), Some(grpc)) => route <= grpc,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    match outcome {
+        H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded if route_owns_expiry => {
+            H3AuthorizedHeadersWrite::RouteDeadlineExceeded
+        }
+        other => other,
     }
 }
 

@@ -50,6 +50,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An HTTP/3 client that stops reading a streamed response can no longer hold
+  it past the route rule's `request` or `backendRequest` timeout (#5646,
+  PR #5741). A client that withholds QUIC flow control parks the gateway's
+  response write, so the relay never reached its own route-deadline check,
+  and the backend stream, the backend admission permit, and the request's
+  guards stayed held until the client read again, its connection closed, or
+  its credential expired. Every downstream write of the native HTTP/3 relays
+  and of the bridge to HTTP/1.1 and HTTP/2 backends (response HEADERS, DATA,
+  trailers, and FIN) now races the route deadline too. A parked write is cut
+  exactly as a slow backend body is: an `H3_REQUEST_CANCELLED` reset,
+  `body_error_class: read_write_timeout`, and no charge to the backend's
+  circuit breaker or passive health. Routes without timeouts arm no extra
+  timer. A buffered response is complete when written and is not cut, as on
+  HTTP/1.1 and HTTP/2.
 - The graceful-shutdown functional tests no longer pass on evidence that does
   not show a working drain (#5739). A proxy or TCP stream port now counts as
   closed only when the connect is refused, or when the peer closes or resets

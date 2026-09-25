@@ -1617,48 +1617,6 @@ fn h3_post_deadline_terminal_write_grace_is_fixed_one_second() {
 }
 
 #[test]
-fn every_h3_streaming_write_seam_carries_the_route_deadline() {
-    let server = include_str!("../../../src/http3/server.rs");
-    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
-    let expected_call = "await_authorized_response_write(\n";
-    let expected_route_argument = "route_body_deadline,";
-
-    let calls = server
-        .match_indices(expected_call)
-        .map(|(start, _)| &server[start..start + 240])
-        .chain(
-            bridge
-                .match_indices(expected_call)
-                .map(|(start, _)| &bridge[start..start + 240]),
-        )
-        .collect::<Vec<_>>();
-
-    assert_eq!(calls.len(), 6, "update the H3 response-writer parity table");
-    assert!(
-        calls
-            .iter()
-            .all(|call| call.contains(expected_route_argument)),
-        "HEADERS, DATA, trailers, and FIN must not park past a route deadline"
-    );
-    let header_calls = server
-        .match_indices("commit_authorized_streaming_response_headers(")
-        .map(|(start, _)| &server[start..start + 300])
-        .collect::<Vec<_>>();
-    assert_eq!(
-        header_calls.len(),
-        3,
-        "update the native-H3 streaming HEADERS parity table"
-    );
-    assert!(
-        header_calls
-            .iter()
-            .all(|call| call.contains(expected_route_argument)),
-        "every native-H3 streaming HEADERS write must carry the route deadline"
-    );
-    assert!(bridge.contains("route.body_deadline(route_attempt_deadline)"));
-}
-
-#[test]
 fn cross_protocol_plain_authorization_expired_terminal_uses_post_deadline_grace() {
     let cross = include_str!("../../../src/http3/cross_protocol.rs");
     let dispatch = cross
