@@ -41,6 +41,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule's `request` or `backendRequest` is now cut on HTTP/3 as it already was
   on HTTP/1.1 and HTTP/2.
 
+### Fixed
+
+- `adaptive_concurrency` now relearns an obsolete minimum-latency baseline
+  (#5737). The baseline was an all-time minimum, so one unusually fast success
+  (a tiny `200`, a `304`, a cache hit) tightened the latency target forever:
+  ordinary healthy latency then kept shrinking the target to `min_limit`, and
+  concurrent traffic kept receiving `503`s with no backend failure. The
+  baseline is now the minimum of the current and the previous window of
+  `baseline_window_samples` healthy samples per target key (new option,
+  default `1000`), so an outlier stops tightening the target within two
+  windows and saturated healthy traffic regains capacity. A sustained latency
+  increase is still measured against the older, faster window and keeps
+  shrinking the limit until that window rolls out; backend failures, the
+  recovery-cohort barrier, and in-flight accounting are unchanged, and
+  compatible reloads keep the learned windows.
+
 ## [0.9.7] - 2026-09-25
 
 This is the first published release after 0.9.5. It ships every change

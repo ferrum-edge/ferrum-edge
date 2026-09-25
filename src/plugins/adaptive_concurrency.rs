@@ -159,6 +159,7 @@ fn parse_config(object: &Map<String, Value>) -> Result<AdaptiveConcurrencyConfig
         "initial_limit",
         "max_limit",
         "min_samples",
+        "baseline_window_samples",
         "target_latency_multiplier",
         "decrease_ratio",
         "increase_step",
@@ -180,6 +181,7 @@ fn parse_config(object: &Map<String, Value>) -> Result<AdaptiveConcurrencyConfig
     let max_limit = optional_u64(object, "max_limit")?.unwrap_or(1024);
     let max_tracked_keys = optional_u64(object, "max_tracked_keys")?.unwrap_or(10_000);
     let min_samples = optional_u64(object, "min_samples")?.unwrap_or(20);
+    let baseline_window_samples = optional_u64(object, "baseline_window_samples")?.unwrap_or(1000);
     let increase_step = optional_u64(object, "increase_step")?.unwrap_or(1);
     let target_latency_multiplier =
         optional_f64(object, "target_latency_multiplier")?.unwrap_or(1.5);
@@ -215,6 +217,11 @@ fn parse_config(object: &Map<String, Value>) -> Result<AdaptiveConcurrencyConfig
     if min_samples == 0 {
         return Err("adaptive_concurrency: `min_samples` must be greater than 0".to_string());
     }
+    if baseline_window_samples == 0 {
+        return Err(
+            "adaptive_concurrency: `baseline_window_samples` must be greater than 0".to_string(),
+        );
+    }
     if increase_step == 0 {
         return Err("adaptive_concurrency: `increase_step` must be greater than 0".to_string());
     }
@@ -238,6 +245,7 @@ fn parse_config(object: &Map<String, Value>) -> Result<AdaptiveConcurrencyConfig
         initial_limit,
         max_limit,
         min_samples,
+        baseline_window_samples,
         target_latency_multiplier,
         decrease_ratio,
         increase_step,
