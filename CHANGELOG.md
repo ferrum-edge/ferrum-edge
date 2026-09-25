@@ -98,16 +98,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected the response replaced the charged wording. On every frontend they
   now get the bounded treatment of the gateway's own deadline terminal: a
   response-replacing plugin is skipped, other hooks get one poll, a rejection
-  from a hook is ignored, and pending work finishes detached under the cleanup
-  bound. On HTTP/1.1 and HTTP/2 the response-body inspection and final-body
-  validation plugins no longer run over the charged terminal, as they do not
-  run over a rejection; the body transform still runs, so a translated
-  gRPC-Web terminal keeps its wire shape. An expired credential still gets its
-  fixed authorization terminal and is never detached. An expiry while a
-  buffered response body is read no longer runs `after_proxy` a second time
-  over the terminal: the terminal carries the gateway headers `after_proxy`
-  already added to the response head, and only the response-committed plugins
-  run over it.
+  from a hook is ignored, and a hook still pending after its poll finishes
+  detached under the cleanup bound, ended early at the credential's lifetime,
+  while every later hook still gets its poll. A pass-through gRPC-Web call
+  whose budget expires on the HTTP/1.1 and HTTP/2 native gRPC path now gets
+  these `after_proxy` decorations too, so a browser client receives the CORS
+  headers it needs to read the gRPC status; that terminal used to skip
+  `after_proxy` entirely. On HTTP/1.1 and HTTP/2 the response-body inspection
+  and final-body validation plugins no longer run over the charged terminal,
+  as they do not run over a rejection; the body transform still runs, so a
+  translated gRPC-Web terminal keeps its wire shape. An expired credential
+  still gets its fixed authorization terminal and is never detached. An expiry
+  while a buffered response body is read no longer runs `after_proxy` a second
+  time over the terminal: the terminal carries the gateway headers
+  `after_proxy` already added to the response head, and only the
+  response-committed plugins run over it.
 - A peer that resets an HTTP/3 stream in the middle of a DATA frame no longer
   tears down the whole QUIC connection (PR #5741). The vendored `h3` frame-drain
   patch held a QUIC error back so it could decode buffered bytes first. Quinn

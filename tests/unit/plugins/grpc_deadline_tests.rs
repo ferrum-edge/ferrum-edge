@@ -1228,6 +1228,147 @@ async fn proxy_core_charged_terminal_after_proxy_hooks_are_bounded() {
     assert!(!gateway_deadline_response_selected_for_test(&ctx));
 }
 
+/// Over a charged backend deadline terminal (#5744) a hook still pending after
+/// its one poll detaches alone: a later decorator that completes within its
+/// own poll (CORS on a gRPC-Web terminal) still decorates the terminal. This
+/// holds on the reject-path runner the HTTP/3 bridge and the native gRPC
+/// branch use, and on proxy core's `after_proxy` runner.
+#[tokio::test]
+async fn a_pending_hook_does_not_drop_a_later_decorator_over_the_charged_terminal() {
+    use ferrum_edge::_test_support::{
+        apply_after_proxy_hooks_to_charged_deadline_rejection_for_test,
+        end_charged_grpc_route_attempt_for_test, run_after_proxy_hooks_reject_for_test,
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(SlowRejectDecorator {
+            name: "stalled-decorator",
+            delay: std::time::Duration::from_secs(3600),
+            calls: Arc::clone(&calls),
+            completed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            completion: Arc::new(tokio::sync::Notify::new()),
+        }),
+        Arc::new(ImmediateRejectHeaderDecorator),
+    ];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    let mut status = 200;
+    let mut body = bytes::Bytes::new();
+    let mut headers = charged_backend_deadline_headers();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        apply_after_proxy_hooks_to_charged_deadline_rejection_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut body,
+            &mut headers,
+        ),
+    )
+    .await
+    .expect("a pending hook must not hold the charged terminal");
+    assert_eq!(
+        headers.get("x-before-deadline").map(String::as_str),
+        Some("trusted"),
+        "reject path: a later ready decorator still decorates the charged terminal"
+    );
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Backend deadline exceeded")
+    );
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    let mut headers = charged_backend_deadline_headers();
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers),
+    )
+    .await
+    .expect("a pending hook must not hold the charged terminal");
+    assert!(rejected.is_none());
+    assert_eq!(
+        headers.get("x-before-deadline").map(String::as_str),
+        Some("trusted"),
+        "proxy core: a later ready decorator still decorates the charged terminal"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "each runner polls the pending hook exactly once"
+    );
+}
+
+/// A hook detached over a charged terminal (#5744) never outlives the admitted
+/// credential: its work ends at the authorization lifetime even though the
+/// post-response cleanup bound is later, on both charged runners.
+#[tokio::test(start_paused = true)]
+async fn a_detached_charged_terminal_hook_ends_at_the_authorization_lifetime() {
+    use ferrum_edge::_test_support::{
+        apply_after_proxy_hooks_to_charged_deadline_rejection_for_test,
+        end_charged_grpc_route_attempt_for_test, request_received_at_for_test,
+        run_after_proxy_hooks_reject_for_test, set_request_credential_deadline_for_test,
+    };
+
+    // Pin the authenticated-stream maximum, so the one-second credential below
+    // is the plan's bound whatever another test published.
+    let lifetime = crate::unit::env_lock::StreamAuthMaxLifetimeGuard::new();
+    lifetime.publish(3_600);
+    let authorized_ctx = || {
+        let mut ctx = create_grpc_context_with_timeout(None);
+        ctx.authenticated_identity = Some("spiffe://example/sa/api".to_string());
+        let received_at = request_received_at_for_test(&ctx);
+        set_request_credential_deadline_for_test(
+            &mut ctx,
+            Some(received_at + std::time::Duration::from_secs(1)),
+        );
+        ctx
+    };
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(SlowRejectDecorator {
+        name: "slow-decorator",
+        delay: std::time::Duration::from_secs(2),
+        calls: Arc::clone(&calls),
+        completed: Arc::clone(&completed),
+        completion: Arc::new(tokio::sync::Notify::new()),
+    })];
+
+    let mut ctx = authorized_ctx();
+    let mut status = 200;
+    let mut body = bytes::Bytes::new();
+    let mut headers = charged_backend_deadline_headers();
+    apply_after_proxy_hooks_to_charged_deadline_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut body,
+        &mut headers,
+    )
+    .await;
+    let mut ctx = authorized_ctx();
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    let mut headers = charged_backend_deadline_headers();
+    let rejected =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers).await;
+    assert!(rejected.is_none());
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "each runner polls the hook once before detaching it"
+    );
+
+    // Past the hook's own delay, but inside the fixed cleanup bound: only the
+    // credential's lifetime can have ended the detached work.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(
+        completed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a detached hook must not run past the credential's lifetime"
+    );
+}
+
 /// Proxy core's committed observers over its charged terminal (#5744) get one
 /// poll each with no RPC deadline in force and then continue detached. The
 /// buffered terminal keeps its charged wording.
