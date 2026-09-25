@@ -1433,8 +1433,7 @@ async fn read_scripted_reply(reply: &'static [u8], then_close: bool) -> H1Read {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
-        if read_request_head(&mut stream).await.is_none()
-            || stream.write_all(reply).await.is_err()
+        if read_request_head(&mut stream).await.is_none() || stream.write_all(reply).await.is_err()
         {
             return;
         }
