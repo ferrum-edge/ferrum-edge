@@ -47,6 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   An empty-match `mesh_route_dispatch` rule carrying only `retry` or
   `retry_disabled: true` is now accepted as a route-action catch-all.
 
+- Gateway API rule-level `ResponseHeaderModifier` (HTTPRoute and GRPCRoute)
+  and HTTPRoute `URLRewrite` (#5646, PR #5650). Both were refused at admission
+  and are now translated onto the rule's own `mesh_route_dispatch` actions:
+  response-header filters become `response_transform` rules and `URLRewrite`
+  becomes a per-rule `rewrite` (hostname, `ReplaceFullPath`, and
+  `ReplacePrefixMatch` following the upstream rewrite table). Admission stays
+  fail-closed for `URLRewrite` combined with `RequestRedirect`, a repeated
+  filter, `URLRewrite` on a GRPCRoute, `ReplacePrefixMatch` without a
+  `PathPrefix` match, protocol-managed response headers, and malformed header
+  names, values, hostnames, or paths. A `RequestRedirect` with a root
+  `PathPrefix: /` match no longer fuses the replacement onto the first path
+  segment.
+
 - Conditional full-replacement writes (#5659). `GET` on proxies, upstreams,
   consumers, and plugin configs returns a strong `ETag`; `PUT`/`DELETE` with a
   non-matching `If-Match` is refused with `412` and writes nothing, so a draft
