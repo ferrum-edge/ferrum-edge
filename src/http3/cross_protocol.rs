@@ -293,7 +293,7 @@ fn record_cross_protocol_connection_start(
     upstream_target: Option<&UpstreamTarget>,
 ) {
     *lb_connection = None;
-    *lb_connection = Some(LoadBalancerConnectionGuard::for_target(
+    *lb_connection = Some(LoadBalancerConnectionGuard::new(
         upstream_target,
         selected_balancer.map(Arc::as_ref),
     ));
@@ -12037,7 +12037,9 @@ mod tests {
     /// target BEFORE acquiring the reqwest client. A client-build/pool failure
     /// must feed the 502 connection failure to the backend outcome path. Since
     /// #5693 the outcome record never ends the connection: the dispatch-scoped
-    /// guard does, exactly once, whichever way the dispatch exits.
+    /// guard does, exactly once, whichever way the dispatch exits. A second,
+    /// concurrent connection keeps the gauge above zero, so a double release
+    /// or a lost start would show instead of saturating at zero.
     #[tokio::test]
     async fn client_acquire_failure_records_outcome_and_guard_releases_connection() {
         let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
@@ -12091,6 +12093,12 @@ mod tests {
                 .sum::<i64>()
         };
 
+        let mut concurrent = None;
+        record_cross_protocol_connection_start(
+            &mut concurrent,
+            Some(&balancer),
+            Some(target.as_ref()),
+        );
         // The caller issues the connection-start before the client acquire.
         let mut lb_connection = None;
         record_cross_protocol_connection_start(
@@ -12098,7 +12106,15 @@ mod tests {
             Some(&balancer),
             Some(target.as_ref()),
         );
-        assert_eq!(active(), 1, "connection-start increments the gauge");
+        assert_eq!(active(), 2, "connection-start increments the gauge");
+        // A retry re-arms the same slot: the previous attempt's count is
+        // released, not stacked.
+        record_cross_protocol_connection_start(
+            &mut lb_connection,
+            Some(&balancer),
+            Some(target.as_ref()),
+        );
+        assert_eq!(active(), 2, "re-arming replaces, not adds, a count");
 
         // No admission permits in this minimal setup; the outcome record must
         // leave the connection to the guard.
@@ -12118,12 +12134,14 @@ mod tests {
 
         assert_eq!(
             active(),
-            1,
+            2,
             "the outcome record must not end the connection the guard owns"
         );
 
         drop(lb_connection);
-        assert_eq!(active(), 0, "the guard's drop is the one release");
+        assert_eq!(active(), 1, "the guard's drop releases one count");
+        drop(concurrent);
+        assert_eq!(active(), 0);
     }
 
     /// #1806: the H3→HTTP plain bridge resolves the per-target effective proxy

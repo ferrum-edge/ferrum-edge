@@ -12,6 +12,7 @@ use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
 use ferrum_edge::load_balancer::{LoadBalancer, LoadBalancerCache};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -452,9 +453,11 @@ fn lease_taken_before_a_rebuild_releases_the_counter_the_new_balancer_reads() {
         vec![a.clone(), b.clone()],
     );
     let cache = cache_with(vec![initial]);
-    let lease = balancer(&cache, "lease")
-        .lease_connection(&a)
-        .expect("a is a target");
+    let old = balancer(&cache, "lease");
+    let first = old.lease_connection(&a).expect("a is a target");
+    let second = old.lease_connection(&a).expect("a is a target");
+    let third = old.lease_connection(&a).expect("a is a target");
+    drop(old);
     assert!(
         balancer(&cache, "lease")
             .lease_connection(&target("absent"))
@@ -474,9 +477,15 @@ fn lease_taken_before_a_rebuild_releases_the_counter_the_new_balancer_reads() {
         );
     }
     let newest = balancer(&cache, "lease");
-    assert_eq!(connections(&newest, &a), 1);
+    assert_eq!(connections(&newest, &a), 3);
 
-    drop(lease);
+    // Each drop releases exactly one count: a double release or a lost start
+    // would show here rather than saturating at zero.
+    drop(second);
+    assert_eq!(connections(&newest, &a), 2);
+    drop(first);
+    assert_eq!(connections(&newest, &a), 1);
+    drop(third);
     assert_eq!(connections(&newest, &a), 0);
     assert!(cache.active_connections_snapshot().is_empty());
 }
@@ -491,10 +500,23 @@ impl Drop for Finished<'_> {
     }
 }
 
+/// Identity of the runtime-state slot `lb` counts `target` against. A held
+/// lease keeps its slot alive, so the address cannot be reused while it is
+/// compared.
+fn slot_id(lb: &LoadBalancer, target: &UpstreamTarget) -> usize {
+    let state = lb
+        .target_runtime_state(target)
+        .expect("target present in balancer");
+    std::ptr::from_ref(state).addr()
+}
+
 /// Connections opened and closed from several threads while service
-/// discovery and config deltas keep republishing the balancer must settle at
-/// exactly zero: no start may be lost, no end may be applied twice, and no
-/// count may go negative while the churn is running.
+/// discovery and config deltas keep republishing the balancer. No count may
+/// go negative while the churn runs. Afterwards the workers hand back the
+/// leases they still hold: each target's live count must equal exactly the
+/// number of those leases taken against its current slot (a lost start or a
+/// double release would show, since the count is above zero), and releasing
+/// them must bring every count back to zero.
 #[test]
 fn concurrent_connection_churn_across_rebuilds_settles_to_zero() {
     const WORKERS: usize = 4;
@@ -508,11 +530,12 @@ fn concurrent_connection_churn_across_rebuilds_settles_to_zero() {
     let cache = cache_with(vec![initial]);
     let finished = AtomicUsize::new(0);
 
-    std::thread::scope(|scope| {
+    let held: Vec<_> = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(WORKERS);
         for worker in 0..WORKERS {
             let (cache, finished) = (&cache, &finished);
             let (a, b) = (&a, &b);
-            scope.spawn(move || {
+            workers.push(scope.spawn(move || {
                 let _finished = Finished(finished);
                 let mut held = std::collections::VecDeque::new();
                 for i in 0..ITERATIONS {
@@ -523,16 +546,17 @@ fn concurrent_connection_churn_across_rebuilds_settles_to_zero() {
                         lb.record_connection_start(chosen);
                         std::thread::yield_now();
                         lb.record_connection_end(chosen);
-                    } else {
-                        // Leases stay open across later rebuilds.
-                        held.push_back(lb.lease_connection(chosen));
+                    } else if let Some(lease) = lb.lease_connection(chosen) {
+                        // Leases stay open across later rebuilds; remember
+                        // which slot each one counts against.
+                        held.push_back((slot_id(&lb, chosen), lease));
                         if held.len() > 8 {
                             drop(held.pop_front());
                         }
                     }
                 }
-                drop(held);
-            });
+                held
+            }));
         }
 
         let mut round = 0usize;
@@ -579,6 +603,11 @@ fn concurrent_connection_churn_across_rebuilds_settles_to_zero() {
             round += 1;
             std::thread::yield_now();
         }
+
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("churn worker panicked"))
+            .collect()
     });
 
     cache.update_targets(
@@ -589,6 +618,24 @@ fn concurrent_connection_churn_across_rebuilds_settles_to_zero() {
         None,
     );
     let settled = balancer(&cache, "churn");
+    let leased = |target: &UpstreamTarget| {
+        let slot = slot_id(&settled, target);
+        let count = held.iter().filter(|(id, _)| *id == slot).count();
+        i64::try_from(count).expect("lease count fits i64")
+    };
+    // `a` is in every published target set, so every lease on it counts
+    // against the one live slot.
+    assert!(leased(&a) > 0, "workers must still hold leases on `a`");
+    for target in [&a, &b, &c] {
+        assert_eq!(
+            connections(&settled, target),
+            leased(target),
+            "{} must count exactly the leases held against its slot",
+            target.host
+        );
+    }
+
+    drop(held);
     for target in [&a, &b, &c] {
         assert_eq!(connections(&settled, target), 0, "{}", target.host);
     }
@@ -624,86 +671,436 @@ fn rust_sources(dir: &Path, out: &mut Vec<(String, String)>) {
     }
 }
 
-/// The body of `fn <name>(` in `source`, up to the next `\n    fn ` or
-/// `\n    pub`.
-fn fn_body<'a>(source: &'a str, name: &str) -> &'a str {
-    let signature = format!("fn {name}(");
-    let start = source
-        .find(signature.as_str())
-        .unwrap_or_else(|| panic!("fn {name} present"));
-    let rest = &source[start + 1..];
-    let end = ["\n    fn ", "\n    pub", "\n}\n"]
+/// Replace every byte in `range` except newlines with a space, so byte
+/// offsets and line numbers stay unchanged.
+fn blank(code: &mut [u8], range: Range<usize>) {
+    for byte in &mut code[range] {
+        if *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn skip_whitespace(code: &[u8], mut at: usize) -> usize {
+    while code.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+    at
+}
+
+/// Index of the delimiter closing the `(`, `[` or `{` at `open`.
+fn matching_close(code: &[u8], open: usize) -> usize {
+    let mut depth = 0i32;
+    for (at, byte) in code.iter().copied().enumerate().skip(open) {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return at;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced delimiter at byte {open}");
+}
+
+/// Number of `#`s when a raw string literal (`r"`, `r#"`, `br#"`) starts at
+/// `at`; `None` for anything else, including a raw identifier (`r#type`).
+fn raw_string_hashes(code: &[u8], at: usize) -> Option<usize> {
+    if code[at] != b'r' {
+        return None;
+    }
+    let prefix_ok = match at.checked_sub(1).map(|before| code[before]) {
+        None => true,
+        Some(b'b') => at < 2 || !is_ident_byte(code[at - 2]),
+        Some(before) => !is_ident_byte(before),
+    };
+    let hashes = code[at + 1..]
+        .iter()
+        .take_while(|byte| **byte == b'#')
+        .count();
+    let opens = prefix_ok && code.get(at + 1 + hashes) == Some(&b'"');
+    opens.then_some(hashes)
+}
+
+/// End (exclusive) of the character literal starting at `at`, or `None` when
+/// the quote opens a lifetime or a label instead.
+fn char_literal_end(source: &str, at: usize) -> Option<usize> {
+    let code = source.as_bytes();
+    if code.get(at + 1) == Some(&b'\\') {
+        // Skip the escaped character itself: it may be a quote.
+        return code
+            .get(at + 3..)?
+            .iter()
+            .position(|byte| *byte == b'\'')
+            .map(|found| at + 3 + found + 1);
+    }
+    let next = source[at + 1..].chars().next()?;
+    let close = at + 1 + next.len_utf8();
+    (code.get(close) == Some(&b'\'')).then_some(close + 1)
+}
+
+/// `source` with comments and the contents of string and character literals
+/// blanked, so delimiter matching and needle searches see code only.
+fn mask_literals_and_comments(source: &str) -> String {
+    let code = source.as_bytes();
+    let mut masked = code.to_vec();
+    let mut at = 0;
+    while at < code.len() {
+        let rest = &code[at..];
+        if rest.starts_with(b"//") {
+            let end = rest
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(code.len(), |found| at + found);
+            blank(&mut masked, at..end);
+            at = end;
+        } else if rest.starts_with(b"/*") {
+            // Block comments nest.
+            let mut depth = 0usize;
+            let mut end = at;
+            while end < code.len() {
+                if code[end..].starts_with(b"/*") {
+                    depth += 1;
+                    end += 2;
+                } else if code[end..].starts_with(b"*/") {
+                    depth -= 1;
+                    end += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    end += 1;
+                }
+            }
+            let end = end.min(code.len());
+            blank(&mut masked, at..end);
+            at = end;
+        } else if let Some(hashes) = raw_string_hashes(code, at) {
+            let open = at + hashes + 2;
+            let terminator: Vec<u8> = std::iter::once(b'"')
+                .chain(std::iter::repeat_n(b'#', hashes))
+                .collect();
+            let close = code[open..]
+                .windows(terminator.len())
+                .position(|window| window == terminator.as_slice())
+                .map_or(code.len(), |found| open + found);
+            blank(&mut masked, open..close);
+            at = close + terminator.len();
+        } else if code[at] == b'"' {
+            let mut close = at + 1;
+            while close < code.len() && code[close] != b'"' {
+                close += if code[close] == b'\\' { 2 } else { 1 };
+            }
+            let close = close.min(code.len());
+            blank(&mut masked, at + 1..close);
+            at = close + 1;
+        } else if code[at] == b'\'' {
+            match char_literal_end(source, at) {
+                Some(end) => {
+                    blank(&mut masked, at + 1..end - 1);
+                    at = end;
+                }
+                None => at += 1,
+            }
+        } else {
+            at += 1;
+        }
+    }
+    String::from_utf8(masked).expect("blanking keeps the source valid UTF-8")
+}
+
+/// Whether `at` starts a struct field or a field initialiser (`name: ...`,
+/// optionally `pub` / `pub(...)`), rather than an item or a statement.
+fn is_field_start(code: &[u8], at: usize) -> bool {
+    let mut at = at;
+    let after_pub = code.get(at + 3).copied();
+    if code[at..].starts_with(b"pub") && !after_pub.is_some_and(is_ident_byte) {
+        at += 3;
+        if code.get(at) == Some(&b'(') {
+            at = matching_close(code, at) + 1;
+        }
+        at = skip_whitespace(code, at);
+    }
+    let name = code[at..]
+        .iter()
+        .take_while(|byte| is_ident_byte(**byte))
+        .count();
+    let colon = skip_whitespace(code, at + name);
+    name > 0 && code.get(colon) == Some(&b':') && code.get(colon + 1) != Some(&b':')
+}
+
+/// End (exclusive) of the item, statement, or field that the attribute at
+/// `attr` applies to: through its `;` or its `{ ... }` body, or through the
+/// trailing `,` of a field. Stops before a closing delimiter that belongs to
+/// the enclosing item.
+fn test_item_end(code: &[u8], attr: usize) -> usize {
+    // This attribute and any that follow it.
+    let mut at = skip_whitespace(code, attr);
+    while code[at..].starts_with(b"#[") {
+        at = skip_whitespace(code, matching_close(code, at + 1) + 1);
+    }
+    let field = is_field_start(code, at);
+    let mut depth = 0i32;
+    while at < code.len() {
+        match code[at] {
+            b'{' if depth == 0 && !field => return matching_close(code, at) + 1,
+            b';' if depth == 0 => return at + 1,
+            b',' if depth == 0 && field => return at + 1,
+            b')' | b']' | b'}' if depth == 0 => return at,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'<' if field => depth += 1,
+            b'>' if field && !matches!(code[at - 1], b'-' | b'=') => depth -= 1,
+            _ => {}
+        }
+        at += 1;
+    }
+    code.len()
+}
+
+/// `source` reduced to production code: comments and literal contents are
+/// blanked, and so is every `#[cfg(test)]` / `#[cfg(all(test, ...))]` item
+/// wherever it sits (test modules, test-only functions, fields and
+/// statements), not only a trailing test module. Byte offsets are unchanged.
+fn production_code(source: &str) -> String {
+    let masked = mask_literals_and_comments(source);
+    if masked.contains("#![cfg(test)]") {
+        return String::new();
+    }
+    let mut production = masked.clone().into_bytes();
+    for marker in ["#[cfg(test)]", "#[cfg(all(test"] {
+        for (at, _) in masked.match_indices(marker) {
+            let end = test_item_end(masked.as_bytes(), at);
+            blank(&mut production, at..end);
+        }
+    }
+    String::from_utf8(production).expect("blanking keeps the source valid UTF-8")
+}
+
+/// Byte range of `fn <name>`, from `fn` through its closing brace, inside
+/// `within`.
+fn fn_span(code: &str, within: Range<usize>, name: &str) -> Range<usize> {
+    let signature = format!("fn {name}");
+    let start = standalone_matches(&code[within.clone()], &signature)
         .into_iter()
-        .filter_map(|marker| rest.find(marker))
-        .min()
-        .unwrap_or(rest.len());
-    &source[start..start + 1 + end]
+        .map(|at| within.start + at)
+        .find(|at| {
+            code[at + signature.len()..]
+                .trim_start()
+                .starts_with(['(', '<'])
+        })
+        .unwrap_or_else(|| panic!("fn {name} present"));
+    let bytes = code.as_bytes();
+    let mut body = start;
+    let mut depth = 0i32;
+    while bytes[body] != b'{' || depth != 0 {
+        match bytes[body] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            _ => {}
+        }
+        body += 1;
+    }
+    start..matching_close(bytes, body) + 1
+}
+
+/// `code[range]` with all whitespace removed.
+fn stripped(code: &str, range: Range<usize>) -> String {
+    code[range].split_whitespace().collect()
+}
+
+/// The top-level arguments, whitespace removed, of each call to `callee`
+/// (which ends in `(`) inside `within`.
+fn call_args(code: &str, within: Range<usize>, callee: &str) -> Vec<Vec<String>> {
+    standalone_matches(&code[within.clone()], callee)
+        .into_iter()
+        .map(|at| {
+            let open = within.start + at + callee.len() - 1;
+            let close = matching_close(code.as_bytes(), open);
+            let mut args = vec![String::new()];
+            let mut depth = 0i32;
+            for c in code[open + 1..close].chars() {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        args.push(String::new());
+                        continue;
+                    }
+                    _ => {}
+                }
+                if !c.is_whitespace() {
+                    args.last_mut().expect("an argument slot").push(c);
+                }
+            }
+            args.retain(|arg| !arg.is_empty());
+            args
+        })
+        .collect()
+}
+
+/// The last argument of each call.
+fn last_args(calls: &[Vec<String>]) -> Vec<&str> {
+    calls
+        .iter()
+        .map(|args| args.last().map_or("", String::as_str))
+        .collect()
+}
+
+const FULL_CONSTRUCTOR: &str = "LoadBalancer::with_subsets_and_port_overrides(";
+const SELF_FULL_CONSTRUCTOR: &str = "Self::with_subsets_and_port_overrides(";
+const SELF_WITH_SUBSETS: &str = "Self::with_subsets(";
+const BUILD: &str = "Self::build_balancer(";
+const BUILD_WITH_TARGETS: &str = "Self::build_balancer_with_targets(";
+
+/// Assert that `caller` calls `callee` exactly once and passes `previous`
+/// (compared without whitespace) as its last argument: the balancer currently
+/// published for the upstream, never `None`.
+fn assert_hands_over(code: &str, caller: &str, callee: &str, previous: &str) {
+    let calls = call_args(code, fn_span(code, 0..code.len(), caller), callee);
+    assert_eq!(
+        last_args(&calls),
+        [previous],
+        "{caller} must hand the published balancer to `{callee}`"
+    );
 }
 
 /// Every production `LoadBalancer` construction must hand the published
-/// balancer over so surviving targets keep their state. The cache builds all
-/// of its balancers through one builder that passes `previous`; any other
-/// construction site (`LoadBalancer::new(`, `LoadBalancer::with_subsets(`, or
-/// a second `with_subsets_and_port_overrides(` call) anywhere in production
-/// code would silently bring back #5693 for that path.
+/// balancer over so surviving targets keep their state, and production code
+/// must count connections through the RAII lease, never with bare
+/// `record_connection_start` / `record_connection_end` pairs (a rebuild no
+/// longer resets a leaked count).
+///
+/// The scan covers every file under `src/` with comments, literal contents
+/// and all `#[cfg(test)]` items blanked, and compares call arguments with
+/// whitespace removed, so it does not depend on rustfmt layout. Any other
+/// construction site (`LoadBalancer::new(`, `LoadBalancer::with_subsets(`,
+/// their `Self::` forms inside `impl LoadBalancer`, or a second call to the
+/// full constructor) would silently bring back #5693 for that path.
 #[test]
 fn every_production_balancer_construction_hands_over_runtime_state() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut sources = Vec::new();
     rust_sources(&src, &mut sources);
     assert!(sources.len() > 10, "source walk found {}", sources.len());
+    let lb_path = src.join("load_balancer.rs").display().to_string();
 
-    let mut builder_calls = Vec::new();
+    let mut constructions = Vec::new();
+    let mut lb_code = None;
     for (path, source) in &sources {
-        // Everything before the first top-level inline test module.
-        let production = source
-            .split("\n#[cfg(test)]\nmod ")
-            .next()
-            .unwrap_or_default();
+        let code = production_code(source);
         for needle in ["LoadBalancer::new(", "LoadBalancer::with_subsets("] {
             assert!(
-                standalone_matches(production, needle).is_empty(),
+                standalone_matches(&code, needle).is_empty(),
                 "{path}: production `{needle}` bypasses the cache builder"
             );
         }
-        let full = "LoadBalancer::with_subsets_and_port_overrides(";
-        for at in standalone_matches(production, full) {
-            builder_calls.push((path.clone(), at));
+        for at in standalone_matches(&code, FULL_CONSTRUCTOR) {
+            constructions.push((path.clone(), at));
+        }
+        if *path == lb_path {
+            lb_code = Some(code);
+            continue;
+        }
+        for needle in ["record_connection_start(", "record_connection_end("] {
+            assert!(
+                standalone_matches(&code, needle).is_empty(),
+                "{path}: production code must count connections with \
+                 `LoadBalancerConnectionGuard`, not `{needle}`"
+            );
         }
     }
-    assert_eq!(
-        builder_calls.len(),
-        1,
-        "exactly one production construction site: {builder_calls:?}"
-    );
+    let code = lb_code.expect("src/load_balancer.rs scanned");
+    let whole = 0..code.len();
 
-    let (path, at) = &builder_calls[0];
-    assert!(path.ends_with("load_balancer.rs"), "{path}");
-    let source = &sources
-        .iter()
-        .find(|(candidate, _)| candidate == path)
-        .expect("builder source")
-        .1;
-    let builder = fn_body(source, "build_balancer_with_targets");
-    let builder_start = source.find(builder).expect("builder body");
+    // Exactly one construction site: the cache builder, which passes the
+    // published balancer as `previous`.
+    assert_eq!(
+        constructions.len(),
+        1,
+        "exactly one production construction site: {constructions:?}"
+    );
+    let (path, at) = &constructions[0];
+    assert_eq!(*path, lb_path);
+    let builder = fn_span(&code, whole.clone(), "build_balancer_with_targets");
     assert!(
-        (builder_start..builder_start + builder.len()).contains(at),
+        builder.contains(at),
         "the one construction must be inside build_balancer_with_targets"
     );
-    assert!(
-        builder.contains("previous,\n        ))"),
+    assert_eq!(
+        last_args(&call_args(&code, builder, FULL_CONSTRUCTOR)),
+        ["previous"],
         "the builder must hand `previous` to the constructor"
     );
-    for cache_path in [
-        "build_balancer",
-        "build_balancers",
-        "build_delta_inner",
-        "build_update_targets_inner",
-    ] {
-        let body = fn_body(source, cache_path);
-        assert!(
-            body.contains("Self::build_balancer"),
-            "{cache_path} must build through the runtime-state-inheriting builder"
-        );
+
+    // Inside `impl LoadBalancer` the public constructors only delegate: `new`
+    // to `with_subsets`, and `with_subsets` to the full constructor.
+    let mut impl_blocks = 0;
+    for at in standalone_matches(&code, "impl LoadBalancer") {
+        let open = skip_whitespace(code.as_bytes(), at + "impl LoadBalancer".len());
+        if code.as_bytes()[open] != b'{' {
+            continue;
+        }
+        impl_blocks += 1;
+        let body = open..matching_close(code.as_bytes(), open) + 1;
+        let new = fn_span(&code, body.clone(), "new");
+        let with_subsets = fn_span(&code, body.clone(), "with_subsets");
+        let delegates = |callee: &str, hit: usize| match callee {
+            SELF_WITH_SUBSETS => new.contains(&hit),
+            SELF_FULL_CONSTRUCTOR => with_subsets.contains(&hit),
+            _ => false,
+        };
+        for callee in ["Self::new(", SELF_WITH_SUBSETS, SELF_FULL_CONSTRUCTOR] {
+            for hit in standalone_matches(&code[body.clone()], callee) {
+                assert!(
+                    delegates(callee, body.start + hit),
+                    "`{callee}` inside `impl LoadBalancer` builds a balancer without `previous`"
+                );
+            }
+        }
     }
+    assert!(impl_blocks > 0, "no `impl LoadBalancer` block found");
+
+    // Every cache path reaches the builder through one of these calls, each
+    // passing the balancer currently published under the same key.
+    let mut build_calls = 0;
+    for callee in [BUILD, BUILD_WITH_TARGETS] {
+        build_calls += standalone_matches(&code, callee).len();
+    }
+    assert_eq!(
+        build_calls, 4,
+        "a new cache build path must hand over `previous` and be checked here"
+    );
+    assert_hands_over(&code, "build_balancers", BUILD, "prior.map(Arc::as_ref)");
+    assert_hands_over(&code, "build_balancer", BUILD_WITH_TARGETS, "previous");
+    assert_hands_over(&code, "build_delta_inner", BUILD, "previous");
+    assert_hands_over(
+        &code,
+        "build_update_targets_inner",
+        BUILD_WITH_TARGETS,
+        "current.balancers.get(&key).map(Arc::as_ref)",
+    );
+    let text = |caller: &str| stripped(&code, fn_span(&code, whole.clone(), caller));
+    let prior = "letprior=previous.and_then(|inner|inner.balancers.get(&key));";
+    assert!(
+        text("build_balancers").contains(prior),
+        "build_balancers must take `prior` from the published snapshot"
+    );
+    let published = "letprevious=new_balancers.get(&key).map(Arc::as_ref);";
+    assert!(
+        text("build_delta_inner").contains(published),
+        "build_delta_inner must take `previous` from the published balancers"
+    );
+    let inherits = "Self::build_inner_inheriting(config,Some(&*current))";
+    assert!(
+        text("rebuild").contains(inherits),
+        "a full rebuild must inherit from the published snapshot"
+    );
 }

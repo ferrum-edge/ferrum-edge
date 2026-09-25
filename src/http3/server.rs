@@ -6897,7 +6897,7 @@ async fn handle_h3_request(
         // rejects). The guard is the one release: it drops when this branch
         // exits, on every return, `?`, or unwind, so no early exit can leak
         // the count (issue #5693).
-        let lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::for_target(
+        let lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
             upstream_target
                 .as_deref()
                 .filter(|_| proxy.upstream_id.is_some()),
@@ -7105,6 +7105,9 @@ async fn handle_h3_request(
                     outcome_error_class,
                     backend_admission_start.elapsed(),
                 );
+                // The backend exchange is settled: release the least-connections
+                // count now, not after the logging below.
+                drop(lb_connection_guard);
 
                 let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -7320,6 +7323,9 @@ async fn handle_h3_request(
                 None,
                 backend_admission_response_elapsed,
             );
+            // The backend exchange is settled: release the least-connections
+            // count now, not after the logging below.
+            drop(lb_connection_guard);
 
             let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -8414,10 +8420,10 @@ async fn handle_h3_request(
     // Track connection for least-connections LB (after all pre-dispatch rejects).
     // Placed here so the streaming-request path above handles its own tracking,
     // and early returns from body collection/plugin rejects don't leak counts.
-    // The guard is the one release and counts the initially selected target
-    // (as the H1/H2 path does), even when a retry rotates to another one; it
-    // drops on every exit from this handler (issue #5693).
-    let lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::for_target(
+    // The guard is the one release; it drops on every exit from this handler,
+    // and the retry loop below re-arms it for each attempt so the count
+    // follows the target actually dialed (issue #5693).
+    let mut lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
         upstream_target
             .as_deref()
             .filter(|_| proxy.upstream_id.is_some()),
@@ -9070,6 +9076,16 @@ async fn handle_h3_request(
                     connection_error = h3_connection_error(result.request_on_wire, result.error_class),
                     native_h3 = current_dispatch_h3,
                     "Retrying backend request (HTTP/3 frontend)"
+                );
+
+                // Count this attempt against the target it dials. The new
+                // lease is taken before the previous attempt's drops, so a
+                // rotation moves the count to the new target without a gap.
+                lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
+                    current_target
+                        .as_deref()
+                        .filter(|_| proxy.upstream_id.is_some()),
+                    upstream_balancer.as_deref(),
                 );
 
                 // Re-resolve the effective proxy for the (possibly rotated)
@@ -13056,9 +13072,10 @@ async fn dispatch_grpc_native_h3(
     let backend_admission_start = std::time::Instant::now();
 
     // Least-connections LB tracking (after all pre-dispatch rejects). The
-    // guard is the one release; it drops on every exit from this relay
-    // (issue #5693).
-    let _lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::for_target(
+    // guard is the one release (issue #5693). Every exit drops it explicitly
+    // once its backend outcome is recorded, so the count is never held across
+    // the awaited transaction logging; any other exit drops it on return.
+    let lb_connection_guard = crate::proxy::LoadBalancerConnectionGuard::new(
         upstream_target.filter(|_| proxy.upstream_id.is_some()),
         upstream_balancer.map(Arc::as_ref),
     );
@@ -13276,6 +13293,7 @@ async fn dispatch_grpc_native_h3(
             )
             .await;
             crate::http3::stream_util::halt_request_body(&mut stream);
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13300,6 +13318,7 @@ async fn dispatch_grpc_native_h3(
             let failure =
                 send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut stream, error).await;
             crate::http3::stream_util::halt_request_body(&mut stream);
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13412,6 +13431,7 @@ async fn dispatch_grpc_native_h3(
             )
             .await;
             pump_guard.retire().await;
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13432,6 +13452,7 @@ async fn dispatch_grpc_native_h3(
             let failure =
                 send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut send_half, error).await;
             pump_guard.retire().await;
+            drop(lb_connection_guard);
             record_failed_h3_grpc_dispatch(
                 &dispatch_env,
                 ctx,
@@ -13567,6 +13588,7 @@ async fn dispatch_grpc_native_h3(
                 false,
                 backend_start.elapsed(),
             );
+            drop(lb_connection_guard);
             record_h3_backend_admission_outcome(
                 &mut backend_admission_permits,
                 response_status,
@@ -13665,6 +13687,7 @@ async fn dispatch_grpc_native_h3(
             false,
             backend_start.elapsed(),
         );
+        drop(lb_connection_guard);
         record_h3_backend_admission_outcome(
             &mut backend_admission_permits,
             response_status,
@@ -13777,6 +13800,7 @@ async fn dispatch_grpc_native_h3(
             false,
             backend_start.elapsed(),
         );
+        drop(lb_connection_guard);
         // Train the adaptive limiter on the BACKEND's terminal gRPC status (a
         // Trailers-Only status rode in the initial headers, snapshotted pre-hook),
         // not the gateway policy reject — a failing backend must still shrink the
@@ -14019,6 +14043,7 @@ async fn dispatch_grpc_native_h3(
             false,
             backend_start.elapsed(),
         );
+        drop(lb_connection_guard);
         record_h3_backend_admission_outcome(
             &mut backend_admission_permits,
             response_status,
@@ -15134,6 +15159,7 @@ async fn dispatch_grpc_native_h3(
         false,
         backend_start.elapsed(),
     );
+    drop(lb_connection_guard);
     // The adaptive-concurrency limiter samples the backend gRPC terminal status:
     // a non-OK `grpc-status` (trailer or trailers-only header) maps to a 5xx so the
     // limiter shrinks, while a client-side status stays healthy. Mirrors the H2

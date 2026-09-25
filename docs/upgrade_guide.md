@@ -454,6 +454,8 @@ The public `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and 
 
 **Operator action:** none for gateway deployments. Library users read per-target state through `LoadBalancer::target_runtime_state(&target)` (`active_connections()`, `latency_ewma_us()`, `latency_sample_count()`), and count a connection with `LoadBalancer::lease_connection(&target)`, whose lease releases on drop, instead of pairing `record_connection_start` and `record_connection_end` by hand.
 
+`LoadBalancer::record_connection_start` and `LoadBalancer::record_connection_end` remain, but they must now be strictly paired: every start needs exactly one end, on the same balancer, on every exit path. A rebuild no longer resets a leaked count, so a missed end keeps the target looking busier than it is to least-connections, and to the per-target connection metrics, until the target leaves the upstream.
+
 ## Database Mode (`FERRUM_MODE=database`)
 ## Build-Out Database Upgrade (PostgreSQL, MySQL, SQLite, MongoDB)
 

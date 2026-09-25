@@ -1015,7 +1015,10 @@ pub(crate) fn run_backend_admission_plugins(
 /// It never touches least-connections accounting: every path that counts a
 /// backend connection holds a `LoadBalancerConnectionGuard`, whose drop is
 /// the one release, so an early return between start and end cannot leak a
-/// count and an outcome record cannot release one twice.
+/// count and an outcome record cannot release one twice. The name keeps its
+/// `_no_conn_end` suffix although no connection-ending variant remains:
+/// `record_backend_outcome(` is the admission-permit method, and several
+/// source-contract tests key on these exact call texts.
 ///
 /// Route-override plugins must pass the shadowed effective proxy so passive
 /// health and least-latency reporting attribute to the upstream that was
@@ -2474,7 +2477,9 @@ mod tests {
         // call a connection-ending outcome record -- so the least-connections
         // gauge was decremented twice per request. Outcome recording must
         // record CB/health/latency WITHOUT ending the connection; the guard's
-        // drop is the one release (issue #5693).
+        // drop is the one release (issue #5693). A second, concurrent
+        // connection keeps the gauge above zero, so a double release would
+        // show instead of saturating at zero.
         let mut config: crate::config::types::GatewayConfig =
             serde_json::from_value(serde_json::json!({
                 "version": "1",
@@ -2522,11 +2527,15 @@ mod tests {
                 .sum::<i64>()
         };
 
-        let guard = crate::proxy::LoadBalancerConnectionGuard::new(
-            Some(Arc::clone(&target)),
-            Some(Arc::clone(&balancer)),
+        let concurrent = crate::proxy::LoadBalancerConnectionGuard::new(
+            Some(target.as_ref()),
+            Some(balancer.as_ref()),
         );
-        assert_eq!(active(), 1, "the guard's start increments the gauge");
+        let guard = crate::proxy::LoadBalancerConnectionGuard::new(
+            Some(target.as_ref()),
+            Some(balancer.as_ref()),
+        );
+        assert_eq!(active(), 2, "each guard's start increments the gauge");
 
         // no_conn_end must NOT decrement -- the guard owns the end.
         record_backend_outcome_no_conn_end(
@@ -2545,12 +2554,14 @@ mod tests {
         );
         assert_eq!(
             active(),
-            1,
+            2,
             "record_backend_outcome_no_conn_end must not end the connection"
         );
 
         drop(guard);
-        assert_eq!(active(), 0, "the guard's drop is the one release");
+        assert_eq!(active(), 1, "the guard's drop releases one count");
+        drop(concurrent);
+        assert_eq!(active(), 0);
     }
 
     #[tokio::test]

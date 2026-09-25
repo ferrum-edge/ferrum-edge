@@ -3913,12 +3913,11 @@ async fn handle_tcp_connection_inner(
             !health_checker.has_running_active_probes(&proxy.namespace, upstream_id)
         });
     let arm_lb_guard = |host: &str, port: u16, policy_port: u16| {
-        LoadBalancerConnectionGuard::new(
-            lb_balancer
-                .is_some()
-                .then(|| Arc::new(stream_lb_accounting_target(host, port, policy_port))),
-            lb_balancer.clone(),
-        )
+        let Some(balancer) = lb_balancer.as_deref() else {
+            return LoadBalancerConnectionGuard::new(None, None);
+        };
+        let target = stream_lb_accounting_target(host, port, policy_port);
+        LoadBalancerConnectionGuard::new(Some(&target), Some(balancer))
     };
     // Reassigned on every connect-phase target rotation below: the right-hand
     // side increments the new target before the previous guard's `Drop`

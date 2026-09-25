@@ -11970,10 +11970,8 @@ pub mod _test_support {
         let snapshot = cache.load_inner();
         let balancer =
             crate::proxy::mesh_tcp_egress_connection_balancer(&snapshot, namespace, upstream_id)?;
-        let guard = crate::proxy::LoadBalancerConnectionGuard::new(
-            Some(Arc::new(target.clone())),
-            Some(Arc::clone(&balancer)),
-        );
+        let guard =
+            crate::proxy::LoadBalancerConnectionGuard::new(Some(target), Some(balancer.as_ref()));
         let during = balancer
             .target_runtime_state(target)
             .map_or(0, |state| state.active_connections());

@@ -3284,9 +3284,12 @@ fn locality_from_matches_source(from: &LocalityPreference, source: &LocalityPref
 /// can neither leak nor be double-released across a rebuild.
 ///
 /// A slot is one small heap allocation (three atomics plus the `Arc` header,
-/// about 48 bytes) per distinct target. It is deliberately not cache-line
-/// padded: slots are separate allocations, and padding would multiply the
-/// per-target memory cost for every algorithm.
+/// about 40-48 bytes) per distinct target. Slots are allocated back to back
+/// when a balancer is built, so neighbouring targets' counters can share a
+/// cache line. That is no worse than the per-target map entries this
+/// replaced, so it is not a regression. The slot is deliberately not
+/// cache-line padded, because padding would multiply the per-target memory
+/// cost for every algorithm.
 #[derive(Debug)]
 pub struct TargetRuntimeState {
     /// Connections currently open to this endpoint. Never negative: the
