@@ -2107,6 +2107,7 @@ mod tests {
     use super::*;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
     use rustls::pki_types::ServerName;
+    use rustls::pki_types::pem::PemObject;
     use std::io::Write;
     use std::sync::Once;
     use tempfile::NamedTempFile;
@@ -2327,12 +2328,12 @@ mod tests {
     /// Build a rustls server `ServerConfig` from leaf PEM cert + PEM key.
     fn build_server_config(cert_pem: &str, key_pem: &str) -> Arc<rustls::ServerConfig> {
         let certs: Vec<CertificateDer<'static>> = must(
-            rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>(),
+            CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>(),
             "parse leaf cert",
         );
         let key: rustls::pki_types::PrivateKeyDer<'static> = must_some(
             must(
-                rustls_pemfile::private_key(&mut key_pem.as_bytes()),
+                crate::tls::first_pem_private_key(key_pem.as_bytes()),
                 "parse private key",
             ),
             "private key should be present",

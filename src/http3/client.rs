@@ -4721,6 +4721,7 @@ mod h3_pool_health_tests {
 
     use super::*;
     use quinn::{ClientConfig, Endpoint, ServerConfig};
+    use rustls::pki_types::pem::PemObject;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Instant;
 
@@ -4752,18 +4753,15 @@ mod h3_pool_health_tests {
         let cert = params.self_signed(&key_pair).expect("self-sign cert");
 
         let cert_pem = cert.pem();
-        let mut cert_reader = cert_pem.as_bytes();
         let mut chain: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut cert_reader)
+            rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
                 .filter_map(Result::ok)
                 .collect();
         let cert_der = chain.pop().expect("at least one cert");
 
         let key_pem = key_pair.serialize_pem();
-        let mut key_reader = key_pem.as_bytes();
-        let key_der = rustls_pemfile::private_key(&mut key_reader)
-            .expect("read private key")
-            .expect("private key present");
+        let key_der = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+            .expect("read private key");
 
         (cert_der, key_der)
     }

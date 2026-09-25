@@ -15,6 +15,8 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use crate::common::{GatewayChildGuard, configure_coverage_gateway_command, explicit_test_binary};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -136,13 +138,11 @@ async fn start_tls_echo_server_on(listener: TcpListener) -> tokio::task::JoinHan
         let key_pem = std::fs::read(key_path).expect("Failed to read test key");
 
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut &cert_pem[..])
+            CertificateDer::pem_slice_iter(&cert_pem[..])
                 .filter_map(|r| r.ok())
                 .collect();
 
-        let key = rustls_pemfile::private_key(&mut &key_pem[..])
-            .expect("Failed to parse key PEM")
-            .expect("No private key found in PEM");
+        let key = PrivateKeyDer::from_pem_slice(&key_pem[..]).expect("Failed to parse key PEM");
 
         let provider = rustls::crypto::ring::default_provider();
         let tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))

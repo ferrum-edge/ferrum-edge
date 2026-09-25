@@ -1620,6 +1620,8 @@ mod tests {
     use crate::config::EnvConfig;
     use crate::config::types::GatewayConfig;
     use crate::dns::{DnsCache, DnsConfig};
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     fn port_scoped_config(port: u16) -> GatewayConfig {
         let proxy: crate::config::types::Proxy = serde_json::from_value(serde_json::json!({
@@ -2462,15 +2464,11 @@ mod tests {
             rcgen::CertificateParams::new(vec!["app.example.com".to_string()]).expect("params");
         let cert = params.self_signed(&key_pair).expect("self-sign");
         let cert_pem = cert.pem();
-        let mut cert_reader = cert_pem.as_bytes();
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .filter_map(Result::ok)
             .collect();
         let key_pem = key_pair.serialize_pem();
-        let mut key_reader = key_pem.as_bytes();
-        let private_key = rustls_pemfile::private_key(&mut key_reader)
-            .expect("read key")
-            .expect("key present");
+        let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("read key");
         std::sync::Arc::new(
             rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
                 rustls::crypto::ring::default_provider(),

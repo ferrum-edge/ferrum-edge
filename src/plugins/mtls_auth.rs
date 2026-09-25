@@ -12,9 +12,9 @@
 use crate::fips::approved::Sha256;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use rustls::pki_types::pem::{PemObject, SectionKind};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::debug;
@@ -303,15 +303,15 @@ impl IssuerFilter {
 }
 
 fn parse_ca_certificate_pem(pem: &str, context: &str) -> Result<Vec<u8>, String> {
-    let items = rustls_pemfile::read_all(&mut Cursor::new(pem.as_bytes()))
+    let items = <(SectionKind, Vec<u8>)>::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| format!("mtls_auth: `{context}.ca_certificate_pem` contains malformed PEM"))?;
-    let [rustls_pemfile::Item::X509Certificate(certificate)] = items.as_slice() else {
+    let [(SectionKind::Certificate, certificate)] = items.as_slice() else {
         return Err(format!(
             "mtls_auth: `{context}.ca_certificate_pem` must contain exactly one certificate and no other PEM items"
         ));
     };
-    let der = certificate.as_ref().to_vec();
+    let der = certificate.clone();
     let (_, parsed) = X509Certificate::from_der(&der).map_err(|_| {
         format!("mtls_auth: `{context}.ca_certificate_pem` is not a valid X.509 certificate")
     })?;

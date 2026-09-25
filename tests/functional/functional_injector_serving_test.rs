@@ -21,7 +21,6 @@
 //! tests into TLS parse failures), and the readiness probe identifies the child
 //! it reached rather than accepting whatever holds the port.
 
-use std::io::Cursor;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,6 +30,8 @@ use ferrum_edge::tls::acme::{
     AcmeHttp01OrderInput, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore,
     AcmeTlsAlpn01ChallengeRecord,
 };
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -350,7 +351,7 @@ fn probe_root_store(gateway: &InjectorGateway) -> Result<rustls::RootCertStore, 
     let ca_pem = std::fs::read(gateway.tmp.path().join("ca.crt"))
         .map_err(|e| format!("read test CA pem: {e}"))?;
     let mut root_store = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut Cursor::new(ca_pem)) {
+    for cert in CertificateDer::pem_slice_iter(&ca_pem) {
         root_store
             .add(cert.map_err(|e| format!("parse CA cert: {e}"))?)
             .map_err(|e| format!("add CA: {e}"))?;

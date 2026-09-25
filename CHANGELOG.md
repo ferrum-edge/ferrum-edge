@@ -211,6 +211,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RUSTSEC-2026-0286: `Session::get_attributes` could build an out-of-bounds slice when
   decoding `CKA_ALLOWED_MECHANISMS` (crash or adjacent heap disclosure). Lockfile-only
   change; the manifest's `0.12` requirement already admits the patch release.
+- Re-evaluate the time-boxed `deny.toml` advisory exceptions before their
+  2026-09-30 expiry (#5721). `mongodb` now requires `>=3.7, <3.9` (the
+  lockfile moves from 3.6.0 to 3.8.2). 3.7 is the first release on hickory
+  0.26, which drops hickory-proto 0.25.2 (RUSTSEC-2026-0118,
+  RUSTSEC-2026-0119). The cap below 3.9 keeps MongoDB 4.2 and Cosmos DB
+  server-version-4.2 support, because 3.9 raised the driver's minimum wire
+  version to 9 (MongoDB 4.4). The optional `secrets-aws` build no longer
+  enables `aws-sdk-secretsmanager`'s legacy `rustls` feature, so hyper 0.14,
+  rustls 0.21 with rustls-webpki 0.101.7 (RUSTSEC-2026-0098, -0099, -0104)
+  and h2 0.3.27 (RUSTSEC-2026-0258) leave the tree. The client already used
+  the SDK's hyper 1.x HTTPS client. PEM parsing, in the gateway and in the
+  standalone performance harnesses, moves from the unmaintained
+  `rustls-pemfile` (RUSTSEC-2025-0134) to the `rustls-pki-types` PEM API.
+  Certificate, key, and CRL records are read the same way, but the wording of
+  the underlying parse error changes in the admin API TLS validation, the TLS
+  inventory, ACME certificate checks (`certificate_metadata`,
+  `validate_completed_certificate_pair`), and the managed TLS store.
+  `mtls_auth` is stricter: a `ca_certificate_pem` that also carries an
+  `ECHCONFIG` block was accepted before (the old parser skipped the block) and
+  is now rejected as containing another PEM item (fail-closed). `rsa`
+  (RUSTSEC-2023-0071) and `paste` (RUSTSEC-2024-0436) still have no upstream
+  fix and are re-affirmed until 2026-12-31.
 - **Route response-header policy is now part of the replay key** (PR #5709).
   `response_caching`, `request_deduplication`, and `ai_semantic_cache` replay a
   response whose headers were finalized when it was stored, so they skip the

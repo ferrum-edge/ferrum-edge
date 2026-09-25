@@ -907,6 +907,8 @@ pub fn build_h3_frontend_tls_reload(
 mod tests {
     use super::*;
     use rustls::ServerConfig;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     fn install_default_crypto_provider() {
         let _ = crate::fips::base_crypto_provider().install_default();
@@ -921,15 +923,12 @@ mod tests {
         let cert = params.self_signed(&key_pair).expect("self-sign cert");
 
         let cert_pem = cert.pem();
-        let mut cert_reader = cert_pem.as_bytes();
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .filter_map(Result::ok)
             .collect();
         let key_pem = key_pair.serialize_pem();
-        let mut key_reader = key_pem.as_bytes();
-        let private_key = rustls_pemfile::private_key(&mut key_reader)
-            .expect("read private key")
-            .expect("private key present");
+        let private_key =
+            PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("read private key");
 
         Arc::new(
             rustls::ServerConfig::builder_with_provider(Arc::new(

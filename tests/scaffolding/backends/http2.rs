@@ -51,7 +51,8 @@ use h2::server::SendResponse;
 use h2::{Reason, RecvStream};
 use http::{HeaderMap, Request, Response, StatusCode};
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, private_key};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -1364,15 +1365,14 @@ fn build_server_config_with_alpn(
     key_pem: &str,
     alpn: Vec<Vec<u8>>,
 ) -> io::Result<ServerConfig> {
-    let mut cert_reader = cert_pem.as_bytes();
-    let cert_chain: Vec<_> = certs(&mut cert_reader).filter_map(|c| c.ok()).collect();
+    let cert_chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .filter_map(|c| c.ok())
+        .collect();
     if cert_chain.is_empty() {
         return Err(io::Error::other("no certificates found in cert_pem"));
     }
-    let mut key_reader = key_pem.as_bytes();
-    let key = private_key(&mut key_reader)
-        .map_err(|e| io::Error::other(format!("parse key: {e}")))?
-        .ok_or_else(|| io::Error::other("no private key found in key_pem"))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .map_err(|e| io::Error::other(format!("parse key: {e}")))?;
     let provider = rustls::crypto::ring::default_provider();
     let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()

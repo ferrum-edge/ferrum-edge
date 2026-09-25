@@ -19864,6 +19864,8 @@ mod build_h3_quinn_server_config_mtls_tests {
     //! clients presenting no certificate. The function must now FAIL CLOSED:
     //! a configured-but-unloadable client CA returns `Err`; only an explicitly
     //! *unconfigured* client CA (`None`) yields no client auth.
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::sync::{Arc, Once};
 
     use super::build_h3_quinn_server_config;
@@ -19887,13 +19889,12 @@ mod build_h3_quinn_server_config_mtls_tests {
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
         let cert = params.self_signed(&key_pair).expect("self-sign cert");
         let cert_pem = cert.pem();
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .filter_map(Result::ok)
             .collect();
         let key_pem = key_pair.serialize_pem();
-        let private_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-            .expect("read private key")
-            .expect("private key present");
+        let private_key =
+            PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("read private key");
         Arc::new(
             rustls::ServerConfig::builder()
                 .with_no_client_auth()
@@ -20039,7 +20040,8 @@ mod h3_ocsp_staple_tests {
     use std::sync::{Arc, Mutex, Once};
 
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
     use super::{build_h3_quinn_server_config, build_h3_rustls_server_config};
     use crate::config::EnvConfig;
@@ -20069,9 +20071,8 @@ mod h3_ocsp_staple_tests {
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
         let cert = params.self_signed(&key_pair).expect("self-sign cert");
         let key_pem = key_pair.serialize_pem();
-        let private_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-            .expect("read private key")
-            .expect("private key present");
+        let private_key =
+            PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("read private key");
 
         let provider = crate::fips::base_crypto_provider();
         let mut certified_key = rustls::sign::CertifiedKey::from_der(

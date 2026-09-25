@@ -23,6 +23,8 @@ use ferrum_edge::k8s_controller::status::{
 };
 use ferrum_edge::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -2320,12 +2322,10 @@ type ProbeLog = Arc<Mutex<Vec<ObservedProbe>>>;
 /// TLS listener that ADVERTISES `h2` ahead of `http/1.1` but only ever speaks
 /// raw HTTP/1.1.
 async fn start_h2_first_raw_h1_backend(cert_pem: &str, key_pem: &str) -> ProbeFixture {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse backend cert");
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .expect("parse backend key")
-        .expect("backend key present");
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("parse backend key");
     let provider = rustls::crypto::ring::default_provider();
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()

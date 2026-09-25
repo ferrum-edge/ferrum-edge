@@ -33,6 +33,8 @@ use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics, start_tcp_listener};
 use ferrum_edge::request_epoch::RequestEpochStore;
 use ferrum_edge::tls::NoVerifier;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::scaffolding::ports::reserve_port;
 
@@ -190,12 +192,10 @@ fn build_frontend_tls_config() -> Arc<rustls::ServerConfig> {
     let key_pem = std::fs::read("tests/certs/server.key").expect("read test key");
 
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut &cert_pem[..])
+        CertificateDer::pem_slice_iter(&cert_pem[..])
             .filter_map(|cert| cert.ok())
             .collect();
-    let key = rustls_pemfile::private_key(&mut &key_pem[..])
-        .expect("parse test key")
-        .expect("test key exists");
+    let key = PrivateKeyDer::from_pem_slice(&key_pem[..]).expect("parse test key");
 
     let provider = rustls::crypto::ring::default_provider();
     Arc::new(

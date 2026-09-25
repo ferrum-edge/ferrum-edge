@@ -38,7 +38,9 @@
 //! The structural sibling inventory lives in `shared_invariant_parity_tests.rs`
 //! (`every_tunnelled_relay_path_shares_one_flushing_byte_pump` and
 //! `every_pre_relay_write_flushes_before_the_relay_starts`).
+use rustls::pki_types::pem::PemObject;
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -619,12 +621,11 @@ fn test_tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) 
     let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
     let cert = params.self_signed(&key).expect("self-signed leaf");
 
-    let certs = rustls_pemfile::certs(&mut cert.pem().as_bytes())
+    let certs = CertificateDer::pem_slice_iter(cert.pem().as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse test leaf certificate");
-    let private_key = rustls_pemfile::private_key(&mut key.serialize_pem().as_bytes())
-        .expect("parse test leaf key")
-        .expect("test leaf key present");
+    let private_key =
+        PrivateKeyDer::from_pem_slice(key.serialize_pem().as_bytes()).expect("parse test leaf key");
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let server = rustls::ServerConfig::builder_with_provider(provider.clone())

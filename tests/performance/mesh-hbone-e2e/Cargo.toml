@@ -38,7 +38,6 @@ h2 = "0.4"
 # SYNC: rustls major version must match root Cargo.toml.
 rustls = { version = "0.23", features = ["ring", "std"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
 rcgen = "0.13"
 
 # CLI

@@ -784,12 +784,12 @@ fn build_root_cert_store(
     root_pem: Option<&str>,
 ) -> Result<rustls::RootCertStore, Box<dyn std::error::Error + Send + Sync>> {
     use rustls::RootCertStore;
-    use rustls_pemfile::certs;
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
 
     let mut root = RootCertStore::empty();
     if let Some(pem) = root_pem {
-        let mut reader = pem.as_bytes();
-        for cert in certs(&mut reader).filter_map(|c| c.ok()) {
+        for cert in CertificateDer::pem_slice_iter(pem.as_bytes()).filter_map(|c| c.ok()) {
             root.add(cert)?;
         }
     } else {

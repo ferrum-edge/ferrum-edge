@@ -31,6 +31,8 @@ use hyper::server::conn::http2::Builder as Http2ServerBuilder;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
@@ -2585,16 +2587,15 @@ async fn mesh_inbound_server_leaf(
     client_identity: (&str, &str),
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()).filter_map(|c| c.ok()) {
         roots.add(cert)?;
     }
     let provider = rustls::crypto::ring::default_provider();
     let (cert_pem, key_pem) = client_identity;
-    let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-        .ok_or("no client private key in PEM")?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
@@ -2672,7 +2673,7 @@ async fn mesh_inbound_mtls_connect(
     use tokio::io::AsyncReadExt;
 
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()).filter_map(|c| c.ok()) {
         roots.add(cert)?;
     }
     let provider = rustls::crypto::ring::default_provider();
@@ -2681,11 +2682,10 @@ async fn mesh_inbound_mtls_connect(
         .with_root_certificates(roots);
     let config = match client_identity {
         Some((cert_pem, key_pem)) => {
-            let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
                 .filter_map(|c| c.ok())
                 .collect();
-            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-                .ok_or("no client private key in PEM")?;
+            let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
             builder.with_client_auth_cert(chain, key)?
         }
         None => builder.with_no_client_auth(),
@@ -2918,7 +2918,7 @@ fn mint_spire_server_leaf(
 /// DER of the first certificate in a PEM bundle — the trust anchor the Workload
 /// API ships in `X509SVID.bundle`.
 fn ca_der_from_pem(ca_pem: &str) -> Vec<u8> {
-    rustls_pemfile::certs(&mut ca_pem.as_bytes())
+    CertificateDer::pem_slice_iter(ca_pem.as_bytes())
         .next()
         .expect("at least one CA cert in PEM")
         .expect("valid CA DER")
@@ -3423,7 +3423,7 @@ async fn mesh_inbound_http_get(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()).filter_map(|c| c.ok()) {
         roots.add(cert)?;
     }
     let provider = rustls::crypto::ring::default_provider();
@@ -3432,11 +3432,10 @@ async fn mesh_inbound_http_get(
         .with_root_certificates(roots);
     let config = match client_identity {
         Some((cert_pem, key_pem)) => {
-            let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
                 .filter_map(|c| c.ok())
                 .collect();
-            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-                .ok_or("no client private key in PEM")?;
+            let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
             builder.with_client_auth_cert(chain, key)?
         }
         None => builder.with_no_client_auth(),
@@ -4694,7 +4693,7 @@ fn mesh_retry_mtls_server_config(svid: &GeneratedGatewaySvid) -> Arc<rustls::Ser
     let _ = rustls::crypto::ring::default_provider().install_default();
     let ca_pem = std::fs::read(&svid.trust_bundle_path).expect("read mesh retry trust bundle");
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()).filter_map(|cert| cert.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_slice()).filter_map(|cert| cert.ok()) {
         roots.add(cert).expect("add mesh retry client root");
     }
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
@@ -4702,12 +4701,11 @@ fn mesh_retry_mtls_server_config(svid: &GeneratedGatewaySvid) -> Arc<rustls::Ser
         .expect("build mesh retry client verifier");
     let cert_pem = std::fs::read(&svid.cert_path).expect("read mesh retry server SVID");
     let key_pem = std::fs::read(&svid.key_path).expect("read mesh retry server key");
-    let chain = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    let chain = CertificateDer::pem_slice_iter(cert_pem.as_slice())
         .filter_map(|cert| cert.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .expect("parse mesh retry server key")
-        .expect("mesh retry server key present");
+    let key =
+        PrivateKeyDer::from_pem_slice(key_pem.as_slice()).expect("parse mesh retry server key");
     let mut config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(chain, key)
@@ -9926,12 +9924,10 @@ fn udp_dest_client_config(svid: &GeneratedGatewaySvid) -> Arc<rustls::ClientConf
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cert_pem = std::fs::read(&svid.cert_path).expect("read client svid cert");
     let key_pem = std::fs::read(&svid.key_path).expect("read client svid key");
-    let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_slice())
         .filter_map(|r| r.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .expect("parse client svid key")
-        .expect("client svid key present");
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_slice()).expect("parse client svid key");
     let mut cfg = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AnyServerCert))
@@ -11039,7 +11035,7 @@ fn sidecar_ingress_client_config(
     peers: &MeshPeerSvids,
 ) -> Result<Arc<rustls::ClientConfig>, String> {
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut peers.ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+    for cert in CertificateDer::pem_slice_iter(peers.ca_pem.as_bytes()).filter_map(|c| c.ok()) {
         roots
             .add(cert)
             .map_err(|e| format!("add mesh CA root: {e}"))?;
@@ -11049,12 +11045,11 @@ fn sidecar_ingress_client_config(
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("client protocol versions: {e}"))?
         .with_root_certificates(roots);
-    let chain: Vec<_> = rustls_pemfile::certs(&mut peers.client_cert_pem.as_bytes())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(peers.client_cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut peers.client_key_pem.as_bytes())
-        .map_err(|e| format!("parse client SVID key: {e}"))?
-        .ok_or_else(|| "no client SVID private key in PEM".to_string())?;
+    let key = PrivateKeyDer::from_pem_slice(peers.client_key_pem.as_bytes())
+        .map_err(|e| format!("parse client SVID key: {e}"))?;
     let mut config = builder
         .with_client_auth_cert(chain, key)
         .map_err(|e| format!("client auth cert: {e}"))?;
@@ -18451,7 +18446,7 @@ fn h3_mesh_server_config(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let ca_pem = std::fs::read(&svid.trust_bundle_path).expect("read mesh peer trust bundle");
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()).filter_map(|cert| cert.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_slice()).filter_map(|cert| cert.ok()) {
         roots.add(cert).expect("add mesh peer client root");
     }
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
@@ -18459,12 +18454,10 @@ fn h3_mesh_server_config(
         .expect("build mesh peer client verifier");
     let cert_pem = std::fs::read(&svid.cert_path).expect("read mesh peer SVID");
     let key_pem = std::fs::read(&svid.key_path).expect("read mesh peer key");
-    let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_slice())
         .filter_map(|cert| cert.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .expect("parse mesh peer key")
-        .expect("mesh peer key present");
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_slice()).expect("parse mesh peer key");
     let signing_key =
         ferrum_edge::fips::any_supported_signing_key(&key).expect("mesh peer signing key");
     let certified = Arc::new(rustls::sign::CertifiedKey::new(chain, signing_key));

@@ -74,9 +74,8 @@ pub use spiffe::{
 
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
-use rustls_pemfile::{certs, private_key};
 use std::fmt;
-use std::io::{self, Cursor};
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,6 +85,7 @@ use tracing::{info, warn};
 use x509_parser::prelude::*;
 
 use rustls::pki_types::CertificateRevocationListDer;
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::config::EnvConfig;
@@ -102,7 +102,7 @@ pub fn shared_crl_list(crls: CrlList) -> SharedCrlList {
 }
 
 /// Fixed operator-facing PEM parse failure class. Never interpolate
-/// rustls-pemfile or I/O diagnostics: they can echo malformed PEM lines or bytes.
+/// PEM parser or I/O diagnostics: they can echo malformed PEM lines or bytes.
 const PEM_CERTIFICATE_PARSE_FAILURE_CLASS: &str = "malformed PEM certificate record";
 
 /// Fixed operator-facing trust-anchor admission failure class. Never interpolate
@@ -208,7 +208,7 @@ pub(crate) fn parse_pem_certificate_bundle(
         ));
     }
 
-    let certificates = rustls_pemfile::certs(&mut Cursor::new(pem_data))
+    let certificates = CertificateDer::pem_slice_iter(pem_data)
         .enumerate()
         .map(|(index, result)| {
             if index >= MAX_PEM_CERTIFICATE_RECORDS {
@@ -270,10 +270,27 @@ pub(crate) fn parse_pem_certificate_bundle(
     Ok(certificates)
 }
 
+/// Return the first PEM private key (PKCS#1, PKCS#8, or SEC1) in `pem_data`,
+/// or `None` when it holds no private-key record.
+///
+/// Non-key records before the key are skipped; a malformed record before the
+/// first key is an error. This keeps the `Result<Option<_>>` contract of the
+/// retired `rustls_pemfile::private_key` on top of the `rustls-pki-types` PEM
+/// parser, which reports "no key" as [`pem::Error::NoItemsFound`] instead.
+pub(crate) fn first_pem_private_key(
+    pem_data: &[u8],
+) -> Result<Option<PrivateKeyDer<'static>>, pem::Error> {
+    match PrivateKeyDer::from_pem_slice(pem_data) {
+        Ok(key) => Ok(Some(key)),
+        Err(pem::Error::NoItemsFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Parse exactly one PEM private key with fixed, redacted diagnostics.
 ///
-/// `rustls_pemfile::private_key` returns after the first key, so keep scanning
-/// the same reader to reject malformed trailing records and multiple keys.
+/// `PrivateKeyDer::from_pem_slice` returns after the first key, so iterate every
+/// record instead to reject malformed trailing records and multiple keys.
 pub(crate) fn parse_pem_private_key(
     pem_data: &[u8],
     label: &str,
@@ -289,19 +306,17 @@ pub(crate) fn parse_pem_private_key(
         ));
     }
 
-    let mut reader = Cursor::new(pem_data);
     let mut selected = None;
-    loop {
-        match rustls_pemfile::private_key(&mut reader) {
-            Ok(Some(key)) if selected.is_none() => selected = Some(key),
-            Ok(Some(_)) => {
+    for result in PrivateKeyDer::pem_slice_iter(pem_data) {
+        match result {
+            Ok(key) if selected.is_none() => selected = Some(key),
+            Ok(_) => {
                 return Err(anyhow::anyhow!(
                     "{}: {:?} contains more than one PEM private key",
                     label,
                     display_source
                 ));
             }
-            Ok(None) => break,
             Err(_error) => {
                 return Err(anyhow::anyhow!(
                     "{}: private key in {:?} is malformed",
@@ -395,12 +410,11 @@ pub(crate) fn temporary_disabled_listener_tls_config() -> Result<Arc<ServerConfi
     let cert = params.self_signed(&key_pair)?;
 
     let cert_pem = cert.pem();
-    let mut cert_reader = cert_pem.as_bytes();
-    let certs: Vec<_> = certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    let certs: Vec<_> =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
     let key_pem = key_pair.serialize_pem();
-    let mut key_reader = key_pem.as_bytes();
-    let key = private_key(&mut key_reader)?
-        .ok_or_else(|| anyhow::anyhow!("temporary listener TLS key was not generated"))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .map_err(|_error| anyhow::anyhow!("temporary listener TLS key was not generated"))?;
 
     Ok(Arc::new(
         rustls::ServerConfig::builder_with_provider(Arc::new(crate::fips::base_crypto_provider()))
@@ -617,7 +631,7 @@ pub fn load_crls(path: Option<&str>, expiry_warning_days: u64) -> Result<CrlList
     })?;
 
     let crls: Vec<CertificateRevocationListDer<'static>> =
-        rustls_pemfile::crls(&mut Cursor::new(material.bytes.expose_secret()))
+        CertificateRevocationListDer::pem_slice_iter(material.bytes.expose_secret())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_error| {
                 anyhow::anyhow!(
@@ -2625,15 +2639,12 @@ mod tests {
         let cert = params.self_signed(&key_pair).expect("self-sign cert");
 
         let cert_pem = cert.pem();
-        let mut cert_reader = cert_pem.as_bytes();
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .filter_map(Result::ok)
             .collect();
         let key_pem = key_pair.serialize_pem();
-        let mut key_reader = key_pem.as_bytes();
-        let private_key = rustls_pemfile::private_key(&mut key_reader)
-            .expect("read private key")
-            .expect("private key present");
+        let private_key =
+            PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("read private key");
 
         rustls::ServerConfig::builder_with_provider(Arc::new(crate::fips::base_crypto_provider()))
             .with_safe_default_protocol_versions()

@@ -14,6 +14,8 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use crate::common::TestGateway;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,18 +115,16 @@ async fn start_https_echo_on(
     let key = key_pem.to_string();
     let ca = client_ca_pem.map(|s| s.to_string());
     let h = tokio::spawn(async move {
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert.as_bytes())
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert.as_bytes())
             .filter_map(|r| r.ok())
             .collect();
-        let pk = rustls_pemfile::private_key(&mut key.as_bytes())
-            .unwrap()
-            .unwrap();
+        let pk = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
         let provider = rustls::crypto::ring::default_provider();
         let builder = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
             .with_safe_default_protocol_versions()
             .unwrap();
         let mut cfg = if let Some(ca_data) = ca {
-            let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca_data.as_bytes())
+            let ca_certs: Vec<_> = CertificateDer::pem_slice_iter(ca_data.as_bytes())
                 .filter_map(|r| r.ok())
                 .collect();
             let mut roots = rustls::RootCertStore::empty();
@@ -1090,12 +1090,10 @@ plugin_configs: []
     )
     .await;
     let pp = ports.proxy_https; // stream listen port
-    let chain: Vec<_> = rustls_pemfile::certs(&mut cli.cert_pem.as_bytes())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(cli.cert_pem.as_bytes())
         .filter_map(|r| r.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut cli.key_pem.as_bytes())
-        .unwrap()
-        .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(cli.key_pem.as_bytes()).unwrap();
     let prov = rustls::crypto::ring::default_provider();
     let tls = rustls::ClientConfig::builder_with_provider(Arc::new(prov))
         .with_safe_default_protocol_versions()

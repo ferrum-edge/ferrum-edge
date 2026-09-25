@@ -1,18 +1,17 @@
 //! TLS server config helpers for the stub HBONE sidecar.
 
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
 fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut reader = BufReader::new(f);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_reader_iter(f)
         .collect::<Result<Vec<_>, _>>()
         .context("parsing PEM certs")?;
     if certs.is_empty() {
@@ -23,10 +22,7 @@ fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 
 fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut reader = BufReader::new(f);
-    rustls_pemfile::private_key(&mut reader)
-        .context("parsing PEM key")?
-        .ok_or_else(|| anyhow!("no key in {}", path.display()))
+    PrivateKeyDer::from_pem_reader(f).with_context(|| format!("parsing PEM key {}", path.display()))
 }
 
 /// Build a `ServerConfig` that requires + verifies a client certificate against
