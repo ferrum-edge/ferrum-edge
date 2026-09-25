@@ -1005,6 +1005,124 @@ async fn functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_e
     backend_task.abort();
 }
 
+/// The same gRPC-Web budget expiry over HTTP/1.1 and HTTP/2 keeps the charged
+/// `Backend deadline exceeded` terminal when an `after_proxy` plugin (CORS)
+/// decorates it (#5744). Proxy core ends the spent attempt budget when it
+/// charges the expiry; before, the first `after_proxy` hook read that expired
+/// budget as the gateway's own deadline and the client got `Deadline exceeded
+/// at gateway` instead.
+#[ignore]
+#[tokio::test]
+async fn functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tcp() {
+    for http2 in [false, true] {
+        assert_tcp_grpc_web_attempt_budget_expiry_wording(http2).await;
+    }
+}
+
+async fn assert_tcp_grpc_web_attempt_budget_expiry_wording(http2: bool) {
+    let (backend_port, backend_hits, backend_task) = spawn_echo_backend(usize::MAX).await;
+    let mut config = route_timeout_config(
+        h3_policy_config(
+            backend_port,
+            "http",
+            None,
+            json!({"tls": {"sni": "backend-sni.example.com"}}),
+            None,
+        ),
+        json!({"attempt_timeout_ms": 300}),
+    );
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "tcp-grpc-web-cors",
+            "namespace": H3_POLICY_NAMESPACE,
+            "plugin_name": "cors",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "allowed_origins": [GRPC_WEB_CORS_ORIGIN],
+                "exposed_headers": ["grpc-status", "grpc-message"]
+            }
+        }))
+        .expect("cors plugin config is valid"),
+    );
+    let gateway = start_h3_policy_gateway(config)
+        .await
+        .expect("start route-deadline gateway");
+
+    let builder = reqwest::Client::builder().danger_accept_invalid_certs(true);
+    let client = if http2 {
+        builder.http2_prior_knowledge()
+    } else {
+        builder.http1_only()
+    }
+    .build()
+    .expect("build TLS client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/echo.Echo/Stall",
+        gateway.https_port
+    );
+    let mut attempts = 0;
+    let (resp, elapsed) = loop {
+        attempts += 1;
+        let started = Instant::now();
+        let sent = client
+            .post(&url)
+            .header("content-type", "application/grpc-web+proto")
+            .header("origin", GRPC_WEB_CORS_ORIGIN)
+            .body(grpc_web_data_frame(b"stalled"))
+            .send()
+            .await;
+        match sent {
+            Ok(resp) => break (resp, started.elapsed()),
+            Err(error) if attempts < 20 => {
+                eprintln!("gRPC-Web call over TCP not answered yet: {error}");
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("gRPC-Web call over TCP failed: {error}"),
+        }
+    };
+    let protocol = if http2 { "HTTP/2" } else { "HTTP/1.1" };
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{protocol}: gRPC-Web errors ride HTTP 200"
+    );
+    let cors = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    assert_eq!(
+        cors.as_deref(),
+        Some(GRPC_WEB_CORS_ORIGIN),
+        "{protocol}: after_proxy must decorate the charged terminal"
+    );
+    let header_message = resp
+        .headers()
+        .get("grpc-message")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body = resp.text().await.expect("gRPC-Web terminal body");
+    let terminal = format!("{header_message}\n{body}");
+    assert!(
+        terminal.contains("Backend deadline exceeded"),
+        "{protocol}: a charged budget expiry must use the backend terminal: {terminal:?}"
+    );
+    assert!(
+        !terminal.contains("Deadline exceeded at gateway"),
+        "{protocol}: a charged budget expiry is not the gateway's own deadline: {terminal:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "{protocol}: the call must end at its budget: {elapsed:?}"
+    );
+    assert_backend_hits_eq(&backend_hits, 1, Duration::from_millis(250)).await;
+
+    gateway.shutdown().await;
+    backend_task.abort();
+}
+
 /// A gRPC-Web pass-through call tells the backend its remaining budget in
 /// `grpc-timeout` in place of the client's relative value, as proxy core does
 /// (#5734): the rule's 5 s attempt budget binds over the client's 30 s.

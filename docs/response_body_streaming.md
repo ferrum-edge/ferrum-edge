@@ -557,6 +557,17 @@ response-head wait), the native-H3 response-head write, the native-H3 buffered
 and streaming downstream write seams, and the cross-protocol plain, terminal,
 and streaming write seams.
 
+A response HEADERS write that such a bound cancels after h3 took its frame
+cannot be followed by another write on that stream: h3-quinn still holds the
+cancelled frame, fails the next `send_data` with a connection-level error, and
+h3 closes the whole QUIC connection with `H3_INTERNAL_ERROR`, every sibling
+stream included. The cross-protocol plain head writes therefore report whether
+the cancelled head was offered to the send half
+(`stream_util::await_offered_response_write_before_deadline`). An offered head
+is answered with a stream reset; only a head whose bound had already elapsed
+before the write began still gets the fixed `401` or the gRPC-Web
+`DEADLINE_EXCEEDED` HEADERS (#5745).
+
 The committed-response observer is the one phase where an elapsed bound used to
 mean "continue in the background". That detach survives only for the
 client-owned RPC deadline. When the authorization bound wins, the pending hook —

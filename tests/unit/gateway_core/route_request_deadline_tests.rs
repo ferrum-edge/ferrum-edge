@@ -27,12 +27,14 @@
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     H3AuthorizedHeadersWrite, H3AuthorizedWrite, attribute_streaming_headers_deadline_for_test,
-    await_authorized_response_write_for_test, await_route_request_deadline_for_test,
-    h3_route_attempt_bounds_for_test, h3_route_deadline_reset_code_for_test,
-    h3_route_deadline_terminal_for_test, h3_route_deadlines_armed_for_test,
-    proxy_body_streaming_for_test, proxy_body_with_client_grpc_deadline_for_test,
-    proxy_body_with_route_request_deadline_for_test, route_deadline_expiry_response_for_test,
-    route_request_deadline_outcome_for_test,
+    await_authorized_response_write_for_test,
+    await_authorized_response_write_with_route_sleep_for_test,
+    await_offered_response_write_for_test, await_route_request_deadline_for_test,
+    h3_plain_bridge_backend_request_for_test, h3_route_attempt_bounds_for_test,
+    h3_route_deadline_reset_code_for_test, h3_route_deadline_terminal_for_test,
+    h3_route_deadlines_armed_for_test, proxy_body_streaming_for_test,
+    proxy_body_with_client_grpc_deadline_for_test, proxy_body_with_route_request_deadline_for_test,
+    route_deadline_expiry_response_for_test, route_request_deadline_outcome_for_test,
 };
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
 use ferrum_edge::proxy::auth_lifetime::{
@@ -483,6 +485,127 @@ async fn an_unbounded_response_write_passes_straight_through() {
     assert_eq!(failed, H3AuthorizedWrite::ClientWriteFailed);
 }
 
+/// Every write of a relay races the relay's one pinned route timer (#5745)
+/// instead of registering a fresh timer per frame: writes before the deadline
+/// land, a parked write is cut exactly at it, and a write offered after it is
+/// never polled. The seam borrows the timer without resetting it, so the
+/// relay's own route arm keeps the same absolute instant.
+#[tokio::test(start_paused = true)]
+async fn every_relay_write_races_the_relays_pinned_route_timer() {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let route_sleep = Some(tokio::time::sleep_until(deadline));
+    tokio::pin!(route_sleep);
+    let latch = StreamAuthTerminationLatch::default();
+
+    for _ in 0..3 {
+        let outcome = await_authorized_response_write_with_route_sleep_for_test(
+            None,
+            route_sleep.as_mut(),
+            &latch,
+            std::future::ready(Ok::<(), &'static str>(())),
+        )
+        .await;
+        assert_eq!(outcome, H3AuthorizedWrite::Written);
+    }
+
+    let outcome = await_authorized_response_write_with_route_sleep_for_test(
+        None,
+        route_sleep.as_mut(),
+        &latch,
+        parked_client_write(),
+    )
+    .await;
+    assert_eq!(outcome, H3AuthorizedWrite::RouteDeadlineExceeded);
+    assert_eq!(Instant::now(), deadline);
+    assert_eq!(latch.observed(), None);
+
+    let polled = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&polled);
+    let late_write = std::future::poll_fn(move |_cx| {
+        flag.store(true, Ordering::SeqCst);
+        Poll::Ready(Ok::<(), &'static str>(()))
+    });
+    let outcome = await_authorized_response_write_with_route_sleep_for_test(
+        None,
+        route_sleep.as_mut(),
+        &latch,
+        late_write,
+    )
+    .await;
+    assert_eq!(outcome, H3AuthorizedWrite::RouteDeadlineExceeded);
+    assert!(!polled.load(Ordering::SeqCst));
+
+    let timer = route_sleep
+        .as_mut()
+        .as_pin_mut()
+        .expect("the relay's route timer");
+    assert_eq!(
+        timer.deadline(),
+        deadline,
+        "the seam must not reset the timer"
+    );
+    assert!(timer.is_elapsed());
+}
+
+/// An earlier authorization plan still owns a write raced against the pinned
+/// route timer, and an exact tie still goes to authorization.
+#[tokio::test(start_paused = true)]
+async fn the_pinned_route_timer_keeps_authorization_first() {
+    let started = Instant::now();
+    let plan = |at| StreamAuthDeadline {
+        at,
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let one = started + Duration::from_secs(1);
+    let five = started + Duration::from_secs(5);
+    for (auth_at, route_at) in [(one, five), (one, one)] {
+        let route_sleep = Some(tokio::time::sleep_until(route_at));
+        tokio::pin!(route_sleep);
+        let latch = StreamAuthTerminationLatch::default();
+        let outcome = await_authorized_response_write_with_route_sleep_for_test(
+            Some(plan(auth_at)),
+            route_sleep.as_mut(),
+            &latch,
+            parked_client_write(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            H3AuthorizedWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+        );
+        assert_eq!(
+            latch.observed(),
+            Some(StreamAuthTermination::CredentialExpired)
+        );
+    }
+}
+
+/// A response HEADERS write the deadline cancels after its first poll has
+/// already handed its frame to the H3 send half (#5745), so the bridge must
+/// reset the stream rather than write a second HEADERS; one refused before its
+/// first poll has not, and a terminal HEADERS is still legal after it.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_head_write_reports_whether_it_reached_the_send_half() {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let (expired, offered) =
+        await_offered_response_write_for_test(Some(deadline), parked_client_write()).await;
+    assert!(expired, "the parked head write must lose to the deadline");
+    assert!(
+        offered,
+        "the parked head write was offered before it was cancelled"
+    );
+
+    let (expired, offered) =
+        await_offered_response_write_for_test(Some(Instant::now()), parked_client_write()).await;
+    assert!(expired);
+    assert!(!offered, "an elapsed deadline must not poll the write");
+
+    let ready = std::future::ready(Ok::<(), &'static str>(()));
+    let (expired, offered) = await_offered_response_write_for_test(Some(deadline), ready).await;
+    assert!(!expired);
+    assert!(offered);
+}
+
 /// A native streaming HEADERS write that outlives its bound is the route's cut
 /// unless a client RPC deadline was strictly earlier; every other outcome is
 /// left alone.
@@ -558,8 +681,8 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
         for call in calls {
             let args = call.split(".await").next().unwrap_or_default();
             assert!(
-                args.contains("route_body_deadline,"),
-                "http3/{file}.rs: a write seam does not race the route deadline"
+                args.contains("route_body_sleep.as_mut(),"),
+                "http3/{file}.rs: a write seam does not race the relay's pinned route timer"
             );
         }
         let cuts = match_arms(
@@ -840,6 +963,89 @@ fn native_http3_plain_bridge_rearms_a_grpc_web_attempt_budget_per_retry() {
     );
 }
 
+/// `after_proxy` runs once per plain-bridge response around a charged gRPC-Web
+/// budget expiry (#5744). An expiry before the response head decorates the
+/// charged terminal with `after_proxy`; one after `after_proxy` decorated the
+/// head carries that head's decorations instead, and the terminal writer then
+/// runs only the committed observers (an authorization expiry still takes the
+/// charged runner, which polls no hook).
+#[test]
+fn native_http3_plain_bridge_runs_after_proxy_once_around_a_charged_expiry() {
+    let dispatch = plain_bridge_dispatch();
+    let after_proxy = dispatch
+        .find("run_after_proxy_hooks(plugins, ctx, status, &mut response_headers)")
+        .expect("the bridge's after_proxy phase");
+    let terminals: Vec<usize> = dispatch
+        .match_indices("return write_plain_grpc_web_deadline_after_handoff(")
+        .map(|m| m.0)
+        .collect();
+    assert_eq!(terminals.len(), 3);
+    for at in terminals {
+        let args = dispatch[at..].split(".await").next().unwrap_or_default();
+        let decorated = args.contains("charged,\n") && args.contains("Some(&response_headers),");
+        assert_eq!(
+            decorated,
+            at > after_proxy,
+            "only the post-head charged terminal carries the decorated head"
+        );
+    }
+
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let writer = bridge
+        .split("async fn write_final_body_reject<S>(")
+        .nth(1)
+        .expect("write_final_body_reject")
+        .split("let http_status = StatusCode::from_u16(parts.status_code)")
+        .next()
+        .expect("the writer's hook phase");
+    assert_eq!(
+        writer.matches("after_proxy_hooks_to_").count(),
+        2,
+        "exactly the standard and the charged after_proxy runners"
+    );
+    let charged_runner = writer
+        .find("} else if hooks == FinalRejectHooks::ChargedBackendDeadline")
+        .expect("the charged runner branch");
+    assert!(
+        writer[charged_runner..].contains("|| ctx.authorization_termination().is_some()"),
+        "after a decorated head only an authorization expiry runs after_proxy again"
+    );
+}
+
+/// A plain-bridge response HEADERS write the deadline cancelled after h3 took
+/// its frame is never followed by a second HEADERS (#5745): h3-quinn would fail
+/// that write with a connection-level error and close every sibling stream.
+/// Both head writes report whether they were offered, and both deadline
+/// terminals that write HEADERS reset the stream instead once one was.
+#[test]
+fn native_http3_plain_bridge_resets_after_an_offered_head_write() {
+    let dispatch = plain_bridge_dispatch();
+    assert_eq!(
+        dispatch
+            .matches("stream_util::await_offered_response_write_before_deadline(")
+            .count(),
+        2,
+        "the buffered and the streaming response HEADERS writes"
+    );
+    for terminal in [
+        "return write_plain_authorization_expired_terminal(",
+        "write_plain_grpc_web_client_deadline_without_hooks(",
+    ] {
+        let guarded: Vec<bool> = dispatch
+            .match_indices(terminal)
+            .filter_map(|(at, _)| {
+                let head = dispatch[..at].rfind("let (head_write, head_offered) =")?;
+                Some(dispatch[head..at].contains("if head_offered {"))
+            })
+            .collect();
+        assert_eq!(
+            guarded,
+            vec![true, true],
+            "`{terminal}` after a head write must first reset an offered head"
+        );
+    }
+}
+
 /// A route timeout `504` handed to the plain bridge's shared response pipeline
 /// (the mesh arm) mints no session affinity, as on the native path and in proxy
 /// core.
@@ -1011,4 +1217,79 @@ async fn the_gateway_advertises_http3_where_a_timed_rule_is_served() {
     assert_eq!(state.update_config(global), ConfigApplyOutcome::Applied);
     assert!(state.alt_svc_for_frontend_port(Some(TIMED_PORT)).is_some());
     assert!(state.alt_svc_for_frontend_port(None).is_some());
+}
+
+// ── gRPC-Web budget forwarding on the plain bridge (#5734) ─────────────────
+
+/// The backend request the HTTP/3 plain bridge builds for one attempt.
+fn plain_bridge_request(
+    proxy_headers: &[(&str, &str)],
+    grpc_deadline_at: Option<Instant>,
+) -> reqwest::Request {
+    use ferrum_edge::config::env_config::EnvConfig;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+
+    let (state, _) = ProxyState::new(
+        GatewayConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        EnvConfig::default(),
+        None,
+        None,
+    )
+    .expect("test proxy state should build");
+    let proxy: Proxy = serde_json::from_value(json!({
+        "backend_host": "backend.example",
+        "backend_port": 443
+    }))
+    .expect("proxy fixture");
+    let headers: std::collections::HashMap<String, String> = proxy_headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    h3_plain_bridge_backend_request_for_test(
+        &state,
+        &proxy,
+        &headers,
+        "https://backend.example/echo.Echo/Call",
+        grpc_deadline_at,
+    )
+    .expect("request should build")
+}
+
+fn grpc_timeout_values(request: &reqwest::Request) -> Vec<&[u8]> {
+    request
+        .headers()
+        .get_all("grpc-timeout")
+        .iter()
+        .map(|value| value.as_bytes())
+        .collect()
+}
+
+/// A gRPC-Web pass-through attempt tells the backend its remaining RPC budget
+/// in `grpc-timeout`, replacing the client's relative value with a single
+/// header, as proxy core's reqwest dispatch does.
+#[tokio::test(start_paused = true)]
+async fn the_plain_bridge_replaces_grpc_timeout_with_the_remaining_budget() {
+    let deadline = Instant::now() + Duration::from_millis(5000);
+    let request = plain_bridge_request(
+        &[
+            ("content-type", "application/grpc-web+proto"),
+            ("grpc-timeout", "30S"),
+        ],
+        Some(deadline),
+    );
+    assert_eq!(
+        grpc_timeout_values(&request),
+        vec![&b"5000m"[..]],
+        "the backend must be told the remaining budget once, not the client's 30S"
+    );
+}
+
+/// Without an RPC deadline (a plain request) the client's `grpc-timeout`,
+/// like every other forwarded header, passes through untouched.
+#[tokio::test]
+async fn the_plain_bridge_forwards_a_client_grpc_timeout_without_a_deadline() {
+    let request = plain_bridge_request(&[("grpc-timeout", "30S")], None);
+    assert_eq!(grpc_timeout_values(&request), vec![&b"30S"[..]]);
 }

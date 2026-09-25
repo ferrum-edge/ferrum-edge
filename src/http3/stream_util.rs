@@ -173,8 +173,12 @@ pub enum H3AuthorizedWrite {
 ///
 /// The plan is **absolute**. It is anchored once at credential acceptance and
 /// passed down by value, so calling this per frame can neither refresh nor
-/// re-derive it. An unauthenticated request without a timed route pays nothing
-/// at all: no timer is registered on that path.
+/// re-derive it. The route deadline is the relay's own pinned `route_body_sleep`
+/// (#5745): racing that one registered timer instead of a fresh `Sleep` keeps a
+/// timed route from registering and deregistering a timer-wheel entry for every
+/// frame, and its instant is the route deadline by construction. An
+/// unauthenticated request without a timed route pays nothing at all: no timer
+/// is registered on that path.
 /// `latch` is the REQUEST's shared once-only termination latch. Routing the
 /// blocked-write class through it — rather than incrementing the counter
 /// directly — is what keeps the upload direction, the pre-commitment gates, the
@@ -182,7 +186,7 @@ pub enum H3AuthorizedWrite {
 /// of them become eligible at the same absolute instant.
 pub(crate) async fn await_authorized_response_write<F, T, E>(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-    route_deadline: Option<tokio::time::Instant>,
+    route_sleep: std::pin::Pin<&mut Option<tokio::time::Sleep>>,
     family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
     latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
     write: F,
@@ -190,15 +194,22 @@ pub(crate) async fn await_authorized_response_write<F, T, E>(
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    let deadline = crate::proxy::earliest_deadline(plan.map(|plan| plan.at), route_deadline);
-    match await_response_write_before_deadline(deadline, write).await {
+    let route_deadline = Option::as_ref(&route_sleep).map(tokio::time::Sleep::deadline);
+    // Authorization wins an exact tie, matching `ComposedAuthBound`. When it
+    // owns the earlier bound the write races the plan exactly as before;
+    // otherwise the route owns it and the write races the pinned route timer.
+    let auth_bound = plan.filter(|plan| route_deadline.is_none_or(|route| plan.at <= route));
+    let outcome = match (auth_bound, route_sleep.as_pin_mut()) {
+        (None, Some(route_sleep)) => {
+            await_response_write_before_pinned_sleep(route_sleep, write).await
+        }
+        _ => await_response_write_before_deadline(auth_bound.map(|plan| plan.at), write).await,
+    };
+    match outcome {
         Ok(_) => H3AuthorizedWrite::Written,
         Err(H3ResponseWriteError::Write(_)) => H3AuthorizedWrite::ClientWriteFailed,
         Err(H3ResponseWriteError::DeadlineExceeded) => {
-            // Authorization wins an exact tie, matching `ComposedAuthBound`.
-            if let Some(plan) =
-                plan.filter(|plan| route_deadline.is_none_or(|route| plan.at <= route))
-            {
+            if let Some(plan) = auth_bound {
                 latch.record_once(plan.termination, family);
                 H3AuthorizedWrite::AuthorizationExpired(plan.termination)
             } else {
@@ -206,6 +217,61 @@ where
             }
         }
     }
+}
+
+/// [`await_response_write_before_deadline`] against a timer the caller already
+/// pinned and registered, instead of a fresh `Sleep` per write (#5745).
+///
+/// Same contract: expiry-first, so an elapsed deadline never polls `write` (one
+/// clock read, no timer registration), and a biased timer arm wins an
+/// exact-deadline tie. The timer is borrowed, never reset, so the caller's own
+/// `select!` arm keeps observing the same absolute instant.
+async fn await_response_write_before_pinned_sleep<F, T, E>(
+    mut sleep: std::pin::Pin<&mut tokio::time::Sleep>,
+    write: F,
+) -> Result<T, H3ResponseWriteError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    if tokio::time::Instant::now() >= sleep.deadline() {
+        return Err(H3ResponseWriteError::DeadlineExceeded);
+    }
+    tokio::select! {
+        biased;
+        () = sleep.as_mut() => Err(H3ResponseWriteError::DeadlineExceeded),
+        result = write => result.map_err(H3ResponseWriteError::Write),
+    }
+}
+
+/// Race a response HEADERS write against `deadline`, also reporting whether
+/// the write was polled — offered to the H3 send half — before it finished or
+/// was cancelled (#5745).
+///
+/// h3 hands the whole frame to h3-quinn's `send_data` on the first poll and
+/// only then waits in `poll_ready`, so a write the deadline cancels after that
+/// leaves h3-quinn's `writing` buffer set. Any later write on the stream then
+/// fails at `send_data` with a CONNECTION-level `InternalError`, and h3 closes
+/// the whole QUIC connection — every sibling stream included — with
+/// `H3_INTERNAL_ERROR`. A caller that sees `DeadlineExceeded` with `offered`
+/// set must therefore reset the stream instead of writing another terminal;
+/// part of the head may already be on the wire anyway. When `offered` is false
+/// the deadline had already elapsed, nothing reached the send half, and a
+/// terminal HEADERS is still legal.
+pub(crate) async fn await_offered_response_write_before_deadline<F, T, E>(
+    deadline: Option<tokio::time::Instant>,
+    write: F,
+) -> (Result<T, H3ResponseWriteError<E>>, bool)
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let mut offered = false;
+    let mut write = std::pin::pin!(write);
+    let tracked = std::future::poll_fn(|cx| {
+        offered = true;
+        write.as_mut().poll(cx)
+    });
+    let result = await_response_write_before_deadline(deadline, tracked).await;
+    (result, offered)
 }
 
 /// Outcome of a native-H3 streaming response HEADERS write raced against the

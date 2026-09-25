@@ -62,11 +62,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly as a slow backend body is: an `H3_REQUEST_CANCELLED` reset,
   `body_error_class: read_write_timeout`, and no charge to the backend's
   circuit breaker or passive health. Routes without timeouts arm no extra
-  timer. A buffered response is complete when written and is not cut, as on
-  HTTP/1.1 and HTTP/2; the bridge's buffered writer now settles the backend
-  outcome and releases the admission permit and least-connections count before
-  its client write, as the native HTTP/3 buffered writer already did, so a
-  client parking that write no longer holds them.
+  timer, and a timed route's writes race the relay's existing route timer
+  instead of arming a new one for every frame (#5745). A buffered response is
+  complete when written and is not cut, as on HTTP/1.1 and HTTP/2; the
+  bridge's buffered writer now settles the backend outcome and releases the
+  admission permit and least-connections count before its client write, as the
+  native HTTP/3 buffered writer already did, so a client parking that write no
+  longer holds them.
+- An HTTP/3 client that stops reading before a bridged response's HEADERS
+  arrive no longer loses its whole QUIC connection when the request's
+  credential expires or its gRPC-Web deadline passes (#5745). The HTTP/3
+  bridge to HTTP/1.1 and HTTP/2 backends cancelled the parked HEADERS write and
+  then wrote its `401` or `DEADLINE_EXCEEDED` HEADERS on the same stream. The
+  QUIC layer still held the cancelled frame, failed that write with a
+  connection-level error, and the connection closed with `H3_INTERNAL_ERROR`,
+  ending every other request on it. The stream is now reset instead once the
+  cancelled HEADERS had been handed to QUIC; a deadline that passed before the
+  write began still answers with the `401` or `DEADLINE_EXCEEDED` terminal.
+- A gRPC-Web `backendRequest` budget expiry keeps its `Backend deadline
+  exceeded` terminal when `after_proxy` plugins (for example CORS) run
+  (#5744). On HTTP/1.1 and HTTP/2 the first such plugin read the spent budget
+  as the gateway's own deadline and turned the terminal into `Deadline
+  exceeded at gateway`; the budget now ends when the expiry is charged, as on
+  the HTTP/3 bridge. On the HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends, the
+  charged terminal's `after_proxy` and response-committed plugins were awaited
+  without a bound when no client `grpc-timeout` or route `request` timeout
+  remained. They now get the bounded treatment of the gateway's own deadline
+  terminal: a response-replacing plugin such as `response_mock` is skipped,
+  other hooks get one poll, and pending work finishes detached under the
+  cleanup bound. An expiry while a buffered response body is read no longer
+  runs `after_proxy` a second time over the terminal: the terminal carries
+  the gateway headers `after_proxy` already added to the response head, and
+  only the response-committed plugins run over it.
 - A peer that resets an HTTP/3 stream in the middle of a DATA frame no longer
   tears down the whole QUIC connection (PR #5741). The vendored `h3` frame-drain
   patch held a QUIC error back so it could decode buffered bytes first. Quinn

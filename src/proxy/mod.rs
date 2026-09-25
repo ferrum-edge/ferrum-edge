@@ -23055,11 +23055,15 @@ fn restore_rejection_response_markers(
     }
 }
 
+/// `gateway_deadline` is false only for a charged backend deadline terminal
+/// (#5744): the detached hooks then observe the charged wording the client got
+/// instead of the gateway's own deadline terminal.
 fn spawn_detached_rejection_cleanup(
     pending_hook: OwnedRejectionHookFuture,
     remaining_plugins: Vec<Arc<dyn Plugin>>,
     previous_marker: Option<String>,
     previous_replaceable_marker: Option<String>,
+    gateway_deadline: bool,
 ) {
     std::mem::drop(tokio::spawn(async move {
         let cleanup = async move {
@@ -23070,13 +23074,15 @@ fn spawn_detached_rejection_cleanup(
                 mut response_headers,
                 result: _,
             } = pending_hook.await;
-            ctx.mark_gateway_deadline_response_selected();
-            replace_rejection_with_gateway_deadline(
-                &mut ctx,
-                &mut status_code,
-                response_body.as_mut(),
-                &mut response_headers,
-            );
+            if gateway_deadline {
+                ctx.mark_gateway_deadline_response_selected();
+                replace_rejection_with_gateway_deadline(
+                    &mut ctx,
+                    &mut status_code,
+                    response_body.as_mut(),
+                    &mut response_headers,
+                );
+            }
             for plugin in remaining_plugins {
                 if plugin.may_replace_rejection_response() {
                     continue;
@@ -23123,12 +23129,35 @@ fn maybe_finalize_route_override_response_headers(
     );
 }
 
+/// Whether the reject-path hooks must answer with the gateway's own deadline
+/// terminal: one is already selected, or the RPC deadline in force elapsed. A
+/// charged backend deadline terminal (#5744) never is: its deadline was the
+/// backend's, and the client gets that wording.
+fn rejection_selects_gateway_deadline(
+    ctx: &RequestContext,
+    charged_backend_deadline: bool,
+) -> bool {
+    if charged_backend_deadline {
+        return false;
+    }
+    ctx.gateway_deadline_response_selected()
+        || ctx
+            .grpc_deadline_at()
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+}
+
+/// `charged_backend_deadline` selects the charged-terminal mode (#5744): the
+/// rejection is a backend deadline the gateway already charged, written after
+/// that deadline passed, so every hook is bounded as over the gateway deadline
+/// terminal — replacers skipped, one poll for the rest, pending work detached —
+/// even with no RPC deadline in force, and the rejection keeps its wording.
 async fn run_after_proxy_hooks_on_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status_code: &mut u16,
     mut response_body: Option<&mut Bytes>,
     response_headers: &mut HashMap<String, String>,
+    charged_backend_deadline: bool,
 ) {
     ctx.begin_rejection_deadline_response_header_provenance(response_headers);
     let previous_replaceable_marker = if response_body.is_some() {
@@ -23159,11 +23188,8 @@ async fn run_after_proxy_hooks_on_rejection(
         restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
         return;
     }
-    let deadline_already_elapsed = ctx
-        .grpc_deadline_at()
-        .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
     let initial_terminal_gateway_deadline =
-        ctx.gateway_deadline_response_selected() || deadline_already_elapsed;
+        rejection_selects_gateway_deadline(ctx, charged_backend_deadline);
     let last_route_response_finalizer = plugins
         .iter()
         .rposition(|plugin| plugin.participates_in_route_response_header_finalization());
@@ -23185,10 +23211,8 @@ async fn run_after_proxy_hooks_on_rejection(
         if ctx.semantic_cache_response_replay && plugin.applies_response_transport_encoding() {
             continue;
         }
-        let terminal_gateway_deadline = ctx.gateway_deadline_response_selected()
-            || ctx
-                .grpc_deadline_at()
-                .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+        let terminal_gateway_deadline =
+            rejection_selects_gateway_deadline(ctx, charged_backend_deadline);
         let terminal_gateway_capacity = ctx.gateway_capacity_response_selected();
         if terminal_gateway_deadline {
             ctx.mark_gateway_deadline_response_selected();
@@ -23207,13 +23231,16 @@ async fn run_after_proxy_hooks_on_rejection(
         // gateway terminal is selected: an already-ready replacer must never
         // overwrite DEADLINE_EXCEEDED or the retained-response capacity
         // refusal at the publication boundary. Non-replacing decorators and
-        // cleanup hooks still run.
-        if (terminal_gateway_deadline || terminal_gateway_capacity)
+        // cleanup hooks still run. A charged backend deadline terminal
+        // (#5744) is bounded the same way, with or without an RPC deadline in
+        // force.
+        let post_deadline_terminal = terminal_gateway_deadline || charged_backend_deadline;
+        if (post_deadline_terminal || terminal_gateway_capacity)
             && plugin.may_replace_rejection_response()
         {
             continue;
         }
-        let result = if terminal_gateway_deadline {
+        let result = if post_deadline_terminal {
             let mut future = owned_rejection_hook_future(
                 Arc::clone(plugin),
                 ctx.clone(),
@@ -23242,6 +23269,7 @@ async fn run_after_proxy_hooks_on_rejection(
                             .collect(),
                         previous_marker.clone(),
                         previous_replaceable_marker.clone(),
+                        !charged_backend_deadline,
                     );
                     restore_rejection_response_markers(
                         ctx,
@@ -23287,6 +23315,7 @@ async fn run_after_proxy_hooks_on_rejection(
                             .collect(),
                         previous_marker.clone(),
                         previous_replaceable_marker.clone(),
+                        true,
                     );
                     restore_rejection_response_markers(
                         ctx,
@@ -23430,11 +23459,7 @@ async fn run_after_proxy_hooks_on_rejection(
         }
     }
 
-    if ctx.gateway_deadline_response_selected()
-        || ctx
-            .grpc_deadline_at()
-            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
-    {
+    if rejection_selects_gateway_deadline(ctx, charged_backend_deadline) {
         ctx.mark_gateway_deadline_response_selected();
         replace_rejection_with_gateway_deadline(ctx, status_code, response_body, response_headers);
     }
@@ -23460,6 +23485,32 @@ pub(crate) async fn apply_replaceable_after_proxy_hooks_to_rejection(
         status_code,
         Some(response_body),
         response_headers,
+        false,
+    )
+    .await;
+}
+
+/// Reject-path `after_proxy` over a charged backend deadline terminal (#5744):
+/// a deadline the backend was charged for (`Backend deadline exceeded`), which
+/// is written after that deadline passed. Every hook is bounded as over the
+/// gateway's own deadline terminal even when no RPC deadline remains in force
+/// — replacers skipped, one poll for decorators and cleanup, pending work
+/// detached under the cleanup bound — while the rejection keeps the charged
+/// wording instead of turning into `Deadline exceeded at gateway`.
+pub(crate) async fn apply_after_proxy_hooks_to_charged_deadline_rejection(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status_code: &mut u16,
+    response_body: &mut Bytes,
+    response_headers: &mut HashMap<String, String>,
+) {
+    run_after_proxy_hooks_on_rejection(
+        plugins,
+        ctx,
+        status_code,
+        Some(response_body),
+        response_headers,
+        true,
     )
     .await;
 }
@@ -37973,12 +38024,16 @@ async fn handle_proxy_request_inner(
                 streaming_h2_read_timeout_ms = mesh_read_timeout_ms;
                 passthrough_request_bytes_latch = passthrough_request_bytes;
                 let mut response = *response;
-                charge_generic_grpc_route_attempt_budget_expiry(
+                if charge_generic_grpc_route_attempt_budget_expiry(
                     &ctx,
                     owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     initial_handed_to_backend,
                     &mut response,
-                );
+                ) {
+                    // The charged attempt's budget is spent: the response
+                    // pipeline and any retry are bounded by the total deadline.
+                    ctx.end_grpc_route_attempt();
+                }
                 (response, retained_body)
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
@@ -38646,12 +38701,16 @@ async fn handle_proxy_request_inner(
                     route_deadline_expiry_response(expiry, true, &mut route_request_timeout_phase)
                 }
             };
-            charge_generic_grpc_route_attempt_budget_expiry(
+            if charge_generic_grpc_route_attempt_budget_expiry(
                 &ctx,
                 owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                 true,
                 &mut result,
-            );
+            ) {
+                // The charged attempt's budget is spent: the response pipeline
+                // and any further retry are bounded by the total deadline.
+                ctx.end_grpc_route_attempt();
+            }
             // Retry helpers can reject the selected target before dialing it
             // (most notably when the egress policy blocks its resolved
             // address). Do not let the response path mistake that target for
@@ -38767,12 +38826,16 @@ async fn handle_proxy_request_inner(
                 streaming_h2_read_timeout_ms = effective_streaming_h2_read_timeout_ms;
                 passthrough_request_bytes_latch = passthrough_request_bytes;
                 let mut response = *response;
-                charge_generic_grpc_route_attempt_budget_expiry(
+                if charge_generic_grpc_route_attempt_budget_expiry(
                     &ctx,
                     owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     dispatch_handed_to_backend,
                     &mut response,
-                );
+                ) {
+                    // The charged attempt's budget is spent: the response
+                    // pipeline is bounded by the total deadline alone.
+                    ctx.end_grpc_route_attempt();
+                }
                 response
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
@@ -49299,12 +49362,19 @@ pub(crate) fn charge_grpc_route_attempt_budget_expiry(
 /// had been handed to the backend and its RPC deadline — the matched rule's
 /// per-attempt budget — has elapsed, the terminal is re-shaped as the charged
 /// backend read timeout.
+///
+/// Returns whether it charged. Proxy core then ends the spent attempt budget
+/// (#5744): the charged terminal flows through the ordinary response pipeline,
+/// whose phases are bounded by the RPC deadline in force, and an expired
+/// attempt budget still in force there would make the first `after_proxy` hook
+/// select the gateway's own deadline and replace `Backend deadline exceeded`
+/// with `Deadline exceeded at gateway`.
 pub(crate) fn charge_generic_grpc_route_attempt_budget_expiry(
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
     handed_to_backend: bool,
     response: &mut retry::BackendResponse,
-) {
+) -> bool {
     if !handed_to_backend
         || response.error_class != Some(retry::ErrorClass::ClientDisconnect)
         || !ctx.grpc_deadline_is_route_attempt_budget()
@@ -49312,11 +49382,12 @@ pub(crate) fn charge_generic_grpc_route_attempt_budget_expiry(
             .grpc_deadline_at()
             .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
     {
-        return;
+        return false;
     }
     let resolved_ip = response.backend_resolved_ip.take();
     *response =
         grpc_deadline_exceeded_response_for_request(ctx, request_headers, resolved_ip, true);
+    true
 }
 
 fn client_grpc_deadline_exceeded_response_for_optional_request(
