@@ -113,6 +113,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time over the terminal: the terminal carries the gateway headers
   `after_proxy` already added to the response head, and only the
   response-committed plugins run over it.
+- Browser gRPC-Web clients now receive the CORS headers on every
+  gateway-generated gRPC-Web error, so they can read the gRPC status instead of
+  failing with an opaque CORS error (#5747). On HTTP/1.1 and HTTP/2 the native
+  gRPC path answered backend unavailable, `Deadline exceeded at gateway`
+  (including an attempt budget that expires while the backend connection is
+  acquired), and an oversized or unretainable response without running
+  `after_proxy`; the HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends did the same
+  for a refused dial or other classified dispatch failure, the route's own
+  deadline, and an oversized response. These terminals now run the reject-path
+  `after_proxy` decorators with the same bounds as a charged `backendRequest`
+  expiry: a response-replacing plugin is skipped, other hooks get one poll, and
+  a hook still pending after its poll finishes detached under the credential's
+  lifetime. Each terminal keeps its wording. A bridged response that proves
+  too large while its body is collected, after `after_proxy` decorated its
+  head, carries that head's gateway decorations. Reject-path cleanup that
+  continues detached after the gateway's own deadline terminal is selected is
+  now also ended at the admitted credential's lifetime instead of running for
+  up to the full post-response cleanup bound. The HTTP/3 bridge's mesh
+  backends no longer run response-body inspection or final-body validation
+  plugins over a charged `Backend deadline exceeded` terminal, as HTTP/1.1 and
+  HTTP/2 already did not.
 - A peer that resets an HTTP/3 stream in the middle of a DATA frame no longer
   tears down the whole QUIC connection (PR #5741). The vendored `h3` frame-drain
   patch held a QUIC error back so it could decode buffered bytes first. Quinn

@@ -2679,13 +2679,20 @@ async fn a_live_or_absent_credential_leaves_the_buffered_terminal_summary_untouc
 /// one poll, so each composes the bound at its two edges: an elapsed
 /// credential answers with the fixed terminal before any poll, and a pending
 /// hook detaches only under the credential's lifetime.
+///
+/// The eleventh is not a phase but the detach bound of the reject-path cleanup
+/// that continues after the gateway's own deadline terminal is selected
+/// (`rejection_cleanup_authorization_at`, #5747). That cleanup runs off the
+/// response frame, so, like the charged-terminal detach, it composes only the
+/// credential's lifetime: it is refused once that lifetime elapsed and
+/// cancelled at it, and it never outlives the fixed cleanup timeout.
 #[test]
 fn every_precommit_response_phase_composes_the_authorization_lifetime() {
     assert_eq!(
         PROXY_SOURCE
             .matches("ctx.precommit_response_phase_bound()")
             .count(),
-        10,
+        11,
         "a pre-commitment response phase lost its authorization bound"
     );
     let charged_runner = PROXY_SOURCE
@@ -2731,6 +2738,13 @@ fn every_precommit_response_phase_composes_the_authorization_lifetime() {
         .split("\nfn spawn_detached_rejection_cleanup(")
         .next()
         .expect("charged-terminal detached runner bounded");
+    let rejection_cleanup = PROXY_SOURCE
+        .split("\nfn spawn_detached_rejection_cleanup(")
+        .nth(1)
+        .expect("detached rejection cleanup")
+        .split("\n}\n")
+        .next()
+        .expect("detached rejection cleanup bounded");
     for enforced in [
         "if authorization_at.is_some_and(|at| started_at >= at) {",
         "if authorization_at.is_some_and(|at| tokio::time::Instant::now() >= at) {",
@@ -2741,7 +2755,33 @@ fn every_precommit_response_phase_composes_the_authorization_lifetime() {
             detached.contains(enforced),
             "the detached charged-terminal hook must enforce the authorization bound: {enforced}"
         );
+        assert!(
+            rejection_cleanup.contains(enforced),
+            "the detached rejection cleanup must enforce the authorization bound: {enforced}"
+        );
     }
+    for detach in [
+        "spawn_detached_rejection_cleanup(",
+        "rejection_cleanup_authorization_at(ctx),",
+    ] {
+        assert_eq!(
+            charged_reject_path.matches(detach).count(),
+            2,
+            "every detached rejection cleanup must carry the credential's lifetime: {detach}"
+        );
+    }
+    let cleanup_bound = PROXY_SOURCE
+        .split("fn rejection_cleanup_authorization_at(")
+        .nth(1)
+        .expect("rejection cleanup authorization bound")
+        .split("\n}\n")
+        .next()
+        .expect("rejection cleanup authorization bound bounded");
+    assert!(
+        cleanup_bound.contains("ctx.precommit_response_phase_bound()")
+            && cleanup_bound.contains(".authorization_deadline_at()"),
+        "the rejection cleanup bound must be the credential's authorization deadline"
+    );
     assert!(
         !PROXY_SOURCE.contains("ctx.precommit_response_phase_deadline_at()"),
         "a pre-commitment phase that keeps only the composed instant cannot tell an \

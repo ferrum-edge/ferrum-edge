@@ -1143,6 +1143,256 @@ async fn assert_tcp_grpc_web_attempt_budget_expiry_wording(http2: bool) {
     backend.shutdown();
 }
 
+/// Gateway-generated gRPC-Web error terminals on proxy core's native gRPC
+/// branch are decorated by `after_proxy` (#5747), so a browser client gets the
+/// CORS headers that let it read the gRPC status instead of an opaque CORS
+/// failure. Covers backend unavailable (a refused dial) and the gateway's own
+/// deadline (the client's `grpc-timeout` expiring while the backend holds the
+/// call) over HTTP/1.1 and HTTP/2. Each terminal keeps its wording.
+#[ignore]
+#[tokio::test]
+async fn functional_grpc_web_gateway_error_terminals_carry_cors_over_tcp() {
+    for http2 in [false, true] {
+        assert_tcp_grpc_web_backend_unavailable_carries_cors(http2).await;
+        assert_tcp_grpc_web_gateway_deadline_carries_cors(http2).await;
+    }
+}
+
+async fn assert_tcp_grpc_web_backend_unavailable_carries_cors(http2: bool) {
+    let protocol = if http2 { "HTTP/2" } else { "HTTP/1.1" };
+    let backend_port = refused_backend_port().await;
+    let gateway = start_h3_policy_gateway(grpc_web_cors_config(backend_port))
+        .await
+        .expect("start gRPC-Web CORS gateway");
+
+    let terminal = send_tcp_grpc_web_call(gateway.https_port, http2, &[]).await;
+    assert_grpc_web_terminal_carries_cors(protocol, &terminal);
+    assert!(
+        terminal.text.contains("Backend unavailable"),
+        "{protocol}: a refused dial is the backend-unavailable terminal: {:?}",
+        terminal.text
+    );
+
+    gateway.shutdown().await;
+}
+
+async fn assert_tcp_grpc_web_gateway_deadline_carries_cors(http2: bool) {
+    let protocol = if http2 { "HTTP/2" } else { "HTTP/1.1" };
+    // A scripted h2c backend that accepts the call and never answers, so the
+    // client's deadline expires while the backend holds it.
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind h2c backend");
+    let backend_port = listener.local_addr().expect("backend addr").port();
+    let mut backend = ScriptedH2Backend::builder_plain(listener)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::AwaitTestSignal)
+        .spawn()
+        .expect("spawn h2c backend");
+    let gateway = start_h3_policy_gateway(grpc_web_cors_config(backend_port))
+        .await
+        .expect("start gRPC-Web CORS gateway");
+
+    let terminal =
+        send_tcp_grpc_web_call(gateway.https_port, http2, &[("grpc-timeout", "300m")]).await;
+    assert_grpc_web_terminal_carries_cors(protocol, &terminal);
+    assert!(
+        terminal.text.contains("Deadline exceeded at gateway"),
+        "{protocol}: the client deadline is the gateway deadline terminal: {:?}",
+        terminal.text
+    );
+    assert!(
+        terminal.elapsed < Duration::from_secs(5),
+        "{protocol}: the call must end at its deadline: {:?}",
+        terminal.elapsed
+    );
+
+    gateway.shutdown().await;
+    backend.shutdown();
+}
+
+/// The HTTP/3 bridge decorates its gateway-generated gRPC-Web error terminals
+/// too (#5747): a refused backend dial answers `UNAVAILABLE` with the CORS
+/// headers a browser client needs to read it.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_grpc_web_backend_unavailable_carries_cors() {
+    let backend_port = refused_backend_port().await;
+    let gateway = start_h3_policy_gateway(grpc_web_cors_config(backend_port))
+        .await
+        .expect("start h3 gRPC-Web CORS gateway");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/echo.Echo/Unavailable",
+        gateway.https_port
+    );
+    let frame = grpc_web_data_frame(b"unavailable");
+    let resp = retry_h3_post_with_headers(
+        &client,
+        &url,
+        "application/grpc-web+proto",
+        &frame,
+        &[("origin", GRPC_WEB_CORS_ORIGIN)],
+    )
+    .await;
+    assert_eq!(
+        resp.status,
+        StatusCode::OK,
+        "gRPC-Web errors ride HTTP 200, got {resp:?}"
+    );
+    assert_eq!(
+        resp.headers
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some(GRPC_WEB_CORS_ORIGIN),
+        "after_proxy must decorate the gateway error terminal: {resp:?}"
+    );
+    let exposed = resp
+        .headers
+        .get("access-control-expose-headers")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        exposed.contains("grpc-status"),
+        "the browser must be allowed to read the gRPC status: {resp:?}"
+    );
+    let body = resp.body_text();
+    assert!(
+        body.contains("grpc-status: 14"),
+        "a refused dial must be UNAVAILABLE: {body:?}"
+    );
+
+    gateway.shutdown().await;
+}
+
+/// A backend port nothing listens on, so every dial to it is refused.
+async fn refused_backend_port() -> u16 {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("reserve refused backend port");
+    listener.local_addr().expect("backend addr").port()
+}
+
+/// The H3 policy route over the plaintext backend on `backend_port`, with a
+/// global CORS policy that admits [`GRPC_WEB_CORS_ORIGIN`] and exposes the
+/// gRPC status fields.
+fn grpc_web_cors_config(backend_port: u16) -> GatewayConfig {
+    let mut config = h3_policy_config(
+        backend_port,
+        "http",
+        None,
+        json!({"tls": {"sni": "backend-sni.example.com"}}),
+        None,
+    );
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "gateway-terminal-grpc-web-cors",
+            "namespace": H3_POLICY_NAMESPACE,
+            "plugin_name": "cors",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "allowed_origins": [GRPC_WEB_CORS_ORIGIN],
+                "exposed_headers": ["grpc-status", "grpc-message"]
+            }
+        }))
+        .expect("cors plugin config is valid"),
+    );
+    config
+}
+
+/// The client-visible terminal of one gRPC-Web call over HTTP/1.1 or HTTP/2.
+struct TcpGrpcWebTerminal {
+    status: u16,
+    allow_origin: Option<String>,
+    expose_headers: String,
+    /// The `grpc-message` header and the body, where a gRPC-Web terminal
+    /// carries its trailer frame.
+    text: String,
+    elapsed: Duration,
+}
+
+/// One gRPC-Web call over HTTP/1.1 or HTTP/2 from [`GRPC_WEB_CORS_ORIGIN`],
+/// retried while the gateway starts.
+async fn send_tcp_grpc_web_call(
+    https_port: u16,
+    http2: bool,
+    headers: &[(&str, &str)],
+) -> TcpGrpcWebTerminal {
+    let builder = reqwest::Client::builder().danger_accept_invalid_certs(true);
+    let client = if http2 {
+        builder.http2_prior_knowledge()
+    } else {
+        builder.http1_only()
+    }
+    .build()
+    .expect("build TLS client");
+    let url = format!("https://localhost:{https_port}/h3-local-policy/echo.Echo/Call");
+    let mut attempts = 0;
+    let (resp, elapsed) = loop {
+        attempts += 1;
+        let started = Instant::now();
+        let mut request = client
+            .post(&url)
+            .header("content-type", "application/grpc-web+proto")
+            .header("origin", GRPC_WEB_CORS_ORIGIN)
+            .body(grpc_web_data_frame(b"call"));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        match request.send().await {
+            Ok(resp) => break (resp, started.elapsed()),
+            Err(error) if attempts < 20 => {
+                eprintln!("gRPC-Web call over TCP not answered yet: {error}");
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("gRPC-Web call over TCP failed: {error}"),
+        }
+    };
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let status = resp.status().as_u16();
+    let allow_origin = header("access-control-allow-origin");
+    let expose_headers = header("access-control-expose-headers").unwrap_or_default();
+    let header_message = header("grpc-message").unwrap_or_default();
+    let body = resp.text().await.expect("gRPC-Web terminal body");
+    TcpGrpcWebTerminal {
+        status,
+        allow_origin,
+        expose_headers,
+        text: format!("{header_message}\n{body}"),
+        elapsed,
+    }
+}
+
+/// A gRPC-Web terminal a browser client can read: HTTP 200 with the CORS
+/// headers that admit its origin and expose the gRPC status.
+fn assert_grpc_web_terminal_carries_cors(protocol: &str, terminal: &TcpGrpcWebTerminal) {
+    assert_eq!(
+        terminal.status, 200,
+        "{protocol}: gRPC-Web errors ride HTTP 200"
+    );
+    assert_eq!(
+        terminal.allow_origin.as_deref(),
+        Some(GRPC_WEB_CORS_ORIGIN),
+        "{protocol}: after_proxy must decorate the gateway error terminal"
+    );
+    assert!(
+        terminal
+            .expose_headers
+            .to_ascii_lowercase()
+            .contains("grpc-status"),
+        "{protocol}: the browser must be allowed to read the gRPC status: {:?}",
+        terminal.expose_headers
+    );
+}
+
 /// A gRPC-Web client deadline that cuts a response body write parked in QUIC
 /// flow control resets ONLY that stream (#5745). The bridge used to append its
 /// `DEADLINE_EXCEEDED` trailer frame after the cut write: h3-quinn still held
