@@ -1378,7 +1378,9 @@ async fn spawn_stalled_body_backend(stall_first: usize) -> (u16, Arc<AtomicUsize
                     // Never send the declared body.
                     std::future::pending::<()>().await;
                 }
-                let _ = stream.write_all(STALLED_BODY_RETRY_PAYLOAD.as_bytes()).await;
+                let _ = stream
+                    .write_all(STALLED_BODY_RETRY_PAYLOAD.as_bytes())
+                    .await;
                 let _ = stream.shutdown().await;
             });
         }

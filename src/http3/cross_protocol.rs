@@ -13921,9 +13921,8 @@ mod tests {
             .expect("end of dispatch_plain not found");
         let dispatch = &tail[..end];
         assert!(
-            dispatch.contains(
-                "PlainBridgeBodySource::Reqwest(_) => plain_bridge_buffers_response(",
-            ),
+            dispatch
+                .contains("PlainBridgeBodySource::Reqwest(_) => plain_bridge_buffers_response(",),
             "H3 plain dispatch must refine a live response through the shared decision"
         );
 
