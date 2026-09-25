@@ -273,9 +273,10 @@ the instrumented `ferrum-edge` binary into `target/llvm-cov-target/debug/`. The
 step exports it as `FERRUM_EDGE_TEST_BIN` and hard-links it to the fixed
 `target/debug/ferrum-edge` path several suites still use. It is a hard link, not
 a symlink, because `functional_cli_test` hard-links that path into temp
-directories, and a relative symlink copied that way dangles. The test run then
-passes `--no-clean`, since every cargo-llvm-cov invocation otherwise runs
-`cargo clean -p ferrum-edge` and rebuilds the linked binary. The step sets
+directories, and a relative symlink copied that way dangles. The test run
+reuses that binary: `--no-report` implies cargo-llvm-cov's `--no-clean` (the two
+flags conflict), so it does not run `cargo clean -p ferrum-edge` and rebuild the
+linked binary. The step sets
 `FERRUM_SKIP_GATEWAY_BUILD=1` so no test process rebuilds an uninstrumented
 binary. The spawned gateways inherit `LLVM_PROFILE_FILE` and
 write their profiles next to the test binaries' profiles when they exit. The

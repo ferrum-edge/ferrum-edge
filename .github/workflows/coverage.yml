@@ -398,9 +398,10 @@ jobs:
           started="${RUNNER_TEMP}/functional-coverage-started"
           touch "$started"
           status=0
-          # `--no-clean`: every cargo-llvm-cov invocation otherwise runs
-          # `cargo clean -p ferrum-edge` and rebuilds the binary linked above.
-          cargo llvm-cov --no-report --no-clean \
+          # `--no-report` implies `--no-clean` (the two flags conflict), so
+          # this run reuses the binary linked above instead of cleaning and
+          # rebuilding it.
+          cargo llvm-cov --no-report \
             nextest --test functional_tests \
             --run-ignored all \
             --no-fail-fast \
