@@ -839,6 +839,7 @@ where
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline,
+                route_body_deadline,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 auth_latch,
                 $write,
@@ -848,6 +849,9 @@ where
                 crate::http3::stream_util::H3AuthorizedWrite::Written => Ok(()),
                 crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
                     Err(H3TrailerFinishError::Client)
+                }
+                crate::http3::stream_util::H3AuthorizedWrite::RouteDeadlineExceeded => {
+                    Err(H3TrailerFinishError::RouteDeadline)
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
                     Err(H3TrailerFinishError::AuthorizationExpired(termination))
@@ -7503,6 +7507,7 @@ async fn handle_h3_request(
                 resp,
                 &mut ctx,
                 state.env_config.authenticated_stream_max_lifetime_seconds,
+                route_body_deadline,
             )
             .await;
         let mut headers_committed = false;
@@ -7600,6 +7605,7 @@ async fn handle_h3_request(
             ($write:expr) => {
                 match crate::http3::stream_util::await_authorized_response_write(
                     auth_deadline_plan,
+                    route_body_deadline,
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                     &auth_latch,
                     $write,
@@ -7610,6 +7616,14 @@ async fn handle_h3_request(
                     crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
                         client_disconnected = true;
                         body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        false
+                    }
+                    crate::http3::stream_util::H3AuthorizedWrite::RouteDeadlineExceeded => {
+                        coalesce_buf.clear();
+                        crate::http3::route_deadline::cancel_response_stream(&mut *stream);
+                        stream.abort_committed();
+                        body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                        route_deadline_cut = true;
                         false
                     }
                     crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(
@@ -11633,6 +11647,7 @@ async fn stream_h3_open_response_to_client(
         resp,
         ctx,
         state.env_config.authenticated_stream_max_lifetime_seconds,
+        route_body_deadline,
     )
     .await;
     match headers_commit.outcome {
@@ -11743,6 +11758,7 @@ async fn stream_h3_open_response_to_client(
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline_plan,
+                route_body_deadline,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 &auth_latch,
                 $write,
@@ -11753,6 +11769,14 @@ async fn stream_h3_open_response_to_client(
                 crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
                     client_disconnected = true;
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    false
+                }
+                crate::http3::stream_util::H3AuthorizedWrite::RouteDeadlineExceeded => {
+                    coalesce_buf.clear();
+                    crate::http3::route_deadline::cancel_response_stream(&mut *h3_stream);
+                    h3_stream.abort_committed();
+                    body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                    route_deadline_cut = true;
                     false
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
@@ -15959,6 +15983,7 @@ async fn proxy_to_backend_h3_streaming(
         resp,
         ctx,
         state.env_config.authenticated_stream_max_lifetime_seconds,
+        route_body_deadline,
     )
     .await;
     match headers_commit.outcome {
@@ -16072,6 +16097,7 @@ async fn proxy_to_backend_h3_streaming(
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline_plan,
+                route_body_deadline,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 &auth_latch,
                 $write,
@@ -16082,6 +16108,14 @@ async fn proxy_to_backend_h3_streaming(
                 crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
                     client_disconnected = true;
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    false
+                }
+                crate::http3::stream_util::H3AuthorizedWrite::RouteDeadlineExceeded => {
+                    coalesce_buf.clear();
+                    crate::http3::route_deadline::cancel_response_stream(&mut *h3_stream);
+                    h3_stream.abort_committed();
+                    body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                    route_deadline_cut = true;
                     false
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {

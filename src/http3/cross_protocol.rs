@@ -5609,7 +5609,16 @@ where
         &mut response_headers,
     );
 
-    // Send response headers, then stream the body.
+    // Send response headers, then stream the body. Recompose the write bound
+    // with the committed attempt's route deadline: QPACK/QUIC flow control can
+    // park this write just like DATA or FIN.
+    plain_write_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        crate::proxy::earliest_deadline(
+            grpc_web_deadline_at,
+            route.body_deadline(route_attempt_deadline),
+        ),
+        plain_auth_deadline_plan,
+    );
     if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
         plain_write_bound.deadline(),
         send_response_headers(stream, &ctx.method, status, &response_headers),
@@ -9255,6 +9264,7 @@ where
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline,
+                route_body_deadline,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 auth_latch,
                 $write,
@@ -9265,6 +9275,13 @@ where
                 crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
                     client_disconnected = true;
                     body_error_class = Some(ErrorClass::ClientDisconnect);
+                    false
+                }
+                crate::http3::stream_util::H3AuthorizedWrite::RouteDeadlineExceeded => {
+                    coalesce_buf.clear();
+                    crate::http3::route_deadline::cancel_response_stream(stream);
+                    body_error_class = Some(ErrorClass::ReadWriteTimeout);
+                    *route_deadline_cut = true;
                     false
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {
@@ -9540,6 +9557,7 @@ where
         ($write:expr) => {
             match crate::http3::stream_util::await_authorized_response_write(
                 auth_deadline,
+                route_body_deadline,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 auth_latch,
                 $write,
@@ -9550,6 +9568,13 @@ where
                 crate::http3::stream_util::H3AuthorizedWrite::ClientWriteFailed => {
                     client_disconnected = true;
                     body_error_class = Some(ErrorClass::ClientDisconnect);
+                    false
+                }
+                crate::http3::stream_util::H3AuthorizedWrite::RouteDeadlineExceeded => {
+                    coalesce_buf.clear();
+                    crate::http3::route_deadline::cancel_response_stream(stream);
+                    body_error_class = Some(ErrorClass::ReadWriteTimeout);
+                    *route_deadline_cut = true;
                     false
                 }
                 crate::http3::stream_util::H3AuthorizedWrite::AuthorizationExpired(termination) => {

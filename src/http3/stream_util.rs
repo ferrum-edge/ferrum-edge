@@ -155,10 +155,13 @@ pub(crate) enum H3AuthorizedWrite {
     /// buffered tail, reset the send half, latch the bounded class into its
     /// summary, and end its relay.
     AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    /// The matched route's absolute response-body deadline elapsed while the
+    /// client write was blocked by QUIC flow control.
+    RouteDeadlineExceeded,
 }
 
 /// Race one potentially flow-control-blocked downstream H3 write against the
-/// admitted stream's absolute authorization deadline.
+/// earliest route or authorization deadline.
 ///
 /// A client that stops reading holds every `send_data` / `finish` in QUIC flow
 /// control, so a relay loop never returns to its `select!` timer and the
@@ -170,8 +173,8 @@ pub(crate) enum H3AuthorizedWrite {
 ///
 /// The plan is **absolute**. It is anchored once at credential acceptance and
 /// passed down by value, so calling this per frame can neither refresh nor
-/// re-derive it, and an unauthenticated request (`None`) pays nothing at all —
-/// no timer is registered on that path.
+/// re-derive it. An unauthenticated request without a timed route pays nothing
+/// at all: no timer is registered on that path.
 /// `latch` is the REQUEST's shared once-only termination latch. Routing the
 /// blocked-write class through it — rather than incrementing the counter
 /// directly — is what keeps the upload direction, the pre-commitment gates, the
@@ -179,6 +182,7 @@ pub(crate) enum H3AuthorizedWrite {
 /// of them become eligible at the same absolute instant.
 pub(crate) async fn await_authorized_response_write<F, T, E>(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    route_deadline: Option<tokio::time::Instant>,
     family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
     latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
     write: F,
@@ -186,18 +190,20 @@ pub(crate) async fn await_authorized_response_write<F, T, E>(
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    let Some(plan) = plan else {
-        return match write.await {
-            Ok(_) => H3AuthorizedWrite::Written,
-            Err(_) => H3AuthorizedWrite::ClientWriteFailed,
-        };
-    };
-    match await_response_write_before_deadline(Some(plan.at), write).await {
+    let deadline = crate::proxy::earliest_deadline(plan.map(|plan| plan.at), route_deadline);
+    match await_response_write_before_deadline(deadline, write).await {
         Ok(_) => H3AuthorizedWrite::Written,
         Err(H3ResponseWriteError::Write(_)) => H3AuthorizedWrite::ClientWriteFailed,
         Err(H3ResponseWriteError::DeadlineExceeded) => {
-            latch.record_once(plan.termination, family);
-            H3AuthorizedWrite::AuthorizationExpired(plan.termination)
+            // Authorization wins an exact tie, matching `ComposedAuthBound`.
+            if let Some(plan) =
+                plan.filter(|plan| route_deadline.is_none_or(|route| plan.at <= route))
+            {
+                latch.record_once(plan.termination, family);
+                H3AuthorizedWrite::AuthorizationExpired(plan.termination)
+            } else {
+                H3AuthorizedWrite::RouteDeadlineExceeded
+            }
         }
     }
 }
@@ -281,7 +287,7 @@ pub(crate) fn compose_aggregate_sse_bound(
 }
 
 /// Capture the admitted stream's authorization plan, race `send_response`
-/// against that exact plan composed with any client RPC deadline, and latch
+/// against that exact plan composed with any client RPC/route deadline, and latch
 /// an authorization expiry through the request. Used by every native-H3
 /// streaming HTTP/SSE backend relay so those three call sites cannot drift.
 /// The aggregate MCP SSE listener composes against its broker lifetime
@@ -291,6 +297,7 @@ pub(crate) async fn commit_authorized_streaming_response_headers<S>(
     resp: http::Response<()>,
     ctx: &mut crate::plugins::RequestContext,
     max_lifetime_seconds: u64,
+    route_deadline: Option<tokio::time::Instant>,
 ) -> AuthorizedStreamingHeadersCommit
 where
     S: RecvStream + SendStream<Bytes>,
@@ -298,8 +305,10 @@ where
     let plan =
         crate::proxy::auth_lifetime::effective_request_auth_deadline(ctx, max_lifetime_seconds);
     let latch = ctx.authorization_termination_latch();
-    let bound =
-        crate::proxy::auth_lifetime::ComposedAuthBound::compose(ctx.grpc_deadline_at(), plan);
+    let bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        crate::proxy::earliest_deadline(ctx.grpc_deadline_at(), route_deadline),
+        plan,
+    );
     let outcome = await_authorized_headers_write(
         bound,
         crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
