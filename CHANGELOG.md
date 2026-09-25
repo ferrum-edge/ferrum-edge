@@ -65,7 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listener, so hyper keeps the connection alive and only the gateway's own
   drain hint can add `Connection: close`. The HTTP/1.1 idle keep-alive
   integration test now keeps its request sender alive, so it passes only when
-  the server closes the connection.
+  the server closes the connection. The held backend counts only real `GET`
+  requests as arrivals. It used to count the gateway's startup h2c probe as
+  one, so a drain case could send SIGTERM before its request reached the
+  gateway.
 - `adaptive_concurrency` now relearns an obsolete minimum-latency baseline
   (#5737). The baseline was an all-time minimum, so one unusually fast success
   (a tiny `200`, a `304`, a cache hit) tightened the latency target forever:

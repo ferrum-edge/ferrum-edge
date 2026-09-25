@@ -250,6 +250,12 @@ shares.
 - **Every spawned gateway must be owned by an RAII guard, not a bare `std::process::Child`** (issue #4991). `Child` does nothing on drop, so a panic between spawn and the explicit shutdown call leaves a live gateway holding its ports. Bespoke spawners wrap the child in `crate::common::GatewayChildGuard` at the instant of spawn; `shutdown()` is idempotent and also runs from `Drop`.
 - **Socket fixtures must not assume Linux host behaviour** (issue #4983): a secondary loopback alias (`127.0.0.2`) exists on Linux but not on macOS; a bound-but-unlistened TCP port refuses on Linux and black-holes on Darwin (`ports::REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY`); Darwin's default UDP datagram ceiling is 9216 bytes; and `SO_REUSEADDR` lets a specific-address and a wildcard listener share one port on Darwin. Prefer a shape every supported host provides (`::1` for a second listen identity, a second ephemeral port for a second UDP session, a sub-ceiling payload for transport probes); where the prerequisite is genuinely required, probe for it and skip with an explicit message naming it. See `docs/functional_testing.md` -> "Host-Dependent Socket Fixtures".
 - Set `FERRUM_POOL_WARMUP_ENABLED=false` in tests that count backend hits.
+- Warmup off does not mean no backend traffic: once ready, file mode still runs
+  one capability refresh, which dials a plaintext backend with the h2c preface
+  (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`). The preface contains a blank line,
+  so a fixture that treats any `\r\n\r\n` as a request head counts the probe
+  as a hit. Match the request line instead
+  (`functional_graceful_shutdown_test.rs::is_client_request`).
 - Keep warmup true when tests require the capability registry to have a `Supported` entry before traffic, such as native H3 or direct H2 routing.
 
 ## Fuzz / property lane

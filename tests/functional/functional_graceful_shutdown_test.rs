@@ -75,9 +75,11 @@ enum HeldResponse {
 
 /// An HTTP/1.1 backend whose responses wait on an explicit barrier.
 ///
-/// Each request is reported on `arrivals` as soon as its head is read. That
-/// report, not a sleep, proves a request is in flight through the gateway, and
-/// the barrier keeps it in flight until the test calls [`HeldBackend::release`].
+/// Each client request is reported on `arrivals` as soon as its head is read.
+/// That report, not a sleep, proves a request is in flight through the gateway,
+/// and the barrier keeps it in flight until the test calls
+/// [`HeldBackend::release`]. Only HTTP/1.1 `GET` heads count: the gateway's own
+/// backend probes are closed unanswered (see [`is_client_request`]).
 struct HeldBackend {
     port: u16,
     arrivals: mpsc::UnboundedReceiver<()>,
@@ -133,7 +135,10 @@ async fn serve_held_backend(
         let arrival_tx = arrival_tx.clone();
         let mut release_rx = release_rx.clone();
         tokio::spawn(async move {
-            if !read_request_head(&mut stream).await {
+            let Some(head) = read_request_head(&mut stream).await else {
+                return;
+            };
+            if !is_client_request(&head) {
                 return;
             }
             let _ = arrival_tx.send(());
@@ -168,25 +173,42 @@ async fn serve_held_backend(
     }
 }
 
-/// Read one request head, through its blank line. Returns `false` if the peer
+/// The HTTP/2 connection preface, which the gateway sends to a plaintext
+/// backend when it probes for h2c support.
+const H2C_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Read one request head, through its blank line. Returns `None` if the peer
 /// closed or failed first, or the head grew past 16 KiB.
-async fn read_request_head(stream: &mut TcpStream) -> bool {
+async fn read_request_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
     let mut head = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
         match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return false,
+            Ok(0) | Err(_) => return None,
             Ok(n) => {
                 head.extend_from_slice(&chunk[..n]);
                 if head.windows(4).any(|window| window == b"\r\n\r\n") {
-                    return true;
+                    return Some(head);
                 }
                 if head.len() > 16 * 1024 {
-                    return false;
+                    return None;
                 }
             }
         }
     }
+}
+
+/// Whether `head` is a proxied client request rather than a gateway probe.
+///
+/// With pool warmup off, the gateway still runs one backend capability refresh
+/// as soon as it is ready, and for a plaintext backend that refresh dials with
+/// the h2c preface ([`H2C_PREFACE`]). The preface contains a blank line, so it
+/// reads as a complete head. Counting it as an arrival let a test send SIGTERM
+/// before its client request reached the gateway, whose version sniff then
+/// cancelled the connection: the "in-flight" request was never in flight.
+/// Every held request in this file is a `GET`.
+fn is_client_request(head: &[u8]) -> bool {
+    head.starts_with(b"GET ")
 }
 
 // ============================================================================
@@ -264,9 +286,10 @@ impl DrainGateway {
     }
 }
 
-/// Spawn the gateway in file mode. Pool warmup is off so a startup `HEAD /`
-/// cannot count as a held-backend arrival, and the managed-TLS store stays in
-/// the attempt's temp dir instead of the checkout (issue #5706).
+/// Spawn the gateway in file mode. Pool warmup is off so no startup `HEAD /`
+/// reaches the held backend (its startup h2c probe is filtered by
+/// [`is_client_request`]), and the managed-TLS store stays in the attempt's
+/// temp dir instead of the checkout (issue #5706).
 fn spawn_gateway(
     config_path: &Path,
     state_dir: &Path,
@@ -1366,6 +1389,39 @@ async fn harness_listener_probe_accepts_kernel_refusal() {
     );
 }
 
+/// The gateway's startup capability refresh sends the h2c preface to a
+/// plaintext backend. The held backend must close that probe unanswered and
+/// not report it as the client request a drain test waits for; a real `GET`
+/// on the same backend still counts.
+#[tokio::test]
+async fn harness_held_backend_ignores_h2c_probe() {
+    let mut backend = HeldBackend::start(HeldResponse::HeadAfterRelease).await;
+    let addr = SocketAddr::from(([127, 0, 0, 1], backend.port));
+
+    let mut probe = TcpStream::connect(addr).await.expect("connect h2c probe");
+    probe
+        .write_all(H2C_PREFACE)
+        .await
+        .expect("write h2c preface");
+    let mut buf = [0u8; 16];
+    let read = timeout(PROBE_STEP_BOUND, probe.read(&mut buf)).await;
+    assert!(
+        matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+        "the held backend must close an h2c probe unanswered, got: {read:?}"
+    );
+    assert!(
+        backend.arrivals.try_recv().is_err(),
+        "an h2c probe must not count as a held-request arrival"
+    );
+
+    let mut client = TcpStream::connect(addr).await.expect("connect client");
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: backend\r\n\r\n")
+        .await
+        .expect("write client request");
+    backend.wait_for_arrival().await;
+}
+
 /// Serve `reply` to one request, then close the socket or hold it open and
 /// silent, and return how [`read_h1_response`] classified the exchange.
 async fn read_scripted_reply(reply: &'static [u8], then_close: bool) -> H1Read {
@@ -1377,7 +1433,9 @@ async fn read_scripted_reply(reply: &'static [u8], then_close: bool) -> H1Read {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
-        if !read_request_head(&mut stream).await || stream.write_all(reply).await.is_err() {
+        if read_request_head(&mut stream).await.is_none()
+            || stream.write_all(reply).await.is_err()
+        {
             return;
         }
         if then_close {
