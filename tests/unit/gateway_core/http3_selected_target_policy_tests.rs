@@ -381,9 +381,8 @@ fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
         .take(128)
         .collect();
     assert!(
-        rotated_call.starts_with(
-            "letattempt=proxy_to_backend_h3(&state,attempt_dispatch_proxy.as_ref(),"
-        ),
+        rotated_call
+            .starts_with("letattempt=proxy_to_backend_h3(&state,attempt_dispatch_proxy.as_ref(),"),
         "the rotated native-H3 dispatch must receive the re-resolved attempt proxy"
     );
 }
