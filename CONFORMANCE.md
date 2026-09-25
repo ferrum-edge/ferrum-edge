@@ -179,7 +179,8 @@ streamed upload's time after the handoff counts against it. `request` is one
 absolute budget, anchored at request receipt, covering every attempt, retry backoff and the streaming response body:
 before the response head a non-gRPC request gets a gateway `504`
 (`{"error":"Request timeout"}`), a body still streaming at the deadline is
-reset (HTTP/2) or its connection closed (HTTP/1.1), and a gRPC request folds the
+reset (HTTP/2 and HTTP/3, the latter with `H3_REQUEST_CANCELLED`) or its
+connection closed (HTTP/1.1), and a gRPC request folds the
 budget into its RPC deadline and ends with `DEADLINE_EXCEEDED`. Both values stay
 on the rule's own dispatch entry, so sibling and merged rules keep the proxy
 defaults. A `request` expiry is charged to a backend's health (circuit
@@ -193,24 +194,19 @@ body cut by `request` keeps a backend `Content-Length` advertised.
 
 - **`HTTPRouteBackendTimeout`:** upstream v1.5.1 defines `backendRequest` as
   the time from when a request starts being sent to the backend until its full
-  response is received, per attempt. HTTP/1.1 and HTTP/2 enforce that for
-  non-gRPC requests. A gRPC or gRPC-Web call folds the budget into its RPC
-  deadline when the rule is selected rather than at the handoff (stricter:
-  gateway-side time before the handoff counts against the first attempt), and a
-  gRPC budget expiry is not retried, since gRPC calls are retried only after
-  connection failures. Native HTTP/3 cannot bound a non-gRPC attempt's total
-  duration, so, exactly as for `request` below, it refuses such a request with
-  `503` and `Alt-Svc` is withheld on every listener port that serves such a
-  rule. The upstream test delays only the response head, which every frontend
-  bounds.
-- **`HTTPRouteRequestTimeout` over HTTP/3:** native HTTP/3 cannot yet enforce
-  `request` on a non-gRPC request, so such a request is refused with `503`
-  before any dial rather than served without its deadline. Because browsers
-  cache `Alt-Svc` origin-wide and do not fall back to TCP on an HTTP error, the
-  H1/H2 frontends withhold `Alt-Svc` on every listener port that serves such a
-  rule (every port for a port-agnostic route), so the gateway never steers a
-  client onto the refusal; a client that reaches HTTP/3 another way still gets
-  the `503`. HTTP/1.1 and HTTP/2 enforce `request` fully.
+  response is received, per attempt. HTTP/1.1, HTTP/2 and native HTTP/3
+  enforce that for non-gRPC requests. A gRPC or gRPC-Web call folds the budget
+  into its RPC deadline when the rule is selected rather than at the handoff
+  (stricter: gateway-side time before the handoff counts against the first
+  attempt), and a gRPC budget expiry is not retried, since gRPC calls are
+  retried only after connection failures. The HTTP/3 bridge to HTTP/1.1 and
+  HTTP/2 backends collects a buffered response body after its retry loop, so
+  an expiry during that collection is answered with the charged `504` but not
+  retried. The upstream test delays only the response head, which every
+  frontend bounds.
+- **`HTTPRouteRequestTimeout`:** no known deviation. HTTP/1.1, HTTP/2 and
+  native HTTP/3 enforce `request` fully, and HTTP/3 stays advertised
+  (`Alt-Svc`) on a listener port that serves a timed rule.
 
 Upgraded WebSocket / CONNECT-UDP tunnels are not bounded by `request`.
 

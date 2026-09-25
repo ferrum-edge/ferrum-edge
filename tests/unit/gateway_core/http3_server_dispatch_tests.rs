@@ -155,8 +155,21 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         mesh_collection.contains("collect_h3_request_body_under_authorization("),
         "mesh uploads must force-collect via collect_h3_request_body_under_authorization"
     );
+    // Buffering a mesh upload is a gateway-local phase: it drains under
+    // `plain_local_bound`, the authorization plan composed with the earliest of
+    // the client RPC deadline and the route rule's total deadline (#5646).
+    let mesh_collection_compact: String = mesh_collection
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let mesh_drain_args = mesh_collection_compact
+        .split_once("collect_h3_request_body_under_authorization(")
+        .expect("mesh uploads must force-collect under the authorization bound")
+        .1;
     assert!(
-        mesh_collection.contains("plain_write_bound"),
+        mesh_drain_args.starts_with(
+            "drain_h3_body(stream,effective_max_request_body_size_bytes),plain_local_bound,"
+        ),
         "mesh force-buffer must drain under the composed authorization bound"
     );
     assert!(
@@ -2035,8 +2048,15 @@ fn h3_plain_grpc_web_client_acquisition_is_deadline_bounded() {
         2,
         "both client acquisitions must use the composed expiry-first bound"
     );
-    assert!(
-        dispatch.contains("plain_write_bound.deadline()"),
+    // Client acquisition is a gateway-local phase, so it waits under
+    // `plain_local_bound`: the authorization plan composed with the earliest of
+    // the client RPC deadline and the route rule's total deadline (#5646).
+    let dispatch_compact: String = dispatch.chars().filter(|c| !c.is_whitespace()).collect();
+    let acquisition_wait =
+        "letclient_result=matchcrate::plugins::await_deadline_first(plain_local_bound.deadline(),";
+    assert_eq!(
+        dispatch_compact.matches(acquisition_wait).count(),
+        2,
         "client acquisition must wait under the captured composed bound, not the client deadline alone"
     );
     assert!(dispatch.contains("drop(pending_slot);"));
@@ -2348,9 +2368,24 @@ fn h3_buffered_retry_recomputes_native_h3_on_target_rotation() {
             && retry.contains("current_dispatch_h3 = crate::proxy::supports_native_http3_backend("),
         "H3 buffered retry must recompute native-H3 eligibility when the concrete target changes"
     );
+    // The rotated attempt dispatches natively only while `current_dispatch_h3`
+    // holds; its `else` arm is the Unknown/Unsupported bridge, which must use
+    // the buffered reqwest path and convert its response for the H3 frontend.
+    let native_arm = retry
+        .find("} else if current_dispatch_h3 {")
+        .expect("rotated attempts must branch on native-H3 eligibility");
+    let bridge_arm = retry[native_arm..]
+        .split_once("} else {")
+        .expect("Unknown/Unsupported rotated targets must have a bridge arm")
+        .1;
+    let bridge_arm = bridge_arm
+        .split("result = match attempt_result {")
+        .next()
+        .expect("bounded Unknown/Unsupported bridge arm");
     assert!(
-        retry.contains("h3_buffered_result_from_backend_response(")
-            && retry.contains("proxy_to_backend_retry("),
+        bridge_arm.contains("crate::proxy::proxy_to_backend_retry(")
+            && bridge_arm.contains(".map(h3_buffered_result_from_backend_response)")
+            && !bridge_arm.contains("proxy_to_backend_h3("),
         "Unknown/Unsupported rotated targets must bridge via the buffered cross-protocol path"
     );
     assert!(

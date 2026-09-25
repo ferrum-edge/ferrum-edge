@@ -12,21 +12,29 @@
 //!   to it — expiry during gateway/client-side work is health-neutral;
 //! * framing: the route cut keeps a known response length exact, so it cannot
 //!   silently turn a `Content-Length` response into a chunked one;
-//! * HTTP/3 steering: `Alt-Svc` is withheld on every frontend port that serves
-//!   a timed rule, because the native HTTP/3 relays refuse such a request.
+//! * native HTTP/3: the relays read the same deadlines, answer an expiry before
+//!   the response head with proxy core's exact terminal and attribution, bound
+//!   the committed body by the earlier of the total deadline and the attempt
+//!   budget, and cut it with `H3_REQUEST_CANCELLED`; and HTTP/3 stays
+//!   advertised (`Alt-Svc`) where a timed rule is served.
 //!
 //! Data-plane behavior through the real gateway is covered by
-//! `tests/integration/k8s_controller_gateway_status_tests.rs`.
+//! `tests/integration/k8s_controller_gateway_status_tests.rs` and, over native
+//! HTTP/3, by `tests/functional/functional_h3_local_policy_test.rs` (the bridge
+//! to an HTTP/1.1 backend) and `tests/functional/scripted_backend_h3_tests.rs`
+//! (the native HTTP/3 backend pool).
 
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
-    await_route_request_deadline_for_test, proxy_body_streaming_for_test,
+    await_route_request_deadline_for_test, h3_route_attempt_bounds_for_test,
+    h3_route_deadline_reset_code_for_test, h3_route_deadline_terminal_for_test,
+    h3_route_deadlines_armed_for_test, proxy_body_streaming_for_test,
     proxy_body_with_client_grpc_deadline_for_test, proxy_body_with_route_request_deadline_for_test,
-    route_request_deadline_outcome_for_test, route_timeout_withholds_alt_svc_for_test,
+    route_deadline_expiry_response_for_test, route_request_deadline_outcome_for_test,
 };
-use ferrum_edge::config::types::{GatewayConfig, PluginAssociation, PluginConfig, Proxy};
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
 use ferrum_edge::proxy::body::ProxyBodyError;
-use ferrum_edge::retry::ErrorClass;
+use ferrum_edge::retry::{ErrorClass, ResponseBody};
 use http_body::{Body, Frame, SizeHint};
 use serde_json::{Value, json};
 use std::pin::Pin;
@@ -186,7 +194,340 @@ async fn a_route_deadline_keeps_a_known_response_length_exact() {
     assert_eq!(grpc.size_hint().exact(), None);
 }
 
-// ── HTTP/3 steering (`Alt-Svc`) ─────────────────────────────────────────────
+// ── Native HTTP/3 ───────────────────────────────────────────────────────────
+
+#[test]
+fn native_http3_reads_a_plain_requests_route_deadlines_and_never_a_grpc_ones() {
+    let armed = h3_route_deadlines_armed_for_test;
+    assert_eq!(
+        armed(Some(500), Some(200), false),
+        (true, Some(Duration::from_millis(200)))
+    );
+    // `0s` disables either bound, exactly as in proxy core.
+    assert_eq!(armed(Some(0), Some(0), false), (false, None));
+    assert_eq!(armed(None, None, false), (false, None));
+    // A gRPC-flavored request folds both into its RPC deadline, which the
+    // native HTTP/3 gRPC relays enforce, so the plain relays see neither.
+    assert_eq!(armed(Some(500), Some(200), true), (false, None));
+}
+
+#[test]
+fn native_http3_answers_a_route_expiry_before_the_head_like_proxy_core() {
+    let route_timeout = r#"{"error":"Request timeout"}"#;
+    // Spent before the attempt started: nothing was dialed, so it is neutral.
+    assert_eq!(
+        h3_route_deadline_terminal_for_test("not_started"),
+        (
+            504,
+            route_timeout,
+            ErrorClass::DispatchPolicyRejected,
+            Some("before_dispatch".to_string()),
+            true,
+        )
+    );
+    // Expired while the backend held the attempt: charged to that backend.
+    assert_eq!(
+        h3_route_deadline_terminal_for_test("in_flight"),
+        (
+            504,
+            route_timeout,
+            ErrorClass::ReadWriteTimeout,
+            Some("dispatch".to_string()),
+            true,
+        )
+    );
+    // An attempt budget is the ordinary, retryable backend timeout: charged,
+    // with no route phase because the transaction is not spent.
+    assert_eq!(
+        h3_route_deadline_terminal_for_test("attempt_budget"),
+        (
+            504,
+            r#"{"error":"Backend timeout"}"#,
+            ErrorClass::ReadWriteTimeout,
+            None,
+            true,
+        )
+    );
+
+    // Byte-for-byte proxy core's terminal for the same expiry. Every native
+    // HTTP/3 attempt is handed to the backend from its first poll.
+    for expiry in ["not_started", "in_flight", "attempt_budget"] {
+        let (status, body, class, phase, _) = h3_route_deadline_terminal_for_test(expiry);
+        let (core, core_phase) = route_deadline_expiry_response_for_test(expiry, true);
+        assert_eq!(status, core.status_code, "{expiry}");
+        assert_eq!(Some(class), core.error_class, "{expiry}");
+        assert_eq!(phase.as_deref(), core_phase, "{expiry}");
+        assert!(!core.connection_error, "{expiry}");
+        match core.body {
+            ResponseBody::Buffered(bytes) => assert_eq!(&bytes[..], body.as_bytes(), "{expiry}"),
+            _ => panic!("proxy core's route terminal must be buffered"),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_http3_bounds_the_committed_body_by_the_earlier_deadline() {
+    let bounds = h3_route_attempt_bounds_for_test;
+    let started = Instant::now();
+    let total = started + Duration::from_millis(1_000);
+    let budget = Duration::from_millis(300);
+    let attempt_deadline = started + budget;
+
+    // A fresh attempt budget starts now, and the committed body is cut at the
+    // earlier of it and the total deadline.
+    let (fresh, body, budget_expired, _) =
+        bounds(Some(total), Some(budget), Some(attempt_deadline));
+    assert_eq!(fresh, Some(attempt_deadline));
+    assert_eq!(body, Some(attempt_deadline));
+    assert!(!budget_expired);
+    let (_, body, _, _) = bounds(Some(total), None, None);
+    assert_eq!(body, Some(total));
+
+    // The attempt budget alone has expired: the retryable backend timeout.
+    tokio::time::advance(budget).await;
+    let (_, _, budget_expired, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
+    assert!(budget_expired);
+    assert_eq!(expiry, "attempt_budget");
+
+    // Once the total deadline has elapsed it wins, so the spent transaction
+    // is never retried.
+    tokio::time::advance(Duration::from_millis(700)).await;
+    let (_, _, budget_expired, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
+    assert!(!budget_expired);
+    assert_eq!(expiry, "in_flight");
+
+    // A rule without timeouts arms nothing.
+    let (fresh, body, budget_expired, _) = bounds(None, None, None);
+    assert_eq!((fresh, body, budget_expired), (None, None, false));
+}
+
+#[test]
+fn native_http3_cuts_a_committed_body_with_h3_request_cancelled() {
+    // RFC 9114 §8.1: H3_REQUEST_CANCELLED, never a clean FIN.
+    assert_eq!(h3_route_deadline_reset_code_for_test(), 0x010c);
+}
+
+/// Every native HTTP/3 relay that writes a plain response body carries the
+/// route deadline arm, and every trailer-finish site handles its expiry; the
+/// retired refusal no longer exists.
+#[test]
+fn native_http3_relays_enforce_the_route_deadline() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    assert_eq!(
+        server
+            .matches("optional_sleep_elapsed(route_body_sleep.as_mut())")
+            .count(),
+        3,
+        "the inline, refined, and buffered-request native relays must cut on the route deadline"
+    );
+    assert_eq!(
+        server
+            .matches("Err(H3TrailerFinishError::RouteDeadline) =>")
+            .count(),
+        3,
+        "every trailer-finish site must cut on the route deadline"
+    );
+    assert_eq!(
+        bridge
+            .matches("optional_sleep_elapsed(route_body_sleep.as_mut())")
+            .count(),
+        2,
+        "both cross-protocol plain relays must cut on the route deadline"
+    );
+    assert!(
+        !server.contains("not supported over HTTP/3"),
+        "the native HTTP/3 refusal of timed routes must stay retired"
+    );
+}
+
+/// The cross-protocol HTTP/3 → gRPC bridge re-arms the matched rule's attempt
+/// budget for each retry exactly as proxy core's gRPC loop does: charged after
+/// every attempt, ended before backoff, and begun before the next attempt.
+#[test]
+fn native_http3_grpc_bridge_rearms_the_attempt_budget_per_retry() {
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = bridge
+        .split("async fn dispatch_grpc<S>(")
+        .nth(1)
+        .expect("dispatch_grpc")
+        .split("pub(crate) fn boxed_dispatch_grpc_streaming<'a>(")
+        .next()
+        .expect("bounded dispatch_grpc");
+    let charge = "crate::proxy::charge_grpc_route_attempt_budget_expiry(ctx, &mut result);";
+    let first_attempt = dispatch
+        .find("proxy_grpc_request_from_bytes(")
+        .expect("initial attempt");
+    let first_charge = dispatch.find(charge).expect("initial attempt charge");
+    assert!(first_attempt < first_charge);
+
+    let retry = &dispatch[first_charge + charge.len()..];
+    let retry = &retry[retry.find("if grpc_has_retry").expect("retry loop")..];
+    let end = retry
+        .find("ctx.end_grpc_route_attempt();")
+        .expect("attempt budget ends before backoff");
+    let backoff = retry.find("retry_delay(").expect("retry backoff");
+    let begin = retry
+        .find("ctx.begin_grpc_route_attempt();")
+        .expect("fresh budget for the retry");
+    let retry_attempt = retry
+        .find("proxy_grpc_request_from_bytes(")
+        .expect("retry attempt");
+    let retry_charge = retry.find(charge).expect("retry attempt charge");
+    assert!(end < backoff, "backoff must be bounded by the total alone");
+    assert!(backoff < begin && begin < retry_attempt && retry_attempt < retry_charge);
+
+    let streaming = bridge
+        .split("pub(crate) async fn dispatch_grpc_streaming(")
+        .nth(1)
+        .expect("dispatch_grpc_streaming");
+    let open = streaming
+        .find("proxy_grpc_request_streaming_channel(")
+        .expect("streaming attempt");
+    let streaming_charge = streaming.find(charge).expect("streaming attempt charge");
+    assert!(open < streaming_charge);
+}
+
+/// The plain HTTP/3 bridge's source between `dispatch_plain` and
+/// `dispatch_grpc`.
+fn plain_bridge_dispatch() -> &'static str {
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    bridge
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("dispatch_plain")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded dispatch_plain")
+}
+
+/// A gRPC-Web pass-through call on the plain HTTP/3 bridge carries the matched
+/// rule's attempt budget in its RPC deadline. The bridge re-arms it exactly as
+/// proxy core does: ended before every retry backoff, begun again at every
+/// retry attempt's handoff, and an expiry after the handoff charged to the
+/// backend.
+#[test]
+fn native_http3_plain_bridge_rearms_a_grpc_web_attempt_budget_per_retry() {
+    let dispatch = plain_bridge_dispatch();
+    let backoff = "let delay = crate::retry::retry_delay(retry_config, attempt);";
+    let backoffs: Vec<usize> = dispatch.match_indices(backoff).map(|m| m.0).collect();
+    assert_eq!(backoffs.len(), 3, "the mesh and both reqwest retry arms");
+    for at in backoffs {
+        let end = dispatch[..at]
+            .rfind("end_plain_route_attempt(")
+            .expect("a retry backoff must end the attempt budget first");
+        assert!(
+            at - end < 800,
+            "every retry backoff must be bounded by the total alone"
+        );
+    }
+    assert_eq!(
+        dispatch.matches("begin_plain_route_attempt(").count(),
+        2,
+        "both the mesh and the reqwest attempt restart the budget at the handoff"
+    );
+    assert_eq!(
+        dispatch.matches("if attempt > 0 {\n").count(),
+        2,
+        "the first attempt keeps the budget armed when the rule was selected"
+    );
+    assert_eq!(
+        dispatch
+            .matches("record_plain_grpc_web_deadline_after_handoff(")
+            .count(),
+        3,
+        "the header wait, the streamed upload, and buffered collection charge a budget expiry"
+    );
+    assert!(
+        dispatch.contains("crate::proxy::charge_generic_grpc_route_attempt_budget_expiry("),
+        "a mesh attempt's budget expiry is charged as proxy core charges its mesh retry"
+    );
+    assert!(
+        dispatch.contains(
+            "let (mut grpc_web_deadline_at, mut plain_write_bound, mut plain_local_bound) ="
+        ),
+        "the bridge's bounds must be re-derivable per attempt"
+    );
+}
+
+/// A route timeout `504` handed to the plain bridge's shared response pipeline
+/// (the mesh arm) mints no session affinity, as on the native path and in proxy
+/// core.
+#[test]
+fn native_http3_plain_bridge_mints_no_affinity_on_a_route_timeout() {
+    let dispatch = plain_bridge_dispatch();
+    let served = dispatch
+        .find("let sticky_served_target = if crate::http3::route_deadline::total_expiry_recorded(")
+        .expect("served target gated on the route timeout");
+    let reissue = dispatch
+        .find("sticky_cookie_reissue_target(")
+        .expect("sticky reissue");
+    let inject = dispatch
+        .find("inject_sticky_cookie_with_deadline_provenance(")
+        .expect("sticky injection");
+    assert!(served < reissue && reissue < inject);
+    let reissue_call = &dispatch[reissue..inject];
+    assert!(
+        reissue_call.contains("sticky_served_target,")
+            && !reissue_call.contains("current_target.as_deref(),"),
+        "the reissue must name the gated served target"
+    );
+}
+
+/// A deferred `before_proxy` pass can re-publish route overrides, so the
+/// native HTTP/3 handler re-arms the rule's deadlines after the rebind exactly
+/// as proxy core does.
+#[test]
+fn native_http3_rearms_route_deadlines_after_the_deferred_rebind() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let arm = "ctx.arm_route_request_deadline(matches!(http_flavor, HttpFlavor::Grpc));";
+    assert_eq!(server.matches(arm).count(), 2);
+    let rebind = server
+        .find("routing_proxy = ctx\n            .apply_route_overrides_with_upstreams(")
+        .expect("deferred rebind");
+    let rearm = server.rfind(arm).expect("re-arm");
+    assert!(
+        rebind < rearm,
+        "the second arm must follow the deferred rebind"
+    );
+    assert!(
+        !server[rebind..rearm].contains("let destination_rebound"),
+        "the re-arm must run right after the overrides are re-applied"
+    );
+}
+
+/// A route timeout raised while buffering an HTTP/3 upload is logged under its
+/// own rejection phase, never a gRPC deadline label.
+#[test]
+fn native_http3_logs_an_upload_route_timeout_under_its_own_phase() {
+    let server = include_str!("../../../src/http3/server.rs");
+    assert!(
+        server.contains("const H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE: &str =")
+            && server.contains("\"route_request_timeout_h3_upload\";"),
+        "a route upload timeout has its own rejection phase"
+    );
+    let finalize = server
+        .split("async fn finalize_h3_upload_deadline_rejection(")
+        .nth(1)
+        .expect("upload deadline finalizer");
+    let route_arm = finalize
+        .split("None if route_timeout => {")
+        .nth(1)
+        .expect("route timeout arm")
+        .split("Some(termination) => {")
+        .next()
+        .expect("bounded route timeout arm");
+    assert!(
+        route_arm.contains("H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE,"),
+        "the route timeout arm must log its own phase"
+    );
+    assert!(
+        !route_arm.contains("(rejection_phase,"),
+        "the caller's gRPC deadline label must not name a route timeout"
+    );
+}
+
+// ── HTTP/3 advertisement (`Alt-Svc`) ────────────────────────────────────────
 
 // Gateway listener ports clear of every default gateway/admin port.
 const TIMED_PORT: u16 = 18_443;
@@ -220,7 +561,8 @@ fn timed_rule() -> Value {
     json!({
         "match": {},
         "destination": {"backend_host": "v1.svc", "backend_port": 8080},
-        "request_timeout_ms": 500
+        "request_timeout_ms": 500,
+        "attempt_timeout_ms": 200
     })
 }
 
@@ -232,111 +574,8 @@ fn config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> GatewayConf
     }
 }
 
-fn withholds(config: &GatewayConfig, port: Option<u16>) -> bool {
-    route_timeout_withholds_alt_svc_for_test(config, port)
-}
-
-#[test]
-fn alt_svc_is_withheld_only_where_a_timed_rule_is_served() {
-    // No timed rule anywhere: HTTP/3 stays advertised.
-    let untimed_rule = json!({
-        "match": {},
-        "destination": {"backend_host": "v1.svc", "backend_port": 8080},
-        "timeout_ms": 500
-    });
-    let untimed = config(
-        vec![proxy("api", None)],
-        vec![dispatch_plugin("proxy", Some("api"), untimed_rule)],
-    );
-    for port in [None, Some(TIMED_PORT), Some(OTHER_PORT)] {
-        assert!(!withholds(&untimed, port), "{port:?}");
-    }
-
-    // A timed rule on a listener-scoped route withholds on that listener only.
-    // `Alt-Svc` is origin-wide, so every response on that port withholds it,
-    // not just the timed route's own.
-    let scoped = config(
-        vec![
-            proxy("api", Some(TIMED_PORT)),
-            proxy("web", Some(OTHER_PORT)),
-        ],
-        vec![dispatch_plugin("proxy", Some("api"), timed_rule())],
-    );
-    assert!(withholds(&scoped, Some(TIMED_PORT)));
-    assert!(!withholds(&scoped, Some(OTHER_PORT)));
-    // A response whose frontend port is unknown withholds conservatively.
-    assert!(withholds(&scoped, None));
-
-    // A port-agnostic route is reachable on every frontend port.
-    let agnostic = config(
-        vec![proxy("api", None)],
-        vec![dispatch_plugin("proxy", Some("api"), timed_rule())],
-    );
-    for port in [None, Some(TIMED_PORT), Some(OTHER_PORT)] {
-        assert!(withholds(&agnostic, port), "{port:?}");
-    }
-
-    // A global instance can select its timed rule on any route.
-    let global = config(
-        vec![proxy("api", Some(TIMED_PORT))],
-        vec![dispatch_plugin("global", None, timed_rule())],
-    );
-    assert!(withholds(&global, Some(OTHER_PORT)));
-
-    // A proxy-group instance applies through the proxy's association.
-    let mut grouped_proxy = proxy("api", Some(TIMED_PORT));
-    grouped_proxy.plugins = vec![PluginAssociation {
-        plugin_config_id: "route-dispatch".to_string(),
-    }];
-    let grouped = config(
-        vec![grouped_proxy, proxy("web", Some(OTHER_PORT))],
-        vec![dispatch_plugin("proxy_group", None, timed_rule())],
-    );
-    assert!(withholds(&grouped, Some(TIMED_PORT)));
-    assert!(!withholds(&grouped, Some(OTHER_PORT)));
-
-    // A disabled instance serves nothing.
-    let mut disabled_plugin = dispatch_plugin("proxy", Some("api"), timed_rule());
-    disabled_plugin.enabled = false;
-    let disabled = config(vec![proxy("api", None)], vec![disabled_plugin]);
-    assert!(!withholds(&disabled, Some(TIMED_PORT)));
-}
-
-#[test]
-fn alt_svc_is_withheld_where_a_rule_bounds_each_attempt() {
-    // Gateway API `backendRequest` projects `attempt_timeout_ms` beside
-    // `timeout_ms`. Native HTTP/3 cannot enforce that per-attempt total bound
-    // on a non-gRPC request either, so it withholds HTTP/3 exactly like a
-    // total request deadline.
-    let attempt_bounded_rule = json!({
-        "match": {},
-        "destination": {"backend_host": "v1.svc", "backend_port": 8080},
-        "timeout_ms": 500,
-        "attempt_timeout_ms": 500
-    });
-    let scoped = config(
-        vec![
-            proxy("api", Some(TIMED_PORT)),
-            proxy("web", Some(OTHER_PORT)),
-        ],
-        vec![dispatch_plugin(
-            "proxy",
-            Some("api"),
-            attempt_bounded_rule.clone(),
-        )],
-    );
-    assert!(withholds(&scoped, Some(TIMED_PORT)));
-    assert!(!withholds(&scoped, Some(OTHER_PORT)));
-
-    let global = config(
-        vec![proxy("api", Some(TIMED_PORT))],
-        vec![dispatch_plugin("global", None, attempt_bounded_rule)],
-    );
-    assert!(withholds(&global, Some(OTHER_PORT)));
-}
-
 #[tokio::test]
-async fn the_gateway_stops_advertising_http3_where_a_timed_rule_is_served() {
+async fn the_gateway_advertises_http3_where_a_timed_rule_is_served() {
     use ferrum_edge::config::env_config::EnvConfig;
     use ferrum_edge::dns::{DnsCache, DnsConfig};
     use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
@@ -359,28 +598,27 @@ async fn the_gateway_stops_advertising_http3_where_a_timed_rule_is_served() {
     )
     .expect("test proxy state should build");
 
-    // HTTP/3 is enabled, but the only route carries a total request deadline
-    // the native HTTP/3 relays cannot enforce, so it is never advertised.
-    assert_eq!(state.alt_svc_for_frontend_port(Some(https_port)), None);
-    assert_eq!(state.alt_svc_for_frontend_port(None), None);
-
-    // Removing the deadline restores the advertisement on the next response:
-    // the decision is re-derived for each published configuration generation.
-    let mut untimed = state.config.load_full().as_ref().clone();
-    untimed.plugin_configs.clear();
-    assert_eq!(state.update_config(untimed), ConfigApplyOutcome::Applied);
+    // Native HTTP/3 enforces both route timeouts, so a timed rule no longer
+    // costs the origin its HTTP/3 advertisement.
     assert!(state.alt_svc_for_frontend_port(Some(https_port)).is_some());
+    assert!(state.alt_svc_for_frontend_port(None).is_some());
 
-    // A timed rule scoped to one Gateway listener withholds only that
-    // listener's advertisement; a sibling listener and the global port keep it.
+    // A timed rule scoped to one Gateway listener keeps that listener's
+    // advertisement, as well as its sibling's and the global port's.
     let mut scoped = state.config.load_full().as_ref().clone();
     scoped.proxies[0].listen_port = Some(TIMED_PORT);
     scoped.proxies.push(proxy("web", Some(OTHER_PORT)));
-    let timed_plugin = dispatch_plugin("proxy", Some("api"), timed_rule());
-    scoped.plugin_configs.push(timed_plugin);
     assert_eq!(state.update_config(scoped), ConfigApplyOutcome::Applied);
     state.publish_gateway_h3_alt_svc(&[TIMED_PORT, OTHER_PORT]);
-    assert_eq!(state.alt_svc_for_frontend_port(Some(TIMED_PORT)), None);
+    assert!(state.alt_svc_for_frontend_port(Some(TIMED_PORT)).is_some());
     assert!(state.alt_svc_for_frontend_port(Some(OTHER_PORT)).is_some());
     assert!(state.alt_svc_for_frontend_port(Some(https_port)).is_some());
+
+    // A global instance, which can select its timed rule on any route, does
+    // not withhold it either.
+    let mut global = state.config.load_full().as_ref().clone();
+    global.plugin_configs = vec![dispatch_plugin("global", None, timed_rule())];
+    assert_eq!(state.update_config(global), ConfigApplyOutcome::Applied);
+    assert!(state.alt_svc_for_frontend_port(Some(TIMED_PORT)).is_some());
+    assert!(state.alt_svc_for_frontend_port(None).is_some());
 }

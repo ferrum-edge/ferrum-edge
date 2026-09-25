@@ -50,8 +50,8 @@ where Ferrum's behavior differs from the upstream field definitions:
 
 - `HTTPRouteBackendTimeout`: upstream v1.5.1 defines `backendRequest` as the
   time from when a request starts being sent to the backend until its full
-  response has been received. HTTP/1.1 and HTTP/2 enforce exactly that, per
-  attempt, for non-gRPC requests. Where Ferrum differs:
+  response has been received. HTTP/1.1, HTTP/2 and HTTP/3 enforce exactly that,
+  per attempt, for non-gRPC requests. Where Ferrum differs:
   - **gRPC and gRPC-Web** fold the budget into the RPC deadline **when the rule
     is selected**, not at the handoff to the backend. That is stricter than
     upstream: gateway-side time before the handoff (collecting a buffered
@@ -61,14 +61,9 @@ where Ferrum's behavior differs from the upstream field definitions:
   - **A gRPC budget expiry is not retried**: gRPC calls are retried only after
     connection failures, never after `DEADLINE_EXCEEDED`, even when the rule's
     `retry` lists `504`.
-  - **Native HTTP/3** cannot bound a non-gRPC attempt's total duration, so, as
-    for `request` below, it refuses such a request with `503` and `Alt-Svc` is
-    withheld on every listener port that serves such a rule.
-- `HTTPRouteRequestTimeout`: native HTTP/3 cannot enforce `request` on a
-  non-gRPC request, so it refuses that request with `503` instead. Ferrum
-  withholds the HTTP/3 `Alt-Svc` advertisement on every listener port that
-  serves such a rule, so it never steers a client onto the refusal; HTTP/1.1 and
-  HTTP/2 enforce `request` fully.
+- `HTTPRouteRequestTimeout`: no known deviation. HTTP/1.1, HTTP/2 and native
+  HTTP/3 enforce `request` fully, and HTTP/3 stays advertised (`Alt-Svc`) on a
+  listener port that serves a timed rule.
 
 Kick a manual run with:
 
@@ -106,7 +101,7 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | `HTTPRoute` `RequestRedirect` | Yes | Redirect filters materialize action-only dispatch rules with status, hostname, scheme, port, and path replacement support |
 | `HTTPRoute` / `GRPCRoute` `ResponseHeaderModifier` | Yes | Rule-level set/add/remove response-header filters are projected into route-local response-transform rules applied by a generated `response_transformer` consumer, and verified through the data plane on both kinds. Upstream `set` overwrites and `add` appends to an existing value. The generated consumer is additive to a same-name **global** `response_transformer`: global static rules run first, the matched route's rules run last and win on a shared name. A filter naming a protocol-managed (hop-by-hop or framing) response field, or setting, adding or removing a gRPC terminal status field (`grpc-status` / `grpc-message` / `grpc-status-details-bin`), is refused at admission. **Trailer cost:** a route override can name any field at request time, so the requests a filtered rule matches drop their non-reserved backend trailers. The generated consumer's trailer policy is request-conditional: sibling rules, and other routes merged onto the same proxy, that declare no response-header filter keep their trailers. For a native gRPC call the initial metadata is modified while `grpc-status` / `grpc-message` / `grpc-status-details-bin`, the message and streaming are preserved; application trailers on that rule are not. `ResponseHeaderModifier` never modifies trailers on any kind. See [ResponseHeaderModifier and response trailers](#responseheadermodifier-and-response-trailers) |
 | `HTTPRoute` `URLRewrite` | Yes | `hostname` rebases the backend-facing `Host` / `:authority` (backend selection, SNI, and `BackendTLSPolicy` are unaffected — the rewrite changes the forwarded authority only). `path.type: ReplaceFullPath` replaces the whole path; `path.type: ReplacePrefixMatch` replaces the matched `PathPrefix` and preserves the untouched suffix and the query string, reproducing the upstream rewrite table (`/foo/` and `/foo` rewrite identically, an empty replacement normalizes to `/`, and the root `PathPrefix: /` prepends rather than replacing). `ReplacePrefixMatch` requires every match in the rule to be a `PathPrefix` match. Gateway API proxies never strip their `listen_path` and carry no backend path prefix, so the rewrite is the only path mutation. `URLRewrite` is HTTPRoute-only upstream and stays refused on `GRPCRoute`, and combining it with `RequestRedirect` in one rule is refused rather than silently dropping one action. An HTTPRoute rule with no `backendRefs` whose only filters are `URLRewrite` and/or header modifiers answers HTTP 500, as upstream requires for a rule that forwards nowhere |
-| `HTTPRoute` rule `timeouts` (`request`, `backendRequest`) | Yes (`HTTPRouteRequestTimeout`, `HTTPRouteBackendTimeout`) | Standard-channel rule field, validated exactly as the pinned CRD does (GEP-2257 duration grammar; a non-zero `request` bounds `backendRequest`). `backendRequest` bounds ONE backend attempt until its full response has been received, with a fresh budget for every retry attempt; `request` is ONE absolute budget for the whole transaction — every attempt, retry backoff, and the streaming response body. Both stay on the rule's own dispatch entry, never on the shared proxy or upstream. `0s` disables either bound. Known deviations: native HTTP/3 cannot enforce `request` or `backendRequest` on a non-gRPC request yet, so it refuses such a request with `503` rather than serving it unbounded — and HTTP/3 is not advertised (`Alt-Svc`) on a listener port that serves such a rule; a gRPC call's `backendRequest` budget starts when the rule is selected rather than at the handoff, and its expiry is not retried. See [Rule timeouts](#rule-timeouts). GRPCRoute defines no `timeouts` and stays refused |
+| `HTTPRoute` rule `timeouts` (`request`, `backendRequest`) | Yes (`HTTPRouteRequestTimeout`, `HTTPRouteBackendTimeout`) | Standard-channel rule field, validated exactly as the pinned CRD does (GEP-2257 duration grammar; a non-zero `request` bounds `backendRequest`). `backendRequest` bounds ONE backend attempt until its full response has been received, with a fresh budget for every retry attempt; `request` is ONE absolute budget for the whole transaction — every attempt, retry backoff, and the streaming response body. Both stay on the rule's own dispatch entry, never on the shared proxy or upstream. `0s` disables either bound. HTTP/1.1, HTTP/2 and native HTTP/3 enforce both. Known deviations: a gRPC call's `backendRequest` budget starts when the rule is selected rather than at the handoff, and its expiry is not retried. See [Rule timeouts](#rule-timeouts). GRPCRoute defines no `timeouts` and stays refused |
 | `HTTPRoute` rule `retry` (`codes`, `attempts`, `backoff`) | No upstream feature exists on `v1.5.1`; Ferrum data-plane regressions | Experimental-channel rule field, present in the experimental CRD bundle the lab installs and validated exactly as that CRD does (codes 400–599, integer `attempts`, GEP-2257 `backoff`); CRD-valid values beyond Ferrum's limits (`attempts` outside 0–100, `backoff` over 5m) are `UnsupportedValue`. `attempts` counts retries after the initial attempt, `codes` are the retried statuses, and `backoff` is a fixed minimum wait. Status retries replay only `GET`/`HEAD`/`OPTIONS`/`PUT`/`DELETE`; a failure before any byte reached the backend is retried for every method. Every attempt and backoff stays inside the rule's `timeouts.request` budget, and a response whose head reached the client is never replayed. The policy stays on the rule's own dispatch entry, never on the shared proxy or upstream. See [Rule retry](#rule-retry). GRPCRoute defines no `retry` and stays refused |
 | `HTTPRoute` weighted `backendRefs` | Yes | Multiple non-zero backends create a weighted upstream; a rule whose backendRefs are **all** `weight: 0` remains traffic-capturing and returns HTTP 500 through a synthesized fault-abort — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Cross-namespace `HTTPRoute.backendRefs` | Yes | Requires an exact `ReferenceGrant`; missing grants are rejected and unresolved |
@@ -754,9 +749,8 @@ head and every idle gap between response frames, as before.
 
 | Request | Expiry before the response head | Expiry while the body streams |
 |---|---|---|
-| HTTP/1.1 or HTTP/2, not gRPC | The attempt is cancelled and the client gets the ordinary backend-timeout `504` (`{"error":"Backend timeout"}`), charged to the backend. Only the attempt ends: when the rule's `retry` lists `504`, the next attempt runs under a **fresh** budget | The body ends with a timeout error exactly like the `request` cut below: the HTTP/2 stream is reset and the HTTP/1.1 connection is closed, a backend `Content-Length` stays advertised, `body_error_class` is `read_write_timeout`, and the cut is not charged to the backend. A response whose head reached the client is never retried |
-| gRPC / gRPC-Web, any frontend | Folded into the RPC deadline, anchored when the rule is selected (see the known deviations below): the earliest of that budget, `request` and any client `grpc-timeout` / `grpc_deadline` budget wins, the backend is told the remaining budget in `grpc-timeout`, and the client gets `DEADLINE_EXCEEDED`. When the attempt budget binds and expires after the request was sent — waiting for the response head, or collecting a buffered response body — the terminal is `Backend deadline exceeded`, charged to the backend's circuit breaker and passive health exactly like a stalled backend under the header wait. On HTTP/1.1 and HTTP/2 each retry attempt re-arms a fresh budget, and retry backoff is bounded by the total alone | `DEADLINE_EXCEEDED` trailers before response DATA, a stream reset after it |
-| HTTP/3, not gRPC | Refused with `503` before any dial, exactly as for `request` (see the known deviation below) | — |
+| HTTP/1.1, HTTP/2 or HTTP/3, not gRPC | The attempt is cancelled and the client gets the ordinary backend-timeout `504` (`{"error":"Backend timeout"}`), charged to the backend. Only the attempt ends: when the rule's `retry` lists `504`, the next attempt runs under a **fresh** budget | The body ends with a timeout error exactly like the `request` cut below: the HTTP/2 stream is reset, the HTTP/1.1 connection is closed and the HTTP/3 stream is reset with `H3_REQUEST_CANCELLED`; a backend `Content-Length` stays advertised on HTTP/1.1 and HTTP/2, `body_error_class` is `read_write_timeout`, and the cut is not charged to the backend. A response whose head reached the client is never retried |
+| gRPC / gRPC-Web, any frontend | Folded into the RPC deadline, anchored when the rule is selected (see the known deviations below): the earliest of that budget, `request` and any client `grpc-timeout` / `grpc_deadline` budget wins, the backend is told the remaining budget in `grpc-timeout`, and the client gets `DEADLINE_EXCEEDED`. When the attempt budget binds and expires after the request was sent — waiting for the response head, or collecting a buffered response body — the terminal is `Backend deadline exceeded`, charged to the backend's circuit breaker and passive health exactly like a stalled backend under the header wait. On every frontend — the HTTP/3 bridge's gRPC and gRPC-Web pass-through dispatch included — each retry attempt re-arms a fresh budget, and retry backoff is bounded by the total alone | `DEADLINE_EXCEEDED` trailers before response DATA, a stream reset after it |
 
 `request`, when set, still bounds the whole transaction: an attempt never runs
 past it, the earlier of the two instants wins, and when both expire together
@@ -779,14 +773,6 @@ expiry while it is still streaming is charged to the backend.
 
 **Known deviations:**
 
-- **HTTP/3, not gRPC.** The native HTTP/3 relays write the response head and
-  body from inside the dispatch, so they cannot enforce `backendRequest` on a
-  non-gRPC request. Exactly as for `request`, such a request is refused with
-  `503` (`{"error":"Route request timeout is not supported over HTTP/3"}`)
-  before any target selection, breaker admission, or dial, and the H1/H2
-  frontends withhold `Alt-Svc` on every listener port that serves such a rule.
-  gRPC and gRPC-Web over HTTP/3 fold the budget into the RPC deadline as above
-  (an HTTP/3 retry does not re-arm it).
 - **gRPC budget start.** A gRPC or gRPC-Web budget is anchored when the rule is
   selected, not when the attempt is handed to the backend, which is stricter
   than upstream: gateway-side time before the handoff (collecting a buffered
@@ -795,6 +781,14 @@ expiry while it is still streaming is charged to the backend.
 - **gRPC budget expiry is not retried.** gRPC calls are retried only after
   connection failures, so a call whose attempt budget expired ends with
   `DEADLINE_EXCEEDED` even when the rule's `retry` lists `504`.
+- **HTTP/3 bridge buffered collection is not retried.** The HTTP/3 bridge to
+  HTTP/1.1 and HTTP/2 backends collects a buffered response body (a
+  response-body plugin or `response_body_mode: buffer`) after its retry loop,
+  once `after_proxy` has run on the response head. An attempt budget that
+  expires while that body is collected ends the request with the same charged
+  backend-timeout `504`, but the rule's `retry` does not replay it, unlike
+  HTTP/1.1, HTTP/2 and the native HTTP/3 backend pool, which collect a buffered
+  body inside the attempt.
 
 The upstream `HTTPRouteTimeoutBackendRequest` test delays only the response
 head, which every frontend bounds.
@@ -805,9 +799,8 @@ against it and no retry re-arms it:
 
 | Request | Expiry before the response head | Expiry while the body streams |
 |---|---|---|
-| HTTP/1.1 or HTTP/2, not gRPC | The in-flight attempt or retry backoff is cancelled — and no new attempt starts once the budget is spent — and the client gets `504` `{"error":"Request timeout"}` with `X-Gateway-Error: backend_timeout`. Never retried. The transaction log names the phase in metadata `route_request_timeout`: `dispatch` when the backend held the cancelled attempt (error class `read_write_timeout`, charged to that backend), `before_dispatch` when the attempt had not yet been handed to a backend, and `retry_backoff` (both the health-neutral `dispatch_policy_rejected`) | The body ends with a timeout error: the HTTP/2 stream is reset and the HTTP/1.1 connection is closed rather than presenting a complete response; a backend `Content-Length` stays advertised, so the cut reads as a short body. `body_error_class` is `read_write_timeout`, and the cut is not charged to the backend |
+| HTTP/1.1, HTTP/2 or HTTP/3, not gRPC | The in-flight attempt or retry backoff is cancelled — and no new attempt starts once the budget is spent — and the client gets `504` `{"error":"Request timeout"}` with `X-Gateway-Error: backend_timeout`. Never retried. The transaction log names the phase in metadata `route_request_timeout`: `dispatch` when the backend held the cancelled attempt (error class `read_write_timeout`, charged to that backend), `before_dispatch` when the attempt had not yet been handed to a backend, and `retry_backoff` (both the health-neutral `dispatch_policy_rejected`) | The body ends with a timeout error: the HTTP/2 stream is reset, the HTTP/1.1 connection is closed, and the HTTP/3 stream is reset with `H3_REQUEST_CANCELLED`, rather than presenting a complete response; on HTTP/1.1 and HTTP/2 a backend `Content-Length` stays advertised, so the cut reads as a short body. `body_error_class` is `read_write_timeout`, and the cut is not charged to the backend |
 | gRPC / gRPC-Web, any frontend | Folded into the RPC deadline (the earlier of the route budget and any client `grpc-timeout` / `grpc_deadline` budget wins), so the existing deadline machinery answers `DEADLINE_EXCEEDED` and forwards the remaining budget upstream as `grpc-timeout` | `DEADLINE_EXCEEDED` trailers before response DATA, a stream reset after it |
-| HTTP/3, not gRPC | Refused with `503` `{"error":"Route request timeout is not supported over HTTP/3"}` before target selection, breaker admission, or any dial | — |
 
 **Backend-health attribution.** A `request` expiry is charged to a backend —
 circuit breaker, passive health (Istio outlier detection included), and the
@@ -826,25 +819,30 @@ total budget ends a long healthy download or a slow-reading client as surely as
 a slow backend. A gRPC request keeps the attribution of the client RPC deadline
 it was folded into.
 
-The HTTP/3 refusal is deliberate and fail-closed. The native HTTP/3 relays write
-the response head and body from inside the dispatch, so they cannot yet turn the
-deadline into a `504` or a mid-body reset; serving the request would drop the
-policy it was routed under. HTTP/3 is only reachable on TLS listeners with
-`FERRUM_ENABLE_HTTP3=true`, and the same request over HTTP/1.1 or HTTP/2 is
-bounded as above. **The gateway never steers a client onto the refusal:** a
-browser caches `Alt-Svc` for the whole origin (`ma=86400`) and does not fall back
-to TCP on an HTTP `503`, so the H1/H2 frontends omit `Alt-Svc` from every
-response on a listener port that serves a rule carrying `request` or
-`backendRequest` — on every port when that rule is on a port-agnostic route. Withholding it on the timed
-rule's own responses alone would not be enough, because any sibling route's
-response on the same origin would still advertise HTTP/3. A client that cached
-`Alt-Svc` before the rule gained its deadline, or reaches HTTP/3 without it (a
-DNS `HTTPS` record or explicit client configuration), still gets the `503` until
-it falls back on its own. On HTTP/3 the refusal also runs before the deferred
-`before_proxy` pass, so a `response_mock` or `fault_injection` abort that defers
-behind a backend-path policy plugin answers `503` there rather than the mock or
-abort H1/H2 return. Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP
-response bodies and are not bounded by `request` on any frontend. Gateway-local
+**HTTP/3.** The native HTTP/3 relays — the bridge to HTTP/1.1 and HTTP/2
+backends, and the native HTTP/3 backend pool, buffered or streaming, with or
+without retries — apply both bounds at the same phases as HTTP/1.1 and HTTP/2:
+every backend attempt runs under the total deadline and a fresh attempt budget,
+a buffered client upload is bounded by the total deadline, retry backoff spends
+it, and the committed attempt's response body is cut at the earlier of the two.
+A cut body ends with an `H3_REQUEST_CANCELLED` stream reset, never a clean
+finish, so an HTTP/3 client cannot mistake it for a complete response. HTTP/3
+therefore stays advertised (`Alt-Svc`) on every listener port, timed rules
+included. A native HTTP/3 attempt is handed to the backend from its first poll
+(the QUIC dial and the request go out together), exactly like a proxy-core retry
+attempt, so its budget starts there. A gateway-local wait before an attempt
+starts (backend admission, request-body hooks) is not cancelled mid-wait: a
+total deadline spent there refuses the next attempt without dialing it, with
+the health-neutral `before_dispatch` `504`. The route deadline is not raced
+against a client write parked in QUIC flow control: a relay whose client stops
+reading is cut the next time it waits on the backend, so a client that never
+grants flow control again keeps its stream until it reads, its connection
+closes, or an authenticated request's credential lifetime ends. HTTP/1.1 and
+HTTP/2 behave the same way — their body is cut only when the transport next
+polls it.
+
+Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
+not bounded by `request` on any frontend. Gateway-local
 plugin hooks on a non-gRPC request are not cancelled mid-hook; their time counts
 against the budget, which is enforced when each backend attempt starts, while it
 is awaited, in retry backoff, and while the body streams (the plugins the
@@ -883,8 +881,19 @@ isolation, withdrawal, and backend-health attribution through a live circuit
 breaker. The paused-clock unit tests in
 `tests/unit/gateway_core/route_request_deadline_tests.rs` pin the attempt
 wrapper (a spent budget refuses an attempt without polling it), the attribution
-rule, `Content-Length` preservation, and `Alt-Svc` withholding for `request`
-and `backendRequest` rules;
+rule, `Content-Length` preservation, native HTTP/3's pre-head terminals (byte
+for byte proxy core's), its committed-body bound and `H3_REQUEST_CANCELLED`
+cut, the HTTP/3 gRPC bridge re-arming the attempt budget for each retry, and
+`Alt-Svc` staying advertised where a timed rule is served;
+`tests/functional/functional_h3_local_policy_test.rs` drives an HTTP/3
+client through a live gateway's bridge to an HTTP/1.1 backend: a served
+request, the pre-head `504`, a reset committed body, an attempt budget retried
+with its request body replayed, and a fresh budget for each retry of a
+gRPC-Web pass-through call; `tests/functional/scripted_backend_h3_tests.rs`
+drives the same deadlines through the native HTTP/3 backend pool to a scripted
+HTTP/3 backend: the pre-head `504`, a committed body reset with
+`H3_REQUEST_CANCELLED`, and an attempt budget retried with its request body
+replayed;
 `tests/unit/gateway_core/route_attempt_budget_tests.rs` pins where the
 per-attempt budget starts (at the handoff, even when the attempt answers in the
 same poll, or a retry's first poll), that it

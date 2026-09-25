@@ -11844,15 +11844,95 @@ pub mod _test_support {
         )
     }
 
-    /// Whether `config` withholds the HTTP/3 `Alt-Svc` advertisement on
-    /// `frontend_port` because a route rule reachable there carries a total
-    /// request deadline or a per-attempt total bound — the rule
-    /// `ProxyState::alt_svc_for_frontend_port` applies to every response.
-    pub fn route_timeout_withholds_alt_svc_for_test(
-        config: &crate::config::types::GatewayConfig,
-        frontend_port: Option<u16>,
-    ) -> bool {
-        crate::proxy::RouteTimeoutAltSvc::for_config(1, config).withholds(frontend_port)
+    /// The native HTTP/3 terminal for an attempt a matched route rule's
+    /// deadline ended before the response head (#5646): `(status, body, error
+    /// class, logged phase, reads as a post-wire read timeout)`. Every native
+    /// HTTP/3 attempt is handed to the backend from its first poll. `expiry` is
+    /// one of `"not_started"`, `"in_flight"`, or `"attempt_budget"`.
+    pub fn h3_route_deadline_terminal_for_test(
+        expiry: &str,
+    ) -> (
+        u16,
+        &'static str,
+        crate::retry::ErrorClass,
+        Option<String>,
+        bool,
+    ) {
+        let expiry = match expiry {
+            "not_started" => crate::proxy::RouteDeadlineExpiry::BeforeDispatch,
+            "in_flight" => crate::proxy::RouteDeadlineExpiry::InFlight,
+            _ => crate::proxy::RouteDeadlineExpiry::AttemptBudget,
+        };
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        let error = crate::http3::route_deadline::expiry_pool_error(&mut ctx, expiry);
+        let (status, body) = crate::http3::route_deadline::expiry_status_body(expiry);
+        let phase = ctx
+            .metadata
+            .remove(crate::plugins::ROUTE_REQUEST_TIMEOUT_METADATA_KEY);
+        (
+            status,
+            body,
+            crate::http3::route_deadline::expiry_error_class(expiry),
+            phase,
+            error.request_on_wire() && error.is_read_timeout(),
+        )
+    }
+
+    /// How the native HTTP/3 relays bound one attempt under a matched route
+    /// rule's deadlines (#5646), for a total deadline `total`, an attempt
+    /// budget `attempt_timeout`, and the committed attempt's budget instant
+    /// `attempt_deadline`: `(a fresh attempt's budget instant, the committed
+    /// body's deadline, whether the attempt budget alone has expired, how the
+    /// body deadline ended the attempt)`.
+    pub fn h3_route_attempt_bounds_for_test(
+        total: Option<tokio::time::Instant>,
+        attempt_timeout: Option<std::time::Duration>,
+        attempt_deadline: Option<tokio::time::Instant>,
+    ) -> (
+        Option<tokio::time::Instant>,
+        Option<tokio::time::Instant>,
+        bool,
+        &'static str,
+    ) {
+        let route = crate::http3::route_deadline::H3RouteDeadlines::new(total, attempt_timeout);
+        (
+            route.start_attempt(),
+            route.body_deadline(attempt_deadline),
+            route.attempt_budget_expired(attempt_deadline),
+            route_deadline_expiry_label(route.body_expiry()),
+        )
+    }
+
+    /// The deadlines the native HTTP/3 relays read for a request whose matched
+    /// rule carries `request_timeout_ms` / `attempt_timeout_ms` (#5646):
+    /// `(total deadline armed, attempt budget)`. A gRPC-flavored request folds
+    /// both into its RPC deadline instead, so the relays see neither.
+    pub fn h3_route_deadlines_armed_for_test(
+        request_timeout_ms: Option<u64>,
+        attempt_timeout_ms: Option<u64>,
+        grpc_flavored: bool,
+    ) -> (bool, Option<std::time::Duration>) {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        ctx.route_override_request_timeout_ms = request_timeout_ms;
+        ctx.route_override_attempt_timeout_ms = attempt_timeout_ms;
+        ctx.arm_route_request_deadline(grpc_flavored);
+        let route = crate::http3::route_deadline::H3RouteDeadlines::from_ctx(&ctx);
+        (route.total().is_some(), route.attempt_timeout())
+    }
+
+    /// The HTTP/3 error code a route deadline cut resets a committed response
+    /// with (#5646): RFC 9114 `H3_REQUEST_CANCELLED`.
+    pub fn h3_route_deadline_reset_code_for_test() -> u64 {
+        let code = crate::http3::route_deadline::ROUTE_DEADLINE_RESET_CODE;
+        code.value()
     }
 
     pub fn proxy_body_into_grpc_web_streaming_for_test(

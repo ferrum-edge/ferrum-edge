@@ -525,11 +525,23 @@ where
         false,
         args.backend_start.elapsed(),
     );
+    // The matched route rule's total deadline (#5646) and attempt budget end
+    // the response-head wait too. Both are backend-held timeouts charged
+    // exactly like the watermarks above; the total deadline's `504` carries
+    // proxy core's route timeout body and names the `dispatch` phase.
+    let body = if plain_route_deadline_fired(request_ctx) {
+        request_ctx.mark_route_request_timeout_exceeded(
+            crate::proxy::ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH,
+        );
+        crate::proxy::ROUTE_REQUEST_TIMEOUT_BODY
+    } else {
+        r#"{"error":"Backend timeout"}"#
+    };
     let mut outcome = write_plain_gateway_error(
         stream,
         request_ctx,
         StatusCode::GATEWAY_TIMEOUT,
-        r#"{"error":"Backend timeout"}"#,
+        body,
         Some(("x-gateway-error", "backend_timeout")),
         args.backend_start,
         args.bytes_sent,
@@ -1180,6 +1192,46 @@ fn build_plain_request_builder(
     req_builder
 }
 
+/// Why one prebuffered plain-bridge attempt produced no response head.
+enum PlainAttemptFailure {
+    /// The backend exchange itself failed.
+    Transport(reqwest::Error),
+    /// The matched route rule's per-attempt budget (`attempt_timeout_ms`,
+    /// Gateway API `timeouts.backendRequest`, #5646) expired first.
+    AttemptBudget,
+}
+
+impl PlainAttemptFailure {
+    /// The attempt's result as the retry policy sees it. An attempt budget
+    /// expiry is the ordinary backend-timeout `504`, exactly as proxy core
+    /// reports it, so the rule's retry policy may retry it.
+    fn attempt_result(&self, state: &ProxyState) -> crate::retry::BackendResponse {
+        match self {
+            Self::Transport(error) => reqwest_error_response_for_cross_protocol(state, error, None),
+            Self::AttemptBudget => {
+                let class = ErrorClass::ReadWriteTimeout;
+                crate::proxy::http_backend_dispatch_error_response(class, None)
+            }
+        }
+    }
+
+    fn warn_https_to_plaintext_backend(&self, proxy: &Proxy, url: &str) {
+        let Self::Transport(error) = self else {
+            return;
+        };
+        crate::proxy::https_to_plaintext::maybe_warn_https_to_plaintext_backend(proxy, url, error);
+    }
+}
+
+impl std::fmt::Display for PlainAttemptFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => std::fmt::Display::fmt(error, f),
+            Self::AttemptBudget => f.write_str("route attempt budget exceeded"),
+        }
+    }
+}
+
 fn reqwest_error_response_for_cross_protocol(
     state: &ProxyState,
     e: &reqwest::Error,
@@ -1328,6 +1380,47 @@ async fn collect_reqwest_response_body_with_limit(
             }
         }
     }
+}
+
+/// Collect a buffered plain response under the matched route rule's body
+/// deadline (#5646): the earlier of its total deadline and the committed
+/// attempt's budget. The body is part of the attempt, as in proxy core, so an
+/// expiry is the collector's own `504` failure shape, charged to the backend
+/// that held the attempt: proxy core's route timeout body (phase `dispatch`)
+/// for the total deadline, the ordinary backend-timeout body for the attempt
+/// budget. No timer exists without a deadline.
+async fn collect_under_route_deadline<F>(
+    ctx: &mut RequestContext,
+    route: crate::http3::route_deadline::H3RouteDeadlines,
+    deadline: Option<tokio::time::Instant>,
+    collect: F,
+) -> Result<bytes::Bytes, (u16, Vec<u8>, Option<ErrorClass>)>
+where
+    F: std::future::Future<Output = Result<bytes::Bytes, (u16, Vec<u8>, Option<ErrorClass>)>>,
+{
+    match crate::plugins::await_deadline_first(deadline, collect).await {
+        Ok(result) => result,
+        Err(()) => {
+            let expiry = route.body_expiry();
+            crate::http3::route_deadline::mark_expiry_phase(ctx, expiry);
+            let (status, body) = crate::http3::route_deadline::expiry_status_body(expiry);
+            Err((
+                status,
+                body.as_bytes().to_vec(),
+                Some(ErrorClass::ReadWriteTimeout),
+            ))
+        }
+    }
+}
+
+/// Headers for a buffered-collection failure. A read or route timeout `504`
+/// carries the `backend_timeout` `X-Gateway-Error` token, as proxy core's does.
+fn plain_collect_failure_headers(status: u16) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    if status == StatusCode::GATEWAY_TIMEOUT.as_u16() {
+        crate::proxy::insert_x_gateway_error_for_backend_failure(&mut headers, false, status);
+    }
+    headers
 }
 
 /// Acquire the shared reqwest client for one H3→HTTP plain-bridge attempt,
@@ -1844,6 +1937,151 @@ fn record_plain_grpc_web_client_deadline(
     );
 }
 
+/// Record a gRPC-Web pass-through RPC deadline that fired after the attempt
+/// was handed to the backend, before its response was complete.
+///
+/// When the deadline in force was the matched route rule's per-attempt budget
+/// (#5646, `attempt_timeout_ms` / Gateway API `timeouts.backendRequest`), the
+/// backend held the attempt past its bound, so it is charged the backend read
+/// timeout exactly as proxy core's `charge_generic_grpc_route_attempt_budget_expiry`
+/// re-shapes the same expiry on HTTP/1.1 and HTTP/2. Any other deadline is the
+/// client's and stays health-neutral. Returns the class the terminal is logged
+/// under when the backend was charged.
+#[allow(clippy::too_many_arguments)]
+fn record_plain_grpc_web_deadline_after_handoff(
+    ctx: &RequestContext,
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&UpstreamTarget>,
+    current_cb_target_key: Option<&str>,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+) -> Option<ErrorClass> {
+    let route_attempt_budget_expired = ctx.grpc_deadline_is_route_attempt_budget()
+        && ctx
+            .grpc_deadline_at()
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+    if !route_attempt_budget_expired {
+        record_plain_grpc_web_client_deadline(
+            state,
+            epoch,
+            proxy,
+            upstream_balancer,
+            current_target,
+            current_cb_target_key,
+            cb_probe,
+            backend_start,
+            backend_admission_permits,
+            backend_admission_elapsed,
+        );
+        return None;
+    }
+    let class = Some(ErrorClass::ReadWriteTimeout);
+    record_backend_outcome_no_conn_end(
+        state,
+        proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
+        current_target,
+        current_cb_target_key,
+        StatusCode::OK.as_u16(),
+        false,
+        class,
+        cb_probe.take_slot(),
+        false,
+        backend_start.elapsed(),
+    );
+    record_cross_protocol_backend_admission_outcome(
+        backend_admission_permits,
+        StatusCode::OK.as_u16(),
+        false,
+        class,
+        backend_admission_elapsed,
+    );
+    class
+}
+
+/// Log a gRPC-Web deadline terminal under the backend read timeout when
+/// [`record_plain_grpc_web_deadline_after_handoff`] charged the backend.
+#[inline]
+fn apply_plain_grpc_web_deadline_charge(
+    outcome: &mut CrossProtocolOutcome,
+    charged: Option<ErrorClass>,
+) {
+    if charged.is_some() {
+        outcome.error_class = charged;
+        outcome.body_error_class = None;
+    }
+}
+
+/// The plain bridge's dispatch bounds for the RPC deadline in force NOW: the
+/// gRPC-Web pass-through deadline (`None` for a plain request), the write bound
+/// that composes it with the authorization plan, and the gateway-local bound
+/// that also folds in the route rule's total deadline.
+///
+/// A gRPC-Web request's RPC deadline carries the matched rule's per-attempt
+/// budget (#5646), so the bridge re-derives these whenever that budget starts
+/// ([`RequestContext::begin_grpc_route_attempt`]) or ends
+/// ([`RequestContext::end_grpc_route_attempt`]).
+#[inline(never)]
+fn plain_bridge_dispatch_bounds(
+    ctx: &RequestContext,
+    policy_flavor: HttpFlavor,
+    auth_plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    route: crate::http3::route_deadline::H3RouteDeadlines,
+) -> PlainBridgeDispatchBounds {
+    let grpc_web_deadline_at = if matches!(policy_flavor, HttpFlavor::Grpc) {
+        ctx.grpc_deadline_at()
+    } else {
+        None
+    };
+    let write_bound =
+        crate::proxy::auth_lifetime::ComposedAuthBound::compose(grpc_web_deadline_at, auth_plan);
+    let local_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        crate::proxy::earliest_deadline(grpc_web_deadline_at, route.total()),
+        auth_plan,
+    );
+    (grpc_web_deadline_at, write_bound, local_bound)
+}
+
+type PlainBridgeDispatchBounds = (
+    Option<tokio::time::Instant>,
+    crate::proxy::auth_lifetime::ComposedAuthBound,
+    crate::proxy::auth_lifetime::ComposedAuthBound,
+);
+
+/// Start a retry attempt's route budget (#5646) at its handoff to the
+/// backend and return the bridge's bounds under it. A no-op on the bounds
+/// unless a gRPC-Web request's matched rule carries a per-attempt budget.
+#[inline(never)]
+fn begin_plain_route_attempt(
+    ctx: &mut RequestContext,
+    policy_flavor: HttpFlavor,
+    auth_plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    route: crate::http3::route_deadline::H3RouteDeadlines,
+) -> PlainBridgeDispatchBounds {
+    ctx.begin_grpc_route_attempt();
+    plain_bridge_dispatch_bounds(ctx, policy_flavor, auth_plan, route)
+}
+
+/// End a failed attempt's route budget (#5646) before retry backoff, so the
+/// backoff is bounded by the total deadline alone, and return the bridge's
+/// bounds without it.
+#[inline(never)]
+fn end_plain_route_attempt(
+    ctx: &mut RequestContext,
+    policy_flavor: HttpFlavor,
+    auth_plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    route: crate::http3::route_deadline::H3RouteDeadlines,
+) -> PlainBridgeDispatchBounds {
+    ctx.end_grpc_route_attempt();
+    plain_bridge_dispatch_bounds(ctx, policy_flavor, auth_plan, route)
+}
+
 /// Record a client deadline after the backend has already produced a terminal
 /// response.
 ///
@@ -1907,6 +2145,54 @@ fn record_plain_grpc_web_client_deadline_after_backend_response(
     );
 }
 
+/// Whether the plain bridge's non-authorization dispatch bound fired because
+/// the matched route rule's total deadline (#5646) expired. A plain request
+/// has no gRPC-Web RPC deadline and a gRPC-Web request no route deadline, so
+/// the two owners of that bound never coexist.
+fn plain_route_deadline_fired(ctx: &RequestContext) -> bool {
+    let route = crate::http3::route_deadline::H3RouteDeadlines::from_ctx(ctx);
+    route.total_elapsed()
+}
+
+/// Record a route total deadline that expired in retry backoff (#5646); a
+/// no-op for the gRPC-Web RPC deadline that shares the backoff bound.
+#[inline(never)]
+fn mark_plain_route_backoff_expiry(ctx: &mut RequestContext) {
+    if plain_route_deadline_fired(ctx) {
+        crate::http3::route_deadline::mark_backoff_expiry(ctx);
+    }
+}
+
+/// Proxy core's route timeout `504` (#5646) for a plain request whose matched
+/// rule's total deadline expired while only the gateway was waiting: buffering
+/// the client upload, acquiring the backend client, or in retry backoff. No
+/// backend held the request, so it is health-neutral, and the transaction log
+/// names the phase (`before_dispatch` unless backoff already recorded
+/// `retry_backoff`).
+#[inline(never)]
+async fn write_plain_route_timeout<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    backend_start: Instant,
+    bytes_sent: u64,
+    backend_target_url: &str,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    crate::http3::route_deadline::mark_phase_once(
+        ctx,
+        crate::proxy::ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH,
+    );
+    let class = ErrorClass::DispatchPolicyRejected;
+    let response = crate::proxy::route_request_timeout_response(None, class);
+    let written =
+        write_classified_backend_dispatch_error(stream, ctx, &response, backend_start, bytes_sent);
+    let mut outcome = written.await?;
+    outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
+    Ok(outcome)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn write_plain_grpc_web_client_deadline<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -1921,6 +2207,17 @@ async fn write_plain_grpc_web_client_deadline<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    // The same bound carries a plain request's route total deadline (#5646).
+    if plain_route_deadline_fired(ctx) {
+        return write_plain_route_timeout(
+            stream,
+            ctx,
+            backend_start,
+            bytes_sent,
+            backend_target_url,
+        )
+        .await;
+    }
     ctx.mark_gateway_deadline_response_selected();
     let mut outcome = write_final_body_reject(
         stream,
@@ -2232,11 +2529,6 @@ where
     } else {
         HttpFlavor::Plain
     };
-    let grpc_web_deadline_at = if matches!(policy_flavor, HttpFlavor::Grpc) {
-        ctx.grpc_deadline_at()
-    } else {
-        None
-    };
     // Absolute authorization lifetime for this admitted request (issue #3815).
     // Anchored once at credential acceptance and never refreshed by relay
     // activity. `grpc_web_deadline_at` is OPTIONAL — a plain HTTP client never
@@ -2248,14 +2540,29 @@ where
         ctx,
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
-    // TYPED, not just the instant: a write parked in QUIC flow control is
-    // routinely not observed again until after BOTH instants have passed, so
-    // the winner is captured here rather than re-derived from the clock in the
-    // deadline branches below.
-    let plain_write_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
-        grpc_web_deadline_at,
-        plain_auth_deadline_plan,
-    );
+    // The matched route rule's deadlines (#5646); both `None` for gRPC-Web and
+    // for a rule without timeouts. The total deadline also bounds the phases
+    // where only the gateway is waiting — buffering a mesh upload, acquiring
+    // the client, retry backoff — through `plain_local_bound`, whose expiry
+    // there is proxy core's health-neutral route timeout `504` (see
+    // `write_plain_grpc_web_client_deadline`). Each attempt folds the total
+    // deadline and its own budget into its response-head wait instead, and the
+    // committed attempt's `route_attempt_deadline` bounds its body.
+    let route = crate::http3::route_deadline::H3RouteDeadlines::from_ctx(ctx);
+    // `plain_write_bound` is TYPED, not just the instant: a write parked in QUIC
+    // flow control is routinely not observed again until after BOTH instants
+    // have passed, so the winner is captured here rather than re-derived from
+    // the clock in the deadline branches below.
+    //
+    // A gRPC-Web request folds the rule's per-attempt budget (#5646) into its
+    // RPC deadline, so all three are re-derived when a retry attempt's budget
+    // starts at its handoff and when a failed attempt's budget ends before
+    // retry backoff, exactly as proxy core re-arms it: each attempt runs under
+    // a fresh budget and backoff under the total alone. After the loop they
+    // hold the committed attempt's bounds.
+    let (mut grpc_web_deadline_at, mut plain_write_bound, mut plain_local_bound) =
+        plain_bridge_dispatch_bounds(ctx, policy_flavor, plain_auth_deadline_plan, route);
+    let mut route_attempt_deadline: Option<tokio::time::Instant> = None;
 
     let req_method = match parse_reqwest_method(method) {
         Some(m) => m,
@@ -2317,7 +2624,7 @@ where
     {
         match super::server::collect_h3_request_body_under_authorization(
             drain_h3_body(stream, effective_max_request_body_size_bytes),
-            plain_write_bound,
+            plain_local_bound,
             proxy.backend_read_timeout_ms,
         )
         .await
@@ -2512,23 +2819,63 @@ where
                         .filter(|target| crate::proxy::target_requires_http_mesh_egress(target))
                     {
                         drop(pending_slot);
+                        // The attempt is handed to the backend from its first
+                        // poll, so the matched route rule's attempt budget
+                        // (#5646) starts there; a route deadline that ends it is
+                        // the attempt's result, exactly as in proxy core. A
+                        // gRPC-Web retry restarts the budget folded into its RPC
+                        // deadline, which the mesh dispatch reads from `ctx`.
+                        // The gateway-local bound is not consulted again before
+                        // this attempt ends, so only the dispatch bounds move.
+                        if attempt > 0 {
+                            (grpc_web_deadline_at, plain_write_bound, _) =
+                                begin_plain_route_attempt(
+                                    ctx,
+                                    policy_flavor,
+                                    plain_auth_deadline_plan,
+                                    route,
+                                );
+                        }
                         // Boxed out of line — see `boxed_proxy_h3_plain_http_mesh_buffered`.
-                        let attempt_result = crate::proxy::boxed_proxy_h3_plain_http_mesh_buffered(
-                            state,
-                            dispatch_proxy,
-                            &current_url,
-                            method,
-                            proxy_headers,
-                            Bytes::from(buffered_body.clone()),
-                            target,
-                            plugins,
-                            ctx,
-                            client_ip,
-                            xff_append_ip,
-                            ctx.request_is_secure,
+                        let mesh_attempt = crate::proxy::await_route_request_deadline(
+                            route.total(),
+                            crate::proxy::RouteAttemptBudget::from_start(
+                                route.attempt_timeout(),
+                                &mut route_attempt_deadline,
+                            ),
+                            crate::proxy::boxed_proxy_h3_plain_http_mesh_buffered(
+                                state,
+                                dispatch_proxy,
+                                &current_url,
+                                method,
+                                proxy_headers,
+                                Bytes::from(buffered_body.clone()),
+                                target,
+                                plugins,
+                                ctx,
+                                client_ip,
+                                xff_append_ip,
+                                ctx.request_is_secure,
+                            ),
                         )
                         .await;
+                        let mut attempt_result = match mesh_attempt {
+                            Ok(result) => result,
+                            Err(expiry) => {
+                                crate::http3::route_deadline::expiry_backend_response(ctx, expiry)
+                            }
+                        };
+                        // A gRPC-Web budget expiry the mesh dispatch answered as
+                        // the client's deadline is charged to this backend, as
+                        // proxy core charges its mesh retry attempts.
+                        crate::proxy::charge_generic_grpc_route_attempt_budget_expiry(
+                            ctx,
+                            proxy_headers,
+                            true,
+                            &mut attempt_result,
+                        );
                         if let Some(retry_config) = retry_config
+                            && !crate::http3::route_deadline::total_expiry_recorded(route, ctx)
                             && crate::retry::should_retry(
                                 retry_config,
                                 method,
@@ -2579,9 +2926,18 @@ where
                                     attempt_result.connection_error,
                                     cb_probe.take_slot(),
                                 );
+                                // A gRPC-Web route attempt budget (#5646) ends with the failed
+                                // attempt, so backoff is bounded by the total deadline alone.
+                                (grpc_web_deadline_at, plain_write_bound, plain_local_bound) =
+                                    end_plain_route_attempt(
+                                        ctx,
+                                        policy_flavor,
+                                        plain_auth_deadline_plan,
+                                        route,
+                                    );
                                 let delay = crate::retry::retry_delay(retry_config, attempt);
                                 if crate::plugins::await_deadline_first(
-                                    plain_write_bound.deadline(),
+                                    plain_local_bound.deadline(),
                                     tokio::time::sleep(delay),
                                 )
                                 .await
@@ -2597,7 +2953,7 @@ where
                                     // the client-facing write — same as the
                                     // reqwest retry arms below.
                                     if let Some(termination) =
-                                        plain_write_bound.expired_authorization()
+                                        plain_local_bound.expired_authorization()
                                     {
                                         ctx.record_authorization_termination_once(
                                             termination,
@@ -2611,6 +2967,9 @@ where
                                         )
                                         .await;
                                     }
+                                    // Backoff is gateway-local: a route total expiry here is
+                                    // health-neutral and logged under `retry_backoff`.
+                                    mark_plain_route_backoff_expiry(ctx);
                                     return write_plain_grpc_web_client_deadline(
                                         stream,
                                         plugins,
@@ -2725,7 +3084,7 @@ where
                     }
 
                     let client_result = match crate::plugins::await_deadline_first(
-                        plain_write_bound.deadline(),
+                        plain_local_bound.deadline(),
                         get_cross_protocol_client(
                             state,
                             dial_proxy,
@@ -2747,7 +3106,7 @@ where
                         Ok(result) => result?,
                         Err(()) => {
                             drop(pending_slot);
-                            if let Some(termination) = plain_write_bound.expired_authorization() {
+                            if let Some(termination) = plain_local_bound.expired_authorization() {
                                 ctx.record_authorization_termination_once(
                                     termination,
                                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
@@ -2870,8 +3229,29 @@ where
                     };
                     // ONE absolute header instant, so a protocol-NACK replay
                     // cannot re-arm the operator's response-header bound.
-                    let plain_header_deadline_at =
+                    // The attempt is handed to the backend here, so the matched
+                    // route rule's attempt budget (#5646) starts now. It and the
+                    // route's total deadline end the response-head wait below
+                    // like the operator's header bound; see the typed arms. A
+                    // gRPC-Web retry restarts the budget folded into its RPC
+                    // deadline instead, which the write bound below races.
+                    // The gateway-local bound is not consulted again before this
+                    // attempt ends, so only the dispatch bounds move.
+                    if attempt > 0 {
+                        (grpc_web_deadline_at, plain_write_bound, _) = begin_plain_route_attempt(
+                            ctx,
+                            policy_flavor,
+                            plain_auth_deadline_plan,
+                            route,
+                        );
+                    }
+                    route_attempt_deadline = route.start_attempt();
+                    let operator_header_deadline_at =
                         absolute_response_header_read_bound(dispatch_proxy.backend_read_timeout_ms);
+                    let plain_header_deadline_at = crate::proxy::earliest_deadline(
+                        operator_header_deadline_at,
+                        route.body_deadline(route_attempt_deadline),
+                    );
                     let plain_upload_deadline = plain_write_bound.deadline();
                     let plain_peer_signal = ctx.peer_connection.as_ref();
                     let mut plain_attempt_builder = plain_request_builder.body(plain_upload_body);
@@ -2946,6 +3326,15 @@ where
                             )
                             .await;
                         }
+                        // The route attempt budget (#5646) ended this attempt
+                        // before its response head: the ordinary backend
+                        // timeout, charged to this backend and retryable.
+                        Ok(Err(())) if route.attempt_budget_expired(route_attempt_deadline) => {
+                            if let Some(pump) = plain_upload_pump.as_mut() {
+                                pump.cancel();
+                            }
+                            Err(PlainAttemptFailure::AttemptBudget)
+                        }
                         Ok(Err(())) => {
                             drop(pending_slot);
                             crate::http3::stream_util::halt_request_body(stream);
@@ -2975,7 +3364,9 @@ where
                             )
                             .await;
                         }
-                        Ok(Ok(H3BackendOrPeer::Ready(result))) => result,
+                        Ok(Ok(H3BackendOrPeer::Ready(result))) => {
+                            result.map_err(PlainAttemptFailure::Transport)
+                        }
                         Ok(Ok(H3BackendOrPeer::Deadline)) => {
                             drop(pending_slot);
                             if let Some(termination) = plain_write_bound.expired_authorization() {
@@ -3012,7 +3403,10 @@ where
                                 )
                                 .await;
                             }
-                            record_plain_grpc_web_client_deadline(
+                            // The attempt was handed to the backend: a gRPC-Web
+                            // route attempt budget expiry is charged to it.
+                            let charged = record_plain_grpc_web_deadline_after_handoff(
+                                ctx,
                                 state,
                                 epoch,
                                 proxy,
@@ -3024,7 +3418,7 @@ where
                                 &mut backend_admission_permits,
                                 backend_admission_start.elapsed(),
                             );
-                            return write_plain_grpc_web_client_deadline(
+                            let mut outcome = write_plain_grpc_web_client_deadline(
                                 stream,
                                 plugins,
                                 ctx,
@@ -3034,7 +3428,9 @@ where
                                 bytes_sent,
                                 &current_url,
                             )
-                            .await;
+                            .await?;
+                            apply_plain_grpc_web_deadline_charge(&mut outcome, charged);
+                            return Ok(outcome);
                         }
                         Ok(Ok(H3BackendOrPeer::PeerGone)) => {
                             drop(pending_slot);
@@ -3120,16 +3516,25 @@ where
                                         false,
                                         cb_probe.take_slot(),
                                     );
+                                    // A gRPC-Web route attempt budget (#5646) ends with the failed
+                                    // attempt, so backoff is bounded by the total deadline alone.
+                                    (grpc_web_deadline_at, plain_write_bound, plain_local_bound) =
+                                        end_plain_route_attempt(
+                                            ctx,
+                                            policy_flavor,
+                                            plain_auth_deadline_plan,
+                                            route,
+                                        );
                                     let delay = crate::retry::retry_delay(retry_config, attempt);
                                     if crate::plugins::await_deadline_first(
-                                        plain_write_bound.deadline(),
+                                        plain_local_bound.deadline(),
                                         tokio::time::sleep(delay),
                                     )
                                     .await
                                     .is_err()
                                     {
                                         if let Some(termination) =
-                                            plain_write_bound.expired_authorization()
+                                            plain_local_bound.expired_authorization()
                                         {
                                             ctx.record_authorization_termination_once(
                                                 termination,
@@ -3143,6 +3548,9 @@ where
                                             )
                                             .await;
                                         }
+                                        // Backoff is gateway-local: a route total expiry here is
+                                        // health-neutral and logged under `retry_backoff`.
+                                        mark_plain_route_backoff_expiry(ctx);
                                         return write_plain_grpc_web_client_deadline(
                                             stream,
                                             plugins,
@@ -3181,13 +3589,8 @@ where
                             break PlainBridgeResponse::Reqwest(response);
                         }
                         Err(e) => {
-                            let attempt_result =
-                                reqwest_error_response_for_cross_protocol(state, &e, None);
-                            crate::proxy::https_to_plaintext::maybe_warn_https_to_plaintext_backend(
-                                proxy,
-                                &current_url,
-                                &e,
-                            );
+                            let attempt_result = e.attempt_result(state);
+                            e.warn_https_to_plaintext_backend(proxy, &current_url);
                             warn!(
                                 proxy_id = %proxy.id,
                                 error = %e,
@@ -3245,16 +3648,25 @@ where
                                         attempt_result.connection_error,
                                         cb_probe.take_slot(),
                                     );
+                                    // A gRPC-Web route attempt budget (#5646) ends with the failed
+                                    // attempt, so backoff is bounded by the total deadline alone.
+                                    (grpc_web_deadline_at, plain_write_bound, plain_local_bound) =
+                                        end_plain_route_attempt(
+                                            ctx,
+                                            policy_flavor,
+                                            plain_auth_deadline_plan,
+                                            route,
+                                        );
                                     let delay = crate::retry::retry_delay(retry_config, attempt);
                                     if crate::plugins::await_deadline_first(
-                                        plain_write_bound.deadline(),
+                                        plain_local_bound.deadline(),
                                         tokio::time::sleep(delay),
                                     )
                                     .await
                                     .is_err()
                                     {
                                         if let Some(termination) =
-                                            plain_write_bound.expired_authorization()
+                                            plain_local_bound.expired_authorization()
                                         {
                                             ctx.record_authorization_termination_once(
                                                 termination,
@@ -3268,6 +3680,9 @@ where
                                             )
                                             .await;
                                         }
+                                        // Backoff is gateway-local: a route total expiry here is
+                                        // health-neutral and logged under `retry_backoff`.
+                                        mark_plain_route_backoff_expiry(ctx);
                                         return write_plain_grpc_web_client_deadline(
                                             stream,
                                             plugins,
@@ -3478,7 +3893,7 @@ where
                 };
 
                 let client_result = match crate::plugins::await_deadline_first(
-                    plain_write_bound.deadline(),
+                    plain_local_bound.deadline(),
                     get_cross_protocol_client(
                         state,
                         dial_proxy,
@@ -3501,7 +3916,7 @@ where
                     Err(()) => {
                         drop(pending_slot);
                         crate::http3::stream_util::halt_request_body(stream);
-                        if let Some(termination) = plain_write_bound.expired_authorization() {
+                        if let Some(termination) = plain_local_bound.expired_authorization() {
                             ctx.record_authorization_termination_once(
                                 termination,
                                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
@@ -3832,6 +4247,10 @@ where
                 > = None;
                 let mut header_wait_expired = false;
                 let mut backend_write_watermark_expired = false;
+                // Whether the composed bound fired after the upload was handed
+                // to the backend, where a gRPC-Web route attempt budget (#5646)
+                // expiry is charged to it.
+                let mut upload_deadline_after_handoff = false;
                 // Set by every pre-header terminal that leaves the request-body
                 // reader running. The halt sequence itself is hoisted BELOW the
                 // loop so it exists once rather than once per arm: this
@@ -3864,13 +4283,23 @@ where
                         }));
                     tokio::pin!(upload_deadline);
                     tokio::pin!(stream_cancelled);
-                    let header_wait_ms = dispatch_proxy.backend_read_timeout_ms;
-                    let header_wait_active = header_wait_ms > 0;
-                    // Built only when the bound is live; `header_wait_active`
-                    // already proves it is nonzero, so no `.max(1)` floor and
-                    // no timer at all on the `0` opt-out (issue #4074).
-                    let header_wait = header_wait_active
-                        .then(|| tokio::time::sleep(Duration::from_millis(header_wait_ms)));
+                    // The streamed upload is handed to the backend here, so the
+                    // matched route rule's attempt budget (#5646) starts now.
+                    // It and the route's total deadline end the response-head
+                    // wait exactly like the operator's header bound: a `504`
+                    // charged to this backend (this arm never retries).
+                    route_attempt_deadline = route.start_attempt();
+                    let operator_header_wait_at =
+                        absolute_response_header_read_bound(dispatch_proxy.backend_read_timeout_ms);
+                    let header_wait_at = crate::proxy::earliest_deadline(
+                        operator_header_wait_at,
+                        route.body_deadline(route_attempt_deadline),
+                    );
+                    let header_wait_active = header_wait_at.is_some();
+                    // Built only when a bound is live: no timer at all on the
+                    // operator's `0` opt-out without a route deadline (issue
+                    // #4074).
+                    let header_wait = header_wait_at.map(tokio::time::sleep_until);
                     tokio::pin!(header_wait);
                     let peer_closed = async {
                         if let Some(signal) = peer_signal.as_ref() {
@@ -3890,6 +4319,7 @@ where
                             // composition, not from arm order between two sleeps.
                             _ = &mut upload_deadline, if upload_deadline_active => {
                                 upload_auth_expired = plain_write_bound.expired_authorization();
+                                upload_deadline_after_handoff = true;
                                 drop(pending_slot.take());
                                 break None;
                             }
@@ -4108,19 +4538,36 @@ where
                             },
                         ));
                     }
-                    record_plain_grpc_web_client_deadline(
-                        state,
-                        epoch,
-                        proxy,
-                        upstream_balancer,
-                        current_target.as_deref(),
-                        current_cb_target_key.as_deref(),
-                        cb_probe,
-                        backend_start,
-                        &mut backend_admission_permits,
-                        backend_admission_start.elapsed(),
-                    );
-                    return write_plain_grpc_web_client_deadline(
+                    let charged = if upload_deadline_after_handoff {
+                        record_plain_grpc_web_deadline_after_handoff(
+                            ctx,
+                            state,
+                            epoch,
+                            proxy,
+                            upstream_balancer,
+                            current_target.as_deref(),
+                            current_cb_target_key.as_deref(),
+                            cb_probe,
+                            backend_start,
+                            &mut backend_admission_permits,
+                            backend_admission_start.elapsed(),
+                        )
+                    } else {
+                        record_plain_grpc_web_client_deadline(
+                            state,
+                            epoch,
+                            proxy,
+                            upstream_balancer,
+                            current_target.as_deref(),
+                            current_cb_target_key.as_deref(),
+                            cb_probe,
+                            backend_start,
+                            &mut backend_admission_permits,
+                            backend_admission_start.elapsed(),
+                        );
+                        None
+                    };
+                    let mut outcome = write_plain_grpc_web_client_deadline(
                         stream,
                         plugins,
                         ctx,
@@ -4130,7 +4577,9 @@ where
                         bytes_sent,
                         &current_url,
                     )
-                    .await;
+                    .await?;
+                    apply_plain_grpc_web_deadline_charge(&mut outcome, charged);
+                    return Ok(outcome);
                 };
                 if oversized.load(Ordering::Relaxed) {
                     record_cross_protocol_backend_admission_outcome(
@@ -4493,10 +4942,20 @@ where
     // every rotated candidate this bridge refuses to dial writes its refusal
     // straight to the stream and never reaches here. An honored cookie that
     // retry moved away from is reissued for the final backend.
+    //
+    // A route timeout `504` (#5646) — the mesh arm hands it here as a buffered
+    // response — is gateway-authored: no backend answered within the rule's
+    // deadline, so it names no served target and mints no affinity, exactly as
+    // on the native path and in proxy core.
+    let sticky_served_target = if crate::http3::route_deadline::total_expiry_recorded(route, ctx) {
+        None
+    } else {
+        current_target.as_deref()
+    };
     let sticky_reissue_target = crate::proxy::backend_dispatch::sticky_cookie_reissue_target(
         sticky_cookie_needed,
         upstream_target,
-        current_target.as_deref(),
+        sticky_served_target,
     );
     crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
         ctx,
@@ -4518,10 +4977,15 @@ where
             PlainBridgeBodySource::Reqwest(response) => {
                 crate::plugins::await_grpc_deadline(
                     grpc_web_deadline_at,
-                    collect_reqwest_response_body_with_limit(
-                        response,
-                        effective_max_response_body_size_bytes,
-                        proxy.backend_read_timeout_ms,
+                    collect_under_route_deadline(
+                        ctx,
+                        route,
+                        route.body_deadline(route_attempt_deadline),
+                        collect_reqwest_response_body_with_limit(
+                            response,
+                            effective_max_response_body_size_bytes,
+                            proxy.backend_read_timeout_ms,
+                        ),
                     ),
                 )
                 .await
@@ -4557,13 +5021,13 @@ where
                     error_class,
                     backend_admission_elapsed,
                 );
-                let empty_headers = HashMap::new();
+                let reject_headers = plain_collect_failure_headers(reject_status);
                 let mut outcome = write_plain_gateway_reject(
                     stream,
                     ctx,
                     reject_status_code,
                     bytes::Bytes::from(error_body),
-                    &empty_headers,
+                    &reject_headers,
                     backend_start,
                     bytes_sent,
                 )
@@ -4574,7 +5038,11 @@ where
                 return Ok(outcome);
             }
             Err(()) => {
-                record_plain_grpc_web_client_deadline(
+                // The backend still held the attempt while its body was
+                // collected: a gRPC-Web route attempt budget expiry is charged
+                // to it, exactly as proxy core charges a buffered dispatch.
+                let charged = record_plain_grpc_web_deadline_after_handoff(
+                    ctx,
                     state,
                     epoch,
                     proxy,
@@ -4586,7 +5054,7 @@ where
                     &mut backend_admission_permits,
                     backend_admission_elapsed,
                 );
-                return write_plain_grpc_web_client_deadline(
+                let mut outcome = write_plain_grpc_web_client_deadline(
                     stream,
                     plugins,
                     ctx,
@@ -4596,7 +5064,9 @@ where
                     bytes_sent,
                     &current_url,
                 )
-                .await;
+                .await?;
+                apply_plain_grpc_web_deadline_charge(&mut outcome, charged);
+                return Ok(outcome);
             }
         };
 
@@ -5232,6 +5702,11 @@ where
     // blocked-write exit inside it records through the REQUEST's shared latch
     // rather than the bare counter.
     let auth_latch = ctx.authorization_termination_latch();
+    // The matched route rule's body deadline (#5646): the earlier of its total
+    // deadline and the committed attempt's budget. The relay resets the stream
+    // with `H3_REQUEST_CANCELLED` when it fires and reports the cut here.
+    let route_body_deadline = route.body_deadline(route_attempt_deadline);
+    let mut route_deadline_cut = false;
     let stream_response = async {
         if let Some(inspector) = response_inspector {
             stream_inspected_reqwest_response(
@@ -5242,6 +5717,8 @@ where
                 proxy.backend_read_timeout_ms,
                 auth_deadline_plan,
                 &auth_latch,
+                route_body_deadline,
+                &mut route_deadline_cut,
             )
             .await
         } else {
@@ -5253,6 +5730,8 @@ where
                 proxy.backend_read_timeout_ms,
                 auth_deadline_plan,
                 &auth_latch,
+                route_body_deadline,
+                &mut route_deadline_cut,
             )
             .await
         }
@@ -5301,6 +5780,14 @@ where
         ctx.latch_authorization_termination(termination);
     }
 
+    // A route deadline cut is the route's own total-duration policy, not
+    // evidence about the backend (#5646): the body keeps its read-timeout class
+    // in the log, while health and admission record it neutrally.
+    let route_cut_class = if route_deadline_cut {
+        Some(ErrorClass::DispatchPolicyRejected)
+    } else {
+        None
+    };
     record_backend_outcome_no_conn_end(
         state,
         proxy,
@@ -5310,13 +5797,14 @@ where
         current_cb_target_key.as_deref(),
         status,
         false,
-        None,
+        route_cut_class,
         cb_probe.take_slot(),
         false,
         backend_start.elapsed(),
     );
-    let backend_admission_connection_error = match body_error_class {
-        Some(ErrorClass::ClientDisconnect) => false,
+    let admission_error_class = route_cut_class.or(body_error_class);
+    let backend_admission_connection_error = match admission_error_class {
+        Some(ErrorClass::ClientDisconnect | ErrorClass::DispatchPolicyRejected) => false,
         Some(_) => true,
         None => false,
     };
@@ -5324,7 +5812,7 @@ where
         &mut backend_admission_permits,
         status,
         backend_admission_connection_error,
-        body_error_class,
+        admission_error_class,
         backend_admission_elapsed,
     );
 
@@ -6727,6 +7215,9 @@ where
         ctx.grpc_deadline_at(),
     )
     .await;
+    // A stall the matched rule's per-attempt budget (`backendRequest`) cut is
+    // the backend's, exactly as on the H1/H2 gRPC path (#5646).
+    crate::proxy::charge_grpc_route_attempt_budget_expiry(ctx, &mut result);
 
     if grpc_has_retry
         && let Some(retry_config) = &proxy.retry
@@ -6821,6 +7312,9 @@ where
                 cb_probe.take_slot(),
             );
 
+            // The failed attempt's route budget ends here: backoff is bounded
+            // by the RPC's total deadline alone (H1/H2 parity, #5646).
+            ctx.end_grpc_route_attempt();
             let delay = crate::retry::retry_delay(retry_config, attempt);
             if let Some(deadline) = ctx.grpc_deadline_at() {
                 if tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
@@ -6938,6 +7432,9 @@ where
             let grpc_retry_dispatch_proxy = grpc_retry_connection_proxy.as_ref();
             let retry_merge_proxy_headers =
                 merge_proxy_headers_for_prebuilt_h3_grpc(&hmap, proxy_headers);
+            // A fresh route attempt budget for this retry (a no-op unless the
+            // matched rule carries one), still capped by the total deadline.
+            ctx.begin_grpc_route_attempt();
             result = proxy_grpc_request_from_bytes(
                 hyper_method.clone(),
                 hmap.clone(),
@@ -6954,6 +7451,7 @@ where
                 ctx.grpc_deadline_at(),
             )
             .await;
+            crate::proxy::charge_grpc_route_attempt_budget_expiry(ctx, &mut result);
         }
     }
 
@@ -8328,7 +8826,7 @@ pub(crate) async fn dispatch_grpc_streaming(
     // H3 Trailers-Only error is written before the upload side is dropped
     // (#2057 ordering contract, mirrored from the H2 streaming path).
     let mut held_frontend_grpc_upload = None;
-    let result = grpc_proxy::proxy_grpc_request_streaming_channel(
+    let mut result = grpc_proxy::proxy_grpc_request_streaming_channel(
         hyper_method,
         hmap,
         rx,
@@ -8346,6 +8844,9 @@ pub(crate) async fn dispatch_grpc_streaming(
         Some(Arc::clone(&ctx.grpc_request_messages_observed)),
     )
     .await;
+    // A stall the matched rule's per-attempt budget (`backendRequest`) cut is
+    // the backend's, exactly as on the H1/H2 gRPC path (#5646).
+    crate::proxy::charge_grpc_route_attempt_budget_expiry(ctx, &mut result);
 
     let final_backend_resolved_ip =
         resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
@@ -8693,6 +9194,10 @@ async fn stream_reqwest_response<S>(
     // past the credential records through the same latch as the upload
     // direction, the pre-commitment gates, and this relay's own idle arm.
     auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    // The matched route rule's body deadline (#5646), or `None`; set
+    // `route_deadline_cut` when it ends the body.
+    route_body_deadline: Option<tokio::time::Instant>,
+    route_deadline_cut: &mut bool,
 ) -> (
     u64,
     bool,
@@ -8718,6 +9223,10 @@ where
             tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
         }));
     tokio::pin!(auth_deadline_sleep);
+    // Absolute and armed once, like the authorization deadline beside it; no
+    // timer exists without a route deadline.
+    let route_body_sleep = route_body_deadline.map(tokio::time::sleep_until);
+    tokio::pin!(route_body_sleep);
     let mut auth_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination> = None;
     let mut stream_done = false;
     let mut bytes_streamed: u64 = 0;
@@ -8880,6 +9389,16 @@ where
                 auth_termination = Some(termination);
                 break 'outer;
             }
+            // The matched route rule's deadline (#5646): HEADERS are committed,
+            // so the body is cut with an `H3_REQUEST_CANCELLED` reset, never a
+            // clean finish, and the buffered tail is dropped.
+            _ = optional_sleep_elapsed(route_body_sleep.as_mut()), if !stream_done => {
+                coalesce_buf.clear();
+                crate::http3::route_deadline::cancel_response_stream(stream);
+                body_error_class = Some(ErrorClass::ReadWriteTimeout);
+                *route_deadline_cut = true;
+                break 'outer;
+            }
             _ = optional_sleep_elapsed(read_deadline.as_mut()), if read_timeout_active && !stream_done && coalesce_buf.is_empty() => {
                 warn!(
                     "Backend read timeout ({read_timeout_ms}ms) during cross-protocol \
@@ -8966,6 +9485,10 @@ async fn stream_inspected_reqwest_response<S>(
     // past the credential records through the same latch as the upload
     // direction, the pre-commitment gates, and this relay's own idle arm.
     auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    // The matched route rule's body deadline (#5646), or `None`; set
+    // `route_deadline_cut` when it ends the body.
+    route_body_deadline: Option<tokio::time::Instant>,
+    route_deadline_cut: &mut bool,
 ) -> (
     u64,
     bool,
@@ -8992,6 +9515,10 @@ where
             tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
         }));
     tokio::pin!(auth_deadline_sleep);
+    // Absolute and armed once, like the authorization deadline beside it; no
+    // timer exists without a route deadline.
+    let route_body_sleep = route_body_deadline.map(tokio::time::sleep_until);
+    tokio::pin!(route_body_sleep);
     let mut auth_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination> = None;
     // Built ONLY when the bound is live (issue #4074): `0` is the documented
     // opt-out long-lived SSE routes rely on, so an unconditional `Sleep` cost
@@ -9075,6 +9602,15 @@ where
                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
                 );
                 auth_termination = Some(termination);
+                break 'relay;
+            }
+            // The matched route rule's deadline (#5646): HEADERS are committed,
+            // so the body is cut with an `H3_REQUEST_CANCELLED` reset, never a
+            // clean finish.
+            _ = optional_sleep_elapsed(route_body_sleep.as_mut()) => {
+                crate::http3::route_deadline::cancel_response_stream(stream);
+                body_error_class = Some(ErrorClass::ReadWriteTimeout);
+                *route_deadline_cut = true;
                 break 'relay;
             }
             _ = optional_sleep_elapsed(read_deadline.as_mut()), if read_timeout_active => {
@@ -13045,7 +13581,7 @@ mod tests {
         let body = &tail[..end];
 
         for required in [
-            "let grpc_web_deadline_at",
+            "mut grpc_web_deadline_at",
             "build_plain_request_builder(",
             "tokio::time::sleep(delay)",
             "collect_reqwest_response_body_with_limit(",

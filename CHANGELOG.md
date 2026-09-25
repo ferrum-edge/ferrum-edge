@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Native HTTP/3 now enforces Gateway API HTTPRoute rule `timeouts` (#5646)
+  instead of refusing a plain request routed under them with `503`. A rule's
+  `request` (`mesh_route_dispatch` `request_timeout_ms`) and `backendRequest`
+  (`attempt_timeout_ms`) bound HTTP/3 exactly as they bound HTTP/1.1 and
+  HTTP/2, on the bridge to HTTP/1.1 and HTTP/2 backends and on the native
+  HTTP/3 backend pool, buffered or streaming, with or without retries. Before
+  the response head the client gets the same `504`, `X-Gateway-Error:
+  backend_timeout` and transaction-log phase as on HTTP/1.1 and HTTP/2, and
+  an expiry is charged to a backend only when that backend held the attempt.
+  An attempt budget expiry is retried when the rule's `retry` lists `504`, and
+  the retry replays the retained request body. After the head, the response
+  body is cut with an `H3_REQUEST_CANCELLED` stream reset, never a clean
+  finish, and the cut is health-neutral. The HTTP/3 bridge to gRPC backends,
+  and its gRPC-Web pass-through to HTTP/1.1 and HTTP/2 backends, now also start
+  a fresh `backendRequest` budget for each retry attempt, end it before retry
+  backoff, and charge an expiry after the request was sent to the backend, as
+  HTTP/1.1 and HTTP/2 do.
+  HTTP/1.1 and HTTP/2 listeners again advertise HTTP/3 (`Alt-Svc`) on ports
+  that serve such a rule. A buffered response collected by the HTTP/3 bridge
+  that ends in a read timeout now also carries `X-Gateway-Error:
+  backend_timeout`, as on HTTP/1.1 and HTTP/2. A route-timeout `504` no longer
+  sets a mesh sticky-session cookie on the HTTP/3 bridge, and one raised while
+  an HTTP/3 upload is still buffered is logged under the
+  `route_request_timeout_h3_upload` rejection phase. One deviation remains: the
+  HTTP/3 bridge collects a buffered response body after its retry loop, so an
+  attempt budget that expires during that collection is answered with the
+  charged `504` but not retried. **Operator action:**
+  with `FERRUM_ENABLE_HTTP3=true`, clients may switch back to HTTP/3 on those
+  ports, so their UDP port must be reachable, and a response longer than the
+  rule's `request` or `backendRequest` is now cut on HTTP/3 as it already was
+  on HTTP/1.1 and HTTP/2.
+
 ## [0.9.7] - 2026-09-25
 
 This is the first published release after 0.9.5. It ships every change

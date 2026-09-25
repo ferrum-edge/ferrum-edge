@@ -832,12 +832,10 @@ pub struct RouteRule {
     /// than zero when set; omit it for no route deadline.
     ///
     /// Expiry before a non-gRPC response head is a gateway `504`; expiry
-    /// mid-body resets the HTTP/2 stream or closes the HTTP/1.1 connection. A
-    /// gRPC request folds it into its RPC deadline and ends with
-    /// `DEADLINE_EXCEEDED`. Native HTTP/3 cannot bound a non-gRPC request by
-    /// it yet, so such a request is refused with `503` rather than served
-    /// without the deadline, and HTTP/3 is not advertised (`Alt-Svc`) on any
-    /// frontend port that serves a rule carrying it.
+    /// mid-body resets the HTTP/2 stream, closes the HTTP/1.1 connection, or
+    /// resets the HTTP/3 stream with `H3_REQUEST_CANCELLED`. A gRPC request
+    /// folds it into its RPC deadline and ends with `DEADLINE_EXCEEDED`.
+    /// HTTP/1.1, HTTP/2 and native HTTP/3 enforce it alike.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_ms: Option<u64>,
     /// Total bound on EACH backend attempt for this rule, in milliseconds:
@@ -852,11 +850,9 @@ pub struct RouteRule {
     /// Expiry before a non-gRPC response head is the ordinary backend-timeout
     /// `504`, retryable like any other; expiry after the head has been sent
     /// cuts the body exactly as `request_timeout_ms` does. A gRPC request
-    /// folds it into its RPC deadline and ends with `DEADLINE_EXCEEDED`.
-    /// Native HTTP/3 cannot enforce it on a non-gRPC request, so, exactly as
-    /// for `request_timeout_ms`, the HTTP/3 frontend refuses such a request
-    /// with `503` and `Alt-Svc` is withheld on every frontend port that serves
-    /// a rule carrying it.
+    /// folds it into its RPC deadline and ends with `DEADLINE_EXCEEDED`, with a
+    /// fresh budget for each retry attempt. HTTP/1.1, HTTP/2 and native HTTP/3
+    /// enforce it alike.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_timeout_ms: Option<u64>,
     /// Override the proxy's retry policy for this rule.
@@ -978,28 +974,6 @@ impl RouteRule {
             || self.retry.is_some()
             || self.retry_disabled
     }
-}
-
-/// Whether a `mesh_route_dispatch` config document carries any rule with a
-/// total request deadline (`request_timeout_ms`) or a per-attempt total bound
-/// (`attempt_timeout_ms`) — the route timeouts the native HTTP/3 relays cannot
-/// enforce on a non-gRPC request.
-///
-/// Read once per published configuration generation to withhold the HTTP/3
-/// `Alt-Svc` advertisement on the frontend ports that serve such a rule
-/// (`crate::proxy::RouteTimeoutAltSvc`). Deliberately conservative: any
-/// non-null value counts, since a document the plugin later rejects never
-/// serves at all.
-pub(crate) fn config_sets_request_or_attempt_timeout(config: &Value) -> bool {
-    let Some(rules) = config.get("rules").and_then(Value::as_array) else {
-        return false;
-    };
-    rules.iter().any(|rule| {
-        ["request_timeout_ms", "attempt_timeout_ms"]
-            .iter()
-            .filter_map(|field| rule.get(*field))
-            .any(|value| !value.is_null())
-    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

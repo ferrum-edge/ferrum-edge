@@ -989,12 +989,15 @@ fn h3_backend_connect_timeout(proxy: &Proxy, host: &str, port: u16, phase: &str)
 ///   committed" semantics: each fresh-connect setup `?` exit threads
 ///   `any_request_on_wire` through this method so a previous post-wire
 ///   attempt's commitment is preserved across the final error.
+/// - [`H3PoolError::route_deadline`] — a matched route rule's deadline, not
+///   the backend transport, ended the attempt (#5646).
 #[derive(Debug)]
 pub struct H3PoolError {
     inner: anyhow::Error,
     request_on_wire: bool,
     graceful_close: bool,
     read_timeout: bool,
+    route_deadline: Option<crate::proxy::RouteDeadlineExpiry>,
 }
 
 impl H3PoolError {
@@ -1008,6 +1011,7 @@ impl H3PoolError {
             request_on_wire: false,
             graceful_close: false,
             read_timeout: false,
+            route_deadline: None,
         }
     }
 
@@ -1021,6 +1025,7 @@ impl H3PoolError {
             request_on_wire: true,
             graceful_close: false,
             read_timeout: false,
+            route_deadline: None,
         }
     }
 
@@ -1041,6 +1046,7 @@ impl H3PoolError {
             request_on_wire: true,
             graceful_close: true,
             read_timeout: false,
+            route_deadline: None,
         }
     }
 
@@ -1065,6 +1071,7 @@ impl H3PoolError {
             request_on_wire: true,
             graceful_close: false,
             read_timeout: true,
+            route_deadline: None,
         }
     }
 
@@ -1074,6 +1081,41 @@ impl H3PoolError {
     /// 504 / `ReadWriteTimeout` mapping does not fork.
     pub fn write_timeout(error: impl Into<anyhow::Error>) -> Self {
         Self::read_timeout(error)
+    }
+
+    /// Construct the error for a native-H3 backend attempt that a matched
+    /// route rule's deadline cancelled (#5646): the total request deadline
+    /// (`mesh_route_dispatch` `request_timeout_ms`, Gateway API
+    /// `timeouts.request`) or the per-attempt budget (`attempt_timeout_ms`,
+    /// `timeouts.backendRequest`).
+    ///
+    /// It carries the typed read-timeout signal, so every native dispatch
+    /// failure arm answers it with a `504` and records it as a post-wire
+    /// timeout rather than a connection failure, exactly like proxy core's
+    /// route deadline terminal (`connection_error: false`). Its class and
+    /// client-visible body come from the expiry instead of the transport:
+    /// see `classify_h3_error` and `h3_backend_failure_status_body`. A route
+    /// deadline never proves the backend lost QUIC, so it never downgrades
+    /// the cached H3 capability.
+    pub(crate) fn route_deadline(expiry: crate::proxy::RouteDeadlineExpiry) -> Self {
+        let inner = if expiry == crate::proxy::RouteDeadlineExpiry::AttemptBudget {
+            anyhow::anyhow!("route attempt budget exceeded before the backend response head")
+        } else {
+            anyhow::anyhow!("route request deadline exceeded before the backend response head")
+        };
+        Self {
+            inner,
+            request_on_wire: true,
+            graceful_close: false,
+            read_timeout: true,
+            route_deadline: Some(expiry),
+        }
+    }
+
+    /// The route rule's deadline that ended this attempt, when one did (see
+    /// [`Self::route_deadline`]).
+    pub(crate) fn route_deadline_expiry(&self) -> Option<crate::proxy::RouteDeadlineExpiry> {
+        self.route_deadline
     }
 
     /// Borrow the underlying error for downcast / display / `tracing` use.

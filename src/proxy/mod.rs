@@ -6625,101 +6625,6 @@ impl Default for ConfigRevisionNotifier {
     }
 }
 
-/// Where one published configuration withholds the HTTP/3 `Alt-Svc`
-/// advertisement because a route rule reachable there carries a total request
-/// deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway API
-/// `HTTPRoute.rules[].timeouts.request`) or a per-attempt total bound
-/// (`attempt_timeout_ms`, Gateway API `timeouts.backendRequest`).
-///
-/// The native HTTP/3 relays cannot enforce either bound on a non-gRPC request,
-/// so the HTTP/3 frontend refuses such a request with `503` rather than serve
-/// it without the policy. Advertising HTTP/3 would steer clients onto that
-/// refusal: a browser caches `Alt-Svc` for the whole origin (`ma=86400`) and
-/// does not fall back to TCP on an HTTP error status. The advertisement is
-/// therefore withheld from EVERY response on a frontend port that serves such
-/// a route. Withholding it only on the timed route's own responses would not
-/// be enough — a sibling route's response on the same origin would still
-/// advertise it.
-///
-/// Derived from the published configuration at most once per configuration
-/// generation, by the first response that asks after a reload.
-#[derive(Debug, Default)]
-pub struct RouteTimeoutAltSvc {
-    /// Request-epoch configuration generation this was derived from. `0` is
-    /// never published, so the default forces the first derivation.
-    config_generation: u64,
-    /// A timed route is reachable on every frontend port.
-    everywhere: bool,
-    /// Frontend ports (`listen_port`) that serve a timed route.
-    ports: Vec<u16>,
-}
-
-impl RouteTimeoutAltSvc {
-    pub(crate) fn for_config(config_generation: u64, config: &GatewayConfig) -> Self {
-        let mut withhold = Self {
-            config_generation,
-            everywhere: false,
-            ports: Vec::new(),
-        };
-        for plugin in &config.plugin_configs {
-            if !plugin.enabled
-                || plugin.plugin_name != "mesh_route_dispatch"
-                || !crate::plugins::mesh_route_dispatch::config_sets_request_or_attempt_timeout(
-                    &plugin.config,
-                )
-            {
-                continue;
-            }
-            // A global instance can select a timed rule on any route.
-            if matches!(plugin.scope, PluginScope::Global) {
-                withhold.everywhere = true;
-                return withhold;
-            }
-            for proxy in &config.proxies {
-                if proxy.namespace != plugin.namespace || !Self::runs_on(plugin, proxy) {
-                    continue;
-                }
-                match proxy.listen_port {
-                    Some(port) => withhold.ports.push(port),
-                    // A port-agnostic route is reachable on every frontend port.
-                    None => {
-                        withhold.everywhere = true;
-                        return withhold;
-                    }
-                }
-            }
-        }
-        withhold
-    }
-
-    /// Whether a proxy- or proxy-group-scoped plugin instance may run on
-    /// `proxy`. Deliberately a superset of the plugin cache's attachment rule
-    /// (which also requires the proxy's association for `proxy` scope):
-    /// over-withholding only costs the HTTP/3 advertisement, while missing a
-    /// timed rule would steer clients onto the refusal.
-    fn runs_on(plugin: &PluginConfig, proxy: &Proxy) -> bool {
-        if plugin.proxy_id.as_deref() == Some(proxy.id.as_str()) {
-            return true;
-        }
-        proxy
-            .plugins
-            .iter()
-            .any(|association| association.plugin_config_id == plugin.id)
-    }
-
-    /// Whether a response that arrived on `frontend_port` must not advertise
-    /// HTTP/3. An unknown port withholds whenever any port does.
-    pub(crate) fn withholds(&self, frontend_port: Option<u16>) -> bool {
-        if self.everywhere {
-            return true;
-        }
-        match frontend_port {
-            Some(port) => self.ports.contains(&port),
-            None => !self.ports.is_empty(),
-        }
-    }
-}
-
 /// Shared state for the proxy engine.
 #[derive(Clone)]
 pub struct ProxyState {
@@ -6791,11 +6696,6 @@ pub struct ProxyState {
     /// reconcile. Read lock-free; a port that is absent advertises nothing,
     /// so a client is never steered to a port with no HTTP/3 listener.
     pub gateway_h3_alt_svc: Arc<ArcSwap<HashMap<u16, Arc<str>>>>,
-    /// Frontend ports whose `Alt-Svc` advertisement is withheld because they
-    /// serve a route rule with a total request deadline the native HTTP/3
-    /// relays cannot enforce; see [`RouteTimeoutAltSvc`]. Re-derived once per
-    /// published configuration generation and read lock-free per response.
-    pub route_timeout_alt_svc: Arc<ArcSwap<RouteTimeoutAltSvc>>,
     /// Pre-computed Via header values per protocol version (RFC 9110 §7.6.3).
     /// `None` when `FERRUM_ADD_VIA_HEADER=false` (default). Keyed by protocol version string.
     pub via_header_http11: Option<String>,
@@ -10391,7 +10291,6 @@ impl ProxyState {
             backend_capabilities_refresh,
             alt_svc_header,
             gateway_h3_alt_svc: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            route_timeout_alt_svc: Arc::new(ArcSwap::from_pointee(Default::default())),
             via_header_http11,
             via_header_http2,
             via_header_http3,
@@ -10646,9 +10545,6 @@ impl ProxyState {
     /// small-map lookup; no allocation and no lock.
     pub fn alt_svc_for_frontend_port(&self, frontend_port: Option<u16>) -> Option<Arc<str>> {
         let global = self.alt_svc_header.as_ref()?;
-        if self.route_timeout_withholds_alt_svc(frontend_port) {
-            return None;
-        }
         match frontend_port {
             Some(port)
                 if port != self.env_config.proxy_https_port
@@ -10658,26 +10554,6 @@ impl ProxyState {
             }
             _ => Some(Arc::clone(global)),
         }
-    }
-
-    /// Whether `Alt-Svc` is withheld on `frontend_port` because the published
-    /// configuration routes a total request deadline there; see
-    /// [`RouteTimeoutAltSvc`]. Two `ArcSwap` loads and a generation compare on
-    /// the steady path; the configuration is re-scanned only when its
-    /// generation has moved since the last derivation. Concurrent first
-    /// callers may each derive and store the same answer, and an older
-    /// derivation that lands last is simply re-derived by the next call.
-    fn route_timeout_withholds_alt_svc(&self, frontend_port: Option<u16>) -> bool {
-        let config_generation = self.request_epoch.config_generation();
-        let current = self.route_timeout_alt_svc.load();
-        if current.config_generation == config_generation {
-            return current.withholds(frontend_port);
-        }
-        let epoch = self.request_epoch.load();
-        let derived = RouteTimeoutAltSvc::for_config(epoch.config_generation, epoch.config());
-        let withholds = derived.withholds(frontend_port);
-        self.route_timeout_alt_svc.store(Arc::new(derived));
-        withholds
     }
 
     /// Publish the Gateway API listener ports that currently have a live QUIC
@@ -49401,7 +49277,7 @@ fn grpc_deadline_exceeded_response_for_request(
 /// held the attempt, is the backend failing to answer within its bound: the
 /// same charged `BackendTimeout { Read }` (`Backend deadline exceeded`) a
 /// stalled backend earns under `timeout_ms` alone.
-fn charge_grpc_route_attempt_budget_expiry(
+pub(crate) fn charge_grpc_route_attempt_budget_expiry(
     ctx: &RequestContext,
     result: &mut Result<GrpcResponseKind, GrpcProxyError>,
 ) {
@@ -49423,7 +49299,7 @@ fn charge_grpc_route_attempt_budget_expiry(
 /// had been handed to the backend and its RPC deadline — the matched rule's
 /// per-attempt budget — has elapsed, the terminal is re-shaped as the charged
 /// backend read timeout.
-fn charge_generic_grpc_route_attempt_budget_expiry(
+pub(crate) fn charge_generic_grpc_route_attempt_budget_expiry(
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
     handed_to_backend: bool,
