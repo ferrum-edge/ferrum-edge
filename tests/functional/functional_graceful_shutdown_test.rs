@@ -499,6 +499,11 @@ async fn probe_listener_once(
         Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
             return Ok(ProbeStep::Closed(ListenerClosed::Refused));
         }
+        // A listener that closes while the handshake is completing resets
+        // the half-open connection, so connect() itself reports the reset.
+        Ok(Err(error)) if is_peer_close(error.kind()) => {
+            return Ok(ProbeStep::Closed(ListenerClosed::ClosedWithoutAnswer));
+        }
         Ok(Err(error)) => return Err(ListenerStillOpen::Failed(error.kind())),
         Ok(Ok(stream)) => stream,
     };
