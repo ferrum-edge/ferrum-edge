@@ -20,9 +20,11 @@ from pathlib import Path
 from coverage_plan import (
     ADMIN_API_SHARD,
     ADMIN_CONFIG_SHARD,
+    ALL_FUNCTIONAL_SHARDS,
     ALL_SHARDS,
     CANONICAL_SHARD_ORDER,
     CONTROLLER_PATHS,
+    FUNCTIONAL_DATA_SHARD,
     LIB_UNIT_SHARD,
     MESH_PLATFORM_SHARD,
     MESH_ROUTING_SHARD,
@@ -132,6 +134,21 @@ SHARD_RESULT_CONTRACT = (
 INVALID_MODE_CONTRACT = (
     "!contains(fromJSON('" + VALID_MODES_JSON + "'), needs.coverage-plan.outputs.mode)"
 )
+# The functional coverage step must reach the instrumented gateway from every
+# binary-resolution path the suites use, and must not rebuild it per test.
+FUNCTIONAL_STEP_TOKENS = (
+    "if: matrix.kind == 'functional'",
+    "nextest --test functional_tests",
+    "--run-ignored all",
+    '-E "$FUNCTIONAL_FILTERSET"',
+    "ln -sfn ../llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge",
+    "FERRUM_EDGE_TEST_BIN: ${{ github.workspace }}/target/llvm-cov-target/debug/ferrum-edge",
+    'FERRUM_SKIP_GATEWAY_BUILD: "1"',
+    "LLVM_PROFILE_FILE_NAME: ferrum-edge-functional-%4m.profraw",
+    "FUNCTIONAL_FILTERSET: ${{ matrix.filterset }}",
+    "FUNCTIONAL_PARTITION: ${{ matrix.partition }}",
+    "if: matrix.kind == 'functional' && matrix.data_services == 'true'",
+)
 
 
 def extract_job_body(workflow_yml: str, job: str) -> str:
@@ -177,6 +194,20 @@ def validate_planner_contract(failures: list[str]) -> None:
             f"{shard} integration filters drifted from the frozen coverage matrix",
             failures,
         )
+    require(
+        bool(ALL_FUNCTIONAL_SHARDS)
+        and all(
+            SHARD_DEFINITIONS[shard]["kind"] == "functional"
+            for shard in ALL_FUNCTIONAL_SHARDS
+        ),
+        "full coverage must include the functional coverage shards",
+        failures,
+    )
+    require(
+        SHARD_DEFINITIONS[FUNCTIONAL_DATA_SHARD]["data_services"] == "true",
+        "functional-data must start the data-plane service containers",
+        failures,
+    )
     require(
         VALID_MODES == {"skip", "plugin", "shards", "full"},
         "planner must keep skip/plugin/shards/full modes",
@@ -303,6 +334,12 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         "coverage-shard must keep the combined lib + unit_tests coverage invocation",
         failures,
     )
+    for token in FUNCTIONAL_STEP_TOKENS:
+        require(
+            token in shard_body,
+            f"coverage-shard functional coverage must retain {token}",
+            failures,
+        )
 
     merge_body = extract_job_body(text, "coverage-merge")
     require(
@@ -657,6 +694,18 @@ jobs:
     steps:
       - run: echo "${{ matrix.shard }}"
       - run: cargo llvm-cov --no-report --lib --test unit_tests
+      - if: matrix.kind == 'functional' && matrix.data_services == 'true'
+        run: docker run -d mongo:7
+      - if: matrix.kind == 'functional'
+        run: |
+          ln -sfn ../llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge
+          cargo llvm-cov --no-report nextest --test functional_tests --run-ignored all -E "$FUNCTIONAL_FILTERSET"
+        env:
+          FUNCTIONAL_FILTERSET: ${{ matrix.filterset }}
+          FUNCTIONAL_PARTITION: ${{ matrix.partition }}
+          FERRUM_EDGE_TEST_BIN: ${{ github.workspace }}/target/llvm-cov-target/debug/ferrum-edge
+          FERRUM_SKIP_GATEWAY_BUILD: "1"
+          LLVM_PROFILE_FILE_NAME: ferrum-edge-functional-%4m.profraw
   coverage-merge:
     name: Merge Coverage
     if: always()
@@ -752,6 +801,26 @@ jobs:
             "cargo llvm-cov --no-report --lib --test unit_tests",
             "cargo llvm-cov --no-report --lib",
             "narrowed lib-unit coverage set",
+        ),
+        (
+            "ln -sfn ../llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge",
+            "true",
+            "uninstrumented fixed-path gateway binary",
+        ),
+        (
+            'FERRUM_SKIP_GATEWAY_BUILD: "1"',
+            'FERRUM_SKIP_GATEWAY_BUILD: "0"',
+            "per-test gateway rebuild",
+        ),
+        (
+            "LLVM_PROFILE_FILE_NAME: ferrum-edge-functional-%4m.profraw",
+            "LLVM_PROFILE_FILE_NAME: ferrum-edge-functional-%p.profraw",
+            "per-process functional profiles",
+        ),
+        (
+            "--run-ignored all",
+            "--no-fail-fast",
+            "ignored functional tests skipped",
         ),
     ]
     for old, new, label in mutations:

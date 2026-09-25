@@ -1,13 +1,16 @@
 # Coverage
 
-Ferrum Edge uses `cargo-llvm-cov` for Rust line coverage. The measured local
-and CI scope is `--lib`, the four unit targets (`--test unit_tests`,
+Ferrum Edge uses `cargo-llvm-cov` for Rust line coverage. The CI scope is
+`--lib`, the four unit targets (`--test unit_tests`,
 `--test unit_plugins_a_tests`, `--test unit_plugins_b_tests`,
-`--test unit_gateway_core_tests`), and `--test integration_tests`.
-Functional tests, conformance tests, custom plugins, vendored crates, and
-performance workspaces are outside the default baseline because they either
-spawn subprocesses, use separate coverage reporters, or are not actionable for
-the core proxy codebase. Build inputs such as `build.rs`, `proto/**`, and
+`--test unit_gateway_core_tests`), `--test integration_tests`, and the
+subprocess `--test functional_tests` suite run against the instrumented
+`ferrum-edge` binary (see [Functional coverage shards](#functional-coverage-shards)).
+The default local `scripts/coverage.sh` run omits the functional suite; pass
+`--functional` to include a curated subset. Conformance tests, custom plugins,
+vendored crates, and performance workspaces stay outside the baseline because
+they use separate coverage reporters or are not actionable for the core proxy
+codebase. Build inputs such as `build.rs`, `proto/**`, and
 `ebpf/**` remain report-ignored for the default baseline, but they are coverage
 trigger surfaces in CI: changing them runs the full coverage matrix instead of
 the plugin-only or no-op PR path.
@@ -157,7 +160,8 @@ PR coverage is mode-aware:
   coverage-controller edits, dependency/build-graph inputs (`Cargo.toml`,
   `Cargo.lock`, `build.rs`, `proto/**`, `ebpf/**`, `.cargo/**`,
   `rust-toolchain.toml`), unknown coverage-relevant paths, and malformed or
-  hostile changed-path transport fail closed to the full six-shard matrix and
+  hostile changed-path transport fail closed to the full matrix (lib-unit, the
+  five integration shards, and the three functional shards) and
   still enforce the overall and `src/plugins/` thresholds. Classifiable paths
   use the conservative repository-relative `[A-Za-z0-9._+@~ /-]` alphabet, so
   Markdown controls cannot alter the Coverage Plan summary. A skipped planned
@@ -238,6 +242,51 @@ common-harness subprocess paths. Broad filters such as `h3`, and additional
 legacy functional filters, can still select tests that under-report
 child-process coverage until their local `kill()` cleanup paths are migrated to
 the shared coverage-aware shutdown helper.
+
+## Functional coverage shards
+
+Most of the code the in-process suites miss (the HTTP/3 server and
+cross-protocol bridge, `src/proxy/mod.rs`, the TCP/UDP proxies, the
+database/file/CP/DP mode runtimes, and the MongoDB store) is exercised only by
+the functional suite, which drives a real `ferrum-edge` process. Every full plan
+therefore adds three functional shards after the integration shards:
+
+- `functional-1` and `functional-2` split every functional module except the
+  service-backed ones with `nextest --partition hash:N/2`. New functional
+  modules join them automatically; no filter list needs updating.
+- `functional-data` runs the service-backed modules (the `data-plane` and
+  `data-plane-runtime` modules of `ci.yml`'s Functional Tests) serially against
+  plaintext Redis, MongoDB (standalone and replica set), PostgreSQL, and MySQL
+  containers. The list lives in `FUNCTIONAL_DATA_MODULES` in
+  `.github/scripts/coverage_plan.py`; a module that moves into ci.yml's
+  data-plane shards should be added there too, or it runs in a partition shard
+  without its services. The database TLS fixtures are not started, so those
+  cells skip.
+
+Path-scoped plans never select the functional shards; a scoped plan that
+selects every integration shard is promoted to the full matrix, which includes
+them.
+
+Each functional shard builds `functional_tests` under `cargo llvm-cov nextest`,
+which also builds the instrumented `ferrum-edge` binary into
+`target/llvm-cov-target/debug/`. The step exports it as `FERRUM_EDGE_TEST_BIN`,
+links the fixed `target/debug/ferrum-edge` path several suites still use to
+it, and sets `FERRUM_SKIP_GATEWAY_BUILD=1` so no test process rebuilds an
+uninstrumented binary. The spawned gateways inherit `LLVM_PROFILE_FILE` and
+write their profiles next to the test binaries' profiles when they exit. The
+step sets `LLVM_PROFILE_FILE_NAME=ferrum-edge-functional-%4m.profraw`: the
+default cargo-llvm-cov name carries `%p`, which would write one multi-megabyte
+profile per test and gateway process, so every process of one binary instead
+merges online into a pool of at most four files. A
+gateway stopped with SIGTERM flushes its profile; one stopped with SIGKILL (a
+bare `Child::kill()`) does not, so moving legacy `kill()` teardown to the shared
+graceful-shutdown helper raises measured coverage without new tests.
+
+`ci.yml`'s Functional Tests shards are the correctness gate for this suite. A
+functional coverage shard therefore only warns on test failures (it runs with
+`--retries 1`), because instrumented debug binaries are slower and a
+timing-sensitive failure must not fail the coverage floor. It still fails when
+the instrumented binary was not built or the run wrote no profiles.
 
 ## Artifact fan-in transport and measurements (#4670)
 

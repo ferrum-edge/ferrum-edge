@@ -18,19 +18,39 @@ ADMIN_CONFIG_SHARD = "admin-config"
 MESH_ROUTING_SHARD = "mesh-routing"
 MESH_PLATFORM_SHARD = "mesh-platform"
 PROTOCOLS_SHARD = "protocols-data-plane"
+FUNCTIONAL_1_SHARD = "functional-1"
+FUNCTIONAL_2_SHARD = "functional-2"
+FUNCTIONAL_DATA_SHARD = "functional-data"
 
-CANONICAL_SHARD_ORDER = (
-    LIB_UNIT_SHARD,
+INTEGRATION_SHARD_ORDER = (
     ADMIN_API_SHARD,
     ADMIN_CONFIG_SHARD,
     MESH_ROUTING_SHARD,
     MESH_PLATFORM_SHARD,
     PROTOCOLS_SHARD,
 )
+# Functional coverage shards run the subprocess `functional_tests` suite against
+# the instrumented `ferrum-edge` binary. They belong to full plans only: the
+# path-scoped PR classification below never selects them.
+FUNCTIONAL_PARTITION_SHARDS = (
+    FUNCTIONAL_1_SHARD,
+    FUNCTIONAL_2_SHARD,
+)
+FUNCTIONAL_SHARD_ORDER = (*FUNCTIONAL_PARTITION_SHARDS, FUNCTIONAL_DATA_SHARD)
+
+CANONICAL_SHARD_ORDER = (
+    LIB_UNIT_SHARD,
+    *INTEGRATION_SHARD_ORDER,
+    *FUNCTIONAL_SHARD_ORDER,
+)
 
 ADMIN_SHARDS = frozenset({ADMIN_API_SHARD, ADMIN_CONFIG_SHARD})
 MESH_SHARDS = frozenset({MESH_ROUTING_SHARD, MESH_PLATFORM_SHARD})
-ALL_INTEGRATION_SHARDS = frozenset(CANONICAL_SHARD_ORDER[1:])
+ALL_INTEGRATION_SHARDS = frozenset(INTEGRATION_SHARD_ORDER)
+ALL_FUNCTIONAL_SHARDS = frozenset(FUNCTIONAL_SHARD_ORDER)
+# Every shard a path-scoped plan can select. Selecting all of them promotes the
+# plan to the full matrix, which adds the functional shards.
+SCOPED_SHARDS = frozenset({LIB_UNIT_SHARD, *INTEGRATION_SHARD_ORDER})
 ALL_SHARDS = frozenset(CANONICAL_SHARD_ORDER)
 # Serving modes that start admin + proxy (and optionally DB/CP), but are not mesh.
 ADMIN_AND_PROTOCOL_SHARDS = frozenset({*ADMIN_SHARDS, PROTOCOLS_SHARD})
@@ -113,6 +133,55 @@ CORE_RELEVANT_PATTERNS = [
     re.compile(r"^\.github/scripts/verify_coverage_workflow\.py$"),
     re.compile(r"^scripts/(check_coverage_thresholds|coverage)\.(py|sh)$"),
 ]
+
+
+# Service-backed functional modules, mirroring the `data-plane` and
+# `data-plane-runtime` shards of `test-functional` in ci.yml. They bind
+# exclusive ports and share one set of Redis/MongoDB/PostgreSQL/MySQL
+# containers, so they run serially on their own runner. Every other functional
+# module runs in the hash-partitioned shards.
+FUNCTIONAL_DATA_MODULES = (
+    "functional_admin_crud_resources_test",
+    "functional_database_parity_test",
+    "functional_database_test",
+    "functional_db_failover_test",
+    "functional_db_tls_test",
+    "functional_db_upstream_test",
+    "functional_mongodb_test",
+    "functional_capability_registry_test",
+    "functional_cp_dp_resilience_test",
+    "functional_cp_dp_test",
+    "functional_db_outage_test",
+    "functional_gateway_trust_bundle_ha_test",
+    "functional_mesh_mode_test",
+    "functional_mesh_stock_xds_test",
+    "functional_namespace_test",
+    "functional_plugin_quarantine_test",
+    "functional_redis_rate_limiting_test",
+)
+# The long stress suites stay local-only, as in ci.yml's functional shards.
+FUNCTIONAL_STRESS_EXCLUSION = (
+    "not test(/test_scale_perf_30k_proxies/) "
+    "and not test(/test_load_stress_10k_proxies/)"
+)
+FUNCTIONAL_DATA_MODULES_FILTERSET = (
+    "test(/::(" + "|".join(FUNCTIONAL_DATA_MODULES) + ")::/)"
+)
+
+
+def functional_partition_definition(shard: str, index: int) -> dict[str, str]:
+    return {
+        "shard": shard,
+        "kind": "functional",
+        "filters": "",
+        "filterset": (
+            f"{FUNCTIONAL_STRESS_EXCLUSION} "
+            f"and not {FUNCTIONAL_DATA_MODULES_FILTERSET}"
+        ),
+        "partition": f"hash:{index}/{len(FUNCTIONAL_PARTITION_SHARDS)}",
+        "test_threads": "",
+        "data_services": "false",
+    }
 
 
 SHARD_DEFINITIONS: dict[str, dict[str, str]] = {
@@ -229,6 +298,19 @@ SHARD_DEFINITIONS: dict[str, dict[str, str]] = {
             ]
         ),
     },
+    **{
+        shard: functional_partition_definition(shard, index)
+        for index, shard in enumerate(FUNCTIONAL_PARTITION_SHARDS, start=1)
+    },
+    FUNCTIONAL_DATA_SHARD: {
+        "shard": FUNCTIONAL_DATA_SHARD,
+        "kind": "functional",
+        "filters": "\n".join(FUNCTIONAL_DATA_MODULES),
+        "filterset": FUNCTIONAL_STRESS_EXCLUSION,
+        "partition": "",
+        "test_threads": "1",
+        "data_services": "true",
+    },
 }
 
 
@@ -246,6 +328,10 @@ class CoveragePlan:
         if not self.shards:
             return [dict(SHARD_DEFINITIONS[LIB_UNIT_SHARD])]
         return [dict(SHARD_DEFINITIONS[name]) for name in self.shards]
+
+
+def filter_lines(filters: str) -> list[str]:
+    return [line.strip() for line in filters.splitlines() if line.strip()]
 
 
 def matches_any(path: str, patterns: list[re.Pattern[str]]) -> bool:
@@ -340,7 +426,7 @@ def shard_plan(reason: str, shards: set[str], plugin_gate: bool) -> CoveragePlan
     selected = set(shards)
     selected.add(LIB_UNIT_SHARD)
     ordered = ordered_shards(selected)
-    if set(ordered) == ALL_SHARDS:
+    if set(ordered) == SCOPED_SHARDS:
         return full_plan(reason, plugin_gate=plugin_gate)
     return CoveragePlan(
         mode="shards",
@@ -750,7 +836,7 @@ def self_test() -> int:
         plan = select_scoped_plan("pull_request", [path])
         if LIB_UNIT_SHARD not in plan.shards:
             failures.append(f"{path}: non-skip ownership plan omitted lib-unit")
-        if set(plan.shards) - {LIB_UNIT_SHARD} != set(expected):
+        if set(plan.shards) - {LIB_UNIT_SHARD} - ALL_FUNCTIONAL_SHARDS != set(expected):
             failures.append(
                 f"{path}: plan shards {plan.shards} drifted from ownership lock"
             )
@@ -893,6 +979,35 @@ def self_test() -> int:
             failures.append(f"{name} shard kind must remain integration")
         if "integration::" not in SHARD_DEFINITIONS[name]["filters"]:
             failures.append(f"{name} shard is missing integration filters")
+    partitions = []
+    for name in ALL_FUNCTIONAL_SHARDS:
+        definition = SHARD_DEFINITIONS[name]
+        if definition["kind"] != "functional":
+            failures.append(f"{name} shard kind must remain functional")
+        if FUNCTIONAL_STRESS_EXCLUSION not in definition["filterset"]:
+            failures.append(f"{name} shard must exclude the local-only stress suites")
+        if definition["partition"]:
+            partitions.append(definition["partition"])
+            if definition["filters"] or definition["data_services"] != "false":
+                failures.append(f"{name} partition shard must not select service modules")
+            if f"not {FUNCTIONAL_DATA_MODULES_FILTERSET}" not in definition["filterset"]:
+                failures.append(f"{name} partition shard must exclude service modules")
+    count = len(FUNCTIONAL_PARTITION_SHARDS)
+    if sorted(partitions) != [f"hash:{index}/{count}" for index in range(1, count + 1)]:
+        failures.append("functional partition shards must cover every hash partition once")
+    data = SHARD_DEFINITIONS[FUNCTIONAL_DATA_SHARD]
+    if (
+        data["partition"]
+        or data["data_services"] != "true"
+        or data["test_threads"] != "1"
+        or filter_lines(data["filters"]) != list(FUNCTIONAL_DATA_MODULES)
+    ):
+        failures.append("functional-data must run every service module serially")
+    for name in ALL_FUNCTIONAL_SHARDS:
+        for scoped_path in ("src/admin/mod.rs", "src/proxy/mod.rs", "src/http3/server.rs"):
+            scoped = select_scoped_plan("pull_request", [scoped_path])
+            if scoped.mode == "shards" and name in scoped.shards:
+                failures.append(f"path-scoped plans must not select {name}")
 
     try:
         parse_planned_shards(json.dumps([LIB_UNIT_SHARD, ADMIN_API_SHARD]))

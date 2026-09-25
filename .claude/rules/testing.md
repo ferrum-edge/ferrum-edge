@@ -157,7 +157,7 @@ shares.
 - Install: `cargo install cargo-llvm-cov --locked && rustup component add llvm-tools-preview`.
 - Run: `scripts/coverage.sh` (lib + unit + integration). HTML report path is printed at the end.
 - Narrow scope: `scripts/coverage.sh -- <filter>` forwards to `cargo llvm-cov`. Example: `scripts/coverage.sh -- plugins::cors`.
-- Functional and conformance suites are intentionally excluded; they spawn subprocesses or use separate coverage reporters. Line coverage for lib/unit/integration runs in CI through `.github/workflows/coverage.yml`.
+- CI coverage (`.github/workflows/coverage.yml`) measures lib/unit/integration plus the functional suite: the `functional-1`/`functional-2` partition shards and the serial service-backed `functional-data` shard run `functional_tests` against the instrumented binary. Local `scripts/coverage.sh` omits functional tests unless passed `--functional`. Conformance stays excluded (separate reporter). A gateway killed with SIGKILL writes no profile; stop spawned gateways through the graceful-shutdown helpers.
 - Coverage outputs (`target/llvm-cov/`, `target/llvm-cov-target/`) are gitignored.
 
 ## Simulating A Server Going Away (tonic)
