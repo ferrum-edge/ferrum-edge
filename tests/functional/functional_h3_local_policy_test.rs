@@ -1,10 +1,11 @@
-//! Functional coverage for H3→HTTP bridge local dispatch-policy ordering.
+//! Functional coverage for H3→HTTP bridge local dispatch-policy ordering and
+//! for route rule timeouts over native HTTP/3 (#5646).
 //!
 //! Run: `cargo build --bin ferrum-edge && cargo test --test functional_tests functional_h3_local_policy -- --ignored --nocapture`
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use crate::scaffolding::clients::{Http3Client, Http3Response};
+use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 use crate::scaffolding::{reserve_colocated_tcp_udp, reserve_port};
 
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
@@ -215,40 +216,19 @@ async fn functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_d
 }
 
 /// A matched route rule's total request deadline (`request_timeout_ms`,
-/// Gateway API `timeouts.request`) cannot yet be enforced by the native H3
-/// HTTP relays, which write the response from inside the dispatch. A plain
-/// HTTP/3 request routed under one must therefore be refused fail closed —
-/// before target selection, admission, or any dial — rather than served
-/// without the deadline it was routed under.
+/// Gateway API `timeouts.request`, #5646) is enforced over native HTTP/3 rather
+/// than refused: a request the backend answers in time is served, and the
+/// HTTP/1.1 and HTTP/2 frontends keep advertising HTTP/3 (`Alt-Svc`) on the
+/// port that serves the timed rule.
 #[ignore]
 #[tokio::test]
-async fn functional_h3_route_request_timeout_refuses_plain_http_before_dispatch() {
+async fn functional_h3_route_request_timeout_serves_plain_http_and_keeps_alt_svc() {
     let (backend_port, backend_hits, release_backend, backend_task) = spawn_holding_backend().await;
     release_backend.release();
-    let mut config = plaintext_backend_tls_sni_config(backend_port);
-    config.plugin_configs.push(
-        serde_json::from_value(json!({
-            "id": "h3-route-request-deadline",
-            "namespace": H3_POLICY_NAMESPACE,
-            "plugin_name": "mesh_route_dispatch",
-            "scope": "proxy",
-            "proxy_id": "h3-local-policy",
-            "enabled": true,
-            "config": {
-                "rules": [{
-                    "match": {"methods": ["GET"]},
-                    "destination": {"upstream_id": H3_POLICY_UPSTREAM_ID},
-                    "request_timeout_ms": 5000
-                }]
-            }
-        }))
-        .expect("route deadline plugin config is valid"),
+    let config = route_timeout_config(
+        plaintext_backend_tls_sni_config(backend_port),
+        json!({"request_timeout_ms": 5000, "attempt_timeout_ms": 5000}),
     );
-    // A proxy-scoped plugin runs only when its proxy lists it; without this
-    // association the rule never matches and no deadline is ever published.
-    config.proxies[0].plugins.push(PluginAssociation {
-        plugin_config_id: "h3-route-request-deadline".to_string(),
-    });
     let gateway = start_h3_policy_gateway(config)
         .await
         .expect("start h3 route-deadline gateway");
@@ -261,15 +241,235 @@ async fn functional_h3_route_request_timeout_refuses_plain_http_before_dispatch(
     let resp = retry_h3_get(&client, &url).await;
     assert_eq!(
         resp.status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "a plain H3 request under a route deadline must be refused, got {resp:?}"
+        StatusCode::OK,
+        "a plain H3 request under a route deadline must be served, got {resp:?}"
     );
-    let body = resp.body_text();
+    assert_eq!(resp.body_text(), "ok");
+    assert!(resp.body_error.is_none(), "unexpected body error: {resp:?}");
+    wait_for_hits(&backend_hits, 1, Duration::from_secs(10)).await;
+
+    // The origin keeps its HTTP/3 advertisement on the TCP listener.
+    let tls_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .http1_only()
+        .build()
+        .expect("build TLS client");
+    let tcp_resp = tls_client
+        .get(&url)
+        .send()
+        .await
+        .expect("HTTPS request to the timed route");
+    assert_eq!(tcp_resp.status().as_u16(), 200);
+    let alt_svc = tcp_resp
+        .headers()
+        .get("alt-svc")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     assert!(
-        body.contains("Route request timeout is not supported over HTTP/3"),
-        "unexpected refusal body: {body:?}"
+        alt_svc.contains(&format!("h3=\":{}\"", gateway.https_port)),
+        "HTTP/3 must stay advertised where a timed rule is served, got {alt_svc:?}"
     );
-    assert_backend_hits_eq(&backend_hits, 0, Duration::from_millis(250)).await;
+
+    gateway.shutdown().await;
+    backend_task.abort();
+}
+
+/// Before the response head, an expired total deadline is proxy core's route
+/// timeout `504` over native HTTP/3 too: the fixed body, the `backend_timeout`
+/// token, and no second attempt.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_route_request_timeout_answers_504_before_the_response_head() {
+    let (backend_port, backend_hits, _hold_backend, backend_task) = spawn_holding_backend().await;
+    let config = route_timeout_config(
+        plaintext_backend_tls_sni_config(backend_port),
+        json!({"request_timeout_ms": 400}),
+    );
+    let gateway = start_h3_policy_gateway(config)
+        .await
+        .expect("start h3 route-deadline gateway");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/stalled",
+        gateway.https_port
+    );
+    let started = Instant::now();
+    let resp = retry_h3_get(&client, &url).await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        resp.status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "a stalled backend under a route deadline must end in 504, got {resp:?}"
+    );
+    assert!(
+        resp.body_text().contains("Request timeout"),
+        "unexpected route timeout body: {:?}",
+        resp.body_text()
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-gateway-error")
+            .and_then(|value| value.to_str().ok()),
+        Some("backend_timeout")
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the 504 must arrive at the route deadline, not the operator's read timeout: {elapsed:?}"
+    );
+    assert_backend_hits_eq(&backend_hits, 1, Duration::from_millis(250)).await;
+
+    gateway.shutdown().await;
+    backend_task.abort();
+}
+
+/// After the response head, the total deadline cuts the body: the stream is
+/// reset rather than finished, so a client can never mistake the truncated
+/// body for a complete one.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_route_request_timeout_resets_a_committed_body() {
+    let (backend_port, backend_task) = spawn_partial_body_backend().await;
+    let config = route_timeout_config(
+        plaintext_backend_tls_sni_config(backend_port),
+        json!({"request_timeout_ms": 600}),
+    );
+    let gateway = start_h3_policy_gateway(config)
+        .await
+        .expect("start h3 route-deadline gateway");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/partial",
+        gateway.https_port
+    );
+    let started = Instant::now();
+    let resp = retry_h3_get(&client, &url).await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        resp.status,
+        StatusCode::OK,
+        "the backend head was committed before the deadline, got {resp:?}"
+    );
+    assert!(
+        resp.body_error.is_some(),
+        "the committed body must end in a stream reset, not a clean finish: {resp:?}"
+    );
+    assert!(
+        resp.body_bytes.len() < PARTIAL_BODY_DECLARED_LEN,
+        "the cut body must be short: {} bytes",
+        resp.body_bytes.len()
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the body must be cut at the route deadline: {elapsed:?}"
+    );
+
+    gateway.shutdown().await;
+    backend_task.abort();
+}
+
+/// The per-attempt budget (`attempt_timeout_ms`, Gateway API
+/// `timeouts.backendRequest`) ends a stalled attempt with the ordinary,
+/// retryable backend-timeout `504`; the retry replays the retained request
+/// body to the next attempt, which answers.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_route_attempt_budget_retries_and_replays_the_body() {
+    let (backend_port, backend_hits, backend_task) = spawn_echo_backend(1).await;
+    let config = route_timeout_config(
+        h3_policy_config(
+            backend_port,
+            "http",
+            None,
+            json!({"tls": {"sni": "backend-sni.example.com"}}),
+            Some(json!({
+                "max_retries": 1,
+                "retryable_status_codes": [504],
+                "retryable_methods": ["POST"],
+                "retry_on_connect_failure": true
+            })),
+        ),
+        json!({"attempt_timeout_ms": 400}),
+    );
+    let gateway = start_h3_policy_gateway(config)
+        .await
+        .expect("start h3 route-deadline gateway");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/replayed",
+        gateway.https_port
+    );
+    let payload = "replayed-request-body";
+    let resp = retry_h3_post(&client, &url, payload).await;
+    assert_eq!(
+        resp.status,
+        StatusCode::OK,
+        "the retry after the attempt budget must be served, got {resp:?}"
+    );
+    assert_eq!(
+        resp.body_text(),
+        payload,
+        "the retry must replay the retained request body"
+    );
+    wait_for_hits(&backend_hits, 2, Duration::from_secs(10)).await;
+    assert_backend_hits_eq(&backend_hits, 2, Duration::from_millis(250)).await;
+
+    gateway.shutdown().await;
+    backend_task.abort();
+}
+
+/// With every attempt stalled, each is ended by its own fresh budget and the
+/// last one's ordinary backend-timeout `504` reaches the client.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_route_attempt_budget_bounds_every_attempt() {
+    let (backend_port, backend_hits, backend_task) = spawn_echo_backend(usize::MAX).await;
+    let config = route_timeout_config(
+        h3_policy_config(
+            backend_port,
+            "http",
+            None,
+            json!({"tls": {"sni": "backend-sni.example.com"}}),
+            Some(json!({
+                "max_retries": 1,
+                "retryable_status_codes": [504],
+                "retryable_methods": ["POST"],
+                "retry_on_connect_failure": true
+            })),
+        ),
+        json!({"attempt_timeout_ms": 300}),
+    );
+    let gateway = start_h3_policy_gateway(config)
+        .await
+        .expect("start h3 route-deadline gateway");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!(
+        "https://localhost:{}/h3-local-policy/stalled",
+        gateway.https_port
+    );
+    let started = Instant::now();
+    let resp = retry_h3_post(&client, &url, "payload").await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        resp.status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "every stalled attempt must end on its budget, got {resp:?}"
+    );
+    assert!(
+        resp.body_text().contains("Backend timeout"),
+        "an attempt budget is the ordinary backend timeout: {:?}",
+        resp.body_text()
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "each attempt must end on its own budget: {elapsed:?}"
+    );
+    wait_for_hits(&backend_hits, 2, Duration::from_secs(10)).await;
+    assert_backend_hits_eq(&backend_hits, 2, Duration::from_millis(250)).await;
 
     gateway.shutdown().await;
     backend_task.abort();
@@ -637,6 +837,199 @@ async fn read_http_request(
         .await?;
     let _ = stream.shutdown().await;
     Ok(())
+}
+
+/// Attach a proxy-scoped `mesh_route_dispatch` rule carrying `timeouts` (the
+/// rule's `request_timeout_ms` / `attempt_timeout_ms`) to the H3 policy route.
+fn route_timeout_config(mut config: GatewayConfig, timeouts: serde_json::Value) -> GatewayConfig {
+    let mut rule = json!({
+        "match": {"methods": ["GET", "POST"]},
+        "destination": {"upstream_id": H3_POLICY_UPSTREAM_ID}
+    });
+    if let (Some(rule), Some(timeouts)) = (rule.as_object_mut(), timeouts.as_object()) {
+        for (field, value) in timeouts {
+            rule.insert(field.clone(), value.clone());
+        }
+    }
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "h3-route-request-deadline",
+            "namespace": H3_POLICY_NAMESPACE,
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "proxy",
+            "proxy_id": "h3-local-policy",
+            "enabled": true,
+            "config": {"rules": [rule]}
+        }))
+        .expect("route deadline plugin config is valid"),
+    );
+    // A proxy-scoped plugin runs only when its proxy lists it; without this
+    // association the rule never matches and no deadline is ever published.
+    config.proxies[0].plugins.push(PluginAssociation {
+        plugin_config_id: "h3-route-request-deadline".to_string(),
+    });
+    config
+}
+
+/// Declared length of [`spawn_partial_body_backend`]'s response body.
+const PARTIAL_BODY_DECLARED_LEN: usize = 100_000;
+
+/// A backend that commits a response head and the first bytes of a long body,
+/// then stalls without ever finishing it.
+async fn spawn_partial_body_backend() -> (u16, JoinHandle<()>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind partial-body backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                if read_http_request_body(&mut stream).await.is_err() {
+                    return;
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: \
+                     {PARTIAL_BODY_DECLARED_LEN}\r\n\r\n"
+                );
+                if stream.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = stream.write_all(&[b'x'; 1024]).await;
+                let _ = stream.flush().await;
+                // Never finish the declared body.
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    (port, task)
+}
+
+/// A backend that stalls the first `hold_first` requests forever and answers
+/// every later one by echoing its request body.
+async fn spawn_echo_backend(hold_first: usize) -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind echo backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let task_hits = Arc::clone(&hits);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let hits = Arc::clone(&task_hits);
+            tokio::spawn(async move {
+                let Ok(body) = read_http_request_body(&mut stream).await else {
+                    return;
+                };
+                let hit = hits.fetch_add(1, Ordering::SeqCst);
+                if hit < hold_first {
+                    std::future::pending::<()>().await;
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (port, hits, task)
+}
+
+/// Read one HTTP/1.1 request and return its body, framed by `Content-Length`
+/// or chunked transfer coding.
+async fn read_http_request_body(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let head_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        read_more(stream, &mut buf).await?;
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]);
+    let head = head.to_ascii_lowercase();
+    let mut rest = buf.split_off(head_end);
+    let content_length = head.lines().find_map(|line| {
+        line.strip_prefix("content-length:")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    });
+    if let Some(len) = content_length {
+        while rest.len() < len {
+            read_more(stream, &mut rest).await?;
+        }
+        rest.truncate(len);
+        return Ok(rest);
+    }
+    if !head.contains("transfer-encoding: chunked") {
+        return Ok(Vec::new());
+    }
+    let mut body = Vec::new();
+    loop {
+        let line_end = loop {
+            if let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
+                break pos;
+            }
+            read_more(stream, &mut rest).await?;
+        };
+        let size_line = String::from_utf8_lossy(&rest[..line_end]).to_string();
+        let size_field = size_line.split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_field, 16)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        rest.drain(..line_end + 2);
+        if size == 0 {
+            return Ok(body);
+        }
+        while rest.len() < size + 2 {
+            read_more(stream, &mut rest).await?;
+        }
+        body.extend_from_slice(&rest[..size]);
+        rest.drain(..size + 2);
+    }
+}
+
+async fn read_more(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut chunk = [0u8; 4096];
+    let n = stream.read(&mut chunk).await?;
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "backend client closed mid-request",
+        ));
+    }
+    buf.extend_from_slice(&chunk[..n]);
+    Ok(())
+}
+
+async fn retry_h3_post(client: &Http3Client, url: &str, body: &str) -> Http3Response {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_err = None;
+    loop {
+        let options = GetOptions::default()
+            .method(http::Method::POST)
+            .header("content-type", "text/plain")
+            .header("content-length", body.len().to_string())
+            .body(bytes::Bytes::copy_from_slice(body.as_bytes()));
+        match client.get_with_options(url, options).await {
+            Ok(resp) => return resp,
+            Err(err) if Instant::now() < deadline => {
+                last_err = Some(err.to_string());
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => {
+                panic!(
+                    "H3 request did not complete; last startup error={last_err:?}; final error={err}"
+                );
+            }
+        }
+    }
 }
 
 async fn retry_h3_get(client: &Http3Client, url: &str) -> Http3Response {

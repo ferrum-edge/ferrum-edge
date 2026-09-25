@@ -7258,12 +7258,15 @@ fn composed_authorization_waits_use_the_shared_expiry_first_primitive() {
         .split("async fn dispatch_grpc<S>(")
         .next()
         .expect("bounded cross-protocol plain dispatcher");
+    // Client acquisition is a gateway-local phase, so it waits under the
+    // composed bound with a plain request's route total deadline folded in
+    // (#5646); the authorization owner is still captured by the composition.
     assert_eq!(
         dispatch
-            .matches("await_deadline_first(\n                        plain_write_bound.deadline()")
+            .matches("await_deadline_first(\n                        plain_local_bound.deadline()")
             .count()
             + dispatch
-                .matches("await_deadline_first(\n                    plain_write_bound.deadline()")
+                .matches("await_deadline_first(\n                    plain_local_bound.deadline()")
                 .count(),
         2,
         "both client acquisitions must wait under the captured composed bound"

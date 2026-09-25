@@ -27,10 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DEADLINE_EXCEEDED`; a backend that holds the call past it is charged to its
   circuit breaker and passive health. `mesh_route_dispatch` rules gain the
   matching `attempt_timeout_ms` field; rules without it behave exactly as
-  before. Like `request`, native HTTP/3 cannot enforce the per-attempt bound
-  for non-gRPC requests yet, so it refuses those requests with `503` and
-  HTTP/3 is not advertised (`Alt-Svc`) on a listener port that serves such a
-  rule.
+  before. Native HTTP/3 enforces it too (see Changed below).
 
 - Gateway API HTTPRoute rule-level `timeouts` (#5646). `timeouts.backendRequest`
   bounds each backend attempt and `timeouts.request` is one total deadline for
@@ -44,12 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a backend's health only when that backend held the request; expiry
   while the gateway is still buffering a client upload, in retry backoff, or
   after the response head does not. A body cut by the deadline keeps its
-  `Content-Length`. Native HTTP/3 cannot enforce the total deadline for
-  non-gRPC requests yet, so it refuses those requests with `503` instead of
-  serving them without the deadline, and HTTP/3 is no longer advertised
-  (`Alt-Svc`) on a listener port that serves such a rule. CI now declares
-  `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`; the per-attempt
-  semantics of `backendRequest` are the entry above.
+  `Content-Length`. Native HTTP/3 enforces it too (see Changed below). CI now
+  declares `HTTPRouteRequestTimeout` and `HTTPRouteBackendTimeout`; the
+  per-attempt semantics of `backendRequest` are the entry above.
 
 - Gateway API HTTPRoute rule-level `retry` (#5646). The experimental-channel
   field, present in the pinned v1.5.1 experimental CRD bundle, is validated like
@@ -296,6 +290,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Existing replay keys rotate once after upgrading.
 
 ### Changed
+
+- Native HTTP/3 now enforces Gateway API HTTPRoute rule `timeouts` (#5646)
+  instead of refusing a plain request routed under them with `503`. A rule's
+  `request` (`mesh_route_dispatch` `request_timeout_ms`) and `backendRequest`
+  (`attempt_timeout_ms`) bound HTTP/3 exactly as they bound HTTP/1.1 and
+  HTTP/2, on the bridge to HTTP/1.1 and HTTP/2 backends and on the native
+  HTTP/3 backend pool, buffered or streaming, with or without retries. Before
+  the response head the client gets the same `504`, `X-Gateway-Error:
+  backend_timeout` and transaction-log phase as on HTTP/1.1 and HTTP/2, and
+  an expiry is charged to a backend only when that backend held the attempt.
+  An attempt budget expiry is retried when the rule's `retry` lists `504`, and
+  the retry replays the retained request body. After the head, the response
+  body is cut with an `H3_REQUEST_CANCELLED` stream reset, never a clean
+  finish, and the cut is health-neutral. The HTTP/3 bridge to gRPC backends now
+  also starts a fresh `backendRequest` budget for each retry attempt, ends it
+  before retry backoff, and charges an expiry after the request was sent to the
+  backend, as HTTP/1.1 and HTTP/2 do. HTTP/1.1 and HTTP/2 listeners again
+  advertise HTTP/3 (`Alt-Svc`) on ports that serve such a rule. A buffered
+  response collected by the HTTP/3 bridge that ends in a read timeout now also
+  carries `X-Gateway-Error: backend_timeout`, as on HTTP/1.1 and HTTP/2.
+  **Operator action:** with `FERRUM_ENABLE_HTTP3=true`, clients may switch
+  back to HTTP/3 on those ports, so their UDP port must be reachable, and a
+  response longer than the rule's `request` or `backendRequest` is now cut on
+  HTTP/3 as it already was on HTTP/1.1 and HTTP/2.
 
 - **BREAKING (library API) — load-balancer runtime state** (issue #5693). The public
   `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and
