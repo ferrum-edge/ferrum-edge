@@ -35,6 +35,21 @@ If `decoder.decode` returns `None`, surface the cached error.
 Same shape applied to `FrameStream::poll_data` so DATA frame body
 bytes that were buffered before the error are not stranded.
 
+A peer `RESET_STREAM` (`StreamErrorIncoming::StreamTerminated`) is the
+one error that is NOT hoisted. The hoist relies on the transport
+reporting the held-back error again on the next read. A connection
+error is reported again, but quinn reports a stream reset exactly once:
+it frees the receive stream as it returns `ReadError::Reset`, and every
+later read is `ClosedStream`. Holding a reset back behind buffered
+bytes would lose its code. When the reset truncated a DATA frame whose
+tail was still buffered, it would also end the body in
+`UnexpectedEnd`, which the request stream escalates to a
+connection-level `H3_FRAME_ERROR`. RFC 9114 §7.1 makes a truncated
+frame a connection error only for a stream that "terminates cleanly".
+A reset therefore surfaces on the poll that observed it, exactly as
+before this patch. Quinn itself discards unread data on a reset (RFC
+9000 §3.2).
+
 ### Termination
 
 Each iteration consumes its own cached error in the same iteration it
@@ -45,13 +60,15 @@ no opportunity for an infinite loop.
 ### Forward progress
 
 When the decoder DOES produce a frame on the cached-error iteration,
-the next poll re-issues `poll_read`, which returns the same error.
+the next poll re-issues `poll_read`, which returns the same error
+(connection errors are sticky; the one-shot stream reset is never
+cached, see above).
 The buffered bytes have shrunk by the consumed frame's length, so
 iterations are bounded by the buffer size.
 
 ## Tests
 
-Two new tests in `frame.rs::tests`:
+Four new tests in `frame.rs::tests`:
 
 - `poll_next_drains_buffered_headers_before_quic_close` — synthesizes a
   HEADERS frame followed by an `ApplicationClose { error_code: 0x100 }`
@@ -61,6 +78,12 @@ Two new tests in `frame.rs::tests`:
   the body path. `poll_next` yields the DATA frame header, `poll_data`
   drains the buffered 4-byte body even though the next poll would
   return the connection error.
+- `poll_data_surfaces_stream_reset_over_a_truncated_buffered_body` — a
+  `StreamTerminated` reset that lands while the tail of a truncated DATA
+  frame is still buffered surfaces as the reset, not `UnexpectedEnd`.
+- `poll_next_surfaces_stream_reset_over_a_buffered_frame` — a reset
+  observed with a decodable frame buffered surfaces as the reset, so its
+  code is not lost to the next read of the freed stream.
 
 `FakeRecv` is extended with a `chunk_then_error` helper that queues a
 synthetic `StreamErrorIncoming::ConnectionErrorIncoming` for the next
@@ -77,11 +100,10 @@ the non-error path).
   continue to win, errors continue to surface, the only difference is
   the ordering when both are pending.
 - Internal API: no callers outside `frame.rs` are affected.
-- Behavioral compat: a backend that intentionally aborts a stream with
-  a non-`NO_ERROR` code mid-frame will now have its buffered partial
-  data delivered before the error fires. This is arguably more correct
-  (the bytes WERE received before the abort) but worth flagging in case
-  any downstream depends on the prior "discard on error" semantic.
+- Behavioral compat: only connection-level errors change ordering. A
+  peer that resets a stream keeps the prior semantic: the reset surfaces
+  immediately and buffered bytes are discarded, as quinn does for its
+  own unread data.
 
 ## Downstream context
 

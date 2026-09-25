@@ -14,10 +14,12 @@ publish = false
 # patched in via `[patch.crates-io]` below. Cargo treats vendored deps under
 # `[patch.crates-io]` as fully built, but `cargo test -p h3 --lib frame` does
 # not run their tests because they aren't workspace members. The patch's
-# regression coverage is the two new unit tests in
+# regression coverage is the four unit tests in
 # `vendor/h3-0.0.8-ferrum-patched/src/frame.rs::tests`
-# (`poll_next_drains_buffered_headers_before_quic_close` and
-# `poll_data_drains_buffered_body_before_quic_close`); to run them locally,
+# (`poll_next_drains_buffered_headers_before_quic_close`,
+# `poll_data_drains_buffered_body_before_quic_close`, and the stream-reset
+# exemption pair `poll_data_surfaces_stream_reset_over_a_truncated_buffered_body`
+# and `poll_next_surfaces_stream_reset_over_a_buffered_frame`); to run them locally,
 # invoke `cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`.
 # The same tests are part of hyperium/h3#339 and run on the upstream PR's CI.
 #

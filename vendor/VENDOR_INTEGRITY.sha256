@@ -163,7 +163,7 @@ ae0f3914b1db227ea53a4e5d448a51ebb3bd308b00591e03839ad64fe71fbc99  vendor/h3-0.0.
 0c4c9bbe11efb6920d91a89084c6e0b518e6e20899c7740ea0b826ab91b4ee0d  vendor/h3-0.0.8-ferrum-patched/src/error/internal_error.rs
 625398047478bb13699ffcf5c5861e40985fa44d42c1c5a9607d7eed1d27f174  vendor/h3-0.0.8-ferrum-patched/src/error/mod.rs
 c5019bafda78b091e6258ceb8af847e094f29d823fe92c1f67a6c85a439f09a5  vendor/h3-0.0.8-ferrum-patched/src/ext.rs
-8c0a28d69e41b287167cd254ab2706431068a404f2c38a26ec03d595a83ba8d8  vendor/h3-0.0.8-ferrum-patched/src/frame.rs
+e1d7e27609f03ef7be471ff43a3d073f4c1a61299ac4f6ecf1eeceb914d7de1d  vendor/h3-0.0.8-ferrum-patched/src/frame.rs
 eeb9a057b1a004f034160e2664eb75dfea88bc8e0ee792b70e7882425050f1a9  vendor/h3-0.0.8-ferrum-patched/src/lib.rs
 2800e31ae27b2199cffc8fc014409e09c7f228d01665dd15e8245050fcceefe0  vendor/h3-0.0.8-ferrum-patched/src/proto/coding.rs
 659e5d57a8f84b41ee047f6febab6ce2aa75277350f5ad93cf7b248024f44976  vendor/h3-0.0.8-ferrum-patched/src/proto/frame.rs

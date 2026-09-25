@@ -67,6 +67,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outcome and releases the admission permit and least-connections count before
   its client write, as the native HTTP/3 buffered writer already did, so a
   client parking that write no longer holds them.
+- A peer that resets an HTTP/3 stream in the middle of a DATA frame no longer
+  tears down the whole QUIC connection (PR #5741). The vendored `h3` frame-drain
+  patch held a QUIC error back so it could decode buffered bytes first. Quinn
+  reports a stream reset only once, so holding the reset back lost it: the
+  truncated frame ended as `H3_FRAME_ERROR` "received incomplete frame", a
+  connection error that also killed every other request on the connection. A
+  stream reset now surfaces with its own code, as it does in stock `h3`. This
+  applied to the gateway as a server (a client resetting a request body), as
+  an HTTP/3 backend client (a backend resetting a response), and to any HTTP/3
+  client built on the vendored crate.
 - The graceful-shutdown functional tests no longer pass on evidence that does
   not show a working drain (#5739). A proxy or TCP stream port now counts as
   closed only when the connect is refused, or when the peer closes or resets

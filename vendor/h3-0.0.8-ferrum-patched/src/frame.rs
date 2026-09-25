@@ -88,10 +88,12 @@ where
             // chance through the decoder. Without this hoist, a
             // CONNECTION_CLOSE frame coalesced with stream data in the
             // same recv batch wins the race and discards a fully-
-            // decodable HEADERS frame.
+            // decodable HEADERS frame. A peer RESET_STREAM is never
+            // hoisted: see `FrameStreamError::is_stream_reset`.
             let (end, pending_quic_err) = match self.try_recv(cx) {
                 Poll::Ready(Ok(end)) => (Poll::Ready(end), None),
                 Poll::Pending => (Poll::Pending, None),
+                Poll::Ready(Err(e)) if e.is_stream_reset() => return Poll::Ready(Err(e)),
                 Poll::Ready(Err(e)) => (Poll::Ready(true), Some(e)),
             };
 
@@ -142,9 +144,12 @@ where
         };
 
         // Mirror the hoist from poll_next: a QUIC-level error must not
-        // discard already-buffered body bytes for the current frame.
+        // discard already-buffered body bytes for the current frame. A peer
+        // RESET_STREAM is never hoisted: see
+        // `FrameStreamError::is_stream_reset`.
         let (end, pending_quic_err) = match self.try_recv(cx) {
             Poll::Ready(Ok(end)) => (end, None),
+            Poll::Ready(Err(e)) if e.is_stream_reset() => return Poll::Ready(Err(e)),
             Poll::Ready(Err(e)) => (true, Some(e)),
             Poll::Pending => (false, None),
         };
@@ -374,6 +379,33 @@ pub enum FrameStreamError {
     Proto(FrameProtocolError),
     Quic(StreamErrorIncoming),
     UnexpectedEnd,
+}
+
+impl FrameStreamError {
+    /// Whether this is the peer's `RESET_STREAM` for the stream being read.
+    ///
+    /// The frame-drain hoist in [`FrameStream::poll_next`] and
+    /// [`FrameStream::poll_data`] holds a QUIC error back so that buffered
+    /// bytes are decoded first. That only works for an error the transport
+    /// reports again on the next read, such as a connection error. Quinn
+    /// reports a stream reset exactly ONCE: it frees the receive stream as it
+    /// returns `ReadError::Reset`, and every later read is `ClosedStream`.
+    /// Holding a reset back therefore loses its code. Worse, a DATA frame the
+    /// reset truncated then ends in [`FrameStreamError::UnexpectedEnd`], which
+    /// the request stream escalates to a connection-level `H3_FRAME_ERROR` and
+    /// so tears down every other stream on the connection. RFC 9114 §7.1
+    /// makes a truncated frame a connection error only when the stream
+    /// "terminates cleanly". A reset is not a clean termination.
+    ///
+    /// A reset therefore surfaces on the poll that observed it, ahead of any
+    /// buffered bytes. That is stock h3 behaviour, and Quinn itself discards
+    /// its own unread data on a reset (RFC 9000 §3.2).
+    fn is_stream_reset(&self) -> bool {
+        matches!(
+            self,
+            FrameStreamError::Quic(StreamErrorIncoming::StreamTerminated { .. })
+        )
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -754,6 +786,74 @@ mod tests {
         assert_poll_matches!(
             |cx| to_bytes(stream.poll_data(cx)),
             Ok(Some(b)) if b.remaining() == 4
+        );
+    }
+
+    /// `H3_REQUEST_CANCELLED`, the code a peer that cuts a committed response
+    /// resets the stream with.
+    const RESET_CODE: u64 = 0x010c;
+
+    /// Regression: a peer RESET_STREAM that truncates a DATA frame while part
+    /// of that frame is still buffered must surface as the reset. Holding it
+    /// back to drain the buffer lost the one-shot reset and ended the body in
+    /// `UnexpectedEnd`, which the request stream escalates to a
+    /// connection-level `H3_FRAME_ERROR` ("received incomplete frame").
+    #[tokio::test]
+    async fn poll_data_surfaces_stream_reset_over_a_truncated_buffered_body() {
+        let mut recv = FakeRecv::default();
+        let mut buf = BytesMut::with_capacity(64);
+        FrameType::DATA.encode(&mut buf);
+        VarInt::from(8u32).encode(&mut buf);
+        buf.put_slice(&b"bo"[..]);
+        recv.chunk(buf.freeze());
+        recv.chunk_then_error(
+            Bytes::from_static(b"dy"),
+            StreamErrorIncoming::StreamTerminated {
+                error_code: RESET_CODE,
+            },
+        );
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Ok(Some(Frame::Data(PayloadLen(8))))
+        );
+        // This poll pulls "dy" into the buffer behind "bo".
+        assert_poll_matches!(
+            |cx| to_bytes(stream.poll_data(cx)),
+            Ok(Some(b)) if &*b == b"bo"
+        );
+        // The reset arrives with "dy" buffered and the frame 4 bytes short.
+        assert_poll_matches!(
+            |cx| to_bytes(stream.poll_data(cx)),
+            Err(FrameStreamError::Quic(StreamErrorIncoming::StreamTerminated {
+                error_code: RESET_CODE
+            }))
+        );
+    }
+
+    /// Regression: a peer RESET_STREAM observed with a decodable frame
+    /// buffered surfaces as the reset instead of the frame. Returning the
+    /// frame first lost the one-shot reset: the next read of the freed QUIC
+    /// stream no longer carries its code.
+    #[tokio::test]
+    async fn poll_next_surfaces_stream_reset_over_a_buffered_frame() {
+        let recv = FakeRecv {
+            pending_error: Some(StreamErrorIncoming::StreamTerminated {
+                error_code: RESET_CODE,
+            }),
+            ..FakeRecv::default()
+        };
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+        let mut buf = BytesMut::with_capacity(64);
+        Frame::headers(&b"header"[..]).encode_with_payload(&mut buf);
+        stream.stream.buf_mut().push_bytes(&mut buf.freeze());
+
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Err(FrameStreamError::Quic(StreamErrorIncoming::StreamTerminated {
+                error_code: RESET_CODE
+            }))
         );
     }
 

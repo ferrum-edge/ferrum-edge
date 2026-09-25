@@ -87,7 +87,7 @@ git add Cargo.toml vendor/
 git commit -m "Vendor h3 with frame-drain-on-quic-close patch (tracks hyperium/h3#NNN)"
 ```
 
-With the vendored crate in place, the gateway-side suppression in PR #506 still applies (it's the right behavior independently — graceful closes shouldn't downgrade backend capability), and the 502 itself goes away because `recv_response` now drains buffered HEADERS instead of erroring. Inline regression tests in `vendor/h3-0.0.8-ferrum-patched/src/frame.rs` (`poll_next_drains_buffered_headers_before_quic_close`, `poll_data_drains_buffered_body_before_quic_close`) cover the fix at the library layer.
+With the vendored crate in place, the gateway-side suppression in PR #506 still applies (it's the right behavior independently — graceful closes shouldn't downgrade backend capability), and the 502 itself goes away because `recv_response` now drains buffered HEADERS instead of erroring. Inline regression tests in `vendor/h3-0.0.8-ferrum-patched/src/frame.rs` (`poll_next_drains_buffered_headers_before_quic_close`, `poll_data_drains_buffered_body_before_quic_close`) cover the fix at the library layer, and `poll_data_surfaces_stream_reset_over_a_truncated_buffered_body` / `poll_next_surfaces_stream_reset_over_a_buffered_frame` pin the stream-reset exemption described under "Changing the patch design before submission".
 
 ## Retirement — when upstream merges
 
@@ -116,6 +116,7 @@ If a reviewer (us, or upstream) wants to change the approach, edit `h3-frame-rs.
 - **Drain ONCE per iteration** rather than loop-until-empty: terminates without proof obligations.
 - **Apply to BOTH `poll_next` and `poll_data`**: same shape, same fix; addressing only one would leave the body path leaky.
 - **`FakeRecv::chunk_then_error` helper instead of a separate fake**: keeps existing tests untouched and minimizes the test surface for review.
+- **Never hoist a peer `RESET_STREAM`** (`FrameStreamError::is_stream_reset`, ferrum-edge#5741): the hoist assumes the held-back error is reported again on the next read, which holds for a connection error but not for a stream reset. Quinn reports `ReadError::Reset` exactly once and frees the receive stream as it does, so every later read is `ClosedStream`. The first draft held a reset back like any other error, which lost the reset code whenever buffered bytes were drained first. Worse, when the reset truncated a DATA frame whose tail was still buffered, `poll_data` returned `UnexpectedEnd`, which the request stream escalates to a connection-level `H3_FRAME_ERROR` ("received incomplete frame") that tears down every other stream on the connection. RFC 9114 §7.1 makes a truncated frame a connection error only for a stream that "terminates cleanly". A stream reset now surfaces on the poll that observed it, ahead of buffered bytes: that is stock h3 behaviour, and Quinn itself discards unread data on a reset (RFC 9000 §3.2). The gateway hit this as an HTTP/3 client reading a response cut by the route deadline while the reader was stalled in flow control (`tests/functional/functional_h3_local_policy_test.rs::functional_h3_route_request_timeout_cuts_a_client_that_stops_reading`). The same defect hit the gateway as a server (a client resetting a request body mid-frame) and as an H3 backend client (a backend resetting a response mid-frame).
 
 Alternative designs considered and rejected:
 
