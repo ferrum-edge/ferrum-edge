@@ -3251,14 +3251,27 @@ async fn http_probe(
     if let Some(host_header) = host_header {
         request = request.header(reqwest::header::HOST, host_header);
     }
+    let started = tokio::time::Instant::now();
     match request.send().await {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let status = resp.status().as_u16();
             let healthy = if healthy_status_codes.is_empty() {
                 (200..300).contains(&status)
             } else {
                 healthy_status_codes.contains(&status)
             };
+            // The verdict is decided by the status alone. Drain a small body so
+            // the HTTP/1.1 connection can return to the idle pool; a body that is
+            // oversized, stalled, or fails mid-read is abandoned (the connection
+            // is closed) without changing the verdict.
+            let drain_budget = timeout
+                .saturating_sub(started.elapsed())
+                .min(HTTP_PROBE_BODY_DRAIN_TIMEOUT);
+            match tokio::time::timeout(drain_budget, drain_probe_body(&mut resp)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => debug!(reason, "HTTP health probe body not drained"),
+                Err(_) => debug!("HTTP health probe body drain timed out"),
+            }
             if healthy {
                 ProbeOutcome::success()
             } else {
@@ -3275,6 +3288,35 @@ async fn http_probe(
             ProbeOutcome::failure(failure)
         }
     }
+}
+
+/// Largest HTTP health probe response body drained for connection reuse.
+/// Larger bodies are abandoned and their connection closed.
+const HTTP_PROBE_BODY_DRAIN_MAX_BYTES: u64 = 64 * 1024;
+
+/// Longest time spent draining an HTTP health probe response body, further
+/// capped by whatever remains of the probe timeout.
+const HTTP_PROBE_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Reads and discards a health probe response body so hyper can return the
+/// connection to the pool. Stops as soon as the body exceeds
+/// [`HTTP_PROBE_BODY_DRAIN_MAX_BYTES`]; each chunk is dropped immediately, so
+/// memory stays bounded by the transport's read buffer.
+async fn drain_probe_body(resp: &mut reqwest::Response) -> Result<(), &'static str> {
+    if resp
+        .content_length()
+        .is_some_and(|len| len > HTTP_PROBE_BODY_DRAIN_MAX_BYTES)
+    {
+        return Err("body exceeds drain limit");
+    }
+    let mut drained: u64 = 0;
+    while let Some(chunk) = resp.chunk().await.map_err(|_| "body read failed")? {
+        drained = drained.saturating_add(chunk.len() as u64);
+        if drained > HTTP_PROBE_BODY_DRAIN_MAX_BYTES {
+            return Err("body exceeds drain limit");
+        }
+    }
+    Ok(())
 }
 
 /// TCP health probe — attempts a TCP connection within the timeout.
@@ -4763,6 +4805,20 @@ pub mod probe_timer_for_test {
     pub fn timer(target_key: &str, interval: Duration) -> tokio::time::Interval {
         super::active_probe_timer(target_key, interval)
     }
+}
+
+/// Public wrapper around [`http_probe`] for use in unit/integration tests.
+/// Returns the probe verdict and its failure reason, if any.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn http_probe_for_test(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    healthy_status_codes: &[u16],
+) -> (bool, Option<String>) {
+    let outcome = http_probe(client, url, None, timeout, healthy_status_codes).await;
+    (outcome.success, outcome.failure)
 }
 
 /// Public wrapper around [`grpc_probe`] for use in unit/integration tests.

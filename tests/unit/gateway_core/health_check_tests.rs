@@ -3166,3 +3166,193 @@ async fn slow_active_probe_yields_one_follow_up_tick_not_a_burst() {
     tokio::time::advance(interval).await;
     timer.tick().await;
 }
+
+// ─── HTTP probe body drain and keep-alive reuse (issue #5791) ────────────────
+
+const PROBE_BODY: &[u8] = b"{\"status\":\"ok\"}";
+
+#[derive(Clone, Copy)]
+enum ProbeBodyMode {
+    /// `Content-Length` body written 10 ms after the response head.
+    Delayed,
+    /// `Content-Length: 0`.
+    Empty,
+    /// Declares a 15-byte body but never sends it.
+    Stalled,
+    /// Chunked body that never ends.
+    Endless,
+}
+
+/// Persistent-connection HTTP/1.1 health server that counts accepted TCP
+/// connections.
+async fn keep_alive_health_server(
+    status: &'static str,
+    mode: ProbeBodyMode,
+) -> (SocketAddr, Arc<AtomicU64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicU64::new(0));
+    let accepted_task = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            accepted_task.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ = serve_health_requests(&mut stream, status, mode).await;
+            });
+        }
+    });
+    (addr, accepted)
+}
+
+async fn serve_health_requests(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    mode: ProbeBodyMode,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = Vec::new();
+    let mut read = [0u8; 1024];
+    loop {
+        // Probes are bodiless GETs, so a request ends at its head.
+        let head_end = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            match stream.read(&mut read).await? {
+                0 => return Ok(()),
+                n => buf.extend_from_slice(&read[..n]),
+            }
+        };
+        buf.drain(..head_end);
+
+        match mode {
+            ProbeBodyMode::Delayed => {
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    PROBE_BODY.len()
+                );
+                stream.write_all(head.as_bytes()).await?;
+                stream.flush().await?;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                stream.write_all(PROBE_BODY).await?;
+            }
+            ProbeBodyMode::Empty => {
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                );
+                stream.write_all(head.as_bytes()).await?;
+            }
+            ProbeBodyMode::Stalled => {
+                let head = format!("HTTP/1.1 {status}\r\nContent-Length: 15\r\n\r\n");
+                stream.write_all(head.as_bytes()).await?;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                return Ok(());
+            }
+            ProbeBodyMode::Endless => {
+                let head = format!("HTTP/1.1 {status}\r\nTransfer-Encoding: chunked\r\n\r\n");
+                stream.write_all(head.as_bytes()).await?;
+                let chunk = [b'x'; 1024];
+                loop {
+                    stream.write_all(b"400\r\n").await?;
+                    stream.write_all(&chunk).await?;
+                    stream.write_all(b"\r\n").await?;
+                }
+            }
+        }
+    }
+}
+
+fn plain_probe_client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+/// Runs six sequential probes 30 ms apart and returns the accepted connection
+/// count.
+async fn sequential_probe_connections(
+    status: &'static str,
+    mode: ProbeBodyMode,
+    expect_healthy: bool,
+) -> u64 {
+    use ferrum_edge::health_check::http_probe_for_test;
+
+    let (addr, accepted) = keep_alive_health_server(status, mode).await;
+    let client = plain_probe_client();
+    let url = format!("http://{addr}/health");
+    for _ in 0..6 {
+        let (healthy, failure) =
+            http_probe_for_test(&client, &url, Duration::from_secs(2), &[200]).await;
+        assert_eq!(healthy, expect_healthy, "unexpected verdict: {failure:?}");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    accepted.load(Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn http_probe_reuses_connection_when_body_follows_headers() {
+    let connections = sequential_probe_connections("200 OK", ProbeBodyMode::Delayed, true).await;
+    assert_eq!(
+        connections, 1,
+        "probes must drain a small delayed body so the keep-alive connection is reused"
+    );
+}
+
+#[tokio::test]
+async fn http_probe_reuses_connection_for_unhealthy_status_with_body() {
+    let status = "503 Service Unavailable";
+    let connections = sequential_probe_connections(status, ProbeBodyMode::Delayed, false).await;
+    assert_eq!(
+        connections, 1,
+        "unhealthy responses must also release the connection"
+    );
+}
+
+#[tokio::test]
+async fn http_probe_reuses_connection_for_empty_body() {
+    let connections = sequential_probe_connections("200 OK", ProbeBodyMode::Empty, true).await;
+    assert_eq!(connections, 1);
+}
+
+#[tokio::test]
+async fn http_probe_stalled_body_keeps_status_verdict_and_is_time_bounded() {
+    use ferrum_edge::health_check::http_probe_for_test;
+
+    let (addr, _accepted) = keep_alive_health_server("200 OK", ProbeBodyMode::Stalled).await;
+    let client = plain_probe_client();
+    let url = format!("http://{addr}/health");
+    let started = Instant::now();
+    let (healthy, failure) =
+        http_probe_for_test(&client, &url, Duration::from_secs(10), &[200]).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        healthy,
+        "a stalled body must not override the status verdict: {failure:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "body drain must be time-bounded independently of the probe timeout, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn http_probe_endless_body_keeps_status_verdict_and_is_byte_bounded() {
+    use ferrum_edge::health_check::http_probe_for_test;
+
+    let (addr, _accepted) = keep_alive_health_server("200 OK", ProbeBodyMode::Endless).await;
+    let client = plain_probe_client();
+    let url = format!("http://{addr}/health");
+    let started = Instant::now();
+    let (healthy, failure) =
+        http_probe_for_test(&client, &url, Duration::from_secs(10), &[200]).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        healthy,
+        "an oversized body must not override the status verdict: {failure:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "body drain must stop at its byte limit, took {elapsed:?}"
+    );
+}
