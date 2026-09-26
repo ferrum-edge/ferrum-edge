@@ -130,7 +130,7 @@ use super::utils::ai_providers::{detect_response_provider, detect_sse_provider};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::json_escape::escape_json_string;
 use super::utils::response_body::read_response_body_bounded;
-use super::utils::sse::{encode_sse_error_event, is_sse_request};
+use super::utils::sse::{encode_sse_error_event, is_sse_request, sse_lines};
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector,
@@ -5583,40 +5583,6 @@ fn next_event_end(buf: &[u8]) -> Option<usize> {
         }
     }
     None
-}
-
-/// Split SSE text into lines on any of the three spec terminators (`\r\n`,
-/// `\r`, `\n`), terminators consumed. `str::lines` is LF-only, so a CR-only
-/// event would collapse into one unparseable line and its `data:` frames
-/// would bypass governance. Terminator bytes are ASCII, so the byte-index
-/// slices always fall on char boundaries.
-fn sse_lines(text: &str) -> Vec<&str> {
-    let bytes = text.as_bytes();
-    let mut lines = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => {
-                lines.push(&text[start..i]);
-                i += 1;
-                start = i;
-            }
-            b'\r' => {
-                lines.push(&text[start..i]);
-                i += 1;
-                if bytes.get(i) == Some(&b'\n') {
-                    i += 1;
-                }
-                start = i;
-            }
-            _ => i += 1,
-        }
-    }
-    if start < bytes.len() {
-        lines.push(&text[start..]);
-    }
-    lines
 }
 
 enum SseEvent {

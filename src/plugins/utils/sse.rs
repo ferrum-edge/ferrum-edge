@@ -296,9 +296,20 @@ pub enum SseForwardedPrefix {
     /// complete that BOM, carry nothing either; after them the stream can be
     /// read as a fresh event.
     PartialBom(usize),
-    /// A `data`, `event` or other field line, or an unterminated line whose
-    /// field is not yet known: the rest of this event may carry data that only
-    /// makes sense together with the forwarded prefix.
+    /// An open event that holds no data text yet, but whose start shapes how
+    /// the client reads the rest of it: an `event` line names the event, other
+    /// field lines are ignored, a `data` line with an empty value adds only a
+    /// line break to the event's data, and an unterminated line whose field
+    /// name is still incomplete, or whose `data` value has not begun, is
+    /// continued by the next bytes. The rest of the event therefore cannot be
+    /// read as a fresh event, yet none of its data text has left: the caller
+    /// keeps the prefix from the given byte offset (where the open event
+    /// starts) as parse-only context and reads the rest of the event together
+    /// with it, so that event's data is still inspected.
+    EventContext(usize),
+    /// A `data` line whose value is not empty, or an unterminated one whose
+    /// value has begun: the forwarded prefix already carries data of the event
+    /// the client dispatches.
     OpenEvent,
 }
 
@@ -319,17 +330,19 @@ pub fn classify_forwarded_sse_prefix(prefix: &[u8]) -> SseForwardedPrefix {
     if !rest.is_empty() && UTF8_BOM.starts_with(rest) {
         return SseForwardedPrefix::PartialBom(UTF8_BOM.len() - rest.len());
     }
+    let mut event_start = prefix.len() - rest.len();
     let mut open = false;
+    let mut context = false;
     let mut unfinished_line = false;
     while !rest.is_empty() {
         let Some((line_end, next)) = sse_line_end(rest) else {
-            // Later bytes extend this unterminated line, so it is inert only
-            // once its field name is complete, and even then those later bytes
-            // belong to it up to the next terminator.
-            if rest.contains(&b':') && is_inert_sse_line(rest) {
-                unfinished_line = true;
-            } else {
-                open = true;
+            // Later bytes extend this unterminated line. Past its `:`, a
+            // comment, `id` or `retry` line stays inert, but those later bytes
+            // still belong to it up to the next terminator.
+            match sse_line_field(rest) {
+                (b"" | b"id" | b"retry", Some(_)) => unfinished_line = true,
+                (b"data", Some(value)) if !matches!(value, b"" | b" ") => open = true,
+                _ => context = true,
             }
             break;
         };
@@ -338,12 +351,23 @@ pub fn classify_forwarded_sse_prefix(prefix: &[u8]) -> SseForwardedPrefix {
         if line.is_empty() {
             // A blank line ends the event; anything after it starts a new one.
             open = false;
-        } else if !is_inert_sse_line(line) {
-            open = true;
+            context = false;
+            event_start = prefix.len() - rest.len();
+            continue;
+        }
+        match sse_line_field(line) {
+            (b"" | b"id" | b"retry", _) => {}
+            // An empty value adds no text of its own, so the event's data is
+            // still ahead and is inspected together with this context.
+            (b"data", None | Some(b"" | b" ")) => context = true,
+            (b"data", Some(_)) => open = true,
+            _ => context = true,
         }
     }
     if open {
         SseForwardedPrefix::OpenEvent
+    } else if context {
+        SseForwardedPrefix::EventContext(event_start)
     } else if unfinished_line {
         SseForwardedPrefix::InertLine
     } else {
@@ -351,14 +375,13 @@ pub fn classify_forwarded_sse_prefix(prefix: &[u8]) -> SseForwardedPrefix {
     }
 }
 
-/// Whether a non-empty SSE line is a comment or an `id` or `retry` field: a
-/// line that can never add data to the event it belongs to.
-fn is_inert_sse_line(line: &[u8]) -> bool {
-    let field = match line.iter().position(|byte| *byte == b':') {
-        Some(colon) => &line[..colon],
-        None => line,
-    };
-    matches!(field, b"" | b"id" | b"retry")
+/// Split a non-empty SSE line into its field name and, when it has a `:`, the
+/// bytes after it. A line starting with `:` is a comment (empty field name).
+fn sse_line_field(line: &[u8]) -> (&[u8], Option<&[u8]>) {
+    match line.iter().position(|byte| *byte == b':') {
+        Some(colon) => (&line[..colon], Some(&line[colon + 1..])),
+        None => (line, None),
+    }
 }
 
 /// Split one line from [`sse_lines_inclusive`] into its content and its
