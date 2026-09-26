@@ -5183,6 +5183,7 @@ fn is_safe_provider_response_header(name: &str) -> bool {
             | "x-goog-request-id"
             | "anthropic-request-id"
             | "openai-request-id"
+            | "ratelimit"
     ) || name.starts_with("x-ratelimit-")
         || name.starts_with("ratelimit-")
         || name.starts_with("anthropic-ratelimit-")

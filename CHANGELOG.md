@@ -379,6 +379,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shrinking the limit until that window rolls out; backend failures, the
   recovery-cohort barrier, and in-flight accounting are unchanged, and
   compatible reloads keep the learned windows.
+- `response_caching` no longer stores or replays rate-limit fields: the
+  combined IETF `RateLimit` field and every `RateLimit-*`, `X-RateLimit-*`,
+  `X-AI-RateLimit-*`, and `Anthropic-RateLimit-*` field are stripped
+  case-insensitively from the retained entry, so a cache hit no longer reports
+  the original client's stale quota (for example `r=0`) until the entry
+  expires. The response that produced the miss is unchanged. `ai_federation`
+  now relays a provider's combined `RateLimit` field alongside the
+  `RateLimit-*` fields it already relayed (#5790).
 
 ### Security
 
