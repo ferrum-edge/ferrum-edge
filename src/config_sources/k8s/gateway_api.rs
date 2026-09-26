@@ -5676,6 +5676,12 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
                 Some("URLRewrite") => {
                     ensure_url_rewrite_filter(object, rule, rule_index, &location, payload_object)?;
                 }
+                Some("RequestRedirect") => {
+                    if let Some(path) = payload_object.get("path") {
+                        let modifier = PathModifierFilter::RequestRedirect;
+                        ensure_path_modifier(object, rule, rule_index, &location, modifier, path)?;
+                    }
+                }
                 Some(modifier @ ("RequestHeaderModifier" | "ResponseHeaderModifier")) => {
                     ensure_header_modifier_filter(
                         object,
@@ -6128,10 +6134,50 @@ fn ensure_url_rewrite_filter(
     let Some(path) = rewrite.get("path") else {
         return Ok(());
     };
+    let modifier = PathModifierFilter::UrlRewrite;
+    ensure_path_modifier(object, rule, rule_index, location, modifier, path)
+}
+
+/// The filter carrying an `HTTPPathModifier`: `URLRewrite` rebases the path
+/// forwarded to the backend, `RequestRedirect` builds the `Location` path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathModifierFilter {
+    UrlRewrite,
+    RequestRedirect,
+}
+
+impl PathModifierFilter {
+    /// The filter's payload key, used in every field-specific status message.
+    fn payload(self) -> &'static str {
+        match self {
+            Self::UrlRewrite => "urlRewrite",
+            Self::RequestRedirect => "requestRedirect",
+        }
+    }
+}
+
+/// Validate one `HTTPPathModifier` (`URLRewrite.path` or
+/// `RequestRedirect.path`) before any rule materializes, with the same
+/// reason mapping as [`ensure_url_rewrite_filter`]. Both filters share one
+/// contract: exactly one replacement field, matching `type`; an absolute,
+/// canonical replacement (an empty `replacePrefixMatch` strips the matched
+/// prefix); and `ReplacePrefixMatch` only under `PathPrefix` matches. A
+/// `RequestRedirect` additionally admits an empty `replaceFullPath`, which
+/// materializes as `/`. A value the dispatch plugin would compose into a
+/// corrupted `Location` is refused here as `Accepted=False` instead.
+fn ensure_path_modifier(
+    object: &K8sObject,
+    rule: &serde_json::Map<String, Value>,
+    rule_index: usize,
+    location: &str,
+    modifier: PathModifierFilter,
+    path: &Value,
+) -> Result<(), K8sTranslateError> {
+    let payload = modifier.payload();
     let Some(path) = path.as_object() else {
         return Err(invalid_resource(
             object,
-            format!("{location}.urlRewrite.path must be an object"),
+            format!("{location}.{payload}.path must be an object"),
         ));
     };
     if path.keys().any(|key| {
@@ -6143,7 +6189,7 @@ fn ensure_url_rewrite_filter(
         return Err(invalid_resource(
             object,
             format!(
-                "{INCOMPATIBLE_FILTERS_MARKER}: {location}.urlRewrite.path contains unhandled fields"
+                "{INCOMPATIBLE_FILTERS_MARKER}: {location}.{payload}.path contains unhandled fields"
             ),
         ));
     }
@@ -6161,9 +6207,7 @@ fn ensure_url_rewrite_filter(
     {
         return Err(invalid_resource(
             object,
-            format!(
-                "{location}.urlRewrite.path.{stray_field} must not be set for type {path_type}"
-            ),
+            format!("{location}.{payload}.path.{stray_field} must not be set for type {path_type}"),
         ));
     }
     match path_type {
@@ -6172,36 +6216,38 @@ fn ensure_url_rewrite_filter(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "{location}.urlRewrite.path.replaceFullPath is required for type ReplaceFullPath"
+                        "{location}.{payload}.path.replaceFullPath is required for type ReplaceFullPath"
                     ),
                 ));
             };
-            ensure_rewrite_replacement_path(object, location, "replaceFullPath", replacement)?;
+            // A redirect's empty full path is the root `Location` path `/`.
+            let redirect_root =
+                modifier == PathModifierFilter::RequestRedirect && replacement.is_empty();
+            if !redirect_root {
+                let field = "replaceFullPath";
+                ensure_rewrite_replacement_path(object, location, modifier, field, replacement)?;
+            }
         }
         Some("ReplacePrefixMatch") => {
             let Some(replacement) = path.get("replacePrefixMatch").and_then(Value::as_str) else {
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "{location}.urlRewrite.path.replacePrefixMatch is required for type ReplacePrefixMatch"
+                        "{location}.{payload}.path.replacePrefixMatch is required for type ReplacePrefixMatch"
                     ),
                 ));
             };
             // An empty replacement is legal upstream and means "drop the
             // matched prefix"; it normalizes to `/` at materialization.
             if !replacement.is_empty() {
-                ensure_rewrite_replacement_path(
-                    object,
-                    location,
-                    "replacePrefixMatch",
-                    replacement,
-                )?;
+                let field = "replacePrefixMatch";
+                ensure_rewrite_replacement_path(object, location, modifier, field, replacement)?;
             }
             if !rule_matches_are_all_path_prefix(rule) {
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "rules[{rule_index}] urlRewrite path.type ReplacePrefixMatch requires every match in the rule to use a PathPrefix path match"
+                        "rules[{rule_index}] {payload} path.type ReplacePrefixMatch requires every match in the rule to use a PathPrefix path match"
                     ),
                 ));
             }
@@ -6210,7 +6256,7 @@ fn ensure_url_rewrite_filter(
             return Err(invalid_resource(
                 object,
                 format!(
-                    "{location}.urlRewrite.path.type {UNSUPPORTED_SHAPE_MARKER}: expected ReplaceFullPath or ReplacePrefixMatch"
+                    "{location}.{payload}.path.type {UNSUPPORTED_SHAPE_MARKER}: expected ReplaceFullPath or ReplacePrefixMatch"
                 ),
             ));
         }
@@ -6218,16 +6264,21 @@ fn ensure_url_rewrite_filter(
     Ok(())
 }
 
-/// Reject a rewrite replacement Ferrum cannot forward verbatim. The dispatch
-/// plugin applies the same absolute/canonical/CRLF rules at construction, so
-/// catching them here turns a plugin-build failure into a route-scoped
-/// `Accepted=False` with a field-specific message.
+/// Reject a rewrite or redirect replacement Ferrum cannot emit verbatim. For
+/// `URLRewrite` the dispatch plugin applies the same absolute/canonical/CRLF
+/// rules at construction, so catching them here turns a plugin-build failure
+/// into a route-scoped `Accepted=False` with a field-specific message. For
+/// `RequestRedirect` this is the only gate: a relative or dot-segment
+/// replacement would otherwise compose a corrupted `Location` (or a `400` on
+/// every matching request).
 fn ensure_rewrite_replacement_path(
     object: &K8sObject,
     location: &str,
+    modifier: PathModifierFilter,
     field: &str,
     replacement: &str,
 ) -> Result<(), K8sTranslateError> {
+    let payload = modifier.payload();
     if !replacement.starts_with('/')
         || replacement.contains(['?', '#'])
         || replacement.contains(['\r', '\n'])
@@ -6235,14 +6286,14 @@ fn ensure_rewrite_replacement_path(
         return Err(invalid_resource(
             object,
             format!(
-                "{location}.urlRewrite.path.{field} must be an absolute path without a query or fragment"
+                "{location}.{payload}.path.{field} must be an absolute path without a query or fragment"
             ),
         ));
     }
     if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(replacement) {
         return Err(invalid_resource(
             object,
-            format!("{location}.urlRewrite.path.{field} is not canonical: {reason}"),
+            format!("{location}.{payload}.path.{field} is not canonical: {reason}"),
         ));
     }
     Ok(())
@@ -7501,15 +7552,7 @@ fn gateway_url_rewrite_value(rule: &Value) -> Option<Value> {
                     if let Some(replacement) =
                         path.get("replacePrefixMatch").and_then(Value::as_str)
                     {
-                        // Upstream's rewrite table maps an empty replacement to
-                        // a bare `/` (`/foo` + prefix `/foo` + `""` -> `/`), so
-                        // normalize it here rather than emitting an empty `uri`
-                        // the dispatch plugin refuses.
-                        let replacement = if replacement.is_empty() {
-                            "/"
-                        } else {
-                            replacement
-                        };
+                        let replacement = gateway_prefix_replacement(replacement);
                         out.insert("uri".to_string(), Value::String(replacement.to_string()));
                         out.insert(
                             GATEWAY_API_REWRITE_REPLACE_PREFIX_MATCH_KEY.to_string(),
@@ -7546,6 +7589,22 @@ fn gateway_rewrite_value_for_match(rewrite: &Value, match_entry: &Value) -> Valu
         );
     }
     value
+}
+
+/// Normalize a `ReplacePrefixMatch` replacement for the dispatch plugin.
+///
+/// Upstream's `HTTPPathModifier` table maps an empty replacement to a bare `/`
+/// (`/foo` + prefix `/foo` + `""` -> `/`, `/foo/bar` -> `/bar`). The dispatch
+/// plugin refuses an empty `uri`, and its prefix join collapses the doubled
+/// separator `/` + `/bar` produces, so `/` reproduces the upstream table for
+/// every request shape. Shared by the `URLRewrite` and `RequestRedirect`
+/// projections so the two filters can never disagree on the empty spelling.
+fn gateway_prefix_replacement(replacement: &str) -> &str {
+    if replacement.is_empty() {
+        "/"
+    } else {
+        replacement
+    }
 }
 
 /// Canonicalize a matched `PathPrefix` value into the literal byte prefix the
@@ -7703,14 +7762,16 @@ fn gateway_redirect_path(redirect: &serde_json::Map<String, Value>) -> Option<(&
     let path = redirect.get("path")?.as_object()?;
     let path_type = path.get("type").and_then(Value::as_str).unwrap_or_default();
     match path_type {
+        // An empty full path is the root `Location` path; admission accepts
+        // it for a redirect only (see `ensure_path_modifier`).
         "ReplaceFullPath" => path
             .get("replaceFullPath")
             .and_then(Value::as_str)
-            .map(|path| (path, false)),
+            .map(|path| (if path.is_empty() { "/" } else { path }, false)),
         "ReplacePrefixMatch" => path
             .get("replacePrefixMatch")
             .and_then(Value::as_str)
-            .map(|path| (path, true)),
+            .map(|path| (gateway_prefix_replacement(path), true)),
         _ => None,
     }
 }
