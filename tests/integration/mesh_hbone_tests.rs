@@ -1305,7 +1305,20 @@ async fn inbound_relay_synthesis_refusal_is_documented_403() {
 async fn peerless_connect_refused_at_synthesis_gets_unauthenticated_peer_terminal() {
     let (backend_addr, mut hit_rx, backend) =
         start_counting_tcp_backend(IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
-    let state = create_egress_udp_gateway_state(MeshConfig::default());
+    let mesh = MeshConfig::default();
+    // The gateway listens on 127.0.0.1, so that is the accepted local address
+    // synthesis decides with. Refusing the authority there is what makes the
+    // answers below attributable to synthesis rather than to a handler gate.
+    let synthesis_decision = mesh.inbound_relay_destination_decision(
+        "127.0.0.1",
+        backend_addr.port(),
+        Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+    );
+    assert!(
+        synthesis_decision.is_err(),
+        "synthesis must refuse the authority, or this test never exercises it"
+    );
+    let state = create_egress_udp_gateway_state(mesh);
     let (gateway_addr, shutdown_tx) = start_plaintext_inbound_gateway(state).await;
     let stream = tokio::net::TcpStream::connect(gateway_addr)
         .await

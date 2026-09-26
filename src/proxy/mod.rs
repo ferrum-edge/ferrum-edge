@@ -2639,10 +2639,12 @@ pub(crate) struct InboundConnectRelay {
 
 /// Why [`build_inbound_hbone_relay_proxy`] withheld a relay (issue #5763).
 ///
-/// A synthesis-time refusal is the same authorization decision the post-plugin
-/// re-check makes, so the caller answers it with the same documented `403`
-/// and `mesh.relay.*` audit metadata rather than a route-miss `404`. Transport
-/// facts only — never request bytes, headers, or credential material.
+/// A synthesis-time refusal is the same decision the post-plugin re-check
+/// makes, so the caller answers it with the same terminal
+/// ([`hbone_proxy::inbound_relay_refusal_terminal`]: the documented `403`, or
+/// `503` before the first mesh slice) and `mesh.relay.*` audit metadata rather
+/// than a route-miss `404`. Transport facts only — never request bytes,
+/// headers, or credential material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InboundConnectRelayRefusal {
     /// Stable `mesh.relay.denial_reason` label:
@@ -2684,10 +2686,12 @@ impl InboundConnectRelayRefusal {
 ///    a destination THIS proxy terminates for. Unreachable for a declared
 ///    ingress listener port so this can never widen it.
 ///
-/// Returns an [`InboundConnectRelayRefusal`] — which the caller answers with the
-/// documented `403 hbone_relay_destination_denied` (issue #5763) — when the
-/// authority is missing/portless or is not a destination this terminator owns
-/// per [`inbound_hbone_relay_destination_decision`].
+/// Returns an [`InboundConnectRelayRefusal`] when the authority is
+/// missing/portless or is not a destination this terminator owns per
+/// [`inbound_hbone_relay_destination_decision`]. The caller answers it through
+/// [`reject_inbound_connect_relay_synthesis`] (issue #5763): the documented
+/// `403 hbone_relay_destination_denied`, `503 hbone_relay_not_ready` before the
+/// first mesh slice, or the unauthenticated-peer `403` for a peerless CONNECT.
 ///
 /// `is_udp_connect` is true for a datagram-over-CONNECT
 /// (`connect-udp`) request: `ingress[]` stream listeners are TCP, the UDP relay
@@ -2760,8 +2764,9 @@ fn build_inbound_hbone_relay_proxy(
                 ingress_listener_authz_port: Some(port),
             });
         }
-        // Synthesis-time refusal: the caller answers the documented 403 and
-        // records the denial on the transaction line (issue #5763). This log
+        // Synthesis-time refusal: the caller answers the refusal's terminal
+        // (403 denial, 503 not-ready, or the unauthenticated-peer 403) and
+        // records it on the transaction line (issue #5763). This log
         // stays debug-level because a peer can drive it at request rate.
         // Authority host/port are transport facts — never request bytes or
         // credentials.
@@ -2820,9 +2825,10 @@ async fn reject_inbound_connect_relay_synthesis(
 /// The terminal a synthesis-time inbound CONNECT relay refusal answers with,
 /// logged to `plugins` (issue #5763). Three cases, in order:
 ///
-/// 1. A peerless CONNECT (no client certificate and no verified SPIFFE
-///    identity) gets the same unauthenticated-peer `403` the HBONE handlers
-///    answer (`hbone_unauthenticated_peer` / `hbone_udp_unauthenticated_peer`).
+/// 1. A peerless CONNECT (no verified SPIFFE identity: no client certificate,
+///    or one without a single valid, currently valid SPIFFE URI SAN) gets the
+///    same unauthenticated-peer `403` the HBONE handlers answer
+///    (`hbone_unauthenticated_peer` / `hbone_udp_unauthenticated_peer`).
 ///    It carries no `mesh.relay.*` metadata and is not counted as a
 ///    destination denial: an unauthenticated peer learns nothing about
 ///    destination ownership or readiness.
@@ -2844,43 +2850,30 @@ pub(crate) async fn reject_inbound_connect_relay_synthesis_with_plugins(
     request_uses_grpc_content_type: bool,
     grpc_web_response_content_type: Option<&str>,
 ) -> Response<ProxyBody> {
-    let peerless = ctx.tls_client_cert_der.is_none() && ctx.peer_spiffe_id.is_none();
+    // Peerless means no VERIFIED SPIFFE identity, exactly what the handlers'
+    // `peer_spiffe_id` gate refuses: a CA-trusted certificate without a usable
+    // SPIFFE ID is as unauthenticated here as no certificate at all. This is a
+    // refusal-only path and reads the connection's extraction cache.
+    let peerless = !crate::plugins::mesh::spiffe_identity::has_verified_peer_spiffe_identity(ctx);
     let terminal = if peerless {
-        hbone_proxy::unauthenticated_peer_connect_terminal(is_udp_connect)
-    } else {
-        hbone_proxy::inbound_relay_refusal_terminal(refusal.reason, is_udp_connect)
-    };
-    ctx.metadata.insert(
-        "mesh_authz.deny_policy".to_string(),
-        terminal.deny_policy.to_string(),
-    );
-    if !peerless {
+        let terminal = hbone_proxy::unauthenticated_peer_connect_terminal(is_udp_connect);
         ctx.metadata.insert(
-            hbone_proxy::MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
-            refusal.reason.to_string(),
+            "mesh_authz.deny_policy".to_string(),
+            terminal.deny_policy.to_string(),
         );
-        if let Some(destination) = refusal.destination.as_deref() {
-            ctx.metadata.insert(
-                hbone_proxy::MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
-                destination.to_string(),
-            );
-        }
-        if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {
-            ctx.metadata.insert(
-                hbone_proxy::MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
-                terminator_ip.to_string(),
-            );
-        }
-    }
+        terminal
+    } else {
+        hbone_proxy::record_inbound_relay_refusal(
+            ctx,
+            refusal.reason,
+            refusal.destination.clone(),
+            is_udp_connect,
+        )
+    };
     crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
         crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
         false,
     );
-    if terminal.is_destination_denial {
-        crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
-            crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
-        );
-    }
     let response = build_pre_plugin_reject_response(
         terminal.status,
         terminal.body,

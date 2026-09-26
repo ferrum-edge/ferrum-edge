@@ -9,10 +9,12 @@ use ferrum_edge::modes::mesh::node_waypoint_observability::{
     self, NodeWaypointAssertedIdentityRejectReason, NodeWaypointDestinationPolicyRejectReason,
     NodeWaypointHboneHandshakePhase,
 };
+use ferrum_edge::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache;
 use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::plugins::{Plugin, RequestContext, TransactionSummary};
 use ferrum_edge::proxy::ProxyState;
 use http_body_util::BodyExt;
+use rcgen::string::Ia5String;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -425,11 +427,36 @@ impl Plugin for CapturingLogPlugin {
     }
 }
 
-/// Whether the refused CONNECT arrived from an mTLS-authenticated peer.
+/// What the refused CONNECT's peer presented on its mTLS connection.
 #[derive(Clone, Copy)]
 enum Peer {
+    /// A client certificate carrying one valid SPIFFE URI SAN.
     Authenticated,
+    /// A client certificate the listener accepted that carries no SPIFFE ID.
+    CertWithoutSpiffeId,
+    /// No client certificate at all.
     Peerless,
+}
+
+const CLIENT_SPIFFE_ID: &str = "spiffe://cluster.local/ns/default/sa/client";
+
+/// A self-signed leaf with `spiffe_id` as its only URI SAN, or with a DNS SAN
+/// only when `None`. The listener's verifier is not under test here: synthesis
+/// runs after the handshake, so only the SAN content decides the peer class.
+fn client_leaf_der(spiffe_id: Option<&str>) -> Vec<u8> {
+    let names = vec!["client.local".to_string()];
+    let mut params = rcgen::CertificateParams::new(names).expect("leaf params");
+    if let Some(spiffe_id) = spiffe_id {
+        let uri = spiffe_id.to_string();
+        let uri = Ia5String::try_from(uri).expect("spiffe uri san");
+        params.subject_alt_names = vec![rcgen::SanType::URI(uri)];
+    }
+    let key = rcgen::KeyPair::generate().expect("leaf key");
+    params
+        .self_signed(&key)
+        .expect("self-signed leaf")
+        .der()
+        .to_vec()
 }
 
 struct SynthesisRefusal {
@@ -456,10 +483,16 @@ async fn refuse_at_synthesis(
         "/".to_string(),
     );
     ctx.mesh_inbound_terminator_ip = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
-    if matches!(peer, Peer::Authenticated) {
-        // Synthesis runs before `spiffe_identity`, so a presented client
-        // certificate is what marks the peer as not peerless there.
-        ctx.tls_client_cert_der = Some(Arc::new(vec![0x30, 0x00]));
+    // Synthesis runs before `spiffe_identity`, so it classifies the peer from
+    // the presented certificate through the connection's extraction cache.
+    let leaf = match peer {
+        Peer::Authenticated => Some(client_leaf_der(Some(CLIENT_SPIFFE_ID))),
+        Peer::CertWithoutSpiffeId => Some(client_leaf_der(None)),
+        Peer::Peerless => None,
+    };
+    if let Some(leaf) = leaf {
+        ctx.tls_client_cert_der = Some(Arc::new(leaf));
+        ctx.peer_spiffe_extraction_cache = Some(Arc::new(SpiffeIdentityConnectionCache::new()));
     }
     let response = _test_support::reject_inbound_connect_relay_synthesis_for_test(
         state,
@@ -500,7 +533,8 @@ fn metadata<'a>(summary: &'a TransactionSummary, key: &str) -> Option<&'a str> {
 /// Issue #5763: a relay-synthesis refusal answers one of three terminals and
 /// writes one transaction line each. Only a real destination denial carries the
 /// documented 403 body and counts as `relay_destination_denied`; `no_mesh_slice`
-/// is a 503 readiness answer, and a peerless CONNECT gets the handlers'
+/// is a 503 readiness answer, and a CONNECT with no verified SPIFFE identity —
+/// no certificate, or one without a usable SPIFFE ID — gets the handlers'
 /// unauthenticated-peer 403 with no `mesh.relay.*` audit metadata.
 #[test]
 fn inbound_connect_relay_synthesis_refusals_log_and_count_by_terminal() {
@@ -511,7 +545,7 @@ fn inbound_connect_relay_synthesis_refusals_log_and_count_by_terminal() {
         .expect("test runtime");
     node_waypoint_observability::set_enabled(true);
     let before = node_waypoint_observability::snapshot();
-    let (denied, udp_denied, not_ready, peerless, state) = runtime.block_on(async {
+    let (denied, udp_denied, not_ready, peerless, no_spiffe, state) = runtime.block_on(async {
         let dns_cache = DnsCache::new(DnsConfig::default());
         let (state, _) = ProxyState::new(
             GatewayConfig::default(),
@@ -553,7 +587,15 @@ fn inbound_connect_relay_synthesis_refusals_log_and_count_by_terminal() {
             false,
         )
         .await;
-        (denied, udp_denied, not_ready, peerless, state)
+        let no_spiffe = refuse_at_synthesis(
+            &state,
+            Peer::CertWithoutSpiffeId,
+            "address_not_terminated_here",
+            ("10.0.0.9", 5353),
+            true,
+        )
+        .await;
+        (denied, udp_denied, not_ready, peerless, no_spiffe, state)
     });
     let after = node_waypoint_observability::snapshot();
     node_waypoint_observability::set_enabled(false);
@@ -652,6 +694,30 @@ fn inbound_connect_relay_synthesis_refusals_log_and_count_by_terminal() {
         peerless.summary.metadata
     );
 
+    // A certificate without a usable SPIFFE ID is no verified identity, so it
+    // is the same unauthenticated-peer answer, never a destination denial.
+    assert_eq!(no_spiffe.status, 403);
+    assert!(
+        no_spiffe
+            .body
+            .contains("HBONE UDP tunnel requires an authenticated mesh peer"),
+        "body={}",
+        no_spiffe.body
+    );
+    assert_eq!(
+        metadata(&no_spiffe.summary, "rejection_phase"),
+        Some("hbone_udp_unauthenticated_peer")
+    );
+    assert!(
+        no_spiffe
+            .summary
+            .metadata
+            .keys()
+            .all(|key| !key.starts_with("mesh.relay.")),
+        "a refusal without a verified identity must carry no relay audit metadata: {:?}",
+        no_spiffe.summary.metadata
+    );
+
     // Only the two real destination denials count.
     assert_eq!(
         after.destination_policy_rejections.relay_destination_denied,
@@ -661,13 +727,13 @@ fn inbound_connect_relay_synthesis_refusals_log_and_count_by_terminal() {
             + 2
     );
     // Every refusal is accounted as a request with its status.
-    assert_eq!(state.request_count.load(Ordering::Relaxed), 4);
+    assert_eq!(state.request_count.load(Ordering::Relaxed), 5);
     let status_count = |status: u16| {
         state
             .status_counts
             .get(&status)
             .map(|count| count.load(Ordering::Relaxed))
     };
-    assert_eq!(status_count(403), Some(3));
+    assert_eq!(status_count(403), Some(4));
     assert_eq!(status_count(503), Some(1));
 }

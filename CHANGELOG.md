@@ -80,11 +80,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   synthesis and a `403` destination denial at the later re-checks. It is no
   longer counted as a `relay_destination_denied` rejection, so a `403` always
   means a real authorization denial.
-- A CONNECT with no client certificate and no verified peer identity that is
-  refused at relay synthesis now gets the same unauthenticated-peer `403` the
-  HBONE handlers return (`hbone_unauthenticated_peer`), not a destination
-  denial (#5763). It carries no `mesh.relay.*` metadata and is not counted as a
-  `relay_destination_denied` rejection.
+- A CONNECT with no verified SPIFFE identity that is refused at relay
+  synthesis now gets the same unauthenticated-peer `403` the HBONE handlers
+  return (`hbone_unauthenticated_peer`), not a destination denial (#5763). That
+  covers a CONNECT with no client certificate and one whose certificate carries
+  no single, currently valid SPIFFE ID. It carries no `mesh.relay.*` metadata
+  and is not counted as a `relay_destination_denied` rejection.
+- A datagram CONNECT refused at the post-plugin re-check or the post-DNS
+  screen is now counted as a `relay_destination_denied` rejection, like the
+  byte-stream relay (#5763). The post-DNS screens also answer `503
+  hbone_relay_not_ready` before the first mesh slice, and both now bracket an
+  IPv6 `mesh.relay.denied_destination`.
 - `mesh.relay.denied_destination` now brackets an IPv6 literal as
   `[host]:port` (#5763).
 - A datagram-over-HBONE relay that ends on a socket error is now recorded as an

@@ -60,6 +60,9 @@ struct HboneConnectError {
     message: String,
     target_url: Option<String>,
     resolved_ip: Option<String>,
+    /// The `mesh.relay.denial_reason` when the post-DNS screen refused the
+    /// relay destination; `status`, `body` and `phase` are then its terminal.
+    relay_denial: Option<&'static str>,
 }
 
 struct HboneUdpSocketOpenError {
@@ -181,6 +184,49 @@ pub(super) fn relay_denied_destination(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
+}
+
+/// Decide and record a refused inbound relay destination (issues #4150,
+/// #5763): the ONE place relay synthesis, both handler re-checks and both
+/// post-DNS screens turn a `mesh.relay.denial_reason` into a terminal.
+///
+/// Stamps `mesh_authz.deny_policy` and the `mesh.relay.*` audit trail —
+/// transport facts only, never request bytes, headers, or credential material —
+/// and counts a real destination denial as `relay_destination_denied`. The
+/// caller answers with the returned terminal.
+pub(super) fn record_inbound_relay_refusal(
+    ctx: &mut RequestContext,
+    reason: &str,
+    destination: Option<String>,
+    is_udp_connect: bool,
+) -> HboneConnectRefusalTerminal {
+    let terminal = inbound_relay_refusal_terminal(reason, is_udp_connect);
+    ctx.metadata.insert(
+        "mesh_authz.deny_policy".to_string(),
+        terminal.deny_policy.to_string(),
+    );
+    ctx.metadata.insert(
+        MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
+        reason.to_string(),
+    );
+    if let Some(destination) = destination {
+        ctx.metadata.insert(
+            MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
+            destination,
+        );
+    }
+    if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {
+        ctx.metadata.insert(
+            MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
+            terminator_ip.to_string(),
+        );
+    }
+    if terminal.is_destination_denial {
+        crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
+        );
+    }
+    terminal
 }
 
 /// Transaction metadata key naming why a datagram-over-HBONE relay ended
@@ -600,19 +646,22 @@ async fn connect_backend(
             message: err.to_string(),
             target_url: Some(target_url.clone()),
             resolved_ip: None,
+            relay_denial: None,
         })?;
     let candidates =
         match screen_ordinary_inbound_hbone_relay_dns_candidates(proxy, mesh, candidates) {
             Ok(candidates) => candidates,
             Err(denial) => {
+                let terminal = inbound_relay_refusal_terminal(denial.as_str(), false);
                 return Err(HboneConnectError {
-                    status: StatusCode::FORBIDDEN,
-                    body: br#"{"error":"HBONE relay destination not allowed"}"#,
-                    phase: "hbone_relay_destination_denied",
+                    status: terminal.status,
+                    body: terminal.body,
+                    phase: terminal.deny_policy,
                     class: retry::ErrorClass::DispatchPolicyRejected,
                     message: denial.as_str().to_string(),
                     target_url: Some(target_url),
                     resolved_ip: None,
+                    relay_denial: Some(denial.as_str()),
                 });
             }
         };
@@ -642,6 +691,7 @@ async fn connect_backend(
                 message: err.to_string(),
                 target_url: Some(target_url),
                 resolved_ip: Some(last_addr.ip().to_string()),
+                relay_denial: None,
             });
         }
         Err(crate::dns::CandidateConnectError::TimedOut { last_addr }) => {
@@ -656,6 +706,7 @@ async fn connect_backend(
                 ),
                 target_url: Some(target_url),
                 resolved_ip: Some(last_addr.ip().to_string()),
+                relay_denial: None,
             });
         }
     };
@@ -912,9 +963,10 @@ pub(super) async fn handle_hbone_request(
             proxy_id = %proxy.id,
             "Rejected HBONE CONNECT with no authenticated peer identity"
         );
+        let terminal = unauthenticated_peer_connect_terminal(false);
         ctx.metadata.insert(
             "mesh_authz.deny_policy".to_string(),
-            "hbone_unauthenticated_peer".to_string(),
+            terminal.deny_policy.to_string(),
         );
         crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
             crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
@@ -923,8 +975,8 @@ pub(super) async fn handle_hbone_request(
         let reject = finalize_reject_response_with_after_proxy_hooks(
             plugins,
             ctx,
-            StatusCode::FORBIDDEN,
-            Bytes::from_static(br#"{"error":"HBONE tunnel requires an authenticated mesh peer"}"#),
+            terminal.status,
+            Bytes::from_static(terminal.body),
             HashMap::new(),
             false,
         )
@@ -934,7 +986,7 @@ pub(super) async fn handle_hbone_request(
             ctx,
             reject.http_status.as_u16(),
             start_time,
-            "hbone_unauthenticated_peer",
+            terminal.deny_policy,
             plugin_execution_ns,
         )
         .await;
@@ -1087,37 +1139,12 @@ pub(super) async fn handle_hbone_request(
         );
         // `no_mesh_slice` is a readiness condition (503), not a denial; every
         // other reason is the documented 403 (issue #5763).
-        let terminal = inbound_relay_refusal_terminal(denial, false);
-        ctx.metadata.insert(
-            "mesh_authz.deny_policy".to_string(),
-            terminal.deny_policy.to_string(),
-        );
-        // Structured audit trail for the refusal (issue #4150). Transport facts
-        // only — the destination the peer named and why this node does not own
-        // it. Never request bytes, headers, or credential material.
-        ctx.metadata.insert(
-            MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
-            denial.to_string(),
-        );
-        ctx.metadata.insert(
-            MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
-            relay_denied_destination(app_host, app_port),
-        );
-        if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {
-            ctx.metadata.insert(
-                MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
-                terminator_ip.to_string(),
-            );
-        }
+        let destination = relay_denied_destination(app_host, app_port);
+        let terminal = record_inbound_relay_refusal(ctx, denial, Some(destination), false);
         crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
             crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
             false,
         );
-        if terminal.is_destination_denial {
-            crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
-                crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
-            );
-        }
         let reject = finalize_reject_response_with_after_proxy_hooks(
             plugins,
             ctx,
@@ -1266,37 +1293,21 @@ pub(super) async fn handle_hbone_request(
     {
         Ok(backend) => backend,
         Err(err) => {
-            if err.status == StatusCode::FORBIDDEN {
+            if let Some(denial) = err.relay_denial {
+                let (app_host, app_port) =
+                    effective_hbone_backend_target(proxy, upstream_target.as_deref());
                 warn!(
                     proxy_id = %proxy.id,
-                    backend_target = ?err.target_url,
-                    denial = %err.message,
+                    app_host,
+                    app_port,
+                    denial,
+                    terminator_local_ip = ?ctx.mesh_inbound_terminator_ip,
                     "Rejected inbound CONNECT whose resolved destination is not one this proxy \
                      terminates for"
                 );
-                ctx.metadata.insert(
-                    "mesh_authz.deny_policy".to_string(),
-                    "hbone_relay_destination_denied".to_string(),
-                );
-                ctx.metadata.insert(
-                    MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
-                    err.message.clone(),
-                );
-                if let Some(target) = err.target_url.as_deref() {
-                    ctx.metadata.insert(
-                        MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
-                        target.strip_prefix("tcp://").unwrap_or(target).to_string(),
-                    );
-                }
-                if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {
-                    ctx.metadata.insert(
-                        MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
-                        terminator_ip.to_string(),
-                    );
-                }
-                crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
-                    crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
-                );
+                // `connect_backend` already answered with this same terminal.
+                let destination = relay_denied_destination(app_host, app_port);
+                record_inbound_relay_refusal(ctx, denial, Some(destination), false);
             } else {
                 error!(
                     proxy_id = %proxy.id,
@@ -1315,11 +1326,17 @@ pub(super) async fn handle_hbone_request(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                settle_hbone_backend_connect_circuit_breaker_outcome(
-                    &cb,
-                    err.status,
-                    cb_probe.take_slot(),
-                );
+                if err.relay_denial.is_some() {
+                    // A refused destination (403, or 503 before the first
+                    // slice) is a policy answer, not a backend failure.
+                    cb.record_neutral(cb_probe.take_slot());
+                } else {
+                    settle_hbone_backend_connect_circuit_breaker_outcome(
+                        &cb,
+                        err.status,
+                        cb_probe.take_slot(),
+                    );
+                }
             }
             ctx.metadata
                 .insert("error_class".to_string(), err.class.to_string());
@@ -1704,17 +1721,16 @@ pub(super) async fn handle_hbone_udp_request(
             proxy_id = %proxy.id,
             "Rejected datagram-over-HBONE CONNECT with no authenticated peer identity"
         );
+        let terminal = unauthenticated_peer_connect_terminal(true);
         ctx.metadata.insert(
             "mesh_authz.deny_policy".to_string(),
-            "hbone_udp_unauthenticated_peer".to_string(),
+            terminal.deny_policy.to_string(),
         );
         let reject = finalize_reject_response_with_after_proxy_hooks(
             plugins,
             ctx,
-            StatusCode::FORBIDDEN,
-            Bytes::from_static(
-                br#"{"error":"HBONE UDP tunnel requires an authenticated mesh peer"}"#,
-            ),
+            terminal.status,
+            Bytes::from_static(terminal.body),
             HashMap::new(),
             false,
         )
@@ -1724,7 +1740,7 @@ pub(super) async fn handle_hbone_udp_request(
             ctx,
             reject.http_status.as_u16(),
             start_time,
-            "hbone_udp_unauthenticated_peer",
+            terminal.deny_policy,
             plugin_execution_ns,
         )
         .await;
@@ -1889,27 +1905,8 @@ pub(super) async fn handle_hbone_udp_request(
         );
         // `no_mesh_slice` is a readiness condition (503), not a denial; every
         // other reason is the documented 403 (issue #5763).
-        let terminal = inbound_relay_refusal_terminal(denial.as_str(), true);
-        ctx.metadata.insert(
-            "mesh_authz.deny_policy".to_string(),
-            terminal.deny_policy.to_string(),
-        );
-        // Structured audit trail for the refusal (issue #4150). Transport facts
-        // only — never request bytes, headers, or credential material.
-        ctx.metadata.insert(
-            MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
-            denial.as_str().to_string(),
-        );
-        ctx.metadata.insert(
-            MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
-            relay_denied_destination(app_host, app_port),
-        );
-        if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {
-            ctx.metadata.insert(
-                MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
-                terminator_ip.to_string(),
-            );
-        }
+        let destination = relay_denied_destination(app_host, app_port);
+        let terminal = record_inbound_relay_refusal(ctx, denial.as_str(), Some(destination), true);
         let reject = finalize_reject_response_with_after_proxy_hooks(
             plugins,
             ctx,
@@ -2076,29 +2073,14 @@ pub(super) async fn handle_hbone_udp_request(
                     "Rejected datagram-over-HBONE CONNECT whose resolved destination is not one \
                      this proxy terminates for"
                 );
-                ctx.metadata.insert(
-                    "mesh_authz.deny_policy".to_string(),
-                    "hbone_udp_relay_destination_denied".to_string(),
-                );
-                ctx.metadata.insert(
-                    MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
-                    denial.as_str().to_string(),
-                );
-                ctx.metadata.insert(
-                    MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
-                    format!("{app_host}:{app_port}"),
-                );
-                if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {
-                    ctx.metadata.insert(
-                        MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
-                        terminator_ip.to_string(),
-                    );
-                }
+                let destination = relay_denied_destination(app_host, app_port);
+                let terminal =
+                    record_inbound_relay_refusal(ctx, denial.as_str(), Some(destination), true);
                 let reject = finalize_reject_response_with_after_proxy_hooks(
                     plugins,
                     ctx,
-                    StatusCode::FORBIDDEN,
-                    Bytes::from_static(br#"{"error":"HBONE UDP relay destination not allowed"}"#),
+                    terminal.status,
+                    Bytes::from_static(terminal.body),
                     HashMap::new(),
                     false,
                 )
@@ -2108,7 +2090,7 @@ pub(super) async fn handle_hbone_udp_request(
                     ctx,
                     reject.http_status.as_u16(),
                     start_time,
-                    "hbone_udp_relay_destination_denied",
+                    terminal.deny_policy,
                     plugin_execution_ns,
                 )
                 .await;
