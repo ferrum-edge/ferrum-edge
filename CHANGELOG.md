@@ -560,6 +560,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streaming usage parser now splits SSE lines on CR, LF and CRLF (including a
   CRLF split across chunks) with the shared leading-BOM policy, so usage in
   CR-framed streams is counted (#5808, #5809).
+- HTTP/3 bridge gateway error terminals (a classified backend dispatch failure
+  and a declared-oversize `502`) now write `X-Gateway-Error` after the
+  `after_proxy` hooks from the typed connection-error signal and the post-hook
+  status, as HTTP/1.1 and HTTP/2 do, so hooks can no longer see, replace,
+  duplicate, or erase the token. A hook-set non-5xx status without a connection
+  error carries no token, matching HTTP/1.1 and HTTP/2 (#5807).
 
 ### Security
 

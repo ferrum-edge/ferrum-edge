@@ -75,7 +75,7 @@ use crate::common::{
     run_trusted_projected_gateway_test,
 };
 use crate::scaffolding::certs::TestCa;
-use crate::scaffolding::clients::{Http3Client, Http3GrpcStream, WebSocketOptions};
+use crate::scaffolding::clients::{GetOptions, Http3Client, Http3GrpcStream, WebSocketOptions};
 use crate::scaffolding::ports::reserve_port;
 
 const GRPC_SECRET: &str = "ferrum-edge-functional-mesh-grpc-secret00";
@@ -20156,12 +20156,22 @@ async fn h3_mesh_reload(
 const H3_MESH_PLAIN_UPSTREAM_ID: &str = "h3-mesh-plain-upstream";
 const H3_MESH_PLAIN_PATH: &str = "/mesh/echo";
 const H3_MESH_PLAIN_BACKEND_PATH: &str = "/echo";
+/// Backend path the mesh-mTLS HTTP peer answers with a gRPC-Web response: the
+/// request's message frames echoed, then a `0x80` trailer frame (#5807).
+const H3_MESH_PLAIN_GRPC_WEB_BACKEND_PATH: &str = "/grpc-web";
+/// Backend path the mesh-mTLS HTTP peer answers with a `503` that carries a
+/// spoofed `X-Gateway-Error` (#5807).
+const H3_MESH_PLAIN_503_BACKEND_PATH: &str = "/backend-503";
+/// The gRPC-Web trailer frame the mesh-mTLS HTTP peer appends on
+/// [`H3_MESH_PLAIN_GRPC_WEB_BACKEND_PATH`].
+const H3_MESH_GRPC_WEB_TRAILER_BLOCK: &[u8] = b"grpc-status:0\r\ngrpc-message:mesh-ok\r\n";
 
 #[derive(Clone, Debug)]
 struct H3MeshObservedHttp {
     authority: String,
     path: String,
     method: String,
+    content_type: Option<String>,
     body: Vec<u8>,
     client_cert_der: Vec<Vec<u8>>,
 }
@@ -20204,6 +20214,65 @@ impl H3MeshHttpPeer {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+
+    async fn wait_for_http_path(&self, path: &str, bound: Duration) -> H3MeshObservedHttp {
+        let deadline = Instant::now() + bound;
+        loop {
+            if let Some(obs) = self
+                .observations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .find(|obs| obs.path == path)
+                .cloned()
+            {
+                return obs;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "H3 mesh HTTP peer never observed a request for {path}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// A gRPC-Web frame: `flag`, a big-endian `u32` length, then `payload`.
+fn h3_mesh_grpc_web_frame(flag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len() + 5);
+    frame.push(flag);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// The mesh-mTLS HTTP peer's response for one observed request: a gRPC-Web
+/// pass-through answer, a `503` with a spoofed gateway token, or the echo.
+fn h3_mesh_http_peer_response(path: &str, body: Vec<u8>) -> hyper::Response<Full<Bytes>> {
+    let builder = hyper::Response::builder().header("x-mesh-plain", "ok");
+    let response = if path == H3_MESH_PLAIN_GRPC_WEB_BACKEND_PATH {
+        let trailer_frame = h3_mesh_grpc_web_frame(0x80, H3_MESH_GRPC_WEB_TRAILER_BLOCK);
+        let mut wire = body;
+        wire.extend_from_slice(&trailer_frame);
+        builder
+            .status(200)
+            .header("content-type", "application/grpc-web+proto")
+            .body(Full::new(Bytes::from(wire)))
+    } else if path == H3_MESH_PLAIN_503_BACKEND_PATH {
+        builder
+            .status(503)
+            .header("content-type", "application/json")
+            .header("x-gateway-error", "spoofed_by_backend")
+            .body(Full::new(Bytes::from_static(
+                br#"{"error":"mesh peer 503"}"#,
+            )))
+    } else {
+        builder
+            .status(200)
+            .header("content-type", "application/octet-stream")
+            .body(Full::new(Bytes::from(body)))
+    };
+    response.expect("build plain mesh peer response")
 }
 
 async fn serve_h3_mesh_http_echo<T>(
@@ -20220,6 +20289,7 @@ async fn serve_h3_mesh_http_echo<T>(
             let authority = h3_mesh_observed_http_authority(&req);
             let path = req.uri().path().to_string();
             let method = req.method().as_str().to_string();
+            let content_type = h3_mesh_header(req.headers(), "content-type");
             let body = req.collect().await?.to_bytes().to_vec();
             observations
                 .lock()
@@ -20228,17 +20298,11 @@ async fn serve_h3_mesh_http_echo<T>(
                     authority,
                     path: path.clone(),
                     method,
+                    content_type,
                     body: body.clone(),
                     client_cert_der,
                 });
-            Ok::<_, hyper::Error>(
-                hyper::Response::builder()
-                    .status(200)
-                    .header("content-type", "application/octet-stream")
-                    .header("x-mesh-plain", "ok")
-                    .body(Full::new(Bytes::from(body)))
-                    .expect("build plain mesh echo"),
-            )
+            Ok::<_, hyper::Error>(h3_mesh_http_peer_response(&path, body))
         }
     });
     let _ = Http2ServerBuilder::new(TokioExecutor::new())
@@ -20276,6 +20340,7 @@ where
             let authority = h3_mesh_observed_http_authority(&req);
             let path = req.uri().path().to_string();
             let method = req.method().as_str().to_string();
+            let content_type = h3_mesh_header(req.headers(), "content-type");
             let body = req.collect().await?.to_bytes().to_vec();
             observations
                 .lock()
@@ -20284,6 +20349,7 @@ where
                     authority,
                     path: path.clone(),
                     method,
+                    content_type,
                     body: body.clone(),
                     client_cert_der: Vec::new(),
                 });
@@ -20548,6 +20614,146 @@ async fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
     assert_eq!(observed.authority, H3_MESH_SERVICE_AUTHORITY);
     assert_eq!(observed.path, H3_MESH_PLAIN_BACKEND_PATH);
     assert_eq!(observed.body, payload);
+
+    gateway.shutdown().await;
+}
+
+async fn h3_mesh_plain_request(
+    https_port: u16,
+    backend_path: &str,
+    options: GetOptions,
+) -> crate::scaffolding::clients::Http3Response {
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/mesh{backend_path}");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        match client.get_with_options(&url, options.clone()).await {
+            Ok(resp) => return resp,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    panic!("H3 plain mesh request to {backend_path} never completed: {error}");
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+}
+
+/// Pass-through gRPC-Web and a relayed backend `5xx` over the H3 plain
+/// bridge's Sidecar mesh-mTLS egress (#5807).
+///
+/// No `grpc_web` plugin is configured, so a gRPC-Web request is passed through:
+/// the peer must see the client's own gRPC-Web content type and frames, and the
+/// client must get the peer's body back byte for byte, trailer frame included.
+/// A `200` carries no `X-Gateway-Error`. A peer `503` reaches the client as a
+/// `503` whose `X-Gateway-Error` is the gateway's own `backend_error`, never the
+/// peer's spoofed value.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token() {
+    let identities = TempDir::new().expect("h3 plain mtls identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let peer = start_h3_mesh_mtls_http_peer(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let declared_app_port = h3_mesh_declared_app_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        declared_app_port,
+        &h3_mesh_mtls_tags(peer.port, H3_MESH_PEER_SPIFFE),
+    );
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_plain_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, peer.port, declared_app_port],
+    )
+    .await;
+
+    // gRPC-Web pass-through.
+    let request_body = h3_mesh_grpc_web_frame(0x00, b"h3-mesh-grpc-web");
+    let options = GetOptions::default()
+        .method(hyper::Method::POST)
+        .header("content-type", "application/grpc-web+proto")
+        .header("x-grpc-web", "1")
+        .body(Bytes::from(request_body.clone()));
+    let result =
+        h3_mesh_plain_request(https_port, H3_MESH_PLAIN_GRPC_WEB_BACKEND_PATH, options).await;
+    assert_eq!(
+        result.status.as_u16(),
+        200,
+        "gRPC-Web pass-through over mesh-mTLS must succeed: {:?}",
+        result.headers
+    );
+    assert_eq!(
+        result
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/grpc-web+proto"),
+        "the peer's gRPC-Web content type must pass through"
+    );
+    let trailer_frame = h3_mesh_grpc_web_frame(0x80, H3_MESH_GRPC_WEB_TRAILER_BLOCK);
+    let mut expected_body = request_body.clone();
+    expected_body.extend_from_slice(&trailer_frame);
+    assert_eq!(
+        result.body_bytes.as_ref(),
+        expected_body.as_slice(),
+        "the pass-through body, trailer frame included, must reach the client unchanged"
+    );
+    assert!(
+        result.headers.get("x-gateway-error").is_none(),
+        "a relayed 200 carries no gateway token: {:?}",
+        result.headers
+    );
+    let observed = peer
+        .wait_for_http_path(H3_MESH_PLAIN_GRPC_WEB_BACKEND_PATH, Duration::from_secs(10))
+        .await;
+    assert!(
+        observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
+        "peer must verify this gateway's client SVID"
+    );
+    assert_eq!(observed.method, "POST");
+    assert_eq!(
+        observed.content_type.as_deref(),
+        Some("application/grpc-web+proto"),
+        "pass-through must not translate the request to native gRPC"
+    );
+    assert_eq!(observed.body, request_body);
+
+    // A relayed backend 5xx carries the gateway's own token.
+    let options = GetOptions::default()
+        .method(hyper::Method::POST)
+        .body(Bytes::from_static(b"h3-mesh-503"));
+    let result = h3_mesh_plain_request(https_port, H3_MESH_PLAIN_503_BACKEND_PATH, options).await;
+    assert_eq!(
+        result.status.as_u16(),
+        503,
+        "the peer's 503 must be relayed: {:?}",
+        result.headers
+    );
+    let tokens: Vec<&str> = result
+        .headers
+        .get_all("x-gateway-error")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(
+        tokens,
+        vec!["backend_error"],
+        "a relayed mesh-egress 5xx must carry exactly the gateway's backend_error token"
+    );
+    let observed = peer
+        .wait_for_http_path(H3_MESH_PLAIN_503_BACKEND_PATH, Duration::from_secs(10))
+        .await;
+    assert!(
+        observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
+        "peer must verify this gateway's client SVID"
+    );
 
     gateway.shutdown().await;
 }
