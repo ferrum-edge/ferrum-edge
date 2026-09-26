@@ -1194,7 +1194,9 @@ fn every_reqwest_streaming_dispatch_site_carries_the_trailer_decision() {
     let compact_arm = arm.split_whitespace().collect::<String>();
     assert_eq!(
         compact_arm
-            .matches("ReqwestResponseTrailers::relay_grpc_terminal(streaming_trailer_governor.take(),")
+            .matches(
+                "ReqwestResponseTrailers::relay_grpc_terminal(streaming_trailer_governor.take(),"
+            )
             .count(),
         1,
         "the gRPC terminal relay must carry the sealed trailer governor"
