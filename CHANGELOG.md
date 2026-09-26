@@ -577,6 +577,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status, as HTTP/1.1 and HTTP/2 do, so hooks can no longer see, replace,
   duplicate, or erase the token. A hook-set non-5xx status without a connection
   error carries no token, matching HTTP/1.1 and HTTP/2 (#5807).
+- A windowed `ai_semantic_firewall` stream cut that follows forwarded bytes
+  ending mid-line (such as a fail-open hold timeout that released an event
+  start like `event: mess` or `data: `) now ends that line with one LF before
+  the terminal error event, so clients read `event: error` and its JSON data
+  instead of joining them onto the partial line. No blank line is added, so the
+  open event is never dispatched (#5820).
 
 ### Security
 

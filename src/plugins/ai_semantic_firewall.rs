@@ -3765,7 +3765,9 @@ struct StreamWindowEngine {
     store_frames: bool,
     reassembler: SseReassembler,
     /// Raw bytes received but not yet split into a complete SSE event. Bounded
-    /// by `max_window_bytes` so an un-terminated event cannot grow unbounded.
+    /// by `max_window_bytes` so an un-terminated event cannot grow unbounded;
+    /// the rest of a force-flushed event may exceed it by the one framing byte
+    /// saved as its context.
     carry: Vec<u8>,
     /// How many leading bytes of `carry` are context only: they already left
     /// the gateway, or belong to an event already absorbed into `held`. They
@@ -5069,6 +5071,12 @@ struct StreamInspector {
     hold: Option<HoldState>,
     /// Whether the one-time hold-timeout warning has fired for this response.
     hold_timeout_logged: Arc<AtomicBool>,
+    /// Whether the last byte this inspector forwarded left a line open on the
+    /// client (it is neither CR nor LF), such as a fail-open release of an
+    /// event start that ends mid-line. A cut then ends that line before its
+    /// error event, so the client never reads the event's first line as the
+    /// rest of the forwarded one.
+    client_line_open: bool,
 }
 
 impl StreamInspector {
@@ -5137,6 +5145,7 @@ impl StreamInspector {
             detect_provider_error_logged: Arc::new(AtomicBool::new(false)),
             hold,
             hold_timeout_logged: Arc::new(AtomicBool::new(false)),
+            client_line_open: false,
         }
     }
 
@@ -5559,18 +5568,36 @@ impl StreamInspector {
             hold.restart();
         }
         let final_bytes = self.config.cut_with_error_event.then(|| {
-            encode_sse_error_event(
+            let event = encode_sse_error_event(
                 "ai_semantic_firewall_response_blocked",
                 "AI response was blocked by semantic firewall policy.",
-            )
+            );
+            if !self.client_line_open {
+                return event;
+            }
+            // One LF ends the open line: the client then reads the error event
+            // from a fresh line. Never a blank line, which would dispatch the
+            // open event (an empty `data` event for a `data:` start).
+            let mut out = Vec::with_capacity(event.len() + 1);
+            out.push(b'\n');
+            out.extend_from_slice(&event);
+            Bytes::from(out)
         });
         ResponseStreamAction::Terminate(final_bytes)
     }
-}
 
-#[async_trait]
-impl ResponseStreamInspector for StreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    /// Record whether `action` forwards bytes that leave a line open on the
+    /// client. Bytes released earlier in a call that ends in a cut never leave,
+    /// so only the returned action counts.
+    fn note_forwarded(&mut self, action: &ResponseStreamAction) {
+        if let ResponseStreamAction::Forward(bytes) = action
+            && let Some(&last) = bytes.last()
+        {
+            self.client_line_open = !matches!(last, b'\n' | b'\r');
+        }
+    }
+
+    async fn inspect_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
@@ -5681,7 +5708,7 @@ impl ResponseStreamInspector for StreamInspector {
         }
     }
 
-    async fn on_end(&mut self) -> ResponseStreamAction {
+    async fn inspect_end(&mut self) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
@@ -5739,6 +5766,21 @@ impl ResponseStreamInspector for StreamInspector {
                 ResponseStreamAction::Forward(Bytes::new())
             }
         }
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for StreamInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let action = self.inspect_chunk(chunk).await;
+        self.note_forwarded(&action);
+        action
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        let action = self.inspect_end().await;
+        self.note_forwarded(&action);
+        action
     }
 
     fn on_downstream_terminated(&mut self) {
