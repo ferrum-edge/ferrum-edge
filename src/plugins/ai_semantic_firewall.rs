@@ -21,9 +21,10 @@ use url::{Host, Url};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{
-    SseEventName, SseReassembler, SseText, SseTextKind, encode_sse_error_event,
-    is_gemini_stream_frame, is_tgi_stream_frame, last_paragraph_boundary, last_sentence_boundary,
-    parse_sse_data_frames_checked, sse_event_end, sse_event_end_after,
+    SseEventName, SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
+    classify_forwarded_sse_prefix, encode_sse_error_event, is_gemini_stream_frame,
+    is_tgi_stream_frame, last_paragraph_boundary, last_sentence_boundary,
+    parse_sse_data_frames_checked, sse_event_end, sse_event_end_after, sse_line_end,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -3764,6 +3765,15 @@ struct StreamWindowEngine {
     /// [`passthrough_to_event_end`]. Never re-emitted, never held awaiting a
     /// semantic verdict, and never counted by the hold clock.
     passthrough_tail: Vec<u8>,
+    /// After a fail-open hold timeout forwarded a carry that ends inside a
+    /// leading BOM, how many more bytes complete that BOM. Only those bytes are
+    /// forwarded uninspected; normal inspection resumes right after them.
+    passthrough_bom_rest: usize,
+    /// After a fail-open hold timeout forwarded a carry that ends inside a
+    /// comment, `id` or `retry` line, the rest of that line through its next CR
+    /// or LF is forwarded uninspected, exactly as the client reads it; normal
+    /// inspection resumes right after that terminator.
+    passthrough_to_line_end: bool,
 }
 
 impl StreamWindowEngine {
@@ -3781,11 +3791,15 @@ impl StreamWindowEngine {
             pending_clears_to: None,
             passthrough_to_event_end: false,
             passthrough_tail: Vec::new(),
+            passthrough_bom_rest: 0,
+            passthrough_to_line_end: false,
         }
     }
 
     fn in_passthrough(&self) -> bool {
         self.passthrough_to_event_end
+            || self.passthrough_bom_rest > 0
+            || self.passthrough_to_line_end
     }
 
     /// Forward bytes of a fail-open mid-event remainder until the next SSE event
@@ -3796,7 +3810,37 @@ impl StreamWindowEngine {
     /// [`passthrough_tail`] is a copy of already-forwarded bytes used only to
     /// detect a blank line that spans chunk edges — it is never re-emitted and
     /// never held awaiting a semantic verdict.
+    ///
+    /// While [`passthrough_bom_rest`] is set, only the bytes that complete the
+    /// forwarded partial BOM pass; any other byte ends pass-through and is
+    /// inspected as the start of a fresh event.
+    ///
+    /// While [`passthrough_to_line_end`] is set, bytes pass through the next CR
+    /// or LF (a CRLF inside `chunk` as one terminator). A CR that ends `chunk`
+    /// ends pass-through; an LF starting the next chunk is then read by normal
+    /// ingest as the rest of that CRLF, as any carry's leading LF is.
     fn ingest_passthrough(&mut self, chunk: &[u8]) -> (Vec<u8>, usize) {
+        if self.passthrough_to_line_end {
+            let Some((_, next)) = sse_line_end(chunk) else {
+                return (chunk.to_vec(), chunk.len());
+            };
+            self.passthrough_to_line_end = false;
+            return (chunk[..next].to_vec(), next);
+        }
+        if self.passthrough_bom_rest > 0 {
+            let expected = &UTF8_BOM[UTF8_BOM.len() - self.passthrough_bom_rest..];
+            let matched = chunk
+                .iter()
+                .zip(expected)
+                .take_while(|(got, want)| got == want)
+                .count();
+            self.passthrough_bom_rest = if matched == chunk.len() {
+                expected.len() - matched
+            } else {
+                0
+            };
+            return (chunk[..matched].to_vec(), matched);
+        }
         debug_assert!(self.passthrough_to_event_end);
         let mut scan = self.passthrough_tail.clone();
         let prefix_len = scan.len();
@@ -3825,6 +3869,8 @@ impl StreamWindowEngine {
     fn finish_passthrough(&mut self) -> Vec<u8> {
         self.passthrough_to_event_end = false;
         self.passthrough_tail.clear();
+        self.passthrough_bom_rest = 0;
+        self.passthrough_to_line_end = false;
         Vec::new()
     }
 
@@ -4306,12 +4352,18 @@ impl StreamWindowEngine {
     }
 
     /// Release every byte that caused the current hold without inspecting it:
-    /// complete held events and any un-terminated `carry`. When `carry` holds
-    /// field bytes, enter [`passthrough_to_event_end`] so the remainder of that
-    /// same SSE event is never absorbed as a fresh inspectable event (its
-    /// prefix already left the gateway uninspected). A `carry` of bare line
-    /// terminators is forwarded without entering pass-through. Used only by the
-    /// fail-open hold-timeout path; returns the raw bytes to forward immediately.
+    /// complete held events and any un-terminated `carry`. When `carry` has
+    /// started an event that may still carry data (a `data`, `event` or other
+    /// field line, or a line whose field is not yet known), enter
+    /// [`passthrough_to_event_end`] so the remainder of that same SSE event is
+    /// never absorbed as a fresh inspectable event (its prefix already left the
+    /// gateway uninspected). A `carry` of only line terminators, leading BOMs,
+    /// and comment, `id` or `retry` lines adds no data to the next event, so
+    /// that event is still inspected; a carry ending inside a leading BOM passes
+    /// only the bytes that complete it, and one ending inside a comment, `id` or
+    /// `retry` line passes only the rest of that line through its terminator.
+    /// Used only by the fail-open hold-timeout path; returns the raw bytes to
+    /// forward immediately.
     fn force_release_held(&mut self) -> Vec<u8> {
         let mut out = if let Some(last) = self.held.last() {
             // Reuse `release()` so the cleared-offset rebase and overlap draining
@@ -4324,19 +4376,28 @@ impl StreamWindowEngine {
         };
         if !self.carry.is_empty() {
             out.extend_from_slice(&self.carry);
-            // A carry of only CR/LF (such as the LF of a CRLF split from the
-            // held event's blank line) started no new event: forwarding it
-            // leaves nothing to finish uninspected, and pass-through here
-            // would forward the NEXT complete event uninspected.
-            if self.carry.iter().any(|b| !matches!(b, b'\r' | b'\n')) {
-                // The first bytes of the next chunk may complete a blank-line
-                // boundary that started in this already-forwarded prefix.
-                // Retain only a detection copy of the final two bytes before
-                // clearing the held carry; they must never be emitted a second
-                // time.
-                let keep = self.carry.len().min(2);
-                self.passthrough_tail = self.carry[self.carry.len() - keep..].to_vec();
-                self.passthrough_to_event_end = true;
+            match classify_forwarded_sse_prefix(&self.carry) {
+                // Nothing forwarded can add data to the event the client
+                // dispatches next (such as the LF of a CRLF split from the held
+                // event's blank line, a stream-start BOM, or a keep-alive
+                // comment), so pass-through here would only forward that
+                // event's data uninspected.
+                SseForwardedPrefix::Inert => {}
+                // The client reads the next bytes as the rest of the forwarded
+                // comment, `id` or `retry` line, so they must not be parsed as
+                // the start of a fresh line.
+                SseForwardedPrefix::InertLine => self.passthrough_to_line_end = true,
+                SseForwardedPrefix::PartialBom(rest) => self.passthrough_bom_rest = rest,
+                SseForwardedPrefix::OpenEvent => {
+                    // The first bytes of the next chunk may complete a
+                    // blank-line boundary that started in this already-forwarded
+                    // prefix. Retain only a detection copy of the final two
+                    // bytes before clearing the held carry; they must never be
+                    // emitted a second time.
+                    let keep = self.carry.len().min(2);
+                    self.passthrough_tail = self.carry[self.carry.len() - keep..].to_vec();
+                    self.passthrough_to_event_end = true;
+                }
             }
             self.carry.clear();
         }
@@ -4355,6 +4416,8 @@ impl StreamWindowEngine {
         self.passthrough_to_event_end = false;
         self.passthrough_tail.clear();
         self.passthrough_tail.shrink_to_fit();
+        self.passthrough_bom_rest = 0;
+        self.passthrough_to_line_end = false;
     }
 }
 
@@ -4966,7 +5029,8 @@ impl StreamInspector {
     /// every held/partial byte is discarded and never reaches the client) or
     /// releases every byte that caused the hold uninspected (fail open),
     /// including any un-terminated carry, then pass-through until the next SSE
-    /// event boundary.
+    /// event boundary when that carry started an event that may still carry
+    /// data.
     ///
     /// `dry_run` is observational and never cuts traffic, so a fail-closed
     /// expiry degrades to the fail-open release there — matching the buffered

@@ -541,6 +541,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass-through, so the next event is still inspected. `ai_transcript_audit`
   reassembles and redacts every captured frame, and `ai_response_guard` redact
   mode rewrites such streams instead of rejecting them (#5803).
+- A windowed `ai_semantic_firewall` fail-open hold timeout that forwards only
+  leading BOMs, line endings, or comment, `id` or `retry` lines no longer starts
+  pass-through, so the next event is still inspected; a forwarded partial BOM
+  passes only the bytes that complete it, and a forwarded unfinished comment,
+  `id` or `retry` line passes only the rest of that line through its next line
+  ending, so those bytes are never read as a fresh line. The `ai_rate_limiter`
+  streaming usage parser now splits SSE lines on CR, LF and CRLF (including a
+  CRLF split across chunks) with the shared leading-BOM policy, so usage in
+  CR-framed streams is counted (#5808, #5809).
 - HTTP/3 bridge gateway error terminals (a classified backend dispatch failure
   and a declared-oversize `502`) now write `X-Gateway-Error` after the
   `after_proxy` hooks from the typed connection-error signal and the post-hook

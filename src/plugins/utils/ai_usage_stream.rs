@@ -39,15 +39,16 @@ use base64::Engine;
 use serde_json::Value;
 
 use super::ai_providers::{AiProvider, AiTokenUsage, detect_sse_provider, extract_response_usage};
+use super::sse::{sse_line_end, strip_sse_boms};
 
 /// Media type AWS Bedrock uses for `InvokeModelWithResponseStream` and
 /// `ConverseStream` responses.
 pub const AWS_EVENT_STREAM_MEDIA_TYPE: &str = "application/vnd.amazon.eventstream";
 
-/// Largest single SSE line retained while waiting for its terminating newline.
-/// A longer line is discarded and the parser resynchronizes at the next
-/// newline, so a provider (or an attacker-controlled upstream) cannot turn one
-/// unterminated line into unbounded gateway memory.
+/// Largest single SSE line retained while waiting for its line terminator. A
+/// longer line is discarded and the parser resynchronizes at the next line
+/// terminator, so a provider (or an attacker-controlled upstream) cannot turn
+/// one unterminated line into unbounded gateway memory.
 pub const MAX_SSE_EVENT_BYTES: usize = 64 * 1024;
 
 /// Largest AWS event-stream message retained whole. Larger messages are skipped
@@ -390,8 +391,14 @@ pub struct UsageStreamExtractor {
     event: SseEventBuffer,
     /// Remaining bytes of an oversized unit to discard without buffering.
     skip_remaining: u64,
-    /// The current SSE line exceeded the cap: discard through the next newline.
+    /// The current SSE line exceeded the cap: discard through the next line
+    /// terminator.
     resyncing: bool,
+    /// The previous chunk ended with a CR, so an LF that starts the next chunk
+    /// completes that CRLF instead of adding a blank line.
+    after_cr: bool,
+    /// No SSE line has been applied yet, so leading BOMs are still stripped.
+    at_stream_start: bool,
     /// Total length of the AWS event-stream message currently being filled.
     pending_message_len: usize,
     /// AWS event-stream framing proved structurally invalid; stop parsing. The
@@ -409,6 +416,8 @@ impl UsageStreamExtractor {
             event: SseEventBuffer::default(),
             skip_remaining: 0,
             resyncing: false,
+            after_cr: false,
+            at_stream_start: true,
             pending_message_len: 0,
             desynced: false,
         }
@@ -438,10 +447,10 @@ impl UsageStreamExtractor {
 
     /// Flush any trailing partial unit at end of stream.
     ///
-    /// A provider that omits the final newline after its terminal usage event
-    /// must still be charged, so the SSE carry is applied here. An incomplete
-    /// AWS event-stream message is discarded: a truncated binary frame carries
-    /// no trustworthy counters.
+    /// A provider that omits the final line terminator after its terminal usage
+    /// event must still be charged, so the SSE carry is applied here. An
+    /// incomplete AWS event-stream message is discarded: a truncated binary
+    /// frame carries no trustworthy counters.
     pub fn finish(&mut self) {
         if self.format == UsageStreamFormat::Sse {
             if !self.resyncing && !self.carry.is_empty() {
@@ -454,14 +463,24 @@ impl UsageStreamExtractor {
             self.dispatch_sse_event();
         }
         self.carry = Vec::new();
+        self.after_cr = false;
         self.pending_message_len = 0;
     }
 
+    /// Split SSE lines on CRLF, LF, or a lone CR, mixed freely, including a
+    /// CRLF split across two chunks.
     fn push_sse(&mut self, chunk: &[u8]) {
         let mut rest = chunk;
-        while let Some(index) = rest.iter().position(|byte| *byte == b'\n') {
-            let (line, tail) = rest.split_at(index);
-            rest = &tail[1..];
+        // An LF that starts this chunk completes a CRLF whose CR ended the
+        // previous one; it is not an extra blank line.
+        if std::mem::take(&mut self.after_cr) {
+            rest = rest.strip_prefix(b"\n").unwrap_or(rest);
+        }
+        while let Some((line_end, next)) = sse_line_end(rest) {
+            // A CR that ends the chunk may be the first half of a CRLF.
+            self.after_cr = next == rest.len() && rest[line_end] == b'\r';
+            let line = &rest[..line_end];
+            rest = &rest[next..];
             if self.resyncing {
                 // The oversized line ends here; resume with the next one.
                 self.resyncing = false;
@@ -471,7 +490,7 @@ impl UsageStreamExtractor {
             // Enforce the line cap before parsing a complete unit too. The
             // unterminated-tail check below bounds retained carry, but without
             // this check a hostile backend could place an arbitrarily large
-            // newline-terminated `data:` field in one body chunk, or complete
+            // terminated `data:` field in one body chunk, or complete
             // a near-cap carry with one large following segment. The former
             // would hand the whole borrowed slice to serde_json and the latter
             // would allocate their combined size, bypassing the bounded-parser
@@ -513,13 +532,17 @@ impl UsageStreamExtractor {
     /// document a provider legally split across two `data` fields is no longer
     /// discarded (`GHSA-pqjf-4jcj-34rp`).
     fn apply_sse_line(&mut self, line: &[u8]) {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let at_stream_start = std::mem::take(&mut self.at_stream_start);
         let Ok(line) = std::str::from_utf8(line) else {
             return;
         };
-        // A UTF-8 BOM is permitted at the very start of an event stream and is
-        // not part of the first field name.
-        let line = line.strip_prefix('\u{feff}').unwrap_or(line);
+        // Leading BOMs are permitted at the very start of an event stream and
+        // are not part of the first field name (the shared SSE BOM policy).
+        let line = if at_stream_start {
+            strip_sse_boms(line)
+        } else {
+            line
+        };
         if line.is_empty() {
             self.dispatch_sse_event();
             return;
