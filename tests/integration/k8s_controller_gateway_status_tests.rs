@@ -3371,6 +3371,284 @@ async fn gateway_url_rewrite_reaches_the_backend_through_the_data_plane() {
     );
 }
 
+/// The path-and-query part of a redirect `Location`, with any
+/// `scheme://authority` prefix removed.
+fn location_path_and_query(location: &str) -> &str {
+    match location.split_once("://") {
+        Some((_, rest)) => rest.find('/').map_or("", |index| &rest[index..]),
+        None => location,
+    }
+}
+
+/// An empty `replacePrefixMatch` is valid upstream and strips the matched
+/// prefix (#5752). It must be admitted, load on the data plane, and produce
+/// the upstream table for both `RequestRedirect` (the `Location` the client
+/// sees, with its query preserved) and `URLRewrite` (the path the backend
+/// sees).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_empty_replace_prefix_match_strips_the_prefix_through_the_data_plane() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+    use crate::scaffolding::ports::reserve_port;
+    use std::time::Duration;
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "strip-prefix",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["strip.test"],
+            "rules": [
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/old"}}],
+                    "filters": [{"type": "RequestRedirect", "requestRedirect": {
+                        "statusCode": 302,
+                        "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": ""}
+                    }}]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/strip"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": [{"type": "URLRewrite", "urlRewrite": {
+                        "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": ""}
+                    }}]
+                }
+            ]
+        }),
+    ));
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("client");
+
+    for (path, expected) in [
+        ("/old", "/"),
+        ("/old/", "/"),
+        ("/old/child", "/child"),
+        ("/old/child?x=1&y=2", "/child?x=1&y=2"),
+    ] {
+        let response = client
+            .get(harness.proxy_url(path))
+            .header("host", "strip.test")
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND, "{path}");
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_else(|| panic!("{path}: redirect must carry a Location"))
+            .to_string();
+        assert_eq!(location_path_and_query(&location), expected, "{path}");
+    }
+
+    for path in ["/strip/users?q=1", "/strip"] {
+        let response = client
+            .get(harness.proxy_url(path))
+            .header("host", "strip.test")
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+    }
+
+    backend.assert_no_matcher_mismatches().await;
+    let observed: Vec<String> = backend
+        .received_requests()
+        .await
+        .iter()
+        .map(|request| request.path.clone())
+        .collect();
+    assert_eq!(
+        observed,
+        vec!["/users?q=1".to_string(), "/".to_string()],
+        "the redirect rule must never reach a backend, and the rewrite must strip the prefix"
+    );
+}
+
+fn route_generated_modifier(value: &str) -> Value {
+    json!({"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+        "set": [{"name": "x-route", "value": value}],
+        "add": [{"name": "x-appended", "value": "route"}]
+    }})
+}
+
+/// Gateway API `ResponseHeaderModifier` applies to every response the route
+/// produces, including the ones it generates itself (#5753): a
+/// `RequestRedirect` answer and the upstream-mandated 500 for a rule with no
+/// `backendRefs`. It must reach the client on those answers over HTTP/1.1 and
+/// HTTP/2, and still apply exactly once to a proxied response. HTTP/3 answers
+/// a plugin rejection through the same response-header finalizer; this
+/// harness has no QUIC listener, so H3 is covered by that shared code path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_response_header_modifier_applies_to_route_generated_responses() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+    use crate::scaffolding::ports::reserve_port;
+    use std::time::Duration;
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "x-appended".into(),
+            value: "origin".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+
+    let mut objects = route_filter_cluster_objects(backend_port);
+    // No `hostnames`, so an HTTP/2 request's `:authority` needs no override.
+    objects.push(object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "generated",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "rules": [
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/old"}}],
+                    "filters": [
+                        route_generated_modifier("redirected"),
+                        {"type": "RequestRedirect", "requestRedirect": {
+                            "statusCode": 302,
+                            "path": {"type": "ReplaceFullPath", "replaceFullPath": "/new"}
+                        }}
+                    ]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/nobackend"}}],
+                    "filters": [route_generated_modifier("faulted")]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/proxied"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}],
+                    "filters": [route_generated_modifier("proxied")]
+                }
+            ]
+        }),
+    ));
+
+    let harness = spawn_translated_route_gateway(&objects, Vec::new()).await;
+    let http1 = reqwest::Client::builder()
+        .no_proxy()
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("http/1.1 client");
+    let http2 = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("h2c client");
+
+    for (protocol, client) in [("http/1.1", &http1), ("h2c", &http2)] {
+        let redirect = client
+            .get(harness.proxy_url("/old/page"))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{protocol} redirect: {error}"));
+        assert_eq!(redirect.status(), reqwest::StatusCode::FOUND, "{protocol}");
+        let headers = redirect.headers().clone();
+        let location = headers
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(location_path_and_query(location), "/new", "{protocol}");
+        assert_eq!(
+            headers.get("x-route").unwrap(),
+            "redirected",
+            "{protocol}: the redirect must carry the rule's response headers"
+        );
+        assert_eq!(
+            headers.get("x-appended").unwrap(),
+            "route",
+            "{protocol}: the route list must apply exactly once to a redirect"
+        );
+
+        let fault = client
+            .get(harness.proxy_url("/nobackend/thing"))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{protocol} fault: {error}"));
+        assert_eq!(
+            fault.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "{protocol}"
+        );
+        assert_eq!(
+            fault.headers().get("x-route").unwrap(),
+            "faulted",
+            "{protocol}: the generated 500 must carry the rule's response headers"
+        );
+        assert_eq!(
+            fault.headers().get("x-appended").unwrap(),
+            "route",
+            "{protocol}: the route list must apply exactly once to a generated 500"
+        );
+
+        let proxied = client
+            .get(harness.proxy_url("/proxied/thing"))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{protocol} proxied: {error}"));
+        assert_eq!(proxied.status(), reqwest::StatusCode::OK, "{protocol}");
+        let headers = proxied.headers().clone();
+        assert_eq!(headers.get("x-route").unwrap(), "proxied", "{protocol}");
+        assert_eq!(
+            headers.get("x-appended").unwrap(),
+            "origin,route",
+            "{protocol}: a proxied response must receive the route list exactly once"
+        );
+        assert_eq!(proxied.text().await.unwrap(), "pong", "{protocol}");
+    }
+
+    backend.assert_no_matcher_mismatches().await;
+    assert_eq!(
+        backend.received_requests().await.len(),
+        2,
+        "only the proxied rule may reach the backend"
+    );
+}
+
 /// A GRPCRoute `ResponseHeaderModifier` must reach the client as response
 /// metadata over a real gRPC call, preserving the message and the terminal
 /// `grpc-status`.
