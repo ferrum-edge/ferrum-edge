@@ -2554,6 +2554,14 @@ async fn handle_h3_request(
         .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
     if let Some(content_type) = grpc_web_response_content_type {
         crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);
+        // The upload's own framing, as on the H1/H2 frontend: the negotiated
+        // response type above can name the other mode.
+        ctx.set_request_grpc_web_text(
+            req.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(crate::plugins::grpc_web::is_grpc_web_text),
+        );
     }
     // Use the actual UDP listener port so port-scoped plugins such as mesh
     // outbound registry and mesh authz see the same frontend port that accepted
@@ -5373,12 +5381,9 @@ async fn handle_h3_request(
         .await;
         // `bytes_sent` above is the raw client-wire length; gRPC messages come
         // from the transformed, backend-visible body so translated gRPC-Web
-        // requests count native frames instead of base64 / trailer framing.
-        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-            &ctx.metadata,
-            &ctx.grpc_request_messages_observed,
-            &transformed,
-        );
+        // requests count native frames instead of base64 / trailer framing,
+        // and an untranslated pass-through upload counts its decoded frames.
+        crate::plugins::grpc_web::record_request_grpc_message_count(&ctx, &transformed);
         let final_body_result = crate::proxy::run_final_request_body_hooks(
             &plugins,
             Some(&mut ctx),
@@ -5919,12 +5924,9 @@ async fn handle_h3_request(
         )
         .await;
         // Same contract as the terminal-hook ladder above: count the
-        // backend-visible native representation, not the client wire bytes.
-        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-            &ctx.metadata,
-            &ctx.grpc_request_messages_observed,
-            &transformed,
-        );
+        // backend-visible representation, not the client wire bytes, and an
+        // untranslated pass-through upload on its decoded frames.
+        crate::plugins::grpc_web::record_request_grpc_message_count(&ctx, &transformed);
         match crate::proxy::run_final_request_body_hooks(
             &plugins,
             Some(&mut ctx),
@@ -6931,10 +6933,8 @@ async fn handle_h3_request(
         let request_stream_opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let request_upload_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let grpc_request_messages =
-            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                &ctx.metadata,
-            )
-            .then(|| Arc::clone(&ctx.grpc_request_messages_observed));
+            crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(&ctx)
+                .then(|| Arc::clone(&ctx.grpc_request_messages_observed));
 
         // The matched route rule's deadlines (#5646). The streamed upload is
         // handed to the backend as soon as the backend stream opens, so the

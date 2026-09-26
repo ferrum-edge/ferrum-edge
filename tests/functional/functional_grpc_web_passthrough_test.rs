@@ -565,6 +565,172 @@ async fn grpc_web_passthrough_buffered_deadline_split_and_unreadable_status() {
     }
 }
 
+/// Three request messages and a trailer frame, as a gRPC-Web client may
+/// upload them.
+fn passthrough_upload() -> Vec<u8> {
+    let mut upload = frame(0x00, b"one");
+    upload.extend_from_slice(&frame(0x00, b"two"));
+    upload.extend_from_slice(&frame(0x00, b"three"));
+    upload.extend_from_slice(&frame(0x80, b"x-app-id: 42\r\n"));
+    upload
+}
+
+fn logged_summary_field(logs: &str, proxy_id: &str, key: &str) -> Vec<Value> {
+    logs.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["proxy_id"] == proxy_id)
+        .map(|entry| entry[key].clone())
+        .collect()
+}
+
+/// Issue #5798: a Direct (non-mesh) pass-through gRPC-Web upload takes the
+/// native gRPC dispatch, and its BUFFERED arms count request messages on the
+/// decoded frame stream: a `grpc-web-text` upload is not read as native
+/// length prefixes, and a binary upload's trailer frame is not a message.
+/// `response_body_mode: buffer` reaches the arm that collects without request
+/// body hooks. A `request_transformer` body rule reaches the arm that runs
+/// them: it buffers every `+json` upload (framed gRPC-Web included) and then
+/// declines the transform when the frames fail the JSON document parse, so
+/// the backend still receives the client's bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() {
+    let (_binary_backend, binary_port) =
+        spawn_h2c_backend("application/grpc-web+proto", passthrough_binary_body()).await;
+    let (_text_backend, text_port) =
+        spawn_h2c_backend("application/grpc-web-text+proto", passthrough_text_body()).await;
+    let (_binary_json_backend, binary_json_port) =
+        spawn_h2c_backend("application/grpc-web+json", passthrough_binary_body()).await;
+    let (_text_json_backend, text_json_port) =
+        spawn_h2c_backend("application/grpc-web-text+json", passthrough_text_body()).await;
+
+    let mut proxies = Vec::new();
+    let mut plugin_configs = vec![
+        json!({
+            "id": "access-log",
+            "plugin_name": "stdout_logging",
+            "config": {},
+            "scope": "global",
+            "enabled": true,
+        }),
+        // Marks the transaction as observing gRPC messages.
+        json!({
+            "id": "prometheus",
+            "plugin_name": "prometheus_metrics",
+            "config": { "render_cache_ttl_seconds": 0 },
+            "scope": "global",
+            "enabled": true,
+        }),
+    ];
+    for suffix in ["h1", "h2"] {
+        for (mode, backend_port) in [("bin", binary_port), ("text", text_port)] {
+            let buffered_id = format!("count-buf-{mode}-{suffix}");
+            proxies.push(buffered_route(&buffered_id, backend_port));
+        }
+        for (mode, backend_port) in [("bin", binary_json_port), ("text", text_json_port)] {
+            let hooks_id = format!("count-hooks-{mode}-{suffix}");
+            let transformer_id = format!("{hooks_id}-transformer");
+            let hooks_plugins = json!([{ "plugin_config_id": transformer_id }]);
+            proxies.push(route(&hooks_id, backend_port, hooks_plugins));
+            plugin_configs.push(json!({
+                "id": transformer_id,
+                "plugin_name": "request_transformer",
+                "config": {
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "never_applied",
+                        "value": "frames are not a JSON document",
+                    }],
+                },
+                "scope": "proxy",
+                "proxy_id": hooks_id,
+                "enabled": true,
+            }));
+        }
+    }
+    let config = json!({
+        "version": "1",
+        "proxies": proxies,
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": plugin_configs,
+    });
+    let harness = GatewayHarness::builder()
+        .file_config(to_file_mode_yaml(&config))
+        .log_level("info")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let base = harness.proxy_base_url().to_string();
+
+    let h1 = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h1 client");
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h2c client");
+    let binary = passthrough_upload();
+    let text = BASE64.encode(&binary).into_bytes();
+
+    // The hooks arm uploads `+json` gRPC-Web so the body rule buffers it.
+    let arms = [
+        (
+            "buf",
+            "application/grpc-web+proto",
+            "application/grpc-web-text+proto",
+        ),
+        (
+            "hooks",
+            "application/grpc-web+json",
+            "application/grpc-web-text+json",
+        ),
+    ];
+    let mut proxy_ids = Vec::new();
+    for (client, suffix) in [(&h1, "h1"), (&h2, "h2")] {
+        for (arm, binary_type, text_type) in arms {
+            for (mode, content_type, upload) in
+                [("bin", binary_type, &binary), ("text", text_type, &text)]
+            {
+                let proxy_id = format!("count-{arm}-{mode}-{suffix}");
+                post_grpc_web(
+                    client,
+                    &format!("{base}/{proxy_id}/echo.Echo/Unary"),
+                    content_type,
+                    upload.clone(),
+                )
+                .await;
+                proxy_ids.push(proxy_id);
+            }
+        }
+    }
+
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| {
+                proxy_ids
+                    .iter()
+                    .all(|proxy_id| !logged_grpc_status(logs, proxy_id).is_empty())
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+    for proxy_id in &proxy_ids {
+        assert_eq!(
+            logged_summary_field(&logs, proxy_id, "grpc_request_messages"),
+            vec![json!(3)],
+            "{proxy_id}: three decoded messages, never the base64 armour or the trailer \
+             frame; logs:\n{logs}"
+        );
+    }
+}
+
 /// Issue #5784: pass-through gRPC-Web over the GENERIC relay path. A
 /// `mesh.unix_socket` HTTP/1.1 target makes the native gRPC branch fall through
 /// (`grpc_mesh_dispatch_falls_through`), so the H1/H2 response funnel's generic
@@ -708,7 +874,9 @@ mod generic_relay_mesh_fall_through {
     }
 
     /// Trusted-projected fixture: one route whose only target carries the
-    /// reserved `mesh.unix_socket` tag, plus an `http_logging` sink.
+    /// reserved `mesh.unix_socket` tag, plus an `http_logging` sink. The global
+    /// `prometheus_metrics` instance marks the transaction as observing gRPC
+    /// messages, so the logged summary carries the message counters.
     fn fixture_yaml(socket_path: &str, placeholder_port: u16, sink_port: u16) -> String {
         format!(
             r#"version: "1"
@@ -744,6 +912,12 @@ plugin_configs:
       endpoint_url: "http://127.0.0.1:{sink_port}/logs"
       batch_size: 1
       flush_interval_ms: 100
+  - id: "{PROXY_ID}-prometheus"
+    plugin_name: prometheus_metrics
+    scope: global
+    enabled: true
+    config:
+      render_cache_ttl_seconds: 0
 "#
         )
     }
@@ -830,6 +1004,14 @@ plugin_configs:
         assert_eq!(
             logged[0]["grpc_status"], 7,
             "the logged status comes from the backend's trailer frame: {logged:?}"
+        );
+        assert_eq!(
+            logged[0]["grpc_request_messages"], 1,
+            "the upload's one message frame is counted: {logged:?}"
+        );
+        assert_eq!(
+            logged[0]["grpc_response_messages"], 1,
+            "the backend's message frame is counted, its trailer frame is not: {logged:?}"
         );
         gateway.shutdown().await;
     }

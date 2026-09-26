@@ -496,6 +496,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trailer section, and a reqwest response whose backend framing cannot carry
   one (HTTP/1.x `Content-Length` or close-delimited) skips the trailer policy
   capture entirely.
+- The HTTP/1.1 and HTTP/2 native gRPC response builders, buffered and
+  streamed, now write the gateway-owned `X-Gateway-Error` token after the last
+  response hook, as the HTTP/1.1 and HTTP/2 plain builder and every HTTP/3
+  response do (#5798). A gRPC backend's HTTP 5xx now carries `backend_error`,
+  and a copy a plugin or hook wrote is replaced instead of forwarded. The token
+  write now skips its strip pass when the map carries no copy. Request-side
+  gRPC message counters now follow the upload's own framing: an untranslated
+  pass-through gRPC-Web upload is counted on its decoded message frames when
+  buffered, and a streamed `grpc-web-text` upload is no longer scanned as
+  native framing over its base64. A pass-through backend's in-body gRPC-Web
+  trailer frame stays backend body content, relayed unchanged; the docs now
+  say it is outside the gateway-owned header contract.
 - A streaming response with no `Content-Length` that exceeds
   `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` now shows the client the committed
   status and the bytes within the limit before it is aborted. Previously, when

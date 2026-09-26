@@ -3575,6 +3575,97 @@ pub(crate) fn record_backend_response_grpc_message_count(
         .fetch_max(observer.messages(), Ordering::Release);
 }
 
+/// Whether this request uploads PASS-THROUGH gRPC-Web in text (base64)
+/// framing, or `None` when its upload is not pass-through gRPC-Web at all.
+///
+/// Pass-through means the client spoke gRPC-Web and no `grpc_web` translator
+/// rewrote the request, so the backend receives the client's own framing. The
+/// request's own `Content-Type`, classified at frontend intake, decides the
+/// mode: the negotiated response type can name the other one.
+fn passthrough_request_text_mode(ctx: &RequestContext) -> Option<bool> {
+    if !ctx.request_is_grpc_web() || request_is_grpc_web_translated(ctx) {
+        return None;
+    }
+    Some(ctx.request_is_grpc_web_text())
+}
+
+/// Count the gRPC messages in a complete request body into `counter`.
+///
+/// A PASS-THROUGH gRPC-Web upload (`passthrough_text_mode` is `Some`) is
+/// counted on its decoded frame stream: `grpc-web-text` is base64 and a
+/// trailer frame is metadata, so neither is a native message. Every other body
+/// is already native length-prefixed framing (a translated upload was decoded
+/// by this plugin's request transform). `fetch_max` keeps a retried or
+/// replayed buffer from inflating the count.
+fn record_request_messages(counter: &AtomicU64, passthrough_text_mode: Option<bool>, body: &[u8]) {
+    use crate::plugins::mesh::prometheus_helpers as helpers;
+    let Some(text_mode) = passthrough_text_mode else {
+        helpers::record_complete_grpc_message_count(counter, body);
+        return;
+    };
+    let mut observer = GrpcWebTrailerStatusObserver::new(text_mode);
+    observer.push(body);
+    counter.fetch_max(observer.messages(), Ordering::Release);
+}
+
+/// Record the authoritative request message count for a complete, buffered
+/// backend-visible body, when the transaction observes gRPC messages. See
+/// [`record_request_messages`] for how a pass-through gRPC-Web upload counts.
+pub(crate) fn record_request_grpc_message_count(ctx: &RequestContext, body: &[u8]) {
+    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+        record_request_messages(
+            &ctx.grpc_request_messages_observed,
+            passthrough_request_text_mode(ctx),
+            body,
+        );
+    }
+}
+
+/// A request's gRPC message counter, captured with its upload framing so a
+/// dispatch whose context a later phase consumes can still count the
+/// backend-visible body.
+pub(crate) struct RequestGrpcMessageCounter {
+    messages: std::sync::Arc<AtomicU64>,
+    passthrough_text_mode: Option<bool>,
+}
+
+impl RequestGrpcMessageCounter {
+    /// `None` when the transaction does not observe gRPC messages.
+    pub(crate) fn for_request(ctx: &RequestContext) -> Option<Self> {
+        use crate::plugins::mesh::prometheus_helpers as helpers;
+        if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+            return None;
+        }
+        Some(Self {
+            messages: std::sync::Arc::clone(&ctx.grpc_request_messages_observed),
+            passthrough_text_mode: passthrough_request_text_mode(ctx),
+        })
+    }
+
+    /// Count a complete backend-visible request body.
+    pub(crate) fn record(&self, body: &[u8]) {
+        record_request_messages(&self.messages, self.passthrough_text_mode, body);
+    }
+}
+
+/// Whether a STREAMED upload may carry the native length-prefix scanner the
+/// request body adapters attach for gRPC message accounting.
+///
+/// A pass-through `grpc-web-text` upload is base64, which that scanner cannot
+/// read: it would count whatever lengths the armour happens to decode to. Such
+/// an upload is therefore not counted when streamed. A binary gRPC-Web upload
+/// shares native length-prefixed message framing, so it keeps the scanner.
+pub(crate) fn request_stream_observes_native_grpc_messages(ctx: &RequestContext) -> bool {
+    crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
+        && !request_uploads_passthrough_grpc_web_text(ctx)
+}
+
+/// Whether this request uploads PASS-THROUGH `grpc-web-text` (base64), which
+/// the native length-prefix scanner cannot read.
+pub(crate) fn request_uploads_passthrough_grpc_web_text(ctx: &RequestContext) -> bool {
+    passthrough_request_text_mode(ctx) == Some(true)
+}
+
 /// Compare an existing trailer-frame suffix against the reconciled trailers
 /// without retaining a rebuilt frame or a decoded body copy.
 fn trailer_suffix_matches_reconciled(

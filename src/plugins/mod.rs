@@ -2642,6 +2642,11 @@ pub struct RequestContext {
     /// Stamped beside `request_wire_transport` from the same pre-routing
     /// classification the dispatchers already computed.
     request_is_grpc_web: bool,
+    /// Whether that recognized gRPC-Web request declared text (base64)
+    /// framing in its own `Content-Type`. Decided from the immutable inbound
+    /// field at frontend intake, because the negotiated response type can name
+    /// the other mode and a request hook can rewrite the header.
+    request_is_grpc_web_text: bool,
     /// Memoized per-instance execution-trigger decisions, keyed by the opaque
     /// process-local token the plugin cache assigned to each triggered
     /// instance.
@@ -3884,6 +3889,7 @@ impl RequestContext {
             origin_http_response_status: None,
             request_wire_transport: None,
             request_is_grpc_web: false,
+            request_is_grpc_web_text: false,
             plugin_trigger_decisions: Vec::new(),
             metadata: HashMap::new(),
             ai_usage_export: None,
@@ -5376,6 +5382,7 @@ impl RequestContext {
             origin_http_response_status: self.origin_http_response_status,
             request_wire_transport: self.request_wire_transport,
             request_is_grpc_web: self.request_is_grpc_web,
+            request_is_grpc_web_text: self.request_is_grpc_web_text,
             // Carried, not dropped: the memoized trigger decisions ARE the
             // authority for whether an instance runs. Re-deriving them on this
             // clone would let a `before_proxy` header/path/query rewrite flip a
@@ -5727,6 +5734,18 @@ impl RequestContext {
     /// Whether the frontend classified this request as recognized gRPC-Web.
     pub fn request_is_grpc_web(&self) -> bool {
         self.request_is_grpc_web
+    }
+
+    /// Stamp whether the request's own `Content-Type` named gRPC-Web text
+    /// framing. Called once per request by the H1/H2 and H3 frontends from the
+    /// inbound field, before any hook runs.
+    pub(crate) fn set_request_grpc_web_text(&mut self, text: bool) {
+        self.request_is_grpc_web_text = text;
+    }
+
+    /// Whether the client uploaded gRPC-Web in text (base64) framing.
+    pub fn request_is_grpc_web_text(&self) -> bool {
+        self.request_is_grpc_web_text
     }
 
     /// Previously memoized execution-trigger decision for `token`, if any.

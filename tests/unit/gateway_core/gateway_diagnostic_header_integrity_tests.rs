@@ -356,6 +356,52 @@ fn h1_h2_builder_strips_both_diagnostics_through_the_shared_helper() {
     );
 }
 
+// ── #5798: the H1/H2 native gRPC builders write the gateway's own token ─────
+
+/// The byte offset of `needle` in `haystack` at or after `from`.
+fn find_after(haystack: &str, from: usize, needle: &str) -> usize {
+    haystack[from..]
+        .find(needle)
+        .map(|idx| from + idx)
+        .unwrap_or_else(|| panic!("{needle} not found"))
+}
+
+#[test]
+fn h1_h2_native_grpc_builders_write_the_gateway_token_after_hooks() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    // Each arm's LAST response hook: the buffered arm runs its
+    // response-committed hooks after `after_proxy`, and those can still write
+    // headers.
+    for (arm, last_hook) in [
+        (
+            "Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {",
+            "run_after_proxy_hooks(",
+        ),
+        (
+            "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
+            "run_deadline_bounded_response_committed_hooks(",
+        ),
+    ] {
+        let start = find_after(proxy, 0, arm);
+        let hooks = find_after(proxy, start, "run_after_proxy_hooks(");
+        let last = find_after(proxy, hooks, last_hook);
+        let write = find_after(
+            proxy,
+            last,
+            "apply_authoritative_gateway_error_header_for_response(",
+        );
+        let wire = find_after(proxy, hooks, "headers_mod::apply_response_headers(");
+        assert!(
+            last < wire,
+            "{arm}: {last_hook} must run before the headers reach the wire"
+        );
+        assert!(
+            write < wire,
+            "{arm}: the gateway token must be written after {last_hook} and before the wire"
+        );
+    }
+}
+
 // ── #5762: a route timeout no backend held is not a backend timeout ─────────
 
 /// The token the context-aware classifier picks, asserting the header writer
