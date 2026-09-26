@@ -14762,7 +14762,20 @@ mod tests {
                 .expect("QUIC server config");
             let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
             let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-            let server = quinn::Endpoint::server(server_config, loopback).expect("bind server");
+            // `Endpoint::server`/`client` are gated on quinn's non-FIPS crypto
+            // features, so build the endpoints explicitly (as the listener does).
+            let runtime = quinn::default_runtime().expect("tokio runtime");
+            let server_socket = std::net::UdpSocket::bind(loopback).expect("bind server");
+            server_socket
+                .set_nonblocking(true)
+                .expect("nonblocking server socket");
+            let server = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(server_config),
+                server_socket,
+                Arc::clone(&runtime),
+            )
+            .expect("server endpoint");
             let server_addr = server.local_addr().expect("server address");
 
             let mut roots = rustls::RootCertStore::empty();
@@ -14774,7 +14787,17 @@ mod tests {
             client_crypto.alpn_protocols = vec![b"h3".to_vec()];
             let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
                 .expect("QUIC client config");
-            let mut client = quinn::Endpoint::client(loopback).expect("bind client");
+            let client_socket = std::net::UdpSocket::bind(loopback).expect("bind client");
+            client_socket
+                .set_nonblocking(true)
+                .expect("nonblocking client socket");
+            let mut client = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                client_socket,
+                runtime,
+            )
+            .expect("client endpoint");
             client.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_client)));
 
             let accept_endpoint = server.clone();
