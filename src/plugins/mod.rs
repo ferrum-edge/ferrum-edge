@@ -7885,8 +7885,8 @@ impl ChainedResponseStreamInspector {
     /// A policy cut from the last inspector's `on_end` follows `released`, the
     /// bytes its `on_chunk` released in the same call. Every inspector cleared
     /// them and the cutting one framed its payload after them, so they leave
-    /// first; an earlier inspector's release has not passed the later ones and
-    /// stays dropped.
+    /// first, even when the cut has no payload of its own; an earlier
+    /// inspector's release has not passed the later ones and stays dropped.
     fn cut_after_last_released(
         &self,
         index: usize,
@@ -7894,10 +7894,12 @@ impl ChainedResponseStreamInspector {
         action: ResponseStreamAction,
     ) -> ResponseStreamAction {
         match action {
-            ResponseStreamAction::Terminate(Some(final_bytes))
+            ResponseStreamAction::Terminate(final_bytes)
                 if index + 1 == self.inspectors.len() && !released.is_empty() =>
             {
-                released.extend_from_slice(&final_bytes);
+                if let Some(final_bytes) = final_bytes {
+                    released.extend_from_slice(&final_bytes);
+                }
                 ResponseStreamAction::Terminate(Some(released.freeze()))
             }
             action => action,
@@ -8009,6 +8011,20 @@ mod chained_inspector_tests {
         }
     }
 
+    /// Passes chunks through unchanged; cuts at end-of-stream with `payload`.
+    struct CutAtEnd {
+        payload: Option<&'static [u8]>,
+    }
+    #[async_trait]
+    impl ResponseStreamInspector for CutAtEnd {
+        async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        }
+        async fn on_end(&mut self) -> ResponseStreamAction {
+            ResponseStreamAction::Terminate(self.payload.map(bytes::Bytes::from_static))
+        }
+    }
+
     /// Holds everything (never releases) — Forward(empty).
     struct HoldAll;
     #[async_trait]
@@ -8072,6 +8088,47 @@ mod chained_inspector_tests {
                 assert_eq!(bytes.as_ref(), b"FINALB");
             }
             other => panic!("expected terminal downstream output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_last_end_cut_drops_what_its_carry_chunk_released() {
+        // "A" flushed by the first inspector passes the cutting one's
+        // `on_chunk`, but the last inspector never saw it, so the cut must not
+        // carry it around that inspector.
+        for payload in [Some(&b"CUT"[..]), None] {
+            let mut chain = chain_response_stream_inspectors(vec![
+                Box::new(TagAtEnd { tag: "A" }),
+                Box::new(CutAtEnd { payload }),
+                Box::new(TagAtEnd { tag: "B" }),
+            ])
+            .expect("chain");
+            match chain.on_end().await {
+                ResponseStreamAction::Terminate(final_bytes) => {
+                    assert_eq!(final_bytes.as_deref(), payload, "no backend bytes");
+                }
+                other => panic!("expected Terminate, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn last_end_cut_emits_what_its_carry_chunk_released_first() {
+        // As the last inspector, what the cutting one released every inspector
+        // passed, so it leaves ahead of the payload, or alone on a silent cut.
+        let cases: [(Option<&'static [u8]>, &[u8]); 2] = [(Some(b"CUT"), b"ACUT"), (None, b"A")];
+        for (payload, expected) in cases {
+            let mut chain = chain_response_stream_inspectors(vec![
+                Box::new(TagAtEnd { tag: "A" }),
+                Box::new(CutAtEnd { payload }),
+            ])
+            .expect("chain");
+            match chain.on_end().await {
+                ResponseStreamAction::Terminate(Some(bytes)) => {
+                    assert_eq!(bytes.as_ref(), expected);
+                }
+                other => panic!("expected terminal output, got {other:?}"),
+            }
         }
     }
 

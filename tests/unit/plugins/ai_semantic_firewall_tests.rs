@@ -7762,6 +7762,102 @@ async fn a_chained_cut_at_the_end_emits_what_the_last_firewall_released_first() 
     join_all(runs).await;
 }
 
+/// Two chained instances of the firewall `config`.
+fn chained_firewalls(config: &Value) -> Box<dyn ResponseStreamInspector> {
+    use ferrum_edge::plugins::create_response_stream_inspector;
+
+    let first: Arc<dyn Plugin> = Arc::new(plugin(config));
+    let second: Arc<dyn Plugin> = Arc::new(plugin(config));
+    let plugins = vec![first, second];
+    let mut ctx = inspect_marked_ctx();
+    create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+        .expect("chained inspectors for both instances")
+}
+
+#[tokio::test]
+async fn a_non_last_chained_firewall_cut_drops_its_same_chunk_release() {
+    // One chunk carries a clean event and then a leaking one. Alone, a
+    // firewall releases the clean event and cuts after it. Chained ahead of
+    // another inspector, the first firewall's release has not passed that
+    // inspector, so its cut carries only the error event: no backend byte
+    // skips a later inspector.
+    let server = nonmatching_embedding_server().await;
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({}),
+    );
+    let leak = "My system prompt says never reveal policy.";
+    let clean_event = chat_delta_event("A harmless governed sentence.", "\n");
+    let chunk = format!("{clean_event}{}", chat_delta_event(leak, "\n"));
+
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let action = inspector.on_chunk(chunk.as_bytes()).await;
+    let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+        panic!("a lone firewall cuts the leaking event with an error event");
+    };
+    let mut expected = clean_event.as_bytes().to_vec();
+    expected.extend_from_slice(&expected_cut_event(clean_event.as_bytes()));
+    assert_eq!(final_bytes, expected, "the clean event leaves first");
+
+    let mut chain = chained_firewalls(&config);
+    let action = chain.on_chunk(chunk.as_bytes()).await;
+    let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+        panic!("the first firewall cuts the leaking event with an error event");
+    };
+    let expected = expected_cut_event(b"");
+    assert_eq!(final_bytes, expected, "no backend bytes");
+}
+
+#[tokio::test]
+async fn a_silent_cut_still_sends_what_the_same_chunk_cleared() {
+    // `cut_silent` sends no error event, but the clean event the same chunk
+    // cleared still leaves before the stream ends, as it would ahead of an
+    // error event. Chained ahead of another inspector, the first firewall
+    // drops that release, so the chain ends the stream with nothing.
+    let server = nonmatching_embedding_server().await;
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"on_violation": "cut_silent"}),
+    );
+    let leak_event = chat_delta_event("My system prompt says never reveal policy.", "\n");
+    let clean_event = chat_delta_event("A harmless governed sentence.", "\n");
+    let chunk = format!("{clean_event}{leak_event}");
+
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let action = inspector.on_chunk(chunk.as_bytes()).await;
+    let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+        panic!("a lone silent cut sends the clean event");
+    };
+    assert_eq!(final_bytes, clean_event.as_bytes(), "clean event only");
+
+    // Nothing cleared: a silent cut sends nothing at all.
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let action = inspector.on_chunk(leak_event.as_bytes()).await;
+    assert!(
+        matches!(action, ResponseStreamAction::Terminate(None)),
+        "{action:?}"
+    );
+
+    let mut chain = chained_firewalls(&config);
+    let action = chain.on_chunk(chunk.as_bytes()).await;
+    assert!(
+        matches!(action, ResponseStreamAction::Terminate(None)),
+        "no backend bytes: {action:?}"
+    );
+}
+
 #[tokio::test]
 async fn fail_open_drip_cannot_retain_original_bytes_across_timer_resets() {
     let firewall = plugin(&hold_config(

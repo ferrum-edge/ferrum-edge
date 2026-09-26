@@ -5588,15 +5588,24 @@ impl StreamInspector {
     /// event ends on its blank line rather than merging into the error event.
     /// Then one LF ends a line the client still holds open, so it reads the
     /// error event from a fresh line. Never a blank line, which would dispatch
-    /// an open event. Allocates only here, on a cut.
+    /// an open event. A silent cut (no error event) still sends `released`
+    /// before the stream ends. When a later chained inspector has not passed
+    /// `released`, it is dropped. Allocates only here, on a cut.
     fn cut_after(&self, released: Vec<u8>, action: ResponseStreamAction) -> ResponseStreamAction {
-        let ResponseStreamAction::Terminate(Some(event)) = action else {
+        let ResponseStreamAction::Terminate(event) = action else {
             return action;
         };
         let mut out = released;
         if self.feeds_inspector {
             out.clear();
         }
+        let Some(event) = event else {
+            // No error event follows, so no line needs ending.
+            if out.is_empty() {
+                return ResponseStreamAction::Terminate(None);
+            }
+            return ResponseStreamAction::Terminate(Some(Bytes::from(out)));
+        };
         let line_open = match out.last() {
             Some(&last) => !matches!(last, b'\n' | b'\r'),
             None => self.client_line_open,
