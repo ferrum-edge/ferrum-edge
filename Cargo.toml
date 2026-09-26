@@ -14,14 +14,22 @@ publish = false
 # patched in via `[patch.crates-io]` below. Cargo treats vendored deps under
 # `[patch.crates-io]` as fully built, but `cargo test -p h3 --lib frame` does
 # not run their tests because they aren't workspace members. The patch's
-# regression coverage is the four unit tests in
-# `vendor/h3-0.0.8-ferrum-patched/src/frame.rs::tests`
-# (`poll_next_drains_buffered_headers_before_quic_close`,
-# `poll_data_drains_buffered_body_before_quic_close`, and the stream-reset
-# exemption pair `poll_data_surfaces_stream_reset_over_a_truncated_buffered_body`
-# and `poll_next_surfaces_stream_reset_over_a_buffered_frame`); to run them locally,
-# invoke `cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`.
-# The same tests are part of hyperium/h3#339 and run on the upstream PR's CI.
+# regression coverage is the unit tests in
+# `vendor/h3-0.0.8-ferrum-patched/src/frame.rs::tests`. Only a QUIC connection
+# error is deferred behind buffered bytes, stored until they drain, and
+# surfaced once: `poll_next_drains_buffered_headers_before_quic_close`,
+# `poll_next_drains_a_buffered_frame_when_it_reads_the_quic_close`,
+# `poll_data_drains_buffered_body_before_quic_close`, and
+# `poll_data_surfaces_quic_close_over_a_truncated_buffered_body`. Every
+# stream-level error surfaces immediately:
+# `poll_data_surfaces_stream_reset_over_a_truncated_buffered_body`,
+# `poll_data_surfaces_stream_reset_over_a_buffered_frame`,
+# `poll_next_surfaces_stream_reset_over_a_buffered_frame`,
+# `poll_data_surfaces_unknown_stream_error_over_a_buffered_body`, and
+# `poll_next_surfaces_unknown_stream_error_over_a_buffered_frame`. To run them
+# locally, invoke
+# `cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`.
+# hyperium/h3#339 carries the same fix and its tests against upstream master.
 #
 # The vendored tungstenite/tokio-tungstenite crates live at
 # `vendor/tungstenite-0.29.0-ferrum-patched/` and
@@ -578,7 +586,9 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # into one recv (common for fast backends doing graceful shutdown), the
 # buffered HEADERS frame is silently discarded and `recv_response` returns
 # `StreamError::ConnectionError` — the gateway surfaces a 502 to the client
-# even though the response was on the wire.
+# even though the response was on the wire. The patch defers only connection
+# errors; a stream reset or any other stream-level error (including a rejected
+# 0-RTT read) surfaces ahead of buffered bytes, as in stock h3.
 #
 # Retirement plan: when h3 ships a release with the fix, remove the
 # corresponding `[patch.crates-io]` line, drop `vendor/h3-0.0.8-ferrum-patched/`,

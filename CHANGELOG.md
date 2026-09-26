@@ -235,6 +235,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovery-cohort barrier, and in-flight accounting are unchanged, and
   compatible reloads keep the learned windows.
 
+### Security
+
+- The vendored `h3` frame-drain patch (001) now defers only QUIC connection
+  errors behind buffered bytes, matching the updated upstream fix
+  (hyperium/h3#339). PR #5741 exempted a peer stream reset, but every other
+  stream error was still held back while buffered frames and body bytes were
+  delivered. `h3-quinn` reports a read of rejected 0-RTT data, and a read of a
+  stream Quinn already freed, as `Unknown`, so data from a rejected 0-RTT
+  flight could have been handed to the application ahead of the error. Every
+  stream-level error now surfaces on the poll that reads it. Ferrum Edge was
+  not exposed in practice: its HTTP/3 backend client never sends 0-RTT, and a
+  0-RTT rejection is only reported to the side that sent the early data. A
+  deferred connection error is now also stored on the stream until the
+  buffered bytes drain, then surfaced exactly once without polling the
+  transport again. Before, `poll_data` dropped it after returning the buffered
+  body and relied on the transport reporting it a second time. A close that
+  truncates a DATA frame now delivers the buffered part of the body and then
+  surfaces as the close, instead of as a connection-level `H3_FRAME_ERROR`.
+  Such a truncated response still fails the gateway's `Content-Length`
+  completeness check, and a response without `Content-Length` is never treated
+  as complete on a close.
+
 ## [0.9.7] - 2026-09-25
 
 This is the first published release after 0.9.5. It ships every change

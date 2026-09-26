@@ -1,127 +1,43 @@
-# frame: drain buffered bytes before propagating QUIC connection error
+frame: drain buffered bytes before propagating QUIC connection error
 
 Fixes #338.
 
 ## Problem
 
-`FrameStream::try_recv` propagates a connection-level error from
-`BufRecvStream::poll_read` via `?` before the frame decoder gets to run
-against bytes that may already be sitting in `BufRecvStream::buf` from
-a previous wake. When a QUIC stack delivers stream data and a
-`CONNECTION_CLOSE` (or other connection error) in the same recv batch —
-common on Linux with io_uring's batched recvmsg and coalesced UDP
-datagrams — buffered HEADERS / DATA bytes are discarded and clients
-see `StreamError::ConnectionError` instead of the response that was
-already on the wire.
+When a QUIC stack delivers stream data and a connection close in the same receive batch (for example a coalesced `STREAM` + `CONNECTION_CLOSE(H3_NO_ERROR)` on Linux with batched `recvmsg`), `FrameStream` could read the connection error while complete frames or DATA body bytes were already sitting in `BufRecvStream`'s buffer. The error was propagated with `?` and those bytes were thrown away, so a response that was already on the wire came back as a connection error. `H3_NO_ERROR` is the RFC 9114 §8.1 code for a graceful shutdown, so backends that close correctly (request limits, draining, rolling deploys) showed up as failures.
 
-The QUIC layer is innocent here: quinn-proto's per-stream assembler is
-not flushed by `close_common`, and `Chunks::next()` returns buffered
-chunks before checking connection state. The discard is purely at
-h3's frame layer.
+Quinn is not at fault: it hands out buffered stream chunks before it reports the connection state. The loss happens in h3's frame layer.
 
-`H3_NO_ERROR` is RFC 9114 §8.1's "graceful shutdown without an error"
-code. Today, a backend that uses it correctly (per-connection request
-limits, drain/rolling deploy, stateless backends) produces 502s at the
-client.
+## Design
 
-## Fix
+Updated to current `master` with a merge. `poll_next` on `master` already decodes buffered frames before it polls the transport (#344), so the remaining gap is `poll_data`, and what happens after it.
 
-Hoist the QUIC error out of `try_recv`'s `?` path. When `poll_read`
-returns an error, cache it for the current iteration; let
-`decoder.decode(self.stream.buf_mut())` run once against whatever is
-already buffered. If the decoder produces a frame, surface it normally.
-If `decoder.decode` returns `None`, surface the cached error.
+- **Drain buffered frames and body before a connection error.** When `poll_data` reads a connection error (`StreamErrorIncoming::ConnectionErrorIncoming`) it stores it on `FrameStream` and keeps returning buffered body bytes. `poll_next` keeps decoding buffered frames (for example trailers that were in the same chunk). The transport is not polled again while an error is pending.
+- **Surface the stored error exactly once.** The first `poll_next` or `poll_data` that finds nothing buffered returns the stored error and clears it. A connection error that truncates a DATA frame delivers the buffered part of the body and then returns the connection error, not `UnexpectedEnd`.
+- **Never defer a stream reset.** A peer `RESET_STREAM` (`StreamTerminated`), and any other stream-level error, surfaces on the poll that reads it, ahead of buffered bytes, as stock h3 does. Quinn reports a reset once and frees the stream, and RFC 9114 §7.1 only makes a truncated frame a connection error when the stream terminates cleanly. Deferring a reset would turn a DATA frame it truncated into `UnexpectedEnd`, which the request stream escalates to a connection-level `H3_FRAME_ERROR` that tears down every other stream on the connection. `FrameStreamError::is_connection_error` decides what can be deferred.
 
-Same shape applied to `FrameStream::poll_data` so DATA frame body
-bytes that were buffered before the error are not stranded.
+The non-error path is unchanged. Public API is unchanged: one private field on `FrameStream` and one private helper on `FrameStreamError`.
 
-A peer `RESET_STREAM` (`StreamErrorIncoming::StreamTerminated`) is the
-one error that is NOT hoisted. The hoist relies on the transport
-reporting the held-back error again on the next read. A connection
-error is reported again, but quinn reports a stream reset exactly once:
-it frees the receive stream as it returns `ReadError::Reset`, and every
-later read is `ClosedStream`. Holding a reset back behind buffered
-bytes would lose its code. When the reset truncated a DATA frame whose
-tail was still buffered, it would also end the body in
-`UnexpectedEnd`, which the request stream escalates to a
-connection-level `H3_FRAME_ERROR`. RFC 9114 §7.1 makes a truncated
-frame a connection error only for a stream that "terminates cleanly".
-A reset therefore surfaces on the poll that observed it, exactly as
-before this patch. Quinn itself discards unread data on a reset (RFC
-9000 §3.2).
+## Credit
 
-### Termination
-
-Each iteration consumes its own cached error in the same iteration it
-was observed. A partial-frame buffer that the decoder cannot resolve
-exits the loop with the cached error in the `None` arm of the match —
-no opportunity for an infinite loop.
-
-### Forward progress
-
-When the decoder DOES produce a frame on the cached-error iteration,
-the next poll re-issues `poll_read`, which returns the same error
-(connection errors are sticky; the one-shot stream reset is never
-cached, see above).
-The buffered bytes have shrunk by the consumed frame's length, so
-iterations are bounded by the buffer size.
+Thanks to @Streetblock for the review. They found that the first version kept the deferred error in a poll-local variable, so it was lost once `poll_data` returned the body, and that the HEADERS test did not really read the error with the frame buffered. This update stores the error on `FrameStream`, following their fix in Streetblock/h3@b24e0af. It is adapted to `master`'s decode-first `poll_next` and to the stream-reset rule above, and credited with a `Co-authored-by` trailer.
 
 ## Tests
 
-Four new tests in `frame.rs::tests`:
+All in `h3/src/frame.rs`. `FakeRecv` gains `chunk_then_error`, which makes the transport report an error after its last chunk instead of end of stream.
 
-- `poll_next_drains_buffered_headers_before_quic_close` — synthesizes a
-  HEADERS frame followed by an `ApplicationClose { error_code: 0x100 }`
-  via `FakeRecv::chunk_then_error`. First poll yields the frame, second
-  poll surfaces the error.
-- `poll_data_drains_buffered_body_before_quic_close` — same shape on
-  the body path. `poll_next` yields the DATA frame header, `poll_data`
-  drains the buffered 4-byte body even though the next poll would
-  return the connection error.
-- `poll_data_surfaces_stream_reset_over_a_truncated_buffered_body` — a
-  `StreamTerminated` reset that lands while the tail of a truncated DATA
-  frame is still buffered surfaces as the reset, not `UnexpectedEnd`.
-- `poll_next_surfaces_stream_reset_over_a_buffered_frame` — a reset
-  observed with a decodable frame buffered surfaces as the reset, so its
-  code is not lost to the next read of the freed stream.
-
-`FakeRecv` is extended with a `chunk_then_error` helper that queues a
-synthetic `StreamErrorIncoming::ConnectionErrorIncoming` for the next
-poll after a chunk drains. This is the smallest model of the recv-batch
-race that a unit test can construct without a live QUIC backend.
-
-The existing tests in `frame.rs` still pass (the change is a no-op for
-the non-error path).
-
-## Compatibility
-
-- Public API: unchanged. `poll_next` and `poll_data` keep the same
-  signatures and the same return-shape contract — successful frames
-  continue to win, errors continue to surface, the only difference is
-  the ordering when both are pending.
-- Internal API: no callers outside `frame.rs` are affected.
-- Behavioral compat: only connection-level errors change ordering. A
-  peer that resets a stream keeps the prior semantic: the reset surfaces
-  immediately and buffered bytes are discarded, as quinn does for its
-  own unread data.
+- `poll_next_drains_buffered_headers_before_quic_close`: `poll_data` reads the connection error while the DATA body and a complete trailing HEADERS frame are buffered. The body and the trailers are delivered, the error follows exactly once without another transport poll, and later polls go back to the transport.
+- `poll_data_drains_buffered_body_before_quic_close`: the buffered body is delivered and the next `poll_next` returns `Err(FrameStreamError::Quic(_))` (the assertion from the review).
+- `poll_data_surfaces_quic_close_over_a_truncated_buffered_body`: a connection error that truncates a DATA frame delivers the buffered part, then the connection error rather than `UnexpectedEnd`.
+- `poll_data_surfaces_stream_reset_over_a_truncated_buffered_body`: a reset that truncates a DATA frame whose tail is still buffered surfaces as the reset, with its code.
+- `poll_data_surfaces_stream_reset_over_a_buffered_frame`: a reset read while whole frames are buffered surfaces as the reset, with its code.
 
 ## Downstream context
 
-This is the root-cause fix for the recv_response analog of [#NNN
-(predecessor PR for recv_data graceful close)]. The recv_data path was
-worked around at the application layer in commit `dbc9e09` via a
-`drain_h3_response_body` helper that re-implemented buffer-aware
-recovery one level up. With this PR, that helper can be simplified —
-the underlying decoder will already drain on its own — but I've kept
-the helper unmodified to keep the change here minimal. Happy to follow
-up with simplification once this lands if maintainers prefer.
-
-The recv_response path is the one this PR specifically fixes: at that
-boundary the application has no buffered bytes of its own to fall back
-on, so the only fix is at h3's frame layer.
+Ferrum Edge ships the same fix in a vendored copy (ferrum-edge/ferrum-edge#5741), including the stream-reset exemption. The gateway hit the reset case as a client reading a response cut mid-frame, and as a server reading a request body reset mid-frame.
 
 ## Refs
 
-- RFC 9114 §8.1 — H3 error codes
-- Issue #338 — bug report with reproducer and rationale
-- Downstream consumer: [ferrum-edge#506](https://github.com/ferrum-edge/ferrum-edge/pull/506) — gateway-side suppression of capability-downgrade for graceful closes (treats the symptom while we await this upstream fix)
+- RFC 9114 §7.1 (frame layout and truncated frames), §8.1 (error codes)
+- RFC 9000 §3.2 (receive-stream states on reset)
+- #338
