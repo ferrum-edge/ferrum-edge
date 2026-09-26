@@ -1428,7 +1428,9 @@ async fn spawn_fake_peer(kind: FakePeer) -> (SocketAddr, JoinHandle<()>) {
 fn harness_drain_begun_wait_requires_the_gateway_log_line() {
     let logged = format!("INFO ferrum_edge::overload: {SHUTDOWN_DRAIN_BEGUN_LOG} phase=drain\n");
     assert!(output_shows_drain_begun(&logged));
-    assert!(!output_shows_drain_begun("INFO Proxy listener shutting down\n"));
+    assert!(!output_shows_drain_begun(
+        "INFO Proxy listener shutting down\n"
+    ));
     assert!(!output_shows_drain_begun(""));
 }
 
