@@ -17,8 +17,10 @@ use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
 use ferrum_edge::plugins::utils::sse::{
     AnthropicEvent, MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseEventName,
-    SseReassembler, SseText, SseTextKind, parse_sse_data_frames_checked, split_sse_line_terminator,
-    sse_event_end, sse_event_end_after, sse_lines, sse_lines_inclusive, strip_sse_boms,
+    SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
+    classify_forwarded_sse_prefix, parse_sse_data_frames_checked, split_sse_line_terminator,
+    sse_event_end, sse_event_end_after, sse_line_end, sse_lines, sse_lines_inclusive,
+    strip_sse_boms,
 };
 use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
@@ -1304,6 +1306,140 @@ fn sse_event_end_after_matches_a_contiguous_scan_at_every_split() {
             );
         }
     }
+}
+
+#[test]
+fn sse_line_end_reports_content_end_and_next_line_start() {
+    assert_eq!(sse_line_end(b"data: x\nrest"), Some((7, 8)));
+    assert_eq!(sse_line_end(b"data: x\r\nrest"), Some((7, 9)));
+    assert_eq!(sse_line_end(b"data: x\rrest"), Some((7, 8)));
+    // A final CR is reported alone; the caller joins an LF that follows it.
+    assert_eq!(sse_line_end(b"data: x\r"), Some((7, 8)));
+    assert_eq!(sse_line_end(b"\n"), Some((0, 1)));
+    assert_eq!(sse_line_end(b"data: x"), None);
+    assert_eq!(sse_line_end(b""), None);
+}
+
+#[test]
+fn forwarded_sse_prefix_without_data_is_inert_under_every_line_ending() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let prefixes = [
+            String::new(),
+            eol.to_string(),
+            "\u{feff}".to_string(),
+            "\u{feff}\u{feff}".to_string(),
+            format!("\u{feff}{eol}"),
+            format!(": keepalive{eol}"),
+            format!("\u{feff}: keepalive{eol}id: 7{eol}retry: 1000{eol}"),
+            format!("id{eol}retry{eol}:{eol}"),
+            // A blank line ends a data event, so nothing after it is open.
+            format!("data: x{eol}{eol}"),
+            format!("data: x{eol}{eol}: keepalive{eol}"),
+        ];
+        for prefix in prefixes {
+            assert_eq!(
+                classify_forwarded_sse_prefix(prefix.as_bytes()),
+                SseForwardedPrefix::Inert,
+                "{prefix:?}"
+            );
+        }
+    }
+    // The LF of a CRLF whose CR ended the previous bytes.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"\n: keepalive\r"),
+        SseForwardedPrefix::Inert
+    );
+}
+
+#[test]
+fn forwarded_sse_prefix_ending_inside_a_data_less_line_is_an_inert_line() {
+    // Unterminated lines already past their `:` carry no data, but the bytes
+    // up to their next terminator still belong to them, so the caller must not
+    // read those bytes as a fresh line.
+    for eol in ["\n", "\r\n", "\r"] {
+        let prefixes = [
+            ":".to_string(),
+            ": keep".to_string(),
+            "id:".to_string(),
+            "id: 7".to_string(),
+            "retry: 10".to_string(),
+            "\u{feff}: keep".to_string(),
+            format!("id: 7{eol}retry: 10"),
+            format!(": keepalive{eol}:"),
+            format!("data: x{eol}{eol}id: 7"),
+        ];
+        for prefix in prefixes {
+            assert_eq!(
+                classify_forwarded_sse_prefix(prefix.as_bytes()),
+                SseForwardedPrefix::InertLine,
+                "{prefix:?}"
+            );
+        }
+    }
+    // The LF of a CRLF whose CR ended the previous bytes.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"\n: keep"),
+        SseForwardedPrefix::InertLine
+    );
+    // A data line earlier in the same event keeps the whole event open.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"data: x\n: keep"),
+        SseForwardedPrefix::OpenEvent
+    );
+}
+
+#[test]
+fn forwarded_sse_prefix_ending_inside_a_bom_reports_the_missing_bytes() {
+    assert_eq!(
+        classify_forwarded_sse_prefix(&UTF8_BOM[..1]),
+        SseForwardedPrefix::PartialBom(2)
+    );
+    assert_eq!(
+        classify_forwarded_sse_prefix(&UTF8_BOM[..2]),
+        SseForwardedPrefix::PartialBom(1)
+    );
+    let mut stacked = UTF8_BOM.to_vec();
+    stacked.push(UTF8_BOM[0]);
+    assert_eq!(
+        classify_forwarded_sse_prefix(&stacked),
+        SseForwardedPrefix::PartialBom(2)
+    );
+}
+
+#[test]
+fn forwarded_sse_prefix_that_may_carry_data_is_open() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let prefixes = [
+            format!("data: x{eol}"),
+            format!("\u{feff}data: x{eol}"),
+            format!(": keepalive{eol}data: x{eol}"),
+            format!("data: x{eol}id: 7{eol}"),
+            format!("event: message{eol}"),
+            format!("custom: value{eol}"),
+            format!("data{eol}"),
+            // Unterminated lines whose field name is not complete yet, so they
+            // are not yet known to be comment, `id` or `retry` lines.
+            "d".to_string(),
+            "dat".to_string(),
+            "data: {\"partial\"".to_string(),
+            format!(": keepalive{eol}da"),
+            format!("id: 7{eol}i"),
+            // A BOM that is not leading is part of a field name.
+            format!("id: 7{eol}\u{feff}"),
+        ];
+        for prefix in prefixes {
+            assert_eq!(
+                classify_forwarded_sse_prefix(prefix.as_bytes()),
+                SseForwardedPrefix::OpenEvent,
+                "{prefix:?}"
+            );
+        }
+    }
+    // A partial BOM followed by other bytes is not a BOM at all.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"\xEFdata: x\n"),
+        SseForwardedPrefix::OpenEvent
+    );
 }
 
 // ---------------------------------------------------------------------------

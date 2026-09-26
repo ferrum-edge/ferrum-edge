@@ -253,13 +253,112 @@ pub fn sse_lines_inclusive(body: &str) -> impl Iterator<Item = &str> {
             return None;
         }
         let start = pos;
-        pos = match bytes[start..].iter().position(is_sse_eol) {
-            Some(offset) => sse_eol_end(bytes, start + offset),
+        pos = match sse_line_end(&bytes[start..]) {
+            Some((_, next)) => start + next,
             None => bytes.len(),
         };
         // CR and LF are ASCII, so `start..pos` lies on char boundaries.
         Some(&body[start..pos])
     })
+}
+
+/// Find the first line terminator in `bytes`: returns the index where it starts
+/// (the end of the line's content) and the index just past it. CRLF is one
+/// terminator; a lone CR or LF is one byte. A CR that is the final byte of
+/// `bytes` is reported as a lone CR, so a caller splitting a stream chunk by
+/// chunk must treat an LF that starts the next chunk as the rest of that CRLF.
+/// Works on raw bytes, so a chunk may end inside a UTF-8 sequence.
+/// Allocation-free.
+pub fn sse_line_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    let eol = bytes.iter().position(is_sse_eol)?;
+    Some((eol, sse_eol_end(bytes, eol)))
+}
+
+/// UTF-8 encoding of U+FEFF, the byte order mark an event stream may start with.
+pub const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// What the unterminated start of an SSE event, already forwarded to a client
+/// without inspection, can still contribute to the event the client goes on to
+/// dispatch. See [`classify_forwarded_sse_prefix`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseForwardedPrefix {
+    /// Nothing that can carry event data: only line terminators, leading BOMs,
+    /// and complete comment, `id` or `retry` lines. The bytes that follow can
+    /// be read as a fresh event without missing any data the client dispatches.
+    Inert,
+    /// Like [`Inert`](Self::Inert), except that the prefix ends inside a
+    /// comment, `id` or `retry` line already past its `:`. The client reads
+    /// every byte up to the next CR or LF as the rest of that line, so those
+    /// bytes carry nothing; only after that terminator can the stream be read
+    /// as a fresh event.
+    InertLine,
+    /// Leading BOMs that end in an incomplete one. The next `n` bytes, when they
+    /// complete that BOM, carry nothing either; after them the stream can be
+    /// read as a fresh event.
+    PartialBom(usize),
+    /// A `data`, `event` or other field line, or an unterminated line whose
+    /// field is not yet known: the rest of this event may carry data that only
+    /// makes sense together with the forwarded prefix.
+    OpenEvent,
+}
+
+/// Classify bytes that were forwarded as the start of an SSE event before the
+/// event was complete.
+///
+/// `prefix` must start where a line starts, optionally with the LF that
+/// completes a CRLF whose CR ended the preceding bytes — as the bytes carried
+/// after the last complete event do. A blank line inside `prefix` ends the
+/// event it belongs to, so only the lines after the last one count. Leading
+/// BOMs follow the [`strip_sse_boms`] policy. Allocation-free.
+pub fn classify_forwarded_sse_prefix(prefix: &[u8]) -> SseForwardedPrefix {
+    let mut rest = prefix;
+    while let Some(after) = rest.strip_prefix(UTF8_BOM.as_slice()) {
+        rest = after;
+    }
+    // Complete BOMs were stripped, so a match here is a strict BOM prefix.
+    if !rest.is_empty() && UTF8_BOM.starts_with(rest) {
+        return SseForwardedPrefix::PartialBom(UTF8_BOM.len() - rest.len());
+    }
+    let mut open = false;
+    let mut unfinished_line = false;
+    while !rest.is_empty() {
+        let Some((line_end, next)) = sse_line_end(rest) else {
+            // Later bytes extend this unterminated line, so it is inert only
+            // once its field name is complete, and even then those later bytes
+            // belong to it up to the next terminator.
+            if rest.contains(&b':') && is_inert_sse_line(rest) {
+                unfinished_line = true;
+            } else {
+                open = true;
+            }
+            break;
+        };
+        let line = &rest[..line_end];
+        rest = &rest[next..];
+        if line.is_empty() {
+            // A blank line ends the event; anything after it starts a new one.
+            open = false;
+        } else if !is_inert_sse_line(line) {
+            open = true;
+        }
+    }
+    if open {
+        SseForwardedPrefix::OpenEvent
+    } else if unfinished_line {
+        SseForwardedPrefix::InertLine
+    } else {
+        SseForwardedPrefix::Inert
+    }
+}
+
+/// Whether a non-empty SSE line is a comment or an `id` or `retry` field: a
+/// line that can never add data to the event it belongs to.
+fn is_inert_sse_line(line: &[u8]) -> bool {
+    let field = match line.iter().position(|byte| *byte == b':') {
+        Some(colon) => &line[..colon],
+        None => line,
+    };
+    matches!(field, b"" | b"id" | b"retry")
 }
 
 /// Split one line from [`sse_lines_inclusive`] into its content and its
