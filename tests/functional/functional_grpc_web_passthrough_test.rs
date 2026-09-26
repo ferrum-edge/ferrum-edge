@@ -588,8 +588,10 @@ fn logged_summary_field(logs: &str, proxy_id: &str, key: &str) -> Vec<Value> {
 /// decoded frame stream: a `grpc-web-text` upload is not read as native
 /// length prefixes, and a binary upload's trailer frame is not a message.
 /// `response_body_mode: buffer` reaches the arm that collects without request
-/// body hooks; `transaction_debugger` request-body capture reaches the arm that
-/// runs them.
+/// body hooks. A `request_transformer` body rule reaches the arm that runs
+/// them: it buffers every `+json` upload (framed gRPC-Web included) and then
+/// declines the transform when the frames fail the JSON document parse, so
+/// the backend still receives the client's bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() {
@@ -597,6 +599,10 @@ async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() 
         spawn_h2c_backend("application/grpc-web+proto", passthrough_binary_body()).await;
     let (_text_backend, text_port) =
         spawn_h2c_backend("application/grpc-web-text+proto", passthrough_text_body()).await;
+    let (_binary_json_backend, binary_json_port) =
+        spawn_h2c_backend("application/grpc-web+json", passthrough_binary_body()).await;
+    let (_text_json_backend, text_json_port) =
+        spawn_h2c_backend("application/grpc-web-text+json", passthrough_text_body()).await;
 
     let mut proxies = Vec::new();
     let mut plugin_configs = vec![
@@ -620,16 +626,22 @@ async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() 
         for (mode, backend_port) in [("bin", binary_port), ("text", text_port)] {
             let buffered_id = format!("count-buf-{mode}-{suffix}");
             proxies.push(buffered_route(&buffered_id, backend_port));
+        }
+        for (mode, backend_port) in [("bin", binary_json_port), ("text", text_json_port)] {
             let hooks_id = format!("count-hooks-{mode}-{suffix}");
-            let debugger_id = format!("{hooks_id}-debugger");
-            let hooks_plugins = json!([{ "plugin_config_id": debugger_id }]);
+            let transformer_id = format!("{hooks_id}-transformer");
+            let hooks_plugins = json!([{ "plugin_config_id": transformer_id }]);
             proxies.push(route(&hooks_id, backend_port, hooks_plugins));
             plugin_configs.push(json!({
-                "id": debugger_id,
-                "plugin_name": "transaction_debugger",
+                "id": transformer_id,
+                "plugin_name": "request_transformer",
                 "config": {
-                    "log_request_body": true,
-                    "max_request_body_bytes": 256,
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "never_applied",
+                        "value": "frames are not a JSON document",
+                    }],
                 },
                 "scope": "proxy",
                 "proxy_id": hooks_id,
@@ -667,12 +679,17 @@ async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() 
     let binary = passthrough_upload();
     let text = BASE64.encode(&binary).into_bytes();
 
+    // The hooks arm uploads `+json` gRPC-Web so the body rule buffers it.
+    let arms = [
+        ("buf", "application/grpc-web+proto", "application/grpc-web-text+proto"),
+        ("hooks", "application/grpc-web+json", "application/grpc-web-text+json"),
+    ];
     let mut proxy_ids = Vec::new();
     for (client, suffix) in [(&h1, "h1"), (&h2, "h2")] {
-        for arm in ["buf", "hooks"] {
+        for (arm, binary_type, text_type) in arms {
             for (mode, content_type, upload) in [
-                ("bin", "application/grpc-web+proto", &binary),
-                ("text", "application/grpc-web-text+proto", &text),
+                ("bin", binary_type, &binary),
+                ("text", text_type, &text),
             ] {
                 let proxy_id = format!("count-{arm}-{mode}-{suffix}");
                 post_grpc_web(

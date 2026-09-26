@@ -585,7 +585,9 @@ fn native_and_translated_request_messages_keep_the_native_scanner() {
     let scanned = request_stream_observes_native_grpc_messages_for_test(&translated);
     assert!(scanned);
     assert!(!request_uploads_passthrough_grpc_web_text_for_test(&ctx));
-    assert!(!request_uploads_passthrough_grpc_web_text_for_test(&translated));
+    assert!(!request_uploads_passthrough_grpc_web_text_for_test(
+        &translated
+    ));
 
     // Without an observing metrics plugin nothing is counted or scanned.
     let mut unobserved = create_test_context();
