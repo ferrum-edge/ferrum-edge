@@ -3634,9 +3634,18 @@ fn registry_unavailable_warning_is_rate_limited_to_the_repeat_interval() {
 
     // A poll interval at or beyond the repeat interval warns every poll, and a
     // zero interval cannot divide by zero.
-    assert!(registry_unavailable_warning_due(2, REGISTRY_UNAVAILABLE_WARN_INTERVAL));
-    assert!(registry_unavailable_warning_due(3, std::time::Duration::from_secs(120)));
-    assert!(!registry_unavailable_warning_due(2, std::time::Duration::ZERO));
+    assert!(registry_unavailable_warning_due(
+        2,
+        REGISTRY_UNAVAILABLE_WARN_INTERVAL
+    ));
+    assert!(registry_unavailable_warning_due(
+        3,
+        std::time::Duration::from_secs(120)
+    ));
+    assert!(!registry_unavailable_warning_due(
+        2,
+        std::time::Duration::ZERO
+    ));
 }
 
 /// Issue #5766: an Ambient proxy with the default registry directory and no

@@ -621,7 +621,8 @@ impl NodeLocalEnrolledDestinationsManager {
                     .filter_map(EnrolledPodEntry::from_capture_target)
                     .collect();
                 self.index.publish(&entries);
-                self.consecutive_unavailable_polls.store(0, Ordering::Relaxed);
+                self.consecutive_unavailable_polls
+                    .store(0, Ordering::Relaxed);
                 if self.snapshot_unhealthy.swap(false, Ordering::Relaxed) {
                     warn!(
                         "Node-local enrolled destination registry recovered; complete snapshots \
