@@ -800,8 +800,7 @@ impl CircuitBreakerCache {
             warn!(
                 max_entries = self.max_entries,
                 suppressed,
-                "Circuit breaker cache at capacity ({}), skipping new entry for {}",
-                self.max_entries,
+                "Circuit breaker cache at capacity, skipping new entry for {}",
                 refused_key
             );
         }

@@ -2676,8 +2676,8 @@ fn ceiling_refusal_warning_is_rate_limited_but_metric_is_exact() {
     let cache = CircuitBreakerCache::with_max_entries(1);
     let config = default_config();
     let warnings = Arc::new(AtomicUsize::new(0));
-    let subscriber = tracing_subscriber::registry()
-        .with(CircuitBreakerWarnCounter(Arc::clone(&warnings)));
+    let subscriber =
+        tracing_subscriber::registry().with(CircuitBreakerWarnCounter(Arc::clone(&warnings)));
 
     tracing::subscriber::with_default(subscriber, || {
         let cached = cache.get_or_create("audit", "p", Some("backend-a:80"), &config);
