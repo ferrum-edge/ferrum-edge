@@ -1865,39 +1865,44 @@ fn logged_request_messages(logs: &str, proxy_id: &str) -> Vec<Value> {
 }
 
 /// Issue #5819: a pass-through gRPC-Web upload that the HTTP/3 cross-protocol
-/// plain bridge streams to an HTTP/1.1 backend counts its request messages on
-/// the decoded frame stream. A binary upload's trailer frame is not a message,
-/// and a `grpc-web-text` upload, here as independently padded base64
-/// segments, is decoded before its frames are counted.
+/// plain bridge sends to an HTTP/1.1 backend counts its request messages on
+/// the decoded frames, whether the bridge streams it or buffers it unprepared
+/// (a client `grpc-timeout` buffers a pass-through upload, and no body plugin
+/// prepares it). A binary upload's trailer frame is not a message, and a
+/// `grpc-web-text` upload, here as independently padded base64 segments, is
+/// decoded before its frames are counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn h3_grpc_web_passthrough_streamed_uploads_count_decoded_request_messages() {
-    let binary_listener = TcpListener::bind_test("127.0.0.1:0")
-        .await
-        .expect("bind binary pass-through backend");
-    let binary_port = binary_listener.local_addr().expect("backend addr").port();
-    let _binary_backend = spawn_passthrough_grpc_web_backend(
-        binary_listener,
-        "h3-grpc-web-count-binary",
-        "application/grpc-web+proto",
-        &passthrough_grpc_web_body(false, b"grpc-status: 0\r\n"),
-    );
-    let text_listener = TcpListener::bind_test("127.0.0.1:0")
-        .await
-        .expect("bind text pass-through backend");
-    let text_port = text_listener.local_addr().expect("backend addr").port();
-    let _text_backend = spawn_passthrough_grpc_web_backend(
-        text_listener,
-        "h3-grpc-web-count-text",
-        "application/grpc-web-text+proto",
-        &passthrough_grpc_web_body(true, b"grpc-status: 0\r\n"),
-    );
-
-    // No body plugin and no retry, so the bridge streams each upload.
-    let route = |id: &str, port: u16| {
-        json!({
-            "id": id,
-            "listen_path": format!("/{id}"),
+async fn h3_grpc_web_passthrough_uploads_count_decoded_request_messages() {
+    // (proxy id, text encoding, client `grpc-timeout`)
+    let cases = [
+        ("h3-count-binary", false, None),
+        ("h3-count-text", true, None),
+        ("h3-count-buffered-binary", false, Some("5S")),
+        ("h3-count-buffered-text", true, Some("5S")),
+    ];
+    let mut backends = Vec::new();
+    let mut routes = Vec::new();
+    for (proxy_id, text, _) in cases {
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind pass-through backend");
+        let port = listener.local_addr().expect("backend addr").port();
+        let content_type = if text {
+            "application/grpc-web-text+proto"
+        } else {
+            "application/grpc-web+proto"
+        };
+        backends.push(spawn_passthrough_grpc_web_backend(
+            listener,
+            proxy_id,
+            content_type,
+            &passthrough_grpc_web_body(text, b"grpc-status: 0\r\n"),
+        ));
+        // No body plugin and no retry: only a `grpc-timeout` buffers the upload.
+        routes.push(json!({
+            "id": proxy_id,
+            "listen_path": format!("/{proxy_id}"),
             "backend_scheme": "https",
             "backend_host": "127.0.0.1",
             "backend_port": port,
@@ -1907,14 +1912,11 @@ async fn h3_grpc_web_passthrough_streamed_uploads_count_decoded_request_messages
             "backend_write_timeout_ms": 5000,
             "backend_tls_verify_server_cert": false,
             "plugins": [],
-        })
-    };
+        }));
+    }
     let config = json!({
         "version": "1",
-        "proxies": [
-            route("h3-count-binary", binary_port),
-            route("h3-count-text", text_port),
-        ],
+        "proxies": routes,
         "consumers": [],
         "upstreams": [],
         "plugin_configs": [
@@ -1948,36 +1950,40 @@ async fn h3_grpc_web_passthrough_streamed_uploads_count_decoded_request_messages
         BASE64.encode(&binary).into_bytes(),
         "the text upload carries padding inside the body"
     );
-    let uploads = [
-        ("h3-count-binary", "application/grpc-web+proto", binary),
-        ("h3-count-text", "application/grpc-web-text+proto", text),
-    ];
-    for (proxy_id, content_type, upload) in uploads {
+    for (proxy_id, is_text, grpc_timeout) in cases {
+        let (content_type, upload) = if is_text {
+            ("application/grpc-web-text+proto", text.clone())
+        } else {
+            ("application/grpc-web+proto", binary.clone())
+        };
+        let mut options = GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", content_type)
+            .header("x-grpc-web", "1")
+            .body(Bytes::from(upload));
+        if let Some(grpc_timeout) = grpc_timeout {
+            options = options.header("grpc-timeout", grpc_timeout);
+        }
         let response = request_with_retry(
             &client,
             &format!("https://127.0.0.1:{https_port}/{proxy_id}/echo.Echo/ClientStream"),
-            GetOptions::default()
-                .method(Method::POST)
-                .header("content-type", content_type)
-                .header("x-grpc-web", "1")
-                .body(Bytes::from(upload)),
+            options,
         )
         .await;
         assert_eq!(response.status, StatusCode::OK, "{proxy_id}");
     }
 
-    let proxy_ids = ["h3-count-binary", "h3-count-text"];
     let logs = gateway
         .wait_for_log_contains(
             |logs| {
-                proxy_ids
+                cases
                     .iter()
-                    .all(|proxy_id| !logged_request_messages(logs, proxy_id).is_empty())
+                    .all(|(proxy_id, _, _)| !logged_request_messages(logs, proxy_id).is_empty())
             },
             Duration::from_secs(10),
         )
         .await;
-    for proxy_id in proxy_ids {
+    for (proxy_id, _, _) in cases {
         assert_eq!(
             logged_request_messages(&logs, proxy_id),
             vec![json!(3)],
@@ -1985,4 +1991,5 @@ async fn h3_grpc_web_passthrough_streamed_uploads_count_decoded_request_messages
              frame; logs:\n{logs}"
         );
     }
+    drop(backends);
 }

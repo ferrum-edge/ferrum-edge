@@ -1823,14 +1823,7 @@ async fn get_cross_protocol_client<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    #[cfg(test)]
-    let acquired = match pool_client_fault::injected(&dispatch_proxy.id) {
-        Some(error) => Err(error),
-        None => state.connection_pool.get_client(dispatch_proxy).await,
-    };
-    #[cfg(not(test))]
-    let acquired = state.connection_pool.get_client(dispatch_proxy).await;
-    match acquired {
+    match acquire_cross_protocol_pool_client(state, dispatch_proxy).await {
         Ok(c) => Ok(Ok(c)),
         Err(e) => {
             error!(
@@ -1872,46 +1865,15 @@ where
     }
 }
 
-/// Test-only fault injection for the plain bridge's pooled-client acquire
-/// (#5824). It exists only in this crate's own test build, so release builds
-/// carry no check and no configuration can reach it.
-#[cfg(test)]
-mod pool_client_fault {
-    use std::sync::{Mutex, MutexGuard, PoisonError};
-
-    /// Proxy ids whose pooled-client acquire fails. Keyed by proxy so tests
-    /// running in parallel never see another test's fault.
-    static FAILING_PROXY_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-    fn failing_proxy_ids() -> MutexGuard<'static, Vec<String>> {
-        FAILING_PROXY_IDS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Fails every pooled-client acquire for one proxy id until dropped.
-    pub(super) struct Armed(String);
-
-    impl Armed {
-        pub(super) fn new(proxy_id: &str) -> Self {
-            failing_proxy_ids().push(proxy_id.to_string());
-            Self(proxy_id.to_string())
-        }
-    }
-
-    impl Drop for Armed {
-        fn drop(&mut self) {
-            failing_proxy_ids().retain(|id| id != &self.0);
-        }
-    }
-
-    /// The injected acquire error for `proxy_id`, when a test armed one.
-    pub(super) fn injected(proxy_id: &str) -> Option<anyhow::Error> {
-        failing_proxy_ids()
-            .iter()
-            .any(|id| id == proxy_id)
-            .then(|| anyhow::anyhow!("injected pool client failure"))
-    }
+/// The plain bridge's pooled-client acquire. The crate's own test build swaps
+/// in a variant that honors `pool_client_fault` (defined with the test-only
+/// items below).
+#[cfg(not(test))]
+async fn acquire_cross_protocol_pool_client(
+    state: &ProxyState,
+    proxy: &Proxy,
+) -> anyhow::Result<reqwest::Client> {
+    state.connection_pool.get_client(proxy).await
 }
 
 /// Record the observability accounting for an H3→HTTP plain-bridge client-acquire
@@ -12395,6 +12357,61 @@ where
                 false,
             ))
         }
+    }
+}
+
+/// Test build of the plain bridge's pooled-client acquire: an armed
+/// `pool_client_fault` fails it, otherwise it defers to the pool.
+#[cfg(test)]
+async fn acquire_cross_protocol_pool_client(
+    state: &ProxyState,
+    proxy: &Proxy,
+) -> anyhow::Result<reqwest::Client> {
+    if let Some(error) = pool_client_fault::injected(&proxy.id) {
+        return Err(error);
+    }
+    state.connection_pool.get_client(proxy).await
+}
+
+/// Test-only fault injection for the plain bridge's pooled-client acquire
+/// (#5824). It exists only in this crate's own test build, so release builds
+/// carry no check and no configuration can reach it.
+#[cfg(test)]
+mod pool_client_fault {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    /// Proxy ids whose pooled-client acquire fails. Keyed by proxy so tests
+    /// running in parallel never see another test's fault.
+    static FAILING_PROXY_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn failing_proxy_ids() -> MutexGuard<'static, Vec<String>> {
+        FAILING_PROXY_IDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Fails every pooled-client acquire for one proxy id until dropped.
+    pub(super) struct Armed(String);
+
+    impl Armed {
+        pub(super) fn new(proxy_id: &str) -> Self {
+            failing_proxy_ids().push(proxy_id.to_string());
+            Self(proxy_id.to_string())
+        }
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            failing_proxy_ids().retain(|id| id != &self.0);
+        }
+    }
+
+    /// The injected acquire error for `proxy_id`, when a test armed one.
+    pub(super) fn injected(proxy_id: &str) -> Option<anyhow::Error> {
+        failing_proxy_ids()
+            .iter()
+            .any(|id| id == proxy_id)
+            .then(|| anyhow::anyhow!("injected pool client failure"))
     }
 }
 
