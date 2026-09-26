@@ -62,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The in-process SPIFFE Workload API (`FERRUM_MESH_WORKLOAD_API_ENABLED`) now
+  returns `ValidateJWTSVIDResponse.claims` as a `google.protobuf.Struct`, as
+  the upstream SPIFFE `workload.proto` declares it, instead of JSON-encoded
+  `bytes` in a renamed `claims_json` field (#5764). go-spiffe and other
+  clients generated from the upstream proto can now decode the claims. JSON
+  claim values map to `Struct` value kinds (null, bool, string, object,
+  array); numbers are carried as doubles, as SPIRE does. A token whose claims
+  nest deeper than 32 levels is refused with `INVALID_ARGUMENT`, so the
+  response stays within common protobuf decoder recursion limits.
+
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,
   PR #5741). A client that withholds QUIC flow control parks the gateway's
