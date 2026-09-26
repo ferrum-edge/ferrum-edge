@@ -11031,7 +11031,23 @@ struct IngressConnectOutcome {
     /// The tagged line the relayed loopback backend wrote back, when the tunnel
     /// opened. `None` for every refused CONNECT.
     relayed: Option<String>,
+    /// The response body of a refused CONNECT. `None` when the tunnel opened.
+    ///
+    /// A relay-destination refusal and a `mesh_authz` DENY are both `403`
+    /// (issue #5763) and neither carries a reason header, so the body is the
+    /// only on-the-wire evidence of WHICH layer refused the CONNECT.
+    refusal_body: Option<String>,
 }
+
+/// The body every inbound byte-stream relay-destination refusal answers with
+/// (`hbone_relay_destination_denied`, issue #5763) — including a declared
+/// Sidecar `ingress[]` block that does not map the CONNECT's port.
+const HBONE_RELAY_DESTINATION_DENIED_BODY: &str =
+    r#"{"error":"HBONE relay destination not allowed"}"#;
+
+/// The prefix every `mesh_authz` refusal body carries. A relay-destination
+/// refusal never carries it.
+const MESH_AUTHZ_DENIED_BODY_PREFIX: &str = r#"{"error":"Mesh authorization denied"#;
 
 /// mTLS client config presenting the peer SVID and verifying the sidecar's
 /// server SVID against the shared mesh CA. ALPN `h2` — the mesh-mTLS transport.
@@ -11092,6 +11108,28 @@ async fn read_tagged_relay_reply(
     })
     .await
     .map_err(|_| "timed out reading the relayed reply".to_string())?
+}
+
+/// Drain a refused CONNECT's response body, bounded in size and time.
+///
+/// A stream error ends the read with whatever already arrived: the server may
+/// reset the still-open request half (`RST_STREAM(NO_ERROR)`) right after the
+/// complete refusal. Callers assert on the exact body text, so a truncated,
+/// empty, or wedged body still fails loudly.
+async fn read_connect_refusal_body(body: &mut h2::RecvStream, timeout: Duration) -> String {
+    const MAX_REFUSAL_BODY: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = tokio::time::timeout(timeout, async {
+        while let Some(Ok(chunk)) = body.data().await {
+            let _ = body.flow_control().release_capacity(chunk.len());
+            buf.extend_from_slice(&chunk);
+            if buf.len() > MAX_REFUSAL_BODY {
+                break;
+            }
+        }
+    })
+    .await;
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Open a real mesh-mTLS HTTP/2 tunnel to a Sidecar's inbound listener and
@@ -11166,18 +11204,24 @@ async fn sidecar_ingress_connect(
 
     // Only an accepted CONNECT has a tunnel to write into; a refusal must never
     // be probed for relayed bytes (that would mask a fail-open regression).
-    let relayed = if status == 200 {
+    let mut body = response.into_body();
+    let (relayed, refusal_body) = if status == 200 {
         send_body
             .send_data(Bytes::from(payload.to_string()), false)
             .map_err(|e| format!("write relay payload: {e}"))?;
-        let mut body = response.into_body();
-        Some(read_tagged_relay_reply(&mut body, Duration::from_secs(10)).await?)
+        let relayed = read_tagged_relay_reply(&mut body, Duration::from_secs(10)).await?;
+        (Some(relayed), None)
     } else {
-        None
+        let refusal = read_connect_refusal_body(&mut body, Duration::from_secs(5)).await;
+        (None, Some(refusal))
     };
 
     conn_task.abort();
-    Ok(IngressConnectOutcome { status, relayed })
+    Ok(IngressConnectOutcome {
+        status,
+        relayed,
+        refusal_body,
+    })
 }
 
 /// The local `echo` workload plus its Service.
@@ -11559,8 +11603,9 @@ async fn functional_mesh_sidecar_ingress_stream_connect_relays_declared_listener
 ///   LISTENER port rejects the CONNECT (403). Authorizing on the
 ///   `defaultEndpoint` backend port instead would let that DENY fail OPEN.
 /// * Phase 3 — a reload that declares a DIFFERENT listener withdraws the first:
-///   the old port fails closed (neither relayed nor still 403 from phase 2) and
-///   the new one relays to the same endpoint.
+///   the old port fails closed as an undeclared destination (the documented
+///   `403` relay-destination refusal, told apart from phase 2's `mesh_authz`
+///   403 by its body; issue #5763) and the new one relays to the same endpoint.
 #[cfg(unix)]
 #[ignore]
 #[tokio::test]
@@ -11783,6 +11828,14 @@ async fn run_sidecar_ingress_reload_phases(
             denied.relayed
         ));
     }
+    // The 403 must be the listener-port DENY itself (`mesh_authz`), not a
+    // relay-destination refusal, which is also a 403 (issue #5763).
+    let denied_body = denied.refusal_body.as_deref().unwrap_or_default();
+    if !denied_body.starts_with(MESH_AUTHZ_DENIED_BODY_PREFIX) {
+        return Err(format!(
+            "the phase-2 403 must be mesh_authz's listener-port DENY, got body {denied_body:?}"
+        ));
+    }
 
     // ── Phase 3: withdraw that listener, declare a different one ──────────
     std::fs::write(
@@ -11796,14 +11849,23 @@ async fn run_sidecar_ingress_reload_phases(
     )
     .map_err(|e| format!("rewrite mesh document withdrawing the first listener: {e}"))?;
     sighup_mesh_gateway(child)?;
-    // Neither 200 (relayed) nor 403 (phase 2's now-withdrawn DENY): under the
-    // NEW document the withdrawn listener port must fail closed.
+    // Under the NEW document the withdrawn listener port must fail closed as
+    // an undeclared destination: the declared `ingress[]` block no longer maps
+    // it, so relay synthesis refuses it (`ingress_endpoint_mapping_mismatch`)
+    // with the documented `403 hbone_relay_destination_denied` (issue #5763)
+    // before `mesh_authz` runs. Phase 2's now-withdrawn DENY is ALSO a 403, so
+    // the status alone cannot tell the reload landed; the refusal body names
+    // the refusing layer: requiring the relay-destination body excludes both a
+    // relayed 200 and phase 2's stale `mesh_authz` DENY.
     let withdrawn = wait_for_ingress_connect(
         inbound_port,
         &first_authority,
         peers,
         reload_deadline,
-        |outcome| outcome.status != 200 && outcome.status != 403,
+        |outcome| {
+            outcome.status == 403
+                && outcome.refusal_body.as_deref() == Some(HBONE_RELAY_DESTINATION_DENIED_BODY)
+        },
     )
     .await
     .map_err(|e| format!("the withdrawn ingress listener never failed closed: {e}"))?;
@@ -11862,8 +11924,8 @@ async fn wait_for_ingress_connect(
         let last = match sidecar_ingress_connect(inbound_port, authority, peers, "ping").await {
             Ok(outcome) if accept(&outcome) => return Ok(outcome),
             Ok(outcome) => format!(
-                "last CONNECT to {authority}: status {} relayed {:?}",
-                outcome.status, outcome.relayed
+                "last CONNECT to {authority}: status {} relayed {:?} refusal body {:?}",
+                outcome.status, outcome.relayed, outcome.refusal_body
             ),
             Err(e) => format!("last CONNECT to {authority} failed: {e}"),
         };
@@ -12095,6 +12157,31 @@ async fn drive_one_waypoint_byte_connect(
     client_svid: &GeneratedGatewaySvid,
     payload: &[u8],
 ) -> Result<(u16, Option<Vec<u8>>), String> {
+    observe_waypoint_byte_connect(hbone_ip, hbone_port, authority, client_svid, payload)
+        .await
+        .map(|outcome| (outcome.status, outcome.echoed))
+}
+
+/// One byte-stream HBONE CONNECT observation.
+struct WaypointByteConnect {
+    status: u16,
+    /// Bytes echoed back through an accepted tunnel. `None` when refused.
+    echoed: Option<Vec<u8>>,
+    /// Response body of a refused CONNECT. `None` when accepted. A
+    /// relay-destination refusal and a `mesh_authz` DENY are both `403`
+    /// (issue #5763), so this is what tells them apart on the wire.
+    refusal_body: Option<String>,
+}
+
+/// [`drive_one_waypoint_byte_connect`], also keeping a refused CONNECT's
+/// response body.
+async fn observe_waypoint_byte_connect(
+    hbone_ip: Ipv4Addr,
+    hbone_port: u16,
+    authority: &str,
+    client_svid: &GeneratedGatewaySvid,
+    payload: &[u8],
+) -> Result<WaypointByteConnect, String> {
     let tcp = tokio::net::TcpStream::connect((hbone_ip, hbone_port))
         .await
         .map_err(|e| format!("connect waypoint: {e}"))?;
@@ -12130,19 +12217,23 @@ async fn drive_one_waypoint_byte_connect(
         .map_err(|e| format!("CONNECT response: {e}"))?;
     let status = resp.status().as_u16();
 
-    let echoed = if status == 200 {
-        let mut response_body = resp.into_body();
-        Some(
-            read_relayed_bytes(&mut response_body, payload.len(), Duration::from_secs(5))
-                .await
-                .map_err(|e| format!("read relayed bytes: {e}"))?,
-        )
+    let mut response_body = resp.into_body();
+    let (echoed, refusal_body) = if status == 200 {
+        let echoed = read_relayed_bytes(&mut response_body, payload.len(), Duration::from_secs(5))
+            .await
+            .map_err(|e| format!("read relayed bytes: {e}"))?;
+        (Some(echoed), None)
     } else {
-        None
+        let refusal = read_connect_refusal_body(&mut response_body, Duration::from_secs(5)).await;
+        (None, Some(refusal))
     };
 
     conn_task.abort();
-    Ok((status, echoed))
+    Ok(WaypointByteConnect {
+        status,
+        echoed,
+        refusal_body,
+    })
 }
 
 /// The outcome of probing BOTH destinations behind one waypoint under one
@@ -12151,6 +12242,7 @@ async fn drive_one_waypoint_byte_connect(
 struct WaypointDestinationOutcome {
     status: u16,
     echoed: Option<Vec<u8>>,
+    refusal_body: Option<String>,
     backend_connections: usize,
 }
 
@@ -12237,7 +12329,7 @@ async fn drive_waypoint_target_refs(
             continue;
         }
 
-        let reviews = drive_one_waypoint_byte_connect(
+        let reviews = observe_waypoint_byte_connect(
             Ipv4Addr::LOCALHOST,
             hbone_port,
             &format!("{workload_address}:{reviews_port}"),
@@ -12245,7 +12337,7 @@ async fn drive_waypoint_target_refs(
             b"reviews-payload",
         )
         .await;
-        let ratings = drive_one_waypoint_byte_connect(
+        let ratings = observe_waypoint_byte_connect(
             Ipv4Addr::LOCALHOST,
             hbone_port,
             &format!("{workload_address}:{ratings_port}"),
@@ -12272,20 +12364,20 @@ async fn drive_waypoint_target_refs(
         }
 
         return match (reviews, ratings) {
-            (Ok((reviews_status, reviews_echoed)), Ok((ratings_status, ratings_echoed))) => {
-                Ok(WaypointTargetRefsOutcome {
-                    reviews: WaypointDestinationOutcome {
-                        status: reviews_status,
-                        echoed: reviews_echoed,
-                        backend_connections: reviews_hits.load(Ordering::SeqCst),
-                    },
-                    ratings: WaypointDestinationOutcome {
-                        status: ratings_status,
-                        echoed: ratings_echoed,
-                        backend_connections: ratings_hits.load(Ordering::SeqCst),
-                    },
-                })
-            }
+            (Ok(reviews), Ok(ratings)) => Ok(WaypointTargetRefsOutcome {
+                reviews: WaypointDestinationOutcome {
+                    status: reviews.status,
+                    echoed: reviews.echoed,
+                    refusal_body: reviews.refusal_body,
+                    backend_connections: reviews_hits.load(Ordering::SeqCst),
+                },
+                ratings: WaypointDestinationOutcome {
+                    status: ratings.status,
+                    echoed: ratings.echoed,
+                    refusal_body: ratings.refusal_body,
+                    backend_connections: ratings_hits.load(Ordering::SeqCst),
+                },
+            }),
             (Err(e), _) | (_, Err(e)) => Err(format!(
                 "waypoint CONNECT failed against a healthy gateway: {e}\n--- waypoint ---\n{logs}"
             )),
@@ -12314,6 +12406,13 @@ fn assert_denied(outcome: &WaypointDestinationOutcome, what: &str) {
     assert_eq!(
         outcome.status, 403,
         "{what} must be denied by mesh_authz (403)"
+    );
+    // A relay-destination refusal is also a 403 (issue #5763); only the body
+    // proves the targetRefs DENY itself refused the CONNECT.
+    let body = outcome.refusal_body.as_deref().unwrap_or_default();
+    assert!(
+        body.starts_with(MESH_AUTHZ_DENIED_BODY_PREFIX),
+        "{what} must be refused by mesh_authz, not another 403 layer; body {body:?}"
     );
     assert_eq!(
         outcome.backend_connections, 0,
