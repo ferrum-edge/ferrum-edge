@@ -430,11 +430,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or request-body buffering) read only DATA and dropped the trailer section, as
   did every buffered collection (`response_body_mode: buffer`, body-buffering
   plugins, and the small-response eager buffer) on the reqwest, direct-HTTP/2,
-  and sidecar-mTLS paths. The same configuration could therefore relay
-  trailers on one run and drop them on the next. These paths now read real
-  frames and forward the trailer section after hop-by-hop stripping and the
-  same response-header policy reconciliation the direct-HTTP/2 streaming relay
-  applies. HTTP/1.1 clients still receive no trailer section.
+  sidecar-mTLS, HBONE, and Unix-socket paths. The same configuration could
+  therefore relay trailers on one run and drop them on the next. These paths
+  now read real frames and forward the trailer section after hop-by-hop
+  stripping and the same response-header policy reconciliation the
+  direct-HTTP/2 streaming relay applies; a section left empty by that ends the
+  body without an empty trailer frame. HTTP/1.1 clients still receive no
+  trailer section, and a reqwest response whose backend framing cannot carry
+  one (HTTP/1.x `Content-Length` or close-delimited) skips the trailer policy
+  capture entirely.
 
 ### Security
 

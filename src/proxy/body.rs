@@ -4597,7 +4597,8 @@ impl http_body::Body for DirectH2Body {
 /// so deferred backend/admission accounting records a read timeout (and, being
 /// post-wire, NOT a connection error) rather than an indefinite in-flight
 /// stream — matching the buffered H2 body collection
-/// (`collect_hyper_body_with_limit`) and the native-H3 streaming read timeout.
+/// (`collect_hyper_body_and_trailers_with_limit`) and the native-H3 streaming
+/// read timeout.
 ///
 /// The deadline is (re)armed only on the transition from "have a frame" to
 /// "waiting on the backend" — NOT on every received frame. A slow downstream
@@ -5234,29 +5235,49 @@ impl<S: H3RecvStream + Unpin> http_body::Body for DirectH3Body<S> {
 /// and this decides what happens to the trailer frame.
 pub(crate) struct ReqwestResponseTrailers {
     relay: bool,
+    /// Keep a trailer frame that stripping and governance emptied. Only a
+    /// gRPC terminal section needs it: a translated gRPC-Web adapter reads an
+    /// empty trailer frame differently from a clean EOF.
+    keep_empty_section: bool,
     /// Response-header policy boundary, applied after hop-by-hop stripping.
     /// `None` when the chain has nothing that could govern a trailer.
     governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 }
 
 impl ReqwestResponseTrailers {
-    /// The client cannot receive a trailer section on this response, so no
-    /// response-policy evidence was captured for one. Drop it at the source
-    /// rather than forward an ungoverned section.
+    /// The client cannot receive a trailer section on this response, or the
+    /// backend response cannot carry one, so no response-policy evidence was
+    /// captured for it. Drop it at the source rather than forward an
+    /// ungoverned section.
     pub(crate) fn drop_all() -> Self {
         Self {
             relay: false,
+            keep_empty_section: false,
             governor: None,
         }
     }
 
-    /// Forward the trailer section after hop-by-hop stripping and, when
-    /// present, the response-header policy boundary.
+    /// Forward a plain-HTTP trailer section after hop-by-hop stripping and,
+    /// when present, the response-header policy boundary. A section left
+    /// empty by those ends the body on its last DATA frame instead.
     pub(crate) fn relay(
         governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
     ) -> Self {
         Self {
             relay: true,
+            keep_empty_section: false,
+            governor,
+        }
+    }
+
+    /// Forward a gRPC terminal section like [`Self::relay`], keeping the
+    /// trailer frame even when nothing in it survives.
+    pub(crate) fn relay_grpc_terminal(
+        governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    ) -> Self {
+        Self {
+            relay: true,
+            keep_empty_section: true,
             governor,
         }
     }
@@ -5267,6 +5288,20 @@ impl ReqwestResponseTrailers {
 struct ReqwestResponseFrames {
     body: StripHopByHopTrailers<reqwest::Body>,
     relay_trailers: bool,
+    keep_empty_section: bool,
+}
+
+impl ReqwestResponseFrames {
+    /// Whether a frame read from the backend is withheld from the client: a
+    /// trailer section the client cannot receive, or one left empty.
+    fn withholds(&self, frame: &Frame<Bytes>) -> bool {
+        match frame.trailers_ref() {
+            Some(section) => {
+                !self.relay_trailers || (section.is_empty() && !self.keep_empty_section)
+            }
+            None => false,
+        }
+    }
 }
 
 impl futures_util::Stream for ReqwestResponseFrames {
@@ -5276,7 +5311,7 @@ impl futures_util::Stream for ReqwestResponseFrames {
         let this = self.get_mut();
         loop {
             match http_body::Body::poll_frame(Pin::new(&mut this.body), cx) {
-                Poll::Ready(Some(Ok(frame))) if frame.is_trailers() && !this.relay_trailers => {}
+                Poll::Ready(Some(Ok(frame))) if this.withholds(&frame) => {}
                 Poll::Ready(Some(Ok(frame))) => return Poll::Ready(Some(Ok(frame))),
                 Poll::Ready(Some(Err(err))) => {
                     return Poll::Ready(Some(Err(Box::new(err) as BoxError)));
@@ -5297,6 +5332,7 @@ fn reqwest_response_frames(
     ReqwestResponseFrames {
         body: StripHopByHopTrailers::with_trailer_governor(body, trailers.governor),
         relay_trailers: trailers.relay,
+        keep_empty_section: trailers.keep_empty_section,
     }
 }
 

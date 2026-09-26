@@ -39566,15 +39566,19 @@ async fn handle_proxy_request_inner(
     // response-header sanitizer strips that field. Only HTTP/2+ clients (and a
     // translated gRPC-Web stream, whose terminal metadata the adapter re-encodes
     // as DATA) can receive backend trailers from this handler.
-    let inbound_carries_response_trailers =
-        matches!(inbound_version, hyper::Version::HTTP_2 | hyper::Version::HTTP_3);
+    let inbound_carries_response_trailers = matches!(
+        inbound_version,
+        hyper::Version::HTTP_2 | hyper::Version::HTTP_3
+    );
     // Backend trailer section collected alongside a buffered body (issue #5760).
     // Native gRPC and translated gRPC-Web own their buffered terminal metadata
     // elsewhere. Cleared below whenever a gateway-authored body replaces the
     // backend's, so a gateway response never carries backend trailers.
-    let buffered_trailers_relayable = inbound_carries_response_trailers
-        && !request_uses_grpc_content_type
-        && !grpc_request_is_web_translated;
+    let buffered_trailers_relayable = buffered_backend_trailers_relayable(
+        inbound_carries_response_trailers,
+        request_uses_grpc_content_type,
+        grpc_request_is_web_translated,
+    );
     let mut buffered_response_trailers = backend_resp
         .buffered_trailers
         .take()
@@ -39774,10 +39778,18 @@ async fn handle_proxy_request_inner(
 
     // The reqwest relay reads real frames (issue #5760), so its trailer section
     // crosses the same boundary as the direct-H2 relay's whenever the client
-    // can receive it. Otherwise the relay drops it at the source and captures
-    // no evidence. Same structural gRPC test as the two terms above.
-    let reqwest_trailers_relayed = matches!(&response_body, ResponseBody::Streaming { .. })
-        && (inbound_carries_response_trailers || grpc_request_is_web_translated);
+    // can receive it AND the backend response can carry one. Otherwise the
+    // relay drops it at the source and captures no evidence, so a
+    // Content-Length HTTP/1.x backend response never pays the pre-policy
+    // snapshot or the final-header clone. Same structural gRPC test as the two
+    // terms above.
+    let reqwest_trailers_relayed = match &response_body {
+        ResponseBody::Streaming { response, .. } => {
+            (inbound_carries_response_trailers || grpc_request_is_web_translated)
+                && reqwest_response_can_carry_trailers(response)
+        }
+        _ => false,
+    };
     let streaming_reqwest_native_grpc =
         request_uses_grpc_content_type && matches!(&response_body, ResponseBody::Streaming { .. });
 
@@ -39821,8 +39833,10 @@ async fn handle_proxy_request_inner(
     // reqwest collection, issue #5760) crosses the same boundary: the builder
     // reconciles that section through the same governor before the buffered
     // body emits it.
-    let hyper_or_h3_streaming_relay =
-        matches!(&response_body, ResponseBody::StreamingH2(_) | ResponseBody::StreamingH3(_));
+    let hyper_or_h3_streaming_relay = matches!(
+        &response_body,
+        ResponseBody::StreamingH2(_) | ResponseBody::StreamingH3(_)
+    );
     let streaming_trailer_policy = if hyper_or_h3_streaming_relay
         || reqwest_trailers_relayed
         || buffered_response_trailers.is_some()
@@ -41111,12 +41125,18 @@ async fn handle_proxy_request_inner(
             // The reqwest relay reads real frames, so the backend's trailer
             // section survives it exactly as on the direct-H2 relay (issue
             // #5760). The governor moves into whichever body reads the frames.
-            let reqwest_trailers = if reqwest_trailers_relayed {
-                crate::proxy::body::ReqwestResponseTrailers::relay(
+            // A gRPC terminal section keeps its trailer frame even when empty;
+            // a plain section left empty ends the body on its last DATA frame.
+            let reqwest_trailers = if !reqwest_trailers_relayed {
+                crate::proxy::body::ReqwestResponseTrailers::drop_all()
+            } else if streaming_reqwest_native_grpc || grpc_request_is_web_translated {
+                crate::proxy::body::ReqwestResponseTrailers::relay_grpc_terminal(
                     streaming_trailer_governor.take(),
                 )
             } else {
-                crate::proxy::body::ReqwestResponseTrailers::drop_all()
+                crate::proxy::body::ReqwestResponseTrailers::relay(
+                    streaming_trailer_governor.take(),
+                )
             };
             if let Some(inspector) = response_inspector {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -41654,23 +41674,12 @@ async fn handle_proxy_request_inner(
             let backend_trailers = buffered_response_trailers
                 .take()
                 .filter(|_| trailers_allowed);
-            match backend_trailers {
-                Some(mut trailers) => {
-                    headers_mod::strip_response_hop_by_hop_trailers(&mut trailers);
-                    if let Some(governor) = streaming_trailer_governor.take() {
-                        let removed = governor.reconcile(&mut trailers);
-                        if removed > 0 {
-                            debug!(
-                                proxy_id = %proxy.id,
-                                removed,
-                                "buffered response: dropped governed backend trailer fields"
-                            );
-                        }
-                    }
-                    ProxyBody::buffered_with_trailers(data, *trailers)
-                }
-                None => ProxyBody::full(data),
-            }
+            buffered_response_body(
+                data,
+                backend_trailers,
+                streaming_trailer_governor.take(),
+                &proxy.id,
+            )
         }
     };
     // Attach native gRPC message scanning before the optional gRPC-Web adapter.
@@ -47665,6 +47674,116 @@ fn reqwest_body_frames(response: reqwest::Response) -> http_body_util::BodyStrea
     http_body_util::BodyStream::new(body)
 }
 
+/// Whether a reqwest backend response can end with a trailer section: an
+/// HTTP/2+ response, or an HTTP/1.1 response framed with chunked
+/// transfer-coding. Read from the reqwest response's own header map, which
+/// still holds the `transfer-encoding` field the gateway strips from the
+/// client-facing copy. Any other HTTP/1.x framing (Content-Length or
+/// close-delimited) has no place for a trailer section (issue #5760).
+fn reqwest_response_can_carry_trailers(response: &reqwest::Response) -> bool {
+    match response.version() {
+        http::Version::HTTP_2 | http::Version::HTTP_3 => true,
+        http::Version::HTTP_11 => response
+            .headers()
+            .get_all(http::header::TRANSFER_ENCODING)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|coding| coding.trim().eq_ignore_ascii_case("chunked")),
+        _ => false,
+    }
+}
+
+/// Test seam (issue #5760): whether the reqwest relay would treat `response`
+/// as able to carry a trailer section, and therefore capture response-policy
+/// evidence for it. Reached only through `crate::_test_support`.
+#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
+pub(crate) fn reqwest_response_can_carry_trailers_for_test(response: &reqwest::Response) -> bool {
+    reqwest_response_can_carry_trailers(response)
+}
+
+/// Whether a backend trailer section collected with a buffered body may be
+/// relayed at all (issue #5760): the client must be able to receive one, and
+/// the request must not be gRPC-flavored. Native gRPC and translated gRPC-Web
+/// own their buffered terminal metadata elsewhere (folded into the response
+/// headers or re-encoded as a body frame), so the plain-HTTP section is
+/// dropped for them.
+fn buffered_backend_trailers_relayable(
+    inbound_carries_response_trailers: bool,
+    request_uses_grpc_content_type: bool,
+    grpc_request_is_web_translated: bool,
+) -> bool {
+    inbound_carries_response_trailers
+        && !request_uses_grpc_content_type
+        && !grpc_request_is_web_translated
+}
+
+/// Body for a buffered backend response (issue #5760). A relayable backend
+/// trailer section rides after the DATA once hop-by-hop names are stripped
+/// and the response-header policy boundary has run. When those leave nothing
+/// to send, the body ends on its DATA instead of an empty trailer frame.
+fn buffered_response_body(
+    data: Bytes,
+    trailers: Option<Box<http::HeaderMap>>,
+    governor: Option<headers_mod::StreamingResponseTrailerGovernor>,
+    proxy_id: &str,
+) -> ProxyBody {
+    let Some(mut trailers) = trailers else {
+        return ProxyBody::full(data);
+    };
+    headers_mod::strip_response_hop_by_hop_trailers(&mut trailers);
+    if let Some(governor) = governor {
+        let removed = governor.reconcile(&mut trailers);
+        if removed > 0 {
+            debug!(
+                proxy_id = %proxy_id,
+                removed,
+                "buffered response: dropped governed backend trailer fields"
+            );
+        }
+    }
+    if trailers.is_empty() {
+        return ProxyBody::full(data);
+    }
+    ProxyBody::buffered_with_trailers(data, *trailers)
+}
+
+/// Test seam (issue #5760) over the handler's buffered-trailer decisions:
+/// whether the request may relay a buffered backend trailer section, whether
+/// the final response still carries the backend's body (`gateway_selected`
+/// names a late gateway terminal: `"deadline"`, `"capacity"`, or
+/// `"representation"`), and the body the builder then emits. Reached only
+/// through `crate::_test_support`.
+#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn buffered_response_body_for_test(
+    inbound_carries_response_trailers: bool,
+    request_uses_grpc_content_type: bool,
+    grpc_request_is_web_translated: bool,
+    gateway_selected: Option<&str>,
+    is_head: bool,
+    status: u16,
+    data: Bytes,
+    trailers: http::HeaderMap,
+    governor: Option<headers_mod::StreamingResponseTrailerGovernor>,
+) -> ProxyBody {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    match gateway_selected {
+        Some("deadline") => ctx.mark_gateway_deadline_response_selected(),
+        Some("capacity") => ctx.mark_gateway_capacity_response_selected(),
+        Some("representation") => ctx.mark_gateway_representation_response_selected(),
+        _ => {}
+    }
+    let relayable = buffered_backend_trailers_relayable(
+        inbound_carries_response_trailers,
+        request_uses_grpc_content_type,
+        grpc_request_is_web_translated,
+    );
+    let allowed = buffered_response_carries_backend_trailers(&ctx, is_head, status);
+    let trailers = Some(Box::new(trailers)).filter(|_| relayable && allowed);
+    buffered_response_body(data, trailers, governor, "test")
+}
+
 /// Whether a buffered response may carry the backend's trailer section: it
 /// must have content, and its body must still be the backend's rather than a
 /// terminal the gateway selected in a late phase.
@@ -49291,22 +49410,12 @@ enum HyperBodyCollectError {
     },
 }
 
-async fn collect_hyper_body_with_limit(
-    body: Incoming,
-    max_size: usize,
-    backend_read_timeout_ms: u64,
-) -> Result<Bytes, HyperBodyCollectError> {
-    collect_hyper_body_and_trailers_with_limit(body, max_size, backend_read_timeout_ms)
-        .await
-        .map(|(body_bytes, _trailers)| body_bytes)
-}
-
-/// Collect a hyper H2 response body up to `max_size`, also capturing the
-/// terminal TRAILERS frame when present. Data-frame limits and read-timeout
-/// behavior are identical to [`collect_hyper_body_with_limit`] (which
-/// delegates here). The mesh-mTLS buffered arm needs the trailers to preserve
-/// gRPC terminal metadata for gRPC-Web translation (codex r1-4); callers that
-/// don't can use the body-only wrapper.
+/// Collect a hyper response body up to `max_size`, also capturing the
+/// terminal trailer section when present (an HTTP/2 TRAILERS frame, or the
+/// trailer fields of an HTTP/1.1 chunked body). The mesh-mTLS buffered arm
+/// needs the trailers to preserve gRPC terminal metadata for gRPC-Web
+/// translation (codex r1-4); every buffered arm also hands them to the
+/// response builder, which relays them after the buffered DATA (issue #5760).
 async fn collect_hyper_body_and_trailers_with_limit(
     mut body: Incoming,
     max_size: usize,
@@ -52572,7 +52681,7 @@ async fn proxy_to_backend_hbone_after_ready(
         let collected = match collect_response_under_authorization(
             ctx.and_then(RequestContext::grpc_deadline_at),
             send_auth_deadline.as_ref(),
-            collect_hyper_body_with_limit(
+            collect_hyper_body_and_trailers_with_limit(
                 response.into_body(),
                 effective_max_response_body_size_bytes,
                 proxy.backend_read_timeout_ms,
@@ -52602,8 +52711,8 @@ async fn proxy_to_backend_hbone_after_ready(
                 );
             }
         };
-        let body_bytes = match collected {
-            Ok(body_bytes) => body_bytes,
+        let (body_bytes, trailers) = match collected {
+            Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
                 return (
                     hbone_response_body_too_large_response(
@@ -52671,7 +52780,11 @@ async fn proxy_to_backend_hbone_after_ready(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
-                buffered_trailers: None,
+                // The inner HTTP/1.1 exchange's chunked trailer section, for
+                // the response builder to govern and relay (issue #5760).
+                buffered_trailers: trailers
+                    .filter(|trailers| !trailers.is_empty())
+                    .map(Box::new),
             },
             None,
             None,
@@ -53550,7 +53663,7 @@ async fn proxy_to_backend_unix(
         let collected = match collect_response_under_authorization(
             ctx.and_then(RequestContext::grpc_deadline_at),
             send_auth_deadline.as_ref(),
-            collect_hyper_body_with_limit(
+            collect_hyper_body_and_trailers_with_limit(
                 response.into_body(),
                 effective_max_response_body_size_bytes,
                 proxy.backend_read_timeout_ms,
@@ -53580,8 +53693,8 @@ async fn proxy_to_backend_unix(
                 );
             }
         };
-        let body_bytes = match collected {
-            Ok(body_bytes) => body_bytes,
+        let (body_bytes, trailers) = match collected {
+            Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
                 return (
                     unix_response_body_too_large_response(
@@ -53650,7 +53763,11 @@ async fn proxy_to_backend_unix(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
-                buffered_trailers: None,
+                // The inner HTTP/1.1 exchange's chunked trailer section, for
+                // the response builder to govern and relay (issue #5760).
+                buffered_trailers: trailers
+                    .filter(|trailers| !trailers.is_empty())
+                    .map(Box::new),
             },
             None,
             None,

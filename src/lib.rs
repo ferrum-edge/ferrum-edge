@@ -7306,6 +7306,21 @@ pub mod _test_support {
         (collected.to_bytes().to_vec(), trailers)
     }
 
+    /// Whether the reqwest relay treats a backend response with `version` and
+    /// `headers` as able to carry a trailer section (issue #5760). When it
+    /// cannot, the handler captures no response-policy evidence and builds no
+    /// trailer governor for it.
+    pub fn reqwest_response_can_carry_trailers_for_test(
+        version: http::Version,
+        headers: &[(&str, &str)],
+    ) -> bool {
+        let mut response = http::Response::new(reqwest::Body::from(Vec::<u8>::new()));
+        *response.version_mut() = version;
+        *response.headers_mut() = backend_trailer_map_for_test(headers);
+        let response = reqwest::Response::from(response);
+        crate::proxy::reqwest_response_can_carry_trailers_for_test(&response)
+    }
+
     /// Collect a reqwest backend response through the production buffered
     /// collector (`eager = false`, used by `response_body_mode: buffer`) or
     /// the eager small-body collector (`eager = true`) and report the
@@ -7321,6 +7336,55 @@ pub mod _test_support {
         let (body, trailers) = collect(response, eager).await.expect("collect");
         let trailers = trailers.as_ref().map(surviving_trailer_lines_for_test);
         (body.to_vec(), trailers)
+    }
+
+    /// Frames of the body the H1/H2 handler builds for a buffered backend
+    /// response that arrived with a trailer section (issue #5760), through the
+    /// handler's own relay decisions: the client can receive trailers
+    /// (`client_http2`), the request is native gRPC (`grpc`) or translated
+    /// gRPC-Web (`grpc_web`), a late gateway terminal replaced the body
+    /// (`gateway_selected`: `"deadline"`, `"capacity"`, `"representation"`),
+    /// and the response is `HEAD` or has a status that forbids content. A
+    /// non-empty `policy_names` installs the response-trailer governor the
+    /// handler builds for a chain declaring those names.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handler_buffered_body_frames_for_test(
+        client_http2: bool,
+        grpc: bool,
+        grpc_web: bool,
+        gateway_selected: Option<&str>,
+        is_head: bool,
+        status: u16,
+        trailers: &[(&str, &str)],
+        policy_names: &[String],
+    ) -> (Vec<u8>, Option<Vec<(String, String)>>) {
+        use http_body_util::BodyExt;
+
+        let governor = (!policy_names.is_empty()).then(|| {
+            crate::proxy::headers::StreamingResponseTrailerGovernor::new(
+                HashMap::new(),
+                crate::proxy::headers::PrePolicyResponseHeaders::NoHeaderPolicyPhase,
+                std::sync::Arc::new(policy_names.to_vec()),
+                std::sync::Arc::new(Vec::new()),
+                crate::proxy::headers::GatewayOwnedResponseHeaders::default(),
+                crate::proxy::headers::TrailerSectionKind::PlainResponse,
+                false,
+            )
+        });
+        let body = crate::proxy::buffered_response_body_for_test(
+            client_http2,
+            grpc,
+            grpc_web,
+            gateway_selected,
+            is_head,
+            status,
+            bytes::Bytes::from_static(b"buffered body"),
+            backend_trailer_map_for_test(trailers),
+            governor,
+        );
+        let collected = body.collect().await.expect("buffered body");
+        let trailers = collected.trailers().map(surviving_trailer_lines_for_test);
+        (collected.to_bytes().to_vec(), trailers)
     }
 
     /// Frames of the buffered body the response builder emits for a buffered
