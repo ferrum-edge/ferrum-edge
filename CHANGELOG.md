@@ -586,6 +586,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before it releases a held response, instead of treating the closed port as
   proof, which removes a race that made it flaky (#5821). The `cp` mode has no
   proxy and does not enter the proxy drain phase.
+- Streamed pass-through gRPC-Web uploads now count request messages on their
+  decoded frames, as the buffered arms do. A `grpc-web-text` upload is decoded
+  from base64 across chunk boundaries, including concatenated padded segments,
+  instead of reporting 0 messages. A binary upload's trailer frame is no longer
+  counted as a message. This covers the native gRPC dispatch, the reqwest,
+   direct-H2, HBONE, Unix and mesh-mTLS upload adapters, and the native HTTP/3
+   backend upload paths (#5807).
 
 ### Security
 

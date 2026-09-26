@@ -3936,7 +3936,7 @@ fn test_direct_h2_dispatch_uses_passthrough_body_when_unlimited() {
         "the completion-gate arm must remain the first dispatch choice"
     );
     assert!(
-        dispatch.contains("else if let (true, Some(messages)) = (use_limit_adapter, observe_grpc)"),
+        dispatch.contains("else if let (true, Some(tap)) = (use_limit_adapter, observe_grpc)"),
         "gRPC observation without a gate must still take SizeLimitedIncoming"
     );
     let limited_ctors: Vec<&str> = dispatch.split("SizeLimitedIncoming::").skip(1).collect();

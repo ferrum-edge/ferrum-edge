@@ -2964,6 +2964,19 @@ impl SizeLimitedIncoming {
         self
     }
 
+    /// [`Self::with_grpc_message_counter`] reading the tap's own framing, so a
+    /// pass-through gRPC-Web upload counts its decoded message frames only.
+    #[must_use]
+    pub fn with_grpc_message_tap(
+        mut self,
+        tap: crate::plugins::mesh::prometheus_helpers::GrpcMessageTap,
+    ) -> Self {
+        let (messages, scanner) = tap.into_parts();
+        self.grpc_messages = Some(messages);
+        self.grpc_scanner = Some(scanner);
+        self
+    }
+
     /// Clone the internal byte counter so the caller can observe `bytes_seen`
     /// after `into_reqwest_body()` has moved ownership into reqwest.
     /// Prefer [`new_with_counter`](Self::new_with_counter) when the counter
@@ -3463,6 +3476,19 @@ impl CountingIncoming {
         self.grpc_messages = Some(messages);
         self.grpc_scanner =
             Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default());
+        self
+    }
+
+    /// [`Self::with_grpc_message_counter`] reading the tap's own framing, so a
+    /// pass-through gRPC-Web upload counts its decoded message frames only.
+    #[must_use]
+    pub fn with_grpc_message_tap(
+        mut self,
+        tap: crate::plugins::mesh::prometheus_helpers::GrpcMessageTap,
+    ) -> Self {
+        let (messages, scanner) = tap.into_parts();
+        self.grpc_messages = Some(messages);
+        self.grpc_scanner = Some(scanner);
         self
     }
 
