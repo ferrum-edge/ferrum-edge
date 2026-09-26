@@ -52,8 +52,8 @@ const UNSUPPORTED_SHAPE_MARKER: &str = "is not implemented by Ferrum";
 const INCOMPATIBLE_FILTERS_MARKER: &str = "incompatible Gateway API filters";
 
 fn translate_route_error(rules: Value) -> String {
-    let error = translate_k8s_objects(&[route(rules)], options())
-        .expect_err("route should be refused");
+    let error =
+        translate_k8s_objects(&[route(rules)], options()).expect_err("route should be refused");
     format!("{error}")
 }
 
