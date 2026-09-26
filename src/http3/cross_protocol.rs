@@ -5416,6 +5416,15 @@ where
             },
             backend_admission_elapsed,
         );
+        // The HTTP/1.1 / HTTP/2 builder's token for the same refusal: not a
+        // connection error, so the `502` reads `backend_error`.
+        let mut headers = HashMap::new();
+        crate::proxy::apply_authoritative_gateway_error_header_for_response(
+            &mut headers,
+            ctx,
+            false,
+            StatusCode::BAD_GATEWAY.as_u16(),
+        );
         // `after_proxy` has not run over this head: a gRPC-Web terminal is
         // decorated as a gateway error terminal (#5747).
         let mut outcome = write_plain_gateway_error_terminal(
@@ -5424,7 +5433,7 @@ where
             ctx,
             StatusCode::BAD_GATEWAY,
             Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
-            HashMap::new(),
+            headers,
             backend_start,
             bytes_sent,
         )

@@ -342,6 +342,11 @@ classifies the response:
 - An HTTP/3 bridge attempt whose reqwest connection-pool client could not be
   built answers its `502` with `connection_failure`, exactly as the HTTP/1.1
   and HTTP/2 builder does for the same shared pool-failure response.
+- A backend response whose declared `Content-Length` exceeds the effective
+  response ceiling is refused with a `502` carrying `backend_error` (the
+  refusal is not a connection error) on every protocol: the HTTP/1.1 and
+  HTTP/2 builder, the three native HTTP/3 streaming relays, and the HTTP/3
+  bridge. A body found too large while it is collected carries the same token.
 
 The headers are not authenticated, though: a client should trust them only on
 a response it received from a gateway it authenticated.

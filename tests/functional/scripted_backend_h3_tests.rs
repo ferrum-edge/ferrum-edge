@@ -6086,3 +6086,394 @@ async fn h3_backend_5xx_carries_the_gateway_backend_error_token_for_stream_and_b
         }
     }
 }
+
+/// Every `X-Gateway-Error` value on an HTTP/3 response, in wire order.
+fn h3_gateway_error_tokens(response: &crate::scaffolding::clients::Http3Response) -> Vec<String> {
+    response
+        .headers
+        .get_all("x-gateway-error")
+        .iter()
+        .map(|value| value.to_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// A single `waf` instance whose one enforcing custom rule scans `target`
+/// (`request_body` or `response_body`), so the proxy's request or response
+/// body is buffered for inspection.
+fn h3_body_waf_plugin_config(target: &str) -> Value {
+    let mut config = json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "H3-OVERSIZE-MARKER",
+            "name": "body marker",
+            "category": "custom",
+            "severity": "high",
+            "target": target,
+            "match_kind": "contains",
+            "pattern": "h3-oversize-marker",
+            "action": "enforce"
+        }]
+    });
+    if target == "response_body" {
+        config["response_inspection"] = json!(true);
+        config["response_body_inspection"] = json!(true);
+    }
+    json!({
+        "id": "h3-oversize-waf",
+        "plugin_name": "waf",
+        "scope": "proxy",
+        "proxy_id": "scripted-h3",
+        "enabled": true,
+        "config": config
+    })
+}
+
+/// A backend response whose declared `Content-Length` exceeds the response
+/// ceiling is refused with a `502` that carries the gateway's own
+/// `X-Gateway-Error: backend_error`, as the HTTP/1.1 / HTTP/2 builder writes
+/// it (#5804). Covers the three native HTTP/3 streaming relays (the inline
+/// streaming-request relay, the refined relay, and the buffered-request relay)
+/// and the HTTP/3 bridge to HTTP/1.1 and HTTP/2 in both body modes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_declared_oversize_response_carries_backend_error_on_every_relay() {
+    for (label, protocol, body_mode, waf_target) in [
+        ("native-inline", "3.0", "stream", None),
+        // A response-body WAF rule forces the refined relay. It releases an
+        // `application/octet-stream` body, so the refined path streams.
+        ("native-refined", "3.0", "stream", Some("response_body")),
+        // A request-body WAF rule buffers the request while the response
+        // still streams.
+        ("native-buffered-request", "3.0", "stream", Some("request_body")),
+        ("bridge-h1-stream", "1.1", "stream", None),
+        ("bridge-h1-buffer", "1.1", "buffer", None),
+        ("bridge-h2-stream", "2.0", "stream", None),
+        ("bridge-h2-buffer", "2.0", "buffer", None),
+    ] {
+        let ca = TestCa::new("h3-oversize-token").expect("ca");
+        let (cert, key) = ca.valid().expect("leaf");
+        let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+        let backend_port = tcp.port;
+        let oversized = Bytes::from(vec![b'x'; 1024]);
+        let mut h1 = None;
+        let mut h2 = None;
+        let mut h3 = None;
+        match protocol {
+            "1.1" => {
+                let mut response = b"HTTP/1.1 200 OK\r\n".to_vec();
+                response.extend_from_slice(b"Content-Type: application/octet-stream\r\n");
+                response.extend_from_slice(b"Content-Length: 1024\r\nConnection: close\r\n\r\n");
+                response.extend_from_slice(&oversized);
+                h1 = Some(
+                    ScriptedTlsBackend::builder(
+                        tcp.into_listener(),
+                        TlsConfig::new(cert.clone(), key.clone())
+                            .with_alpn(vec![b"http/1.1".to_vec()]),
+                    )
+                    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+                    .step(TcpStep::Write(response))
+                    .step(TcpStep::Drop)
+                    .spawn()
+                    .expect("h1 backend"),
+                );
+            }
+            "2.0" => {
+                h2 = Some(
+                    ScriptedH2Backend::builder_tls(tcp.into_listener(), &cert, &key)
+                        .expect("h2 builder")
+                        .repeat_script(true)
+                        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+                        .step(H2Step::RespondHeaders(vec![
+                            (":status", "200".into()),
+                            ("content-type", "application/octet-stream".into()),
+                            ("content-length", "1024".into()),
+                        ]))
+                        .step(H2Step::RespondData {
+                            data: oversized.clone(),
+                            end_stream: true,
+                        })
+                        .spawn()
+                        .expect("h2 backend"),
+                );
+            }
+            _ => {
+                let listener = tcp.into_listener();
+                h2 = Some(spawn_h2_bridge_backend(listener, &cert, &key, b"fallback"));
+                h3 = Some(
+                    ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+                        .step(H3Step::AcceptStream)
+                        .step(H3Step::RespondHeaders(vec![
+                            (":status", "200".into()),
+                            ("content-type", "application/octet-stream".into()),
+                            ("content-length", "1024".into()),
+                        ]))
+                        .step(H3Step::RespondData(oversized.clone()))
+                        .step(H3Step::RespondTrailers(vec![]))
+                        .step(H3Step::StallFor(Duration::from_secs(30)))
+                        .spawn()
+                        .expect("h3 backend"),
+                );
+            }
+        }
+        let mut config: Value =
+            serde_yaml::from_str(&file_mode_yaml_for_h3(backend_port)).expect("fixture config");
+        config["proxies"][0]["response_body_mode"] = json!(body_mode);
+        if let Some(target) = waf_target {
+            config["proxies"][0]["plugins"] = json!([{"plugin_config_id": "h3-oversize-waf"}]);
+            config["plugin_configs"] = json!([h3_body_waf_plugin_config(target)]);
+        }
+        let (harness, _, https_port) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+            serde_yaml::to_string(&config).expect("yaml"),
+            true,
+            None,
+            &[
+                ("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "64"),
+                ("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0"),
+            ],
+        )
+        .await;
+        if protocol == "3.0" {
+            wait_for_h3_class(&harness, "supported", Duration::from_secs(15))
+                .await
+                .expect("capability probe")
+                .expect("native H3 must be selected");
+        }
+        let client = Http3Client::insecure().expect("h3 client");
+        let url = format!("https://127.0.0.1:{https_port}/api/oversize");
+        let options = if waf_target == Some("request_body") {
+            GetOptions::default()
+                .method(http::Method::POST)
+                .header("content-type", "text/plain")
+                .body(Bytes::from_static(b"benign request body"))
+        } else {
+            GetOptions::default()
+        };
+        let response = client
+            .get_with_options(&url, options)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: H3 request failed: {error}"));
+        assert_eq!(
+            response.status.as_u16(),
+            502,
+            "{label}; body={:?}; gateway logs:\n{}",
+            response.body_text(),
+            harness.captured_combined().unwrap_or_default()
+        );
+        assert!(
+            response.body_text().contains("exceeds maximum size"),
+            "{label}: {:?}",
+            response.body_text()
+        );
+        assert_eq!(
+            h3_gateway_error_tokens(&response),
+            ["backend_error"],
+            "{label}: a declared oversize response carries the gateway's own token: {:?}",
+            response.headers
+        );
+        if protocol == "3.0" {
+            let requests = h3.as_ref().expect("h3 backend").received_requests().await;
+            assert_eq!(
+                requests.len(),
+                1,
+                "{label}: the native HTTP/3 backend served the request: {requests:?}"
+            );
+        }
+        drop((harness, h1, h2, h3));
+    }
+}
+
+/// A plugin that writes its own `X-Gateway-Error` on an HTTP/3 streaming
+/// relay does not reach the client: the relay writes exactly the gateway's
+/// `backend_error` for a backend 5xx, on the native H3 relay and the bridge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streaming_relay_replaces_a_plugin_written_gateway_error_token() {
+    for protocol in ["1.1", "3.0"] {
+        let ca = TestCa::new("h3-plugin-token").expect("ca");
+        let (cert, key) = ca.valid().expect("leaf");
+        let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+        let backend_port = tcp.port;
+        let mut h1 = None;
+        let mut h2 = None;
+        let mut h3 = None;
+        if protocol == "1.1" {
+            h1 = Some(
+                ScriptedTlsBackend::builder(
+                    tcp.into_listener(),
+                    TlsConfig::new(cert.clone(), key.clone())
+                        .with_alpn(vec![b"http/1.1".to_vec()]),
+                )
+                .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+                .step(TcpStep::Write(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy".to_vec(),
+                ))
+                .step(TcpStep::Drop)
+                .spawn()
+                .expect("h1 backend"),
+            );
+        } else {
+            let listener = tcp.into_listener();
+            h2 = Some(spawn_h2_bridge_backend(listener, &cert, &key, b"fallback"));
+            h3 = Some(
+                ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+                    .step(H3Step::AcceptStream)
+                    .step(H3Step::RespondHeaders(vec![
+                        (":status", "503".into()),
+                        ("content-type", "text/plain".into()),
+                    ]))
+                    .step(H3Step::RespondData(Bytes::from_static(b"busy")))
+                    .step(H3Step::RespondTrailers(vec![]))
+                    .step(H3Step::StallFor(Duration::from_secs(30)))
+                    .spawn()
+                    .expect("h3 backend"),
+            );
+        }
+        let mut config: Value =
+            serde_yaml::from_str(&file_mode_yaml_for_h3(backend_port)).expect("fixture config");
+        config["proxies"][0]["response_body_mode"] = json!("stream");
+        config["proxies"][0]["plugins"] = json!([{"plugin_config_id": "h3-token-writer"}]);
+        config["plugin_configs"] = json!([{
+            "id": "h3-token-writer",
+            "plugin_name": "response_transformer",
+            "scope": "proxy",
+            "proxy_id": "scripted-h3",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "X-Gateway-Error",
+                    "value": "connection_failure"
+                }]
+            }
+        }]);
+        let (harness, _, _) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+            serde_yaml::to_string(&config).expect("yaml"),
+            true,
+            None,
+            &[("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0")],
+        )
+        .await;
+        if protocol == "3.0" {
+            wait_for_h3_class(&harness, "supported", Duration::from_secs(15))
+                .await
+                .expect("capability probe")
+                .expect("native H3 must be selected");
+        }
+        let response = h3_get(&harness, "/api/plugin-token")
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status.as_u16(),
+            503,
+            "{protocol}; body={:?}; gateway logs:\n{}",
+            response.body_text(),
+            harness.captured_combined().unwrap_or_default()
+        );
+        assert_eq!(response.body_bytes.as_ref(), b"busy");
+        assert_eq!(
+            h3_gateway_error_tokens(&response),
+            ["backend_error"],
+            "{protocol}: a plugin-written token is replaced by the gateway's own: {:?}",
+            response.headers
+        );
+        drop((harness, h1, h2, h3));
+    }
+}
+
+/// A gRPC backend's HTTP 5xx relayed to an HTTP/3 client carries the gateway's
+/// `backend_error` on the native HTTP/3 gRPC relay and on the bridge's gRPC
+/// streaming and buffered paths (#5783).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_grpc_backend_http_5xx_carries_backend_error_on_native_and_bridge() {
+    for (label, body_mode) in [
+        ("native", "stream"),
+        ("bridge-stream", "stream"),
+        ("bridge-buffer", "buffer"),
+    ] {
+        let ca = TestCa::new("h3-grpc-5xx-token").expect("ca");
+        let (cert, key) = ca.valid().expect("leaf");
+        let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+        let backend_port = tcp.port;
+        let mut probe = None;
+        let mut h2 = None;
+        let mut h3 = None;
+        let harness = if label == "native" {
+            let probe_backend =
+                spawn_grpc_probe_tcp_backend(tcp.into_listener(), cert.clone(), key.clone());
+            probe = Some(probe_backend);
+            h3 = Some(
+                ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+                    .step(H3Step::AcceptStream)
+                    .step(H3Step::RespondHeaders(vec![
+                        (":status", "503".into()),
+                        ("content-type", "application/grpc".into()),
+                    ]))
+                    .step(H3Step::RespondTrailers(vec![("grpc-status", "14".into())]))
+                    .step(H3Step::StallFor(Duration::from_secs(1)))
+                    .spawn()
+                    .expect("h3 backend"),
+            );
+            let (harness, _, _) =
+                spawn_h3_harness_with_explicit_https_port(backend_port, false, Some(1)).await;
+            wait_for_h3_class(&harness, "supported", Duration::from_secs(15))
+                .await
+                .expect("capability probe")
+                .expect("native H3 must be selected");
+            harness
+        } else {
+            // No QUIC listener: the gRPC request crosses the HTTP/3 bridge.
+            drop(udp);
+            h2 = Some(
+                ScriptedH2Backend::builder_tls(tcp.into_listener(), &cert, &key)
+                    .expect("h2 builder")
+                    .repeat_script(true)
+                    .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+                    .step(H2Step::DrainRequestBody)
+                    .step(H2Step::RespondHeaders(vec![
+                        (":status", "503".into()),
+                        ("content-type", "application/grpc".into()),
+                    ]))
+                    .step(H2Step::RespondTrailers(vec![("grpc-status", "14".into())]))
+                    .spawn()
+                    .expect("h2 backend"),
+            );
+            let fixture = file_mode_yaml_for_h3(backend_port);
+            let mut config: Value = serde_yaml::from_str(&fixture).expect("fixture config");
+            config["proxies"][0]["response_body_mode"] = json!(body_mode);
+            let (harness, _, _) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+                serde_yaml::to_string(&config).expect("yaml"),
+                false,
+                None,
+                &[],
+            )
+            .await;
+            harness
+        };
+        let response = h3_grpc_post(&harness, "/api/echo.Echo/Unary", grpc_frame(b"ping"))
+            .await
+            .unwrap_or_else(|error| panic!("{label}: H3 gRPC request failed: {error}"));
+        assert_eq!(
+            response.status.as_u16(),
+            503,
+            "{label}; gateway logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        );
+        assert_eq!(
+            h3_gateway_error_tokens(&response),
+            ["backend_error"],
+            "{label}: a gRPC backend's HTTP 5xx carries the gateway's own token: {:?}",
+            response.headers
+        );
+        if label == "native" {
+            let requests = h3.as_ref().expect("h3 backend").received_requests().await;
+            assert_eq!(
+                requests.len(),
+                1,
+                "the native HTTP/3 gRPC backend served the RPC: {requests:?}"
+            );
+        }
+        drop((harness, probe, h2, h3));
+    }
+}

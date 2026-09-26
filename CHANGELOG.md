@@ -432,17 +432,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stripped case-insensitively alongside the `X-RateLimit-*` family, both before
   storage and when an existing entry is replayed, so a cache hit no longer
   reports the original response's stale quota or reset (#5788).
-- HTTP/3 responses now carry the gateway's own `X-Gateway-Error` on every
-  path, as HTTP/1.1 and HTTP/2 do (#5783). A backend 5xx relayed on an HTTP/3
+- An HTTP/3 `502` for a backend response whose declared `Content-Length`
+  exceeds the response size limit now carries `X-Gateway-Error:
+  backend_error`, as it does on HTTP/1.1 and HTTP/2. The three native HTTP/3
+  streaming relays and the HTTP/3 bridge previously sent this `502` with no
+  token (#5804).
+- HTTP/3 responses now carry the gateway's own `X-Gateway-Error` for a
+  backend 5xx on every path (#5783). A backend 5xx relayed on an HTTP/3
   streaming relay (native or bridged, plain or gRPC) or on the HTTP/3
   bridge's buffered path now reads `backend_error`, and a copy a plugin or
-  hook wrote is replaced instead of forwarded. An HTTP/3 bridge attempt whose
-  connection-pool client could not be built now answers its `502` with
-  `connection_failure`. A plugin that writes the `route_request_timeout`
-  transaction metadata key can no longer suppress the route-deadline phase an
-  HTTP/3 relay records (and with it the `request_timeout` token), end the
-  HTTP/3 retry loop, or withhold an affinity cookie: those decisions now read
-  a typed marker only trusted proxy code sets.
+  hook wrote is replaced instead of forwarded. This matches the HTTP/1.1 and
+  HTTP/2 builder, except that HTTP/1.1 and HTTP/2 native gRPC still forward
+  a plugin- or hook-written copy and write no `backend_error` for a gRPC
+  backend's HTTP 5xx, while HTTP/3 native and bridged gRPC write it (#5798).
+  An HTTP/3 bridge attempt whose connection-pool client could not be built
+  now answers its `502` with `connection_failure`. A plugin that writes the
+  `route_request_timeout` transaction metadata key can no longer suppress
+  the route-deadline phase an HTTP/3 relay records (and with it the
+  `request_timeout` token), end the HTTP/3 retry loop, or withhold an
+  affinity cookie: those decisions now read a typed marker only trusted
+  proxy code sets.
 - Pass-through gRPC-Web follow-ups (#5784). The mesh gRPC response message
   counter now counts a pass-through body's decoded message frames on HTTP/1.1
   and HTTP/2, streamed or buffered: it no longer counts the backend's `0x80`
@@ -484,17 +493,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `X-Gateway-Upstream-Status` reached the client on the generic HTTP/1.1 and
   HTTP/2 path, and was duplicated beside the gateway's own on fallback
   routing. A backend's `X-Gateway-Error` reached the client on native gRPC,
-  gRPC-Web pass-through, and the HTTP/3 streaming and bridge paths. Both names
-  now live in one shared list. Every backend response boundary strips a
-  backend-supplied copy, in the headers or the trailers: reqwest, direct
+  gRPC-Web pass-through, and the HTTP/3 streaming and bridge paths. Both
+  names now live in one shared list. Every backend response boundary strips
+  a backend-supplied copy, in the headers or the trailers: reqwest, direct
   HTTP/2, native gRPC, native HTTP/3, the HTTP/3 bridge, and serverless
   functions, buffered or streamed. The gateway then writes its own value
-  where it classifies the response: on every gateway-synthesized failure, and
-  on a backend 5xx through the HTTP/1.1 / HTTP/2 builder and the native HTTP/3
-  buffered writer. A backend 5xx relayed on an HTTP/3 streaming path or the
-  HTTP/3 bridge's buffered path currently gets no `X-Gateway-Error` (the
-  forged copy is still stripped). The headers are still unauthenticated, so
-  trust them only on a response from a gateway the client authenticated.
+  where it classifies the response: on every gateway-synthesized failure,
+  and on a backend 5xx through the HTTP/1.1 / HTTP/2 builder and every
+  HTTP/3 path (#5783). The headers are still unauthenticated, so trust them
+  only on a response from a gateway the client authenticated.
 - The vendored `h3` frame-drain patch (001) now defers only QUIC connection
   errors behind buffered bytes, matching the updated upstream fix
   (hyperium/h3#339). PR #5741 exempted a peer stream reset, but every other
