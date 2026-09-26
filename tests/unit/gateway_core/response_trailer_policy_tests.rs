@@ -1214,7 +1214,9 @@ fn every_reqwest_streaming_dispatch_site_carries_the_trailer_decision() {
         "both mutually-exclusive relaying decisions must consume the sealed trailer governor"
     );
     assert!(
-        arm.contains("if reqwest_trailers_relayed {"),
+        compact_arm.contains(
+            "if!reqwest_trailers_relayed{crate::proxy::body::ReqwestResponseTrailers::drop_all()"
+        ),
         "the relay must be gated by the same flag that decided evidence capture"
     );
     for constructor in [
