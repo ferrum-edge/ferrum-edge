@@ -8762,7 +8762,10 @@ mod stream_window_tests {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 1, 0));
         let windows = feed(&mut eng, b"data: x\n");
         assert!(
-            windows.iter().flatten().all(|(inspectable, _)| !inspectable),
+            windows
+                .iter()
+                .flatten()
+                .all(|(inspectable, _)| !inspectable),
             "every forced piece is uninspectable"
         );
         assert_eq!(eng.carry, b"\n", "the framing byte is kept");
