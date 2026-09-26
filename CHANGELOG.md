@@ -275,6 +275,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completeness check, and a response without `Content-Length` is never treated
   as complete on a close.
 
+### Performance
+
+- `security_headers` removes matching response headers in place without allocating or cloning keys
+  (#5755).
+
 ## [0.9.7] - 2026-09-25
 
 This is the first published release after 0.9.5. It ships every change
