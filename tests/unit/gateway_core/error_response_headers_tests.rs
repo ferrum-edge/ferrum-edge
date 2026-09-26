@@ -367,7 +367,7 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
     );
 
     // The declared-oversize 502 hands the writer its non-connection signal.
-    let oversized_body = "Backend response body exceeds maximum size";
+    let oversized_body = r##"br#"{"error":"Backend response body exceeds maximum size"}"#"##;
     let body_start = cross
         .find(oversized_body)
         .expect("the declared-oversize response body");
