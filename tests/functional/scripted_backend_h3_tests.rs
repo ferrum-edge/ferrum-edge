@@ -6144,7 +6144,12 @@ async fn h3_declared_oversize_response_carries_backend_error_on_every_relay() {
         ("native-refined", "3.0", "stream", Some("response_body")),
         // A request-body WAF rule buffers the request while the response
         // still streams.
-        ("native-buffered-request", "3.0", "stream", Some("request_body")),
+        (
+            "native-buffered-request",
+            "3.0",
+            "stream",
+            Some("request_body"),
+        ),
         ("bridge-h1-stream", "1.1", "stream", None),
         ("bridge-h1-buffer", "1.1", "buffer", None),
         ("bridge-h2-stream", "2.0", "stream", None),
