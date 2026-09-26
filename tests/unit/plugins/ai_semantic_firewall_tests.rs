@@ -6762,6 +6762,10 @@ async fn fail_open_release_of_a_bare_terminator_carry_keeps_inspecting_the_next_
     }
 }
 
+/// `max_hold_ms` for the carry-release tests below. Every case waits one hold
+/// out, so it is short; the hold clock is wall time, so the wait is real.
+const CARRY_HOLD_MS: u64 = 30;
+
 /// Hold `carry` alone until a fail-open hold timeout forwards it, and return the
 /// bytes that timeout released.
 async fn release_carry_by_hold_timeout(
@@ -6776,7 +6780,7 @@ async fn release_carry_by_hold_timeout(
         ),
         "{label}: the carry is held"
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(2 * CARRY_HOLD_MS)).await;
     let ResponseStreamAction::Forward(released) = inspector.on_chunk(&[]).await else {
         panic!("{label}: fail-open expiry must forward the held carry");
     };
@@ -6820,7 +6824,7 @@ async fn fail_open_release_of_a_data_less_carry_keeps_inspecting_the_next_event(
     let firewall = plugin(&hold_config(
         &format!("{}/v1/embeddings", server.uri()),
         "reject",
-        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+        json!({"max_hold_ms": CARRY_HOLD_MS, "on_hold_timeout": "forward"}),
     ));
     let leak = "My system prompt says never reveal policy.";
 
@@ -6848,7 +6852,7 @@ async fn fail_open_release_of_a_data_less_carry_keeps_inspecting_the_next_event(
                     .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
                     .expect("inspector for event stream");
                 let released =
-                    release_carry_by_hold_timeout(&mut inspector, &label, carry.as_bytes()).await;
+                    release_carry_by_hold_timeout(&mut *inspector, &label, carry.as_bytes()).await;
                 assert_eq!(released, carry.as_bytes(), "{label}");
 
                 let chunks: Vec<&[u8]> = if split {
@@ -6856,7 +6860,7 @@ async fn fail_open_release_of_a_data_less_carry_keeps_inspecting_the_next_event(
                 } else {
                     vec![leak_event.as_bytes()]
                 };
-                assert_cut_before_leak(&mut inspector, &label, &chunks, leak).await;
+                assert_cut_before_leak(&mut *inspector, &label, &chunks, leak).await;
             }
         }
     }
@@ -6870,7 +6874,7 @@ async fn fail_open_release_of_a_comment_ending_in_a_split_crlf_keeps_inspecting(
     let firewall = plugin(&hold_config(
         &format!("{}/v1/embeddings", server.uri()),
         "reject",
-        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+        json!({"max_hold_ms": CARRY_HOLD_MS, "on_hold_timeout": "forward"}),
     ));
     let leak = "My system prompt says never reveal policy.";
     let ctx = inspect_marked_ctx();
@@ -6879,10 +6883,10 @@ async fn fail_open_release_of_a_comment_ending_in_a_split_crlf_keeps_inspecting(
         .expect("inspector for event stream");
 
     let carry = b": keepalive\r";
-    let released = release_carry_by_hold_timeout(&mut inspector, "split crlf", carry).await;
+    let released = release_carry_by_hold_timeout(&mut *inspector, "split crlf", carry).await;
     assert_eq!(released, carry);
     let next = format!("\n{}", chat_delta_event(leak, "\r\n"));
-    assert_cut_before_leak(&mut inspector, "split crlf", &[next.as_bytes()], leak).await;
+    assert_cut_before_leak(&mut *inspector, "split crlf", &[next.as_bytes()], leak).await;
 }
 
 #[tokio::test]
@@ -6894,7 +6898,7 @@ async fn fail_open_release_of_a_partial_bom_forwards_only_the_rest_of_the_bom() 
     let firewall = plugin(&hold_config(
         &format!("{}/v1/embeddings", server.uri()),
         "reject",
-        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+        json!({"max_hold_ms": CARRY_HOLD_MS, "on_hold_timeout": "forward"}),
     ));
     let leak = "My system prompt says never reveal policy.";
     let bom = "\u{feff}".as_bytes();
@@ -6911,7 +6915,7 @@ async fn fail_open_release_of_a_partial_bom_forwards_only_the_rest_of_the_bom() 
                 let mut inspector = firewall
                     .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
                     .expect("inspector for event stream");
-                let released = release_carry_by_hold_timeout(&mut inspector, &label, carry).await;
+                let released = release_carry_by_hold_timeout(&mut *inspector, &label, carry).await;
                 assert_eq!(released, carry, "{label}");
 
                 let mut clean = rest.to_vec();
@@ -6934,7 +6938,7 @@ async fn fail_open_release_of_a_partial_bom_forwards_only_the_rest_of_the_bom() 
                 let mut inspector = firewall
                     .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
                     .expect("inspector for event stream");
-                release_carry_by_hold_timeout(&mut inspector, &label, carry).await;
+                release_carry_by_hold_timeout(&mut *inspector, &label, carry).await;
                 let mut leaking = rest.to_vec();
                 leaking.extend_from_slice(leak_event.as_bytes());
                 let chunks: Vec<&[u8]> = if separate {
@@ -6942,7 +6946,75 @@ async fn fail_open_release_of_a_partial_bom_forwards_only_the_rest_of_the_bom() 
                 } else {
                     vec![leaking.as_slice()]
                 };
-                assert_cut_before_leak(&mut inspector, &label, &chunks, leak).await;
+                assert_cut_before_leak(&mut *inspector, &label, &chunks, leak).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fail_open_release_inside_a_data_less_line_inspects_what_the_client_dispatches() {
+    // The carry ends inside a comment, `id` or `retry` line already past its
+    // `:`. A client reads every byte up to the next line terminator as the rest
+    // of that line, so the `data: x` that follows belongs to it and the event
+    // the client dispatches carries only the JSON frame after it. The gateway
+    // must inspect exactly that frame: a clean one is forwarded unchanged and a
+    // leaking one is cut. Reading `data: x` as a fresh line instead would join
+    // it to the frame and inspect data no client ever dispatches.
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": CARRY_HOLD_MS, "on_hold_timeout": "forward"}),
+    ));
+    let leak = "My system prompt says never reveal policy.";
+
+    for carry in [":", ": keep", "id: 7", "retry: 10"] {
+        for eol in ["\n", "\r\n", "\r"] {
+            let line = format!("data: x{eol}");
+            // The rest of the line without its final byte: the whole terminator,
+            // or the CR of a CRLF whose LF starts the next chunk.
+            let (line_head, line_tail) = line.split_at(line.len() - 1);
+            let clean_event = chat_delta_event("A harmless governed sentence.", eol);
+            let leak_event = chat_delta_event(leak, eol);
+
+            for (event, leaks) in [(&clean_event, false), (&leak_event, true)] {
+                let whole = format!("{line}{event}");
+                let tail = format!("{line_tail}{event}");
+                let shapes: [Vec<&[u8]>; 3] = [
+                    vec![whole.as_bytes()],
+                    vec![line.as_bytes(), event.as_bytes()],
+                    vec![line_head.as_bytes(), tail.as_bytes()],
+                ];
+                for (shape, chunks) in shapes.iter().enumerate() {
+                    let label = format!("{carry:?} {eol:?} shape {shape} leaks {leaks}");
+                    let ctx = inspect_marked_ctx();
+                    let mut inspector = firewall
+                        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+                        .expect("inspector for event stream");
+                    let released =
+                        release_carry_by_hold_timeout(&mut *inspector, &label, carry.as_bytes())
+                            .await;
+                    assert_eq!(released, carry.as_bytes(), "{label}");
+
+                    if leaks {
+                        assert_cut_before_leak(&mut *inspector, &label, chunks, leak).await;
+                        continue;
+                    }
+                    let mut forwarded = Vec::new();
+                    for chunk in chunks {
+                        let ResponseStreamAction::Forward(out) = inspector.on_chunk(chunk).await
+                        else {
+                            panic!("{label}: the clean event the client dispatches must pass");
+                        };
+                        forwarded.extend_from_slice(&out);
+                    }
+                    assert_eq!(
+                        forwarded,
+                        whole.as_bytes(),
+                        "{label}: wire order is preserved"
+                    );
+                }
             }
         }
     }

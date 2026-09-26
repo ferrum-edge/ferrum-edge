@@ -1332,10 +1332,6 @@ fn forwarded_sse_prefix_without_data_is_inert_under_every_line_ending() {
             format!(": keepalive{eol}"),
             format!("\u{feff}: keepalive{eol}id: 7{eol}retry: 1000{eol}"),
             format!("id{eol}retry{eol}:{eol}"),
-            // Unterminated lines already past their `:` stay inert whatever
-            // follows them.
-            ": keep".to_string(),
-            format!("id: 7{eol}retry: 10"),
             // A blank line ends a data event, so nothing after it is open.
             format!("data: x{eol}{eol}"),
             format!("data: x{eol}{eol}: keepalive{eol}"),
@@ -1352,6 +1348,43 @@ fn forwarded_sse_prefix_without_data_is_inert_under_every_line_ending() {
     assert_eq!(
         classify_forwarded_sse_prefix(b"\n: keepalive\r"),
         SseForwardedPrefix::Inert
+    );
+}
+
+#[test]
+fn forwarded_sse_prefix_ending_inside_a_data_less_line_is_an_inert_line() {
+    // Unterminated lines already past their `:` carry no data, but the bytes
+    // up to their next terminator still belong to them, so the caller must not
+    // read those bytes as a fresh line.
+    for eol in ["\n", "\r\n", "\r"] {
+        let prefixes = [
+            ":".to_string(),
+            ": keep".to_string(),
+            "id:".to_string(),
+            "id: 7".to_string(),
+            "retry: 10".to_string(),
+            "\u{feff}: keep".to_string(),
+            format!("id: 7{eol}retry: 10"),
+            format!(": keepalive{eol}:"),
+            format!("data: x{eol}{eol}id: 7"),
+        ];
+        for prefix in prefixes {
+            assert_eq!(
+                classify_forwarded_sse_prefix(prefix.as_bytes()),
+                SseForwardedPrefix::InertLine,
+                "{prefix:?}"
+            );
+        }
+    }
+    // The LF of a CRLF whose CR ended the previous bytes.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"\n: keep"),
+        SseForwardedPrefix::InertLine
+    );
+    // A data line earlier in the same event keeps the whole event open.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"data: x\n: keep"),
+        SseForwardedPrefix::OpenEvent
     );
 }
 
@@ -1384,7 +1417,8 @@ fn forwarded_sse_prefix_that_may_carry_data_is_open() {
             format!("event: message{eol}"),
             format!("custom: value{eol}"),
             format!("data{eol}"),
-            // Unterminated lines whose field name may still become `data`.
+            // Unterminated lines whose field name is not complete yet, so they
+            // are not yet known to be comment, `id` or `retry` lines.
             "d".to_string(),
             "dat".to_string(),
             "data: {\"partial\"".to_string(),

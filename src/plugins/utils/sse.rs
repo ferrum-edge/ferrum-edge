@@ -283,10 +283,15 @@ pub const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseForwardedPrefix {
     /// Nothing that can carry event data: only line terminators, leading BOMs,
-    /// and comment, `id` or `retry` lines (complete, or unterminated but already
-    /// past their `:`). The bytes that follow can be read as a fresh event
-    /// without missing any data the client dispatches.
+    /// and complete comment, `id` or `retry` lines. The bytes that follow can
+    /// be read as a fresh event without missing any data the client dispatches.
     Inert,
+    /// Like [`Inert`](Self::Inert), except that the prefix ends inside a
+    /// comment, `id` or `retry` line already past its `:`. The client reads
+    /// every byte up to the next CR or LF as the rest of that line, so those
+    /// bytes carry nothing; only after that terminator can the stream be read
+    /// as a fresh event.
+    InertLine,
     /// Leading BOMs that end in an incomplete one. The next `n` bytes, when they
     /// complete that BOM, carry nothing either; after them the stream can be
     /// read as a fresh event.
@@ -315,12 +320,17 @@ pub fn classify_forwarded_sse_prefix(prefix: &[u8]) -> SseForwardedPrefix {
         return SseForwardedPrefix::PartialBom(UTF8_BOM.len() - rest.len());
     }
     let mut open = false;
+    let mut unfinished_line = false;
     while !rest.is_empty() {
         let Some((line_end, next)) = sse_line_end(rest) else {
             // Later bytes extend this unterminated line, so it is inert only
-            // once its field name is complete.
-            let inert = rest.contains(&b':') && is_inert_sse_line(rest);
-            open |= !inert;
+            // once its field name is complete, and even then those later bytes
+            // belong to it up to the next terminator.
+            if rest.contains(&b':') && is_inert_sse_line(rest) {
+                unfinished_line = true;
+            } else {
+                open = true;
+            }
             break;
         };
         let line = &rest[..line_end];
@@ -334,6 +344,8 @@ pub fn classify_forwarded_sse_prefix(prefix: &[u8]) -> SseForwardedPrefix {
     }
     if open {
         SseForwardedPrefix::OpenEvent
+    } else if unfinished_line {
+        SseForwardedPrefix::InertLine
     } else {
         SseForwardedPrefix::Inert
     }
