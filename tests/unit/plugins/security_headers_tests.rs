@@ -60,7 +60,11 @@ async fn removes_all_case_insensitive_header_values_in_place() {
 
     plugin.after_proxy(&mut ctx, 200, &mut headers).await;
 
-    assert!(headers.keys().all(|key| !key.eq_ignore_ascii_case("x-remove")));
+    assert!(
+        headers
+            .keys()
+            .all(|key| !key.eq_ignore_ascii_case("x-remove"))
+    );
     assert_eq!(headers.get("keep").map(String::as_str), Some("value"));
 }
 
