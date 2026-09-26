@@ -296,19 +296,20 @@ pub enum SseForwardedPrefix {
     /// complete that BOM, carry nothing either; after them the stream can be
     /// read as a fresh event.
     PartialBom(usize),
-    /// An open event that holds no data yet, but whose start shapes how the
-    /// client reads the rest of it: an `event` line names the event, other
-    /// field lines are ignored, and an unterminated line whose field name is
-    /// still incomplete, or whose `data` value has not begun, is continued by
-    /// the next bytes. The rest of the event therefore cannot be read as a
-    /// fresh event, yet none of its data has left: the caller keeps the prefix
-    /// from the given byte offset (where the open event starts) as parse-only
-    /// context and reads the rest of the event together with it, so that
-    /// event's data is still inspected.
+    /// An open event that holds no data text yet, but whose start shapes how
+    /// the client reads the rest of it: an `event` line names the event, other
+    /// field lines are ignored, a `data` line with an empty value adds only a
+    /// line break to the event's data, and an unterminated line whose field
+    /// name is still incomplete, or whose `data` value has not begun, is
+    /// continued by the next bytes. The rest of the event therefore cannot be
+    /// read as a fresh event, yet none of its data text has left: the caller
+    /// keeps the prefix from the given byte offset (where the open event
+    /// starts) as parse-only context and reads the rest of the event together
+    /// with it, so that event's data is still inspected.
     EventContext(usize),
-    /// A `data` line, or an unterminated one whose value has begun: the
-    /// forwarded prefix already carries data of the event the client
-    /// dispatches.
+    /// A `data` line whose value is not empty, or an unterminated one whose
+    /// value has begun: the forwarded prefix already carries data of the event
+    /// the client dispatches.
     OpenEvent,
 }
 
@@ -354,9 +355,12 @@ pub fn classify_forwarded_sse_prefix(prefix: &[u8]) -> SseForwardedPrefix {
             event_start = prefix.len() - rest.len();
             continue;
         }
-        match sse_line_field(line).0 {
-            b"" | b"id" | b"retry" => {}
-            b"data" => open = true,
+        match sse_line_field(line) {
+            (b"" | b"id" | b"retry", _) => {}
+            // An empty value adds no text of its own, so the event's data is
+            // still ahead and is inspected together with this context.
+            (b"data", None | Some(b"" | b" ")) => context = true,
+            (b"data", Some(_)) => open = true,
             _ => context = true,
         }
     }

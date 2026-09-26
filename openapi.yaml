@@ -32235,7 +32235,7 @@ components:
               format: uint
               minimum: 1
               default: 4096
-              description: "Hard aggregate cap for the current window's input and retained raw/frame/reassembled state. Coalesced chunks are expanded event-by-event: only one complete event's bytes are taken at a time and a ready window is inspected and released before more events are absorbed, so transport batching never changes a clean completion's disposition. Only an event that cannot fit with nothing else retained is uninspectable (fails closed under on_error=reject, forwarded under warn/allow)."
+              description: "Hard aggregate cap for the current window's input and retained raw/frame/reassembled state. Coalesced chunks are expanded event-by-event: only one complete event's bytes are taken at a time and a ready window is inspected and released before more events are absorbed, so transport batching never changes a clean completion's disposition. Only an event that cannot fit with nothing else retained is uninspectable (fails closed under on_error=reject, forwarded under warn/allow). The start of an event kept after a fail-open hold timeout forwarded it (see on_hold_timeout) counts toward the cap together with the rest of that event; when the two do not fit together, the rest of that event is uninspectable."
             overlap_bytes:
               type: integer
               format: uint

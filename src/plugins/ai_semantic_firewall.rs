@@ -3920,28 +3920,30 @@ impl StreamWindowEngine {
     fn absorb_event(&mut self, mut raw: Vec<u8>, context: usize, parse: EventParse) {
         let context = context.min(raw.len());
         let raw_len = raw.len() - context;
-        // Reassembled strings cannot contain more payload bytes than the raw
-        // event. Reserve that upper bound before parsing; if the aggregate
+        // A forced rest's only context is the byte that frames it, so parse
+        // just its own bytes.
+        let parse_from = match parse {
+            EventParse::ForcedRest => context,
+            EventParse::Whole | EventParse::Forced => 0,
+        };
+        let parsed_len = raw.len() - parse_from;
+        // Reassembled strings cannot contain more payload bytes than the parsed
+        // bytes. Reserve that upper bound before parsing; if the aggregate
         // retained-state budget would be crossed, keep only the raw block-mode
         // bytes and mark the event uninspectable instead of duplicating it.
-        let retained = self.retained_bytes();
-        let projected = retained.saturating_add(self.absorb_cost(raw.len()));
+        // The context is parsed but never held, so raw retention is `raw_len`.
+        let cost = self.absorb_cost(raw_len, parsed_len);
+        let projected = self.retained_bytes().saturating_add(cost);
         let within_budget =
             parse != EventParse::Forced && projected <= self.config.max_window_bytes;
 
         let (inspectable, frames, actual_frame_bytes) = if within_budget {
-            // A forced rest's only context is the byte that frames it, so
-            // parse just its own bytes.
-            let parse_from = match parse {
-                EventParse::ForcedRest => context,
-                EventParse::Whole | EventParse::Forced => 0,
-            };
             let parsed = parse_sse_data_frames_checked(&raw[parse_from..]);
             for (event, frame) in parsed.reassembly_frames() {
                 self.reassembler.push_event_frame(event, frame);
             }
             let actual_frame_bytes = if self.store_frames && !parsed.frames.is_empty() {
-                raw.len()
+                parsed_len
             } else {
                 0
             };
@@ -3987,18 +3989,31 @@ impl StreamWindowEngine {
     }
 
     fn input_window_bytes(&self) -> usize {
-        self.carry
-            .len()
+        self.carry_window_bytes()
             .saturating_add(self.held.iter().map(|event| event.raw_len).sum::<usize>())
     }
 
-    /// Wire bytes awaiting a verdict: [`input_window_bytes`] without the carry
-    /// context, which already left the gateway or is counted by a held event.
-    ///
-    /// [`input_window_bytes`]: Self::input_window_bytes
+    /// The saved framing byte of a forced event's rest: the final byte of the
+    /// force-flushed start, kept as the only context of `carry`. It decides
+    /// where that event ends for the client, so it is never shed to make room
+    /// and is left out of every window and budget measure (it is one byte).
+    fn forced_seam_len(&self) -> usize {
+        usize::from(self.carry_continues_forced && self.carry_context > 0)
+    }
+
+    /// Bytes of `carry` the window and budget count: all of it except the
+    /// [`forced_seam_len`](Self::forced_seam_len) byte.
+    fn carry_window_bytes(&self) -> usize {
+        self.carry.len().saturating_sub(self.forced_seam_len())
+    }
+
+    /// Wire bytes awaiting a verdict: complete held events and the carry
+    /// without its context, which already left the gateway or is counted by a
+    /// held event.
     fn held_wire_bytes(&self) -> usize {
-        let context = self.carry_context;
-        self.input_window_bytes().saturating_sub(context)
+        let carry = self.carry.len().saturating_sub(self.carry_context);
+        let held: usize = self.held.iter().map(|event| event.raw_len).sum();
+        carry.saturating_add(held)
     }
 
     /// Take the first `end` bytes of `carry` (one event, or the whole carry)
@@ -4036,14 +4051,12 @@ impl StreamWindowEngine {
     /// Free window capacity held only by carry context: the open event is too
     /// large to read together with it. The rest of the event is then read as
     /// the uninspectable remainder of a forced one, framed against the final
-    /// context byte; when that byte alone still fills the window it goes too.
-    /// Each call shrinks `carry`, and an empty one always leaves capacity.
+    /// context byte, which is kept as the
+    /// [`forced_seam_len`](Self::forced_seam_len) byte and no longer counts
+    /// toward the window. Never called on the rest of a forced event, whose
+    /// only context is already that byte.
     fn shed_carry_context(&mut self) {
-        let keep = if self.carry_continues_forced || self.carry.is_empty() {
-            0
-        } else {
-            1
-        };
+        let keep = self.carry.len().min(1);
         let shed = self.carry.len() - keep;
         self.carry.drain(..shed);
         self.carry_context = keep;
@@ -4057,8 +4070,7 @@ impl StreamWindowEngine {
     }
 
     fn retained_bytes(&self) -> usize {
-        self.carry
-            .len()
+        self.carry_window_bytes()
             .saturating_add(
                 self.held
                     .iter()
@@ -4075,25 +4087,34 @@ impl StreamWindowEngine {
     }
 
     /// Aggregate retained-state cost [`absorb_event`](Self::absorb_event) charges
-    /// for one complete event of `raw_len` bytes: the block-mode raw retention,
-    /// the retained parsed-frame budget, and the reassembled-text upper bound.
-    fn absorb_cost(&self, raw_len: usize) -> usize {
+    /// for one complete event that holds `raw_len` wire bytes (its carry
+    /// context is never held) and parses `parsed_len` bytes: the block-mode raw
+    /// retention, the retained parsed-frame budget, and the reassembled-text
+    /// upper bound.
+    fn absorb_cost(&self, raw_len: usize, parsed_len: usize) -> usize {
         let raw_retained = if self.hold_raw { raw_len } else { 0 };
-        let frame_budget = if self.store_frames { raw_len } else { 0 };
+        let frame_budget = if self.store_frames { parsed_len } else { 0 };
         raw_retained
             .saturating_add(frame_budget)
-            .saturating_add(raw_len)
+            .saturating_add(parsed_len)
     }
 
     /// Whether the aggregate budget still covers absorbing the complete event of
-    /// `raw_len` bytes currently at the head of `carry` — the same projection
+    /// `end` bytes currently at the head of `carry` — the same projection
     /// [`absorb_event`](Self::absorb_event) applies, evaluated BEFORE the event
     /// is drained (so its own carry bytes are discounted).
-    fn event_fits_budget(&self, raw_len: usize) -> bool {
+    fn event_fits_budget(&self, end: usize) -> bool {
+        let raw_len = end - self.carry_context.min(end);
+        let parsed_len = if self.carry_continues_forced {
+            raw_len
+        } else {
+            end
+        };
+        let counted = end.saturating_sub(self.forced_seam_len());
         let projected = self
             .retained_bytes()
-            .saturating_sub(raw_len)
-            .saturating_add(self.absorb_cost(raw_len));
+            .saturating_sub(counted)
+            .saturating_add(self.absorb_cost(raw_len, parsed_len));
         projected <= self.config.max_window_bytes
     }
 
@@ -4155,7 +4176,7 @@ impl StreamWindowEngine {
             }
             if self.carry.len() > self.carry_context {
                 self.flush_forced_carry();
-            } else if !self.carry.is_empty() {
+            } else if !self.carry.is_empty() && !self.carry_continues_forced {
                 // Context alone leaves no room for the rest of its event.
                 self.shed_carry_context();
                 return IngestStep {
@@ -8730,6 +8751,36 @@ mod stream_window_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn forced_event_framing_byte_is_never_shed_for_capacity() {
+        // The final byte of a force-flushed start frames the rest of that
+        // event: after an LF, a leading LF is the blank line that ends it. Even
+        // a window that byte alone would fill keeps it, so the event ends
+        // where the client ends it instead of swallowing the next one.
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 1, 0));
+        let windows = feed(&mut eng, b"data: x\n");
+        assert!(
+            windows.iter().flatten().all(|(inspectable, _)| !inspectable),
+            "every forced piece is uninspectable"
+        );
+        assert_eq!(eng.carry, b"\n", "the framing byte is kept");
+        assert_eq!(eng.carry_context, 1);
+        assert!(eng.carry_continues_forced);
+        assert_eq!(eng.input_window_bytes(), 0, "framing byte not counted");
+        assert_eq!(eng.retained_bytes(), 0, "framing byte not counted");
+
+        assert_eq!(
+            feed(&mut eng, b"\n"),
+            vec![vec![(false, b"\n".to_vec())]],
+            "the blank line ends the forced event as the rest of it"
+        );
+        assert!(eng.carry.is_empty());
+        assert!(
+            !eng.carry_continues_forced,
+            "the next bytes start a fresh event"
+        );
     }
 
     #[test]

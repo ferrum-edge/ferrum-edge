@@ -1415,8 +1415,8 @@ fn forwarded_sse_prefix_that_carries_data_is_open() {
             format!(": keepalive{eol}data: x{eol}"),
             format!("data: x{eol}id: 7{eol}"),
             format!("event: message{eol}data: x{eol}"),
-            format!("data{eol}"),
-            format!("data:{eol}"),
+            // An empty `data` line ahead of one with a value.
+            format!("data:{eol}data: x{eol}"),
             // Unterminated `data` lines whose value has begun.
             "data: {\"partial\"".to_string(),
             "data:x".to_string(),
@@ -1454,6 +1454,13 @@ fn forwarded_sse_prefix_whose_open_event_holds_no_data_is_context() {
             ("data: ".to_string(), 0),
             (format!(": keepalive{eol}da"), 0),
             (format!("id: 7{eol}i"), 0),
+            // Complete `data` lines whose value is empty add no text of their
+            // own, so the event's data is still ahead.
+            (format!("data{eol}"), 0),
+            (format!("data:{eol}"), 0),
+            (format!("data: {eol}"), 0),
+            (format!("event: message{eol}data:{eol}"), 0),
+            (format!("data:{eol}data: "), 0),
             // A BOM that is not leading is part of a field name.
             (format!("id: 7{eol}\u{feff}"), 0),
             // Leading BOMs are not part of the event.

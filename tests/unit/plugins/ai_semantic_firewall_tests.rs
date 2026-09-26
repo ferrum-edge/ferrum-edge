@@ -7060,6 +7060,10 @@ fn data_less_event_starts(text: &str, eol: &str) -> Vec<String> {
         format!("da|{}", &delta[2..]),
         format!("data:|{}", &delta[5..]),
         format!("data: |{}", &delta[6..]),
+        // A complete `data` line with an empty value adds no text of its own.
+        format!("data{eol}|{delta}"),
+        format!("data:{eol}|{delta}"),
+        format!("data: {eol}|{delta}"),
         // Anthropic names each event on a line ahead of its `data:` line.
         format!("event: content_block_delta{eol}|{anthropic}"),
     ]
