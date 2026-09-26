@@ -77,28 +77,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Pass-through gRPC-Web (a route without the `grpc_web` plugin whose backend
-  already answers in gRPC-Web) no longer gains a second trailer frame on
-  HTTP/1.1 and HTTP/2 (#5758). The native gRPC dispatch ran the translation
-  adapter on the untranslated body, so after the backend's own trailer frame
-  it appended a synthesized `grpc-status: 2` frame (and would have base64
-  encoded a text body a second time). The backend's body now reaches the
-  client byte for byte, binary and text, with no synthesized trailer frame;
-  the gateway still frames its own deadline and authorization-expiry
-  terminals as gRPC-Web. The transaction log's `grpc_status` for these calls
-  is now read from the backend's final trailer frame instead of defaulting to
-  `UNKNOWN` (2): on HTTP/1.1 and HTTP/2, streamed or buffered, and on the
-  HTTP/3 cross-protocol and native HTTP/3 relays, streamed or buffered. The
-  HTTP/3 mesh-egress buffered bridge is not covered yet. A non-OK status there
-  feeds backend outcome accounting the way native gRPC trailers do, including
-  when the body is dropped after its final frame without a transaction
-  logger. A final frame that is present but unreadable (a compressed `0x81`
-  trailer frame, or a body under an HTTP `Content-Encoding`) leaves
-  `grpc_status` unset rather than `UNKNOWN`, and
-  `metadata.grpc_status_unreadable` names why (`compressed_trailer_frame` or
-  `content_encoded_body`); only a body with no final trailer frame at all is
-  still `UNKNOWN`. Translated gRPC-Web keeps reading its status from the
-  backend's HTTP/2 trailers.
 - An Ambient mesh proxy whose node-agent registry directory is missing now
   says so, repeatedly (#5766). `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`
   defaults to `/run/ferrum/node-waypoint-pods` and is authoritative for the
@@ -299,6 +277,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and circuit-breaker charging were already correct. A gRPC call's budget
   still starts when the rule is selected and its expiry is still not retried;
   both stay documented deviations.
+- Pass-through gRPC-Web (a route without the `grpc_web` plugin whose backend
+  already answers in gRPC-Web) no longer gains a second trailer frame on
+  HTTP/1.1 and HTTP/2 (#5758). The native gRPC dispatch ran the translation
+  adapter on the untranslated body, so after the backend's own trailer frame
+  it appended a synthesized `grpc-status: 2` frame (and would have base64
+  encoded a text body a second time). The backend's body now reaches the
+  client byte for byte, binary and text, with no synthesized trailer frame;
+  the gateway still frames its own deadline and authorization-expiry
+  terminals as gRPC-Web. The transaction log's `grpc_status` for these calls
+  is now read from the backend's final trailer frame instead of defaulting to
+  `UNKNOWN` (2): on HTTP/1.1 and HTTP/2, streamed or buffered, and on the
+  HTTP/3 cross-protocol and native HTTP/3 relays, streamed or buffered. The
+  HTTP/3 mesh-egress buffered bridge is not covered yet. A non-OK status there
+  feeds backend outcome accounting the way native gRPC trailers do, including
+  when the body is dropped after its final frame without a transaction
+  logger. A final frame that is present but unreadable (a compressed `0x81`
+  trailer frame, or a body under an HTTP `Content-Encoding`) leaves
+  `grpc_status` unset rather than `UNKNOWN`, and
+  `metadata.grpc_status_unreadable` names why (`compressed_trailer_frame` or
+  `content_encoded_body`); only a body with no final trailer frame at all is
+  still `UNKNOWN`. Translated gRPC-Web keeps reading its status from the
+  backend's HTTP/2 trailers.
 - `adaptive_concurrency` now relearns an obsolete minimum-latency baseline
   (#5737). The baseline was an all-time minimum, so one unusually fast success
   (a tiny `200`, a `304`, a cache hit) tightened the latency target forever:
