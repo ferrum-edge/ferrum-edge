@@ -45,7 +45,11 @@
 //! * An index that has never published admits NOTHING. Startup, a missing
 //!   registry directory, and a retracted (shutdown) index are all
 //!   indistinguishable from "this node enrolls no pods", which is the correct
-//!   refusal, not a reason to fall back to the identity view.
+//!   refusal, not a reason to fall back to the identity view. Refusal is not
+//!   silence, though (issue #5766): the default registry directory is armed
+//!   even on a host with no node agent, so the poller names the directory and
+//!   the missing node agent and repeats that warning while it stays
+//!   unavailable.
 //! * The poller consumes a **strict, bounded, all-or-nothing** registry
 //!   snapshot ([`PodCaptureSource::list_complete_targets`]), never the
 //!   best-effort [`PodCaptureSource::list_targets`] scan. Any missing
@@ -510,6 +514,40 @@ pub struct NodeLocalEnrolledDestinationsManager {
     index: Arc<NodeLocalEnrolledDestinations>,
     poll_interval: Duration,
     snapshot_unhealthy: AtomicBool,
+    /// Consecutive reconcile passes that retracted the index. Drives the
+    /// rate-limited repeat of the unavailable-registry warning (issue #5766).
+    consecutive_unavailable_polls: AtomicU64,
+    /// The registry directory this manager reads, when it is a filesystem
+    /// registry: the raw path for the missing-directory check and its
+    /// sanitized rendering for diagnostics.
+    registry_dir: Option<RegistryDirDiagnostic>,
+}
+
+/// How often a registry that stays unavailable re-emits its warning (issue
+/// #5766). A node with no node agent refuses every declared relay destination
+/// for as long as it runs; one startup line is too easy to miss, and one line
+/// per 2s poll would flood the log.
+pub const REGISTRY_UNAVAILABLE_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+struct RegistryDirDiagnostic {
+    path: std::path::PathBuf,
+    rendered: String,
+}
+
+/// Whether the `consecutive`-th unavailable poll (1-based) re-emits the
+/// unavailable-registry warning: the first failure always does, then once per
+/// [`REGISTRY_UNAVAILABLE_WARN_INTERVAL`] worth of polls at `poll_interval`.
+pub fn registry_unavailable_warning_due(consecutive: u64, poll_interval: Duration) -> bool {
+    if consecutive == 0 {
+        return false;
+    }
+    if consecutive == 1 {
+        return true;
+    }
+    let poll_ms = poll_interval.as_millis().max(1);
+    let every = (REGISTRY_UNAVAILABLE_WARN_INTERVAL.as_millis() / poll_ms).max(1);
+    u128::from(consecutive - 1).is_multiple_of(every)
 }
 
 /// Retract the enrolled set whenever the manager future leaves scope — not only
@@ -537,7 +575,25 @@ impl NodeLocalEnrolledDestinationsManager {
             index,
             poll_interval,
             snapshot_unhealthy: AtomicBool::new(false),
+            consecutive_unavailable_polls: AtomicU64::new(0),
+            registry_dir: None,
         }
+    }
+
+    /// Name the node-agent registry directory this manager reads, so the
+    /// unavailable-registry warning can say which path is missing (issue
+    /// #5766). The rendering goes through the startup diagnostic sanitizer.
+    pub fn with_registry_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        let path = dir.into();
+        let rendered = crate::startup::sanitize_startup_cause(path.display(), &[]);
+        self.registry_dir = Some(RegistryDirDiagnostic { path, rendered });
+        self
+    }
+
+    /// Consecutive reconcile passes that found the registry unavailable; `0`
+    /// while complete snapshots publish.
+    pub fn consecutive_unavailable_polls(&self) -> u64 {
+        self.consecutive_unavailable_polls.load(Ordering::Relaxed)
     }
 
     /// One reconcile pass. A complete snapshot is published wholesale; any
@@ -553,8 +609,10 @@ impl NodeLocalEnrolledDestinationsManager {
     /// Returns the entries that were published (empty after a retraction).
     /// Diagnostics are fixed-shape transition lines; the error payload is
     /// discarded so registry contents, identities, pod UIDs, and attacker-
-    /// controlled names never reach a log. The first retraction warns, repeated
-    /// failures are debug-only, and recovery warns once.
+    /// controlled names never reach a log. The first retraction warns, a
+    /// registry that stays unavailable re-warns once per
+    /// [`REGISTRY_UNAVAILABLE_WARN_INTERVAL`] (the polls in between are
+    /// debug-only), and recovery warns once.
     pub fn reconcile_once(&self) -> Vec<EnrolledPodEntry> {
         match self.source.list_complete_targets() {
             Ok(targets) => {
@@ -563,6 +621,7 @@ impl NodeLocalEnrolledDestinationsManager {
                     .filter_map(EnrolledPodEntry::from_capture_target)
                     .collect();
                 self.index.publish(&entries);
+                self.consecutive_unavailable_polls.store(0, Ordering::Relaxed);
                 if self.snapshot_unhealthy.swap(false, Ordering::Relaxed) {
                     warn!(
                         "Node-local enrolled destination registry recovered; complete snapshots \
@@ -573,19 +632,64 @@ impl NodeLocalEnrolledDestinationsManager {
             }
             Err(_) => {
                 self.index.clear();
-                if !self.snapshot_unhealthy.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "Node-local enrolled destination registry is unavailable; the \
-                         authenticated inbound HBONE relay inventory is retracted"
-                    );
+                self.snapshot_unhealthy.store(true, Ordering::Relaxed);
+                let consecutive = self
+                    .consecutive_unavailable_polls
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                if registry_unavailable_warning_due(consecutive, self.poll_interval) {
+                    self.warn_registry_unavailable(consecutive);
                 } else {
                     debug!(
+                        consecutive_unavailable_polls = consecutive,
                         "Node-local enrolled destination index remains retracted; \
                          registry snapshot was not complete"
                     );
                 }
                 Vec::new()
             }
+        }
+    }
+
+    /// The unavailable-registry warning. Fixed-shape: it names the directory
+    /// (sanitized) and whether it exists, never the snapshot error payload.
+    fn warn_registry_unavailable(&self, consecutive: u64) {
+        // Bounded to `u32::MAX` by construction, so the cast cannot truncate.
+        let elapsed_polls = consecutive.saturating_sub(1).min(u64::from(u32::MAX)) as u32;
+        let unavailable_for_secs = self.poll_interval.saturating_mul(elapsed_polls).as_secs();
+        let Some(dir) = &self.registry_dir else {
+            warn!(
+                consecutive_unavailable_polls = consecutive,
+                unavailable_for_secs,
+                "Node-local enrolled destination registry is unavailable; the \
+                 authenticated inbound HBONE relay inventory is retracted and every \
+                 declared relay destination is refused"
+            );
+            return;
+        };
+        if dir.path.is_dir() {
+            warn!(
+                registry_dir = %dir.rendered,
+                consecutive_unavailable_polls = consecutive,
+                unavailable_for_secs,
+                "Node-local enrolled destination registry is unavailable: the node agent's \
+                 enrolled-pod registry snapshot is incomplete or malformed; the authenticated \
+                 inbound HBONE relay inventory is retracted and every declared relay \
+                 destination is refused until a complete snapshot publishes"
+            );
+        } else {
+            warn!(
+                registry_dir = %dir.rendered,
+                consecutive_unavailable_polls = consecutive,
+                unavailable_for_secs,
+                "Node-local enrolled destination registry directory does not exist: no node \
+                 agent (`FERRUM_MODE=node_agent`) has published an enrolled-pod registry on \
+                 this node. The registry is authoritative for Ambient, so the authenticated \
+                 inbound HBONE relay refuses every declared relay destination (fail closed). \
+                 Run the node agent on this node, or clear \
+                 FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR to fall back to the weaker \
+                 identity/label relay bound"
+            );
         }
     }
 

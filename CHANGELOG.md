@@ -62,6 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An Ambient mesh proxy whose node-agent registry directory is missing now
+  says so, repeatedly (#5766). `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`
+  defaults to `/run/ferrum/node-waypoint-pods` and is authoritative for the
+  inbound HBONE relay even when no node agent runs, so every declared
+  destination is refused; previously the only signal was one generic warning
+  at startup. The warning now names the directory, says whether it is missing
+  (no node agent has published it) or present but incomplete, tells the
+  operator to run the node agent or clear the variable, and repeats every 60
+  seconds while the registry stays unavailable, with the consecutive failed
+  polls and elapsed seconds. Refusal stays the default. The configuration
+  reference documents that the default is authoritative without a node agent.
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,
   PR #5741). A client that withholds QUIC flow control parks the gateway's
