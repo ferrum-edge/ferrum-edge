@@ -2261,6 +2261,7 @@ dependencies = [
  "pin-project-lite",
  "prost",
  "prost-reflect",
+ "prost-types",
  "psl",
  "quinn",
  "rand 0.10.1",

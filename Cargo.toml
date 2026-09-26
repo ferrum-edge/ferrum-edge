@@ -168,6 +168,9 @@ tracing-appender = "0.2"
 tonic = { version = "0.14.6", features = ["tls-webpki-roots"] }
 tonic-prost = "0.14.6"
 prost = "0.14.3"
+# Well-known types (`google.protobuf.Struct`) for the SPIFFE Workload API
+# `ValidateJWTSVIDResponse.claims` field.
+prost-types = "0.14.3"
 tower = { version = "0.5", features = ["util"] }
 
 # JWT and auth
