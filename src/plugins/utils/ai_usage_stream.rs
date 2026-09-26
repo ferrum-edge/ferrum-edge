@@ -478,7 +478,7 @@ impl UsageStreamExtractor {
         }
         while let Some((line_end, next)) = sse_line_end(rest) {
             // A CR that ends the chunk may be the first half of a CRLF.
-            self.after_cr = next == rest.len() && rest[line_end] == b'\r';
+            self.after_cr = next == rest.len() && next == line_end + 1 && rest[line_end] == b'\r';
             let line = &rest[..line_end];
             rest = &rest[next..];
             if self.resyncing {

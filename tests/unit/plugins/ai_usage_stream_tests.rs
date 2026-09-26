@@ -706,6 +706,20 @@ fn crlf_split_across_chunks_does_not_dispatch_an_event_early() {
 }
 
 #[test]
+fn chunk_final_crlf_does_not_consume_next_chunks_dispatching_lf() {
+    // The first chunk ends with a complete CRLF, not the first half of one.
+    // Its following LF is therefore a blank line that must dispatch the
+    // multiline usage event before the terminal event starts.
+    let first = b"data: {\"usage\":\r\ndata: {\"prompt_tokens\":11,\"completion_tokens\":700,\"total_tokens\":711}}\r\n"
+        as &[u8];
+    let second = b"\ndata: [DONE]\n\n" as &[u8];
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[first, second], "total_tokens"),
+        Some(711)
+    );
+}
+
+#[test]
 fn stacked_leading_boms_are_stripped_before_the_first_sse_line() {
     // The usage event is the first event, so a BOM left on its field name
     // would hide it.
