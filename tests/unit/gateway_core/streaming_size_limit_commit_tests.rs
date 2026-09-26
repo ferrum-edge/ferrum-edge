@@ -51,6 +51,9 @@ const UNLIMITED_ADAPTERS: [&str; 6] = [
     "h3_coalescing",
 ];
 
+/// An adapter name paired with the body builder that fails with a backend reset.
+type BodyCase = (&'static str, fn() -> ProxyBody);
+
 /// Two ready chunks: the first fits the limit exactly, the second overruns it.
 fn over_limit_body() -> ProxyBody {
     size_limited_streaming_body_from_ready_chunks(
@@ -461,7 +464,7 @@ async fn http2_client_sees_the_committed_status_before_the_over_limit_reset() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn http2_client_sees_the_committed_status_before_an_h2_or_h3_backend_reset() {
-    let bodies: [(&str, fn() -> ProxyBody); 4] = [
+    let bodies: [BodyCase; 4] = [
         ("h2_direct", h2_direct_backend_reset_body),
         ("h2_coalescing", h2_coalescing_backend_reset_body),
         ("h3_direct", h3_direct_backend_reset_body),
