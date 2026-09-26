@@ -589,7 +589,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start like `event: mess` or `data: `) now ends that line with one LF before
   the terminal error event, so clients read `event: error` and its JSON data
   instead of joining them onto the partial line. No blank line is added, so the
-  open event is never dispatched (#5820).
+  partial start merges harmlessly into the error event. Bytes the same chunk
+  already cleared, such as the pass-through rest of an event whose data the
+  client already holds, now leave ahead of the error event instead of being
+  dropped, so that event ends intact. In a chain of stream inspectors the LF
+  follows what the client actually received, and a last inspector's cut at the
+  end of the stream keeps the bytes it released just before (#5820).
 
 ### Security
 

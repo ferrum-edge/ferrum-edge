@@ -7198,6 +7198,14 @@ pub trait ResponseStreamInspector: Send {
     /// no longer represents the client-visible stream.
     fn on_downstream_terminated(&mut self) {}
 
+    /// Called by a chain before each hook on an inspector that a later
+    /// inspector follows, with whether the bytes the chain already sent to the
+    /// client end mid-line (the last is neither CR nor LF). That inspector's
+    /// output is not what the client receives, and its `Terminate` payload
+    /// reaches the client without passing the later inspectors, so the payload
+    /// must not carry backend bytes. The default ignores it.
+    fn set_chained_client_line_open(&mut self, _open: bool) {}
+
     /// Called immediately before the owning stream task publishes inspector
     /// completion to terminal hooks.
     ///
@@ -7225,7 +7233,10 @@ pub fn chain_response_stream_inspectors(
         1 => inspectors.pop(),
         _ => {
             inspectors.sort_by_key(|inspector| inspector.stage());
-            Some(Box::new(ChainedResponseStreamInspector { inspectors }))
+            Some(Box::new(ChainedResponseStreamInspector {
+                inspectors,
+                client_line_open: false,
+            }))
         }
     }
 }
@@ -7352,6 +7363,10 @@ impl ResponseStreamInspector for CompletionNotifyingInspector {
 
     fn on_downstream_terminated(&mut self) {
         self.inner.on_downstream_terminated();
+    }
+
+    fn set_chained_client_line_open(&mut self, open: bool) {
+        self.inner.set_chained_client_line_open(open);
     }
 }
 
@@ -7737,15 +7752,41 @@ pub async fn normalize_response_body_for_inspection(
 /// `Terminate` actions short-circuit and cut the stream. A normalizer's terminal
 /// payload is different: it is the final client-visible window, so it is passed
 /// through every downstream inspector and their end-of-stream flushes before
-/// the chain returns `Terminate`. Same-call clean releases from a downstream
-/// policy cut are dropped, preserving the single-action contract.
+/// the chain returns `Terminate`. A policy cut drops what earlier inspectors
+/// released in the same call, since the cutting and later inspectors have not
+/// passed it; bytes the last inspector released earlier in the same call leave
+/// ahead of its terminal payload. The chain tracks whether the bytes it sent
+/// end mid-line and tells each inspector that a later one follows, so a cut
+/// there frames its terminal payload after what the client actually received.
 struct ChainedResponseStreamInspector {
     inspectors: Vec<Box<dyn ResponseStreamInspector>>,
+    /// Whether the bytes this chain returned so far end mid-line.
+    client_line_open: bool,
 }
 
 #[async_trait]
 impl ResponseStreamInspector for ChainedResponseStreamInspector {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let action = self.chunk_through(chunk).await;
+        self.note_sent(&action);
+        action
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        let action = self.end_through().await;
+        self.note_sent(&action);
+        action
+    }
+
+    fn on_before_drop(&mut self) {
+        for inspector in &mut self.inspectors {
+            inspector.on_before_drop();
+        }
+    }
+}
+
+impl ChainedResponseStreamInspector {
+    async fn chunk_through(&mut self, chunk: &[u8]) -> ResponseStreamAction {
         let mut buf = bytes::Bytes::copy_from_slice(chunk);
         for index in 0..self.inspectors.len() {
             if buf.is_empty() {
@@ -7753,6 +7794,7 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
                 // the rest of the chain to see.
                 return ResponseStreamAction::Forward(bytes::Bytes::new());
             }
+            self.prime(index);
             match self.inspectors[index].on_chunk(&buf).await {
                 ResponseStreamAction::Forward(out) => buf = out,
                 ResponseStreamAction::Terminate(final_bytes)
@@ -7772,13 +7814,14 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
         ResponseStreamAction::Forward(buf)
     }
 
-    async fn on_end(&mut self) -> ResponseStreamAction {
+    async fn end_through(&mut self) -> ResponseStreamAction {
         // Flush each inspector in order; bytes flushed by inspector *i* are fed to
         // inspector *i+1* as a final chunk before *i+1* is itself flushed.
         let mut carry = bytes::Bytes::new();
         for index in 0..self.inspectors.len() {
             let mut released = bytes::BytesMut::new();
             if !carry.is_empty() {
+                self.prime(index);
                 match self.inspectors[index].on_chunk(&carry).await {
                     ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
                     ResponseStreamAction::Terminate(final_bytes)
@@ -7795,6 +7838,7 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
                     }
                 }
             }
+            self.prime(index);
             match self.inspectors[index].on_end().await {
                 ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
                 ResponseStreamAction::Terminate(final_bytes)
@@ -7813,7 +7857,7 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
                 }
                 terminate @ ResponseStreamAction::Terminate(_) => {
                     self.notify_prior_downstream_terminated(index);
-                    return terminate;
+                    return self.cut_after_last_released(index, released, terminate);
                 }
             }
             carry = released.freeze();
@@ -7821,14 +7865,45 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
         ResponseStreamAction::Forward(carry)
     }
 
-    fn on_before_drop(&mut self) {
-        for inspector in &mut self.inspectors {
-            inspector.on_before_drop();
+    /// Tell inspector `index` whether the client's line is open when a later
+    /// inspector still sees its output.
+    fn prime(&mut self, index: usize) {
+        if index + 1 < self.inspectors.len() {
+            self.inspectors[index].set_chained_client_line_open(self.client_line_open);
         }
     }
-}
 
-impl ChainedResponseStreamInspector {
+    /// Record whether `action` leaves the client mid-line.
+    fn note_sent(&mut self, action: &ResponseStreamAction) {
+        if let ResponseStreamAction::Forward(bytes) = action
+            && let Some(&last) = bytes.last()
+        {
+            self.client_line_open = !matches!(last, b'\n' | b'\r');
+        }
+    }
+
+    /// A policy cut from the last inspector's `on_end` follows `released`, the
+    /// bytes its `on_chunk` released in the same call. Every inspector cleared
+    /// them and the cutting one framed its payload after them, so they leave
+    /// first; an earlier inspector's release has not passed the later ones and
+    /// stays dropped.
+    fn cut_after_last_released(
+        &self,
+        index: usize,
+        mut released: bytes::BytesMut,
+        action: ResponseStreamAction,
+    ) -> ResponseStreamAction {
+        match action {
+            ResponseStreamAction::Terminate(Some(final_bytes))
+                if index + 1 == self.inspectors.len() && !released.is_empty() =>
+            {
+                released.extend_from_slice(&final_bytes);
+                ResponseStreamAction::Terminate(Some(released.freeze()))
+            }
+            action => action,
+        }
+    }
+
     async fn finish_after_normalizer_termination(
         &mut self,
         normalizer_index: usize,
@@ -7840,6 +7915,7 @@ impl ChainedResponseStreamInspector {
             let stage = self.inspectors[index].stage();
             let mut released = bytes::BytesMut::new();
             if !carry.is_empty() {
+                self.prime(index);
                 match self.inspectors[index].on_chunk(&carry).await {
                     ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
                     ResponseStreamAction::Terminate(final_bytes)
@@ -7855,6 +7931,7 @@ impl ChainedResponseStreamInspector {
                     }
                 }
             }
+            self.prime(index);
             match self.inspectors[index].on_end().await {
                 ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
                 ResponseStreamAction::Terminate(final_bytes)
@@ -7869,7 +7946,7 @@ impl ChainedResponseStreamInspector {
                 }
                 terminate @ ResponseStreamAction::Terminate(_) => {
                     self.notify_prior_downstream_terminated(index);
-                    return terminate;
+                    return self.cut_after_last_released(index, released, terminate);
                 }
             }
             carry = released.freeze();
