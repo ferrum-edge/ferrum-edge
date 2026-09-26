@@ -22,8 +22,10 @@ use crate::tls::backend::{
     append_optional_pool_key_component, append_pool_key_component,
     backend_svid_generation_for_client_cert, backend_tls_config_cache_key,
 };
+use crate::tls::source::TLS_SOURCE_MAX_CONCURRENT_PREBUILDS;
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -114,6 +116,26 @@ impl ReqwestPoolManager {
         key.push_str(alpn);
         key.push_str(&tls_key);
         key
+    }
+
+    /// One [`ConnectionPool::prebuild_tls_configs_from_config`] build. The
+    /// input snapshot is taken only once the prebuild owns the key's
+    /// single-flight entry, so a reload while it waited for admission cannot
+    /// leave it building from superseded inputs.
+    async fn prebuild_reqwest_tls_config(&self, proxy: &Proxy, key: String, enable_http2: bool) {
+        let result = self
+            .backend_reqwest_tls_configs
+            .prebuild(key, || {
+                let inputs = self.backend_tls_inputs(proxy);
+                move || inputs.builder().build_rustls_for_reqwest(enable_http2)
+            })
+            .await;
+        if let Err(error) = result {
+            tracing::debug!(
+                error = %error,
+                "Backend TLS config prebuild failed; the first request retries it"
+            );
+        }
     }
 
     fn backend_tls_inputs(&self, proxy: &Proxy) -> OwnedBackendTlsConfigInputs {
@@ -476,16 +498,19 @@ impl ConnectionPool {
     /// that request (config load / reload).
     ///
     /// Covers every `HttpsPool` proxy, in the ALPN variant its effective pool
-    /// settings select. Builds run on the TLS source executor under background
-    /// admission, so they neither block a Tokio worker nor take the executor
-    /// slots reserved for request-path cold builds; identities that are
-    /// already cached, in flight, or backing off after a slow failure are not
-    /// rebuilt. Failures are logged and left to the request path, which still
-    /// fails closed.
+    /// settings select. Builds run on the TLS source executor as prebuilds
+    /// (see [`BackendTlsConfigCache::prebuild`]): the lowest admission class,
+    /// at most [`TLS_SOURCE_MAX_CONCURRENT_PREBUILDS`] at a time, admitted only
+    /// into idle capacity, and never registered where a request could join
+    /// them before they run. They neither block a Tokio worker nor delay
+    /// refreshes, reconcile work, or request-path cold builds. Identities that
+    /// are already cached, in flight, backing off after a slow failure, or
+    /// whose last prebuild failed are skipped. Failures are logged and left
+    /// to the request path, which still fails closed.
     pub async fn prebuild_tls_configs_from_config(&self, config: &GatewayConfig) {
         let manager = self.pool.manager();
         let mut seen = HashSet::new();
-        let mut builds = Vec::new();
+        let mut prebuilds = Vec::new();
         for proxy in &config.proxies {
             if proxy.dispatch_kind != DispatchKind::HttpsPool {
                 continue;
@@ -498,22 +523,12 @@ impl ConnectionPool {
             if !seen.insert(key.clone()) {
                 continue;
             }
-            let inputs = manager.backend_tls_inputs(proxy);
-            let build = move || inputs.builder().build_rustls_for_reqwest(enable_http2);
-            builds.push(async move {
-                let result = manager
-                    .backend_reqwest_tls_configs
-                    .prebuild(key, move || build)
-                    .await;
-                if let Err(error) = result {
-                    tracing::debug!(
-                        error = %error,
-                        "Backend TLS config prebuild failed; the first request retries it"
-                    );
-                }
-            });
+            let prebuild = manager.prebuild_reqwest_tls_config(proxy, key, enable_http2);
+            prebuilds.push(prebuild);
         }
-        futures_util::future::join_all(builds).await;
+        futures_util::stream::iter(prebuilds)
+            .for_each_concurrent(TLS_SOURCE_MAX_CONCURRENT_PREBUILDS, |prebuild| prebuild)
+            .await;
     }
 
     #[allow(dead_code)] // exercised from unit tests

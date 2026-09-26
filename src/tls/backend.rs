@@ -20,7 +20,7 @@ use crate::config::types::{BackendTlsConfig, Proxy, validate_backend_tls_san_all
 use crate::tls::san::ip_addr_from_san_bytes;
 use crate::tls::source::{
     CertSource, CertSourceUri, MaterialError, MaterialKind, SourceScheme, TlsSourceAdmission,
-    TlsSourceExecutor, load_material_blocking,
+    TlsSourceExecutor, TlsSourcePermits, load_material_blocking,
 };
 use crate::tls::{
     NoVerifier, TlsPolicy, backend_client_config_builder, build_server_verifier_with_crls,
@@ -234,6 +234,11 @@ impl OwnedBackendTlsConfigInputs {
 /// shared executor saturated. [`Self::clear`] (backend TLS / CRL reload) drops
 /// every such backoff.
 ///
+/// Config-load warming goes through [`Self::prebuild`], which is admitted to
+/// the executor before it registers its single-flight entry: a request never
+/// joins a prebuild that is still waiting for a slot, it starts its own
+/// request-path build instead.
+///
 /// [`TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER`]:
 /// crate::tls::source::TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER
 #[derive(Clone, Default)]
@@ -250,6 +255,28 @@ pub struct BackendTlsConfigCache {
     /// Keys whose last build failed after holding an executor slot for at
     /// least the per-source budget, with the time a new build may start.
     slow_failures: Arc<DashMap<String, SlowBackendTlsFailure>>,
+    /// Keys whose last [`Self::prebuild`] failed. Later config publications
+    /// skip them until a build succeeds or [`Self::clear`] reloads the inputs;
+    /// the request path still builds them on demand.
+    prebuild_failures: Arc<DashMap<String, ()>>,
+}
+
+/// What [`BackendTlsConfigCache::register_or_join`] found for a key.
+enum BackendTlsBuildSlot {
+    /// A build finished between the caller's miss and registration.
+    Cached(Arc<ClientConfig>),
+    /// Another caller's build for the key is in flight.
+    Joined(Arc<PendingBackendTlsBuild>),
+    /// This caller registered the build, under this clear epoch.
+    Leader(Arc<PendingBackendTlsBuild>, u64),
+}
+
+/// How a registered build reaches the executor.
+enum BackendTlsBuildAdmission {
+    /// A request-path build queues for admission after registering.
+    Queue(TlsSourceAdmission),
+    /// A prebuild was admitted before it registered.
+    Admitted(TlsSourcePermits),
 }
 
 /// Backoff left behind by a build that failed slowly (see
@@ -320,6 +347,10 @@ struct PendingBackendTlsPublisher {
     /// Per-source budget: a failure that held its slot this long backs the
     /// key off for the same span.
     slow_failure_backoff: std::time::Duration,
+    prebuild_failures: Arc<DashMap<String, ()>>,
+    /// Whether this is a [`BackendTlsConfigCache::prebuild`], whose failure
+    /// keeps the key out of later prebuild passes.
+    is_prebuild: bool,
     key: String,
     pending: Arc<PendingBackendTlsBuild>,
     published: bool,
@@ -329,10 +360,10 @@ impl PendingBackendTlsPublisher {
     fn publish(mut self, outcome: Result<TimedBackendTlsBuild, MaterialError>) {
         let outcome = match outcome {
             Ok(TimedBackendTlsBuild {
-                result: Ok(config),
-                ..
+                result: Ok(config), ..
             }) => {
                 self.slow_failures.remove(&self.key);
+                self.prebuild_failures.remove(&self.key);
                 Ok(self.insert(Arc::new(config)))
             }
             Ok(TimedBackendTlsBuild {
@@ -347,22 +378,37 @@ impl PendingBackendTlsPublisher {
             }
             Err(error) => Err(Arc::new(backend_tls_executor_error(error))),
         };
+        if outcome.is_err() && self.is_prebuild {
+            self.remember_failure(&self.prebuild_failures, ());
+        }
         self.finish(outcome);
     }
 
     /// Back the key off before the pending entry is retired, so a caller that
-    /// no longer finds this build in flight finds the backoff instead. Checked
-    /// under the entry guard like [`Self::insert`], so a failure from inputs a
-    /// [`BackendTlsConfigCache::clear`] superseded is not remembered.
+    /// no longer finds this build in flight finds the backoff instead.
     fn record_slow_failure(&self, error: &Arc<TlsError>) {
-        let entry = self.slow_failures.entry(self.key.clone());
+        let failure = SlowBackendTlsFailure {
+            retry_at: tokio::time::Instant::now() + self.slow_failure_backoff,
+            error: Arc::clone(error),
+        };
+        self.remember_failure(&self.slow_failures, failure);
+    }
+
+    /// Remember a failure for this key in `failures`. Checked under the entry
+    /// guard like [`Self::insert`], so a failure from inputs a
+    /// [`BackendTlsConfigCache::clear`] superseded, or for a numeric SVID
+    /// generation a drain already retired, is not remembered.
+    fn remember_failure<V>(&self, failures: &DashMap<String, V>, value: V) {
+        let entry = failures.entry(self.key.clone());
         if self.clear_epoch.load(Ordering::Acquire) != self.started_epoch {
             return;
         }
-        entry.insert(SlowBackendTlsFailure {
-            retry_at: tokio::time::Instant::now() + self.slow_failure_backoff,
-            error: Arc::clone(error),
-        });
+        if let Some(generation) = numeric_svid_generation_from_key(&self.key)
+            && self.retirement.is_numeric_generation_retired(generation)
+        {
+            return;
+        }
+        entry.insert(value);
     }
 
     /// Same insert contract as [`BackendTlsConfigCache::get_or_try_build`]:
@@ -443,6 +489,7 @@ impl BackendTlsConfigCache {
             pending: Arc::new(DashMap::with_shard_amount(shards)),
             clear_epoch: Arc::new(AtomicU64::new(0)),
             slow_failures: Arc::new(DashMap::with_shard_amount(shards)),
+            prebuild_failures: Arc::new(DashMap::with_shard_amount(shards)),
         }
     }
 
@@ -459,17 +506,19 @@ impl BackendTlsConfigCache {
         let matcher = SvidGenerationMatcher::new(generation);
         self.configs.retain(|key, _| !matcher.matches(key));
         self.slow_failures.retain(|key, _| !matcher.matches(key));
+        self.prebuild_failures.retain(|key, _| !matcher.matches(key));
     }
 
     pub fn clear(&self) {
         // Epoch first: an in-flight build that registered before this clear
         // must not re-insert a config built from the pre-clear inputs. Then
         // retire pending entries so later callers start a fresh build, and
-        // drop slow-failure backoffs so the reloaded inputs are tried at once.
+        // drop remembered failures so the reloaded inputs are tried at once.
         self.clear_epoch.fetch_add(1, Ordering::AcqRel);
         self.pending.clear();
         self.configs.clear();
         self.slow_failures.clear();
+        self.prebuild_failures.clear();
     }
 
     /// Keep only configs whose keys are in `live`.
@@ -480,6 +529,7 @@ impl BackendTlsConfigCache {
     pub fn retain_keys(&self, live: &HashSet<String>) {
         self.configs.retain(|key, _| live.contains(key));
         self.slow_failures.retain(|key, _| live.contains(key));
+        self.prebuild_failures.retain(|key, _| live.contains(key));
     }
 
     #[allow(dead_code)] // exercised from unit tests
@@ -568,29 +618,84 @@ impl BackendTlsConfigCache {
         }
         let executor = crate::tls::source::effective_tls_source_executor()
             .map_err(backend_tls_executor_error)?;
-        Box::pin(self.build_or_join(executor, TlsSourceAdmission::RequestPath, key, prepare)).await
+        Box::pin(self.build_or_join(executor, key, prepare)).await
     }
 
     /// Warm `key` ahead of the first request (config load / reload).
     ///
-    /// Same single-flight, insert, and backoff rules as [`Self::get_or_build`],
-    /// but the build is admitted as [`TlsSourceAdmission::Background`], so a
-    /// burst of prebuilds cannot take the executor slots reserved for cold
-    /// request-path builds. The caller's wait is bounded by the executor
-    /// deadline like any other; a build that outlives it still caches.
+    /// Skips a key that is cached, in flight, backing off after a slow
+    /// failure, or whose last prebuild failed. Otherwise the prebuild is
+    /// admitted as [`TlsSourceAdmission::Prebuild`] (the lowest class: bounded
+    /// concurrency, idle capacity only, never ahead of refreshes, reconcile
+    /// work, or request-path builds) *before* it registers the key's
+    /// single-flight entry. A request for the key therefore never waits on a
+    /// prebuild that has not started; it starts its own request-path build.
+    /// Once admitted, the prebuild waits for its build to finish, so a
+    /// prebuild pass never has more builds in flight than the executor's
+    /// prebuild concurrency. Insert and backoff rules match
+    /// [`Self::get_or_build`].
     pub async fn prebuild<P, F>(&self, key: String, prepare: P) -> Result<(), TlsError>
     where
         P: FnOnce() -> F,
         F: FnOnce() -> Result<ClientConfig, TlsError> + Send + 'static,
     {
-        if self.configs.contains_key(&key) {
+        if !self.needs_prebuild(&key) {
             return Ok(());
         }
         let executor = crate::tls::source::effective_tls_source_executor()
             .map_err(backend_tls_executor_error)?;
-        Box::pin(self.build_or_join(executor, TlsSourceAdmission::Background, key, prepare))
+        Box::pin(self.prebuild_with_executor(&executor, key, prepare)).await
+    }
+
+    /// [`Self::prebuild`] against an explicit executor, like
+    /// [`Self::get_or_build_with_executor`].
+    pub async fn prebuild_with_executor<P, F>(
+        &self,
+        executor: &TlsSourceExecutor,
+        key: String,
+        prepare: P,
+    ) -> Result<(), TlsError>
+    where
+        P: FnOnce() -> F,
+        F: FnOnce() -> Result<ClientConfig, TlsError> + Send + 'static,
+    {
+        debug_assert!(
+            backend_tls_pool_key_has_svid_field(&key),
+            "BackendTlsConfigCache::prebuild requires the key to be tagged with `|svidg=...`; call append_backend_svid_generation_key_field before this entry point"
+        );
+        if executor.prebuild_concurrency() == 0 || !self.needs_prebuild(&key) {
+            return Ok(());
+        }
+        let permits = executor
+            .admit(TlsSourceAdmission::Prebuild)
             .await
-            .map(|_| ())
+            .map_err(backend_tls_executor_error)?;
+        // A request may have built or started the key while this prebuild
+        // waited for admission; the permits go back unused.
+        if !self.needs_prebuild(&key) {
+            return Ok(());
+        }
+        let slot = self.register_or_join(&key);
+        let BackendTlsBuildSlot::Leader(pending, started_epoch) = slot else {
+            return Ok(());
+        };
+        self.spawn_build(
+            executor.clone(),
+            BackendTlsBuildAdmission::Admitted(permits),
+            key,
+            &pending,
+            started_epoch,
+            prepare,
+        );
+        pending.wait().await.map(|_| ())
+    }
+
+    /// Whether a prebuild for `key` has anything to do.
+    fn needs_prebuild(&self, key: &str) -> bool {
+        !self.configs.contains_key(key)
+            && !self.pending.contains_key(key)
+            && !self.prebuild_failures.contains_key(key)
+            && !self.is_backing_off(key)
     }
 
     /// [`Self::get_or_build`] against an explicit executor. Production uses the
@@ -606,27 +711,10 @@ impl BackendTlsConfigCache {
         P: FnOnce() -> F,
         F: FnOnce() -> Result<ClientConfig, TlsError> + Send + 'static,
     {
-        self.get_or_build_with_admission(executor, TlsSourceAdmission::RequestPath, key, prepare)
-            .await
-    }
-
-    /// [`Self::get_or_build_with_executor`] under an explicit admission class
-    /// ([`Self::prebuild`] uses [`TlsSourceAdmission::Background`]).
-    pub async fn get_or_build_with_admission<P, F>(
-        &self,
-        executor: &TlsSourceExecutor,
-        admission: TlsSourceAdmission,
-        key: String,
-        prepare: P,
-    ) -> Result<Arc<ClientConfig>, TlsError>
-    where
-        P: FnOnce() -> F,
-        F: FnOnce() -> Result<ClientConfig, TlsError> + Send + 'static,
-    {
         if let Some(existing) = self.configs.get(&key) {
             return Ok(existing.clone());
         }
-        Box::pin(self.build_or_join(executor.clone(), admission, key, prepare)).await
+        Box::pin(self.build_or_join(executor.clone(), key, prepare)).await
     }
 
     /// Number of single-flight builds currently in flight.
@@ -636,11 +724,17 @@ impl BackendTlsConfigCache {
     }
 
     /// Whether `key` is backing off after a slow failure.
-    #[allow(dead_code)] // exercised from unit tests
     pub fn is_backing_off(&self, key: &str) -> bool {
         self.slow_failures
             .get(key)
             .is_some_and(|failure| tokio::time::Instant::now() < failure.retry_at)
+    }
+
+    /// Whether the last prebuild of `key` failed, so config publications skip
+    /// it until a build succeeds or a [`Self::clear`].
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn is_prebuild_skipped(&self, key: &str) -> bool {
+        self.prebuild_failures.contains_key(key)
     }
 
     /// The remembered error while `key` backs off after a slow failure. An
@@ -660,7 +754,6 @@ impl BackendTlsConfigCache {
     async fn build_or_join<P, F>(
         &self,
         executor: TlsSourceExecutor,
-        admission: TlsSourceAdmission,
         key: String,
         prepare: P,
     ) -> Result<Arc<ClientConfig>, TlsError>
@@ -680,79 +773,114 @@ impl BackendTlsConfigCache {
         // This caller's total budget, queue time included. The build itself is
         // not bound by it: see `run_blocking_result_to_completion`.
         let wait_deadline = tokio::time::Instant::now() + executor.deadline();
-        let (pending, started_epoch) = match self.pending.entry(key.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => (Arc::clone(entry.get()), None),
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                // A leader inserts into `configs` before it retires its
-                // pending entry, so a vacant pending slot with a cached config
-                // means a build finished between the caller's miss and here.
-                if let Some(existing) = self.configs.get(entry.key()) {
-                    return Ok(existing.clone());
-                }
-                let started_epoch = self.clear_epoch.load(Ordering::Acquire);
-                let pending = Arc::new(PendingBackendTlsBuild::new());
-                entry.insert(Arc::clone(&pending));
-                (pending, Some(started_epoch))
+        let pending = match self.register_or_join(&key) {
+            BackendTlsBuildSlot::Cached(config) => return Ok(config),
+            BackendTlsBuildSlot::Joined(pending) => pending,
+            BackendTlsBuildSlot::Leader(pending, started_epoch) => {
+                let admission = BackendTlsBuildAdmission::Queue(TlsSourceAdmission::RequestPath);
+                self.spawn_build(executor, admission, key, &pending, started_epoch, prepare);
+                pending
             }
         };
-
-        match started_epoch {
-            Some(started_epoch) => {
-                let publisher = PendingBackendTlsPublisher {
-                    configs: Arc::clone(&self.configs),
-                    retirement: Arc::clone(&self.retirement),
-                    pending_builds: Arc::clone(&self.pending),
-                    clear_epoch: Arc::clone(&self.clear_epoch),
-                    started_epoch,
-                    slow_failures: Arc::clone(&self.slow_failures),
-                    slow_failure_backoff: executor.deadline(),
-                    key,
-                    pending: Arc::clone(&pending),
-                    published: false,
-                };
-                // The snapshot runs after registration, so it is taken at or
-                // after `started_epoch`; a reload that lands later bumps the
-                // epoch and keeps this result out of the cache.
-                let build = prepare();
-                let clear_epoch = Arc::clone(&self.clear_epoch);
-                tokio::spawn(async move {
-                    let outcome = executor
-                        .run_blocking_result_to_completion_with(admission, move || {
-                            // Admission can queue behind other builds. If a
-                            // reload landed meanwhile, this build's result can
-                            // no longer be cached, so give the slot back to
-                            // fresh builds instead of running it.
-                            if clear_epoch.load(Ordering::Acquire) != started_epoch {
-                                return Ok::<_, std::convert::Infallible>(TimedBackendTlsBuild {
-                                    result: Err(TlsError::Rustls(
-                                        RELOAD_CANCELLED_BUILD_DETAILS.to_string(),
-                                    )),
-                                    held: std::time::Duration::ZERO,
-                                });
-                            }
-                            let started = std::time::Instant::now();
-                            let result = build();
-                            Ok(TimedBackendTlsBuild {
-                                result,
-                                held: started.elapsed(),
-                            })
-                        })
-                        .await;
-                    let outcome = match outcome {
-                        Ok(Ok(timed)) => Ok(timed),
-                        Ok(Err(never)) => match never {},
-                        Err(error) => Err(error),
-                    };
-                    publisher.publish(outcome);
-                });
-            }
-            None => drop(prepare),
-        }
 
         match tokio::time::timeout_at(wait_deadline, pending.wait()).await {
             Ok(outcome) => outcome,
             Err(_) => Err(backend_tls_executor_error(MaterialError::DeadlineExceeded)),
         }
+    }
+
+    /// Join `key`'s in-flight build, or register the caller as its leader.
+    fn register_or_join(&self, key: &str) -> BackendTlsBuildSlot {
+        match self.pending.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                BackendTlsBuildSlot::Joined(Arc::clone(entry.get()))
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                // A leader inserts into `configs` before it retires its
+                // pending entry, so a vacant pending slot with a cached config
+                // means a build finished between the caller's miss and here.
+                if let Some(existing) = self.configs.get(entry.key()) {
+                    return BackendTlsBuildSlot::Cached(existing.clone());
+                }
+                let started_epoch = self.clear_epoch.load(Ordering::Acquire);
+                let pending = Arc::new(PendingBackendTlsBuild::new());
+                entry.insert(Arc::clone(&pending));
+                BackendTlsBuildSlot::Leader(pending, started_epoch)
+            }
+        }
+    }
+
+    /// Run the leader's build in its own task, so a cancelled caller neither
+    /// aborts it for the others nor leaves them waiting.
+    fn spawn_build<P, F>(
+        &self,
+        executor: TlsSourceExecutor,
+        admission: BackendTlsBuildAdmission,
+        key: String,
+        pending: &Arc<PendingBackendTlsBuild>,
+        started_epoch: u64,
+        prepare: P,
+    ) where
+        P: FnOnce() -> F,
+        F: FnOnce() -> Result<ClientConfig, TlsError> + Send + 'static,
+    {
+        let publisher = PendingBackendTlsPublisher {
+            configs: Arc::clone(&self.configs),
+            retirement: Arc::clone(&self.retirement),
+            pending_builds: Arc::clone(&self.pending),
+            clear_epoch: Arc::clone(&self.clear_epoch),
+            started_epoch,
+            slow_failures: Arc::clone(&self.slow_failures),
+            slow_failure_backoff: executor.deadline(),
+            prebuild_failures: Arc::clone(&self.prebuild_failures),
+            is_prebuild: matches!(admission, BackendTlsBuildAdmission::Admitted(_)),
+            key,
+            pending: Arc::clone(pending),
+            published: false,
+        };
+        // The snapshot runs after registration, so it is taken at or after
+        // `started_epoch`; a reload that lands later bumps the epoch and keeps
+        // this result out of the cache.
+        let build = prepare();
+        let clear_epoch = Arc::clone(&self.clear_epoch);
+        let operation = move || {
+            // Admission can queue behind other builds. If a reload landed
+            // meanwhile, this build's result can no longer be cached, so give
+            // the slot back to fresh builds instead of running it.
+            if clear_epoch.load(Ordering::Acquire) != started_epoch {
+                let cancelled = TlsError::Rustls(RELOAD_CANCELLED_BUILD_DETAILS.to_string());
+                return Ok::<_, std::convert::Infallible>(TimedBackendTlsBuild {
+                    result: Err(cancelled),
+                    held: std::time::Duration::ZERO,
+                });
+            }
+            let started = std::time::Instant::now();
+            let result = build();
+            Ok(TimedBackendTlsBuild {
+                result,
+                held: started.elapsed(),
+            })
+        };
+        tokio::spawn(async move {
+            let outcome = match admission {
+                BackendTlsBuildAdmission::Queue(admission) => {
+                    executor
+                        .run_blocking_result_to_completion_with(admission, operation)
+                        .await
+                }
+                BackendTlsBuildAdmission::Admitted(permits) => {
+                    executor
+                        .run_admitted_to_completion(permits, operation)
+                        .await
+                }
+            };
+            let outcome = match outcome {
+                Ok(Ok(timed)) => Ok(timed),
+                Ok(Err(never)) => match never {},
+                Err(error) => Err(error),
+            };
+            publisher.publish(outcome);
+        });
     }
 }
 

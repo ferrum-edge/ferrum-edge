@@ -8235,11 +8235,11 @@ impl ProxyState {
     /// the cache instead of paying the cold build.
     ///
     /// Fire-and-forget: publication never waits on material I/O. The builds
-    /// run on the TLS source executor under background admission (see
-    /// [`ConnectionPool::prebuild_tls_configs_from_config`]), share the
-    /// request path's single-flight entries, and identities that are already
-    /// cached are skipped, so a republication with no TLS change costs only
-    /// the key scan. Without a Tokio runtime (focused sync tests) this is a
+    /// run on the TLS source executor as its lowest admission class (see
+    /// [`ConnectionPool::prebuild_tls_configs_from_config`]), claim an
+    /// identity's single-flight entry only once they run, and identities that
+    /// are already cached are skipped, so a republication with no TLS change
+    /// costs only the key scan. Without a Tokio runtime (focused sync tests) this is a
     /// no-op and the request path builds on first use as before.
     fn spawn_backend_tls_prebuild(&self, config: Arc<GatewayConfig>) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {

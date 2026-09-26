@@ -10,13 +10,16 @@
 //! bounded background budget, and a late success is cached for the next
 //! request. A build that fails only after holding its executor slot for the
 //! whole per-source budget backs its key off, and background work can never
-//! take the executor slots reserved for request-path builds.
+//! take the executor slots reserved for request-path builds. Config-load
+//! prebuilds are the lowest class: bounded, admitted only into idle capacity,
+//! and never registered where a request could join them before they run.
 
 use ferrum_edge::tls::backend::{BackendTlsConfigCache, TlsError};
 use ferrum_edge::tls::source::{
     MaterialError, TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER, TlsSourceAdmission,
     TlsSourceExecutor, remaining_tls_source_operation_budget,
-    resolve_on_tls_source_runtime_for_test, tls_source_request_path_reserved_permits,
+    resolve_on_tls_source_runtime_for_test, tls_source_prebuild_permits,
+    tls_source_request_path_reserved_permits,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -850,7 +853,9 @@ async fn wait_until_idle(cache: &BackendTlsConfigCache) {
 /// and start no build, and the first miss after it builds again.
 #[tokio::test(flavor = "current_thread")]
 async fn slow_failure_backs_the_key_off_for_one_budget() {
-    const BUDGET: Duration = Duration::from_millis(200);
+    // Wide enough that scheduling delay on a loaded CI host cannot outlast
+    // the backoff window between the build publishing and the assertions.
+    const BUDGET: Duration = Duration::from_secs(1);
 
     let cache = BackendTlsConfigCache::new();
     let executor = test_executor(2, BUDGET);
@@ -919,13 +924,14 @@ async fn slow_failure_backs_the_key_off_for_one_budget() {
 /// inputs are tried on the next miss.
 #[tokio::test(flavor = "current_thread")]
 async fn clear_drops_slow_failure_backoff() {
-    const BUDGET: Duration = Duration::from_millis(100);
+    // See `slow_failure_backs_the_key_off_for_one_budget`.
+    const BUDGET: Duration = Duration::from_secs(1);
 
     let cache = BackendTlsConfigCache::new();
     let executor = test_executor(2, BUDGET);
     let _ = cache
         .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), || {
-            slow_failing_build(BUDGET + Duration::from_millis(20))
+            slow_failing_build(BUDGET + Duration::from_millis(50))
         })
         .await;
     wait_until_idle(&cache).await;
@@ -1060,63 +1066,359 @@ async fn deadline_bound_refresh_work_is_admitted_as_background() {
         .expect("parked result");
 }
 
-/// A prebuild is admitted as background work, so with the background share
-/// busy it cannot start, while a request-path miss for another key still can.
+/// A background operation parked by [`park_background_work`].
+type ParkedWork = tokio::task::JoinHandle<Result<Result<(), ()>, MaterialError>>;
+
+/// Park `count` background operations on `executor` until `release` is set,
+/// returning once every one of them runs.
+async fn park_background_work(
+    executor: &TlsSourceExecutor,
+    count: usize,
+    release: &Arc<AtomicBool>,
+) -> Vec<ParkedWork> {
+    let started = Arc::new(AtomicUsize::new(0));
+    let parked = (0..count)
+        .map(|_| {
+            let executor = executor.clone();
+            let started = Arc::clone(&started);
+            let release = Arc::clone(release);
+            let operation = move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                park_until(&release);
+                Ok::<_, ()>(())
+            };
+            tokio::spawn(async move {
+                executor
+                    .run_blocking_result_to_completion_with(
+                        TlsSourceAdmission::Background,
+                        operation,
+                    )
+                    .await
+            })
+        })
+        .collect();
+    tokio::time::timeout(RELEASE_TIMEOUT, async {
+        while started.load(Ordering::SeqCst) < count {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("background work parks");
+    parked
+}
+
+async fn finish_parked(parked: Vec<ParkedWork>) {
+    for task in parked {
+        task.await
+            .expect("parked task")
+            .expect("parked operation")
+            .expect("parked result");
+    }
+}
+
+/// A prebuild is the lowest admission class: it runs only in idle capacity
+/// that still leaves a background slot free. With all but one background slot
+/// busy it waits without registering its key, while a refresh and a
+/// request-path miss are both admitted at once; it runs once capacity frees.
 #[tokio::test(flavor = "current_thread")]
-async fn prebuild_admission_leaves_the_reserved_slot_to_requests() {
+async fn prebuild_waits_for_idle_capacity_behind_refreshes_and_requests() {
     const OTHER_KEY: &str = "ca=|cert=|key=|sni=other|san=|verify=1|svidg=static";
 
+    assert_eq!(tls_source_prebuild_permits(1), 0);
+    assert_eq!(tls_source_prebuild_permits(2), 0);
+    assert_eq!(tls_source_prebuild_permits(3), 1);
+    assert_eq!(tls_source_prebuild_permits(8), 2);
+
     let cache = BackendTlsConfigCache::new();
-    let executor = test_executor(2, Duration::from_millis(200));
+    // One slot reserved for request-path builds, three for background work.
+    let executor = test_executor(4, Duration::from_millis(500));
+    assert_eq!(executor.prebuild_concurrency(), 2);
     let release = Arc::new(AtomicBool::new(false));
-    let (started_tx, started_rx) = oneshot::channel();
-    let parked = tokio::spawn({
+    let parked = park_background_work(&executor, 2, &release).await;
+
+    let prebuilt = Arc::new(AtomicBool::new(false));
+    let prebuild = tokio::spawn({
+        let cache = cache.clone();
         let executor = executor.clone();
-        let release = Arc::clone(&release);
+        let prebuilt = Arc::clone(&prebuilt);
         async move {
-            executor
-                .run_blocking_result_to_completion_with(TlsSourceAdmission::Background, move || {
-                    let _ = started_tx.send(());
-                    park_until(&release);
-                    Ok::<_, ()>(())
+            let key = OTHER_KEY.to_string();
+            cache
+                .prebuild_with_executor(&executor, key, move || -> TestBuild {
+                    Box::new(move || -> BuildResult {
+                        prebuilt.store(true, Ordering::SeqCst);
+                        Ok(test_client_config())
+                    })
                 })
                 .await
         }
     });
-    started_rx.await.expect("background operation started");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        cache.pending_builds(),
+        0,
+        "a prebuild that is not admitted registers nothing"
+    );
 
-    let prebuilt = Arc::new(AtomicBool::new(false));
-    let prebuild_ran = Arc::clone(&prebuilt);
-    let prebuild = cache
-        .get_or_build_with_admission(
-            &executor,
-            TlsSourceAdmission::Background,
-            OTHER_KEY.to_string(),
-            move || -> TestBuild {
-                Box::new(move || -> BuildResult {
-                    prebuild_ran.store(true, Ordering::SeqCst);
-                    Ok(test_client_config())
-                })
-            },
-        )
-        .await;
-    assert!(prebuild.is_err(), "the prebuild waits for a background slot");
-    assert!(!prebuilt.load(Ordering::SeqCst));
-
+    executor
+        .run_blocking(|| Ok(()))
+        .await
+        .expect("a refresh takes the background slot the prebuild leaves free");
     cache
         .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), ok_build)
         .await
         .expect("a request-path miss uses the reserved slot");
     assert!(cache.contains_key(STATIC_KEY));
+    assert!(
+        !prebuilt.load(Ordering::SeqCst),
+        "the prebuild must not take the last free background slot"
+    );
 
     release.store(true, Ordering::SeqCst);
-    parked
+    finish_parked(parked).await;
+    tokio::time::timeout(RELEASE_TIMEOUT, prebuild)
         .await
-        .expect("parked task")
-        .expect("parked operation")
-        .expect("parked result");
-    wait_until_cached(&cache, OTHER_KEY).await;
+        .expect("the prebuild runs once capacity frees")
+        .expect("prebuild task")
+        .expect("prebuild");
     assert!(prebuilt.load(Ordering::SeqCst));
+    assert!(cache.contains_key(OTHER_KEY));
+}
+
+/// A request for a key whose prebuild is still waiting for admission does not
+/// join it: the prebuild has not registered the key, so the request starts
+/// its own request-path build on the reserved slot and gets its config within
+/// the deadline. The prebuild then finds the key cached and builds nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn request_does_not_wait_on_an_unadmitted_prebuild_of_its_key() {
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(4, Duration::from_millis(500));
+    let release = Arc::new(AtomicBool::new(false));
+    // Every background slot is busy, so the prebuild cannot be admitted.
+    let parked = park_background_work(&executor, 3, &release).await;
+
+    let prebuild_prepared = Arc::new(AtomicBool::new(false));
+    let prebuild = tokio::spawn({
+        let cache = cache.clone();
+        let executor = executor.clone();
+        let prebuild_prepared = Arc::clone(&prebuild_prepared);
+        async move {
+            let key = STATIC_KEY.to_string();
+            cache
+                .prebuild_with_executor(&executor, key, move || {
+                    prebuild_prepared.store(true, Ordering::SeqCst);
+                    ok_build()
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(cache.pending_builds(), 0);
+
+    cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), ok_build)
+        .await
+        .expect("the request builds on the reserved slot instead of joining the prebuild");
+    assert!(cache.contains_key(STATIC_KEY));
+
+    release.store(true, Ordering::SeqCst);
+    finish_parked(parked).await;
+    tokio::time::timeout(RELEASE_TIMEOUT, prebuild)
+        .await
+        .expect("the prebuild finishes once admitted")
+        .expect("prebuild task")
+        .expect("prebuild");
+    assert!(
+        !prebuild_prepared.load(Ordering::SeqCst),
+        "the prebuild must not rebuild a key the request cached"
+    );
+}
+
+fn burst_key(index: usize) -> String {
+    format!("ca=|cert=|key=|sni=burst-{index}|san=|verify=1|svidg=static")
+}
+
+/// A config load with many identities prebuilds at most the prebuild
+/// concurrency at once and registers only the admitted builds. A refresh
+/// competing with the burst is admitted at once and finishes within its
+/// deadline, and a request for a key still queued in the burst builds it
+/// itself.
+#[tokio::test(flavor = "current_thread")]
+async fn refresh_completes_within_its_deadline_during_a_prebuild_burst() {
+    const BURST: usize = 32;
+    const DEADLINE: Duration = Duration::from_millis(500);
+
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(8, DEADLINE);
+    let running = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let burst: Vec<_> = (0..BURST)
+        .map(|index| {
+            let cache = cache.clone();
+            let executor = executor.clone();
+            let running = Arc::clone(&running);
+            let peak = Arc::clone(&peak);
+            let release = Arc::clone(&release);
+            let build = move || -> BuildResult {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                park_until(&release);
+                running.fetch_sub(1, Ordering::SeqCst);
+                Ok(test_client_config())
+            };
+            tokio::spawn(async move {
+                let key = burst_key(index);
+                cache
+                    .prebuild_with_executor(&executor, key, move || build)
+                    .await
+            })
+        })
+        .collect();
+    tokio::time::timeout(RELEASE_TIMEOUT, async {
+        while running.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the burst starts its first prebuilds");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(running.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        cache.pending_builds(),
+        2,
+        "only admitted prebuilds register a single-flight entry"
+    );
+
+    let refresh = tokio::time::timeout(DEADLINE, executor.run_blocking(|| Ok(7_u8)))
+        .await
+        .expect("a refresh must not queue behind the prebuild burst")
+        .expect("the refresh is admitted within its deadline");
+    assert_eq!(refresh, 7);
+
+    let queued_key = burst_key(BURST - 1);
+    cache
+        .get_or_build_with_executor(&executor, queued_key.clone(), ok_build)
+        .await
+        .expect("a request for a queued prebuild's key builds it itself");
+    assert!(cache.contains_key(&queued_key));
+
+    release.store(true, Ordering::SeqCst);
+    for task in burst {
+        tokio::time::timeout(RELEASE_TIMEOUT, task)
+            .await
+            .expect("the burst drains")
+            .expect("prebuild task")
+            .expect("prebuild");
+    }
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+    for index in 0..BURST {
+        assert!(cache.contains_key(&burst_key(index)));
+    }
+    assert_eq!(cache.pending_builds(), 0);
+}
+
+/// A prebuild that fails is skipped by later config publications, while the
+/// request path still builds the key on demand. A successful build or a
+/// backend TLS / CRL reload makes the key eligible for prebuilds again.
+#[tokio::test(flavor = "current_thread")]
+async fn failed_prebuild_is_skipped_by_later_publications() {
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(4, Duration::from_secs(5));
+    let failing_build = || -> TestBuild {
+        Box::new(|| -> BuildResult {
+            Err(TlsError::Rustls("missing CA bundle".to_string()))
+        })
+    };
+
+    let first = cache
+        .prebuild_with_executor(&executor, STATIC_KEY.to_string(), failing_build)
+        .await;
+    assert!(first.is_err(), "a failed prebuild reports its failure");
+    assert!(cache.is_prebuild_skipped(STATIC_KEY));
+    assert_eq!(cache.pending_builds(), 0);
+
+    let prepared = Arc::new(AtomicBool::new(false));
+    let retry_prepared = Arc::clone(&prepared);
+    cache
+        .prebuild_with_executor(&executor, STATIC_KEY.to_string(), move || {
+            retry_prepared.store(true, Ordering::SeqCst);
+            ok_build()
+        })
+        .await
+        .expect("a skipped prebuild is a no-op");
+    assert!(!prepared.load(Ordering::SeqCst), "no build may start");
+    assert!(!cache.contains_key(STATIC_KEY));
+
+    cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), ok_build)
+        .await
+        .expect("the request path still builds the key");
+    assert!(!cache.is_prebuild_skipped(STATIC_KEY));
+
+    cache.clear();
+    let _ = cache
+        .prebuild_with_executor(&executor, STATIC_KEY.to_string(), failing_build)
+        .await;
+    assert!(cache.is_prebuild_skipped(STATIC_KEY));
+    cache.clear();
+    assert!(!cache.is_prebuild_skipped(STATIC_KEY));
+    cache
+        .prebuild_with_executor(&executor, STATIC_KEY.to_string(), ok_build)
+        .await
+        .expect("after a reload the key is prebuilt again");
+    assert!(cache.contains_key(STATIC_KEY));
+}
+
+/// A miss whose build parks until `release`, then fails the way a remote
+/// source that is down does.
+async fn parked_failing_miss(
+    cache: &BackendTlsConfigCache,
+    executor: &TlsSourceExecutor,
+    key: &str,
+    release: &Arc<AtomicBool>,
+) -> Result<Arc<rustls::ClientConfig>, TlsError> {
+    let release = Arc::clone(release);
+    cache
+        .get_or_build_with_executor(executor, key.to_string(), move || -> TestBuild {
+            Box::new(move || -> BuildResult {
+                park_until(&release);
+                Err(TlsError::Rustls(
+                    "remote source deadline exceeded".to_string(),
+                ))
+            })
+        })
+        .await
+}
+
+/// A slow failure that publishes after its numeric SVID generation was
+/// drained leaves no backoff behind, just as a late success of a drained
+/// generation is not cached; a live generation still backs off.
+#[tokio::test(flavor = "current_thread")]
+async fn slow_failure_of_a_drained_svid_generation_leaves_no_backoff() {
+    const BUDGET: Duration = Duration::from_secs(1);
+    const DRAINED_KEY: &str = "ca=|cert=|key=|sni=|san=|verify=1|svidg=5";
+    const LIVE_KEY: &str = "ca=|cert=|key=|sni=|san=|verify=1|svidg=6";
+
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(4, BUDGET);
+    let release = Arc::new(AtomicBool::new(false));
+    let drained = parked_failing_miss(&cache, &executor, DRAINED_KEY, &release);
+    let live = parked_failing_miss(&cache, &executor, LIVE_KEY, &release);
+    let (drained, live) = tokio::join!(drained, live);
+    assert!(drained.is_err() && live.is_err(), "waiters fail closed");
+
+    cache.drain_svid_generation(5);
+    // Both builds have now held their slots for more than the budget.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    release.store(true, Ordering::SeqCst);
+    wait_until_idle(&cache).await;
+
+    assert!(
+        !cache.is_backing_off(DRAINED_KEY),
+        "a drained generation must not be backed off"
+    );
+    assert!(cache.is_backing_off(LIVE_KEY));
 }
 
 /// WebSocket (`wss://`) backends take their rustls config from the cached,
@@ -1137,7 +1439,11 @@ fn websocket_backend_dial_never_builds_tls_synchronously() {
         body.contains(".get_websocket_tls_config_for_backend(proxy)"),
         "the WebSocket dialer must use the cached backend TLS config"
     );
-    for forbidden in ["BackendTlsConfigBuilder", "build_rustls", "get_or_try_build"] {
+    for forbidden in [
+        "BackendTlsConfigBuilder",
+        "build_rustls",
+        "get_or_try_build",
+    ] {
         assert!(
             !body.contains(forbidden),
             "the WebSocket dialer must not build TLS on the worker ({forbidden})"

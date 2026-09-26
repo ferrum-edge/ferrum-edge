@@ -2535,7 +2535,9 @@ async fn config_prebuild_warms_reqwest_tls_configs_per_identity() {
     assert_eq!(cache.pending_builds(), 0);
 
     // The first request reuses the prebuilt config instead of building.
-    pool.get_client(&first).await.expect("client from prebuilt TLS");
+    pool.get_client(&first)
+        .await
+        .expect("client from prebuilt TLS");
     assert_eq!(pool.backend_reqwest_tls_config_cache().len(), 1);
 
     // A republication with nothing new is a no-op.

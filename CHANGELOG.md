@@ -473,7 +473,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is 2 or more) is reserved for request-path builds, so refreshes, reconcile work, and
   prebuilds cannot starve them. Every config load or reload prebuilds, in the
   background, the reqwest backend TLS config of each HTTPS proxy whose TLS identity
-  is not cached yet.
+  is not cached yet. Prebuilds are the lowest executor class: at most two run at a
+  time, only in idle capacity that leaves a slot for refreshes and reconcile work, and
+  an identity is claimed only once its prebuild runs, so a request never waits behind
+  a queued prebuild and refreshes never queue behind a prebuild burst. An identity
+  whose prebuild failed is not prebuilt again until it builds or a reload.
 
 ## [0.9.7] - 2026-09-25
 
