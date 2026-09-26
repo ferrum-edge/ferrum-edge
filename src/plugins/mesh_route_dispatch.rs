@@ -2148,14 +2148,15 @@ impl Plugin for MeshRouteDispatch {
                 if let Some(redirect) = rule.redirect.as_ref() {
                     return build_redirect_response(ctx, headers, redirect);
                 }
-                // Per-rule fault action: fire BEFORE setting any route
-                // override on the context. If the fault aborts, the
-                // request never reaches backend dispatch so the override
-                // would be wasted work — and skipping the assignment
-                // keeps `ctx.route_override_*` untouched (mirroring the
-                // proxy-scoped `fault_injection` plugin's behaviour where
-                // an aborted request never reaches the route override
-                // stage).
+                // Per-rule fault action: fire BEFORE setting any backend
+                // route override on the context. If the fault aborts, the
+                // request never reaches backend dispatch, so the
+                // destination / timeout / retry / rewrite / request-transform
+                // overrides stay unset (mirroring the proxy-scoped
+                // `fault_injection` plugin, where an aborted request never
+                // reaches the route override stage). Only the response
+                // transform published above applies, because the abort is
+                // a response this rule generates.
                 if let Some(fault) = rule.fault.as_ref()
                     && let Some(result) = apply_fault_action(ctx, rule, fault).await
                 {
@@ -2164,6 +2165,11 @@ impl Plugin for MeshRouteDispatch {
                 if let Some(result) =
                     reject_node_waypoint_authz_destination_override(ctx, &rule.destination)
                 {
+                    // A security denial is not a response this rule
+                    // generates: tenant route policy must never decorate
+                    // it, so withdraw the response list published above.
+                    ctx.route_override_response_transform = None;
+                    ctx.route_override_response_transform_published = false;
                     return result;
                 }
                 // Route overrides are a whole-destination decision, not a

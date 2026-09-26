@@ -3292,3 +3292,47 @@ async fn later_redirect_instance_replaces_an_earlier_response_transform() {
     );
     assert!(!cleared.route_override_response_transform_published);
 }
+
+#[tokio::test]
+async fn node_waypoint_authz_denial_carries_no_route_response_transform() {
+    // A NodeWaypoint authorization 403 is a security denial, not a response
+    // the matched rule generates: tenant route response policy must never
+    // decorate it, including a list an earlier instance published.
+    let earlier = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"upstream_id": "stable"},
+        "response_transform": [
+            {"operation": "update", "target": "header", "key": "X-Earlier", "value": "1"}
+        ]
+    }]}))
+    .expect("earlier instance");
+    let denied = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"upstream_id": "canary"},
+        "response_transform": [
+            {"operation": "update", "target": "header", "key": "X-Route", "value": "1"}
+        ]
+    }]}))
+    .expect("denied instance");
+    let mut request = ctx();
+    request.metadata.insert(
+        "mesh_authz.node_waypoint_authorized_upstream_id".to_string(),
+        "stable".to_string(),
+    );
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        earlier.before_proxy(&mut request, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(response_transform_keys(&request), ["x-earlier"]);
+
+    match denied.before_proxy(&mut request, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("unauthorized NodeWaypoint override must reject, got {other:?}"),
+    }
+    assert!(
+        request.route_override_response_transform.is_none(),
+        "a security denial must not carry route response headers"
+    );
+    assert!(!request.route_override_response_transform_published);
+}

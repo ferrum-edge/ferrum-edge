@@ -44,6 +44,19 @@ fn route(rules: Value) -> K8sObject {
     }
 }
 
+/// Markers the translator embeds so the status writer can pick the
+/// `Accepted=False` reason: `UnsupportedValue` for a CRD-valid shape Ferrum
+/// declines, `IncompatibleFilters` for an unimplemented filter field. A refusal
+/// carrying neither is `Invalid`.
+const UNSUPPORTED_SHAPE_MARKER: &str = "is not implemented by Ferrum";
+const INCOMPATIBLE_FILTERS_MARKER: &str = "incompatible Gateway API filters";
+
+fn translate_route_error(rules: Value) -> String {
+    let error = translate_k8s_objects(&[route(rules)], options())
+        .expect_err("route should be refused");
+    format!("{error}")
+}
+
 fn translate_route_plugins(rules: Value) -> Vec<PluginConfig> {
     let plugins = translate_k8s_objects(&[route(rules)], options())
         .expect("route should materialize")
@@ -73,11 +86,7 @@ fn emitted_dispatch(plugins: &[PluginConfig]) -> (Value, MeshRouteDispatch) {
 }
 
 fn request(path: &str, query: &str) -> RequestContext {
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        path.to_string(),
-    );
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
     ctx.set_raw_query_string(query.to_string());
     ctx
 }
@@ -266,4 +275,185 @@ async fn generated_fault_answer_carries_the_rule_response_header_modifier() {
     }
     assert_eq!(published_response_keys(&ctx), ["x-route"]);
     assert!(ctx.route_override_response_transform_published);
+}
+
+// ── RequestRedirect path admission (#5752) ─────────────────────────────────
+
+fn redirect_rule(matches: Value, path: Value) -> Value {
+    json!([{
+        "matches": matches,
+        "filters": [{"type": "RequestRedirect", "requestRedirect": {
+            "statusCode": 302,
+            "path": path
+        }}]
+    }])
+}
+
+fn prefix_match(prefix: &str) -> Value {
+    json!([{"path": {"type": "PathPrefix", "value": prefix}}])
+}
+
+#[test]
+fn request_redirect_path_rejects_unsupported_shapes() {
+    // A redirect path is validated exactly like a `URLRewrite` path: a
+    // relative, query-carrying or dot-segment replacement would otherwise
+    // compose a corrupted `Location`, so the route is refused (Accepted=False)
+    // rather than materialized. Reasons follow WHAT is wrong: a bad value is
+    // `Invalid`, an unknown `type` is `UnsupportedValue`, an unimplemented
+    // `path` field is `IncompatibleFilters`.
+    const INVALID: &str = "Invalid";
+    const UNSUPPORTED: &str = "UnsupportedValue";
+    const INCOMPATIBLE: &str = "IncompatibleFilters";
+    let cases = [
+        // Non-absolute replacements.
+        (
+            json!({"type": "ReplaceFullPath", "replaceFullPath": "v2"}),
+            INVALID,
+            "absolute path",
+        ),
+        (
+            json!({"type": "ReplacePrefixMatch", "replacePrefixMatch": "new"}),
+            INVALID,
+            "absolute path",
+        ),
+        (
+            json!({"type": "ReplaceFullPath", "replaceFullPath": "/v2?a=b"}),
+            INVALID,
+            "absolute path",
+        ),
+        // Dot-segment replacements.
+        (
+            json!({"type": "ReplaceFullPath", "replaceFullPath": "/v2/../etc"}),
+            INVALID,
+            "not canonical",
+        ),
+        (
+            json!({"type": "ReplacePrefixMatch", "replacePrefixMatch": "/a/./b"}),
+            INVALID,
+            "not canonical",
+        ),
+        // The field each `type` requires.
+        (
+            json!({"type": "ReplaceFullPath"}),
+            INVALID,
+            "replaceFullPath is required",
+        ),
+        (
+            json!({"type": "ReplacePrefixMatch"}),
+            INVALID,
+            "replacePrefixMatch is required",
+        ),
+        // A modifier field the selected type does not use would be dropped.
+        (
+            json!({
+                "type": "ReplaceFullPath",
+                "replaceFullPath": "/a",
+                "replacePrefixMatch": "/b"
+            }),
+            INVALID,
+            "must not be set",
+        ),
+        (
+            json!({
+                "type": "ReplacePrefixMatch",
+                "replacePrefixMatch": "/a",
+                "replaceFullPath": "/b"
+            }),
+            INVALID,
+            "must not be set",
+        ),
+        (
+            json!({"type": "ReplaceQuery"}),
+            UNSUPPORTED,
+            "expected ReplaceFullPath or ReplacePrefixMatch",
+        ),
+        (
+            json!({"type": "ReplaceQuery", "replaceQuery": "a=b"}),
+            INCOMPATIBLE,
+            "unhandled fields",
+        ),
+    ];
+    for (path, expected, fragment) in cases {
+        let message = translate_route_error(redirect_rule(prefix_match("/old"), path.clone()));
+        assert!(
+            message.contains("requestRedirect") && message.contains(fragment),
+            "{path}: expected a requestRedirect-scoped {fragment:?} diagnostic, got {message}"
+        );
+        let actual = if message.contains(INCOMPATIBLE_FILTERS_MARKER) {
+            INCOMPATIBLE
+        } else if message.contains(UNSUPPORTED_SHAPE_MARKER) {
+            UNSUPPORTED
+        } else {
+            INVALID
+        };
+        assert_eq!(actual, expected, "{path}: {message}");
+    }
+}
+
+#[test]
+fn request_redirect_replace_prefix_match_requires_path_prefix_matches() {
+    let path = json!({"type": "ReplacePrefixMatch", "replacePrefixMatch": "/new"});
+    for matches in [
+        json!([{"path": {"type": "Exact", "value": "/old"}}]),
+        json!([
+            {"path": {"type": "PathPrefix", "value": "/old"}},
+            {"path": {"type": "RegularExpression", "value": "/o.*"}}
+        ]),
+    ] {
+        let message = translate_route_error(redirect_rule(matches.clone(), path.clone()));
+        assert!(
+            message.contains("requestRedirect")
+                && message.contains("PathPrefix")
+                && !message.contains(UNSUPPORTED_SHAPE_MARKER)
+                && !message.contains(INCOMPATIBLE_FILTERS_MARKER),
+            "{matches}: {message}"
+        );
+    }
+    // An empty replacement is still gated on the match kind.
+    let empty = json!({"type": "ReplacePrefixMatch", "replacePrefixMatch": ""});
+    let exact = json!([{"path": {"type": "Exact", "value": "/old"}}]);
+    let message = translate_route_error(redirect_rule(exact, empty));
+    assert!(message.contains("PathPrefix"), "{message}");
+}
+
+#[tokio::test]
+async fn empty_replace_full_path_redirect_targets_the_root() {
+    // Upstream permits an empty `replaceFullPath`; the redirect `Location`
+    // path is then the root `/`, never an empty or relative path.
+    let path = json!({"type": "ReplaceFullPath", "replaceFullPath": ""});
+    let plugins = translate_route_plugins(redirect_rule(prefix_match("/old"), path));
+    let (config, plugin) = emitted_dispatch(&plugins);
+    let redirect = &config["rules"][0]["redirect"];
+    assert_eq!(redirect["uri"], "/", "{redirect}");
+    assert!(redirect.get("match_prefix").is_none(), "{redirect}");
+
+    let mut ctx = request("/old/child", "");
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 302);
+            assert_eq!(headers.get("location").map(String::as_str), Some("/"));
+        }
+        other => panic!("expected redirect Reject, got {other:?}"),
+    }
+}
+
+#[test]
+fn url_rewrite_keeps_refusing_an_empty_replace_full_path() {
+    // Only a redirect maps an empty full path to `/`; a rewrite still refuses
+    // it rather than silently forwarding the root.
+    let message = translate_route_error(json!([{
+        "matches": [{"path": {"type": "PathPrefix", "value": "/old"}}],
+        "backendRefs": [{"name": "api", "port": 8080}],
+        "filters": [{"type": "URLRewrite", "urlRewrite": {
+            "path": {"type": "ReplaceFullPath", "replaceFullPath": ""}
+        }}]
+    }]));
+    assert!(
+        message.contains("urlRewrite") && message.contains("absolute path"),
+        "{message}"
+    );
 }

@@ -3501,7 +3501,9 @@ fn route_generated_modifier(value: &str) -> Value {
 /// produces, including the ones it generates itself (#5753): a
 /// `RequestRedirect` answer and the upstream-mandated 500 for a rule with no
 /// `backendRefs`. It must reach the client on those answers over HTTP/1.1 and
-/// HTTP/2, and still apply exactly once to a proxied response.
+/// HTTP/2, and still apply exactly once to a proxied response. HTTP/3 answers
+/// a plugin rejection through the same response-header finalizer; this
+/// harness has no QUIC listener, so H3 is covered by that shared code path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_response_header_modifier_applies_to_route_generated_responses() {
     use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
@@ -3616,6 +3618,11 @@ async fn gateway_response_header_modifier_applies_to_route_generated_responses()
             fault.headers().get("x-route").unwrap(),
             "faulted",
             "{protocol}: the generated 500 must carry the rule's response headers"
+        );
+        assert_eq!(
+            fault.headers().get("x-appended").unwrap(),
+            "route",
+            "{protocol}: the route list must apply exactly once to a generated 500"
         );
 
         let proxied = client

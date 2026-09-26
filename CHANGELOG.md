@@ -77,10 +77,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule with no serviceable `backendRefs`, and an Istio `headers.response` was
   missing from an aborted route `fault`. The matched rule's list is now
   published before those answers and applied once by the existing
-  response-header finalizer on HTTP/1.1, HTTP/2 and HTTP/3. A matching rule
-  also replaces, or clears, a list an earlier dispatch instance published, so
-  another rule's headers never decorate its answer. A redirect or aborted fault
-  still sets no backend destination.
+  response-header finalizer; HTTP/1.1 and HTTP/2 are covered by data-plane
+  regressions, and HTTP/3 answers a plugin rejection through the same
+  finalizer. A matching rule also replaces, or clears, a list an earlier
+  dispatch instance published, so another rule's headers never decorate its
+  answer. A redirect or aborted fault still sets no backend destination. A
+  NodeWaypoint authorization denial is a security answer, not a route
+  response, so it never carries the route's response headers.
+- A Gateway API HTTPRoute `RequestRedirect` `path` is now validated at
+  translation exactly like a `URLRewrite` path (#5752): the replacement field
+  must match `path.type` (no stray field for the other type), must be an
+  absolute, canonical path without a query, fragment or dot segment, and
+  `ReplacePrefixMatch` requires every match in the rule to be `PathPrefix`. A
+  violating route is `Accepted=False` with a field-specific reason instead of
+  producing a corrupted `Location`. An empty `replaceFullPath` redirects to
+  `/`.
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,
   PR #5741). A client that withholds QUIC flow control parks the gateway's
