@@ -24,7 +24,8 @@ use super::utils::sse::{
     SseEventName, SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
     classify_forwarded_sse_prefix, encode_sse_error_event, is_gemini_stream_frame,
     is_tgi_stream_frame, last_paragraph_boundary, last_sentence_boundary,
-    parse_sse_data_frames_checked, sse_event_end, sse_event_end_after, sse_line_end,
+    parse_sse_data_frames_checked, sse_event_end, sse_event_end_after, sse_event_on_fresh_line,
+    sse_line_end,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -5082,6 +5083,10 @@ struct StreamInspector {
     /// A cut's payload then goes to the client around that inspector, so it
     /// must not carry the backend bytes this call already cleared.
     feeds_inspector: bool,
+    /// A cut deferred behind the bytes the same call cleared, for the chain to
+    /// emit once every later inspector has passed them: the error event, or
+    /// `None` for a silent cut. Set only while `feeds_inspector`.
+    deferred_cut: Option<Option<Bytes>>,
 }
 
 impl StreamInspector {
@@ -5152,6 +5157,7 @@ impl StreamInspector {
             hold_timeout_logged: Arc::new(AtomicBool::new(false)),
             client_line_open: false,
             feeds_inspector: false,
+            deferred_cut: None,
         }
     }
 
@@ -5590,15 +5596,22 @@ impl StreamInspector {
     /// error event from a fresh line. Never a blank line, which would dispatch
     /// an open event. A silent cut (no error event) still sends `released`
     /// before the stream ends. When a later chained inspector has not passed
-    /// `released`, it is dropped. Allocates only here, on a cut.
-    fn cut_after(&self, released: Vec<u8>, action: ResponseStreamAction) -> ResponseStreamAction {
+    /// `released`, this forwards it and defers the cut, so the chain emits the
+    /// error event only after that inspector has inspected `released`.
+    /// Allocates only here, on a cut.
+    fn cut_after(
+        &mut self,
+        released: Vec<u8>,
+        action: ResponseStreamAction,
+    ) -> ResponseStreamAction {
         let ResponseStreamAction::Terminate(event) = action else {
             return action;
         };
-        let mut out = released;
-        if self.feeds_inspector {
-            out.clear();
+        if self.feeds_inspector && !released.is_empty() {
+            self.deferred_cut = Some(event);
+            return ResponseStreamAction::Forward(Bytes::from(released));
         }
+        let mut out = released;
         let Some(event) = event else {
             // No error event follows, so no line needs ending.
             if out.is_empty() {
@@ -5831,8 +5844,18 @@ impl ResponseStreamInspector for StreamInspector {
         self.feeds_inspector = true;
     }
 
+    fn has_deferred_cut(&self) -> bool {
+        self.deferred_cut.is_some()
+    }
+
+    fn take_deferred_cut(&mut self, client_line_open: bool) -> Option<Bytes> {
+        let event = self.deferred_cut.take().flatten()?;
+        Some(sse_event_on_fresh_line(event, client_line_open))
+    }
+
     fn on_downstream_terminated(&mut self) {
         self.terminated = true;
+        self.deferred_cut = None;
         self.window.discard_held();
         if let Some(hold) = self.hold.as_mut() {
             hold.restart();

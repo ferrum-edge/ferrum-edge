@@ -542,6 +542,20 @@ pub fn encode_sse_error_event(code: &str, message: &str) -> bytes::Bytes {
     bytes::Bytes::from(format!("event: error\ndata: {payload}\n\ndata: [DONE]\n\n"))
 }
 
+/// Frame a terminal `event` to start on a fresh line: one LF first when the
+/// bytes the client already received end mid-line (`client_line_open`), so the
+/// client never reads the event's first line as the rest of that one. Never a
+/// blank line, which would dispatch an event the client still holds open.
+pub fn sse_event_on_fresh_line(event: bytes::Bytes, client_line_open: bool) -> bytes::Bytes {
+    if !client_line_open {
+        return event;
+    }
+    let mut out = Vec::with_capacity(event.len() + 1);
+    out.push(b'\n');
+    out.extend_from_slice(&event);
+    bytes::Bytes::from(out)
+}
+
 /// Floor `idx` down to the nearest UTF-8 char boundary at or below it in `s`.
 /// Window release/overlap offsets are computed from byte lengths, so callers
 /// snap them here before slicing to avoid panicking on multi-byte content.
