@@ -440,7 +440,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still counts every refused admission (#5787).
 - The shared buffered SSE inspection parser used by `ai_semantic_firewall` and
   `ai_response_guard` now follows the WHATWG event-stream framing: it consumes
-  one leading UTF-8 BOM and splits lines on CRLF, LF, or a lone CR (mixed
+  leading UTF-8 BOMs and splits lines on CRLF, LF, or a lone CR (mixed
   freely). Previously a leading BOM or CR-only framing hid events from
   inspection while the body was still reported as fully parsed (#5795).
 

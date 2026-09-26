@@ -1087,12 +1087,53 @@ fn sse_parser_splits_cr_only_stream_after_comment() {
 }
 
 #[test]
-fn sse_parser_consumes_only_one_leading_bom() {
-    // Only the stream's first U+FEFF is a BOM. A second one is part of the
-    // field name, so an EventSource client sees an unknown field and dispatches
-    // nothing — the parser must agree rather than invent a frame.
+fn sse_parser_consumes_multiple_leading_boms() {
     let body = format!("\u{feff}\u{feff}{}", chat_delta_event("x", "\n"));
-    assert_eq!(parse_and_reassemble(&body), (0, true, String::new()));
+    assert_eq!(parse_and_reassemble(&body), (1, true, "x".to_string()));
+}
+
+#[test]
+fn sse_parser_dispatches_lf_then_cr_blank_line() {
+    let body = "data: {\"n\":1}\n\rdata: {\"n\":2}\n\n";
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(parsed.frames, vec![json!({"n": 1}), json!({"n": 2})]);
+}
+
+#[test]
+fn sse_parser_dispatches_cr_then_crlf_blank_line() {
+    let body = "data: {\"n\":1}\r\r\n";
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(parsed.frames, vec![json!({"n": 1})]);
+}
+
+#[test]
+fn sse_parser_strips_only_one_space_after_data_colon() {
+    let body = "data:  \" x\"\n\n";
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(parsed.frames, vec![json!(" x")]);
+}
+
+#[test]
+fn sse_parser_ignores_capitalized_and_unknown_fields() {
+    let body = concat!(
+        "Data: {\"n\":0}\n",
+        "unknown: {\"n\":1}\n",
+        "data: {\"n\":2}\n\n",
+    );
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(parsed.frames, vec![json!({"n": 2})]);
+}
+
+#[test]
+fn sse_parser_ignores_id_and_retry_fields() {
+    let body = "id: cursor\nretry: 1000\ndata: {\"n\":1}\n\n";
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(parsed.frames, vec![json!({"n": 1})]);
 }
 
 #[test]

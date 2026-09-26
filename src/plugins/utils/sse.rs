@@ -108,7 +108,7 @@ pub struct SseParse {
 
 /// Parse SSE `data:` frames from a buffered SSE response body into JSON values.
 ///
-/// Consumes one leading UTF-8 BOM, splits lines on CRLF, LF, or CR, skips
+/// Consumes leading UTF-8 BOMs, splits lines on CRLF, LF, or CR, skips
 /// comments, strips the `data: ` (or `data:`) prefix, skips empty data,
 /// the `[DONE]` sentinel, and frames that are not valid JSON. Returns the
 /// parsed frames in order. Returns an empty `Vec` if the body is not valid
@@ -173,10 +173,9 @@ pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
         }
     }
 
-    // The WHATWG event-stream decoder consumes one leading U+FEFF before
-    // parsing; left in place it would turn the first field into an unknown
-    // `\u{feff}data` field and hide that event's payload from inspection.
-    let body_str = body_str.strip_prefix('\u{feff}').unwrap_or(body_str);
+    // Strip leading U+FEFF characters so decoding stages that each consume a
+    // BOM cannot leave a second one hiding the first event from inspection.
+    let body_str = body_str.trim_start_matches('\u{feff}');
 
     for line in sse_lines(body_str) {
         if line.is_empty() {
