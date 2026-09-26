@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (wire) — `ValidateJWTSVID` returns claims as
+  `google.protobuf.Struct`** (issue #5764). The in-process SPIFFE Workload API
+  (`FERRUM_MESH_WORKLOAD_API_ENABLED`) now returns
+  `ValidateJWTSVIDResponse.claims` as a `google.protobuf.Struct`, as the
+  upstream SPIFFE `workload.proto` declares it, instead of JSON-encoded
+  `bytes` in a renamed `claims_json` field. go-spiffe and other clients
+  generated from the upstream proto can now decode the claims. Field 2 keeps
+  its number but changes type, so a client generated from Ferrum's previous
+  vendored proto no longer reads `claims_json` as JSON and must be regenerated
+  from the upstream (or current vendored) `workload.proto`. JSON claim values
+  map to `Struct` value kinds (null, bool, string, object, array); numbers are
+  carried as doubles, as SPIRE does, so an integer claim beyond 2^53 loses
+  precision. A token whose claims nest deeper than 32 levels is refused with
+  `INVALID_ARGUMENT`, so the response stays within common protobuf decoder
+  recursion limits.
 - Native HTTP/3 now enforces Gateway API HTTPRoute rule `timeouts` (#5646)
   instead of refusing a plain request routed under them with `503`. A rule's
   `request` (`mesh_route_dispatch` `request_timeout_ms`) and `backendRequest`
@@ -61,16 +76,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no spans, so its logs are unchanged.
 
 ### Fixed
-
-- The in-process SPIFFE Workload API (`FERRUM_MESH_WORKLOAD_API_ENABLED`) now
-  returns `ValidateJWTSVIDResponse.claims` as a `google.protobuf.Struct`, as
-  the upstream SPIFFE `workload.proto` declares it, instead of JSON-encoded
-  `bytes` in a renamed `claims_json` field (#5764). go-spiffe and other
-  clients generated from the upstream proto can now decode the claims. JSON
-  claim values map to `Struct` value kinds (null, bool, string, object,
-  array); numbers are carried as doubles, as SPIRE does. A token whose claims
-  nest deeper than 32 levels is refused with `INVALID_ARGUMENT`, so the
-  response stays within common protobuf decoder recursion limits.
 
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,

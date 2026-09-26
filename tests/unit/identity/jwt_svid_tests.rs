@@ -982,8 +982,7 @@ fn claims_to_struct_bounds_nesting_depth() {
         );
 
         let over_limit = nested_claims(MAX_JWT_CLAIMS_NESTING_DEPTH + 1, wrap);
-        let err = claims_to_struct(&over_limit)
-            .expect_err("claims past the limit must fail");
+        let err = claims_to_struct(&over_limit).expect_err("claims past the limit must fail");
         assert!(err.to_string().contains("nested too deeply"));
     }
 }
@@ -1040,6 +1039,47 @@ fn validate_returns_nested_claims_that_decode_with_the_upstream_proto() {
             claims: Some(expected),
         }
     );
+}
+
+#[test]
+fn validate_returns_max_depth_claims_that_decode_with_the_upstream_proto() {
+    use ferrum_edge::identity::workload_api::proto::ValidateJwtsvidResponse;
+
+    // Every object level costs about three nested protobuf messages (`Struct`,
+    // map entry, `Value`), so the deepest allowed claims must still fit under
+    // prost's default decode recursion limit of 100.
+    let key = forge_key();
+    let mut claims = nested_claims(MAX_JWT_CLAIMS_NESTING_DEPTH, wrap_in_object);
+    claims.insert("sub".into(), workload_id().as_str().into());
+    claims.insert("aud".into(), serde_json::json!(["aud"]));
+    claims.insert("exp".into(), serde_json::json!(now() + 300));
+    let token = sign_compact(
+        &key,
+        r#"{"alg":"ES256","kid":"k1","typ":"JWT"}"#,
+        &serde_json::Value::Object(claims.clone()).to_string(),
+    );
+    let validated = validate_jwt_svid(&token, "aud", &forged_bundles(&key, "k1"))
+        .expect("claims at the nesting limit validate");
+    let expected = claims_to_struct(&claims).expect("claims at the nesting limit convert");
+    assert_eq!(validated.claims, expected);
+
+    let response = ValidateJwtsvidResponse {
+        spiffe_id: validated.spiffe_id.to_string(),
+        claims: Some(validated.claims),
+    };
+    let upstream = UpstreamValidateJwtsvidResponse::decode(response.encode_to_vec().as_slice())
+        .expect("max-depth claims decode within the protobuf recursion limit");
+    assert_eq!(upstream.spiffe_id, workload_id().as_str());
+    let decoded = upstream.claims.expect("claims are returned");
+    assert_eq!(decoded, expected);
+
+    let mut depth = 1;
+    let mut level = &decoded;
+    while let Some(Kind::StructValue(inner)) = level.fields["n"].kind.as_ref() {
+        depth += 1;
+        level = inner;
+    }
+    assert_eq!(depth, MAX_JWT_CLAIMS_NESTING_DEPTH);
 }
 
 #[test]
