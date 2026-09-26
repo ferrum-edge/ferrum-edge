@@ -550,6 +550,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streaming usage parser now splits SSE lines on CR, LF and CRLF (including a
   CRLF split across chunks) with the shared leading-BOM policy, so usage in
   CR-framed streams is counted (#5808, #5809).
+- A windowed `ai_semantic_firewall` fail-open hold timeout that forwards the
+  start of an event holding no data yet (an `event` line, such as the
+  Anthropic event name sent ahead of its `data:` line, another field, or a
+  field name or `data:` line whose value has not begun) now keeps that start to
+  read the rest of the event with, so the event's data is still held and
+  inspected instead of passing through. The rest of an event that outgrew
+  `streaming.max_window_bytes` is now read as part of that uninspectable event
+  up to the blank line that ends it, so `on_error` decides it rather than it
+  being parsed as a fresh event. `ai_stream_router` and `ai_tool_governor` now
+  split SSE lines (and, for `ai_stream_router`, events) with the shared SSE
+  helpers (#5814).
 
 ### Security
 

@@ -228,6 +228,7 @@ use super::utils::content_encoding::{
     DecodeLimits, decode_content_encoding, parse_content_codings,
 };
 use super::utils::openai_error::openai_error_body;
+use super::utils::sse::{sse_event_end, sse_lines};
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, ResponseStreamInspectorStage,
@@ -5011,7 +5012,7 @@ impl AnthropicSseNormalizer {
         loop {
             let end = {
                 let scan_start = self.scan_cursor.max(self.cursor).min(self.buf.len());
-                match next_event_boundary(&self.buf[scan_start..]) {
+                match sse_event_end(&self.buf[scan_start..]) {
                     Some(end_rel) => scan_start + end_rel,
                     None => {
                         // `\r\n\r\n` is the longest delimiter. Retain its
@@ -6005,7 +6006,7 @@ impl GeminiStreamNormalizer {
         loop {
             let end = {
                 let scan_start = self.scan_cursor.max(self.cursor).min(self.buf.len());
-                match next_event_boundary(&self.buf[scan_start..]) {
+                match sse_event_end(&self.buf[scan_start..]) {
                     Some(end_rel) => scan_start + end_rel,
                     None => {
                         self.scan_cursor = self.buf.len().saturating_sub(3).max(self.cursor);
@@ -6925,46 +6926,6 @@ async fn normalize_provider_stream_buffered(
     out.finish()
 }
 
-/// Length of the SSE line terminator starting at `index`, or `None` when that
-/// byte does not begin one.
-///
-/// The event-stream grammar terminates a line with LF, CRLF, **or a lone CR**.
-/// A trailing `\r` at the very end of the buffer is treated as a complete lone
-/// CR rather than an unfinished CRLF: deferring it would strand the final event
-/// of a CR-delimited stream until EOF, and treating it as complete costs
-/// nothing, because the `\n` that may follow simply opens the next frame with
-/// an empty line, which carries no field.
-fn line_terminator_len(buf: &[u8], index: usize) -> Option<usize> {
-    match *buf.get(index)? {
-        b'\r' if buf.get(index + 1) == Some(&b'\n') => Some(2),
-        b'\r' | b'\n' => Some(1),
-        _ => None,
-    }
-}
-
-/// Index just past the first complete SSE event boundary (a blank line), or
-/// `None` if no complete event is buffered yet.
-///
-/// An event ends at two consecutive line terminators, in any legal mix of LF,
-/// CRLF, and lone CR. Searching only for the literal `\n\n` / `\r\n\r\n`
-/// byte pairs turned a complete, successful CR-delimited provider stream into
-/// an upstream error with none of its content (issue #5298).
-fn next_event_boundary(buf: &[u8]) -> Option<usize> {
-    let mut index = 0;
-    while index < buf.len() {
-        let Some(first) = line_terminator_len(buf, index) else {
-            index += 1;
-            continue;
-        };
-        let after_first = index + first;
-        match line_terminator_len(buf, after_first) {
-            Some(second) => return Some(after_first + second),
-            None => index = after_first,
-        }
-    }
-    None
-}
-
 fn is_known_anthropic_event(event_type: &str) -> bool {
     matches!(
         event_type,
@@ -6991,46 +6952,6 @@ fn is_known_anthropic_event(event_type: &str) -> bool {
 /// unrecognized-framing case.
 fn sse_line_may_start_with(byte: u8) -> bool {
     !byte.is_ascii_control()
-}
-
-/// Iterator over the lines of one raw SSE frame.
-///
-/// `str::lines()` splits only on LF (stripping a preceding CR), so a provider
-/// frame delimited with lone CRs arrived as ONE unsplit line and none of its
-/// `data:` fields were ever seen (issue #5298). The event-stream grammar
-/// accepts LF, CRLF, and lone CR interchangeably, so all three are split here.
-struct SseLines<'a> {
-    rest: &'a str,
-}
-
-impl<'a> Iterator for SseLines<'a> {
-    type Item = &'a str;
-
-    fn next(&mut self) -> Option<&'a str> {
-        if self.rest.is_empty() {
-            return None;
-        }
-        let bytes = self.rest.as_bytes();
-        let Some(end) = bytes.iter().position(|b| matches!(b, b'\r' | b'\n')) else {
-            let line = self.rest;
-            self.rest = "";
-            return Some(line);
-        };
-        // `end` and `end + skip` both land on an ASCII terminator or one past
-        // it, so neither slice can split a multi-byte character.
-        let skip = if bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n') {
-            2
-        } else {
-            1
-        };
-        let line = &self.rest[..end];
-        self.rest = &self.rest[end + skip..];
-        Some(line)
-    }
-}
-
-fn sse_lines(text: &str) -> SseLines<'_> {
-    SseLines { rest: text }
 }
 
 /// Extract and concatenate the `data:` payload lines of one raw SSE event.

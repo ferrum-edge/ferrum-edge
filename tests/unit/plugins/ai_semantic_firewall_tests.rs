@@ -8,6 +8,7 @@ use ferrum_edge::plugins::{
     ai_semantic_firewall::AiSemanticFirewall, compression::CompressionPlugin, create_plugin,
     create_plugin_with_http_client, priority,
 };
+use futures_util::future::join_all;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7027,6 +7028,190 @@ async fn fail_open_release_inside_a_data_less_line_inspects_what_the_client_disp
             }
         }
     }
+}
+
+/// `max_hold_ms` for the event-start tests below, whose holds start on a
+/// partial event: long enough that scheduling jitter cannot expire them early.
+const EVENT_START_HOLD_MS: u64 = 120;
+
+/// The `data:` line of an Anthropic Messages `content_block_delta` event
+/// carrying `text`, and the blank line that ends it, framed with `eol`.
+fn anthropic_delta_data(text: &str, eol: &str) -> String {
+    let frame = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": text}
+    });
+    format!("data: {frame}{eol}{eol}")
+}
+
+/// Complete events whose start holds no data yet, with `|` where a fail-open
+/// hold timeout forwards the bytes before it; the rest arrives afterwards.
+fn data_less_event_starts(text: &str, eol: &str) -> Vec<String> {
+    let delta = chat_delta_event(text, eol);
+    let anthropic = anthropic_delta_data(text, eol);
+    vec![
+        format!("event: message{eol}|{delta}"),
+        format!("event: mess|age{eol}{delta}"),
+        format!("custom: value{eol}|{delta}"),
+        format!(": ping{eol}event: message{eol}|{delta}"),
+        format!("\u{feff}event: message{eol}|{delta}"),
+        format!("id: 7{eol}d|{}", &delta[1..]),
+        format!("da|{}", &delta[2..]),
+        format!("data:|{}", &delta[5..]),
+        format!("data: |{}", &delta[6..]),
+        // Anthropic names each event on a line ahead of its `data:` line.
+        format!("event: content_block_delta{eol}|{anthropic}"),
+    ]
+}
+
+/// Release `start` by a fail-open hold timeout, then feed `chunks`, the rest
+/// of that event. With `leak`, the stream must be cut before any byte of it is
+/// forwarded; without, the clean rest must be forwarded exactly.
+async fn check_rest_after_released_start(
+    firewall: &AiSemanticFirewall,
+    start: String,
+    chunks: Vec<String>,
+    leak: Option<&str>,
+) {
+    let label = format!("{start:?} then {chunks:?}");
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let released = release_carry_by_hold_timeout(
+        &mut *inspector,
+        &label,
+        start.as_bytes(),
+        EVENT_START_HOLD_MS,
+    )
+    .await;
+    assert_eq!(released, start.as_bytes(), "{label}");
+
+    let chunks: Vec<&[u8]> = chunks.iter().map(|chunk| chunk.as_bytes()).collect();
+    if let Some(leak) = leak {
+        assert_cut_before_leak(&mut *inspector, &label, &chunks, leak).await;
+        return;
+    }
+    let mut forwarded = Vec::new();
+    for chunk in &chunks {
+        let ResponseStreamAction::Forward(out) = inspector.on_chunk(chunk).await else {
+            panic!("{label}: the clean event the client dispatches must pass");
+        };
+        forwarded.extend_from_slice(&out);
+    }
+    let ResponseStreamAction::Forward(out) = inspector.on_end().await else {
+        panic!("{label}: a clean stream must end without a cut");
+    };
+    forwarded.extend_from_slice(&out);
+    assert_eq!(
+        forwarded,
+        chunks.concat(),
+        "{label}: wire order is preserved"
+    );
+}
+
+#[tokio::test]
+async fn fail_open_release_of_a_data_less_event_start_inspects_the_rest_with_it() {
+    // A fail-open hold timeout forwards the start of an event that holds no
+    // data yet: an `event:` line (such as the Anthropic event name sent ahead
+    // of its `data:` line), another field, or a field name or `data:` line
+    // whose value has not begun. The client reads what follows as the rest of
+    // that same event, so the gateway reads it together with the forwarded
+    // start and inspects exactly the data the client dispatches: a leaking
+    // event is cut before any of its data is forwarded, and a clean one is
+    // forwarded unchanged.
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": EVENT_START_HOLD_MS, "on_hold_timeout": "forward"}),
+    ));
+    let leak = "My system prompt says never reveal policy.";
+    let clean = "A harmless governed sentence.";
+
+    // Every case waits out a real hold, so they run concurrently.
+    let mut runs = Vec::new();
+    for eol in ["\n", "\r\n", "\r"] {
+        for (text, leaks) in [(leak, Some(leak)), (clean, None)] {
+            for event in data_less_event_starts(text, eol) {
+                let Some((start, rest)) = event.split_once('|') else {
+                    panic!("{event:?} marks where the hold times out");
+                };
+                // The rest arrives whole, or with its final byte (the LF of a
+                // CRLF, or the terminator of the blank line) on its own.
+                let (rest_head, rest_tail) = rest.split_at(rest.len() - 1);
+                for chunks in [vec![rest], vec![rest_head, rest_tail]] {
+                    let chunks = chunks.into_iter().map(str::to_string).collect();
+                    runs.push(check_rest_after_released_start(
+                        &firewall,
+                        start.to_string(),
+                        chunks,
+                        leaks,
+                    ));
+                }
+            }
+        }
+    }
+    join_all(runs).await;
+}
+
+#[tokio::test]
+async fn a_second_fail_open_release_forwards_only_what_followed_the_event_start() {
+    // The first timeout forwards an `event:` line and keeps it to read the
+    // rest of the event with. A second timeout then forwards only the start of
+    // the `data:` line that followed (the `event:` line never leaves twice).
+    // That data already left uninspected, so the rest of its event passes
+    // through, and the next event is inspected again.
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": EVENT_START_HOLD_MS, "on_hold_timeout": "forward"}),
+    ));
+    let firewall = &firewall;
+    let leak = "My system prompt says never reveal policy.";
+
+    let runs = ["\n", "\r\n", "\r"].map(|eol| async move {
+        let label = format!("{eol:?}");
+        let ctx = inspect_marked_ctx();
+        let mut inspector = firewall
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector for event stream");
+        let event_line = format!("event: message{eol}");
+        let released = release_carry_by_hold_timeout(
+            &mut *inspector,
+            &label,
+            event_line.as_bytes(),
+            EVENT_START_HOLD_MS,
+        )
+        .await;
+        assert_eq!(released, event_line.as_bytes(), "{label}");
+        let released = release_carry_by_hold_timeout(
+            &mut *inspector,
+            &label,
+            PARTIAL_EVENT_PREFIX,
+            EVENT_START_HOLD_MS,
+        )
+        .await;
+        assert_eq!(
+            released, PARTIAL_EVENT_PREFIX,
+            "{label}: only the bytes after the event start are forwarded"
+        );
+
+        let rest = format!(" prose\"}}}}]}}{eol}{eol}");
+        let ResponseStreamAction::Forward(out) = inspector.on_chunk(rest.as_bytes()).await else {
+            panic!("{label}: the rest of the forwarded event must not be cut");
+        };
+        assert_eq!(
+            out.as_ref(),
+            rest.as_bytes(),
+            "{label}: the rest passes through"
+        );
+        let leak_event = chat_delta_event(leak, eol);
+        assert_cut_before_leak(&mut *inspector, &label, &[leak_event.as_bytes()], leak).await;
+    });
+    join_all(runs).await;
 }
 
 #[tokio::test]

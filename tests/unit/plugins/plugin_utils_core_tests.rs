@@ -1407,25 +1407,21 @@ fn forwarded_sse_prefix_ending_inside_a_bom_reports_the_missing_bytes() {
 }
 
 #[test]
-fn forwarded_sse_prefix_that_may_carry_data_is_open() {
+fn forwarded_sse_prefix_that_carries_data_is_open() {
     for eol in ["\n", "\r\n", "\r"] {
         let prefixes = [
             format!("data: x{eol}"),
             format!("\u{feff}data: x{eol}"),
             format!(": keepalive{eol}data: x{eol}"),
             format!("data: x{eol}id: 7{eol}"),
-            format!("event: message{eol}"),
-            format!("custom: value{eol}"),
+            format!("event: message{eol}data: x{eol}"),
             format!("data{eol}"),
-            // Unterminated lines whose field name is not complete yet, so they
-            // are not yet known to be comment, `id` or `retry` lines.
-            "d".to_string(),
-            "dat".to_string(),
+            format!("data:{eol}"),
+            // Unterminated `data` lines whose value has begun.
             "data: {\"partial\"".to_string(),
-            format!(": keepalive{eol}da"),
-            format!("id: 7{eol}i"),
-            // A BOM that is not leading is part of a field name.
-            format!("id: 7{eol}\u{feff}"),
+            "data:x".to_string(),
+            "data:  ".to_string(),
+            format!("event: message{eol}data: {{"),
         ];
         for prefix in prefixes {
             assert_eq!(
@@ -1435,10 +1431,56 @@ fn forwarded_sse_prefix_that_may_carry_data_is_open() {
             );
         }
     }
-    // A partial BOM followed by other bytes is not a BOM at all.
+}
+
+#[test]
+fn forwarded_sse_prefix_whose_open_event_holds_no_data_is_context() {
+    // The open event has no data yet, but its lines change how the client reads
+    // the rest of it, so the caller keeps it, from the offset where it starts,
+    // as parse context for the rest of that event.
+    for eol in ["\n", "\r\n", "\r"] {
+        let cases = [
+            (format!("event: message{eol}"), 0),
+            (format!("custom: value{eol}"), 0),
+            (format!(": keepalive{eol}event: message{eol}id: 7{eol}"), 0),
+            (format!("event: message{eol}: keep"), 0),
+            ("event: mess".to_string(), 0),
+            // Unterminated lines whose field name is not complete yet, or
+            // `data` lines whose value has not begun.
+            ("d".to_string(), 0),
+            ("dat".to_string(), 0),
+            ("data".to_string(), 0),
+            ("data:".to_string(), 0),
+            ("data: ".to_string(), 0),
+            (format!(": keepalive{eol}da"), 0),
+            (format!("id: 7{eol}i"), 0),
+            // A BOM that is not leading is part of a field name.
+            (format!("id: 7{eol}\u{feff}"), 0),
+            // Leading BOMs are not part of the event.
+            (format!("\u{feff}event: message{eol}"), 3),
+            // A blank line ends an event, so the open one starts after it.
+            (
+                format!("data: x{eol}{eol}event: message{eol}"),
+                7 + 2 * eol.len(),
+            ),
+        ];
+        for (prefix, event_start) in cases {
+            assert_eq!(
+                classify_forwarded_sse_prefix(prefix.as_bytes()),
+                SseForwardedPrefix::EventContext(event_start),
+                "{prefix:?}"
+            );
+        }
+    }
+    // The LF of a CRLF whose CR ended the previous bytes.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"\nevent: message\n"),
+        SseForwardedPrefix::EventContext(1)
+    );
+    // A partial BOM followed by other bytes is not a BOM, but a field name.
     assert_eq!(
         classify_forwarded_sse_prefix(b"\xEFdata: x\n"),
-        SseForwardedPrefix::OpenEvent
+        SseForwardedPrefix::EventContext(0)
     );
 }
 
