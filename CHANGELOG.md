@@ -436,7 +436,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exceeds the response size limit now carries `X-Gateway-Error:
   backend_error`, as it does on HTTP/1.1 and HTTP/2. The three native HTTP/3
   streaming relays and the HTTP/3 bridge previously sent this `502` with no
-  token (#5804).
+  token (#5804). The HTTP/3 bridge's buffered path now also tokens its other
+  body-collection refusals as HTTP/1.1 and HTTP/2 do: a body found too large
+  while collected or a body read error (`502`) and an exhausted
+  retained-response budget (`503`) carry `backend_error`.
 - HTTP/3 responses now carry the gateway's own `X-Gateway-Error` for a
   backend 5xx on every path (#5783). A backend 5xx relayed on an HTTP/3
   streaming relay (native or bridged, plain or gRPC) or on the HTTP/3

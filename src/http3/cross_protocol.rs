@@ -1734,12 +1734,20 @@ async fn collect_plain_response_within_attempt(
     })
 }
 
-/// Headers for a buffered-collection failure. A read or route timeout `504`
-/// carries the `backend_timeout` `X-Gateway-Error` token, as proxy core's does.
-fn plain_collect_failure_headers(status: u16) -> HashMap<String, String> {
+/// Headers for a buffered-collection failure. Every such refusal is a
+/// post-wire 5xx, tokened as proxy core tokens the same collector failure: a
+/// read or route timeout `504` is `backend_timeout`; an oversized body, a
+/// body read error (`502`), and an exhausted retention budget (`503`) are
+/// `backend_error`.
+fn plain_collect_failure_headers(ctx: &RequestContext, status: u16) -> HashMap<String, String> {
     let mut headers = HashMap::new();
-    if status == StatusCode::GATEWAY_TIMEOUT.as_u16() {
-        crate::proxy::insert_x_gateway_error_for_backend_failure(&mut headers, false, status);
+    if status >= 500 {
+        crate::proxy::apply_authoritative_gateway_error_header_for_response(
+            &mut headers,
+            ctx,
+            false,
+            status,
+        );
     }
     headers
 }
@@ -5654,7 +5662,7 @@ where
                     error_class,
                     backend_admission_elapsed,
                 );
-                let mut reject_headers = plain_collect_failure_headers(reject_status);
+                let mut reject_headers = plain_collect_failure_headers(ctx, reject_status);
                 // `after_proxy` already decorated this head: a gRPC-Web terminal
                 // carries its provenance-known gateway decorations (CORS)
                 // instead of running the hooks a second time (#5747).

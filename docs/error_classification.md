@@ -345,8 +345,12 @@ classifies the response:
 - A backend response whose declared `Content-Length` exceeds the effective
   response ceiling is refused with a `502` carrying `backend_error` (the
   refusal is not a connection error) on every protocol: the HTTP/1.1 and
-  HTTP/2 builder, the three native HTTP/3 streaming relays, and the HTTP/3
-  bridge. A body found too large while it is collected carries the same token.
+  HTTP/2 builder, the native HTTP/3 buffered path, the three native HTTP/3
+  streaming relays, and the HTTP/3 bridge. A body found too large while it is
+  collected carries the same token. On the HTTP/3 bridge's buffered path so do
+  the other collection refusals, as on HTTP/1.1 and HTTP/2: a body read error
+  `502` and an exhausted retained-response budget `503` read `backend_error`,
+  and a read timeout `504` reads `backend_timeout`.
 
 The headers are not authenticated, though: a client should trust them only on
 a response it received from a gateway it authenticated.

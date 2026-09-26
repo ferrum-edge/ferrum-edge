@@ -6287,6 +6287,101 @@ async fn h3_declared_oversize_response_carries_backend_error_on_every_relay() {
     }
 }
 
+/// A bridged backend response with no declared length (HTTP/1.1 chunked, or
+/// HTTP/2 without `content-length`) that outgrows the response ceiling while
+/// the bridge's buffered path collects it is refused with a `502` carrying
+/// the gateway's own `X-Gateway-Error: backend_error`, as the HTTP/1.1 /
+/// HTTP/2 builder writes it for the same collector refusal (#5804).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_bridge_buffered_collected_oversize_response_carries_backend_error() {
+    for protocol in ["1.1", "2.0"] {
+        let ca = TestCa::new("h3-collected-oversize-token").expect("ca");
+        let (cert, key) = ca.valid().expect("leaf");
+        let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+        // No QUIC listener: the request crosses the HTTP/3 bridge.
+        drop(udp);
+        let backend_port = tcp.port;
+        let oversized = Bytes::from(vec![b'x'; 1024]);
+        let mut h1 = None;
+        let mut h2 = None;
+        if protocol == "1.1" {
+            let mut response = b"HTTP/1.1 200 OK\r\n".to_vec();
+            response.extend_from_slice(b"Content-Type: application/octet-stream\r\n");
+            response.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+            response.extend_from_slice(b"Connection: close\r\n\r\n");
+            response.extend_from_slice(b"400\r\n");
+            response.extend_from_slice(&oversized);
+            response.extend_from_slice(b"\r\n0\r\n\r\n");
+            h1 = Some(
+                ScriptedTlsBackend::builder(
+                    tcp.into_listener(),
+                    TlsConfig::new(cert.clone(), key.clone())
+                        .with_alpn(vec![b"http/1.1".to_vec()]),
+                )
+                .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+                .step(TcpStep::Write(response))
+                .step(TcpStep::Drop)
+                .spawn()
+                .expect("h1 backend"),
+            );
+        } else {
+            h2 = Some(
+                ScriptedH2Backend::builder_tls(tcp.into_listener(), &cert, &key)
+                    .expect("h2 builder")
+                    .repeat_script(true)
+                    .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+                    .step(H2Step::RespondHeaders(vec![
+                        (":status", "200".into()),
+                        ("content-type", "application/octet-stream".into()),
+                    ]))
+                    .step(H2Step::RespondData {
+                        data: oversized.clone(),
+                        end_stream: true,
+                    })
+                    .spawn()
+                    .expect("h2 backend"),
+            );
+        }
+        let mut config: Value =
+            serde_yaml::from_str(&file_mode_yaml_for_h3(backend_port)).expect("fixture config");
+        config["proxies"][0]["response_body_mode"] = json!("buffer");
+        let (harness, _, _) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+            serde_yaml::to_string(&config).expect("yaml"),
+            false,
+            None,
+            &[
+                ("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "64"),
+                ("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0"),
+            ],
+        )
+        .await;
+        let response = h3_get(&harness, "/api/collected-oversize")
+            .await
+            .unwrap_or_else(|error| panic!("{protocol}: H3 request failed: {error}"));
+        assert_eq!(
+            response.status.as_u16(),
+            502,
+            "{protocol}; body={:?}; gateway logs:\n{}",
+            response.body_text(),
+            harness.captured_combined().unwrap_or_default()
+        );
+        assert!(
+            response.body_text().contains("exceeds maximum size"),
+            "{protocol}: {:?}",
+            response.body_text()
+        );
+        assert_eq!(
+            h3_gateway_error_tokens(&response),
+            ["backend_error"],
+            "{protocol}: a body found too large while collected carries the gateway's own \
+             token: {:?}",
+            response.headers
+        );
+        drop((harness, h1, h2));
+    }
+}
+
 /// A plugin that writes its own `X-Gateway-Error` on an HTTP/3 streaming
 /// relay does not reach the client: the relay writes exactly the gateway's
 /// `backend_error` for a backend 5xx, on the native H3 relay and the bridge.
@@ -6344,12 +6439,20 @@ async fn h3_streaming_relay_replaces_a_plugin_written_gateway_error_token() {
             "proxy_id": "scripted-h3",
             "enabled": true,
             "config": {
-                "rules": [{
-                    "operation": "add",
-                    "target": "header",
-                    "key": "X-Gateway-Error",
-                    "value": "connection_failure"
-                }]
+                "rules": [
+                    {
+                        "operation": "add",
+                        "target": "header",
+                        "key": "X-Gateway-Error",
+                        "value": "connection_failure"
+                    },
+                    {
+                        "operation": "add",
+                        "target": "header",
+                        "key": "X-Plugin-Ran",
+                        "value": "h3-token-writer"
+                    }
+                ]
             }
         }]);
         let (harness, _, _) = spawn_h3_harness_with_explicit_https_port_config_and_env(
@@ -6376,6 +6479,17 @@ async fn h3_streaming_relay_replaces_a_plugin_written_gateway_error_token() {
             harness.captured_combined().unwrap_or_default()
         );
         assert_eq!(response.body_bytes.as_ref(), b"busy");
+        // The marker proves the plugin ran on this response, so the token
+        // assertion below cannot pass because the plugin never wrote one.
+        assert_eq!(
+            response
+                .headers
+                .get("x-plugin-ran")
+                .and_then(|value| value.to_str().ok()),
+            Some("h3-token-writer"),
+            "{protocol}: the token-writing plugin ran on the response: {:?}",
+            response.headers
+        );
         assert_eq!(
             h3_gateway_error_tokens(&response),
             ["backend_error"],
