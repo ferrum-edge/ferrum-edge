@@ -7624,10 +7624,11 @@ fn push_tls_material_source(
 /// NOTE on the asymmetric drain calls: only `connection_pool`, `http2_pool`,
 /// and `grpc_pool` get a `drain_backend_tls_config_cache_svid_generation()`
 /// call on rotation — the H3 pool's TLS config cache is co-located on
-/// `connection_pool.backend_h3_tls_configs`, so it is drained transitively,
-/// and the HBONE and mesh mTLS pools build their SPIFFE client config per
-/// connect (no cache to drain). That same unconditional call also reclaims
-/// generation-keyed H2/gRPC `rr_counters`. A post-sweep late insert of a
+/// `connection_pool.backend_h3_tls_configs` (next to the reqwest rustls config
+/// cache), so it is drained transitively, and the HBONE and mesh mTLS pools
+/// build their SPIFFE client config per connect (no cache to drain). That same
+/// unconditional call also reclaims generation-keyed H2/gRPC `rr_counters`.
+/// A post-sweep late insert of a
 /// captured retired generation is removed on the cold-insert miss path
 /// (and TLS configs refuse to cache a retired numeric generation) so a
 /// default `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0` cannot leak one

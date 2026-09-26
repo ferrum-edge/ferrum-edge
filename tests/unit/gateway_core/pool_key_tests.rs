@@ -2469,6 +2469,36 @@ async fn reqwest_cold_client_with_missing_ca_fails_closed() {
             .starts_with("Failed to build reqwest backend TLS config"),
         "{error}"
     );
+    let cache = pool.backend_reqwest_tls_config_cache();
+    assert!(cache.is_empty(), "failures are never cached");
+    assert_eq!(cache.pending_builds(), 0);
+}
+
+/// The reqwest pool caches its rustls config per TLS identity (plus ALPN
+/// variant), so reqwest clients for two endpoints with the same trust material
+/// share one cold build, and a backend TLS / CRL reload clears it.
+#[tokio::test]
+async fn reqwest_cold_clients_share_one_cached_rustls_build() {
+    ensure_crypto_provider();
+    let pool = pool_with_defaults();
+    let first = proxy_at("10.0.0.1", 8080);
+    let second = proxy_at("10.0.0.2", 8080);
+
+    pool.get_client(&first).await.expect("first client");
+    pool.get_client(&second).await.expect("second client");
+
+    let tls_key = pool.tls_config_cache_key_for_warmup(&first);
+    let cache = pool.backend_reqwest_tls_config_cache();
+    assert_eq!(cache.len(), 1, "one rustls build per TLS identity");
+    assert!(
+        cache.contains_key(&format!("alpn=h2|{tls_key}"))
+            || cache.contains_key(&format!("alpn=h1|{tls_key}")),
+        "reqwest TLS cache key must be the TLS identity plus its ALPN variant"
+    );
+    assert_eq!(cache.pending_builds(), 0);
+
+    pool.clear_backend_tls_config_cache();
+    assert!(pool.backend_reqwest_tls_config_cache().is_empty());
 }
 
 #[tokio::test]

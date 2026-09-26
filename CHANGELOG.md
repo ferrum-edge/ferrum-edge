@@ -74,10 +74,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`). Concurrent misses for one TLS
   identity on the direct HTTP/2, gRPC, and HTTP/3 pools share a single build
   instead of each building its own; the reqwest pool already coalesces misses
-  per pool key. Cache hits are unchanged. Failures keep their existing error
-  classes and are not cached, a build that exceeds the executor deadline fails
-  closed, and a build still in flight when backend TLS or CRL reload clears the
-  cache answers its callers without being cached.
+  per pool key, and its rustls config is now cached per TLS identity as well.
+  Cache hits are unchanged. Each request waiting on a cold build has a total
+  budget of `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS` (at most 5s), including
+  executor queue time, and fails closed when it runs out. The build keeps
+  running (remote source waits inside it share one budget of the same length,
+  measured from when it starts executing), and a late success is cached, so a
+  slow but working source serves the next request instead of timing out on
+  every one. There is still at most one build in flight per TLS identity.
+  Failures keep their existing error classes and are not cached, and a build
+  still in flight when backend TLS or CRL reload clears the cache answers its
+  callers without being cached.
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,
   PR #5741). A client that withholds QUIC flow control parks the gateway's

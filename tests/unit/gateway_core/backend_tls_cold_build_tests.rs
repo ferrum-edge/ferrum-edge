@@ -5,10 +5,14 @@
 //! the build runs on the bounded TLS source executor rather than the worker
 //! polling the request, concurrent misses for one key coalesce onto a single
 //! build, and failures stay fail-closed without being cached — including a
-//! build that straddles a cache clear (CRL / backend TLS reload).
+//! build that straddles a cache clear (CRL / backend TLS reload). Waiters are
+//! bounded by the executor deadline, but the build is not: a late success is
+//! cached for the next request.
 
 use ferrum_edge::tls::backend::{BackendTlsConfigCache, TlsError};
-use ferrum_edge::tls::source::TlsSourceExecutor;
+use ferrum_edge::tls::source::{
+    MaterialError, TlsSourceExecutor, remaining_tls_source_operation_budget,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -296,30 +300,268 @@ async fn cold_build_straddling_a_clear_answers_callers_without_caching() {
     assert!(!Arc::ptr_eq(&stale, &fresh));
 }
 
+/// A build slower than the executor deadline (queue time included) fails its
+/// waiters closed but keeps running: the late success is cached, callers that
+/// arrive meanwhile join the same build instead of starting another, and the
+/// next request is a cache hit.
 #[tokio::test(flavor = "current_thread")]
-async fn cold_build_past_the_executor_deadline_fails_closed() {
+async fn slow_cold_build_fails_waiters_closed_then_caches_its_late_success() {
     let cache = BackendTlsConfigCache::new();
-    let executor = test_executor(1, Duration::from_millis(50));
-    let (started_tx, _started_rx) = oneshot::channel();
+    let executor = test_executor(1, Duration::from_secs(1));
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let (started_tx, started_rx) = oneshot::channel();
     let (release_tx, release_rx) = mpsc::channel();
 
-    let result = cache
+    let leader_prepares = Arc::clone(&prepares);
+    let timed_out = cache
         .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+            leader_prepares.fetch_add(1, Ordering::SeqCst);
             parked_build(started_tx, release_rx)
         })
         .await;
-    // Let the abandoned blocking operation finish before the runtime shuts down.
-    let _ = release_tx.send(());
+    started_rx.await.expect("cold build started");
 
-    let details = match result {
+    let details = match timed_out {
         Err(TlsError::Rustls(details)) => details,
-        Err(other) => panic!("deadline must fail closed as a build error, got {other}"),
-        Ok(_) => panic!("a build past the executor deadline must not succeed"),
+        Err(other) => panic!("a waiter past its deadline must fail closed, got {other}"),
+        Ok(_) => panic!("the build was still parked; the waiter cannot have succeeded"),
     };
     assert!(
         details.contains("did not complete"),
         "unexpected deadline diagnostic: {details}"
     );
     assert!(cache.is_empty());
+    assert_eq!(
+        cache.pending_builds(),
+        1,
+        "the build outlives its timed-out waiter"
+    );
+
+    // A caller arriving while the late build is still running joins it with
+    // its own fresh budget rather than starting a second build.
+    let joiner_prepares = Arc::clone(&prepares);
+    let joiner = async {
+        cache
+            .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+                joiner_prepares.fetch_add(1, Ordering::SeqCst);
+                ok_build()
+            })
+            .await
+    };
+    let release = async {
+        tokio::task::yield_now().await;
+        release_tx.send(()).expect("release the parked build");
+    };
+    let (joined, ()) = tokio::join!(joiner, release);
+    let joined = joined.expect("the joiner receives the late success");
+
+    assert_eq!(prepares.load(Ordering::SeqCst), 1, "one build per key");
+    assert!(cache.contains_key(STATIC_KEY), "the late success is cached");
     assert_eq!(cache.pending_builds(), 0);
+    let hit = cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), ok_build)
+        .await
+        .expect("cache hit");
+    assert!(Arc::ptr_eq(&joined, &hit));
+}
+
+/// Cancelling the caller that started a build (request deadline, client
+/// disconnect) neither aborts the build nor strands the callers that joined it.
+#[tokio::test(flavor = "current_thread")]
+async fn aborted_leader_does_not_strand_joined_waiters() {
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(1, Duration::from_secs(5));
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let joiner_prepares = Arc::new(AtomicUsize::new(0));
+
+    let leader = tokio::spawn({
+        let cache = cache.clone();
+        let executor = executor.clone();
+        async move {
+            cache
+                .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+                    parked_build(started_tx, release_rx)
+                })
+                .await
+        }
+    });
+    started_rx.await.expect("cold build started");
+
+    let joiner = tokio::spawn({
+        let cache = cache.clone();
+        let executor = executor.clone();
+        let joiner_prepares = Arc::clone(&joiner_prepares);
+        async move {
+            cache
+                .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+                    joiner_prepares.fetch_add(1, Ordering::SeqCst);
+                    ok_build()
+                })
+                .await
+        }
+    });
+    // Let the joiner register on the in-flight build.
+    tokio::task::yield_now().await;
+    assert_eq!(cache.pending_builds(), 1);
+
+    leader.abort();
+    let aborted = leader.await.expect_err("the leader caller was aborted");
+    assert!(aborted.is_cancelled());
+
+    release_tx.send(()).expect("release the parked build");
+    let joined = joiner
+        .await
+        .expect("joiner task")
+        .expect("the joiner still receives the build");
+    assert_eq!(
+        joiner_prepares.load(Ordering::SeqCst),
+        0,
+        "the joiner must join the in-flight build, not start its own"
+    );
+    assert_eq!(cache.pending_builds(), 0, "nothing stays pending");
+    let hit = cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), ok_build)
+        .await
+        .expect("cache hit");
+    assert!(Arc::ptr_eq(&joined, &hit));
+}
+
+/// If the build task itself is dropped before it publishes (runtime
+/// shutdown), its waiters are answered with a closed failure instead of
+/// waiting out their deadline, and the key is free for a fresh build.
+#[tokio::test(flavor = "current_thread")]
+async fn dropped_build_task_answers_waiters_with_a_closed_failure() {
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(1, Duration::from_secs(5));
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    // The leader, and therefore its spawned build task, run on a separate
+    // runtime; shutting that runtime down drops the build task mid-build.
+    let build_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    let _leader = build_runtime.spawn({
+        let cache = cache.clone();
+        let executor = executor.clone();
+        async move {
+            cache
+                .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+                    parked_build(started_tx, release_rx)
+                })
+                .await
+        }
+    });
+    started_rx.await.expect("cold build started");
+
+    let waiter = tokio::spawn({
+        let cache = cache.clone();
+        let executor = executor.clone();
+        async move {
+            cache
+                .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), ok_build)
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(cache.pending_builds(), 1);
+
+    build_runtime.shutdown_background();
+    let result = tokio::time::timeout(RELEASE_TIMEOUT, waiter)
+        .await
+        .expect("the waiter must be answered when the build task is dropped")
+        .expect("waiter task");
+    // Let the orphaned blocking operation exit.
+    let _ = release_tx.send(());
+
+    let details = match result {
+        Err(TlsError::Rustls(details)) => details,
+        Err(other) => panic!("a dropped build must fail closed, got {other}"),
+        Ok(_) => panic!("a dropped build must not produce a config"),
+    };
+    assert!(
+        details.contains("cancelled"),
+        "unexpected cancellation diagnostic: {details}"
+    );
+    assert!(cache.is_empty());
+    assert_eq!(cache.pending_builds(), 0);
+
+    cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), ok_build)
+        .await
+        .expect("a fresh build after the dropped one");
+    assert!(cache.contains_key(STATIC_KEY));
+}
+
+/// Every executor operation carries one absolute deadline measured from
+/// admission, and remote source waits inside it spend only what remains of
+/// it. The deadline is scoped to the operation, and a run-to-completion
+/// operation returns its result even after that deadline has passed.
+#[tokio::test(flavor = "current_thread")]
+async fn executor_operations_carry_one_absolute_source_budget() {
+    let budget = Duration::from_secs(5);
+    assert_eq!(remaining_tls_source_operation_budget(budget), budget);
+
+    let executor = test_executor(1, Duration::from_millis(400));
+    let (fresh, spent) = executor
+        .run_blocking(move || {
+            let fresh = remaining_tls_source_operation_budget(budget);
+            std::thread::sleep(Duration::from_millis(100));
+            let spent = remaining_tls_source_operation_budget(budget);
+            Ok::<_, MaterialError>((fresh, spent))
+        })
+        .await
+        .expect("bounded operation");
+    assert!(fresh <= Duration::from_millis(400), "{fresh:?}");
+    assert!(spent < fresh, "{spent:?} must be less than {fresh:?}");
+    assert!(spent <= Duration::from_millis(300), "{spent:?}");
+
+    let late = executor
+        .run_blocking_result_to_completion(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok::<_, ()>(remaining_tls_source_operation_budget(budget))
+        })
+        .await
+        .expect("run-to-completion operation")
+        .expect("late result");
+    assert_eq!(late, Duration::ZERO, "the operation deadline has passed");
+
+    let after = tokio::task::spawn_blocking(move || remaining_tls_source_operation_budget(budget))
+        .await
+        .expect("plain blocking task");
+    assert_eq!(after, budget, "the deadline is scoped to its operation");
+}
+
+/// The direct HTTP/2, gRPC, and reqwest/H3 pool managers must reach the
+/// backend TLS cache only through the async single-flight `get_or_build`; the
+/// synchronous `get_or_try_build` would run the build on the Tokio worker.
+#[test]
+fn backend_pool_managers_never_build_tls_synchronously() {
+    let sources = [
+        (
+            "src/proxy/http2_pool.rs",
+            include_str!("../../../src/proxy/http2_pool.rs"),
+        ),
+        (
+            "src/proxy/grpc_proxy.rs",
+            include_str!("../../../src/proxy/grpc_proxy.rs"),
+        ),
+        (
+            "src/connection_pool.rs",
+            include_str!("../../../src/connection_pool.rs"),
+        ),
+    ];
+    for (path, source) in sources {
+        assert!(
+            !source.contains("get_or_try_build("),
+            "{path} must not build backend TLS configs synchronously on the Tokio worker"
+        );
+        assert!(
+            source.contains(".get_or_build("),
+            "{path} must build cold backend TLS configs through get_or_build"
+        );
+    }
 }

@@ -21,7 +21,6 @@ use crate::tls::backend::{
     SvidGenerationMatcher, TlsError, append_backend_tls_pool_key_fields,
     append_optional_pool_key_component, append_pool_key_component,
     backend_svid_generation_for_client_cert, backend_tls_config_cache_key,
-    build_backend_tls_off_worker,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -29,6 +28,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+/// Boxed H3 backend TLS config lookup returned by
+/// [`ConnectionPool::backend_h3_tls_config_owned`].
+pub type BackendH3TlsConfigFuture =
+    futures_util::future::BoxFuture<'static, Result<Arc<rustls::ClientConfig>, anyhow::Error>>;
 
 #[derive(Clone)]
 struct ReqwestPoolManager {
@@ -38,6 +42,11 @@ struct ReqwestPoolManager {
     tls_policy: Option<Arc<TlsPolicy>>,
     crls: crate::tls::SharedCrlList,
     backend_h3_tls_configs: BackendTlsConfigCache,
+    /// rustls configs for reqwest clients, keyed by TLS identity plus the
+    /// baked-in ALPN variant (see `reqwest_tls_config_cache_key_owned`).
+    /// Caching them is what lets a cold build that outlives the requests
+    /// waiting on it serve the next pool miss instead of being discarded.
+    backend_reqwest_tls_configs: BackendTlsConfigCache,
     backend_svid_generation: BackendSvidGeneration,
     workload_svid_cert_path: Option<String>,
     /// Shared DestinationRule `connectionPool.tcp.maxConnections` admission
@@ -87,6 +96,22 @@ impl ReqwestPoolManager {
         )
     }
 
+    /// TLS identity key plus the ALPN variant `build_rustls_for_reqwest` bakes
+    /// into the config (HTTP/1.1-only vs h2-capable). The variant is a prefix
+    /// so the `|svidg=` field stays last for SVID drain and retirement.
+    fn reqwest_tls_config_cache_key_owned(&self, proxy: &Proxy, enable_http2: bool) -> String {
+        let alpn = if proxy.forces_backend_http1_only() || !enable_http2 {
+            "alpn=h1|"
+        } else {
+            "alpn=h2|"
+        };
+        let tls_key = self.tls_config_cache_key_owned(proxy);
+        let mut key = String::with_capacity(alpn.len() + tls_key.len());
+        key.push_str(alpn);
+        key.push_str(&tls_key);
+        key
+    }
+
     fn backend_tls_inputs(&self, proxy: &Proxy) -> OwnedBackendTlsConfigInputs {
         OwnedBackendTlsConfigInputs::for_pool(
             proxy,
@@ -121,21 +146,30 @@ impl ReqwestPoolManager {
         ));
 
         // Material loading and rustls construction run on the bounded TLS
-        // source executor, never on this Tokio worker. `GenericPool` already
-        // coalesces concurrent misses for this pool key onto one `create`.
+        // source executor, never on this Tokio worker, single-flight per TLS
+        // identity and ALPN variant; a build that outlives its waiters is
+        // still cached for the next miss. `GenericPool` additionally coalesces
+        // concurrent misses for this pool key onto one `create`.
         let tls_inputs = Arc::new(self.backend_tls_inputs(proxy));
         let enable_http2 = config.enable_http2;
-        let build_inputs = Arc::clone(&tls_inputs);
-        let rustls_config = build_backend_tls_off_worker(move || {
-            build_inputs
-                .builder()
-                .build_rustls_for_reqwest(enable_http2)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to build reqwest backend TLS config: {}", e))?;
+        let cache_key = self.reqwest_tls_config_cache_key_owned(proxy, enable_http2);
+        let rustls_config = self
+            .backend_reqwest_tls_configs
+            .get_or_build(cache_key, || {
+                let build_inputs = Arc::clone(&tls_inputs);
+                move || {
+                    build_inputs
+                        .builder()
+                        .build_rustls_for_reqwest(enable_http2)
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to build reqwest backend TLS config: {}", e))?;
+        // `use_preconfigured_tls` takes the config by value; the clone shares
+        // the cached verifier, client-auth resolver, and resumption store.
         let mut client_builder = tls_inputs
             .builder()
-            .reqwest_builder_with_rustls(rustls_config, enable_http2)
+            .reqwest_builder_with_rustls(rustls_config.as_ref().clone(), enable_http2)
             .dns_resolver(dns_resolver)
             .tcp_nodelay(true)
             .pool_max_idle_per_host(config.max_idle_per_host)
@@ -367,6 +401,7 @@ impl ConnectionPool {
             tls_policy,
             crls,
             backend_h3_tls_configs: BackendTlsConfigCache::with_shards(shards),
+            backend_reqwest_tls_configs: BackendTlsConfigCache::with_shards(shards),
             backend_svid_generation,
             workload_svid_cert_path,
             reqwest_conn_admission: std::sync::OnceLock::new(),
@@ -413,22 +448,33 @@ impl ConnectionPool {
         self.pool.manager().tls_config_cache_key_owned(proxy)
     }
 
-    /// Drop H3 TLS configs whose identity is no longer in `config`. Cold-path
-    /// only (config publication); live TLS identities are retained.
+    /// Drop H3 and reqwest TLS configs whose identity is no longer in
+    /// `config`. Cold-path only (config publication); live TLS identities are
+    /// retained.
     pub fn retain_live_tls_configs_from_config(&self, config: &GatewayConfig) {
+        let manager = self.pool.manager();
         let mut live_tls_keys = HashSet::with_capacity(config.proxies.len());
+        let mut live_reqwest_tls_keys = HashSet::with_capacity(config.proxies.len() * 2);
         for proxy in &config.proxies {
-            live_tls_keys.insert(self.pool.manager().tls_config_cache_key_owned(proxy));
+            live_tls_keys.insert(manager.tls_config_cache_key_owned(proxy));
+            live_reqwest_tls_keys.insert(manager.reqwest_tls_config_cache_key_owned(proxy, true));
+            live_reqwest_tls_keys.insert(manager.reqwest_tls_config_cache_key_owned(proxy, false));
         }
-        self.pool
-            .manager()
-            .backend_h3_tls_configs
-            .retain_keys(&live_tls_keys);
+        manager.backend_h3_tls_configs.retain_keys(&live_tls_keys);
+        manager
+            .backend_reqwest_tls_configs
+            .retain_keys(&live_reqwest_tls_keys);
     }
 
     #[allow(dead_code)] // exercised from unit tests
     pub fn backend_tls_config_cache(&self) -> &BackendTlsConfigCache {
         &self.pool.manager().backend_h3_tls_configs
+    }
+
+    /// Reqwest-side counterpart of [`Self::backend_tls_config_cache`].
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn backend_reqwest_tls_config_cache(&self) -> &BackendTlsConfigCache {
+        &self.pool.manager().backend_reqwest_tls_configs
     }
 
     /// Get the global pool configuration.
@@ -488,13 +534,14 @@ impl ConnectionPool {
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))
     }
 
-    /// Owned-future form of [`Self::get_tls_config_for_backend`] for H3
+    /// Owned, boxed form of [`Self::get_tls_config_for_backend`] for H3
     /// dispatch closures that cannot borrow the request's `Proxy`.
-    pub async fn backend_h3_tls_config_owned(
-        self: Arc<Self>,
-        proxy: Proxy,
-    ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
-        self.get_tls_config_for_backend(&proxy).await
+    ///
+    /// The H3 pools invoke these closures only on a connection miss, so the
+    /// box is allocated only then, and every pooled H3 call's future stores a
+    /// pointer instead of an owned `Proxy` plus the lookup state inline.
+    pub fn backend_h3_tls_config_owned(self: Arc<Self>, proxy: Proxy) -> BackendH3TlsConfigFuture {
+        Box::pin(async move { self.get_tls_config_for_backend(&proxy).await })
     }
 
     /// Clear all pooled connections.
@@ -504,14 +551,19 @@ impl ConnectionPool {
     }
 
     pub fn drain_backend_tls_config_cache_svid_generation(&self, generation: u64) {
-        self.pool
-            .manager()
+        let manager = self.pool.manager();
+        manager
             .backend_h3_tls_configs
+            .drain_svid_generation(generation);
+        manager
+            .backend_reqwest_tls_configs
             .drain_svid_generation(generation);
     }
 
     pub fn clear_backend_tls_config_cache(&self) {
-        self.pool.manager().backend_h3_tls_configs.clear();
+        let manager = self.pool.manager();
+        manager.backend_h3_tls_configs.clear();
+        manager.backend_reqwest_tls_configs.clear();
     }
 
     pub fn force_drain_svid_generation(&self, generation: u64) {

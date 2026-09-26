@@ -121,26 +121,9 @@ impl TlsError {
 /// blocking pool) into the backend TLS build error class. `MaterialError`'s
 /// Display for these variants is a fixed, source-free sentence.
 fn backend_tls_executor_error(error: MaterialError) -> TlsError {
-    TlsError::Rustls(format!("backend TLS configuration build did not complete: {error}"))
-}
-
-/// Run a blocking backend TLS build on the shared bounded TLS source executor.
-///
-/// Material loading (file reads, provider resolution, PKCS#11) and rustls
-/// config construction happen on a blocking-pool thread admitted by the
-/// process-wide `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY` semaphore and
-/// bounded by `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`, never on the Tokio
-/// worker that is serving requests. Build errors are returned unchanged;
-/// executor failures fail closed as [`TlsError::Rustls`].
-pub async fn build_backend_tls_off_worker<T, F>(build: F) -> Result<T, TlsError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, TlsError> + Send + 'static,
-{
-    match crate::tls::source::run_tls_source_blocking_result(build).await {
-        Ok(result) => result,
-        Err(error) => Err(backend_tls_executor_error(error)),
-    }
+    TlsError::Rustls(format!(
+        "backend TLS configuration build did not complete: {error}"
+    ))
 }
 
 /// Owned snapshot of the [`BackendTlsConfigBuilder`] inputs.
@@ -229,7 +212,13 @@ impl OwnedBackendTlsConfigInputs {
 /// first caller for a key becomes the single-flight leader and runs the build
 /// on the bounded TLS source executor, and every concurrent caller for the
 /// same key awaits that one build instead of starting its own. No Tokio worker
-/// performs material I/O, and failures are not negatively cached.
+/// performs material I/O, and failures are not negatively cached. Each caller
+/// waits at most the executor deadline (including executor queue time) and
+/// then fails closed, but the build itself runs to completion: a late success
+/// is cached, so a slow yet working source serves the next request from the
+/// cache instead of timing out forever. The pending entry stays registered
+/// until the build publishes, so there is never more than one build in flight
+/// per key.
 #[derive(Clone, Default)]
 pub struct BackendTlsConfigCache {
     configs: Arc<DashMap<String, Arc<ClientConfig>>>,
@@ -279,9 +268,9 @@ impl PendingBackendTlsBuild {
 
 /// Leader-side publication for one [`PendingBackendTlsBuild`].
 ///
-/// Owned by the spawned build task. Dropping it without publishing (task
-/// cancelled at runtime shutdown) publishes a closed failure, so waiters never
-/// hang on a build that will not finish.
+/// Owned by the spawned build task, which outlives every waiter. Dropping it
+/// without publishing (task cancelled at runtime shutdown) publishes a closed
+/// failure, so waiters never hang on a build that will not finish.
 struct PendingBackendTlsPublisher {
     configs: Arc<DashMap<String, Arc<ClientConfig>>>,
     retirement: Arc<NumericSvidRetirement>,
@@ -480,6 +469,10 @@ impl BackendTlsConfigCache {
     /// a cancelled caller (request deadline, client disconnect) neither aborts
     /// the build for the others nor leaves them waiting. Insert rules match
     /// [`Self::get_or_try_build`]; failures are not cached.
+    ///
+    /// Every caller waits at most the executor deadline, measured from its
+    /// own arrival and including executor queue time, then fails closed. The
+    /// build keeps running past that point and caches a late success.
     pub async fn get_or_build<P, F>(
         &self,
         key: String,
@@ -536,6 +529,9 @@ impl BackendTlsConfigCache {
             backend_tls_pool_key_has_svid_field(&key),
             "BackendTlsConfigCache::get_or_build requires the key to be tagged with `|svidg=...`; call append_backend_svid_generation_key_field before this entry point"
         );
+        // This caller's total budget, queue time included. The build itself is
+        // not bound by it: see `run_blocking_result_to_completion`.
+        let wait_deadline = tokio::time::Instant::now() + executor.deadline();
         let (pending, started_epoch) = match self.pending.entry(key.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => (Arc::clone(entry.get()), None),
             dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -569,14 +565,17 @@ impl BackendTlsConfigCache {
                 // epoch and keeps this result out of the cache.
                 let build = prepare();
                 tokio::spawn(async move {
-                    let outcome = executor.run_blocking_result(build).await;
+                    let outcome = executor.run_blocking_result_to_completion(build).await;
                     publisher.publish(outcome);
                 });
             }
             None => drop(prepare),
         }
 
-        pending.wait().await
+        match tokio::time::timeout_at(wait_deadline, pending.wait()).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(backend_tls_executor_error(MaterialError::DeadlineExceeded)),
+        }
     }
 }
 
