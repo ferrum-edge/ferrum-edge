@@ -3657,7 +3657,13 @@ impl RequestGrpcMessageCounter {
 /// shares native length-prefixed message framing, so it keeps the scanner.
 pub(crate) fn request_stream_observes_native_grpc_messages(ctx: &RequestContext) -> bool {
     crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
-        && passthrough_request_text_mode(ctx) != Some(true)
+        && !request_uploads_passthrough_grpc_web_text(ctx)
+}
+
+/// Whether this request uploads PASS-THROUGH `grpc-web-text` (base64), which
+/// the native length-prefix scanner cannot read.
+pub(crate) fn request_uploads_passthrough_grpc_web_text(ctx: &RequestContext) -> bool {
+    passthrough_request_text_mode(ctx) == Some(true)
 }
 
 /// Compare an existing trailer-frame suffix against the reconciled trailers

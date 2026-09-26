@@ -35186,12 +35186,9 @@ async fn handle_proxy_request_inner(
             // NOT the client wire bytes recorded into `bytes_sent_observed`
             // above. A translated gRPC-Web request only becomes native
             // length-prefixed framing after the transform decodes text-mode
-            // base64 and strips the terminal trailer frame.
-            crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-                &ctx.metadata,
-                &ctx.grpc_request_messages_observed,
-                &grpc_req_body,
-            );
+            // base64 and strips the terminal trailer frame; an untranslated
+            // pass-through upload counts its decoded frames.
+            crate::plugins::grpc_web::record_request_grpc_message_count(&ctx, &grpc_req_body);
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
             let mut body_hook_ctx = deferred_body_hook_ctx.take();
@@ -35539,7 +35536,10 @@ async fn handle_proxy_request_inner(
                     upload_observer,
                     ctx.grpc_deadline_at(),
                     &mut held_frontend_grpc_upload,
-                    Some(Arc::clone(&ctx.grpc_request_messages_observed)),
+                    // The native length-prefix scanner cannot read a
+                    // pass-through `grpc-web-text` upload's base64.
+                    (!crate::plugins::grpc_web::request_uploads_passthrough_grpc_web_text(&ctx))
+                        .then(|| Arc::clone(&ctx.grpc_request_messages_observed)),
                     // The buffered arms `fetch_max` the collected length into
                     // this counter; the streamed arm has no collected length,
                     // so the body publishes its forwarded DATA tally at upload
@@ -35602,10 +35602,11 @@ async fn handle_proxy_request_inner(
                         // gRPC-Web translation is configured) or when an earlier
                         // terminal preparation already ran the transforms
                         // (`request_body_prepared`). Either way `grpc_req_body`
-                        // is already the backend-visible native representation.
-                        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-                            &ctx.metadata,
-                            &ctx.grpc_request_messages_observed,
+                        // is already the backend-visible representation; an
+                        // untranslated pass-through gRPC-Web upload counts its
+                        // decoded frames rather than its base64 / trailer bytes.
+                        crate::plugins::grpc_web::record_request_grpc_message_count(
+                            &ctx,
                             &grpc_req_body,
                         );
                         backend_admission_permits =
@@ -52224,11 +52225,11 @@ async fn proxy_to_backend_hbone_after_ready(
             );
             let body = match ctx {
                 Some(c)
-                    if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(c) =>
+                    if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
+                        c,
+                    ) =>
                 {
-                    body.with_grpc_message_counter(Arc::clone(
-                        &c.grpc_request_messages_observed,
-                    ))
+                    body.with_grpc_message_counter(Arc::clone(&c.grpc_request_messages_observed))
                 }
                 _ => body,
             };
@@ -53225,11 +53226,11 @@ async fn proxy_to_backend_unix(
             );
             let body = match ctx {
                 Some(c)
-                    if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(c) =>
+                    if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
+                        c,
+                    ) =>
                 {
-                    body.with_grpc_message_counter(Arc::clone(
-                        &c.grpc_request_messages_observed,
-                    ))
+                    body.with_grpc_message_counter(Arc::clone(&c.grpc_request_messages_observed))
                 }
                 _ => body,
             };

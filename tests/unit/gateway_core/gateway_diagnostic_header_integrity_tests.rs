@@ -369,21 +369,35 @@ fn find_after(haystack: &str, from: usize, needle: &str) -> usize {
 #[test]
 fn h1_h2_native_grpc_builders_write_the_gateway_token_after_hooks() {
     let proxy = include_str!("../../../src/proxy/mod.rs");
-    for arm in [
-        "Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {",
-        "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
+    // Each arm's LAST response hook: the buffered arm runs its
+    // response-committed hooks after `after_proxy`, and those can still write
+    // headers.
+    for (arm, last_hook) in [
+        (
+            "Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {",
+            "run_after_proxy_hooks(",
+        ),
+        (
+            "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
+            "run_deadline_bounded_response_committed_hooks(",
+        ),
     ] {
         let start = find_after(proxy, 0, arm);
         let hooks = find_after(proxy, start, "run_after_proxy_hooks(");
+        let last = find_after(proxy, hooks, last_hook);
         let write = find_after(
             proxy,
-            hooks,
+            last,
             "apply_authoritative_gateway_error_header_for_response(",
         );
         let wire = find_after(proxy, hooks, "headers_mod::apply_response_headers(");
         assert!(
+            last < wire,
+            "{arm}: {last_hook} must run before the headers reach the wire"
+        );
+        assert!(
             write < wire,
-            "{arm}: the gateway token must be written after the hooks and before the wire"
+            "{arm}: the gateway token must be written after {last_hook} and before the wire"
         );
     }
 }

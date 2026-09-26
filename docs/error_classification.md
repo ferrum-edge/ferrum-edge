@@ -333,13 +333,17 @@ classifies the response:
   it: the HTTP/1.1 and HTTP/2 response builder, the HTTP/1.1 and HTTP/2
   native gRPC response (buffered and streamed), and every HTTP/3 response,
   native or bridged, buffered or streamed, plain or gRPC
-  ([`finalize_h3_response_gateway_headers`](../src/http3/server.rs)). Each
-  applies
+  ([`finalize_h3_response_gateway_headers`](../src/http3/server.rs)). The
+  plain HTTP/1.1 / HTTP/2 builder derives the token with
+  [`x_gateway_error_for_response`](../src/proxy/mod.rs) and removes every
+  hook- or backend-written copy with
+  [`strip_gateway_owned_diagnostic_response_headers`](../src/proxy/headers.rs)
+  before writing it. The native gRPC builders and every HTTP/3 response apply
   [`apply_authoritative_gateway_error_header_for_response`](../src/proxy/mod.rs)
-  after the last response hook, so a copy a plugin or hook wrote is replaced
-  by the gateway's own value, never forwarded or duplicated. A gRPC response
-  still reports the RPC outcome in `grpc-status`; the token describes only the
-  HTTP status the gateway relayed.
+  after the last response hook. Either way a copy a plugin or hook wrote is
+  replaced by the gateway's own value, never forwarded or duplicated. A gRPC
+  response still reports the RPC outcome in `grpc-status`; the token describes
+  only the HTTP status the gateway relayed.
 - An HTTP/3 bridge attempt whose reqwest connection-pool client could not be
   built answers its `502` with `connection_failure`, exactly as the HTTP/1.1
   and HTTP/2 builder does for the same shared pool-failure response.
@@ -358,9 +362,9 @@ cover a pass-through gRPC-Web backend's in-body trailer frame. On a route
 without the `grpc_web` translator, the backend answers in gRPC-Web itself, and
 its trailer frame is backend body content that the gateway relays unchanged.
 Metadata in that frame, `x-gateway-error` included, reaches the client byte
-for byte. The gateway does not write it and does not classify with it, and the
-gateway does not rewrite pass-through bodies. Only the HTTP header section
-carries the gateway's own token (see the
+for byte. The gateway does not write it and does not derive or write
+`X-Gateway-Error` from it, and the gateway does not rewrite pass-through
+bodies. Only the HTTP header section carries the gateway's own token (see the
 [`grpc_web` plugin](plugins.md#grpc_web) for the pass-through relay).
 
 The headers are not authenticated, though: a client should trust them only on

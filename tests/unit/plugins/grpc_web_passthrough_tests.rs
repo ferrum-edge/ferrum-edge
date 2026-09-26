@@ -24,6 +24,7 @@ use ferrum_edge::_test_support::{
     record_captured_request_grpc_message_count_for_test,
     record_grpc_web_passthrough_status_for_test, record_request_grpc_message_count_for_test,
     request_stream_observes_native_grpc_messages_for_test,
+    request_uploads_passthrough_grpc_web_text_for_test,
     retain_grpc_web_client_content_type_for_test, set_request_grpc_web_upload_for_test,
 };
 use ferrum_edge::plugins::TransactionSummary;
@@ -547,6 +548,17 @@ fn passthrough_request_messages_follow_the_upload_framing() {
             !text_mode,
             "text_mode={text_mode}"
         );
+        // The native dispatch's streamed arm withholds its counter from a
+        // base64 upload whether or not a metrics plugin observes it.
+        let mut unobserved = create_test_context();
+        set_request_grpc_web_upload_for_test(&mut unobserved, text_mode);
+        for ctx in [&ctx, &unobserved] {
+            assert_eq!(
+                request_uploads_passthrough_grpc_web_text_for_test(ctx),
+                text_mode,
+                "text_mode={text_mode}"
+            );
+        }
     }
 }
 
@@ -572,6 +584,8 @@ fn native_and_translated_request_messages_keep_the_native_scanner() {
     assert_eq!(counted, 2);
     let scanned = request_stream_observes_native_grpc_messages_for_test(&translated);
     assert!(scanned);
+    assert!(!request_uploads_passthrough_grpc_web_text_for_test(&ctx));
+    assert!(!request_uploads_passthrough_grpc_web_text_for_test(&translated));
 
     // Without an observing metrics plugin nothing is counted or scanned.
     let mut unobserved = create_test_context();
@@ -580,6 +594,46 @@ fn native_and_translated_request_messages_keep_the_native_scanner() {
     assert_eq!(counted, 0);
     let scanned = request_stream_observes_native_grpc_messages_for_test(&unobserved);
     assert!(!scanned);
+}
+
+/// The H1/H2 and H3 frontends stamp the upload's framing from the request's
+/// OWN `Content-Type`, not from the negotiated response type, which can name
+/// the other mode.
+#[test]
+fn frontends_stamp_the_text_mode_flag_from_the_request_content_type() {
+    for (frontend, source) in [
+        ("h1_h2", include_str!("../../../src/proxy/mod.rs")),
+        ("h3", include_str!("../../../src/http3/server.rs")),
+    ] {
+        let stamp = "ctx.set_request_grpc_web_text(";
+        assert_eq!(
+            source.matches(stamp).count(),
+            1,
+            "{frontend}: exactly one frontend stamp"
+        );
+        let start = source.find(stamp).expect("stamp present");
+        let call = &source[start..];
+        let call = &call[..call.find(");").expect("stamp call ends")];
+        for needle in [
+            "req.headers()",
+            ".get(hyper::header::CONTENT_TYPE)",
+            ".is_some_and(crate::plugins::grpc_web::is_grpc_web_text)",
+        ] {
+            assert!(
+                call.contains(needle),
+                "{frontend}: the stamp reads {needle}: {call}"
+            );
+        }
+        // Stamped inside the gRPC-Web intake, beside the negotiated response
+        // type it must not be derived from.
+        let intake = source[..start]
+            .rfind("if let Some(content_type) = grpc_web_response_content_type {")
+            .expect("gRPC-Web intake block");
+        assert!(
+            !source[intake..start].contains("\n    }\n"),
+            "{frontend}: the stamp sits in the gRPC-Web intake block"
+        );
+    }
 }
 
 #[test]

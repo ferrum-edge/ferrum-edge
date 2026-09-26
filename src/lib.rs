@@ -12799,8 +12799,7 @@ pub mod _test_support {
         ctx: &crate::plugins::RequestContext,
         body: &[u8],
     ) -> u64 {
-        if let Some(counter) =
-            crate::plugins::grpc_web::RequestGrpcMessageCounter::for_request(ctx)
+        if let Some(counter) = crate::plugins::grpc_web::RequestGrpcMessageCounter::for_request(ctx)
         {
             counter.record(body);
         }
@@ -12814,6 +12813,14 @@ pub mod _test_support {
         ctx: &crate::plugins::RequestContext,
     ) -> bool {
         crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(ctx)
+    }
+
+    /// Whether `ctx` uploads pass-through `grpc-web-text`, which the native
+    /// dispatch's streamed upload never hands the native message scanner.
+    pub fn request_uploads_passthrough_grpc_web_text_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::plugins::grpc_web::request_uploads_passthrough_grpc_web_text(ctx)
     }
 
     /// Feed `chunks`, in order, to the pass-through gRPC-Web trailer observer

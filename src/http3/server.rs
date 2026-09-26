@@ -5924,12 +5924,9 @@ async fn handle_h3_request(
         )
         .await;
         // Same contract as the terminal-hook ladder above: count the
-        // backend-visible native representation, not the client wire bytes.
-        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-            &ctx.metadata,
-            &ctx.grpc_request_messages_observed,
-            &transformed,
-        );
+        // backend-visible representation, not the client wire bytes, and an
+        // untranslated pass-through upload on its decoded frames.
+        crate::plugins::grpc_web::record_request_grpc_message_count(&ctx, &transformed);
         match crate::proxy::run_final_request_body_hooks(
             &plugins,
             Some(&mut ctx),

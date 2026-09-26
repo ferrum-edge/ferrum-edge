@@ -565,6 +565,148 @@ async fn grpc_web_passthrough_buffered_deadline_split_and_unreadable_status() {
     }
 }
 
+/// Three request messages and a trailer frame, as a gRPC-Web client may
+/// upload them.
+fn passthrough_upload() -> Vec<u8> {
+    let mut upload = frame(0x00, b"one");
+    upload.extend_from_slice(&frame(0x00, b"two"));
+    upload.extend_from_slice(&frame(0x00, b"three"));
+    upload.extend_from_slice(&frame(0x80, b"x-app-id: 42\r\n"));
+    upload
+}
+
+fn logged_summary_field(logs: &str, proxy_id: &str, key: &str) -> Vec<Value> {
+    logs.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["proxy_id"] == proxy_id)
+        .map(|entry| entry[key].clone())
+        .collect()
+}
+
+/// Issue #5798: a Direct (non-mesh) pass-through gRPC-Web upload takes the
+/// native gRPC dispatch, and its BUFFERED arms count request messages on the
+/// decoded frame stream: a `grpc-web-text` upload is not read as native
+/// length prefixes, and a binary upload's trailer frame is not a message.
+/// `response_body_mode: buffer` reaches the arm that collects without request
+/// body hooks; `transaction_debugger` request-body capture reaches the arm that
+/// runs them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() {
+    let (_binary_backend, binary_port) =
+        spawn_h2c_backend("application/grpc-web+proto", passthrough_binary_body()).await;
+    let (_text_backend, text_port) =
+        spawn_h2c_backend("application/grpc-web-text+proto", passthrough_text_body()).await;
+
+    let mut proxies = Vec::new();
+    let mut plugin_configs = vec![
+        json!({
+            "id": "access-log",
+            "plugin_name": "stdout_logging",
+            "config": {},
+            "scope": "global",
+            "enabled": true,
+        }),
+        // Marks the transaction as observing gRPC messages.
+        json!({
+            "id": "prometheus",
+            "plugin_name": "prometheus_metrics",
+            "config": { "render_cache_ttl_seconds": 0 },
+            "scope": "global",
+            "enabled": true,
+        }),
+    ];
+    for suffix in ["h1", "h2"] {
+        for (mode, backend_port) in [("bin", binary_port), ("text", text_port)] {
+            let buffered_id = format!("count-buf-{mode}-{suffix}");
+            proxies.push(buffered_route(&buffered_id, backend_port));
+            let hooks_id = format!("count-hooks-{mode}-{suffix}");
+            let debugger_id = format!("{hooks_id}-debugger");
+            let hooks_plugins = json!([{ "plugin_config_id": debugger_id }]);
+            proxies.push(route(&hooks_id, backend_port, hooks_plugins));
+            plugin_configs.push(json!({
+                "id": debugger_id,
+                "plugin_name": "transaction_debugger",
+                "config": {
+                    "log_request_body": true,
+                    "max_request_body_bytes": 256,
+                },
+                "scope": "proxy",
+                "proxy_id": hooks_id,
+                "enabled": true,
+            }));
+        }
+    }
+    let config = json!({
+        "version": "1",
+        "proxies": proxies,
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": plugin_configs,
+    });
+    let harness = GatewayHarness::builder()
+        .file_config(to_file_mode_yaml(&config))
+        .log_level("info")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let base = harness.proxy_base_url().to_string();
+
+    let h1 = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h1 client");
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h2c client");
+    let binary = passthrough_upload();
+    let text = BASE64.encode(&binary).into_bytes();
+
+    let mut proxy_ids = Vec::new();
+    for (client, suffix) in [(&h1, "h1"), (&h2, "h2")] {
+        for arm in ["buf", "hooks"] {
+            for (mode, content_type, upload) in [
+                ("bin", "application/grpc-web+proto", &binary),
+                ("text", "application/grpc-web-text+proto", &text),
+            ] {
+                let proxy_id = format!("count-{arm}-{mode}-{suffix}");
+                post_grpc_web(
+                    client,
+                    &format!("{base}/{proxy_id}/echo.Echo/Unary"),
+                    content_type,
+                    upload.clone(),
+                )
+                .await;
+                proxy_ids.push(proxy_id);
+            }
+        }
+    }
+
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| {
+                proxy_ids
+                    .iter()
+                    .all(|proxy_id| !logged_grpc_status(logs, proxy_id).is_empty())
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+    for proxy_id in &proxy_ids {
+        assert_eq!(
+            logged_summary_field(&logs, proxy_id, "grpc_request_messages"),
+            vec![json!(3)],
+            "{proxy_id}: three decoded messages, never the base64 armour or the trailer \
+             frame; logs:\n{logs}"
+        );
+    }
+}
+
 /// Issue #5784: pass-through gRPC-Web over the GENERIC relay path. A
 /// `mesh.unix_socket` HTTP/1.1 target makes the native gRPC branch fall through
 /// (`grpc_mesh_dispatch_falls_through`), so the H1/H2 response funnel's generic
