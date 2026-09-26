@@ -2,16 +2,14 @@
 
 ## Supported Versions
 
-Ferrum Edge is in pre-1.0 build-out. The release-preparation snapshot on
-2026-09-06 declares `0.9.3` in `Cargo.toml`; source tags `v0.9.0`, `v0.9.1`, and
-`v0.9.2` already exist. A source tag alone does not prove that its release assets
-or container images finished publishing. Check the
+Ferrum Edge is in pre-1.0 build-out. A source tag alone does not prove that its
+release assets or container images finished publishing. Check the
 [Releases page](https://github.com/ferrum-edge/ferrum-edge/releases) and the
 version's release workflow before choosing an artifact.
 
 | Version | Status | Security updates |
 | ------- | ------ | ---------------- |
-| `main` (currently preparing `0.9.3`) | active build-out; breaking changes expected | fixes land on `main`; CI validates but does not publish production artifacts |
+| `main` | active build-out; breaking changes expected | fixes land on `main`; CI validates but does not publish production artifacts |
 | Published `v0.9.x` artifacts | pre-1.0 versioned releases, where publication completed | take a subsequently published version containing the fix; no minor-line backport window is committed yet |
 | Historical `latest` artifacts | no longer refreshed by main CI | do not use as a security-update channel |
 
@@ -29,9 +27,12 @@ We take security vulnerabilities seriously. If you discover a security issue in 
 
 ### Private Disclosure Process
 
-**Please do not open public GitHub issues for security vulnerabilities.**
+Please do not report security issues in public GitHub issues. Submit a report
+through [GitHub's private vulnerability reporting form](https://github.com/ferrum-edge/ferrum-edge/security/advisories/new)
+so maintainers can coordinate a fix and disclosure privately. Published reports
+are listed in the [GitHub Security Advisories](https://github.com/ferrum-edge/ferrum-edge/security/advisories).
 
-Instead, send an email to: **contact@ferrumedge.com**
+If private reporting is unavailable, email **contact@ferrumedge.com**.
 
 Include the following information:
 - Description of the vulnerability
@@ -136,9 +137,8 @@ Key controls:
 
 ## Acknowledgments
 
-We thank the following security researchers who have responsibly disclosed vulnerabilities:
-
-*No vulnerabilities have been publicly disclosed at this time.*
+Researchers who choose to be credited are acknowledged in the
+[published GitHub Security Advisories](https://github.com/ferrum-edge/ferrum-edge/security/advisories).
 
 ---
 
