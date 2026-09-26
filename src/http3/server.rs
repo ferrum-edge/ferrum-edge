@@ -7237,12 +7237,7 @@ async fn handle_h3_request(
             // Do NOT propagate a send error: the outcome record below releases
             // the CB probe slot and the admission outcome, so a `?` here would
             // skip them when the client disconnects during the reject write.
-            let _ = send_h3_response(
-                &mut stream,
-                StatusCode::BAD_GATEWAY,
-                r#"{"error":"Backend response body exceeds maximum size"}"#,
-            )
-            .await;
+            let _ = send_h3_response_too_large(&mut stream, &ctx).await;
 
             crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                 &state,
@@ -11634,13 +11629,7 @@ async fn stream_h3_open_response_to_client(
             max_response_body_size_bytes = effective_max_response_body_size_bytes,
             "HTTP/3 backend response body exceeds configured size limit"
         );
-        let size_reject_sent = send_h3_response(
-            h3_stream,
-            StatusCode::BAD_GATEWAY,
-            r#"{"error":"Backend response body exceeds maximum size"}"#,
-        )
-        .await
-        .is_ok();
+        let size_reject_sent = send_h3_response_too_large(h3_stream, ctx).await.is_ok();
         return Ok(H3StreamResult {
             status: 502,
             backend_status: response_status,
@@ -15995,13 +15984,7 @@ async fn proxy_to_backend_h3_streaming(
         // Same outcome-accounting contract as the after_proxy reject below:
         // never propagate a send error, or the caller's backend outcome record
         // is skipped for a client that disconnected during the reject write.
-        let size_reject_sent = send_h3_response(
-            h3_stream,
-            StatusCode::BAD_GATEWAY,
-            r#"{"error":"Backend response body exceeds maximum size"}"#,
-        )
-        .await
-        .is_ok();
+        let size_reject_sent = send_h3_response_too_large(h3_stream, ctx).await.is_ok();
         return Ok(H3StreamResult {
             status: 502,
             // The backend did respond (headers received) before we found the
@@ -17085,6 +17068,33 @@ async fn send_h3_reject_response(
     let mut headers = headers.clone();
     headers.insert("content-type".to_string(), "application/json".to_string());
     send_h3_finalized_reject_response(stream, status, body, &headers, disposition).await
+}
+
+/// The `502` a native HTTP/3 streaming relay writes when the backend declares
+/// a `Content-Length` over the effective response ceiling, before any response
+/// hook ran. It carries the `X-Gateway-Error` token the HTTP/1.1 / HTTP/2
+/// builder writes for the same refusal: not a connection error, so a `502`
+/// reads `backend_error`.
+async fn send_h3_response_too_large(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    ctx: &RequestContext,
+) -> Result<(), anyhow::Error> {
+    let mut headers = HashMap::with_capacity(2);
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    crate::proxy::apply_authoritative_gateway_error_header_for_response(
+        &mut headers,
+        ctx,
+        false,
+        StatusCode::BAD_GATEWAY.as_u16(),
+    );
+    send_h3_finalized_reject_response(
+        stream,
+        StatusCode::BAD_GATEWAY,
+        Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
+        &headers,
+        RejectBodyDisposition::WireBody,
+    )
+    .await
 }
 
 /// Write a rejection whose header map has already completed response policy.
