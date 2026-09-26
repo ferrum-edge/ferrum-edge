@@ -781,13 +781,18 @@ expiry while it is still streaming is charged to the backend.
   budget rides the call's single absolute RPC deadline, which the `grpc_deadline`
   plugin, the gRPC dispatchers and every gRPC-Web pass-through bound share from
   before dispatch; starting it at the handoff needs each of those dispatchers
-  to re-arm that deadline from inside its own send path (tracked in #5734).
+  to re-arm that deadline from inside its own send path. This is intentional
+  (decided in #5734): the only difference is a few milliseconds of gateway-side
+  work on the first attempt, and retries already start a fresh budget.
 - **gRPC budget expiry is not retried.** gRPC calls are retried only after
   connection failures, so a call whose attempt budget expired ends with
   `DEADLINE_EXCEEDED` even when the rule's `retry` lists `504`. The gRPC retry
   path replays only calls that never reached the backend; retrying an expiry
   would replay a call the backend already received, which that policy does not
-  do (tracked in #5734).
+  do. This is intentional (decided in #5734): replaying an RPC that reached the
+  backend can run a non-idempotent call twice, gRPC's own retry design
+  (gRFC A6) retries only calls that received no response headers, and Gateway
+  API defines no GRPCRoute `retry` field.
 
 The HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends collects a buffered response
 body (a response-body plugin or `response_body_mode: buffer`) inside the
