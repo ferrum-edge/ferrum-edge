@@ -33,6 +33,7 @@ use crate::scaffolding::ports::{
 };
 
 use bytes::Bytes;
+use ferrum_edge::overload::SHUTDOWN_DRAIN_BEGUN_LOG;
 use http_body_util::{BodyExt, Empty};
 use hyper::client::conn::http1;
 use hyper::header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, TRANSFER_ENCODING};
@@ -274,6 +275,28 @@ impl DrainGateway {
         expect_listener_closed(self.proxy_addr(), HTTP_PROBE, context).await;
     }
 
+    /// Wait until the gateway logs [`SHUTDOWN_DRAIN_BEGUN_LOG`] (issue #5821).
+    ///
+    /// A closed proxy port does not prove drain has begun: the mode stores
+    /// the drain flags only after it has joined every listener handle. The
+    /// line is written after those stores, so once it is read, a response the
+    /// gateway builds afterwards carries the drain close hint.
+    async fn expect_drain_begun(&self, context: &str) {
+        let deadline = Instant::now() + DRAIN_BEGUN_DEADLINE;
+        loop {
+            match self.guard.read_captured_output() {
+                Ok(output) if output_shows_drain_begun(&output) => return,
+                Ok(_) if Instant::now() < deadline => sleep(CAPTURE_POLL_INTERVAL).await,
+                Ok(_) => panic!(
+                    "{context}: gateway did not log `{SHUTDOWN_DRAIN_BEGUN_LOG}` within \
+                     {DRAIN_BEGUN_DEADLINE:?}\n{}",
+                    self.guard.startup_diagnostics()
+                ),
+                Err(error) => panic!("{context}: reading gateway output failed: {error}"),
+            }
+        }
+    }
+
     /// Assert that the gateway exits on its own, with status 0, within `bound`.
     async fn expect_clean_exit(&mut self, bound: Duration, context: &str) {
         let result = wait_for_clean_exit(self.guard.child_mut(), bound).await;
@@ -447,6 +470,16 @@ const TCP_PROBE: &[u8] = b"x";
 const PROBE_STEP_BOUND: Duration = Duration::from_secs(2);
 /// Deadline for a listener to show closure after SIGTERM.
 const LISTENER_CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+/// Deadline for the drain-begun log line after the proxy port closed. The
+/// gateway logs through a non-blocking writer, so the line can trail the event.
+const DRAIN_BEGUN_DEADLINE: Duration = Duration::from_secs(5);
+/// Interval between reads of the gateway's captured output.
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Whether captured gateway output shows the shutdown drain has begun.
+fn output_shows_drain_begun(output: &str) -> bool {
+    output.contains(SHUTDOWN_DRAIN_BEGUN_LOG)
+}
 
 /// Positive evidence that a listener stopped accepting.
 enum ListenerClosed {
@@ -925,8 +958,12 @@ async fn test_drain_zero_exits_immediately() {
 /// `Connection: close` together with its complete body.
 ///
 /// The held backend proves the request is in flight before SIGTERM, and it
-/// releases the response only after the proxy listener is shown closed, so the
-/// response head is written while draining. An idle socket that shutdown
+/// releases the response only after the gateway has logged that drain began,
+/// so the response head is written while draining. A closed proxy port alone
+/// is not enough (issue #5821): the drain flags are stored only after the mode
+/// joins every listener handle, and a response released in that gap can miss
+/// the drain hint and depend only on the connection task having run
+/// `graceful_shutdown()`. An idle socket that shutdown
 /// closes fails this case because it has no response; idle closure is covered
 /// by `test_idle_keepalive_connection_closed_on_drain`.
 ///
@@ -949,6 +986,7 @@ async fn test_drain_sets_connection_close_header() {
 
     gateway.send_sigterm();
     gateway.expect_proxy_port_closed("after SIGTERM").await;
+    gateway.expect_drain_begun("after SIGTERM").await;
     backend.release();
 
     let response = expect_complete(finish(inflight).await, "response released during drain");
@@ -1382,6 +1420,16 @@ async fn spawn_fake_peer(kind: FakePeer) -> (SocketAddr, JoinHandle<()>) {
         }
     });
     (addr, task)
+}
+
+/// The drain-begun wait matches only the gateway's own log line, so output
+/// that shows the listener closing without the drain flags set cannot pass it.
+#[test]
+fn harness_drain_begun_wait_requires_the_gateway_log_line() {
+    let logged = format!("INFO ferrum_edge::overload: {SHUTDOWN_DRAIN_BEGUN_LOG} phase=drain\n");
+    assert!(output_shows_drain_begun(&logged));
+    assert!(!output_shows_drain_begun("INFO Proxy listener shutting down\n"));
+    assert!(!output_shows_drain_begun(""));
 }
 
 #[tokio::test]

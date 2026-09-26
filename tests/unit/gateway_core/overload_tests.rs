@@ -277,6 +277,34 @@ fn begin_drain_is_idempotent() {
     assert!(state.reject_new_requests.load(Ordering::Acquire));
 }
 
+#[test]
+fn shutdown_drain_logs_begun_only_after_flags_are_stored() {
+    // Issue #5821: a closed proxy port does not prove drain has begun, so the
+    // graceful-shutdown functional tests wait for this log line before they
+    // release a held response. The line is only a valid signal if it is
+    // emitted after `begin_drain` has stored the flags. Pinned at the source:
+    // calling `begin_shutdown_drain` here would cancel the process-global
+    // fault-delay token for every later test in this binary.
+    let source = include_str!("../../../src/overload.rs");
+    let entry = source
+        .find("pub fn begin_shutdown_drain(")
+        .expect("begin_shutdown_drain must exist");
+    let body = &source[entry..];
+    let end = body.find("\n}\n").expect("begin_shutdown_drain body end");
+    let body = &body[..end];
+    let flags_at = body
+        .find("begin_drain(state);")
+        .expect("begin_shutdown_drain must set the drain flags");
+    let logged_at = body
+        .find("SHUTDOWN_DRAIN_BEGUN_LOG")
+        .expect("begin_shutdown_drain must log that drain has begun");
+    assert!(
+        flags_at < logged_at,
+        "the drain-begun line must follow the flag stores, or a reader could act on it \
+         before responses carry the close hint"
+    );
+}
+
 // ── wait_for_drain ───────────────────────────────────────────────────
 
 #[tokio::test]

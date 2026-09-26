@@ -1545,7 +1545,24 @@ pub fn classify_shutdown_signal(observed_count: u32) -> ShutdownSignalAction {
 /// notification) sees the post-shutdown state in a happens-before relationship.
 ///
 /// Called by every serving mode at the START of the post-listener-exit phase,
-/// regardless of `FERRUM_SHUTDOWN_DRAIN_SECONDS`. Two effects:
+/// regardless of `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
+///
+/// **Ordering (issue #5821).** The shutdown broadcast, the accept loops
+/// closing, and this call are separate steps. The broadcast closes the proxy
+/// accept loops and signals each connection's `graceful_shutdown()`, and the
+/// mode then joins every listener handle before calling this. So an observer
+/// that sees a proxy port closed has NOT seen the drain flags set yet. That
+/// join is deliberate and must not be collapsed by setting these flags ahead
+/// of the broadcast: the HTTP/3 listener runs its own bounded GOAWAY drain
+/// before its handle returns, and during that window accepted H3 streams and
+/// CONNECT-UDP tunnels keep being served. Setting `reject_new_requests` and
+/// `drain_started` earlier would reject those streams and end those tunnels
+/// (see `docs/http3.md`). In the gap, HTTP/1.1 keep-alive is already off
+/// through hyper's `graceful_shutdown()`. [`begin_shutdown_drain`] logs
+/// [`SHUTDOWN_DRAIN_BEGUN_LOG`] once the flags are stored, which is the
+/// observable "drain has begun" signal.
+///
+/// Two effects:
 ///
 /// 1. **`draining=true`** — `Connection: close` is injected on HTTP/1.1 responses
 ///    so keepalive clients release connections instead of holding them open
@@ -1584,7 +1601,19 @@ pub fn begin_drain(state: &Arc<OverloadState>) {
 pub fn begin_shutdown_drain(state: &Arc<OverloadState>) {
     begin_drain(state);
     crate::plugins::utils::fault_delay::cancel_fault_delays_for_shutdown();
+    info!(phase = "drain", "{}", SHUTDOWN_DRAIN_BEGUN_LOG);
 }
+
+/// Message [`begin_shutdown_drain`] logs at `info` after the drain flags are
+/// stored (issue #5821).
+///
+/// A closed proxy port does not prove drain has begun (see [`begin_drain`]),
+/// so the line is the process-external signal: every response produced after
+/// it is written carries the close hint, and every new request is rejected.
+/// The graceful-shutdown functional tests wait for it before releasing a held
+/// response.
+pub const SHUTDOWN_DRAIN_BEGUN_LOG: &str =
+    "Shutdown drain begun: Connection: close hint and new-request rejection are active";
 
 /// Wait for all in-flight connections and requests to drain, up to the
 /// configured timeout.

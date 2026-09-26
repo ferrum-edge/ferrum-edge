@@ -566,6 +566,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status, as HTTP/1.1 and HTTP/2 do, so hooks can no longer see, replace,
   duplicate, or erase the token. A hook-set non-5xx status without a connection
   error carries no token, matching HTTP/1.1 and HTTP/2 (#5807).
+- Serving modes now log `Shutdown drain begun: Connection: close hint and
+  new-request rejection are active` at `info` once the shutdown drain flags are
+  set. A closed proxy port does not mean drain has begun, because the flags are
+  set only after every listener task returns, including the HTTP/3 listener's
+  own drain. The graceful-shutdown functional test now waits for this line
+  before it releases a held response, instead of treating the closed port as
+  proof, which removes a race that made it flaky (#5821).
 
 ### Security
 

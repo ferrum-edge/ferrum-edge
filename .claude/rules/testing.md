@@ -211,7 +211,11 @@ shares.
   check both. Hyper adds `Connection: close` by itself once
   `graceful_shutdown()` disables keep-alive, so the gateway's own drain hint is
   pinned in `tests/integration/graceful_shutdown_tests.rs` with the listener's
-  shutdown channel left unsignalled. A hyper client closes an idle connection
+  shutdown channel left unsignalled. A closed proxy port does not prove drain
+  has begun: the drain flags are set only after every listener task returns
+  (issue #5821). Before you assert drain-flag behaviour from a real process,
+  wait for `overload::SHUTDOWN_DRAIN_BEGUN_LOG` (`expect_drain_begun`). A hyper
+  client closes an idle connection
   once its last `SendRequest` drops; keep the sender alive when asserting that
   the server closed it.
 - Readiness is not identity — and that applies to bespoke spawners too, not just `TestGateway`. `functional_websocket_test.rs::wait_for_owned_gateway` reuses the exported `probe_gateway_identity` because a bare TCP accept let a foreign H2 fixture answer (and `PROTOCOL_ERROR`-reset) an RFC 8441 Extended CONNECT handshake (issue #3435).
