@@ -3648,20 +3648,42 @@ impl RequestGrpcMessageCounter {
     }
 }
 
-/// Whether a STREAMED upload may carry the native length-prefix scanner the
-/// request body adapters attach for gRPC message accounting.
+/// Framing of this request's backend-visible upload, as a gRPC message scanner
+/// reads it while the upload streams.
 ///
-/// A pass-through `grpc-web-text` upload is base64, which that scanner cannot
-/// read: it would count whatever lengths the armour happens to decode to. Such
-/// an upload is therefore not counted when streamed. A binary gRPC-Web upload
-/// shares native length-prefixed message framing, so it keeps the scanner.
-pub(crate) fn request_stream_observes_native_grpc_messages(ctx: &RequestContext) -> bool {
-    crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
-        && !request_uploads_passthrough_grpc_web_text(ctx)
+/// A PASS-THROUGH gRPC-Web upload keeps the client's framing: its trailer
+/// frame is metadata and `grpc-web-text` is base64, so neither is read as
+/// native length prefixes. Every other upload is native framing (a translated
+/// upload was decoded by this plugin's request transform).
+pub(crate) fn request_upload_grpc_message_framing(
+    ctx: &RequestContext,
+) -> crate::plugins::mesh::prometheus_helpers::GrpcMessageFraming {
+    use crate::plugins::mesh::prometheus_helpers::GrpcMessageFraming;
+    match passthrough_request_text_mode(ctx) {
+        Some(text_mode) => GrpcMessageFraming::grpc_web(text_mode),
+        None => GrpcMessageFraming::Native,
+    }
+}
+
+/// The message tap a STREAMED upload's body adapter feeds for gRPC message
+/// accounting, reading the upload's own framing (see
+/// [`request_upload_grpc_message_framing`]). `None` when the transaction does
+/// not observe gRPC messages.
+pub(crate) fn request_stream_grpc_message_tap(
+    ctx: &RequestContext,
+) -> Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap> {
+    use crate::plugins::mesh::prometheus_helpers as helpers;
+    if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+        return None;
+    }
+    Some(helpers::GrpcMessageTap::new(
+        std::sync::Arc::clone(&ctx.grpc_request_messages_observed),
+        request_upload_grpc_message_framing(ctx),
+    ))
 }
 
 /// Whether this request uploads PASS-THROUGH `grpc-web-text` (base64), which
-/// the native length-prefix scanner cannot read.
+/// only a text-mode message scanner can read.
 pub(crate) fn request_uploads_passthrough_grpc_web_text(ctx: &RequestContext) -> bool {
     passthrough_request_text_mode(ctx) == Some(true)
 }

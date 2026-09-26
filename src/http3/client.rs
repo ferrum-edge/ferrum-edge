@@ -2763,8 +2763,9 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
-        // Optional authoritative gRPC length-prefixed request message counter.
-        grpc_messages: Option<Arc<AtomicU64>>,
+        // Optional authoritative gRPC request message counter, scanning the
+        // upload's own framing.
+        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
         // Response-header wait bound (ms; `0` = unbounded). Normally
         // `proxy.backend_read_timeout_ms`, but the native-H3 gRPC path overrides it
         // with `0` when a client `grpc-timeout` is present so the outer absolute
@@ -2812,9 +2813,7 @@ impl Http3ConnectionPool {
         // Uses Buf::copy_to_bytes() which is zero-copy when the underlying
         // buffer is already bytes::Bytes (common with h3-quinn).
         let mut total_sent: usize = 0;
-        let mut grpc_scanner = grpc_messages.as_ref().map(|_| {
-            crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default()
-        });
+        let mut grpc_tap = grpc_messages;
         loop {
             let recv_res = frontend_stream.recv_data().await;
             let chunk_opt = match recv_res {
@@ -2840,19 +2839,15 @@ impl Http3ConnectionPool {
                 continue;
             }
             let data = chunk.copy_to_bytes(len);
-            let metric_data = grpc_scanner.as_ref().map(|_| data.clone());
+            let metric_data = grpc_tap.as_ref().map(|_| data.clone());
             await_h3_client_write_with_timeout(
                 proxy.backend_write_timeout_ms,
                 backend_stream.send_data(data),
                 "send_data",
             )
             .await?;
-            if let (Some(messages), Some(scanner), Some(metric_data)) = (
-                grpc_messages.as_ref(),
-                grpc_scanner.as_mut(),
-                metric_data.as_ref(),
-            ) {
-                scanner.push(metric_data, messages);
+            if let (Some(tap), Some(metric_data)) = (grpc_tap.as_mut(), metric_data.as_ref()) {
+                tap.push(metric_data);
             }
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
@@ -3177,7 +3172,7 @@ impl Http3ConnectionPool {
         frontend_body: Incoming,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<Arc<AtomicU64>>,
+        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
     ) -> Result<H3StreamingResponse, (H3PoolError, Option<Incoming>)> {
         let backend_stream = match Self::open_streaming_incoming_backend_stream(
             send_request,
@@ -3255,12 +3250,10 @@ impl Http3ConnectionPool {
         mut frontend_body: Incoming,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<Arc<AtomicU64>>,
+        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let mut total_sent: usize = 0;
-        let mut grpc_scanner = grpc_messages.as_ref().map(|_| {
-            crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default()
-        });
+        let mut grpc_tap = grpc_messages;
         while let Some(frame_result) = frontend_body.frame().await {
             let frame = frame_result.map_err(|e| {
                 H3PoolError::post_wire(anyhow::anyhow!(
@@ -3284,19 +3277,15 @@ impl Http3ConnectionPool {
                 continue;
             }
             let data = chunk.copy_to_bytes(len);
-            let metric_data = grpc_scanner.as_ref().map(|_| data.clone());
+            let metric_data = grpc_tap.as_ref().map(|_| data.clone());
             await_h3_client_write_with_timeout(
                 proxy.backend_write_timeout_ms,
                 backend_stream.send_data(data),
                 "send_data",
             )
             .await?;
-            if let (Some(messages), Some(scanner), Some(metric_data)) = (
-                grpc_messages.as_ref(),
-                grpc_scanner.as_mut(),
-                metric_data.as_ref(),
-            ) {
-                scanner.push(metric_data, messages);
+            if let (Some(tap), Some(metric_data)) = (grpc_tap.as_mut(), metric_data.as_ref()) {
+                tap.push(metric_data);
             }
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
@@ -3340,7 +3329,7 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<Arc<AtomicU64>>,
+        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
         // Response-header wait bound (ms; `0` = unbounded), forwarded to
         // `do_request_streaming_body`. Callers pass `proxy.backend_read_timeout_ms`
         // normally; the native-H3 gRPC path passes `0` under a client `grpc-timeout`
@@ -3463,7 +3452,7 @@ impl Http3ConnectionPool {
         mut frontend_body: Incoming,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<Arc<AtomicU64>>,
+        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
     where
@@ -3576,7 +3565,7 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<Arc<AtomicU64>>,
+        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
         // Response-header wait bound (ms; `0` = unbounded), forwarded to
         // `do_request_streaming_body`. Callers pass `proxy.backend_read_timeout_ms`
         // normally; the native-H3 gRPC path passes `0` under a client `grpc-timeout`
@@ -3720,7 +3709,7 @@ impl Http3ConnectionPool {
         mut frontend_body: Incoming,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<Arc<AtomicU64>>,
+        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
     where

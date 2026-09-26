@@ -6932,9 +6932,7 @@ async fn handle_h3_request(
         // satisfy the shared signature.
         let request_stream_opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let request_upload_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let grpc_request_messages =
-            crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(&ctx)
-                .then(|| Arc::clone(&ctx.grpc_request_messages_observed));
+        let grpc_request_messages = crate::plugins::grpc_web::request_stream_grpc_message_tap(&ctx);
 
         // The matched route rule's deadlines (#5646). The streamed upload is
         // handed to the backend as soon as the backend stream opens, so the
@@ -12635,7 +12633,7 @@ struct H3GrpcUploadPumpParams {
     /// backend-visible request DATA on this path, so the length-prefixed message
     /// scan lives here — exactly where the drain-then-read
     /// `do_request_streaming_body` used to keep it.
-    grpc_messages: Option<Arc<std::sync::atomic::AtomicU64>>,
+    grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
     shutdown: Arc<tokio::sync::Notify>,
     auth_deadline_plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     auth_latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
@@ -12674,9 +12672,7 @@ async fn run_h3_grpc_upload_pump(
         upload.publish_fault(H3GrpcUploadFault::AuthorizationExpired(termination));
     };
     let mut total_sent: usize = 0;
-    let mut grpc_scanner = grpc_messages
-        .as_ref()
-        .map(|_| crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default());
+    let mut grpc_tap = grpc_messages;
     // Every `break` carries the exit reason, so there is no initial value that
     // teardown could read by accident. `blocked_on_backend` is published around
     // the backend awaits (and only those) so a response-header wait that expires
@@ -12722,7 +12718,7 @@ async fn run_h3_grpc_upload_pump(
         // Cloning a `Bytes` is a refcount bump, and only when the metric is
         // actually observed: `send_data` moves the buffer, but a complete
         // message may only be counted AFTER the forward succeeds.
-        let metric_data = grpc_scanner.as_ref().map(|_| data.clone());
+        let metric_data = grpc_tap.as_ref().map(|_| data.clone());
         upload.set_blocked_on_backend(true);
         let sent = match h3_grpc_upload_await_until_authorization(
             auth_deadline_plan,
@@ -12749,12 +12745,8 @@ async fn run_h3_grpc_upload_pump(
             upload.publish_fault(H3GrpcUploadFault::BackendUploadHalted);
             break 'pump H3UploadPumpExit::Halted;
         }
-        if let (Some(messages), Some(scanner), Some(metric_data)) = (
-            grpc_messages.as_ref(),
-            grpc_scanner.as_mut(),
-            metric_data.as_ref(),
-        ) {
-            scanner.push(metric_data, messages);
+        if let (Some(tap), Some(metric_data)) = (grpc_tap.as_mut(), metric_data.as_ref()) {
+            tap.push(metric_data);
         }
         upload.add_bytes(len as u64);
     };
@@ -13528,8 +13520,13 @@ async fn dispatch_grpc_native_h3(
     // gRPC request-message accounting for the `GRPC_REQUEST_MESSAGES` telemetry
     // family. The upload pump owns the only copy of the backend-visible request
     // DATA on this path, so the length-prefixed message scan rides with it; the
-    // native H3 gRPC path would otherwise stop feeding the metric entirely.
-    let grpc_request_messages = Some(Arc::clone(&ctx.grpc_request_messages_observed));
+    // native H3 gRPC path would otherwise stop feeding the metric entirely. It
+    // reads the upload's own framing: a pass-through gRPC-Web upload counts
+    // decoded message frames only.
+    let grpc_request_messages = crate::plugins::mesh::prometheus_helpers::GrpcMessageTap::new(
+        Arc::clone(&ctx.grpc_request_messages_observed),
+        crate::plugins::grpc_web::request_upload_grpc_message_framing(ctx),
+    );
 
     // Honor the client gRPC deadline (`grpc-timeout`) as an ABSOLUTE end-to-end
     // RPC deadline anchored at request receipt — exactly like the H2 /
@@ -13755,7 +13752,7 @@ async fn dispatch_grpc_native_h3(
             H3GrpcUploadPumpParams {
                 upload: Arc::clone(&upload),
                 max_request_body_size: effective_max_grpc_recv_size_bytes,
-                grpc_messages: grpc_request_messages,
+                grpc_messages: Some(grpc_request_messages),
                 shutdown: pump_shutdown,
                 auth_deadline_plan,
                 auth_latch: ctx.authorization_termination_latch(),

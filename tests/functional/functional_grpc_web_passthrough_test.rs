@@ -567,12 +567,17 @@ async fn grpc_web_passthrough_buffered_deadline_split_and_unreadable_status() {
 
 /// Three request messages and a trailer frame, as a gRPC-Web client may
 /// upload them.
+fn passthrough_upload_frames() -> [Vec<u8>; 4] {
+    [
+        frame(0x00, b"one"),
+        frame(0x00, b"two"),
+        frame(0x00, b"three"),
+        frame(0x80, b"x-app-id: 42\r\n"),
+    ]
+}
+
 fn passthrough_upload() -> Vec<u8> {
-    let mut upload = frame(0x00, b"one");
-    upload.extend_from_slice(&frame(0x00, b"two"));
-    upload.extend_from_slice(&frame(0x00, b"three"));
-    upload.extend_from_slice(&frame(0x80, b"x-app-id: 42\r\n"));
-    upload
+    passthrough_upload_frames().concat()
 }
 
 fn logged_summary_field(logs: &str, proxy_id: &str, key: &str) -> Vec<Value> {
@@ -708,6 +713,145 @@ async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() 
                 .await;
                 proxy_ids.push(proxy_id);
             }
+        }
+    }
+
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| {
+                proxy_ids
+                    .iter()
+                    .all(|proxy_id| !logged_grpc_status(logs, proxy_id).is_empty())
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+    for proxy_id in &proxy_ids {
+        assert_eq!(
+            logged_summary_field(&logs, proxy_id, "grpc_request_messages"),
+            vec![json!(3)],
+            "{proxy_id}: three decoded messages, never the base64 armour or the trailer \
+             frame; logs:\n{logs}"
+        );
+    }
+}
+
+/// `upload` as a request body of unknown length, written in chunks cut at
+/// `cuts` with a pause before each, so the gateway reads the chunks
+/// separately and cannot pre-buffer the upload.
+fn chunked_upload(upload: &[u8], cuts: &[usize]) -> reqwest::Body {
+    use futures_util::StreamExt;
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    for cut in cuts.iter().copied().chain([upload.len()]) {
+        let chunk = Bytes::copy_from_slice(&upload[start..cut]);
+        chunks.push(Ok::<_, std::io::Error>(chunk));
+        start = cut;
+    }
+    let paced = futures_util::stream::iter(chunks).then(|chunk| async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        chunk
+    });
+    reqwest::Body::wrap_stream(paced)
+}
+
+/// Issue #5807: a Direct pass-through gRPC-Web upload on the native gRPC
+/// dispatch's STREAMED arm counts request messages on its decoded frame
+/// stream, as the buffered arms do. A binary upload's trailer frame is not a
+/// message, and a `grpc-web-text` upload, here as independently padded base64
+/// segments, is decoded across chunk boundaries that split both frames and
+/// base64 groups.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_web_passthrough_streamed_uploads_count_decoded_request_messages() {
+    let (_binary_backend, binary_port) =
+        spawn_h2c_backend("application/grpc-web+proto", passthrough_binary_body()).await;
+    let (_text_backend, text_port) =
+        spawn_h2c_backend("application/grpc-web-text+proto", passthrough_text_body()).await;
+
+    let mut proxies = Vec::new();
+    for suffix in ["h1", "h2"] {
+        for (mode, backend_port) in [("bin", binary_port), ("text", text_port)] {
+            let proxy_id = format!("count-stream-{mode}-{suffix}");
+            proxies.push(route(&proxy_id, backend_port, json!([])));
+        }
+    }
+    let config = json!({
+        "version": "1",
+        "proxies": proxies,
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "access-log",
+                "plugin_name": "stdout_logging",
+                "config": {},
+                "scope": "global",
+                "enabled": true,
+            },
+            // Marks the transaction as observing gRPC messages.
+            {
+                "id": "prometheus",
+                "plugin_name": "prometheus_metrics",
+                "config": { "render_cache_ttl_seconds": 0 },
+                "scope": "global",
+                "enabled": true,
+            },
+        ],
+    });
+    let harness = GatewayHarness::builder()
+        .file_config(to_file_mode_yaml(&config))
+        .log_level("info")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let base = harness.proxy_base_url().to_string();
+
+    let h1 = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h1 client");
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h2c client");
+    let binary = passthrough_upload();
+    let text: Vec<u8> = passthrough_upload_frames()
+        .iter()
+        .flat_map(|frame| BASE64.encode(frame).into_bytes())
+        .collect();
+    assert_ne!(
+        text,
+        BASE64.encode(&binary).into_bytes(),
+        "the text upload carries padding inside the body"
+    );
+    // The cuts fall inside frame headers and payloads of the binary upload
+    // and inside base64 groups of the text upload.
+    let cuts = [1, 6, 11, 30];
+    let uploads = [
+        ("bin", "application/grpc-web+proto", binary),
+        ("text", "application/grpc-web-text+proto", text),
+    ];
+    let mut proxy_ids = Vec::new();
+    for (client, suffix) in [(&h1, "h1"), (&h2, "h2")] {
+        for (mode, content_type, upload) in &uploads {
+            let proxy_id = format!("count-stream-{mode}-{suffix}");
+            let response = client
+                .post(format!("{base}/{proxy_id}/echo.Echo/ClientStream"))
+                .header("content-type", *content_type)
+                .header("x-grpc-web", "1")
+                .body(chunked_upload(upload, &cuts))
+                .send()
+                .await
+                .expect("streamed gRPC-Web request");
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "{proxy_id}");
+            response.bytes().await.expect("gRPC-Web body");
+            proxy_ids.push(proxy_id);
         }
     }
 

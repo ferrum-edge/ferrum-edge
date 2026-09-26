@@ -35536,10 +35536,12 @@ async fn handle_proxy_request_inner(
                     upload_observer,
                     ctx.grpc_deadline_at(),
                     &mut held_frontend_grpc_upload,
-                    // The native length-prefix scanner cannot read a
-                    // pass-through `grpc-web-text` upload's base64.
-                    (!crate::plugins::grpc_web::request_uploads_passthrough_grpc_web_text(&ctx))
-                        .then(|| Arc::clone(&ctx.grpc_request_messages_observed)),
+                    // Scans the upload's own framing: a pass-through
+                    // gRPC-Web upload counts decoded message frames only.
+                    Some(crate::plugins::mesh::prometheus_helpers::GrpcMessageTap::new(
+                        Arc::clone(&ctx.grpc_request_messages_observed),
+                        crate::plugins::grpc_web::request_upload_grpc_message_framing(&ctx),
+                    )),
                     // The buffered arms `fetch_max` the collected length into
                     // this counter; the streamed arm has no collected length,
                     // so the body publishes its forwarded DATA tally at upload
@@ -46552,16 +46554,12 @@ async fn proxy_to_backend(
                         proxy.backend_write_timeout_ms,
                     );
                     upload_pump = pump;
-                    let limited =
-                        if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
-                            request_ctx,
-                        ) {
-                            limited.with_grpc_message_counter(Arc::clone(
-                                &request_ctx.grpc_request_messages_observed,
-                            ))
-                        } else {
-                            limited
-                        };
+                    let grpc_tap =
+                        crate::plugins::grpc_web::request_stream_grpc_message_tap(request_ctx);
+                    let limited = match grpc_tap {
+                        Some(tap) => limited.with_grpc_message_tap(tap),
+                        None => limited,
+                    };
                     req_builder = req_builder.body(limited.into_reqwest_body());
                 } else {
                     // No size limit — stream body directly. Wrap in
@@ -46582,16 +46580,12 @@ async fn proxy_to_backend(
                         proxy.backend_write_timeout_ms,
                     );
                     upload_pump = pump;
-                    let counting =
-                        if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
-                            request_ctx,
-                        ) {
-                            counting.with_grpc_message_counter(Arc::clone(
-                                &request_ctx.grpc_request_messages_observed,
-                            ))
-                        } else {
-                            counting
-                        };
+                    let grpc_tap =
+                        crate::plugins::grpc_web::request_stream_grpc_message_tap(request_ctx);
+                    let counting = match grpc_tap {
+                        Some(tap) => counting.with_grpc_message_tap(tap),
+                        None => counting,
+                    };
                     req_builder = req_builder.body(counting.into_reqwest_body());
                 }
             }
@@ -52223,15 +52217,10 @@ async fn proxy_to_backend_hbone_after_ready(
                 .as_ref(),
                 proxy.backend_write_timeout_ms,
             );
-            let body = match ctx {
-                Some(c)
-                    if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
-                        c,
-                    ) =>
-                {
-                    body.with_grpc_message_counter(Arc::clone(&c.grpc_request_messages_observed))
-                }
-                _ => body,
+            let grpc_tap = ctx.and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
+            let body = match grpc_tap {
+                Some(tap) => body.with_grpc_message_tap(tap),
+                None => body,
             };
             (parts, http_body_util::Either::Left(body), upload_pump)
         }
@@ -53224,15 +53213,10 @@ async fn proxy_to_backend_unix(
                 .as_ref(),
                 proxy.backend_write_timeout_ms,
             );
-            let body = match ctx {
-                Some(c)
-                    if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
-                        c,
-                    ) =>
-                {
-                    body.with_grpc_message_counter(Arc::clone(&c.grpc_request_messages_observed))
-                }
-                _ => body,
+            let grpc_tap = ctx.and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
+            let body = match grpc_tap {
+                Some(tap) => body.with_grpc_message_tap(tap),
+                None => body,
             };
             (parts, http_body_util::Either::Left(body), upload_pump)
         }
@@ -54807,14 +54791,10 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                 .as_ref(),
                 proxy.backend_write_timeout_ms,
             );
-            let body = if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
-                request_ctx,
-            ) {
-                body.with_grpc_message_counter(Arc::clone(
-                    &request_ctx.grpc_request_messages_observed,
-                ))
-            } else {
-                body
+            let grpc_tap = crate::plugins::grpc_web::request_stream_grpc_message_tap(request_ctx);
+            let body = match grpc_tap {
+                Some(tap) => body.with_grpc_message_tap(tap),
+                None => body,
             };
             (
                 parts,
@@ -55640,10 +55620,7 @@ async fn proxy_to_backend_http2(
     // completion channel (and therefore the response gate) is limit-gated.
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let mut body_cancel_tx = Some(cancel_tx);
-    let observe_grpc = ctx.and_then(|c| {
-        crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(c)
-            .then(|| Arc::clone(&c.grpc_request_messages_observed))
-    });
+    let observe_grpc = ctx.and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
     // Authorization lifetime for the UPLOAD direction (#3815); see
     // `request_upload_auth_deadline`. Direct-H2 hands the body to hyper's
     // detached pipe task, so an expiry error from the adapter is also what
@@ -55695,8 +55672,8 @@ async fn proxy_to_backend_http2(
                 completion_tx,
                 cancel_rx,
             );
-            if let Some(messages) = observe_grpc.clone() {
-                body = body.with_grpc_message_counter(messages);
+            if let Some(tap) = observe_grpc {
+                body = body.with_grpc_message_tap(tap);
             }
             // Full upload lifecycle (#3815). Direct-H2 is the one H1/H2 dispatcher
             // whose upload is scoped to the handler — the completion gate below
@@ -55716,7 +55693,7 @@ async fn proxy_to_backend_http2(
                 Some(completion_rx),
                 upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
             )
-        } else if let (true, Some(messages)) = (use_limit_adapter, observe_grpc) {
+        } else if let (true, Some(tap)) = (use_limit_adapter, observe_grpc) {
             // gRPC message observation with no size cap and no auth deadline
             // still needs the limiter's length-prefixed scanner.
             let body = body::SizeLimitedIncoming::new_with_counter(
@@ -55726,7 +55703,7 @@ async fn proxy_to_backend_http2(
                 Arc::clone(ctx_bytes_sent_observed),
             )
             .with_cancel(cancel_rx)
-            .with_grpc_message_counter(messages);
+            .with_grpc_message_tap(tap);
             // No auth plan on this arm, but a live `backend_write_timeout_ms`
             // still needs its watermark (issue #4055): the adapter exists
             // here, so the pump can be installed. `cancel_on_drop` stays
@@ -56835,12 +56812,7 @@ async fn proxy_to_backend_http3(
                     let connection_pool = state.connection_pool.clone();
                     let proxy_clone = proxy.clone();
                     let grpc_messages = response_decision_ctx
-                        .filter(|c| {
-                            crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
-                                c,
-                            )
-                        })
-                        .map(|c| Arc::clone(&c.grpc_request_messages_observed));
+                        .and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
                     state
                         .h3_pool
                         .request_with_target_streaming_incoming_body(
@@ -56862,12 +56834,7 @@ async fn proxy_to_backend_http3(
                     let connection_pool = state.connection_pool.clone();
                     let proxy_clone = proxy.clone();
                     let grpc_messages = response_decision_ctx
-                        .filter(|c| {
-                            crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
-                                c,
-                            )
-                        })
-                        .map(|c| Arc::clone(&c.grpc_request_messages_observed));
+                        .and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
                     state
                         .h3_pool
                         .request_streaming_incoming_body(
