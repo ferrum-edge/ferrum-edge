@@ -506,7 +506,8 @@ impl BackendTlsConfigCache {
         let matcher = SvidGenerationMatcher::new(generation);
         self.configs.retain(|key, _| !matcher.matches(key));
         self.slow_failures.retain(|key, _| !matcher.matches(key));
-        self.prebuild_failures.retain(|key, _| !matcher.matches(key));
+        self.prebuild_failures
+            .retain(|key, _| !matcher.matches(key));
     }
 
     pub fn clear(&self) {

@@ -482,8 +482,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is not cached yet. Prebuilds are the lowest executor class: at most two run at a
   time, only in idle capacity that leaves a slot for refreshes and reconcile work, and
   an identity is claimed only once its prebuild runs, so a request never waits behind
-  a queued prebuild and refreshes never queue behind a prebuild burst. An identity
-  whose prebuild failed is not prebuilt again until it builds or a reload.
+  a queued prebuild and a prebuild never waits in line ahead of refreshes. An
+  admitted prebuild holds its slot until its build ends (up to 3×
+  `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`), so with a small
+  `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY` two running prebuilds reduce refresh
+  capacity for that long. Only the newest config load's prebuild pass stays alive; a
+  newer load cancels the older pass's unstarted prebuilds. An identity whose prebuild
+  failed is not prebuilt again until it builds or a reload.
 
 ## [0.9.7] - 2026-09-25
 

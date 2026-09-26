@@ -26,6 +26,7 @@ use ferrum_edge::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Once};
+use std::time::Duration;
 
 /// Build a minimal `Proxy` with sensible defaults for pool key testing.
 fn minimal_proxy() -> Proxy {
@@ -2579,6 +2580,93 @@ async fn config_prebuild_failure_caches_nothing() {
     let cache = pool.backend_reqwest_tls_config_cache();
     assert!(cache.is_empty(), "failures are never cached");
     assert_eq!(cache.pending_builds(), 0);
+}
+
+/// Two HTTPS proxies with distinct TLS identities: one only an older config
+/// publication has, one the newer publication keeps.
+fn removed_and_kept_https_proxies() -> (Proxy, Proxy) {
+    let mut removed = https_proxy_at("10.0.0.1", 8443);
+    removed.resolved_tls.verify_server_cert = false;
+    let kept = https_proxy_at("10.0.0.2", 8443);
+    (removed, kept)
+}
+
+fn single_proxy_config(proxy: &Proxy) -> GatewayConfig {
+    GatewayConfig {
+        proxies: vec![proxy.clone()],
+        ..GatewayConfig::default()
+    }
+}
+
+/// A newer config publication supersedes an older prebuild pass: the older
+/// pass starts no further builds, so its config snapshot never warms an
+/// identity the newer config dropped.
+#[tokio::test]
+async fn superseded_config_prebuild_pass_starts_no_builds() {
+    ensure_crypto_provider();
+    let pool = pool_with_defaults();
+    let (removed, kept) = removed_and_kept_https_proxies();
+    let stale_config = single_proxy_config(&removed);
+    let current_config = single_proxy_config(&kept);
+
+    let stale = pool.prebuild_tls_configs_from_config(&stale_config);
+    let current = pool.prebuild_tls_configs_from_config(&current_config);
+    stale.await;
+    current.await;
+
+    let removed_tls = pool.tls_config_cache_key_for_warmup(&removed);
+    let removed_key = format!("alpn=h2|{removed_tls}");
+    let kept_tls = pool.tls_config_cache_key_for_warmup(&kept);
+    let kept_key = format!("alpn=h2|{kept_tls}");
+    assert_ne!(removed_key, kept_key);
+    let cache = pool.backend_reqwest_tls_config_cache();
+    assert!(
+        !cache.contains_key(&removed_key),
+        "a superseded pass must not start builds"
+    );
+    assert!(
+        cache.contains_key(&kept_key),
+        "the newest pass still warms its identities"
+    );
+    assert_eq!(cache.pending_builds(), 0);
+}
+
+/// Background prebuild passes keep at most one alive: a newer publication
+/// aborts the older pass, which releases its config snapshot, and only the
+/// newest config is warmed.
+#[tokio::test]
+async fn spawned_config_prebuild_keeps_only_the_newest_pass() {
+    ensure_crypto_provider();
+    let pool = Arc::new(pool_with_defaults());
+    let (removed, kept) = removed_and_kept_https_proxies();
+    let stale_config = Arc::new(single_proxy_config(&removed));
+
+    pool.spawn_tls_prebuild(Arc::clone(&stale_config));
+    pool.spawn_tls_prebuild(Arc::new(single_proxy_config(&kept)));
+
+    let removed_tls = pool.tls_config_cache_key_for_warmup(&removed);
+    let removed_key = format!("alpn=h2|{removed_tls}");
+    let kept_tls = pool.tls_config_cache_key_for_warmup(&kept);
+    let kept_key = format!("alpn=h2|{kept_tls}");
+    let cache = pool.backend_reqwest_tls_config_cache();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !cache.contains_key(&kept_key) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the newest pass warms its identity");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while Arc::strong_count(&stale_config) > 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the superseded pass is aborted and drops its config");
+    assert!(
+        !cache.contains_key(&removed_key),
+        "a superseded pass must not start builds"
+    );
 }
 
 /// `wss://` backends reuse one cached rustls config per TLS identity instead

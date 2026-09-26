@@ -8227,30 +8227,8 @@ impl ProxyState {
         self.grpc_pool.retain_live_from_config(&published.config);
         self.connection_pool
             .retain_live_tls_configs_from_config(&published.config);
-        self.spawn_backend_tls_prebuild(Arc::clone(&published.config));
-    }
-
-    /// Warm the reqwest backend TLS configs of a newly published config in
-    /// the background, so the first HTTPS request after a load or reload hits
-    /// the cache instead of paying the cold build.
-    ///
-    /// Fire-and-forget: publication never waits on material I/O. The builds
-    /// run on the TLS source executor as its lowest admission class (see
-    /// [`ConnectionPool::prebuild_tls_configs_from_config`]), claim an
-    /// identity's single-flight entry only once they run, and identities that
-    /// are already cached are skipped, so a republication with no TLS change
-    /// costs only the key scan. Without a Tokio runtime (focused sync tests) this is a
-    /// no-op and the request path builds on first use as before.
-    fn spawn_backend_tls_prebuild(&self, config: Arc<GatewayConfig>) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let connection_pool = Arc::clone(&self.connection_pool);
-        runtime.spawn(async move {
-            connection_pool
-                .prebuild_tls_configs_from_config(&config)
-                .await;
-        });
+        self.connection_pool
+            .spawn_tls_prebuild(Arc::clone(&published.config));
     }
 
     /// Terminal drain of transport pools that own kernel objects the graceful

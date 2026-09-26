@@ -1326,9 +1326,7 @@ async fn failed_prebuild_is_skipped_by_later_publications() {
     let cache = BackendTlsConfigCache::new();
     let executor = test_executor(4, Duration::from_secs(5));
     let failing_build = || -> TestBuild {
-        Box::new(|| -> BuildResult {
-            Err(TlsError::Rustls("missing CA bundle".to_string()))
-        })
+        Box::new(|| -> BuildResult { Err(TlsError::Rustls("missing CA bundle".to_string())) })
     };
 
     let first = cache

@@ -65,6 +65,13 @@ struct ReqwestPoolManager {
     /// construction; a pool built without it (focused tests, standalone
     /// callers) simply never enforces a cap.
     reqwest_conn_admission: std::sync::OnceLock<Arc<ReqwestConnectionAdmission>>,
+    /// Generation of the newest TLS prebuild pass. An older pass starts no
+    /// further builds once a newer config publication supersedes it.
+    tls_prebuild_pass: Arc<std::sync::atomic::AtomicU64>,
+    /// The background prebuild pass of the newest config publication, aborted
+    /// when a newer publication starts its own (see
+    /// [`ConnectionPool::spawn_tls_prebuild`]).
+    tls_prebuild_task: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl ReqwestPoolManager {
@@ -121,8 +128,18 @@ impl ReqwestPoolManager {
     /// One [`ConnectionPool::prebuild_tls_configs_from_config`] build. The
     /// input snapshot is taken only once the prebuild owns the key's
     /// single-flight entry, so a reload while it waited for admission cannot
-    /// leave it building from superseded inputs.
-    async fn prebuild_reqwest_tls_config(&self, proxy: &Proxy, key: String, enable_http2: bool) {
+    /// leave it building from superseded inputs. A build whose `pass` a newer
+    /// publication superseded before it started is skipped.
+    async fn prebuild_reqwest_tls_config(
+        &self,
+        proxy: &Proxy,
+        key: String,
+        enable_http2: bool,
+        pass: u64,
+    ) {
+        if self.tls_prebuild_pass.load(Ordering::Acquire) != pass {
+            return;
+        }
         let result = self
             .backend_reqwest_tls_configs
             .prebuild(key, || {
@@ -432,6 +449,8 @@ impl ConnectionPool {
             backend_svid_generation,
             workload_svid_cert_path,
             reqwest_conn_admission: std::sync::OnceLock::new(),
+            tls_prebuild_pass: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            tls_prebuild_task: Arc::new(std::sync::Mutex::new(None)),
         });
 
         Self {
@@ -502,12 +521,64 @@ impl ConnectionPool {
     /// (see [`BackendTlsConfigCache::prebuild`]): the lowest admission class,
     /// at most [`TLS_SOURCE_MAX_CONCURRENT_PREBUILDS`] at a time, admitted only
     /// into idle capacity, and never registered where a request could join
-    /// them before they run. They neither block a Tokio worker nor delay
-    /// refreshes, reconcile work, or request-path cold builds. Identities that
+    /// them before they run. They never block a Tokio worker or wait in line
+    /// ahead of refreshes, reconcile work, or request-path cold builds, though
+    /// an admitted prebuild holds its slot until its build ends. Identities that
     /// are already cached, in flight, backing off after a slow failure, or
     /// whose last prebuild failed are skipped. Failures are logged and left
     /// to the request path, which still fails closed.
-    pub async fn prebuild_tls_configs_from_config(&self, config: &GatewayConfig) {
+    ///
+    /// Calling this starts a new pass synchronously, before the returned
+    /// future is polled, and supersedes every earlier pass: a superseded pass
+    /// starts no further builds, so an old config snapshot never warms
+    /// identities a newer publication removed.
+    pub fn prebuild_tls_configs_from_config<'a>(
+        &'a self,
+        config: &'a GatewayConfig,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        let pass = self.begin_tls_prebuild_pass();
+        self.run_tls_prebuild_pass(config, pass)
+    }
+
+    /// Start [`Self::prebuild_tls_configs_from_config`] for a newly published
+    /// config in the background.
+    ///
+    /// Fire-and-forget: publication never waits on material I/O. At most one
+    /// pass stays alive: starting one aborts the previous pass, which drops
+    /// its prebuilds still waiting for admission and releases its config
+    /// snapshot. A build it already started finishes on the executor and
+    /// still publishes. Without a Tokio runtime (focused sync tests) this is a
+    /// no-op and the request path builds on first use.
+    pub fn spawn_tls_prebuild(self: &Arc<Self>, config: Arc<GatewayConfig>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut task = self
+            .pool
+            .manager()
+            .tls_prebuild_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = task.take() {
+            previous.abort();
+        }
+        // Claimed here rather than in the task, so passes are ordered by
+        // publication even if an aborted pass is still mid-poll.
+        let pass = self.begin_tls_prebuild_pass();
+        let pool = Arc::clone(self);
+        let handle = runtime.spawn(async move {
+            pool.run_tls_prebuild_pass(&config, pass).await;
+        });
+        *task = Some(handle.abort_handle());
+    }
+
+    /// Start a new prebuild pass, superseding every earlier one.
+    fn begin_tls_prebuild_pass(&self) -> u64 {
+        let manager = self.pool.manager();
+        manager.tls_prebuild_pass.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    async fn run_tls_prebuild_pass(&self, config: &GatewayConfig, pass: u64) {
         let manager = self.pool.manager();
         let mut seen = HashSet::new();
         let mut prebuilds = Vec::new();
@@ -523,7 +594,7 @@ impl ConnectionPool {
             if !seen.insert(key.clone()) {
                 continue;
             }
-            let prebuild = manager.prebuild_reqwest_tls_config(proxy, key, enable_http2);
+            let prebuild = manager.prebuild_reqwest_tls_config(proxy, key, enable_http2, pass);
             prebuilds.push(prebuild);
         }
         futures_util::stream::iter(prebuilds)
