@@ -427,8 +427,8 @@ impl GrpcLengthPrefixedScanner {
                 Err(_) => self.malformed = true,
             }
         }
-        let mut groups = data.chunks_exact(4);
-        for group in groups.by_ref() {
+        let (groups, rest) = data.as_chunks::<4>();
+        for group in groups {
             if self.malformed {
                 return;
             }
@@ -437,7 +437,6 @@ impl GrpcLengthPrefixedScanner {
                 Err(_) => self.malformed = true,
             }
         }
-        let rest = groups.remainder();
         self.text_group[..rest.len()].copy_from_slice(rest);
         self.text_group_len = rest.len() as u8;
     }
