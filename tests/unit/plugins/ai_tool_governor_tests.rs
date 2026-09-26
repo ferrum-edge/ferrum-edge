@@ -2024,6 +2024,122 @@ async fn streaming_denies_at_end_when_no_finish_reason() {
     assert!(!text.contains("danger"), "held frame leaked: {text}");
 }
 
+/// A later chained inspector that logs every chunk it receives, and `<end>`
+/// when it is flushed, and forwards each chunk unchanged.
+struct RecordingInspector {
+    seen: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+#[async_trait::async_trait]
+impl ResponseStreamInspector for RecordingInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        self.seen.lock().unwrap().extend_from_slice(chunk);
+        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        self.seen.lock().unwrap().extend_from_slice(b"<end>");
+        ResponseStreamAction::Forward(bytes::Bytes::new())
+    }
+}
+
+/// A later chained inspector that cuts every chunk it receives.
+struct CutEveryChunk;
+
+const CUT_BY_LATER: &[u8] = b"event: error\ndata: later\n\n";
+
+#[async_trait::async_trait]
+impl ResponseStreamInspector for CutEveryChunk {
+    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(CUT_BY_LATER)))
+    }
+}
+
+/// A content frame the governor forwards live.
+const CONTENT_FRAME: &str =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+
+/// A denied tool call whose batch its finish frame completes.
+const DENIED_TOOL_CALL: &str = concat!(
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}]}}]}\n\n",
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+);
+
+#[tokio::test]
+async fn chained_governor_cut_sends_its_same_chunk_release_through_later_inspectors() {
+    // Alone, the governor sends the content frame it cleared in the chunk
+    // that also completes a denied tool call, then its deny event. Chained
+    // ahead of another inspector, it forwards that frame and defers its cut:
+    // the later inspector sees the frame exactly once, and is flushed, before
+    // the chain sends it and then the deny event. A silent cut still sends the
+    // frame, and a later inspector that cuts on the frame wins.
+    use ferrum_edge::plugins::chain_response_stream_inspectors;
+    use ferrum_edge::plugins::utils::sse::encode_sse_error_event;
+
+    let content = CONTENT_FRAME;
+    let chunk = format!("{content}{DENIED_TOOL_CALL}");
+    let deny_event = encode_sse_error_event(
+        "ai_tool_governor_tool_blocked",
+        "Tool call blocked by ai_tool_governor policy.",
+    );
+    let config = streaming_config(json!({ "safe": { "action": "allow" } }), "deny");
+    let mut silent_config = config.clone();
+    silent_config["response"] = json!({ "streaming_deny_event": false });
+    let with_event = [content.as_bytes(), &deny_event[..]].concat();
+    let cases = [
+        (config, with_event),
+        (silent_config, content.as_bytes().to_vec()),
+    ];
+
+    for (config, expected) in cases {
+        let plugin = make(config);
+        let ctx = create_test_context();
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let action = inspector.on_chunk(chunk.as_bytes()).await;
+        let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+            panic!("a lone governor sends the cleared frame before the cut");
+        };
+        assert_eq!(final_bytes, expected, "alone");
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let recorder: Box<dyn ResponseStreamInspector> = Box::new(RecordingInspector {
+            seen: Arc::clone(&seen),
+        });
+        let mut chain = chain_response_stream_inspectors(vec![inspector, recorder]).expect("chain");
+        let action = chain.on_chunk(chunk.as_bytes()).await;
+        let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+            panic!("a chained governor sends the cleared frame before the cut");
+        };
+        assert_eq!(final_bytes, expected, "chained");
+        let expected_seen = [content.as_bytes(), &b"<end>"[..]].concat();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            expected_seen,
+            "seen once, then flushed"
+        );
+        assert!(
+            !String::from_utf8_lossy(&final_bytes).contains("danger"),
+            "the denied tool call never leaves"
+        );
+
+        let inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let cutter: Box<dyn ResponseStreamInspector> = Box::new(CutEveryChunk);
+        let mut chain = chain_response_stream_inspectors(vec![inspector, cutter]).expect("chain");
+        let action = chain.on_chunk(chunk.as_bytes()).await;
+        let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+            panic!("the later inspector cuts the forwarded frame");
+        };
+        assert_eq!(final_bytes, CUT_BY_LATER, "the later cut wins");
+    }
+}
+
 #[tokio::test]
 async fn streaming_inspector_only_for_event_stream_2xx() {
     let plugin = make(streaming_config(

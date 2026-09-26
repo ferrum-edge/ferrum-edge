@@ -130,7 +130,9 @@ use super::utils::ai_providers::{detect_response_provider, detect_sse_provider};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::json_escape::escape_json_string;
 use super::utils::response_body::read_response_body_bounded;
-use super::utils::sse::{encode_sse_error_event, is_sse_request, sse_lines};
+use super::utils::sse::{
+    encode_sse_error_event, is_sse_request, sse_event_on_fresh_line, sse_lines,
+};
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector,
@@ -4883,6 +4885,18 @@ struct ToolCallStreamInspector {
     terminated: bool,
     /// Sniffed body shape (see [`StreamBodyShape`]).
     shape: StreamBodyShape,
+    /// Whether the bytes the client already received end mid-line, as a chain
+    /// reports when a later inspector follows. This inspector's own releases
+    /// are whole events, so they never leave a line open.
+    client_line_open: bool,
+    /// Whether a later chained inspector still sees this inspector's output.
+    /// A cut's payload then goes to the client around that inspector, so it
+    /// must not carry the bytes this call already cleared.
+    feeds_inspector: bool,
+    /// A cut deferred behind the bytes the same call cleared, for the chain to
+    /// emit once every later inspector has passed them: the deny event, or
+    /// `None` without one. Set only while `feeds_inspector`.
+    deferred_cut: Option<Option<Bytes>>,
 }
 
 impl ToolCallStreamInspector {
@@ -4905,6 +4919,9 @@ impl ToolCallStreamInspector {
             bypassed: false,
             terminated: false,
             shape: StreamBodyShape::Unknown,
+            client_line_open: false,
+            feeds_inspector: false,
+            deferred_cut: None,
         }
     }
 
@@ -5087,15 +5104,30 @@ impl ToolCallStreamInspector {
         }
     }
 
-    /// Build the terminal action, prepending any already-cleared bytes in `out`
-    /// so clean content released in the same chunk is not lost.
+    /// Build the terminal action after `out`, the bytes this call already
+    /// cleared, so clean content released in the same chunk is not lost. They
+    /// lead the payload when this is the only or last stream inspector. When a
+    /// later chained inspector still sees this output, they are forwarded and
+    /// the cut is deferred, so the chain emits the deny event only after that
+    /// inspector has passed them. Allocates only here, on a cut.
     fn terminate(&mut self, mut out: Vec<u8>) -> ResponseStreamAction {
         self.terminated = true;
-        if self.engine.response.streaming_deny_event {
-            out.extend_from_slice(&encode_sse_error_event(
+        let event = self.engine.response.streaming_deny_event.then(|| {
+            encode_sse_error_event(
                 "ai_tool_governor_tool_blocked",
                 "Tool call blocked by ai_tool_governor policy.",
-            ));
+            )
+        });
+        if self.feeds_inspector && !out.is_empty() {
+            self.deferred_cut = Some(event);
+            return ResponseStreamAction::Forward(Bytes::from(out));
+        }
+        if let Some(event) = event {
+            let client_line_open = match out.last() {
+                Some(&last) => !matches!(last, b'\n' | b'\r'),
+                None => self.client_line_open,
+            };
+            out.extend_from_slice(&sse_event_on_fresh_line(event, client_line_open));
         }
         if out.is_empty() {
             ResponseStreamAction::Terminate(None)
@@ -5520,6 +5552,20 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
         }
         out.extend_from_slice(&trailing);
         ResponseStreamAction::Forward(Bytes::from(out))
+    }
+
+    fn set_chained_client_line_open(&mut self, open: bool) {
+        self.client_line_open = open;
+        self.feeds_inspector = true;
+    }
+
+    fn has_deferred_cut(&self) -> bool {
+        self.deferred_cut.is_some()
+    }
+
+    fn take_deferred_cut(&mut self, client_line_open: bool) -> Option<Bytes> {
+        let event = self.deferred_cut.take().flatten()?;
+        Some(sse_event_on_fresh_line(event, client_line_open))
     }
 }
 

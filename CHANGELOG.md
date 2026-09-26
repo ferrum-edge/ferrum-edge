@@ -610,6 +610,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a fail-open pass-through rest, so backend bytes never skip the later
   inspectors; in that configuration the error event's data may still be
   unparseable (#5826; #5820).
+- A cut by an `ai_semantic_firewall` or `ai_tool_governor` stream inspector
+  that is not the last one in the chain no longer drops the bytes it cleared
+  in the same call (clean windows, a fail-open pass-through rest, or content
+  frames released ahead of a denied tool call). The chain now runs those bytes
+  through every later stream inspector, flushed as at the end of the stream,
+  and sends what they release before the terminal error event, so the client
+  receives each cleared byte once and still reads a parseable error event. A
+  `cut_silent` cut sends them too. If a later inspector cuts on those bytes,
+  its cut wins. `ai_tool_governor` no longer puts bytes it cleared into its
+  terminal payload when a later inspector follows, so they no longer skip
+  that inspector. The H1, H2 and H3 drivers are unchanged (#5826).
 - The HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends now counts pass-through
   gRPC-Web request messages on their decoded frames on its streamed upload,
   its mesh-egress drain, and its unprepared buffered body, which fed no count

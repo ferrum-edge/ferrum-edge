@@ -80,6 +80,7 @@ mod unit {
         mod response_caching_tests;
         mod response_mock_tests;
         mod response_size_limiting_tests;
+        mod response_stream_chain_tests;
         mod response_transformer_tests;
         mod route_header_finalization_tests;
         mod security_headers_tests;

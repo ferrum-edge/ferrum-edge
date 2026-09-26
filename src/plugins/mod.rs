@@ -7175,6 +7175,20 @@ pub enum ResponseStreamInspectorStage {
 /// streaming loop and inside the detached task that drives the poll-based H1/H2
 /// channel body (which cannot borrow the request `ctx`). The proxy drives it
 /// chunk-by-chunk and relays the returned [`ResponseStreamAction`] bytes.
+///
+/// # Terminal payloads
+///
+/// A `Terminate` payload never carries backend bytes that a later chained
+/// inspector has not inspected. The only or last inspector may put bytes it
+/// cleared ahead of its terminal event in the payload, since every inspector
+/// already passed them. An inspector that a later one follows (see
+/// [`Self::set_chained_client_line_open`]) must not: its payload reaches the
+/// client around the later inspectors. To cut after bytes it cleared in the
+/// same call, it returns them in `Forward` and defers the cut instead (see
+/// [`Self::has_deferred_cut`]). The chain passes those bytes through every
+/// later inspector before it emits the terminal payload, so the client
+/// receives each cleared byte once, inspected by every later inspector,
+/// followed by the terminal event.
 #[async_trait]
 pub trait ResponseStreamInspector: Send {
     /// Stage used when composing multiple inspectors. Policy inspectors should
@@ -7205,6 +7219,25 @@ pub trait ResponseStreamInspector: Send {
     /// reaches the client without passing the later inspectors, so the payload
     /// must not carry backend bytes. The default ignores it.
     fn set_chained_client_line_open(&mut self, _open: bool) {}
+
+    /// Whether the last hook call cut the stream after clearing the bytes it
+    /// returned in `Forward`. Only an inspector that a later one follows
+    /// defers a cut. The chain then runs those bytes through every later
+    /// inspector, each flushed as at the end of the stream, and ends the
+    /// stream with what they released followed by
+    /// [`Self::take_deferred_cut`]'s payload. A later inspector that cuts on
+    /// those bytes wins. The default never defers.
+    fn has_deferred_cut(&self) -> bool {
+        false
+    }
+
+    /// Take the deferred cut's terminal payload (`None` for a cut without
+    /// one), framed for a client whose received bytes end mid-line when
+    /// `client_line_open`. Like any chained `Terminate` payload, it must not
+    /// carry backend bytes.
+    fn take_deferred_cut(&mut self, _client_line_open: bool) -> Option<bytes::Bytes> {
+        None
+    }
 
     /// Called immediately before the owning stream task publishes inspector
     /// completion to terminal hooks.
@@ -7367,6 +7400,14 @@ impl ResponseStreamInspector for CompletionNotifyingInspector {
 
     fn set_chained_client_line_open(&mut self, open: bool) {
         self.inner.set_chained_client_line_open(open);
+    }
+
+    fn has_deferred_cut(&self) -> bool {
+        self.inner.has_deferred_cut()
+    }
+
+    fn take_deferred_cut(&mut self, client_line_open: bool) -> Option<bytes::Bytes> {
+        self.inner.take_deferred_cut(client_line_open)
     }
 }
 
@@ -7755,13 +7796,39 @@ pub async fn normalize_response_body_for_inspection(
 /// the chain returns `Terminate`. A policy cut drops what earlier inspectors
 /// released in the same call, since the cutting and later inspectors have not
 /// passed it; bytes the last inspector released earlier in the same call leave
-/// ahead of its terminal payload. The chain tracks whether the bytes it sent
-/// end mid-line and tells each inspector that a later one follows, so a cut
-/// there frames its terminal payload after what the client actually received.
+/// ahead of its terminal payload. An inspector that cuts after clearing bytes
+/// defers its cut instead: those bytes pass every later inspector and their
+/// end-of-stream flushes, then its terminal payload follows what they
+/// released, unless a later inspector cuts first. The chain tracks whether the
+/// bytes it sent end mid-line and tells each inspector that a later one
+/// follows, so a cut there frames its terminal payload after what the client
+/// actually received.
 struct ChainedResponseStreamInspector {
     inspectors: Vec<Box<dyn ResponseStreamInspector>>,
     /// Whether the bytes this chain returned so far end mid-line.
     client_line_open: bool,
+}
+
+/// How the stream ended ahead of a chain flush.
+#[derive(Clone, Copy)]
+enum ChainFlushEnd {
+    /// The backend stream ended; the flush forwards what it released.
+    Eof,
+    /// A normalizer ended the stream with its final window.
+    Normalized,
+    /// The inspector at this index cut after clearing the flushed bytes and
+    /// deferred its terminal payload.
+    Cut(usize),
+}
+
+impl ChainFlushEnd {
+    /// The end after a normalizer terminates; a deferred cut still stands.
+    fn normalized(self) -> Self {
+        match self {
+            Self::Eof => Self::Normalized,
+            end => end,
+        }
+    }
 }
 
 #[async_trait]
@@ -7773,7 +7840,11 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
-        let action = self.end_through().await;
+        // Flush each inspector in order; bytes flushed by inspector *i* are fed to
+        // inspector *i+1* as a final chunk before *i+1* is itself flushed.
+        let action = self
+            .flush_from(0, bytes::Bytes::new(), ChainFlushEnd::Eof)
+            .await;
         self.note_sent(&action);
         action
     }
@@ -7801,8 +7872,10 @@ impl ChainedResponseStreamInspector {
                     if self.inspectors[index].stage()
                         == ResponseStreamInspectorStage::Normalize =>
                 {
+                    self.notify_prior_downstream_terminated(index);
+                    let carry = final_bytes.unwrap_or_default();
                     return self
-                        .finish_after_normalizer_termination(index, final_bytes)
+                        .flush_from(index + 1, carry, ChainFlushEnd::Normalized)
                         .await;
                 }
                 terminate @ ResponseStreamAction::Terminate(_) => {
@@ -7810,59 +7883,85 @@ impl ChainedResponseStreamInspector {
                     return terminate;
                 }
             }
+            if self.inspectors[index].has_deferred_cut() {
+                self.notify_prior_downstream_terminated(index);
+                return self
+                    .flush_from(index + 1, buf, ChainFlushEnd::Cut(index))
+                    .await;
+            }
         }
         ResponseStreamAction::Forward(buf)
     }
 
-    async fn end_through(&mut self) -> ResponseStreamAction {
-        // Flush each inspector in order; bytes flushed by inspector *i* are fed to
-        // inspector *i+1* as a final chunk before *i+1* is itself flushed.
-        let mut carry = bytes::Bytes::new();
-        for index in 0..self.inspectors.len() {
+    /// Flush inspectors `from..` as the end of the stream: each receives
+    /// `carry`, what the inspectors before it released, as a final chunk, and
+    /// is then flushed. `end` says how the stream ended ahead of `from`.
+    async fn flush_from(
+        &mut self,
+        from: usize,
+        mut carry: bytes::Bytes,
+        mut end: ChainFlushEnd,
+    ) -> ResponseStreamAction {
+        for index in from..self.inspectors.len() {
+            let stage = self.inspectors[index].stage();
             let mut released = bytes::BytesMut::new();
             if !carry.is_empty() {
                 self.prime(index);
                 match self.inspectors[index].on_chunk(&carry).await {
                     ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
                     ResponseStreamAction::Terminate(final_bytes)
-                        if self.inspectors[index].stage()
-                            == ResponseStreamInspectorStage::Normalize =>
+                        if stage == ResponseStreamInspectorStage::Normalize =>
                     {
-                        return self
-                            .finish_after_normalizer_termination(index, final_bytes)
-                            .await;
+                        self.notify_prior_downstream_terminated(index);
+                        end = end.normalized();
+                        carry = final_bytes.unwrap_or_default();
+                        continue;
                     }
                     terminate @ ResponseStreamAction::Terminate(_) => {
                         self.notify_prior_downstream_terminated(index);
                         return terminate;
                     }
                 }
+                if self.inspectors[index].has_deferred_cut() {
+                    // Its cut follows what it just released; it has nothing
+                    // left to flush.
+                    self.notify_prior_downstream_terminated(index);
+                    end = ChainFlushEnd::Cut(index);
+                    carry = released.freeze();
+                    continue;
+                }
             }
             self.prime(index);
             match self.inspectors[index].on_end().await {
                 ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
                 ResponseStreamAction::Terminate(final_bytes)
-                    if self.inspectors[index].stage()
-                        == ResponseStreamInspectorStage::Normalize =>
+                    if stage == ResponseStreamInspectorStage::Normalize =>
                 {
+                    self.notify_prior_downstream_terminated(index);
+                    end = end.normalized();
                     if let Some(final_bytes) = final_bytes {
                         released.extend_from_slice(&final_bytes);
                     }
-                    return self
-                        .finish_after_normalizer_termination(
-                            index,
-                            (!released.is_empty()).then(|| released.freeze()),
-                        )
-                        .await;
+                    carry = released.freeze();
+                    continue;
                 }
                 terminate @ ResponseStreamAction::Terminate(_) => {
                     self.notify_prior_downstream_terminated(index);
                     return self.cut_after_last_released(index, released, terminate);
                 }
             }
+            if self.inspectors[index].has_deferred_cut() {
+                self.notify_prior_downstream_terminated(index);
+                end = ChainFlushEnd::Cut(index);
+            }
             carry = released.freeze();
         }
-        ResponseStreamAction::Forward(carry)
+        match end {
+            ChainFlushEnd::Eof => ResponseStreamAction::Forward(carry),
+            ChainFlushEnd::Normalized if carry.is_empty() => ResponseStreamAction::Terminate(None),
+            ChainFlushEnd::Normalized => ResponseStreamAction::Terminate(Some(carry)),
+            ChainFlushEnd::Cut(owner) => self.emit_deferred_cut(owner, carry),
+        }
     }
 
     /// Tell inspector `index` whether the client's line is open when a later
@@ -7906,57 +8005,26 @@ impl ChainedResponseStreamInspector {
         }
     }
 
-    async fn finish_after_normalizer_termination(
-        &mut self,
-        normalizer_index: usize,
-        final_bytes: Option<bytes::Bytes>,
-    ) -> ResponseStreamAction {
-        self.notify_prior_downstream_terminated(normalizer_index);
-        let mut carry = final_bytes.unwrap_or_default();
-        for index in normalizer_index + 1..self.inspectors.len() {
-            let stage = self.inspectors[index].stage();
-            let mut released = bytes::BytesMut::new();
-            if !carry.is_empty() {
-                self.prime(index);
-                match self.inspectors[index].on_chunk(&carry).await {
-                    ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
-                    ResponseStreamAction::Terminate(final_bytes)
-                        if stage == ResponseStreamInspectorStage::Normalize =>
-                    {
-                        self.notify_prior_downstream_terminated(index);
-                        carry = final_bytes.unwrap_or_default();
-                        continue;
-                    }
-                    terminate @ ResponseStreamAction::Terminate(_) => {
-                        self.notify_prior_downstream_terminated(index);
-                        return terminate;
-                    }
-                }
+    /// End the stream with `carry`, what every inspector after `owner`
+    /// released of the bytes it cleared before its deferred cut, followed by
+    /// that cut's terminal payload framed after what the client then holds.
+    /// Allocates only here, on a cut.
+    fn emit_deferred_cut(&mut self, owner: usize, carry: bytes::Bytes) -> ResponseStreamAction {
+        let client_line_open = match carry.last() {
+            Some(&last) => !matches!(last, b'\n' | b'\r'),
+            None => self.client_line_open,
+        };
+        let payload = self.inspectors[owner].take_deferred_cut(client_line_open);
+        match payload {
+            None if carry.is_empty() => ResponseStreamAction::Terminate(None),
+            None => ResponseStreamAction::Terminate(Some(carry)),
+            Some(payload) if carry.is_empty() => ResponseStreamAction::Terminate(Some(payload)),
+            Some(payload) => {
+                let mut out = bytes::BytesMut::with_capacity(carry.len() + payload.len());
+                out.extend_from_slice(&carry);
+                out.extend_from_slice(&payload);
+                ResponseStreamAction::Terminate(Some(out.freeze()))
             }
-            self.prime(index);
-            match self.inspectors[index].on_end().await {
-                ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
-                ResponseStreamAction::Terminate(final_bytes)
-                    if stage == ResponseStreamInspectorStage::Normalize =>
-                {
-                    self.notify_prior_downstream_terminated(index);
-                    if let Some(final_bytes) = final_bytes {
-                        released.extend_from_slice(&final_bytes);
-                    }
-                    carry = released.freeze();
-                    continue;
-                }
-                terminate @ ResponseStreamAction::Terminate(_) => {
-                    self.notify_prior_downstream_terminated(index);
-                    return self.cut_after_last_released(index, released, terminate);
-                }
-            }
-            carry = released.freeze();
-        }
-        if carry.is_empty() {
-            ResponseStreamAction::Terminate(None)
-        } else {
-            ResponseStreamAction::Terminate(Some(carry))
         }
     }
 
