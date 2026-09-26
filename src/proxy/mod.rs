@@ -8227,6 +8227,8 @@ impl ProxyState {
         self.grpc_pool.retain_live_from_config(&published.config);
         self.connection_pool
             .retain_live_tls_configs_from_config(&published.config);
+        self.connection_pool
+            .spawn_tls_prebuild(Arc::clone(&published.config));
     }
 
     /// Terminal drain of transport pools that own kernel objects the graceful
@@ -15514,8 +15516,7 @@ async fn handle_websocket_request_authenticated(
                         ws_dial_proxy,
                         &env_config,
                         &client_headers,
-                        state.tls_policy.as_deref(),
-                        &state.crls,
+                        &state.connection_pool,
                         ws_size_limits.max_frame_bytes,
                         ws_size_limits.max_message_bytes,
                         state.websocket_write_buffer_size,
@@ -17157,47 +17158,6 @@ pub(crate) fn websocket_backend_tls_sni_unsupported(proxy: &Proxy) -> bool {
     matches!(proxy.backend_scheme, Some(BackendScheme::Https)) && proxy.resolved_tls.sni.is_some()
 }
 
-/// Build a rustls TLS connector for WebSocket backends that respects
-/// proxy-level and global TLS settings (CA bundles, client certs, cert verification).
-/// When `tls_policy` is provided, outbound connections use the same cipher suites,
-/// protocol versions, and key exchange groups as inbound listeners.
-fn build_websocket_tls_connector(
-    proxy: &Proxy,
-    env_config: &crate::config::EnvConfig,
-    tls_policy: Option<&TlsPolicy>,
-    crls: &crate::tls::CrlList,
-) -> Result<Option<tokio_tungstenite::Connector>, anyhow::Error> {
-    // Only build a TLS connector when the backend scheme is TLS — a plaintext
-    // `ws://` upgrade needs no TLS. WebSocket is a runtime flavor, so the
-    // caller has already filtered to WebSocket requests; here we only decide
-    // encrypted vs plaintext.
-    if !matches!(proxy.backend_scheme, Some(BackendScheme::Https)) {
-        return Ok(None);
-    }
-
-    let client_config = BackendTlsConfigBuilder {
-        proxy,
-        policy: tls_policy,
-        global_ca: env_config.tls_ca_bundle_path.as_deref().map(Path::new),
-        global_no_verify: env_config.tls_no_verify,
-        global_client_cert: env_config
-            .backend_tls_client_cert_path
-            .as_deref()
-            .map(Path::new),
-        global_client_key: env_config
-            .backend_tls_client_key_path
-            .as_deref()
-            .map(Path::new),
-        crls,
-    }
-    .build_rustls()
-    .map_err(|e| anyhow::anyhow!("Failed to build WebSocket backend TLS config: {}", e))?;
-
-    Ok(Some(tokio_tungstenite::Connector::Rustls(Arc::new(
-        client_config,
-    ))))
-}
-
 /// Outcome of a successful backend WebSocket handshake. The stream carries
 /// frames; `negotiated_subprotocol` preserves the backend's chosen value
 /// (RFC 6455 §11.3.4, also applicable to RFC 8441 / RFC 9220 Extended CONNECT)
@@ -17285,8 +17245,11 @@ pub(crate) async fn connect_websocket_backend(
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
     client_headers: &[(String, String)],
-    tls_policy: Option<&TlsPolicy>,
-    crls: &crate::tls::CrlList,
+    // Source of the cached `wss://` rustls config (proxy-level and global CA
+    // bundles, client certs, verification, the gateway TLS policy, and the
+    // live CRL generation). A miss builds on the bounded TLS source executor,
+    // never on this Tokio worker.
+    tls_configs: &ConnectionPool,
     max_websocket_frame_size_bytes: usize,
     max_websocket_message_size_bytes: usize,
     websocket_write_buffer_size: usize,
@@ -17357,7 +17320,18 @@ pub(crate) async fn connect_websocket_backend(
         return Err(retry::WS_BACKEND_TLS_SNI_UNSUPPORTED.into());
     }
 
-    let connector = build_websocket_tls_connector(proxy, env_config, tls_policy, crls)?;
+    // Only a TLS backend scheme needs a connector; a plaintext `ws://` upgrade
+    // needs no TLS. WebSocket is a runtime flavor, so the caller has already
+    // filtered to WebSocket requests; here we only decide encrypted vs
+    // plaintext.
+    let connector = if matches!(proxy.backend_scheme, Some(BackendScheme::Https)) {
+        let client_config = tls_configs
+            .get_websocket_tls_config_for_backend(proxy)
+            .await?;
+        Some(tokio_tungstenite::Connector::Rustls(client_config))
+    } else {
+        None
+    };
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
     // Dial the TCP stream ourselves (instead of `connect_async_tls_with_config`)
     // so the byte-level `WsActivityIo` idle adapter can be installed UNDER the

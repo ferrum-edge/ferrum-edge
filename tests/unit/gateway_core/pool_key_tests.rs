@@ -26,6 +26,7 @@ use ferrum_edge::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Once};
+use std::time::Duration;
 
 /// Build a minimal `Proxy` with sensible defaults for pool key testing.
 fn minimal_proxy() -> Proxy {
@@ -2499,6 +2500,249 @@ async fn reqwest_cold_clients_share_one_cached_rustls_build() {
 
     pool.clear_backend_tls_config_cache();
     assert!(pool.backend_reqwest_tls_config_cache().is_empty());
+}
+
+fn https_proxy_at(host: &str, port: u16) -> Proxy {
+    let mut proxy = proxy_at(host, port);
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    proxy
+}
+
+/// Config load / reload prebuilds the reqwest TLS config of every HTTPS proxy
+/// (one build per TLS identity, in the ALPN variant its pool settings select),
+/// so the first request is a cache hit rather than a cold build.
+#[tokio::test]
+async fn config_prebuild_warms_reqwest_tls_configs_per_identity() {
+    ensure_crypto_provider();
+    let pool = pool_with_defaults();
+    let first = https_proxy_at("10.0.0.1", 8443);
+    let second = https_proxy_at("10.0.0.2", 8443);
+    let plaintext = proxy_at("10.0.0.3", 8080);
+    let config = GatewayConfig {
+        proxies: vec![first.clone(), second, plaintext],
+        ..GatewayConfig::default()
+    };
+
+    pool.prebuild_tls_configs_from_config(&config).await;
+
+    let tls_key = pool.tls_config_cache_key_for_warmup(&first);
+    let cache = pool.backend_reqwest_tls_config_cache();
+    assert_eq!(cache.len(), 1, "one prebuild per TLS identity");
+    assert!(
+        cache.contains_key(&format!("alpn=h2|{tls_key}")),
+        "the prebuild must use the ALPN variant the pool settings select"
+    );
+    assert_eq!(cache.pending_builds(), 0);
+
+    // The first request reuses the prebuilt config instead of building.
+    pool.get_client(&first)
+        .await
+        .expect("client from prebuilt TLS");
+    assert_eq!(pool.backend_reqwest_tls_config_cache().len(), 1);
+
+    // A republication with nothing new is a no-op.
+    pool.prebuild_tls_configs_from_config(&config).await;
+    assert_eq!(pool.backend_reqwest_tls_config_cache().len(), 1);
+}
+
+/// Plaintext-only configs have no backend TLS to warm.
+#[tokio::test]
+async fn config_prebuild_skips_plaintext_proxies() {
+    ensure_crypto_provider();
+    let pool = pool_with_defaults();
+    let config = GatewayConfig {
+        proxies: vec![proxy_at("10.0.0.1", 8080)],
+        ..GatewayConfig::default()
+    };
+
+    pool.prebuild_tls_configs_from_config(&config).await;
+
+    assert!(pool.backend_reqwest_tls_config_cache().is_empty());
+}
+
+/// A prebuild that fails (here a missing CA bundle) caches nothing, leaving
+/// the request path to fail closed exactly as before.
+#[tokio::test]
+async fn config_prebuild_failure_caches_nothing() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing_ca = dir.path().join("missing-ca.pem");
+    let missing_ca = missing_ca.to_str().expect("utf-8 temp path");
+    let pool = pool_with_global_tls(None, None, Some(missing_ca), false);
+    let config = GatewayConfig {
+        proxies: vec![https_proxy_at("10.0.0.1", 8443)],
+        ..GatewayConfig::default()
+    };
+
+    pool.prebuild_tls_configs_from_config(&config).await;
+
+    let cache = pool.backend_reqwest_tls_config_cache();
+    assert!(cache.is_empty(), "failures are never cached");
+    assert_eq!(cache.pending_builds(), 0);
+}
+
+/// Two HTTPS proxies with distinct TLS identities: one only an older config
+/// publication has, one the newer publication keeps.
+fn removed_and_kept_https_proxies() -> (Proxy, Proxy) {
+    let mut removed = https_proxy_at("10.0.0.1", 8443);
+    removed.resolved_tls.verify_server_cert = false;
+    let kept = https_proxy_at("10.0.0.2", 8443);
+    (removed, kept)
+}
+
+fn single_proxy_config(proxy: &Proxy) -> GatewayConfig {
+    GatewayConfig {
+        proxies: vec![proxy.clone()],
+        ..GatewayConfig::default()
+    }
+}
+
+/// A newer config publication supersedes an older prebuild pass: the older
+/// pass starts no further builds, so its config snapshot never warms an
+/// identity the newer config dropped.
+#[tokio::test]
+async fn superseded_config_prebuild_pass_starts_no_builds() {
+    ensure_crypto_provider();
+    let pool = pool_with_defaults();
+    let (removed, kept) = removed_and_kept_https_proxies();
+    let stale_config = single_proxy_config(&removed);
+    let current_config = single_proxy_config(&kept);
+
+    let stale = pool.prebuild_tls_configs_from_config(&stale_config);
+    let current = pool.prebuild_tls_configs_from_config(&current_config);
+    stale.await;
+    current.await;
+
+    let removed_tls = pool.tls_config_cache_key_for_warmup(&removed);
+    let removed_key = format!("alpn=h2|{removed_tls}");
+    let kept_tls = pool.tls_config_cache_key_for_warmup(&kept);
+    let kept_key = format!("alpn=h2|{kept_tls}");
+    assert_ne!(removed_key, kept_key);
+    let cache = pool.backend_reqwest_tls_config_cache();
+    assert!(
+        !cache.contains_key(&removed_key),
+        "a superseded pass must not start builds"
+    );
+    assert!(
+        cache.contains_key(&kept_key),
+        "the newest pass still warms its identities"
+    );
+    assert_eq!(cache.pending_builds(), 0);
+}
+
+/// Background prebuild passes keep at most one alive: a newer publication
+/// aborts the older pass, which releases its config snapshot, and only the
+/// newest config is warmed.
+#[tokio::test]
+async fn spawned_config_prebuild_keeps_only_the_newest_pass() {
+    ensure_crypto_provider();
+    let pool = Arc::new(pool_with_defaults());
+    let (removed, kept) = removed_and_kept_https_proxies();
+    let stale_config = Arc::new(single_proxy_config(&removed));
+
+    pool.spawn_tls_prebuild(Arc::clone(&stale_config));
+    pool.spawn_tls_prebuild(Arc::new(single_proxy_config(&kept)));
+
+    let removed_tls = pool.tls_config_cache_key_for_warmup(&removed);
+    let removed_key = format!("alpn=h2|{removed_tls}");
+    let kept_tls = pool.tls_config_cache_key_for_warmup(&kept);
+    let kept_key = format!("alpn=h2|{kept_tls}");
+    let cache = pool.backend_reqwest_tls_config_cache();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !cache.contains_key(&kept_key) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the newest pass warms its identity");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while Arc::strong_count(&stale_config) > 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the superseded pass is aborted and drops its config");
+    assert!(
+        !cache.contains_key(&removed_key),
+        "a superseded pass must not start builds"
+    );
+}
+
+/// `wss://` backends reuse one cached rustls config per TLS identity instead
+/// of building a connector for every upgrade; the config advertises no ALPN,
+/// and reload, SVID drain, and config retention manage it with the other
+/// backend TLS caches.
+#[tokio::test]
+async fn websocket_backend_tls_config_is_cached_per_identity() {
+    ensure_crypto_provider();
+    let pool = pool_with_defaults();
+    let first = https_proxy_at("10.0.0.1", 8443);
+    let second = https_proxy_at("10.0.0.2", 8443);
+
+    let a = pool
+        .get_websocket_tls_config_for_backend(&first)
+        .await
+        .expect("first WebSocket TLS config");
+    let b = pool
+        .get_websocket_tls_config_for_backend(&second)
+        .await
+        .expect("second WebSocket TLS config");
+    assert!(
+        Arc::ptr_eq(&a, &b),
+        "upgrades sharing trust material must share one cached config"
+    );
+    assert!(
+        a.alpn_protocols.is_empty(),
+        "the WebSocket transport must not advertise ALPN"
+    );
+    let tls_key = pool.tls_config_cache_key_for_warmup(&first);
+    let cache = pool.backend_websocket_tls_config_cache();
+    assert_eq!(cache.len(), 1);
+    assert!(cache.contains_key(&tls_key));
+    assert!(
+        pool.backend_reqwest_tls_config_cache().is_empty(),
+        "the WebSocket cache must not be shared with the ALPN-bearing reqwest cache"
+    );
+
+    // Config retention drops identities no longer configured.
+    pool.retain_live_tls_configs_from_config(&GatewayConfig {
+        proxies: vec![first.clone()],
+        ..GatewayConfig::default()
+    });
+    assert_eq!(pool.backend_websocket_tls_config_cache().len(), 1);
+    pool.retain_live_tls_configs_from_config(&GatewayConfig::default());
+    assert!(pool.backend_websocket_tls_config_cache().is_empty());
+
+    // A backend TLS / CRL reload clears it.
+    pool.get_websocket_tls_config_for_backend(&first)
+        .await
+        .expect("rebuilt WebSocket TLS config");
+    assert_eq!(pool.backend_websocket_tls_config_cache().len(), 1);
+    pool.clear_backend_tls_config_cache();
+    assert!(pool.backend_websocket_tls_config_cache().is_empty());
+}
+
+/// A WebSocket TLS config that cannot be built fails closed and is not cached.
+#[tokio::test]
+async fn websocket_backend_tls_config_with_missing_ca_fails_closed() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing_ca = dir.path().join("missing-ca.pem");
+    let missing_ca = missing_ca.to_str().expect("utf-8 temp path");
+    let pool = pool_with_global_tls(None, None, Some(missing_ca), false);
+
+    let error = pool
+        .get_websocket_tls_config_for_backend(&https_proxy_at("10.0.0.1", 8443))
+        .await
+        .expect_err("a missing backend CA bundle must fail closed");
+    assert!(
+        error
+            .to_string()
+            .starts_with("Failed to build WebSocket backend TLS config"),
+        "{error}"
+    );
+    assert!(pool.backend_websocket_tls_config_cache().is_empty());
 }
 
 #[tokio::test]

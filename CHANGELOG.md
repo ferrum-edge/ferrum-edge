@@ -447,6 +447,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`IncompleteMessage`). The reqwest, direct-H2/gRPC, and native-H3
   size-limited adapters now hold the error for one scheduler turn so the
   frontend flushes first.
+- The shared buffered SSE inspection parser used by `ai_semantic_firewall` and
+  `ai_response_guard` now follows the WHATWG event-stream framing: it consumes
+  leading UTF-8 BOMs and splits lines on CRLF, LF, or a lone CR (mixed
+  freely). Previously a leading BOM or CR-only framing hid events from
+  inspection while the body was still reported as fully parsed (#5795).
 - HTTP active health probes now decide the verdict and record latency from the
   response headers, then drain small response bodies in the background (up to
   64 KiB, within at most 1 second and the remaining probe timeout) so a health
@@ -496,6 +501,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `security_headers` removes matching response headers in place without allocating or cloning keys
   (#5755).
+
+- Backend TLS follow-ups to the off-worker cold builds (#5782). `wss://` WebSocket
+  backends reuse one cached rustls config per TLS identity, built on the bounded TLS
+  source executor, instead of building a connector on the Tokio worker for every
+  upgrade; WebSocket dials now also follow CRL reloads. A cold build that fails only
+  after holding its executor slot for the full `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`
+  budget backs that TLS identity off for one more budget, so requests fail closed at
+  once instead of tying up another slot; a backend TLS / CRL reload clears it. A
+  quarter of `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY` (at least one slot when it
+  is 2 or more) is reserved for request-path builds, so refreshes, reconcile work, and
+  prebuilds cannot starve them. Every config load or reload prebuilds, in the
+  background, the reqwest backend TLS config of each HTTPS proxy whose TLS identity
+  is not cached yet. Prebuilds are the lowest executor class: at most two run at a
+  time, only in idle capacity that leaves a slot for refreshes and reconcile work, and
+  an identity is claimed only once its prebuild runs, so a request never waits behind
+  a queued prebuild and a prebuild never waits in line ahead of refreshes. An
+  admitted prebuild holds its slot until its build ends (up to 3×
+  `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`), so with a small
+  `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY` two running prebuilds reduce refresh
+  capacity for that long. Only the newest config load's prebuild pass stays alive; a
+  newer load cancels the older pass's unstarted prebuilds. An identity whose prebuild
+  failed is not prebuilt again until it builds or a reload.
 
 ## [0.9.7] - 2026-09-25
 

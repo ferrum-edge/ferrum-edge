@@ -12,7 +12,7 @@
 
 use crate::backend_conn_limit::ReqwestConnectionAdmission;
 use crate::config::PoolConfig;
-use crate::config::types::{GatewayConfig, Proxy};
+use crate::config::types::{DispatchKind, GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
@@ -22,8 +22,10 @@ use crate::tls::backend::{
     append_optional_pool_key_component, append_pool_key_component,
     backend_svid_generation_for_client_cert, backend_tls_config_cache_key,
 };
+use crate::tls::source::TLS_SOURCE_MAX_CONCURRENT_PREBUILDS;
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -47,6 +49,10 @@ struct ReqwestPoolManager {
     /// Caching them is what lets a cold build that outlives the requests
     /// waiting on it serve the next pool miss instead of being discarded.
     backend_reqwest_tls_configs: BackendTlsConfigCache,
+    /// rustls configs for `wss://` backend upgrades, keyed by TLS identity.
+    /// No ALPN is advertised on this transport, so the configs cannot be
+    /// shared with the ALPN-bearing caches above.
+    backend_ws_tls_configs: BackendTlsConfigCache,
     backend_svid_generation: BackendSvidGeneration,
     workload_svid_cert_path: Option<String>,
     /// Shared DestinationRule `connectionPool.tcp.maxConnections` admission
@@ -59,6 +65,13 @@ struct ReqwestPoolManager {
     /// construction; a pool built without it (focused tests, standalone
     /// callers) simply never enforces a cap.
     reqwest_conn_admission: std::sync::OnceLock<Arc<ReqwestConnectionAdmission>>,
+    /// Generation of the newest TLS prebuild pass. An older pass starts no
+    /// further builds once a newer config publication supersedes it.
+    tls_prebuild_pass: Arc<std::sync::atomic::AtomicU64>,
+    /// The background prebuild pass of the newest config publication, aborted
+    /// when a newer publication starts its own (see
+    /// [`ConnectionPool::spawn_tls_prebuild`]).
+    tls_prebuild_task: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl ReqwestPoolManager {
@@ -110,6 +123,36 @@ impl ReqwestPoolManager {
         key.push_str(alpn);
         key.push_str(&tls_key);
         key
+    }
+
+    /// One [`ConnectionPool::prebuild_tls_configs_from_config`] build. The
+    /// input snapshot is taken only once the prebuild owns the key's
+    /// single-flight entry, so a reload while it waited for admission cannot
+    /// leave it building from superseded inputs. A build whose `pass` a newer
+    /// publication superseded before it started is skipped.
+    async fn prebuild_reqwest_tls_config(
+        &self,
+        proxy: &Proxy,
+        key: String,
+        enable_http2: bool,
+        pass: u64,
+    ) {
+        if self.tls_prebuild_pass.load(Ordering::Acquire) != pass {
+            return;
+        }
+        let result = self
+            .backend_reqwest_tls_configs
+            .prebuild(key, || {
+                let inputs = self.backend_tls_inputs(proxy);
+                move || inputs.builder().build_rustls_for_reqwest(enable_http2)
+            })
+            .await;
+        if let Err(error) = result {
+            tracing::debug!(
+                error = %error,
+                "Backend TLS config prebuild failed; the first request retries it"
+            );
+        }
     }
 
     fn backend_tls_inputs(&self, proxy: &Proxy) -> OwnedBackendTlsConfigInputs {
@@ -402,9 +445,12 @@ impl ConnectionPool {
             crls,
             backend_h3_tls_configs: BackendTlsConfigCache::with_shards(shards),
             backend_reqwest_tls_configs: BackendTlsConfigCache::with_shards(shards),
+            backend_ws_tls_configs: BackendTlsConfigCache::with_shards(shards),
             backend_svid_generation,
             workload_svid_cert_path,
             reqwest_conn_admission: std::sync::OnceLock::new(),
+            tls_prebuild_pass: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            tls_prebuild_task: Arc::new(std::sync::Mutex::new(None)),
         });
 
         Self {
@@ -448,9 +494,9 @@ impl ConnectionPool {
         self.pool.manager().tls_config_cache_key_owned(proxy)
     }
 
-    /// Drop H3 and reqwest TLS configs whose identity is no longer in
-    /// `config`. Cold-path only (config publication); live TLS identities are
-    /// retained.
+    /// Drop H3, reqwest, and WebSocket TLS configs whose identity is no longer
+    /// in `config`. Cold-path only (config publication); live TLS identities
+    /// are retained.
     pub fn retain_live_tls_configs_from_config(&self, config: &GatewayConfig) {
         let manager = self.pool.manager();
         let mut live_tls_keys = HashSet::with_capacity(config.proxies.len());
@@ -461,9 +507,99 @@ impl ConnectionPool {
             live_reqwest_tls_keys.insert(manager.reqwest_tls_config_cache_key_owned(proxy, false));
         }
         manager.backend_h3_tls_configs.retain_keys(&live_tls_keys);
+        manager.backend_ws_tls_configs.retain_keys(&live_tls_keys);
         manager
             .backend_reqwest_tls_configs
             .retain_keys(&live_reqwest_tls_keys);
+    }
+
+    /// Warm the reqwest TLS configs a first HTTPS request needs, ahead of
+    /// that request (config load / reload).
+    ///
+    /// Covers every `HttpsPool` proxy, in the ALPN variant its effective pool
+    /// settings select. Builds run on the TLS source executor as prebuilds
+    /// (see [`BackendTlsConfigCache::prebuild`]): the lowest admission class,
+    /// at most [`TLS_SOURCE_MAX_CONCURRENT_PREBUILDS`] at a time, admitted only
+    /// into idle capacity, and never registered where a request could join
+    /// them before they run. They never block a Tokio worker or wait in line
+    /// ahead of refreshes, reconcile work, or request-path cold builds, though
+    /// an admitted prebuild holds its slot until its build ends. Identities that
+    /// are already cached, in flight, backing off after a slow failure, or
+    /// whose last prebuild failed are skipped. Failures are logged and left
+    /// to the request path, which still fails closed.
+    ///
+    /// Calling this starts a new pass synchronously, before the returned
+    /// future is polled, and supersedes every earlier pass: a superseded pass
+    /// starts no further builds, so an old config snapshot never warms
+    /// identities a newer publication removed.
+    pub fn prebuild_tls_configs_from_config<'a>(
+        &'a self,
+        config: &'a GatewayConfig,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        let pass = self.begin_tls_prebuild_pass();
+        self.run_tls_prebuild_pass(config, pass)
+    }
+
+    /// Start [`Self::prebuild_tls_configs_from_config`] for a newly published
+    /// config in the background.
+    ///
+    /// Fire-and-forget: publication never waits on material I/O. At most one
+    /// pass stays alive: starting one aborts the previous pass, which drops
+    /// its prebuilds still waiting for admission and releases its config
+    /// snapshot. A build it already started finishes on the executor and
+    /// still publishes. Without a Tokio runtime (focused sync tests) this is a
+    /// no-op and the request path builds on first use.
+    pub fn spawn_tls_prebuild(self: &Arc<Self>, config: Arc<GatewayConfig>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut task = self
+            .pool
+            .manager()
+            .tls_prebuild_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = task.take() {
+            previous.abort();
+        }
+        // Claimed here rather than in the task, so passes are ordered by
+        // publication even if an aborted pass is still mid-poll.
+        let pass = self.begin_tls_prebuild_pass();
+        let pool = Arc::clone(self);
+        let handle = runtime.spawn(async move {
+            pool.run_tls_prebuild_pass(&config, pass).await;
+        });
+        *task = Some(handle.abort_handle());
+    }
+
+    /// Start a new prebuild pass, superseding every earlier one.
+    fn begin_tls_prebuild_pass(&self) -> u64 {
+        let manager = self.pool.manager();
+        manager.tls_prebuild_pass.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    async fn run_tls_prebuild_pass(&self, config: &GatewayConfig, pass: u64) {
+        let manager = self.pool.manager();
+        let mut seen = HashSet::new();
+        let mut prebuilds = Vec::new();
+        for proxy in &config.proxies {
+            if proxy.dispatch_kind != DispatchKind::HttpsPool {
+                continue;
+            }
+            let enable_http2 = manager.global_config.effective_enable_http2(proxy);
+            let key = manager.reqwest_tls_config_cache_key_owned(proxy, enable_http2);
+            if manager.backend_reqwest_tls_configs.contains_key(&key) {
+                continue;
+            }
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let prebuild = manager.prebuild_reqwest_tls_config(proxy, key, enable_http2, pass);
+            prebuilds.push(prebuild);
+        }
+        futures_util::stream::iter(prebuilds)
+            .for_each_concurrent(TLS_SOURCE_MAX_CONCURRENT_PREBUILDS, |prebuild| prebuild)
+            .await;
     }
 
     #[allow(dead_code)] // exercised from unit tests
@@ -534,6 +670,35 @@ impl ConnectionPool {
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))
     }
 
+    /// TLS configuration for `wss://` backend upgrades.
+    ///
+    /// Cached per TLS identity like the H3 config, so a WebSocket burst reuses
+    /// one `ClientConfig` instead of reading CA/client material per upgrade. A
+    /// miss is built once on the bounded TLS source executor (see
+    /// [`BackendTlsConfigCache::get_or_build`]) with the pool's live CRL
+    /// generation; concurrent misses await it and fail closed at the executor
+    /// deadline.
+    pub async fn get_websocket_tls_config_for_backend(
+        &self,
+        proxy: &Proxy,
+    ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
+        let manager = self.pool.manager();
+        manager
+            .backend_ws_tls_configs
+            .get_or_build(manager.tls_config_cache_key_owned(proxy), || {
+                let inputs = manager.backend_tls_inputs(proxy);
+                move || inputs.builder().build_rustls()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to build WebSocket backend TLS config: {}", e))
+    }
+
+    /// WebSocket-side counterpart of [`Self::backend_tls_config_cache`].
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn backend_websocket_tls_config_cache(&self) -> &BackendTlsConfigCache {
+        &self.pool.manager().backend_ws_tls_configs
+    }
+
     /// Owned, boxed form of [`Self::get_tls_config_for_backend`] for H3
     /// dispatch closures that cannot borrow the request's `Proxy`.
     ///
@@ -558,12 +723,16 @@ impl ConnectionPool {
         manager
             .backend_reqwest_tls_configs
             .drain_svid_generation(generation);
+        manager
+            .backend_ws_tls_configs
+            .drain_svid_generation(generation);
     }
 
     pub fn clear_backend_tls_config_cache(&self) {
         let manager = self.pool.manager();
         manager.backend_h3_tls_configs.clear();
         manager.backend_reqwest_tls_configs.clear();
+        manager.backend_ws_tls_configs.clear();
     }
 
     pub fn force_drain_svid_generation(&self, generation: u64) {
