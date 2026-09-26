@@ -21,7 +21,10 @@ use ferrum_edge::_test_support::{
     proxy_body_into_grpc_web_streaming_for_test, proxy_body_streaming_for_test,
     proxy_body_with_client_grpc_deadline_for_test,
     record_backend_response_grpc_message_count_for_test,
-    record_grpc_web_passthrough_status_for_test, retain_grpc_web_client_content_type_for_test,
+    record_captured_request_grpc_message_count_for_test,
+    record_grpc_web_passthrough_status_for_test, record_request_grpc_message_count_for_test,
+    request_stream_observes_native_grpc_messages_for_test,
+    retain_grpc_web_client_content_type_for_test, set_request_grpc_web_upload_for_test,
 };
 use ferrum_edge::plugins::TransactionSummary;
 use ferrum_edge::plugins::mesh::prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA;
@@ -494,6 +497,89 @@ fn buffered_passthrough_response_messages_are_counted_on_decoded_frames() {
         );
         assert_eq!(counted, 1, "{content_type}");
     }
+}
+
+/// A context whose transaction observes gRPC messages, as the
+/// `prometheus_metrics` hook leaves it.
+fn observing_request_context() -> ferrum_edge::plugins::RequestContext {
+    let mut ctx = create_test_context();
+    ctx.metadata.insert(
+        MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    ctx
+}
+
+/// Two request messages and a trailer frame, as a gRPC-Web client may upload.
+fn grpc_web_upload() -> Vec<u8> {
+    let mut upload = frame(0x00, b"one");
+    upload.extend_from_slice(&frame(0x00, b"two"));
+    upload.extend_from_slice(&frame(GRPC_FRAME_TRAILER, b"x-app-id: 42\r\n"));
+    upload
+}
+
+#[test]
+fn passthrough_request_messages_follow_the_upload_framing() {
+    let binary = grpc_web_upload();
+    let text = BASE64.encode(&binary).into_bytes();
+    for (text_mode, wire) in [(false, binary), (true, text)] {
+        // Buffered: decoded message frames, never the trailer frame or the
+        // base64 armour.
+        let mut ctx = observing_request_context();
+        set_request_grpc_web_upload_for_test(&mut ctx, text_mode);
+        assert_eq!(
+            record_request_grpc_message_count_for_test(&ctx, &wire),
+            2,
+            "text_mode={text_mode}"
+        );
+        let mut captured = observing_request_context();
+        set_request_grpc_web_upload_for_test(&mut captured, text_mode);
+        assert_eq!(
+            record_captured_request_grpc_message_count_for_test(&captured, &wire),
+            2,
+            "text_mode={text_mode}: the captured counter counts the same frames"
+        );
+        // Streamed: the native scanner reads binary framing, never base64.
+        assert_eq!(
+            request_stream_observes_native_grpc_messages_for_test(&ctx),
+            !text_mode,
+            "text_mode={text_mode}"
+        );
+    }
+}
+
+#[test]
+fn native_and_translated_request_messages_keep_the_native_scanner() {
+    let mut native = frame(0x00, b"one");
+    native.extend_from_slice(&frame(0x00, b"two"));
+
+    let ctx = observing_request_context();
+    let counted = record_request_grpc_message_count_for_test(&ctx, &native);
+    assert_eq!(counted, 2);
+    let scanned = request_stream_observes_native_grpc_messages_for_test(&ctx);
+    assert!(scanned);
+
+    // A translated text upload reaches the backend decoded, so the native
+    // scanner counts it on both paths.
+    let mut translated = observing_request_context();
+    set_request_grpc_web_upload_for_test(&mut translated, true);
+    translated
+        .metadata
+        .insert("grpc_web_mode".to_string(), "text".to_string());
+    let counted = record_request_grpc_message_count_for_test(&translated, &native);
+    assert_eq!(counted, 2);
+    let scanned = request_stream_observes_native_grpc_messages_for_test(&translated);
+    assert!(scanned);
+
+    // Without an observing metrics plugin nothing is counted or scanned.
+    let mut unobserved = create_test_context();
+    set_request_grpc_web_upload_for_test(&mut unobserved, false);
+    let counted = record_request_grpc_message_count_for_test(&unobserved, &grpc_web_upload());
+    assert_eq!(counted, 0);
+    let scanned = request_stream_observes_native_grpc_messages_for_test(&unobserved);
+    assert!(!scanned);
 }
 
 #[test]

@@ -12771,6 +12771,51 @@ pub mod _test_support {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Stamp the frontend's classification of a recognized gRPC-Web upload,
+    /// with `text_mode` for a `grpc-web-text` request `Content-Type`.
+    pub fn set_request_grpc_web_upload_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        text_mode: bool,
+    ) {
+        ctx.set_request_wire_protocol(crate::config::types::HttpWireTransport::Http2, true);
+        ctx.set_request_grpc_web_text(text_mode);
+    }
+
+    /// The authoritative request message count a complete buffered
+    /// backend-visible body records, for a transaction that observes gRPC
+    /// messages.
+    pub fn record_request_grpc_message_count_for_test(
+        ctx: &crate::plugins::RequestContext,
+        body: &[u8],
+    ) -> u64 {
+        crate::plugins::grpc_web::record_request_grpc_message_count(ctx, body);
+        ctx.grpc_request_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// [`record_request_grpc_message_count_for_test`] through the counter a
+    /// dispatch captures before a phase consumes its context.
+    pub fn record_captured_request_grpc_message_count_for_test(
+        ctx: &crate::plugins::RequestContext,
+        body: &[u8],
+    ) -> u64 {
+        if let Some(counter) =
+            crate::plugins::grpc_web::RequestGrpcMessageCounter::for_request(ctx)
+        {
+            counter.record(body);
+        }
+        ctx.grpc_request_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether a streamed upload for `ctx` carries the native length-prefix
+    /// message scanner.
+    pub fn request_stream_observes_native_grpc_messages_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(ctx)
+    }
+
     /// Feed `chunks`, in order, to the pass-through gRPC-Web trailer observer
     /// and return the terminal status it read.
     pub fn grpc_web_trailer_status_for_test(chunks: &[&[u8]], text_mode: bool) -> Option<u32> {

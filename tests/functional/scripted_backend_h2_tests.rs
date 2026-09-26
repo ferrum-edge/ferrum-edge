@@ -1547,6 +1547,144 @@ async fn grpc_backend_forged_gateway_diagnostics_are_stripped_from_headers_and_t
     );
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Gateway-owned `X-Gateway-Error` on the native gRPC builders (#5798).
+// ────────────────────────────────────────────────────────────────────────────
+//
+// The HTTP/1.1 / HTTP/2 native gRPC response builders, streamed and buffered,
+// write the gateway's own token after the last response hook, as the plain
+// builder and every HTTP/3 response do: a backend's HTTP 5xx reads
+// `backend_error`, and a copy a plugin wrote is replaced on a 5xx and removed
+// from a success.
+
+/// A one-RPC native gRPC backend that answers HTTP 503 when `unavailable`,
+/// otherwise an ordinary successful RPC.
+async fn spawn_gateway_error_parity_backend(unavailable: bool) -> (ScriptedGrpcBackend, u16) {
+    let reservation = reserve_port().await.expect("reserve port");
+    let port = reservation.port;
+    let builder = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()));
+    let builder = if unavailable {
+        builder
+            .step(GrpcStep::SendInitialHeadersOverride(vec![
+                (":status", "503".into()),
+                ("content-type", "application/grpc".into()),
+            ]))
+            .step(GrpcStep::RespondStatus {
+                code: 14,
+                message: "unavailable",
+            })
+    } else {
+        builder
+            .step(GrpcStep::SendInitialHeaders)
+            .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
+            .step(GrpcStep::RespondStatus {
+                code: 0,
+                message: "",
+            })
+    };
+    (builder.spawn().expect("spawn backend"), port)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn native_grpc_builders_write_the_gateway_owned_error_token() {
+    let (_streamed_503, streamed_503_port) = spawn_gateway_error_parity_backend(true).await;
+    let (_buffered_503, buffered_503_port) = spawn_gateway_error_parity_backend(true).await;
+    let (_streamed_ok, streamed_ok_port) = spawn_gateway_error_parity_backend(false).await;
+    let (_buffered_ok, buffered_ok_port) = spawn_gateway_error_parity_backend(false).await;
+
+    let proxy = |id: &str, port: u16, buffered: bool| {
+        let mut proxy = json!({
+            "id": id,
+            "listen_path": format!("/{id}"),
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+        });
+        if buffered {
+            // Sends native gRPC through the BUFFERED builder.
+            proxy["response_body_mode"] = json!("buffer");
+        }
+        proxy
+    };
+    let config = json!({
+        "version": "1",
+        "proxies": [
+            proxy("streamed-503", streamed_503_port, false),
+            proxy("buffered-503", buffered_503_port, true),
+            proxy("streamed-ok", streamed_ok_port, false),
+            proxy("buffered-ok", buffered_ok_port, true),
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            // A plugin-written copy the builders must never forward.
+            "id": "forge-gateway-error",
+            "plugin_name": "response_transformer",
+            "config": {
+                "rules": [{
+                    "target": "header",
+                    "operation": "add",
+                    "key": "X-Gateway-Error",
+                    "value": "overload",
+                }],
+            },
+            "scope": "global",
+            "enabled": true,
+        }],
+    });
+    let harness = GatewayHarness::builder()
+        .file_config(to_file_mode_yaml(&config))
+        .log_level("info")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+
+    for (route, http_status, expected) in [
+        ("streamed-503", 503, vec!["backend_error"]),
+        ("buffered-503", 503, vec!["backend_error"]),
+        ("streamed-ok", 200, Vec::new()),
+        ("buffered-ok", 200, Vec::new()),
+    ] {
+        let response = client
+            .unary(
+                &format!("/{route}/ferrum.Echo/Ping"),
+                Bytes::from_static(b""),
+            )
+            .await
+            .expect("response surfaced");
+        assert_eq!(
+            response.http_status, http_status,
+            "{route}: headers={:?}",
+            response.headers
+        );
+        let tokens: Vec<&str> = response
+            .headers
+            .get_all("x-gateway-error")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert_eq!(
+            tokens, expected,
+            "{route}: exactly the gateway's own token; headers={:?}",
+            response.headers
+        );
+    }
+}
+
 async fn assert_errors_only_grpc_output(overrides: Value, case: &str) {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;

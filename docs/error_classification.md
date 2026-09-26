@@ -330,18 +330,29 @@ classifies the response:
   timeout and route-deadline `504`, reject-path `503`s, response-transformer
   output-ceiling refusals) carry their token on every protocol.
 - A backend-returned 5xx carries `backend_error` on every path that relays
-  it: the HTTP/1.1 and HTTP/2 response builder, and every HTTP/3 response,
+  it: the HTTP/1.1 and HTTP/2 response builder, the HTTP/1.1 and HTTP/2
+  native gRPC response (buffered and streamed), and every HTTP/3 response,
   native or bridged, buffered or streamed, plain or gRPC
-  ([`finalize_h3_response_gateway_headers`](../src/http3/server.rs)). A copy a
-  plugin or hook wrote is replaced by the gateway's own value, never forwarded
-  or duplicated — except on the HTTP/1.1 / HTTP/2 native gRPC branch, which
-  reports the RPC outcome in `grpc-status` trailers, forwards a plugin- or
-  hook-written copy unchanged, and writes no `backend_error` token for a gRPC
-  backend's HTTP 5xx (the HTTP/3 native gRPC response now writes one). Giving
-  that branch the HTTP/3 seal is follow-up #5798.
+  ([`finalize_h3_response_gateway_headers`](../src/http3/server.rs)). Each
+  applies
+  [`apply_authoritative_gateway_error_header_for_response`](../src/proxy/mod.rs)
+  after the last response hook, so a copy a plugin or hook wrote is replaced
+  by the gateway's own value, never forwarded or duplicated. A gRPC response
+  still reports the RPC outcome in `grpc-status`; the token describes only the
+  HTTP status the gateway relayed.
 - An HTTP/3 bridge attempt whose reqwest connection-pool client could not be
   built answers its `502` with `connection_failure`, exactly as the HTTP/1.1
   and HTTP/2 builder does for the same shared pool-failure response.
+
+The contract covers the HTTP response headers and HTTP trailers. It does not
+cover a pass-through gRPC-Web backend's in-body trailer frame. On a route
+without the `grpc_web` translator, the backend answers in gRPC-Web itself, and
+its trailer frame is backend body content that the gateway relays unchanged.
+Metadata in that frame, `x-gateway-error` included, reaches the client byte
+for byte. The gateway does not write it and does not classify with it, and the
+gateway does not rewrite pass-through bodies. Only the HTTP header section
+carries the gateway's own token (see the
+[`grpc_web` plugin](plugins.md#grpc_web) for the pass-through relay).
 
 The headers are not authenticated, though: a client should trust them only on
 a response it received from a gateway it authenticated.

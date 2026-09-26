@@ -708,7 +708,9 @@ mod generic_relay_mesh_fall_through {
     }
 
     /// Trusted-projected fixture: one route whose only target carries the
-    /// reserved `mesh.unix_socket` tag, plus an `http_logging` sink.
+    /// reserved `mesh.unix_socket` tag, plus an `http_logging` sink. The global
+    /// `prometheus_metrics` instance marks the transaction as observing gRPC
+    /// messages, so the logged summary carries the message counters.
     fn fixture_yaml(socket_path: &str, placeholder_port: u16, sink_port: u16) -> String {
         format!(
             r#"version: "1"
@@ -744,6 +746,12 @@ plugin_configs:
       endpoint_url: "http://127.0.0.1:{sink_port}/logs"
       batch_size: 1
       flush_interval_ms: 100
+  - id: "{PROXY_ID}-prometheus"
+    plugin_name: prometheus_metrics
+    scope: global
+    enabled: true
+    config:
+      render_cache_ttl_seconds: 0
 "#
         )
     }
@@ -830,6 +838,14 @@ plugin_configs:
         assert_eq!(
             logged[0]["grpc_status"], 7,
             "the logged status comes from the backend's trailer frame: {logged:?}"
+        );
+        assert_eq!(
+            logged[0]["grpc_request_messages"], 1,
+            "the upload's one message frame is counted: {logged:?}"
+        );
+        assert_eq!(
+            logged[0]["grpc_response_messages"], 1,
+            "the backend's message frame is counted, its trailer frame is not: {logged:?}"
         );
         gateway.shutdown().await;
     }
