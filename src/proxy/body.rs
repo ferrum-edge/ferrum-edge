@@ -28,6 +28,7 @@ use crate::retry::ErrorClass;
 
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
+use crate::plugins::grpc_web::{PassthroughFraming, PassthroughGrpcStatus};
 use crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER;
 use crate::proxy::response_watchdog::AuthorizationTerminalOwner;
 
@@ -99,6 +100,11 @@ pub struct ProxyBody {
     /// status even though the downstream frame is DATA rather than native HTTP
     /// trailers.
     grpc_web_terminal_status: Option<Arc<AtomicU64>>,
+    /// Set by the pass-through gRPC-Web relay to the `grpc-status` of the
+    /// backend's own final body trailer frame. Read only when the body ends, so
+    /// the deferred logger and backend outcome classification report the status
+    /// the client actually received without a synthesized trailer.
+    grpc_web_passthrough_status: Option<Arc<AtomicU64>>,
     /// Deferred logger that fires after body completion, allowing
     /// `TransactionSummary.body_completed` / `body_error_class` /
     /// `client_disconnected` / `bytes_streamed` to reflect the
@@ -467,6 +473,40 @@ impl http_body::Body for BufferedGrpcBody {
 }
 
 const GRPC_WEB_TERMINAL_STATUS_UNSET: u64 = u64::MAX;
+/// Pass-through outcomes that name no readable status. They share the atomic
+/// that carries a readable `u32` status, so both lie above `u32::MAX`.
+const GRPC_WEB_PASSTHROUGH_COMPRESSED_TRAILER: u64 = u64::MAX - 1;
+const GRPC_WEB_PASSTHROUGH_CONTENT_ENCODED: u64 = u64::MAX - 2;
+
+fn encode_passthrough_grpc_status(outcome: Option<PassthroughGrpcStatus>) -> u64 {
+    use crate::plugins::grpc_web::GrpcWebTrailerUnreadable::{
+        CompressedTrailerFrame, ContentEncodedBody,
+    };
+    match outcome {
+        None => GRPC_WEB_TERMINAL_STATUS_UNSET,
+        Some(PassthroughGrpcStatus::Status(code)) => u64::from(code),
+        Some(PassthroughGrpcStatus::Unreadable(CompressedTrailerFrame)) => {
+            GRPC_WEB_PASSTHROUGH_COMPRESSED_TRAILER
+        }
+        Some(PassthroughGrpcStatus::Unreadable(ContentEncodedBody)) => {
+            GRPC_WEB_PASSTHROUGH_CONTENT_ENCODED
+        }
+    }
+}
+
+fn decode_passthrough_grpc_status(value: u64) -> Option<PassthroughGrpcStatus> {
+    use crate::plugins::grpc_web::GrpcWebTrailerUnreadable::{
+        CompressedTrailerFrame, ContentEncodedBody,
+    };
+    let reason = match value {
+        GRPC_WEB_TERMINAL_STATUS_UNSET => return None,
+        GRPC_WEB_PASSTHROUGH_COMPRESSED_TRAILER => CompressedTrailerFrame,
+        GRPC_WEB_PASSTHROUGH_CONTENT_ENCODED => ContentEncodedBody,
+        // Every other stored value came from a `u32` status.
+        code => return Some(PassthroughGrpcStatus::Status(code as u32)),
+    };
+    Some(PassthroughGrpcStatus::Unreadable(reason))
+}
 
 /// Incremental native-gRPC to gRPC-Web response adapter.
 ///
@@ -620,6 +660,125 @@ impl http_body::Body for GrpcWebStreamingBody {
     }
 }
 
+/// Pass-through gRPC-Web response relay.
+///
+/// The route has no `grpc_web` translator and the backend already answers in
+/// gRPC-Web, so every backend DATA byte, including the backend's own trailer
+/// frame, is forwarded unchanged and a clean EOF adds nothing. Synthesizing a
+/// terminal here would append a second trailer frame after the backend's and
+/// misreport the RPC status.
+///
+/// The backend's trailer frame is read, never rewritten, so the outer body can
+/// log and classify the status the client actually received. The only frame
+/// this relay authors is a gateway terminal: when a client-deadline or
+/// authorization-lifetime wrapper below it ends the stream with native
+/// trailers, those become one gRPC-Web trailer frame, because a gRPC-Web client
+/// cannot read HTTP trailers.
+struct GrpcWebPassthroughBody {
+    inner: ProxyBody,
+    text_mode: bool,
+    http_status: u16,
+    observer: crate::plugins::grpc_web::GrpcWebTrailerStatusObserver,
+    observed_status: Arc<AtomicU64>,
+    terminal_status: Arc<AtomicU64>,
+    terminal_emitted: bool,
+    failed: bool,
+}
+
+impl GrpcWebPassthroughBody {
+    /// Status of a gateway terminal that a deadline wrapper below this relay
+    /// has selected, or `None` while the backend still owns the stream. The
+    /// authorization deadline wins over a client-chosen deadline.
+    fn gateway_terminal_status(&self) -> Option<u32> {
+        if self
+            .inner
+            .stream_auth_deadline
+            .as_ref()
+            .is_some_and(|state| state.fired.load(Ordering::Acquire))
+        {
+            return Some(crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED);
+        }
+        self.inner
+            .client_grpc_deadline_fired
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+            .then_some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED)
+    }
+}
+
+impl http_body::Body for GrpcWebPassthroughBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.terminal_emitted || this.failed {
+            return Poll::Ready(None);
+        }
+        let frame = match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Ready(Some(Err(error))) => {
+                this.failed = true;
+                return Poll::Ready(Some(Err(error)));
+            }
+            Poll::Ready(Some(Ok(frame))) => frame,
+        };
+        let gateway_terminal = this.gateway_terminal_status();
+        if let Some(data) = frame.data_ref() {
+            if let Some(status) = gateway_terminal {
+                // The wrapper below already framed its terminal as gRPC-Web
+                // DATA; forward it verbatim and expose its status.
+                this.terminal_status
+                    .store(u64::from(status), Ordering::Release);
+                this.terminal_emitted = true;
+            } else {
+                this.observer.push(data);
+                let observed = encode_passthrough_grpc_status(this.observer.outcome());
+                this.observed_status.store(observed, Ordering::Release);
+            }
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        if gateway_terminal.is_some() && frame.is_trailers() {
+            let trailers = match frame.into_trailers() {
+                Ok(trailers) => trailers,
+                Err(_) => {
+                    this.failed = true;
+                    return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                        "gRPC-Web pass-through relay received an invalid trailer frame",
+                    )))));
+                }
+            };
+            let mut collected = std::collections::HashMap::new();
+            super::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
+            let (data, grpc_status) = crate::plugins::grpc_web::build_streaming_trailer_data(
+                &collected,
+                this.http_status,
+                this.text_mode,
+            );
+            this.terminal_status
+                .store(u64::from(grpc_status), Ordering::Release);
+            this.terminal_emitted = true;
+            return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        // Backend-authored HTTP trailers are part of the pass-through response.
+        Poll::Ready(Some(Ok(frame)))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.terminal_emitted || self.failed || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        // The relay forwards the backend's bytes unchanged. The deadline
+        // wrappers below it own their hints for the terminals they can emit.
+        self.inner.size_hint()
+    }
+}
+
 /// Immediately-EOF body that never advertises an exact length.
 ///
 /// Used for HTTP 205 responses so Hyper does not synthesize
@@ -665,6 +824,7 @@ impl ProxyBody {
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
+            grpc_web_passthrough_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             grpc_messages: None,
@@ -696,6 +856,7 @@ impl ProxyBody {
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
+            grpc_web_passthrough_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             grpc_messages: None,
@@ -774,6 +935,92 @@ impl ProxyBody {
         body.grpc_web_terminal_status = Some(terminal_status);
         body.logger = logger;
         body
+    }
+
+    /// Wrap a PASS-THROUGH gRPC-Web response: the backend already answers in
+    /// gRPC-Web, so its bytes and its own trailer frame reach the client
+    /// unchanged and nothing is appended at EOF (see
+    /// [`GrpcWebPassthroughBody`]). `framing` names the response framing the
+    /// backend's trailer frame is read in, and whether a content-coding hides
+    /// it.
+    ///
+    /// Ownership moves exactly as in [`Self::into_grpc_web_streaming`]: guards
+    /// stay on the inner body, while outcome classifiers and the deferred
+    /// logger move to the returned outer body so the backend's terminal status
+    /// is logged and classified once, at the end of the client-visible body.
+    pub(crate) fn into_grpc_web_passthrough_streaming(
+        self,
+        framing: PassthroughFraming,
+        http_status: u16,
+    ) -> Self {
+        let mut inner = self;
+        let client_grpc_deadline_fired = inner.client_grpc_deadline_fired.clone();
+        let stream_auth_deadline = inner.stream_auth_deadline.clone();
+        let logger = inner.logger.take();
+        let backend_admission_permits = inner._backend_admission_permits.take();
+        let backend_admission_outcome = inner.backend_admission_outcome.take();
+        let backend_dispatch_outcome = inner.backend_dispatch_outcome.take();
+        let terminal_status = Arc::new(AtomicU64::new(GRPC_WEB_TERMINAL_STATUS_UNSET));
+        let observer = framing.observer();
+        let initial_status = encode_passthrough_grpc_status(observer.outcome());
+        let observed_status = Arc::new(AtomicU64::new(initial_status));
+        let relay = GrpcWebPassthroughBody {
+            inner,
+            text_mode: framing.text_mode,
+            http_status,
+            observer,
+            observed_status: Arc::clone(&observed_status),
+            terminal_status: Arc::clone(&terminal_status),
+            terminal_emitted: false,
+            failed: false,
+        };
+        let mut body = Self::streaming(Box::pin(relay));
+        body._backend_admission_permits = backend_admission_permits;
+        body.backend_admission_outcome = backend_admission_outcome;
+        body.backend_dispatch_outcome = backend_dispatch_outcome;
+        body.client_grpc_deadline_fired = client_grpc_deadline_fired;
+        body.stream_auth_deadline = stream_auth_deadline;
+        body.grpc_web_terminal_status = Some(terminal_status);
+        body.grpc_web_passthrough_status = Some(observed_status);
+        body.logger = logger;
+        body
+    }
+
+    /// Terminal status of the backend's final body frame on a pass-through
+    /// gRPC-Web response, when one has been observed.
+    fn grpc_web_passthrough_outcome(&self) -> Option<PassthroughGrpcStatus> {
+        self.grpc_web_passthrough_status
+            .as_ref()
+            .and_then(|status| decode_passthrough_grpc_status(status.load(Ordering::Acquire)))
+    }
+
+    /// Whether a body dropped without its terminal poll is nevertheless proven
+    /// to have ended: a protocol adapter's declared byte count was reached, or
+    /// an inner wrapper already reports end-of-stream.
+    fn proved_complete_on_drop(&self, client_deadline_fired: bool) -> bool {
+        self.success_on_drop_after_bytes
+            .is_some_and(|expected| self.bytes_streamed.load(Ordering::Relaxed) == expected)
+            || (!client_deadline_fired && self.proved_end_of_stream_on_drop())
+    }
+
+    /// Feed a terminal gRPC status into deferred admission and dispatch
+    /// accounting. gRPC failures complete under HTTP 200, so a non-OK status is
+    /// mapped once and recorded for both classifiers.
+    fn classify_grpc_terminal_status(&mut self, code: u32) {
+        if code == 0 {
+            return;
+        }
+        let status = crate::proxy::grpc_proxy::grpc_status_to_http_status(code);
+        if let Some(outcome) = self.backend_admission_outcome.as_mut()
+            && outcome.classify_grpc_trailer
+        {
+            outcome.grpc_trailer_http_status = Some(status);
+        }
+        if let Some(outcome) = self.backend_dispatch_outcome.as_mut()
+            && outcome.classify_grpc_trailer
+        {
+            outcome.grpc_trailer_http_status = Some(status);
+        }
     }
 
     /// Attach a [`RequestGuard`] to this body so the `active_requests`
@@ -1345,6 +1592,7 @@ impl ProxyBody {
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
+            grpc_web_passthrough_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             grpc_messages: None,
@@ -1677,24 +1925,21 @@ impl http_body::Body for ProxyBody {
                         })
                     })
                     .or(grpc_web_terminal_status);
+                // Pass-through gRPC-Web carries its status in the backend's body
+                // trailer frame; HTTP trailers without one fall back to it.
+                let passthrough = if is_trailers && grpc_status.is_none() {
+                    this.grpc_web_passthrough_outcome()
+                } else {
+                    None
+                };
+                let grpc_status =
+                    grpc_status.or_else(|| passthrough.and_then(PassthroughGrpcStatus::status));
                 // gRPC streaming: the response can finish HTTP 200 while the real
                 // outcome rides in the grpc-status trailer. Capture a non-OK status
                 // once and feed both deferred admission and backend dispatch
                 // accounting from the same mapped value.
-                if let Some(code) = grpc_status
-                    && code != 0
-                {
-                    let status = crate::proxy::grpc_proxy::grpc_status_to_http_status(code);
-                    if let Some(outcome) = this.backend_admission_outcome.as_mut()
-                        && outcome.classify_grpc_trailer
-                    {
-                        outcome.grpc_trailer_http_status = Some(status);
-                    }
-                    if let Some(outcome) = this.backend_dispatch_outcome.as_mut()
-                        && outcome.classify_grpc_trailer
-                    {
-                        outcome.grpc_trailer_http_status = Some(status);
-                    }
+                if let Some(code) = grpc_status {
+                    this.classify_grpc_terminal_status(code);
                 }
                 if is_trailers || is_grpc_web_deadline_terminal || is_grpc_web_streaming_terminal {
                     if let Some(logger) = this.logger.take() {
@@ -1706,9 +1951,15 @@ impl http_body::Body for ProxyBody {
                         } else {
                             grpc_status
                         };
+                        // A gateway terminal names its own status; otherwise an
+                        // unreadable pass-through status stays unset.
+                        let grpc_status_unreadable = passthrough
+                            .and_then(PassthroughGrpcStatus::unreadable)
+                            .filter(|_| terminal_grpc_status.is_none());
                         logger.fire(
                             crate::proxy::deferred_log::BodyOutcome::success(bytes)
                                 .with_grpc_status(terminal_grpc_status)
+                                .with_grpc_status_unreadable(grpc_status_unreadable)
                                 .with_authorization_termination(auth_deadline_termination),
                         );
                     }
@@ -1756,10 +2007,21 @@ impl http_body::Body for ProxyBody {
                 this.pooled_backend_lease = None;
             }
             Poll::Ready(None) => {
+                // A pass-through gRPC-Web body ends on the backend's own trailer
+                // frame, so its status is known only once the body has ended.
+                let passthrough = this.grpc_web_passthrough_outcome();
+                let passthrough_grpc_status = passthrough.and_then(PassthroughGrpcStatus::status);
+                if let Some(code) = passthrough_grpc_status {
+                    this.classify_grpc_terminal_status(code);
+                }
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
+                    let passthrough_unreadable =
+                        passthrough.and_then(PassthroughGrpcStatus::unreadable);
                     logger.fire(
                         crate::proxy::deferred_log::BodyOutcome::success(bytes)
+                            .with_grpc_status(passthrough_grpc_status)
+                            .with_grpc_status_unreadable(passthrough_unreadable)
                             .with_authorization_termination(auth_deadline_termination),
                     );
                 }
@@ -1863,10 +2125,7 @@ impl Drop for ProxyBody {
             //    `is_end_stream()` is still unreliable before terminal poll,
             //    so we trust `polled` exclusively and treat never-polled as
             //    success.
-            let proved_complete = self
-                .success_on_drop_after_bytes
-                .is_some_and(|expected| bytes == expected)
-                || (!client_deadline_fired && self.proved_end_of_stream_on_drop());
+            let proved_complete = self.proved_complete_on_drop(client_deadline_fired);
             let outcome = if self.polled.load(Ordering::Relaxed) {
                 // Polled at least once but never reached Ready(None) or an
                 // error terminal. That's normally a client disconnect
@@ -1906,6 +2165,23 @@ impl Drop for ProxyBody {
                 deferred_admission_error_class = outcome.body_error_class;
                 deferred_admission_client_disconnected = outcome.client_disconnected;
             }
+            // A proven-complete pass-through gRPC-Web body that hyper dropped
+            // before the EOF poll still ended on the backend's trailer frame.
+            let passthrough = if outcome.body_completed {
+                self.grpc_web_passthrough_outcome()
+            } else {
+                None
+            };
+            if let Some(code) = passthrough.and_then(PassthroughGrpcStatus::status) {
+                self.classify_grpc_terminal_status(code);
+            }
+            let outcome = if let Some(passthrough) = passthrough {
+                outcome
+                    .with_grpc_status(passthrough.status())
+                    .with_grpc_status_unreadable(passthrough.unreadable())
+            } else {
+                outcome
+            };
             // `fire` is single-fire, so a body whose terminal poll already
             // recorded the class cannot record it twice. This branch only
             // covers the Drop safety net.
@@ -1924,6 +2200,14 @@ impl Drop for ProxyBody {
         {
             deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
             deferred_admission_client_disconnected = true;
+        } else if let Some(passthrough) = self.grpc_web_passthrough_outcome()
+            && let Some(code) = passthrough.status()
+            && self.proved_complete_on_drop(client_deadline_fired)
+        {
+            // No logger: a proven-complete pass-through gRPC-Web body still
+            // feeds the backend's terminal status into admission and dispatch
+            // accounting, exactly as its EOF poll would have.
+            self.classify_grpc_terminal_status(code);
         }
         if client_deadline_fired {
             deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);

@@ -29,7 +29,11 @@ use bytes::Bytes;
 use http_body::Body as _;
 use http_body::Frame;
 
-use ferrum_edge::_test_support::proxy_body_streaming_for_test;
+use ferrum_edge::_test_support::{
+    proxy_body_into_grpc_web_passthrough_streaming_for_test,
+    proxy_body_into_grpc_web_passthrough_streaming_with_headers_for_test,
+    proxy_body_streaming_for_test, proxy_body_with_grpc_admission_outcome_for_test,
+};
 use ferrum_edge::plugins::prometheus_metrics::{ClientDisconnectKey, MetricsRegistry};
 use ferrum_edge::plugins::{
     Plugin, RequestContext, ResponseStreamAction, ResponseStreamInspector, TransactionSummary,
@@ -1857,4 +1861,318 @@ fn native_grpc_classification_treats_an_absent_protocol_as_grpc() {
         !native_grpc_request_protocol_is_grpc(&grpc_web),
         "a request that declared another protocol keeps it"
     );
+}
+
+/// A backend's complete pass-through gRPC-Web body: one message frame and the
+/// backend's own trailer frame (issue #5758).
+fn grpc_web_passthrough_wire(trailer: &[u8]) -> Vec<u8> {
+    let mut wire = vec![0x00];
+    wire.extend_from_slice(&5u32.to_be_bytes());
+    wire.extend_from_slice(b"hello");
+    wire.push(0x80);
+    wire.extend_from_slice(&(trailer.len() as u32).to_be_bytes());
+    wire.extend_from_slice(trailer);
+    wire
+}
+
+fn grpc_terminal_logger(plugins: Arc<Vec<Arc<dyn Plugin>>>) -> Arc<DeferredTransactionLogger> {
+    let mut ctx = make_ctx();
+    ctx.metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    let mut summary = make_summary_with_status(200);
+    summary.metadata = HashMap::new();
+    DeferredTransactionLogger::new_with_start_time(
+        summary,
+        plugins,
+        ctx,
+        std::time::Instant::now(),
+        true,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_passthrough_logs_the_backend_trailer_frame_status() {
+    use futures_util::stream;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let logger = grpc_terminal_logger(plugins);
+
+    let wire = grpc_web_passthrough_wire(b"grpc-status: 7\r\ngrpc-message: denied\r\n");
+    let (first, second) = wire.split_at(9);
+    let frames = vec![
+        Ok::<_, ProxyBodyError>(Frame::data(Bytes::copy_from_slice(first))),
+        Ok(Frame::data(Bytes::copy_from_slice(second))),
+    ];
+    let inner = proxy_body_streaming_for_test(Box::pin(StreamBody::new(stream::iter(frames))));
+    let mut body = proxy_body_into_grpc_web_passthrough_streaming_for_test(inner, false, 200)
+        .with_logger(logger);
+
+    let mut delivered = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let data = frame
+            .expect("pass-through frame")
+            .into_data()
+            .expect("pass-through gRPC-Web is DATA only");
+        delivered.extend_from_slice(&data);
+    }
+    assert_eq!(delivered, wire, "the body is relayed unchanged");
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    let got = &captures[0];
+    assert!(got.body_completed);
+    assert_eq!(got.bytes_received, wire.len() as u64);
+    assert_eq!(
+        got.metadata.get("grpc_status").map(String::as_str),
+        Some("7"),
+        "the logged status is the backend's own trailer frame, not UNKNOWN"
+    );
+    assert_eq!(got.grpc_status(), Some(7));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_passthrough_drop_after_final_frame_logs_the_backend_status() {
+    use http_body_util::BodyExt;
+
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let logger = grpc_terminal_logger(plugins);
+
+    // A body whose last DATA frame already reports end-of-stream: hyper may
+    // drop it without the EOF poll, and the Drop safety net must still log the
+    // backend's terminal status rather than UNKNOWN.
+    let wire = grpc_web_passthrough_wire(b"grpc-status: 0\r\n");
+    let inner = ProxyBody::full(Bytes::from(wire.clone()));
+    let mut body = proxy_body_into_grpc_web_passthrough_streaming_for_test(inner, false, 200)
+        .with_logger(logger);
+
+    let data = body
+        .frame()
+        .await
+        .expect("the whole body is one frame")
+        .expect("pass-through frame")
+        .into_data()
+        .expect("pass-through gRPC-Web is DATA only");
+    assert_eq!(data.as_ref(), wire.as_slice());
+    assert!(body.is_end_stream());
+    drop(body);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    let got = &captures[0];
+    assert!(got.body_completed);
+    assert!(!got.client_disconnected);
+    assert_eq!(
+        got.metadata.get("grpc_status").map(String::as_str),
+        Some("0")
+    );
+    assert!(!got.is_terminal_failure());
+}
+
+/// Drain a pass-through body to EOF and return the bytes it delivered.
+async fn drain_passthrough(mut body: ProxyBody) -> Vec<u8> {
+    use http_body_util::BodyExt;
+
+    let mut delivered = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let data = frame
+            .expect("pass-through frame")
+            .into_data()
+            .expect("pass-through gRPC-Web is DATA only");
+        delivered.extend_from_slice(&data);
+    }
+    delivered
+}
+
+/// A streaming source that yields `wire` as one DATA frame.
+fn single_frame_source(wire: &[u8]) -> ProxyBody {
+    use futures_util::stream;
+    use http_body_util::StreamBody;
+
+    let frame = Frame::data(Bytes::copy_from_slice(wire));
+    let frames = vec![Ok::<_, ProxyBodyError>(frame)];
+    proxy_body_streaming_for_test(Box::pin(StreamBody::new(stream::iter(frames))))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_passthrough_unreadable_trailer_frame_leaves_grpc_status_unset() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let logger = grpc_terminal_logger(plugins);
+
+    // The backend's final frame is a COMPRESSED trailer frame (flag 0x81): its
+    // status is on the wire, but the gateway cannot read it.
+    let mut wire = vec![0x00];
+    wire.extend_from_slice(&5u32.to_be_bytes());
+    wire.extend_from_slice(b"hello");
+    wire.push(0x81);
+    wire.extend_from_slice(&8u32.to_be_bytes());
+    wire.extend_from_slice(b"deflated");
+    let inner = single_frame_source(&wire);
+    let body = proxy_body_into_grpc_web_passthrough_streaming_for_test(inner, false, 200)
+        .with_logger(logger);
+    assert_eq!(drain_passthrough(body).await, wire);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    let got = &captures[0];
+    assert!(got.body_completed);
+    assert_eq!(
+        got.metadata.get("grpc_status"),
+        None,
+        "a status present but unreadable is not reported as UNKNOWN"
+    );
+    let reason = got.metadata.get("grpc_status_unreadable");
+    assert_eq!(
+        reason.map(String::as_str),
+        Some("compressed_trailer_frame"),
+        "the log names why the status is unset"
+    );
+    assert_eq!(got.grpc_status(), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_passthrough_content_encoded_body_leaves_grpc_status_unset() {
+    use http_body_util::BodyExt;
+
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let logger = grpc_terminal_logger(plugins);
+
+    // Under a content-coding the relayed bytes are not gRPC-Web frames the
+    // gateway can parse, even when they happen to look like one. Drop after the
+    // final frame so the Drop safety net reports it too.
+    let wire = grpc_web_passthrough_wire(b"grpc-status: 0\r\n");
+    let content_type = "application/grpc-web+proto".to_string();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), content_type);
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let inner = ProxyBody::full(Bytes::from(wire.clone()));
+    let body = proxy_body_into_grpc_web_passthrough_streaming_with_headers_for_test(
+        inner, false, &headers, 200,
+    );
+    let mut body = body.with_logger(logger);
+    let data = body
+        .frame()
+        .await
+        .expect("the whole body is one frame")
+        .expect("pass-through frame")
+        .into_data()
+        .expect("pass-through gRPC-Web is DATA only");
+    assert_eq!(data.as_ref(), wire.as_slice());
+    assert!(body.is_end_stream());
+    drop(body);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    let got = &captures[0];
+    assert!(got.body_completed);
+    assert_eq!(got.metadata.get("grpc_status"), None);
+    let reason = got.metadata.get("grpc_status_unreadable");
+    assert_eq!(
+        reason.map(String::as_str),
+        Some("content_encoded_body"),
+        "the log names why the status is unset"
+    );
+    assert_eq!(got.grpc_status(), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_passthrough_without_a_trailer_frame_is_unknown() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let logger = grpc_terminal_logger(plugins);
+
+    // A truly missing final trailer frame is still UNKNOWN (2).
+    let mut wire = vec![0x00];
+    wire.extend_from_slice(&5u32.to_be_bytes());
+    wire.extend_from_slice(b"hello");
+    let inner = single_frame_source(&wire);
+    let body = proxy_body_into_grpc_web_passthrough_streaming_for_test(inner, false, 200)
+        .with_logger(logger);
+    assert_eq!(drain_passthrough(body).await, wire);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    let got = &captures[0];
+    assert_eq!(
+        got.metadata.get("grpc_status").map(String::as_str),
+        Some("2")
+    );
+    assert!(!got.metadata.contains_key("grpc_status_unreadable"));
+}
+
+#[derive(Default)]
+struct RecordedAdmission {
+    statuses: Mutex<Vec<u16>>,
+}
+
+impl RecordedAdmission {
+    fn statuses(&self) -> Vec<u16> {
+        self.statuses
+            .lock()
+            .expect("recorded admission statuses")
+            .clone()
+    }
+}
+
+struct RecordingAdmissionPermit {
+    recorded: Arc<RecordedAdmission>,
+}
+
+impl ferrum_edge::plugins::BackendAdmissionPermit for RecordingAdmissionPermit {
+    fn record_backend_outcome(&self, outcome: ferrum_edge::plugins::BackendAdmissionOutcome) {
+        self.recorded
+            .statuses
+            .lock()
+            .expect("recorded admission statuses")
+            .push(outcome.response_status);
+    }
+}
+
+fn recording_admission_permits(
+    recorded: &Arc<RecordedAdmission>,
+) -> ferrum_edge::plugins::BackendAdmissionPermitSet {
+    let permit: Arc<dyn ferrum_edge::plugins::BackendAdmissionPermit> =
+        Arc::new(RecordingAdmissionPermit {
+            recorded: Arc::clone(recorded),
+        });
+    ferrum_edge::plugins::BackendAdmissionPermitSet::new(vec![permit])
+        .expect("a one-permit set is non-empty")
+}
+
+#[tokio::test]
+async fn grpc_web_passthrough_drop_without_a_logger_classifies_the_backend_status() {
+    use http_body_util::BodyExt;
+
+    // No deferred logger: hyper drops the body after its final frame without
+    // the EOF poll. The backend's UNAVAILABLE (14) must still reach admission
+    // accounting as its mapped 503, not as the HTTP 200 the stream began with.
+    let recorded = Arc::new(RecordedAdmission::default());
+    let permits = recording_admission_permits(&recorded);
+    let wire = grpc_web_passthrough_wire(b"grpc-status: 14\r\n");
+    let inner = ProxyBody::full(Bytes::from(wire.clone()));
+    let inner = proxy_body_with_grpc_admission_outcome_for_test(inner, permits, 200);
+    let mut body = proxy_body_into_grpc_web_passthrough_streaming_for_test(inner, false, 200);
+    let data = body
+        .frame()
+        .await
+        .expect("the whole body is one frame")
+        .expect("pass-through frame")
+        .into_data()
+        .expect("pass-through gRPC-Web is DATA only");
+    assert_eq!(data.as_ref(), wire.as_slice());
+    assert!(body.is_end_stream());
+    drop(body);
+    assert_eq!(recorded.statuses(), vec![503]);
+
+    // The same body polled to EOF classifies identically.
+    let recorded = Arc::new(RecordedAdmission::default());
+    let permits = recording_admission_permits(&recorded);
+    let inner = ProxyBody::full(Bytes::from(wire.clone()));
+    let inner = proxy_body_with_grpc_admission_outcome_for_test(inner, permits, 200);
+    let body = proxy_body_into_grpc_web_passthrough_streaming_for_test(inner, false, 200);
+    assert_eq!(drain_passthrough(body).await, wire);
+    assert_eq!(recorded.statuses(), vec![503]);
 }

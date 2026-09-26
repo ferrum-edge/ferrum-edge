@@ -772,7 +772,7 @@ Tags: `method`, `status`, `status_class`, `grpc_status` (gRPC only), `proxy`, `b
 
 - Standard codes `0`–`16` retain their decimal label
 - Malformed or non-standard codes collapse to `OTHER` (cardinality bound)
-- Missing terminal status on a known gRPC transaction normalizes to `2` (`UNKNOWN`), matching the shared `TransactionSummary::grpc_status` contract
+- Missing terminal status on a known gRPC transaction normalizes to `2` (`UNKNOWN`), matching the shared `TransactionSummary::grpc_status` contract. A status present on the wire but unreadable by the gateway (`metadata.grpc_status_unreadable`, e.g. a pass-through gRPC-Web compressed trailer frame) is not missing: it omits both the tag and the counter
 - Ordinary backend failures and gateway-generated gRPC rejections use the same tag/counter family
 - Plain HTTP / non-gRPC transactions omit both the tag and the counter
 
@@ -1163,7 +1163,7 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `backend_target` | String or null | Backend the request was forwarded to. For HTTP this is the full URL (`scheme://host:port/path`); `null` when the request was rejected before backend selection. Same JSON key as `StreamTransactionSummary.backend_target` (which uses `host:port` form because stream proxies have no path). |
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
 | `response_status_code` | u16 | HTTP status code |
-| `grpc_status` | u32 | Final normalized gRPC application status, separate from HTTP transport status; emitted for gRPC transactions. Missing terminal status normalizes to `2` (UNKNOWN); malformed input uses the existing `u32::MAX` invalid-status sentinel |
+| `grpc_status` | u32 | Final normalized gRPC application status, separate from HTTP transport status; emitted for gRPC transactions. Missing terminal status normalizes to `2` (UNKNOWN); malformed input uses the existing `u32::MAX` invalid-status sentinel. A status present on the wire but unreadable by the gateway is omitted, and `metadata.grpc_status_unreadable` names why (see `grpc_web`) |
 | `latency_total_ms` | f64 | Total request-to-response time (for streamed responses: request receipt → body terminal) |
 | `latency_gateway_processing_ms` | f64 | Total time excluding attributed backend communication; `-1.0` when streaming backend total is unknown |
 | `latency_backend_ttfb_ms` | f64 | Time to first byte / response headers from backend; `-1.0` when no backend first byte or response headers were observed (including failures before response headers) |
@@ -6041,6 +6041,8 @@ Translates between gRPC-Web (browser-compatible) and native gRPC (HTTP/2) wire f
 Supports both encoding modes:
 - **Binary** (`application/grpc-web`, `application/grpc-web+proto`): same length-prefixed framing as native gRPC — request body passes through unchanged.
 - **Text** (`application/grpc-web-text`, `application/grpc-web-text+proto`): base64-encoded binary frames — decoded on request and re-encoded on response.
+
+**Without this plugin** a gRPC-Web request passes through untranslated to a backend that answers in gRPC-Web itself. On HTTP/1.1, HTTP/2, and HTTP/3 the gateway relays that response body byte for byte, binary and text alike: the backend's own `0x80` trailer frame is the response's only terminal status and the gateway appends no trailer frame of its own. The transaction log's `grpc_status` is read from that backend trailer frame on HTTP/1.1 and HTTP/2 (streamed and buffered) and on the HTTP/3 cross-protocol and native HTTP/3 relays (streamed and buffered); the HTTP/3 mesh-egress buffered bridge is not covered yet. A final frame that is present but unreadable (a compressed `0x81` trailer frame, or a body under an HTTP `Content-Encoding`) leaves `grpc_status` unset instead of `UNKNOWN`, and `metadata.grpc_status_unreadable` names why (`compressed_trailer_frame` or `content_encoded_body`); `grpc_status` is `UNKNOWN` only when the body ends without a final trailer frame naming a status. The only gRPC-Web trailer frames the gateway writes on a pass-through route are its own terminals, such as a client-deadline or authorization-lifetime expiry, which carry their own status.
 
 Message-format suffixes (`+proto`, `+json`, `+thrift`, or another valid custom `+subtype`) name the message serialization, which translation never changes. They are preserved in both directions: on the negotiated response `Content-Type`, and on the native `Content-Type` the backend receives.
 

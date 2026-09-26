@@ -2267,6 +2267,13 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
     }
 }
 
+/// Transaction metadata key naming why a gRPC exchange's terminal status is
+/// present on the wire but unreadable by the gateway (a pass-through gRPC-Web
+/// body ending on a compressed trailer frame, or a content-encoded one). While
+/// it is set and no `grpc_status` is recorded, the status stays unset rather
+/// than defaulting to `UNKNOWN` (2), which the client never received.
+pub const GRPC_STATUS_UNREADABLE_METADATA_KEY: &str = "grpc_status_unreadable";
+
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
     pub const OK: u32 = 0;
@@ -2442,10 +2449,11 @@ pub(crate) fn refresh_grpc_status_metadata(
 /// actually received.
 ///
 /// So when the terminal metadata is body-framed and neither map names a status,
-/// an already-recorded status stands. A status present in either map is still
-/// authoritative and still refreshes, so a genuine post-hook edit is never
-/// ignored, and a request with no recorded status at all still falls back to
-/// `UNKNOWN`.
+/// an already-recorded status stands, and so does a body-framed status recorded
+/// as present but unreadable ([`GRPC_STATUS_UNREADABLE_METADATA_KEY`]), which
+/// stays unset. A status present in either map is still authoritative and still
+/// refreshes, so a genuine post-hook edit is never ignored, and a request with
+/// no recorded status at all still falls back to `UNKNOWN`.
 pub(crate) fn refresh_grpc_status_metadata_with_body_framed_terminal(
     metadata: &mut HashMap<String, String>,
     trailers: &HashMap<String, String>,
@@ -2454,7 +2462,8 @@ pub(crate) fn refresh_grpc_status_metadata_with_body_framed_terminal(
 ) {
     if terminal_metadata_is_body_framed
         && grpc_status_from_maps(trailers, headers).is_none()
-        && metadata.contains_key("grpc_status")
+        && (metadata.contains_key("grpc_status")
+            || metadata.contains_key(GRPC_STATUS_UNREADABLE_METADATA_KEY))
     {
         return;
     }
