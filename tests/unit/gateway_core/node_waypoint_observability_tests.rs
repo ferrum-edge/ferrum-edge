@@ -655,7 +655,10 @@ fn inbound_connect_relay_synthesis_refusals_log_and_count_by_terminal() {
     // Only the two real destination denials count.
     assert_eq!(
         after.destination_policy_rejections.relay_destination_denied,
-        before.destination_policy_rejections.relay_destination_denied + 2
+        before
+            .destination_policy_rejections
+            .relay_destination_denied
+            + 2
     );
     // Every refusal is accounted as a request with its status.
     assert_eq!(state.request_count.load(Ordering::Relaxed), 4);
