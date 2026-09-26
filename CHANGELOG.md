@@ -476,6 +476,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leading UTF-8 BOMs and splits lines on CRLF, LF, or a lone CR (mixed
   freely). Previously a leading BOM or CR-only framing hid events from
   inspection while the body was still reported as fully parsed (#5795).
+- HTTP active health probes now decide the verdict and record latency from the
+  response headers, then drain small response bodies in the background (up to
+  64 KiB, within at most 1 second and the remaining probe timeout) so a health
+  endpoint that sends its body after its headers can return its HTTP/1.1
+  connection to the idle pool. Oversized, stalled, or failing bodies are
+  abandoned without changing the verdict (#5791).
 - Windowed `ai_semantic_firewall` streaming inspection, `ai_transcript_audit`
   SSE capture, and the `ai_response_guard` SSE rewriters now share that
   parser's line splitting and leading-BOM policy, so CR-only and mixed
