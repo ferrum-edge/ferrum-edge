@@ -1136,7 +1136,10 @@ fn sse_parser_still_fails_closed_on_malformed_json_under_cr_and_bom() {
     ] {
         let parsed = parse_sse_data_frames_checked(body.as_bytes());
         assert!(parsed.frames.is_empty(), "{body:?}");
-        assert!(!parsed.fully_parsed, "{body:?} must not report fully parsed");
+        assert!(
+            !parsed.fully_parsed,
+            "{body:?} must not report fully parsed"
+        );
     }
 }
 
