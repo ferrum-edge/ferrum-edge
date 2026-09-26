@@ -135,10 +135,10 @@ pub fn server_0rtt_handshake_succeeded(zero_rtt_accepted: bool, connection_is_op
 /// open a stream after the client's `Finished`. That relaxation is deliberate.
 /// A replay can never complete a handshake (it lacks the client's keys), so
 /// every replayed copy stays early data and is refused or forwarded with
-/// `Early-Data: 1` by whichever instance receives it. RFC 8470 §6.2 requires
-/// only that instances agree on requests acted on *before* the handshake
-/// completes, and §6.4 permits processing early data received after
-/// completion when replays are handled consistently.
+/// `Early-Data: 1` by whichever instance receives it. The operative rule is
+/// RFC 8470 §6.4, which permits processing early data received after the
+/// handshake completes. §6.2 is still satisfied, because processing after
+/// completion is the "delay" treatment it permits, and replays stay early.
 ///
 /// The inner future is polled only while pending and dropped as soon as it
 /// resolves, so it is never polled after completion. No lock and no

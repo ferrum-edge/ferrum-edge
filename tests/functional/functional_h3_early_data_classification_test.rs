@@ -53,7 +53,7 @@ const ONE_RTT_CONNECTIONS: usize = 8;
 /// leg. The client can neither hold 1-RTT keys nor send its `Finished` before
 /// this has passed, so it is also the window the gateway has to accept and
 /// classify the 0-RTT request streams while the handshake is still pending.
-const SERVER_FLIGHT_DELAY: Duration = Duration::from_millis(500);
+const SERVER_FLIGHT_DELAY: Duration = Duration::from_millis(1500);
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
 type H3Sender = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
@@ -474,13 +474,10 @@ async fn functional_h3_early_data_classification_follows_the_handshake_state() {
         .connect(relay.addr, "localhost")
         .expect("start 0-RTT connect");
     let Ok((connection, zero_rtt_accepted)) = connecting.into_0rtt() else {
-        eprintln!(
-            "SKIP 0-RTT leg: the client holds no 0-RTT-capable session ticket from the \
-             gateway, so no request can be sent as early data"
+        panic!(
+            "the client holds no 0-RTT-capable session ticket after the warmup and \
+             {ONE_RTT_CONNECTIONS} resumed handshakes with early data enabled"
         );
-        gateway.shutdown();
-        backend.abort();
-        return;
     };
     let (mut sender, driver) = h3_session(connection.clone()).await;
     let mut put = h3_send(&mut sender, Method::PUT, &url("/early/zero-rtt-put")).await;
@@ -493,6 +490,13 @@ async fn functional_h3_early_data_classification_follows_the_handshake_state() {
             "SKIP 0-RTT leg: the gateway rejected the client's 0-RTT data, so the \
              requests were never delivered as early data"
         );
+        for path in ["/early/zero-rtt-put", "/early/zero-rtt-get"] {
+            let forwarded = backend_requests(&log, path);
+            assert!(
+                forwarded.is_empty(),
+                "rejected 0-RTT data must never reach the backend: {forwarded:?}"
+            );
+        }
         driver.abort();
         gateway.shutdown();
         backend.abort();

@@ -1051,10 +1051,11 @@ packets that open a stream after the client's `Finished`. This relaxation is
 deliberate. A replayed copy of 0-RTT data can never complete a handshake,
 because the attacker lacks the client's keys, so every gateway instance that
 receives a replay handles it as early data: the method allowlist, `425 Too
-Early`, and `Early-Data: 1` still apply to it. RFC 8470 §6.2 requires
-instances to agree only on how they handle a request *before* the handshake
-completes, and §6.4 allows a server to process early data received after the
-handshake completes when replays are handled consistently.
+Early`, and `Early-Data: 1` still apply to it. The operative rule is RFC 8470
+§6.4, which permits a server to process early data it receives after the
+handshake completes. §6.2 is still satisfied: processing such a request after
+completion is the "delay" treatment §6.2 permits, and because a replay can
+never complete a handshake, every replayed copy stays early data.
 
 Peer identity and early data are published as one per-connection snapshot
 (`http3::peer_identity::H3ConnectionIdentity`, an `ArcSwap` slot read once
