@@ -8740,7 +8740,7 @@ type column says so. Unknown keys are rejected at every level.
 | `retry` | Object \| null | omitted | Route-local retry policy (below), applied only to requests this rule matches (Istio `http[].retries`, Gateway API `HTTPRoute.rules[].retry`). Cannot be combined with `retry_disabled: true` |
 | `retry_disabled` | bool | `false` | Clear the selected proxy's inherited retry policy for this route. Cannot be combined with `retry` |
 | `request_transform` | Object[] | `[]` | Route-level request header transforms (below). Requires an eligible consumer — see [Route transforms need a consumer](#route-transforms-need-a-consumer) |
-| `response_transform` | Object[] | `[]` | Route-level response header transforms. Same shape and same consumer requirement, plus the closed protocol-managed destination set described above |
+| `response_transform` | Object[] | `[]` | Route-level response header transforms. Same shape and same consumer requirement, plus the closed protocol-managed destination set described above. Applied exactly once to every response the matched rule produces — a proxied response and also the rule's own `redirect` or aborted `fault` answer. A matching rule always replaces the list an earlier dispatch instance published (clearing it when the rule declares none) |
 | `fault` | Object \| null | omitted | Per-rule delay / abort, applied before any route override |
 | `rewrite` | Object \| null | omitted | Per-rule URI / authority rewrite applied to the backend request |
 | `redirect` | Object \| null | omitted | Per-rule 3xx answer. Highest precedence: the request never reaches a backend, so the rule needs no `destination` |
@@ -8790,7 +8790,7 @@ type column says so. Unknown keys are rejected at every level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `uri` | String \| null | omitted | Replacement `Location` path; the request path is preserved when unset. The composed path is canonicalized, and a `.` or `..` segment is refused with `400` |
+| `uri` | String \| null | omitted | Replacement `Location` path; the request path is preserved when unset. Must be non-empty: a Gateway API `ReplacePrefixMatch` with an empty `replacePrefixMatch` (strip the matched prefix) is translated to `uri: /`, which composes `/old` → `/`, `/old/` → `/`, and `/old/child` → `/child` under `match_prefix: /old`. The composed path is canonicalized, and a `.` or `..` segment is refused with `400` |
 | `match_prefix` | String \| null | omitted | Prefix replaced by `uri`, with the same literal-substitution contract as `rewrite.match_prefix` |
 | `authority` | String \| null | omitted | Replacement `Location` authority; the request authority is preserved when unset |
 | `port` | 1–65535 \| null | omitted | Replacement authority port. Mutually exclusive with `derive_port` |

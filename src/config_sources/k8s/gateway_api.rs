@@ -7501,15 +7501,7 @@ fn gateway_url_rewrite_value(rule: &Value) -> Option<Value> {
                     if let Some(replacement) =
                         path.get("replacePrefixMatch").and_then(Value::as_str)
                     {
-                        // Upstream's rewrite table maps an empty replacement to
-                        // a bare `/` (`/foo` + prefix `/foo` + `""` -> `/`), so
-                        // normalize it here rather than emitting an empty `uri`
-                        // the dispatch plugin refuses.
-                        let replacement = if replacement.is_empty() {
-                            "/"
-                        } else {
-                            replacement
-                        };
+                        let replacement = gateway_prefix_replacement(replacement);
                         out.insert("uri".to_string(), Value::String(replacement.to_string()));
                         out.insert(
                             GATEWAY_API_REWRITE_REPLACE_PREFIX_MATCH_KEY.to_string(),
@@ -7546,6 +7538,22 @@ fn gateway_rewrite_value_for_match(rewrite: &Value, match_entry: &Value) -> Valu
         );
     }
     value
+}
+
+/// Normalize a `ReplacePrefixMatch` replacement for the dispatch plugin.
+///
+/// Upstream's `HTTPPathModifier` table maps an empty replacement to a bare `/`
+/// (`/foo` + prefix `/foo` + `""` -> `/`, `/foo/bar` -> `/bar`). The dispatch
+/// plugin refuses an empty `uri`, and its prefix join collapses the doubled
+/// separator `/` + `/bar` produces, so `/` reproduces the upstream table for
+/// every request shape. Shared by the `URLRewrite` and `RequestRedirect`
+/// projections so the two filters can never disagree on the empty spelling.
+fn gateway_prefix_replacement(replacement: &str) -> &str {
+    if replacement.is_empty() {
+        "/"
+    } else {
+        replacement
+    }
 }
 
 /// Canonicalize a matched `PathPrefix` value into the literal byte prefix the
@@ -7710,7 +7718,7 @@ fn gateway_redirect_path(redirect: &serde_json::Map<String, Value>) -> Option<(&
         "ReplacePrefixMatch" => path
             .get("replacePrefixMatch")
             .and_then(Value::as_str)
-            .map(|path| (path, true)),
+            .map(|path| (gateway_prefix_replacement(path), true)),
         _ => None,
     }
 }

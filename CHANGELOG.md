@@ -62,6 +62,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Gateway API HTTPRoute `RequestRedirect` whose `path.type:
+  ReplacePrefixMatch` sets an empty `replacePrefixMatch` (strip the matched
+  prefix) now loads on the data plane (#5752). The translator emitted an empty
+  redirect `uri`, which `mesh_route_dispatch` refused, so the route could not be
+  deployed. The empty replacement now normalizes to `/` through the same helper
+  `URLRewrite` uses, so `/old`, `/old/` and `/old/child?x=1` under
+  `PathPrefix: /old` redirect to `/`, `/` and `/child?x=1`.
+- A route's response-header policy now applies to the responses the route
+  generates itself (#5753). `mesh_route_dispatch` published a matched rule's
+  `response_transform` only on the forwarding path, after its redirect and
+  fault-abort early returns, so a Gateway API `ResponseHeaderModifier` was
+  missing from a `RequestRedirect` answer and from the fail-closed HTTP 500 of a
+  rule with no serviceable `backendRefs`, and an Istio `headers.response` was
+  missing from an aborted route `fault`. The matched rule's list is now
+  published before those answers and applied once by the existing
+  response-header finalizer on HTTP/1.1, HTTP/2 and HTTP/3. A matching rule
+  also replaces, or clears, a list an earlier dispatch instance published, so
+  another rule's headers never decorate its answer. A redirect or aborted fault
+  still sets no backend destination.
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,
   PR #5741). A client that withholds QUIC flow control parks the gateway's

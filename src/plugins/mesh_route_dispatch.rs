@@ -2126,6 +2126,20 @@ impl Plugin for MeshRouteDispatch {
         for rule in &self.config.rules {
             if rule_matches(rule, ctx, headers, canonical_query.as_ref()) {
                 ctx.mesh_route_dispatch_matched = true;
+                // Per-rule response header transforms: publish the
+                // pre-compiled Arc BEFORE any route-owned terminal. A redirect
+                // or an aborted fault is a response this rule generates, and
+                // Gateway API `ResponseHeaderModifier` / Istio
+                // `headers.response` apply to it just as they do to a proxied
+                // response; proxy core's rejection path applies the published
+                // list exactly once. A matching instance always replaces the
+                // slot — clearing it when this rule declares none — so an
+                // earlier instance's list never decorates this rule's answer.
+                // Cloning an Arc is one atomic refcount bump.
+                ctx.route_override_response_transform =
+                    rule.response_transform_compiled.as_ref().map(Arc::clone);
+                ctx.route_override_response_transform_published =
+                    ctx.route_override_response_transform.is_some();
                 // Per-rule redirect (Istio `http[].redirect`): answer the
                 // request ourselves with a 3xx + `Location`. Highest
                 // precedence — a redirect short-circuits before fault and
@@ -2185,17 +2199,14 @@ impl Plugin for MeshRouteDispatch {
                 } else {
                     None
                 };
-                // Per-rule header transforms: publish the pre-compiled Arc
-                // so request_transformer / response_transformer can apply
-                // them after their own static rules. Cloning an Arc is one
-                // atomic refcount bump — cheaper than rebuilding the rule
+                // Per-rule request header transforms: publish the
+                // pre-compiled Arc so request_transformer can apply it after
+                // its own static rules. (The response list was published
+                // above, before the route-owned terminals.) Cloning an Arc is
+                // one atomic refcount bump — cheaper than rebuilding the rule
                 // list on every match.
                 ctx.route_override_request_transform =
                     rule.request_transform_compiled.as_ref().map(Arc::clone);
-                ctx.route_override_response_transform =
-                    rule.response_transform_compiled.as_ref().map(Arc::clone);
-                ctx.route_override_response_transform_published =
-                    ctx.route_override_response_transform.is_some();
                 // Per-rule rewrite (Istio `http[].rewrite`): rebase the path /
                 // authority forwarded to the backend. A non-matching later
                 // instance must not stomp this, so — like the destination
