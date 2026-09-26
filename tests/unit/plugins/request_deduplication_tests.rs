@@ -12,6 +12,7 @@ use ferrum_edge::_test_support::{
     request_deduplication_redis_payload_for_test,
     request_deduplication_redis_record_payload_is_valid,
     request_deduplication_redis_requires_no_eviction_for_test,
+    request_deduplication_replay_stored_response_for_test,
     request_deduplication_request_identity_for_test,
     request_deduplication_set_request_state_for_test,
     request_deduplication_with_instance_id_for_test,
@@ -5515,6 +5516,100 @@ async fn test_replay_strips_set_cookie_case_insensitively() {
             assert_eq!(
                 headers.get("content-type").map(String::as_str),
                 Some("application/json")
+            );
+        }
+        other => panic!("Expected RejectBinary replay, got {:?}", other),
+    }
+}
+
+/// The non-`X-` IETF-draft rate-limit family (`RateLimit` combined field and
+/// split `RateLimit-*` fields, including `RateLimit-Policy`) describes the
+/// original response's quota. It must be stripped on store so a replay does
+/// not report a stale budget to the retrying client.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn test_replay_strips_ietf_ratelimit_headers() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({}));
+
+    let mut ctx1 = new_ctx("POST", "/api");
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "ietf-rl-key".to_string());
+    let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("RateLimit-Remaining".to_string(), "0".to_string());
+    response_headers.insert("RateLimit-Reset".to_string(), "60".to_string());
+    response_headers.insert("RateLimit".to_string(), "\"api\";r=0;t=60".to_string());
+    response_headers.insert("RateLimit-Policy".to_string(), "\"api\";q=100".to_string());
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx1, 200, &response_headers, b"{}")
+        .await;
+
+    let mut ctx2 = new_ctx_from("127.0.0.1", "POST", "/api");
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "ietf-rl-key".to_string());
+    match plugin.before_proxy(&mut ctx2, &mut headers2).await {
+        PluginResult::RejectBinary { headers, .. } => {
+            assert!(
+                !headers
+                    .keys()
+                    .any(|k| k.to_ascii_lowercase().starts_with("ratelimit")),
+                "IETF rate-limit headers must not be replayed: {headers:?}"
+            );
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+        }
+        other => panic!("Expected RejectBinary replay, got {:?}", other),
+    }
+}
+
+/// A completion persisted before the current header policy (so its stored
+/// headers still carry quota counters) must be re-sanitized on replay rather
+/// than trusted as stored.
+#[test]
+fn test_replay_resanitizes_ratelimit_headers_from_persisted_entry() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({}));
+    let mut ctx = new_ctx("POST", "/api");
+
+    let stored = HashMap::from([
+        ("RateLimit-Remaining".to_string(), "0".to_string()),
+        ("ratelimit-reset".to_string(), "60".to_string()),
+        ("rAtElImIt".to_string(), "\"api\";r=0;t=60".to_string()),
+        ("RateLimit-Policy".to_string(), "\"api\";q=100".to_string()),
+        ("X-RateLimit-Remaining".to_string(), "0".to_string()),
+        ("Set-Cookie".to_string(), "session=stored".to_string()),
+        ("content-type".to_string(), "application/json".to_string()),
+        ("x-app-version".to_string(), "7".to_string()),
+    ]);
+    let result = request_deduplication_replay_stored_response_for_test(
+        &plugin,
+        &mut ctx,
+        201,
+        stored,
+        b"{}",
+    );
+    match result {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 201);
+            let mut names: Vec<&str> = headers.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["content-type", "x-app-version", "x-idempotent-replayed"],
+                "replay must strip every stored quota header and keep ordinary headers"
             );
         }
         other => panic!("Expected RejectBinary replay, got {:?}", other),

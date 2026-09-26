@@ -3179,6 +3179,16 @@ pub mod _test_support {
         plugin.redis_payload_for_tests(status_code, headers, body, presentation_digest)
     }
 
+    pub fn request_deduplication_replay_stored_response_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: u16,
+        headers: HashMap<String, String>,
+        body: &[u8],
+    ) -> crate::plugins::PluginResult {
+        plugin.replay_stored_response_for_tests(ctx, status_code, headers, body)
+    }
+
     // ── plugins/kafka_logging ───────────────────────────────────────────────
     /// Pure producer-configuration / CRL admission boundary. External unit
     /// tests use this so TLS-policy coverage does not require constructing a
@@ -4853,6 +4863,16 @@ pub mod _test_support {
         hook: Option<std::sync::Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
         plugin.set_store_post_admit_hook_for_tests(hook);
+    }
+
+    pub fn ai_semantic_cache_admit_sealed_redis_hit_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        redis_key: &str,
+        status_code: u16,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<(u16, HashMap<String, String>)> {
+        plugin.admit_sealed_redis_hit_for_tests(redis_key, status_code, headers, body)
     }
 
     pub fn ai_semantic_cache_instance_id_for_test(
