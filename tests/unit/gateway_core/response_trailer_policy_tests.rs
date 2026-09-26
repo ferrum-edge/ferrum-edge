@@ -914,15 +914,15 @@ fn streaming_h2_body_reconciles_after_the_hop_by_hop_strip() {
 fn every_streaming_h2_body_constructor_carries_the_trailer_governor() {
     let src = include_str!("../../../src/proxy/body.rs");
     for constructor in [
-        "pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(",
+        "pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers<B>(",
         "pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(",
-        "pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(",
+        "pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers<B>(",
     ] {
         let body = src
             .split(constructor)
             .nth(1)
             .unwrap_or_else(|| panic!("missing constructor {constructor}"));
-        let signature = body.split(") -> ProxyBody {").next().expect("signature");
+        let signature = body.split(") -> ProxyBody").next().expect("signature");
         assert!(
             signature.contains(
                 "trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>"
