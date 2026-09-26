@@ -2637,6 +2637,31 @@ pub(crate) struct InboundConnectRelay {
     pub(crate) ingress_listener_authz_port: Option<u16>,
 }
 
+/// Why [`build_inbound_hbone_relay_proxy`] withheld a relay (issue #5763).
+///
+/// A synthesis-time refusal is the same authorization decision the post-plugin
+/// re-check makes, so the caller answers it with the same documented `403`
+/// and `mesh.relay.*` audit metadata rather than a route-miss `404`. Transport
+/// facts only — never request bytes, headers, or credential material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InboundConnectRelayRefusal {
+    /// Stable `mesh.relay.denial_reason` label:
+    /// [`crate::modes::mesh::config::InboundRelayDenial::as_str`], or
+    /// `ingress_endpoint_mapping_mismatch` for a Sidecar `ingress[]` block.
+    pub(crate) reason: &'static str,
+    /// `host:port` the CONNECT named, when the authority carried both.
+    pub(crate) destination: Option<String>,
+}
+
+impl InboundConnectRelayRefusal {
+    fn new(reason: &'static str, host: &str, port: u16) -> Self {
+        Self {
+            reason,
+            destination: Some(format!("{host}:{port}")),
+        }
+    }
+}
+
 /// Build the inbound CONNECT relay proxy for an authenticated mesh peer.
 ///
 /// Two shapes share this boundary, in strict order:
@@ -2650,18 +2675,19 @@ pub(crate) struct InboundConnectRelay {
 ///    validated loopback `defaultEndpoint` — `pod-ip:16379` → `127.0.0.1:6379`
 ///    — and report the DECLARED listener port so `mesh_authz` authorizes on it.
 ///    A declared ingress block that does not resolve to exactly one valid,
-///    owner-stamped, stream-family mapping for that exact local IP returns
-///    `None` (caller 404s) instead of falling through to dial an unlisted or
-///    invalid port the operator replaced.
+///    owner-stamped, stream-family mapping for that exact local IP is refused
+///    (`ingress_endpoint_mapping_mismatch`) instead of falling through to dial
+///    an unlisted or invalid port the operator replaced.
 /// 2. **Ordinary transparent relay** (Ambient / Waypoint terminators, which
 ///    materialize NO inbound routes): dial the CONNECT `:authority` itself, the
 ///    original destination the peer asked for — but only when that authority is
 ///    a destination THIS proxy terminates for. Unreachable for a declared
 ///    ingress listener port so this can never widen it.
 ///
-/// Returns `None` (caller 404s) when the authority is missing/portless or is not
-/// a destination this terminator owns per
-/// [`inbound_hbone_relay_destination_decision`].
+/// Returns an [`InboundConnectRelayRefusal`] — which the caller answers with the
+/// documented `403 hbone_relay_destination_denied` (issue #5763) — when the
+/// authority is missing/portless or is not a destination this terminator owns
+/// per [`inbound_hbone_relay_destination_decision`].
 ///
 /// `is_udp_connect` is true for a datagram-over-CONNECT
 /// (`connect-udp`) request: `ingress[]` stream listeners are TCP, the UDP relay
@@ -2673,13 +2699,17 @@ fn build_inbound_hbone_relay_proxy(
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
     is_udp_connect: bool,
     accepted_local_ip: Option<std::net::IpAddr>,
-) -> Option<InboundConnectRelay> {
-    use crate::modes::mesh::config::SidecarIngressConnectRelay;
-    let authority = authority?;
+) -> Result<InboundConnectRelay, InboundConnectRelayRefusal> {
+    use crate::modes::mesh::config::{InboundRelayDenial, SidecarIngressConnectRelay};
+    let unresolvable = || InboundConnectRelayRefusal {
+        reason: InboundRelayDenial::UnresolvableHost.as_str(),
+        destination: None,
+    };
+    let authority = authority.ok_or_else(unresolvable)?;
     let host = hbone_relay_authority_host_for_mesh(authority.host());
-    let port = authority.port_u16()?;
+    let port = authority.port_u16().ok_or_else(unresolvable)?;
     if host.is_empty() || port == 0 {
-        return None;
+        return Err(unresolvable());
     }
     let ingress_remap = match mesh {
         Some(mesh) if !is_udp_connect => {
@@ -2696,7 +2726,11 @@ fn build_inbound_hbone_relay_proxy(
                  declared: the authority does not resolve to one valid, owner-stamped, \
                  stream-family loopback endpoint for this accepted local address"
             );
-            return None;
+            return Err(InboundConnectRelayRefusal::new(
+                "ingress_endpoint_mapping_mismatch",
+                host,
+                port,
+            ));
         }
         SidecarIngressConnectRelay::Relay {
             listener_port,
@@ -2705,7 +2739,7 @@ fn build_inbound_hbone_relay_proxy(
         } => {
             let endpoint = endpoint_host.as_str();
             let relay = crate::modes::mesh::mesh_ingress_relay_proxy(endpoint, endpoint_port);
-            return Some(InboundConnectRelay {
+            return Ok(InboundConnectRelay {
                 proxy: Arc::new(relay),
                 ingress_listener_authz_port: Some(listener_port),
             });
@@ -2719,16 +2753,18 @@ fn build_inbound_hbone_relay_proxy(
             && let Some((dial_host, dial_port)) =
                 mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
         {
-            return Some(InboundConnectRelay {
+            return Ok(InboundConnectRelay {
                 proxy: Arc::new(crate::modes::mesh::mesh_inbound_hbone_relay_proxy(
                     &dial_host, dial_port,
                 )),
                 ingress_listener_authz_port: Some(port),
             });
         }
-        // Synthesis-time refusal: the caller 404s and no request context exists
-        // yet, so the diagnosis rides a structured log. Authority host/port are
-        // transport facts — never request bytes or credentials.
+        // Synthesis-time refusal: the caller answers the documented 403 and
+        // records the denial on the transaction line (issue #5763). This log
+        // stays debug-level because a peer can drive it at request rate.
+        // Authority host/port are transport facts — never request bytes or
+        // credentials.
         debug!(
             authority_host = host,
             authority_port = port,
@@ -2737,13 +2773,91 @@ fn build_inbound_hbone_relay_proxy(
             "Refusing authenticated inbound CONNECT: the destination is not one this proxy \
              terminates for"
         );
-        return None;
+        return Err(InboundConnectRelayRefusal::new(denial.as_str(), host, port));
     }
     let relay = crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port);
-    Some(InboundConnectRelay {
+    Ok(InboundConnectRelay {
         proxy: Arc::new(relay),
         ingress_listener_authz_port: Some(port),
     })
+}
+
+/// Answer a synthesis-time inbound CONNECT relay refusal (issue #5763).
+///
+/// The documented contract (`docs/mesh.md`, "Fail closed") is a `403` carrying
+/// `mesh_authz.deny_policy=hbone_relay_destination_denied` (or
+/// `hbone_udp_relay_destination_denied` for the datagram flavor) plus the
+/// `mesh.relay.*` audit metadata — the same terminal the post-plugin re-check
+/// in `handle_hbone_request` / `handle_hbone_udp_request` produces. No plugin
+/// chain has run yet, so the transaction line goes to the logging plugins the
+/// synthesized relay would have carried. Nothing is dialed.
+#[allow(clippy::too_many_arguments)]
+async fn reject_inbound_connect_relay_synthesis(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    ctx: &mut RequestContext,
+    refusal: &InboundConnectRelayRefusal,
+    is_udp_connect: bool,
+    accepted_local_ip: Option<std::net::IpAddr>,
+    start_time: Instant,
+    request_uses_grpc_content_type: bool,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    let (deny_policy, body): (&'static str, &'static [u8]) = if is_udp_connect {
+        (
+            "hbone_udp_relay_destination_denied",
+            br#"{"error":"HBONE UDP relay destination not allowed"}"#,
+        )
+    } else {
+        (
+            "hbone_relay_destination_denied",
+            br#"{"error":"HBONE relay destination not allowed"}"#,
+        )
+    };
+    ctx.metadata.insert(
+        "mesh_authz.deny_policy".to_string(),
+        deny_policy.to_string(),
+    );
+    ctx.metadata.insert(
+        hbone_proxy::MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
+        refusal.reason.to_string(),
+    );
+    if let Some(destination) = refusal.destination.as_deref() {
+        ctx.metadata.insert(
+            hbone_proxy::MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
+            destination.to_string(),
+        );
+    }
+    if let Some(terminator_ip) = accepted_local_ip {
+        ctx.metadata.insert(
+            hbone_proxy::MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
+            terminator_ip.to_string(),
+        );
+    }
+    crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+        crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+        false,
+    );
+    crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+        crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
+    );
+    state.request_count.fetch_add(1, Ordering::Relaxed);
+    let response = build_pre_plugin_reject_response(
+        StatusCode::FORBIDDEN,
+        body,
+        &EMPTY_HEADERS,
+        request_uses_grpc_content_type,
+        grpc_web_response_content_type,
+    );
+    let status = response.status().as_u16();
+    let plugins = epoch.plugin_cache.plugins_for_protocol(
+        "",
+        crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID,
+        ProxyProtocol::Http,
+    );
+    log_pre_backend_rejected_request(&plugins, ctx, status, start_time, deny_policy, 0).await;
+    record_status(state, status);
+    response
 }
 
 /// A captured NodeWaypoint inbound connection resolved against the live slice:
@@ -31657,7 +31771,8 @@ async fn handle_proxy_request_inner(
     // open-relay destination guard (`inbound_hbone_relay_destination_decision`)
     // that `build_inbound_hbone_relay_proxy` applies. Forcing a route miss here
     // funnels every UDP CONNECT through that guard (which bounds the authority to
-    // a destination this proxy terminates for) or a fail-closed 404 — the
+    // a destination this proxy terminates for) or a fail-closed refusal (the
+    // documented 403 on an inbound terminator, a route-miss 404 elsewhere) — the
     // same destination check the byte-stream relay's synthesis path enforces
     // (codex r5 P2). The byte-stream HBONE relay deliberately keeps matched-route
     // dispatch (VirtualService `mesh_route_dispatch` overrides ride it), so this
@@ -31750,17 +31865,37 @@ async fn handle_proxy_request_inner(
             let hbone_relay = if is_hbone_connect_any
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
-                build_inbound_hbone_relay_proxy(
+                Some(build_inbound_hbone_relay_proxy(
                     req.uri().authority(),
                     epoch.config.mesh.as_deref(),
                     is_udp_hbone_connect,
                     accepted_local_ip,
-                )
+                ))
             } else {
                 None
             };
             match hbone_relay {
-                Some(relay) => {
+                Some(Err(refusal)) => {
+                    // Synthesis-time refusal (issue #5763): the same
+                    // authorization decision the post-plugin re-check makes, so
+                    // it answers the same documented 403 + `mesh.relay.*` audit
+                    // metadata and writes a transaction line, instead of
+                    // masquerading as a route miss.
+                    let response = reject_inbound_connect_relay_synthesis(
+                        &state,
+                        &epoch,
+                        &mut ctx,
+                        &refusal,
+                        is_udp_hbone_connect,
+                        accepted_local_ip,
+                        start_time,
+                        request_uses_grpc_content_type,
+                        grpc_web_response_content_type,
+                    )
+                    .await;
+                    return Ok(response);
+                }
+                Some(Ok(relay)) => {
                     // Plugins (incl. the mesh global chain / `mesh_authz`) read
                     // `ctx.headers`, so materialize them before the chain runs.
                     ctx.materialize_headers();

@@ -2235,7 +2235,7 @@ Rules that apply across all of them:
   - **Contested addresses are refused for every claimant.** Inventory entries are keyed by the destination *plus the owning record's enrollment evidence* (its SPIFFE id and pod UID), so several Service records backing ONE pod can collapse into a single entry whose ports are their union. That key alone is not sufficient when a record carries no pod UID: two same-identity records can collapse, and a UID-less record can otherwise pass the registry's identity comparison at an enrolled sibling's address. Mesh apply therefore classifies the RAW records per canonical IP before deduplication. One record is admissible with or without a UID; several records are admissible only when every one carries the same non-empty pod UID. Different UIDs, mixed present/missing UIDs, or several UID-less records make the address contested, and an authoritative registry refuses the address for EVERY inventory claimant before considering ports. A lone `WorkloadEntry` / VM record at an enrolled IP remains supported.
   - **Registry health is operator-visible.** The first incomplete/unreadable snapshot warns that the authenticated inbound relay inventory was retracted; repeated failures are debug-only, and the transition back to complete snapshots warns once. These diagnostics are fixed-shape and contain no registry contents, identities, pod UIDs, or enumerated leaf names.
   - A `Sidecar` carries no general relay inventory (see the topology table), so there is nothing for a registry to bound and none is installed for it. Clearing `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` opts an `Ambient` proxy out of the node bound entirely, with a startup warning, leaving it on the identity/locality bound.
-- **Fail closed.** No slice, an unresolvable authority, an empty inventory, or a missing accepted local address all refuse. The refusal is a `403` carrying `mesh_authz.deny_policy=hbone_relay_destination_denied` (or `hbone_udp_relay_destination_denied`) plus structured audit metadata: `mesh.relay.denial_reason` (`no_mesh_slice`, `unresolvable_authority`, `address_not_terminated_here`, `port_not_declared`, or `ingress_endpoint_mapping_mismatch`), `mesh.relay.denied_destination` (the effective `host:port`), and `mesh.relay.terminator_ip` when one was resolved.
+- **Fail closed.** No slice, an unresolvable authority, an empty inventory, or a missing accepted local address all refuse. Every refusal is a `403` (`{"error":"HBONE relay destination not allowed"}`, or `{"error":"HBONE UDP relay destination not allowed"}` for the datagram flavor) carrying `mesh_authz.deny_policy=hbone_relay_destination_denied` (or `hbone_udp_relay_destination_denied`) plus structured audit metadata: `mesh.relay.denial_reason` (`no_mesh_slice`, `unresolvable_authority`, `address_not_terminated_here`, `port_not_declared`, or `ingress_endpoint_mapping_mismatch`), `mesh.relay.denied_destination` (the effective `host:port`; omitted when the authority carried no host and port), and `mesh.relay.terminator_ip` when one was resolved. This holds wherever the guard fires — at relay synthesis, at the post-plugin re-check, and at the post-DNS screen — and each writes a transaction line whose `rejection_phase` is the deny policy, so a synthesis-time refusal is never a route-miss `404`. A synthesis-time refusal is decided before any plugin runs, so its transaction line reaches the logging plugins the synthesized relay would have carried (the global chain) and has no `proxy_id`; the per-refusal diagnostic log stays at `debug` because a peer can drive it at request rate.
 - **Re-checked after plugins.** The guard runs at relay synthesis on the original authority, and again on the *effective* destination after the `before_proxy` chain, so a `mesh_route_dispatch` route override cannot move the dial off the admitted set. Both the authority decision and the post-DNS screen read the current `RequestEpoch` mesh snapshot.
 
 Two narrower boundaries sit beside this guard and are unaffected by it: a declared Sidecar `ingress[]` block replaces the ordinary surface with an exact `listener port → defaultEndpoint` mapping (see [Sidecar Ingress Listeners](#sidecar-ingress-listeners)), and an `EgressGateway` admits external UDP `ServiceEntry` destinations from its own precomputed dial-endpoint allowlist.
@@ -4389,7 +4389,20 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   terminator owns — ownership-scoped inventory, Sidecar-only loopback privilege —
   and ordinary UDP then screens concrete DNS answers immediately before dial,
   the same contract as the byte-stream relay),
-  and frames replies back. The destination's inbound relay is **transport-agnostic**:
+  and frames replies back. **How a destination relay ends (issue #5765):** the
+  CONNECT stream always closes with a clean HTTP/2 `END_STREAM` — hyper's
+  upgraded stream has no reset, and the framing has no error record — so the
+  client cannot tell a socket error from an idle or peer close. The gateway
+  records the difference instead: the transaction line carries
+  `hbone.udp.termination_reason` (`tunnel_closed`, `idle_timeout`, `revoked`,
+  `tunnel_read_error`, `tunnel_write_error`, `tunnel_write_stalled`,
+  `app_send_error`, or `app_recv_error`). Only `tunnel_closed` and
+  `idle_timeout` record `body_completed=true`; every other ending records
+  `body_completed=false` with a `body_error_class` — for example
+  `connection_refused` when nothing listens on the workload port and the relay
+  socket receives the ICMP port-unreachable. A socket-error ending also logs a
+  warning, sampled to at most one per 10 seconds (the per-event detail is at
+  `debug`). The destination's inbound relay is **transport-agnostic**:
   `is_udp_hbone_connect` matches the `udp` marker regardless of which listener the
   CONNECT arrived on (Ambient `:15008` or Sidecar `:15006`), funnelling through the
   same `build_inbound_hbone_relay_proxy` + `handle_hbone_udp_request`, so no

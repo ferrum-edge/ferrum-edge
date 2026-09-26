@@ -39,6 +39,7 @@ use crate::load_balancer::LoadBalancerCache;
 use crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID;
 use crate::modes::mesh::MESH_INGRESS_HBONE_RELAY_PROXY_ID;
 use crate::modes::mesh::config::MeshConfig;
+use crate::plugins::utils::log_sampling::warn_sampled;
 use crate::plugins::{
     Direction, DisconnectCause, HboneReuseContext, Plugin, RequestContext, TransactionSummary,
 };
@@ -80,6 +81,89 @@ pub(super) const MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY: &str = "mesh.relay.
 /// the address this proxy terminates for. Present only when the accept path
 /// resolved one; its ABSENCE is itself the diagnosis for an own-pod topology.
 pub(super) const MESH_RELAY_TERMINATOR_IP_METADATA_KEY: &str = "mesh.relay.terminator_ip";
+
+/// Transaction metadata key naming why a datagram-over-HBONE relay ended
+/// (issue #5765). One of [`HboneUdpRelayEnd::as_str`].
+pub(super) const HBONE_UDP_TERMINATION_METADATA_KEY: &str = "hbone.udp.termination_reason";
+
+/// Why [`relay_hbone_udp`] ended (issue #5765).
+///
+/// hyper's upgraded HTTP/2 stream exposes no reset: closing or dropping it
+/// always ends the CONNECT stream with a clean `END_STREAM`, and the
+/// `[u16 length][payload]` framing has no error record. The wire end of an
+/// errored relay is therefore indistinguishable from an idle or peer close;
+/// this reason is what keeps them apart on the gateway side. It drives the
+/// transaction summary's `body_completed` / `body_error_class` /
+/// `client_disconnected`, the `hbone.udp.termination_reason` metadata, and a
+/// sampled warning for socket-error endings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HboneUdpRelayEnd {
+    /// The tunnel peer ended its request stream.
+    TunnelClosed,
+    /// Neither direction was active for the idle window.
+    IdleTimeout,
+    /// The admission fence revoked the tunnel.
+    Revoked,
+    /// Reading a frame off the tunnel failed.
+    TunnelReadFailed(io::ErrorKind),
+    /// Writing a framed batch onto the tunnel failed.
+    TunnelWriteFailed(io::ErrorKind),
+    /// Writing onto the tunnel stalled past the write deadline.
+    TunnelWriteStalled,
+    /// Sending a datagram to the local app socket failed — for example
+    /// `ECONNREFUSED` after an ICMP port-unreachable because nothing listens.
+    AppSendFailed(io::ErrorKind),
+    /// Receiving from the local app socket failed.
+    AppRecvFailed(io::ErrorKind),
+}
+
+impl HboneUdpRelayEnd {
+    /// Stable, low-cardinality label for logs and transaction metadata.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TunnelClosed => "tunnel_closed",
+            Self::IdleTimeout => "idle_timeout",
+            Self::Revoked => "revoked",
+            Self::TunnelReadFailed(_) => "tunnel_read_error",
+            Self::TunnelWriteFailed(_) => "tunnel_write_error",
+            Self::TunnelWriteStalled => "tunnel_write_stalled",
+            Self::AppSendFailed(_) => "app_send_error",
+            Self::AppRecvFailed(_) => "app_recv_error",
+        }
+    }
+
+    /// The I/O error kind behind a socket-error ending, if any.
+    const fn io_error_kind(self) -> Option<io::ErrorKind> {
+        match self {
+            Self::TunnelReadFailed(kind)
+            | Self::TunnelWriteFailed(kind)
+            | Self::AppSendFailed(kind)
+            | Self::AppRecvFailed(kind) => Some(kind),
+            _ => None,
+        }
+    }
+
+    /// Whether the tunnel side (the HBONE client) caused the ending.
+    const fn client_disconnected(self) -> bool {
+        matches!(self, Self::TunnelReadFailed(_) | Self::TunnelWriteFailed(_))
+    }
+
+    /// The transaction `body_error_class`, or `None` for a clean ending (peer
+    /// close or idle expiry).
+    fn error_class(self) -> Option<retry::ErrorClass> {
+        match self {
+            Self::TunnelClosed | Self::IdleTimeout => None,
+            Self::Revoked => Some(retry::ErrorClass::ConnectionClosed),
+            Self::TunnelReadFailed(_) | Self::TunnelWriteFailed(_) => {
+                Some(retry::ErrorClass::ClientDisconnect)
+            }
+            Self::TunnelWriteStalled => Some(retry::ErrorClass::ReadWriteTimeout),
+            Self::AppSendFailed(kind) | Self::AppRecvFailed(kind) => {
+                Some(classify_io_error(&io::Error::from(kind)))
+            }
+        }
+    }
+}
 
 /// Settle the selected-target breaker after `connect_backend` returns.
 ///
@@ -2006,7 +2090,7 @@ pub(super) async fn handle_hbone_udp_request(
         match on_upgrade.await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);
-                let (bytes_to_app, bytes_to_tunnel) =
+                let (bytes_to_app, bytes_to_tunnel, relay_end) =
                     relay_hbone_udp(io, socket, idle, tunnel.revocation_token()).await;
                 // Deregister before the summary and the logging chain. This
                 // relay has no per-direction failure record to classify from
@@ -2018,6 +2102,14 @@ pub(super) async fn handle_hbone_udp_request(
                 // to idle/EOF can therefore never be reported as revoked.
                 tunnel.retire();
                 let revoked_reason = tunnel.revoked_reason();
+                // The fence's verdict is authoritative for revocation; the
+                // relay's own reason covers every other ending (issue #5765).
+                let relay_end = if revoked_reason.is_some() {
+                    HboneUdpRelayEnd::Revoked
+                } else {
+                    relay_end
+                };
+                let relay_error_class = relay_end.error_class();
                 if let Some(reason) = revoked_reason {
                     info!(
                         proxy_id = %relay_proxy_id,
@@ -2026,22 +2118,34 @@ pub(super) async fn handle_hbone_udp_request(
                         bytes_out = bytes_to_tunnel,
                         "HBONE UDP tunnel closed: admission revoked"
                     );
+                } else if let Some(error_class) = relay_error_class {
+                    // Peer- and workload-driven, so sampled: the detailed event
+                    // stays at debug and at most one warning per 10s is emitted.
+                    warn_sampled!(
+                        proxy_id = %relay_proxy_id,
+                        termination = relay_end.as_str(),
+                        error_kind = ?relay_end.io_error_kind(),
+                        error_class = %error_class,
+                        bytes_in = bytes_to_app,
+                        bytes_out = bytes_to_tunnel,
+                        "HBONE UDP tunnel relay ended on a socket error"
+                    );
                 } else {
                     debug!(
                         proxy_id = %relay_proxy_id,
                         method = %relay_method,
+                        termination = relay_end.as_str(),
                         bytes_in = bytes_to_app,
                         bytes_out = bytes_to_tunnel,
                         "HBONE UDP tunnel relay completed"
                     );
                 }
-                // The datagram relay ends cleanly on idle/EOF/peer-close; there
-                // is no per-direction failure record (unlike the byte-stream
-                // copy), so completion is body_completed=true / not a client
-                // disconnect. `bytes_sent` is client→backend (tunnel→app). A
-                // fence revocation is the one non-clean ending: neither
-                // endpoint disconnected, the body simply did not complete.
-                let summary = build_hbone_relay_summary(
+                // Only a peer close or idle expiry is a completed body. A socket
+                // error or fence revocation is not, and carries its error class
+                // (issue #5765): the wire end is a clean END_STREAM either way,
+                // so this summary is where the two stay distinguishable.
+                // `bytes_sent` is client→backend (tunnel→app).
+                let mut summary = build_hbone_relay_summary(
                     &relay_proxy,
                     relay_ctx,
                     &relay_method,
@@ -2053,9 +2157,13 @@ pub(super) async fn handle_hbone_udp_request(
                     relay_plugin_execution_ns,
                     bytes_to_app,
                     bytes_to_tunnel,
-                    revoked_reason.is_none(),
-                    false,
-                    revoked_reason.map(|_| retry::ErrorClass::ConnectionClosed),
+                    relay_error_class.is_none(),
+                    relay_end.client_disconnected(),
+                    relay_error_class,
+                );
+                summary.metadata.insert(
+                    HBONE_UDP_TERMINATION_METADATA_KEY.to_string(),
+                    relay_end.as_str().to_string(),
                 );
                 // Runs unconditionally so runtime transaction metrics are always
                 // recorded regardless of whether logging plugins are configured.
@@ -2301,7 +2409,10 @@ const HBONE_UDP_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 /// Two-way datagram relay between an upgraded `udp`-CONNECT tunnel (framed) and a
 /// connected local `UdpSocket` (raw datagrams). Tunnel → unframe → `send`; `recv`
 /// → frame → tunnel. Either direction ending (EOF, error) ends the relay; on
-/// exit the tunnel write half is half-closed (h2 end-stream).
+/// exit the tunnel write half is half-closed (h2 end-stream). hyper's upgraded
+/// stream cannot reset, so that end-stream is clean even when a socket error
+/// ended the relay; the returned [`HboneUdpRelayEnd`] is what records WHY
+/// (issue #5765).
 ///
 /// The idle window is refreshed on activity in **EITHER** direction — a shared
 /// `last_activity` timestamp bumped by both the tunnel→app reads and the
@@ -2318,7 +2429,9 @@ const HBONE_UDP_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 /// Returns the bytes relayed `(tunnel→app, app→tunnel)` — the datagram payload
 /// totals (excluding the 2-byte frame prefix), used to build the transaction
 /// summary so a completed UDP HBONE tunnel records the same observability as the
-/// byte-stream relay (codex r5 P2).
+/// byte-stream relay (codex r5 P2) — and the reason the relay ended. The reason
+/// is the one that ended the relay first; an error in the surviving direction
+/// after that is not observed.
 ///
 /// `revocation` is the admission fence's cancellation handle (issue #5042 step
 /// 1): it is a fourth arm of the same `select!` as the two pumps and the idle
@@ -2331,7 +2444,7 @@ async fn relay_hbone_udp<S>(
     socket: tokio::net::UdpSocket,
     idle: Option<Duration>,
     revocation: tokio_util::sync::CancellationToken,
-) -> (u64, u64)
+) -> (u64, u64, HboneUdpRelayEnd)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -2366,15 +2479,20 @@ where
     let to_app_bytes = bytes_tunnel_to_app.clone();
     let to_app = async move {
         let mut buf = BytesMut::with_capacity(max);
-        while let Ok(Some(payload)) =
-            crate::proxy::mesh_udp_frame::read_datagram(&mut tunnel_read, &mut buf).await
-        {
+        loop {
+            let read =
+                crate::proxy::mesh_udp_frame::read_datagram(&mut tunnel_read, &mut buf).await;
+            let payload = match read {
+                Ok(Some(payload)) => payload,
+                Ok(None) => return HboneUdpRelayEnd::TunnelClosed,
+                Err(e) => return HboneUdpRelayEnd::TunnelReadFailed(e.kind()),
+            };
             to_app_activity.store(
                 crate::socket_opts::monotonic_now_ms(),
                 std::sync::atomic::Ordering::Relaxed,
             );
-            if send_socket.send(&payload).await.is_err() {
-                break;
+            if let Err(e) = send_socket.send(&payload).await {
+                return HboneUdpRelayEnd::AppSendFailed(e.kind());
             }
             to_app_bytes.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2401,13 +2519,13 @@ where
         let mut held: Option<usize> = None;
         // A `try_recv` error (not `WouldBlock`) ends the relay after the batch
         // it interrupted has been written, matching the blocking `recv` path.
-        let mut recv_failed = false;
-        loop {
+        let mut recv_failed: Option<io::ErrorKind> = None;
+        let end = loop {
             let first = match held.take() {
                 Some(n) => n,
                 None => match socket.recv(&mut recv_buf).await {
                     Ok(n) => n,
-                    Err(_) => break,
+                    Err(e) => break HboneUdpRelayEnd::AppRecvFailed(e.kind()),
                 },
             };
             from_app_activity.store(
@@ -2428,15 +2546,15 @@ where
                         let _ = batch.push(&recv_buf[..n]);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        recv_failed = true;
+                    Err(e) => {
+                        recv_failed = Some(e.kind());
                         break;
                     }
                 }
             }
             if batch.is_empty() {
-                if recv_failed {
-                    break;
+                if let Some(kind) = recv_failed {
+                    break HboneUdpRelayEnd::AppRecvFailed(kind);
                 }
                 continue;
             }
@@ -2457,14 +2575,22 @@ where
                         failure.committed_payload_bytes as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    break;
+                    break match failure.kind {
+                        crate::proxy::mesh_udp_frame::BatchWriteFailureKind::Io(e) => {
+                            HboneUdpRelayEnd::TunnelWriteFailed(e.kind())
+                        }
+                        crate::proxy::mesh_udp_frame::BatchWriteFailureKind::Stalled => {
+                            HboneUdpRelayEnd::TunnelWriteStalled
+                        }
+                    };
                 }
             }
-            if recv_failed {
-                break;
+            if let Some(kind) = recv_failed {
+                break HboneUdpRelayEnd::AppRecvFailed(kind);
             }
-        }
+        };
         let _ = tunnel_write.shutdown().await;
+        end
     };
 
     // Idle watchdog: ends the relay when neither direction has been active for
@@ -2473,8 +2599,7 @@ where
     // expiry fires within ~one poll of the deadline (mirrors the DTLS watchdog).
     let watchdog = async move {
         let Some(idle) = idle else {
-            std::future::pending::<()>().await;
-            return;
+            return std::future::pending::<HboneUdpRelayEnd>().await;
         };
         let idle_ms = idle.as_millis().min(u64::MAX as u128) as u64;
         let poll_ms = (idle_ms / 4).clamp(100, 1_000);
@@ -2483,21 +2608,22 @@ where
             interval.tick().await;
             let last = last_activity.load(std::sync::atomic::Ordering::Relaxed);
             if crate::socket_opts::monotonic_now_ms().saturating_sub(last) > idle_ms {
-                break;
+                break HboneUdpRelayEnd::IdleTimeout;
             }
         }
     };
 
-    tokio::select! {
-        _ = to_app => {}
-        _ = from_app => {}
-        _ = watchdog => {}
-        () = revocation.cancelled() => {}
-    }
+    let end = tokio::select! {
+        end = to_app => end,
+        end = from_app => end,
+        end = watchdog => end,
+        () = revocation.cancelled() => HboneUdpRelayEnd::Revoked,
+    };
 
     (
         bytes_tunnel_to_app.load(std::sync::atomic::Ordering::Relaxed),
         bytes_app_to_tunnel.load(std::sync::atomic::Ordering::Relaxed),
+        end,
     )
 }
 
@@ -2929,5 +3055,195 @@ mod tests {
             Some("hbone")
         );
         assert_eq!(summary.request_user_agent.as_deref(), Some("hbone-client"));
+    }
+
+    // Issue #5765: the datagram relay reports WHY it ended. hyper's upgraded
+    // H2 stream cannot reset, so these drive the private relay loop over an
+    // in-memory tunnel and check the reason the transaction summary is built
+    // from.
+
+    fn framed_datagram(payload: &[u8]) -> Vec<u8> {
+        let mut out = bytes::BytesMut::new();
+        crate::proxy::mesh_udp_frame::encode_datagram(&mut out, payload)
+            .expect("encode");
+        out.to_vec()
+    }
+
+    async fn relay_socket_connected_to(dest: std::net::SocketAddr) -> tokio::net::UdpSocket {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay socket");
+        socket.connect(dest).await.expect("connect relay socket");
+        socket
+    }
+
+    #[tokio::test]
+    async fn udp_relay_ended_by_refused_app_socket_reports_the_error() {
+        use super::{HboneUdpRelayEnd, relay_hbone_udp};
+        use tokio::io::AsyncWriteExt;
+
+        // Nothing listens on the workload port: the first datagram draws an
+        // ICMP port-unreachable that the connected relay socket surfaces on its
+        // next send or recv.
+        let placeholder = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind placeholder");
+        let dead_addr = placeholder.local_addr().expect("placeholder addr");
+        drop(placeholder);
+
+        let socket = relay_socket_connected_to(dead_addr).await;
+        let (mut client, tunnel) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(relay_hbone_udp(
+            tunnel,
+            socket,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        ));
+
+        // Keep sending until the relay ends so the test does not depend on
+        // when the ICMP error arrives.
+        let datagram = framed_datagram(b"ping");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !relay.is_finished() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the relay never observed the refused workload socket"
+            );
+            if client.write_all(&datagram).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let (_, _, end) = relay.await.expect("relay task");
+
+        assert!(
+            matches!(
+                end,
+                HboneUdpRelayEnd::AppSendFailed(_) | HboneUdpRelayEnd::AppRecvFailed(_)
+            ),
+            "a refused workload socket must end the relay as an app-socket error, got {end:?}"
+        );
+        // Unix reports the ICMP port-unreachable as ECONNREFUSED; Windows
+        // reports it as WSAECONNRESET.
+        assert!(
+            matches!(
+                end.error_class(),
+                Some(ErrorClass::ConnectionRefused | ErrorClass::ConnectionReset)
+            ),
+            "a socket-error ending must carry a specific error class, got {:?}",
+            end.error_class()
+        );
+        assert!(!end.client_disconnected());
+    }
+
+    #[tokio::test]
+    async fn udp_relay_ended_by_tunnel_close_is_clean() {
+        use super::{HboneUdpRelayEnd, relay_hbone_udp};
+        use tokio::io::AsyncWriteExt;
+
+        let workload = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind workload");
+        let workload_addr = workload.local_addr().expect("workload addr");
+        let socket = relay_socket_connected_to(workload_addr).await;
+        let wait = std::time::Duration::from_secs(10);
+        let (mut client, tunnel) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(relay_hbone_udp(
+            tunnel,
+            socket,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        ));
+
+        client
+            .write_all(&framed_datagram(b"ping"))
+            .await
+            .expect("write datagram");
+        let mut buf = [0_u8; 64];
+        let received = tokio::time::timeout(wait, workload.recv(&mut buf))
+            .await
+            .expect("workload receives the datagram")
+            .expect("workload recv");
+        assert_eq!(&buf[..received], b"ping");
+        client.shutdown().await.expect("half-close the tunnel");
+
+        let (bytes_to_app, _, end) = tokio::time::timeout(wait, relay)
+            .await
+            .expect("relay ends")
+            .expect("relay task");
+        assert_eq!(end, HboneUdpRelayEnd::TunnelClosed);
+        assert_eq!(end.error_class(), None);
+        assert_eq!(bytes_to_app, 4);
+    }
+
+    #[tokio::test]
+    async fn udp_relay_ended_by_idle_expiry_is_clean() {
+        use super::{HboneUdpRelayEnd, relay_hbone_udp};
+
+        let workload = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind workload");
+        let workload_addr = workload.local_addr().expect("workload addr");
+        let socket = relay_socket_connected_to(workload_addr).await;
+        let (_client, tunnel) = tokio::io::duplex(64 * 1024);
+
+        let (_, _, end) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            relay_hbone_udp(
+                tunnel,
+                socket,
+                Some(std::time::Duration::from_millis(200)),
+                tokio_util::sync::CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("idle relay ends");
+        assert_eq!(end, HboneUdpRelayEnd::IdleTimeout);
+        assert_eq!(end.error_class(), None);
+    }
+
+    #[test]
+    fn udp_relay_end_reasons_are_distinct_and_classified() {
+        use super::HboneUdpRelayEnd;
+        use std::io::ErrorKind;
+
+        let ends = [
+            HboneUdpRelayEnd::TunnelClosed,
+            HboneUdpRelayEnd::IdleTimeout,
+            HboneUdpRelayEnd::Revoked,
+            HboneUdpRelayEnd::TunnelReadFailed(ErrorKind::ConnectionReset),
+            HboneUdpRelayEnd::TunnelWriteFailed(ErrorKind::BrokenPipe),
+            HboneUdpRelayEnd::TunnelWriteStalled,
+            HboneUdpRelayEnd::AppSendFailed(ErrorKind::ConnectionRefused),
+            HboneUdpRelayEnd::AppRecvFailed(ErrorKind::ConnectionRefused),
+        ];
+        let labels: std::collections::HashSet<&str> =
+            ends.iter().map(|end| end.as_str()).collect();
+        assert_eq!(labels.len(), ends.len(), "labels must be distinct");
+        for end in ends {
+            let clean = matches!(
+                end,
+                HboneUdpRelayEnd::TunnelClosed | HboneUdpRelayEnd::IdleTimeout
+            );
+            assert_eq!(end.error_class().is_none(), clean, "{end:?}");
+        }
+
+        let refused = HboneUdpRelayEnd::AppSendFailed(ErrorKind::ConnectionRefused);
+        assert_eq!(refused.error_class(), Some(ErrorClass::ConnectionRefused));
+        assert_eq!(refused.io_error_kind(), Some(ErrorKind::ConnectionRefused));
+        assert_eq!(
+            HboneUdpRelayEnd::TunnelWriteStalled.error_class(),
+            Some(ErrorClass::ReadWriteTimeout)
+        );
+        assert_eq!(
+            HboneUdpRelayEnd::Revoked.error_class(),
+            Some(ErrorClass::ConnectionClosed)
+        );
+        let tunnel_read = HboneUdpRelayEnd::TunnelReadFailed(ErrorKind::ConnectionReset);
+        assert_eq!(
+            tunnel_read.error_class(),
+            Some(ErrorClass::ClientDisconnect)
+        );
+        assert!(tunnel_read.client_disconnected());
     }
 }

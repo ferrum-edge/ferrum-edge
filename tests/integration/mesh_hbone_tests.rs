@@ -1151,9 +1151,11 @@ async fn egress_udp_unadmitted_destination_is_refused() {
         .await
         .expect("udp CONNECT response")
         .expect("udp CONNECT response");
+    // Issue #5763: a synthesis-time refusal is the documented 403, not a
+    // route-miss 404.
     assert_eq!(
         resp.status(),
-        StatusCode::NOT_FOUND,
+        StatusCode::FORBIDDEN,
         "an unadmitted external UDP destination must never open a relay socket"
     );
 
@@ -1186,11 +1188,64 @@ async fn egress_udp_empty_allowlist_admits_nothing() {
         .await
         .expect("udp CONNECT response")
         .expect("udp CONNECT response");
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     shutdown_tx.send(true).expect("shutdown gateway");
     external_handle.abort();
     conn_task.abort();
+}
+
+/// Issue #5763: an authenticated byte-stream CONNECT naming a destination this
+/// terminator does not own is refused at relay synthesis with the documented
+/// `403` and relay-destination body — never a route-miss `404` — and nothing is
+/// dialed. An empty slice terminates for nothing, so `127.0.0.1` is refused as
+/// `address_not_terminated_here` before any plugin runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_relay_synthesis_refusal_is_documented_403() {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
+    let (backend_addr, mut hit_rx, backend) =
+        start_counting_tcp_backend(IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+    let state = create_egress_udp_gateway_state(MeshConfig::default());
+    let (gateway_addr, shutdown_tx) =
+        start_egress_udp_gateway(state, hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let req = Request::builder()
+        .method(Method::CONNECT)
+        .uri(backend_addr.to_string())
+        .body(())
+        .expect("byte-stream CONNECT");
+    let (response_fut, _request_body) = sender.send_request(req, false).expect("send CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("CONNECT response")
+        .expect("CONNECT response");
+    let status = resp.status();
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        collect_h2_body(resp.into_body()),
+    )
+    .await
+    .unwrap_or_else(|_| Bytes::new());
+    let hits = observe_backend_hits(&mut hit_rx, std::time::Duration::from_millis(500)).await;
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    backend.abort();
+    conn_task.abort();
+
+    let body_text = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a synthesis-time relay refusal must be the documented 403, not a route-miss \
+         404. body={body_text}"
+    );
+    assert!(
+        body_text.contains("HBONE relay destination not allowed"),
+        "the refusal must carry the relay-destination body. body={body_text}"
+    );
+    assert_eq!(hits, Some(0), "a refused CONNECT must dial nothing");
 }
 
 /// The relay is authenticated: a `udp`-marked CONNECT to an ADMITTED external
@@ -4096,12 +4151,14 @@ fn reviews_and_ratings_mesh(bindings: Vec<MeshWaypointBinding>) -> MeshConfig {
 // synthesized inbound HBONE relay (`MeshSlice::from_gateway_config` does not
 // project `GatewayConfig.plugin_configs`; file source accepts only MeshConfig;
 // xDS reverse translation does not carry operator plugins). The functional
-// cases therefore prove synthesis-time 404. These in-process tests invoke the
-// real dispatcher → `handle_hbone_request` / `handle_hbone_udp_request` path
-// with a normal GatewayConfig plugin cache: CONNECT names a dest B terminates
-// for, a global `mesh_route_dispatch` rewrites onto C, and each handler must
-// 403 with zero backend hits. Deleting either re-check fails these tests;
-// a synthesis 404 would mean this setup never reached the handlers.
+// cases therefore prove synthesis-time refusal. These in-process tests invoke
+// the real dispatcher → `handle_hbone_request` / `handle_hbone_udp_request`
+// path with a normal GatewayConfig plugin cache: CONNECT names a dest B
+// terminates for, a global `mesh_route_dispatch` rewrites onto C, and each
+// handler must 403 with zero backend hits. Deleting either re-check fails
+// these tests. Synthesis refusals answer the same documented 403 (issue
+// #5763), so each driver first proves the guard ADMITS B's authority — the 403
+// can then only come from a handler re-check.
 
 fn is_usable_non_loopback_unicast(ip: IpAddr) -> bool {
     match ip {
@@ -4225,8 +4282,8 @@ fn post_plugin_refusal_mesh(b_port: u16, c_ip: IpAddr, c_port: u16) -> MeshConfi
         // Issue #4249 bound the loopback arm to the per-address port the
         // terminator actually owns, so the Sidecar-shaped fixture must project
         // B's own-address ports the way the apply path does. Without this the
-        // control CONNECT to 127.0.0.1 is refused `PortNotDeclared` and the
-        // test sees a 404 instead of C's ownership 403.
+        // control CONNECT to 127.0.0.1 is refused `PortNotDeclared` at
+        // synthesis and never reaches C's post-plugin ownership re-check.
         inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
             relay_guard_workload("svc-b", &["127.0.0.1"], &[b_port]),
         ]),
@@ -4585,8 +4642,21 @@ async fn drive_post_plugin_third_workload_refusal(flavor: PostPluginConnectFlavo
     };
     let c_port = c_addr.port();
     let b_port = if c_port == 18080 { 18081 } else { 18080 };
+    let mesh = post_plugin_refusal_mesh(b_port, c_ip, c_port);
+    // The gateway listens on 127.0.0.1, so that is the accepted local address
+    // synthesis decides with. Admitting B here is what makes the 403 below
+    // attributable to the handler re-check rather than to synthesis.
+    assert_eq!(
+        mesh.inbound_relay_destination_decision(
+            "127.0.0.1",
+            b_port,
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ),
+        Ok(()),
+        "synthesis must admit B's own authority, or this setup never reaches the handlers"
+    );
     let state = create_post_plugin_third_workload_state(
-        post_plugin_refusal_mesh(b_port, c_ip, c_port),
+        mesh,
         global_mesh_route_dispatch_to(&c_ip.to_string(), c_port),
     );
     let (gateway_addr, shutdown_tx) =
@@ -4648,9 +4718,8 @@ async fn drive_post_plugin_third_workload_refusal(flavor: PostPluginConnectFlavo
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "post-plugin re-check must return 404-distinct 403; 404 means synthesis \
-         never reached the handler, 200/502 means the override or guard did not \
-         fire. body={body_text}"
+        "post-plugin re-check must return 403; 200/502 means the override or \
+         guard did not fire. body={body_text}"
     );
     assert!(
         body_text.contains("relay destination not allowed"),

@@ -62,6 +62,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An inbound HBONE CONNECT refused at relay synthesis now returns the
+  documented `403` instead of a route-miss `404` (#5763). This covers a
+  destination the terminator does not own, a missing slice, an unresolvable
+  authority, and a declared Sidecar `ingress[]` block that does not map the
+  port. The response body is `{"error":"HBONE relay destination not allowed"}`
+  (the `UDP` variant for a datagram CONNECT), the same as the later re-checks.
+  The refusal now writes a transaction line whose `rejection_phase` is
+  `hbone_relay_destination_denied` (or `hbone_udp_relay_destination_denied`),
+  with `mesh_authz.deny_policy`, `mesh.relay.denial_reason`,
+  `mesh.relay.denied_destination`, and `mesh.relay.terminator_ip`. Before, the
+  reason was only in a debug log. Nothing is dialed, as before.
+- A datagram-over-HBONE relay that ends on a socket error is now recorded as an
+  error, not as a completed tunnel (#5765). The CONNECT stream still ends with a
+  clean HTTP/2 `END_STREAM`, because hyper's upgraded stream cannot reset. The
+  transaction line now carries `hbone.udp.termination_reason`, and every ending
+  other than a peer close or an idle expiry records `body_completed: false`
+  with a `body_error_class`. For example, a relay whose workload port has no
+  listener records `connection_refused`. Socket-error endings also log a
+  warning, sampled to at most one per 10 seconds.
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,
   PR #5741). A client that withholds QUIC flow control parks the gateway's
