@@ -367,15 +367,25 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
     );
 
     // The declared-oversize 502 hands the writer its non-connection signal.
-    let oversized = cross
-        .split("Backend response body exceeds maximum size")
-        .nth(1)
-        .expect("the declared-oversize response body")
+    let oversized_body = "Backend response body exceeds maximum size";
+    let body_start = cross
+        .find(oversized_body)
+        .expect("the declared-oversize response body");
+    let call_start = cross[..body_start]
+        .rfind("let mut outcome = write_plain_gateway_error_terminal(")
+        .expect("the declared-oversize terminal writer call");
+    let oversized = cross[call_start..]
         .split(".await?;")
         .next()
         .expect("the declared-oversize terminal writer call");
+    let oversized_compact: String = oversized.chars().filter(|ch| !ch.is_whitespace()).collect();
     assert!(
-        oversized.contains("false") && !oversized.contains(token_writer),
+        oversized_compact.contains(
+            "write_plain_gateway_error_terminal(stream,plugins,ctx,StatusCode::BAD_GATEWAY,"
+        ) && oversized_compact.contains("Bytes::from_static(")
+            && oversized_compact.contains("),false,backend_start,bytes_sent,")
+            && !oversized.contains(token_writer)
+            && !oversized_compact.contains("headers"),
         "the declared-oversize 502 must hand the typed signal to the terminal writer"
     );
 }
