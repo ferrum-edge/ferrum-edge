@@ -7,9 +7,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::plugins::mesh::prometheus_helpers::{
-    GrpcLengthPrefixedScanner, count_grpc_length_prefixed_messages,
+    GrpcLengthPrefixedScanner, GrpcMessageFraming, count_grpc_length_prefixed_messages,
 };
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::prometheus_metrics::{MetricsRegistry, PrometheusMetrics};
@@ -325,6 +327,117 @@ fn grpc_length_prefixed_scanner_counts_spanning_frames() {
         count_grpc_length_prefixed_messages(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 2, 3]),
         2
     );
+}
+
+fn grpc_frame(flag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(payload.len() + 5);
+    framed.push(flag);
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(payload);
+    framed
+}
+
+/// Messages a scanner in `framing` counts over `chunks`, fed in order.
+fn scanned_messages(framing: GrpcMessageFraming, chunks: &[&[u8]]) -> u64 {
+    let counter = AtomicU64::new(0);
+    let mut scanner = GrpcLengthPrefixedScanner::new(framing);
+    for chunk in chunks {
+        scanner.push(chunk, &counter);
+    }
+    counter.load(Ordering::Relaxed)
+}
+
+/// `wire` split into two chunks at every byte offset, then fed one byte at a
+/// time, always counts `expected` messages.
+fn assert_counts_at_every_split(framing: GrpcMessageFraming, wire: &[u8], expected: u64) {
+    for cut in 0..=wire.len() {
+        let (head, tail) = wire.split_at(cut);
+        let counted = scanned_messages(framing, &[head, tail]);
+        assert_eq!(counted, expected, "{framing:?} split at {cut}");
+    }
+    let bytes: Vec<&[u8]> = wire.chunks(1).collect();
+    let counted = scanned_messages(framing, &bytes);
+    assert_eq!(counted, expected, "{framing:?} one byte at a time");
+}
+
+/// Three gRPC-Web message frames (one compressed, one empty) and the frames a
+/// gRPC-Web upload may interleave that are not messages: an empty trailer
+/// frame, a trailer frame, and a compressed trailer frame.
+fn grpc_web_frames() -> Vec<Vec<u8>> {
+    vec![
+        grpc_frame(0x00, b"one"),
+        grpc_frame(0x80, b""),
+        grpc_frame(0x01, b"compressed"),
+        grpc_frame(0x00, b""),
+        grpc_frame(0x80, b"x-app-id: 42\r\n"),
+        grpc_frame(0x81, b"deflated"),
+    ]
+}
+
+#[test]
+fn grpc_web_scanner_counts_message_frames_and_skips_trailer_frames() {
+    let wire = grpc_web_frames().concat();
+    let framing = GrpcMessageFraming::grpc_web(false);
+    assert_eq!(framing, GrpcMessageFraming::GrpcWeb);
+    assert_counts_at_every_split(framing, &wire, 3);
+    // Native framing has no trailer frames: every length-prefixed frame is a
+    // message, exactly as before.
+    assert_counts_at_every_split(GrpcMessageFraming::Native, &wire, 6);
+    let counter = AtomicU64::new(0);
+    let mut native = GrpcLengthPrefixedScanner::default();
+    native.push(&wire, &counter);
+    assert_eq!(counter.load(Ordering::Relaxed), 6);
+}
+
+#[test]
+fn grpc_web_text_scanner_decodes_base64_across_chunks() {
+    let frames = grpc_web_frames();
+    let framing = GrpcMessageFraming::grpc_web(true);
+    assert_eq!(framing, GrpcMessageFraming::GrpcWebText);
+
+    // One base64 run over the whole binary body.
+    let whole = BASE64.encode(frames.concat()).into_bytes();
+    assert_counts_at_every_split(framing, &whole, 3);
+
+    // Each frame encoded on its own, as a sender flushing per frame writes
+    // it: independently padded segments, concatenated.
+    let segments: Vec<String> = frames.iter().map(|frame| BASE64.encode(frame)).collect();
+    let padded_segments = segments.iter().filter(|s| s.ends_with('=')).count();
+    assert!(
+        padded_segments >= 2,
+        "the fixture must carry padded segments: {segments:?}"
+    );
+    let padded = segments.concat().into_bytes();
+    assert_counts_at_every_split(framing, &padded, 3);
+}
+
+#[test]
+fn grpc_web_text_scanner_counts_messages_as_they_complete() {
+    let first = BASE64.encode(grpc_frame(0x00, b"one"));
+    let second = BASE64.encode(grpc_frame(0x00, b"two"));
+    let counter = AtomicU64::new(0);
+    let mut scanner = GrpcLengthPrefixedScanner::new(GrpcMessageFraming::GrpcWebText);
+    scanner.push(first.as_bytes(), &counter);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    // A truncated frame is not a message until its last byte arrives.
+    let (head, tail) = second.as_bytes().split_at(second.len() - 4);
+    scanner.push(head, &counter);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    scanner.push(tail, &counter);
+    assert_eq!(counter.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn grpc_web_text_scanner_stops_counting_at_malformed_base64() {
+    let first = BASE64.encode(grpc_frame(0x00, b"one"));
+    let second = BASE64.encode(grpc_frame(0x00, b"two"));
+    let wire = format!("{first}!!!!{second}");
+    let counted = scanned_messages(GrpcMessageFraming::GrpcWebText, &[wire.as_bytes()]);
+    assert_eq!(counted, 1, "nothing after undecodable base64 is counted");
+    // Binary gRPC-Web bytes are not base64: a text scanner counts nothing.
+    let binary = grpc_frame(0x00, b"one");
+    let counted = scanned_messages(GrpcMessageFraming::GrpcWebText, &[&binary]);
+    assert_eq!(counted, 0);
 }
 
 #[tokio::test]

@@ -333,20 +333,118 @@ pub fn count_grpc_length_prefixed_messages(data: &[u8]) -> u64 {
     count
 }
 
+/// Flag bit that marks a gRPC-Web trailer frame (`0x80`, or `0x81` when
+/// compressed): trailing metadata, not a message.
+const GRPC_WEB_TRAILER_FLAG: u8 = 0x80;
+
+/// Wire framing a [`GrpcLengthPrefixedScanner`] reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GrpcMessageFraming {
+    /// Native gRPC: every length-prefixed frame is a message.
+    #[default]
+    Native,
+    /// Binary gRPC-Web: a frame with the trailer flag bit is metadata.
+    GrpcWeb,
+    /// `grpc-web-text`: base64 over gRPC-Web frames. Each 4-character group
+    /// decodes on its own, because a sender may pad at every flush boundary.
+    GrpcWebText,
+}
+
+impl GrpcMessageFraming {
+    /// gRPC-Web framing, base64 text when `text_mode`.
+    pub fn grpc_web(text_mode: bool) -> Self {
+        if text_mode {
+            Self::GrpcWebText
+        } else {
+            Self::GrpcWeb
+        }
+    }
+}
+
 /// Incremental scanner for gRPC length-prefixed messages spanning DATA frames.
 ///
+/// State is fixed-size: a message payload is skipped by its declared length,
+/// never buffered, and text framing holds at most one partial base64 group.
+/// gRPC-Web framing counts only frames without the trailer flag bit. Base64 the
+/// scanner cannot decode stops counting for the rest of the body.
 /// Completed-message increments use `Release`, matching the buffered
 /// `fetch_max` writer, so the `Acquire` readers that emit the metric observe
 /// every count published before the body finished.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct GrpcLengthPrefixedScanner {
+    framing: GrpcMessageFraming,
     header: [u8; 5],
     header_filled: u8,
     remaining: Option<u32>,
+    /// Whether the frame being walked is a message rather than metadata.
+    frame_is_message: bool,
+    text_group: [u8; 4],
+    text_group_len: u8,
+    malformed: bool,
 }
 
 impl GrpcLengthPrefixedScanner {
-    pub fn push(&mut self, mut data: &[u8], messages: &AtomicU64) {
+    /// A scanner for a body in `framing`. [`Self::default`] reads native gRPC.
+    pub fn new(framing: GrpcMessageFraming) -> Self {
+        Self {
+            framing,
+            ..Self::default()
+        }
+    }
+
+    pub fn push(&mut self, data: &[u8], messages: &AtomicU64) {
+        if self.framing == GrpcMessageFraming::GrpcWebText {
+            self.push_base64(data, messages);
+        } else {
+            self.push_frames(data, messages);
+        }
+    }
+
+    /// Decode each complete 4-character base64 group before passing frames to
+    /// `push_frames`. This decoder and `GrpcWebTrailerStatusObserver` must agree:
+    /// decode per 4-character group, and a frame is a message iff `flag & 0x80 == 0`,
+    /// so a change to one decoder must be mirrored in the other.
+    fn push_base64(&mut self, mut data: &[u8], messages: &AtomicU64) {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        if self.malformed {
+            return;
+        }
+        let mut decoded = [0u8; 3];
+        if self.text_group_len != 0 {
+            let filled = usize::from(self.text_group_len);
+            let take = (4 - filled).min(data.len());
+            self.text_group[filled..filled + take].copy_from_slice(&data[..take]);
+            self.text_group_len += take as u8;
+            data = &data[take..];
+            if self.text_group_len < 4 {
+                return;
+            }
+            self.text_group_len = 0;
+            match BASE64.decode_slice(self.text_group, &mut decoded) {
+                Ok(len) => self.push_frames(&decoded[..len], messages),
+                Err(_) => self.malformed = true,
+            }
+        }
+        let (groups, rest) = data.as_chunks::<4>();
+        for group in groups {
+            if self.malformed {
+                return;
+            }
+            match BASE64.decode_slice(group, &mut decoded) {
+                Ok(len) => self.push_frames(&decoded[..len], messages),
+                Err(_) => self.malformed = true,
+            }
+        }
+        self.text_group[..rest.len()].copy_from_slice(rest);
+        self.text_group_len = rest.len() as u8;
+    }
+
+    /// Walk decoded frames using the same rules as `GrpcWebTrailerStatusObserver`:
+    /// base64 is decoded per 4-character group, and a frame is a message iff
+    /// `flag & 0x80 == 0`. A change to one decoder must be mirrored in the other.
+    fn push_frames(&mut self, mut data: &[u8], messages: &AtomicU64) {
         while !data.is_empty() {
             if let Some(left) = self.remaining {
                 let take = (left as usize).min(data.len());
@@ -354,7 +452,7 @@ impl GrpcLengthPrefixedScanner {
                 let next = left.saturating_sub(take as u32);
                 if next == 0 {
                     self.remaining = None;
-                    messages.fetch_add(1, Ordering::Release);
+                    self.finish_frame(messages);
                 } else {
                     self.remaining = Some(next);
                 }
@@ -376,12 +474,46 @@ impl GrpcLengthPrefixedScanner {
                 self.header[4],
             ]);
             self.header_filled = 0;
+            self.frame_is_message = self.framing == GrpcMessageFraming::Native
+                || self.header[0] & GRPC_WEB_TRAILER_FLAG == 0;
             if len == 0 {
-                messages.fetch_add(1, Ordering::Release);
+                self.finish_frame(messages);
             } else {
                 self.remaining = Some(len);
             }
         }
+    }
+
+    fn finish_frame(&self, messages: &AtomicU64) {
+        if self.frame_is_message {
+            messages.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+/// A streamed body's authoritative gRPC message counter, paired with the
+/// scanner that reads the body's framing into it.
+#[derive(Clone, Debug)]
+pub struct GrpcMessageTap {
+    messages: Arc<AtomicU64>,
+    scanner: GrpcLengthPrefixedScanner,
+}
+
+impl GrpcMessageTap {
+    pub fn new(messages: Arc<AtomicU64>, framing: GrpcMessageFraming) -> Self {
+        Self {
+            messages,
+            scanner: GrpcLengthPrefixedScanner::new(framing),
+        }
+    }
+
+    /// Count the complete messages `data` finishes, in wire order.
+    pub fn push(&mut self, data: &[u8]) {
+        self.scanner.push(data, &self.messages);
+    }
+
+    pub fn into_parts(self) -> (Arc<AtomicU64>, GrpcLengthPrefixedScanner) {
+        (self.messages, self.scanner)
     }
 }
 

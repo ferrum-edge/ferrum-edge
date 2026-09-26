@@ -12807,16 +12807,30 @@ pub mod _test_support {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Whether a streamed upload for `ctx` carries the native length-prefix
-    /// message scanner.
-    pub fn request_stream_observes_native_grpc_messages_for_test(
+    /// Feed `chunks`, in order, to the message tap a streamed upload for `ctx`
+    /// carries and return the request message count, or `None` when the
+    /// upload carries no tap.
+    pub fn request_stream_grpc_messages_for_test(
         ctx: &crate::plugins::RequestContext,
-    ) -> bool {
-        crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(ctx)
+        chunks: &[&[u8]],
+    ) -> Option<u64> {
+        let mut tap = crate::plugins::grpc_web::request_stream_grpc_message_tap(ctx)?;
+        for chunk in chunks {
+            tap.push(chunk);
+        }
+        let messages = &ctx.grpc_request_messages_observed;
+        Some(messages.load(std::sync::atomic::Ordering::Acquire))
     }
 
-    /// Whether `ctx` uploads pass-through `grpc-web-text`, which the native
-    /// dispatch's streamed upload never hands the native message scanner.
+    /// Framing the message scanner reads for a streamed upload from `ctx`.
+    pub fn request_upload_grpc_message_framing_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> crate::plugins::mesh::prometheus_helpers::GrpcMessageFraming {
+        crate::plugins::grpc_web::request_upload_grpc_message_framing(ctx)
+    }
+
+    /// Whether `ctx` uploads pass-through `grpc-web-text`, which only a
+    /// text-mode message scanner can read.
     pub fn request_uploads_passthrough_grpc_web_text_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> bool {
