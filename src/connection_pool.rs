@@ -17,15 +17,15 @@ use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
-    BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
-    append_backend_tls_pool_key_fields, append_optional_pool_key_component,
-    append_pool_key_component, backend_svid_generation_for_client_cert,
-    backend_tls_config_cache_key,
+    BackendSvidGeneration, BackendTlsConfigCache, OwnedBackendTlsConfigInputs,
+    SvidGenerationMatcher, TlsError, append_backend_tls_pool_key_fields,
+    append_optional_pool_key_component, append_pool_key_component,
+    backend_svid_generation_for_client_cert, backend_tls_config_cache_key,
+    build_backend_tls_off_worker,
 };
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -87,6 +87,15 @@ impl ReqwestPoolManager {
         )
     }
 
+    fn backend_tls_inputs(&self, proxy: &Proxy) -> OwnedBackendTlsConfigInputs {
+        OwnedBackendTlsConfigInputs::for_pool(
+            proxy,
+            self.tls_policy.as_ref(),
+            &self.global_env_config,
+            &self.crls,
+        )
+    }
+
     async fn create_client(&self, proxy: &Proxy, config: &PoolConfig) -> Result<reqwest::Client> {
         // Install the per-proxy `dns_override` on the shared DnsCacheResolver so
         // every hostname this client dials — including load-balanced targets
@@ -111,35 +120,22 @@ impl ReqwestPoolManager {
             proxy.dns_override.clone(),
         ));
 
-        let crls = self.crls.load_full();
-        let tls_builder = BackendTlsConfigBuilder {
-            proxy,
-            policy: self.tls_policy.as_deref(),
-            global_ca: self
-                .global_env_config
-                .tls_ca_bundle_path
-                .as_deref()
-                .map(Path::new),
-            global_no_verify: self.global_env_config.tls_no_verify,
-            global_client_cert: self
-                .global_env_config
-                .backend_tls_client_cert_path
-                .as_deref()
-                .map(Path::new),
-            global_client_key: self
-                .global_env_config
-                .backend_tls_client_key_path
-                .as_deref()
-                .map(Path::new),
-            crls: crls.as_ref().as_slice(),
-        };
-        let reqwest_builder = if config.enable_http2 {
-            tls_builder.build_reqwest()
-        } else {
-            tls_builder.build_reqwest_with_http2_enabled(false)
-        };
-        let mut client_builder = reqwest_builder
-            .map_err(|e| anyhow::anyhow!("Failed to build reqwest backend TLS config: {}", e))?
+        // Material loading and rustls construction run on the bounded TLS
+        // source executor, never on this Tokio worker. `GenericPool` already
+        // coalesces concurrent misses for this pool key onto one `create`.
+        let tls_inputs = Arc::new(self.backend_tls_inputs(proxy));
+        let enable_http2 = config.enable_http2;
+        let build_inputs = Arc::clone(&tls_inputs);
+        let rustls_config = build_backend_tls_off_worker(move || {
+            build_inputs
+                .builder()
+                .build_rustls_for_reqwest(enable_http2)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to build reqwest backend TLS config: {}", e))?;
+        let mut client_builder = tls_inputs
+            .builder()
+            .reqwest_builder_with_rustls(rustls_config, enable_http2)
             .dns_resolver(dns_resolver)
             .tcp_nodelay(true)
             .pool_max_idle_per_host(config.max_idle_per_host)
@@ -469,43 +465,36 @@ impl ConnectionPool {
     }
 
     /// Get TLS configuration for HTTP/3 backend connections.
-    pub fn get_tls_config_for_backend(
+    ///
+    /// Cache hits return immediately. A miss is built once per TLS identity on
+    /// the bounded TLS source executor (see
+    /// [`BackendTlsConfigCache::get_or_build`]); concurrent misses await it.
+    pub async fn get_tls_config_for_backend(
         &self,
         proxy: &Proxy,
     ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
         let manager = self.pool.manager();
-        manager.backend_h3_tls_configs.get_or_try_build(
-            manager.tls_config_cache_key_owned(proxy),
-            || {
-                let crls = manager.crls.load_full();
-                let mut client_config = BackendTlsConfigBuilder {
-                    proxy,
-                    policy: manager.tls_policy.as_deref(),
-                    global_ca: manager
-                        .global_env_config
-                        .tls_ca_bundle_path
-                        .as_deref()
-                        .map(Path::new),
-                    global_no_verify: manager.global_env_config.tls_no_verify,
-                    global_client_cert: manager
-                        .global_env_config
-                        .backend_tls_client_cert_path
-                        .as_deref()
-                        .map(Path::new),
-                    global_client_key: manager
-                        .global_env_config
-                        .backend_tls_client_key_path
-                        .as_deref()
-                        .map(Path::new),
-                    crls: crls.as_ref().as_slice(),
+        manager
+            .backend_h3_tls_configs
+            .get_or_build(manager.tls_config_cache_key_owned(proxy), || {
+                let inputs = manager.backend_tls_inputs(proxy);
+                move || -> Result<rustls::ClientConfig, TlsError> {
+                    let mut client_config = inputs.builder().build_rustls_quic()?;
+                    client_config.alpn_protocols = vec![b"h3".to_vec()];
+                    Ok(client_config)
                 }
-                .build_rustls_quic()
-                .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))?;
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))
+    }
 
-                client_config.alpn_protocols = vec![b"h3".to_vec()];
-                Ok(client_config)
-            },
-        )
+    /// Owned-future form of [`Self::get_tls_config_for_backend`] for H3
+    /// dispatch closures that cannot borrow the request's `Proxy`.
+    pub async fn backend_h3_tls_config_owned(
+        self: Arc<Self>,
+        proxy: Proxy,
+    ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
+        self.get_tls_config_for_backend(&proxy).await
     }
 
     /// Clear all pooled connections.

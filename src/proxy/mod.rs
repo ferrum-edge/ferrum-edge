@@ -11025,7 +11025,8 @@ impl ProxyState {
                 // only parallelizes *across* targets, not within one.
                 let tls_config_result = self
                     .connection_pool
-                    .get_tls_config_for_backend(&probe_proxy);
+                    .get_tls_config_for_backend(&probe_proxy)
+                    .await;
                 let h2_fut = self.probe_h2_tls(
                     H2TlsProbeTarget {
                         probe_proxy: &probe_proxy,
@@ -56137,7 +56138,7 @@ async fn proxy_to_backend_http3(
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             grpc_messages,
-                            move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                            move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                         )
                         .await
                 } else {
@@ -56161,7 +56162,7 @@ async fn proxy_to_backend_http3(
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             grpc_messages,
-                            move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                            move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                         )
                         .await
                 };
@@ -56567,7 +56568,7 @@ async fn proxy_to_backend_http3(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         } else {
@@ -56581,7 +56582,7 @@ async fn proxy_to_backend_http3(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         };
@@ -56677,7 +56678,7 @@ async fn proxy_to_backend_http3(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         } else {
@@ -56691,7 +56692,7 @@ async fn proxy_to_backend_http3(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         };
@@ -57280,7 +57281,7 @@ async fn proxy_to_backend_http3_retry(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         } else {
@@ -57292,7 +57293,7 @@ async fn proxy_to_backend_http3_retry(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         };
@@ -57423,7 +57424,7 @@ async fn proxy_to_backend_http3_retry(
                 backend_url,
                 &http3_headers,
                 body_bytes,
-                move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
             )
             .await
     } else {
@@ -57435,7 +57436,7 @@ async fn proxy_to_backend_http3_retry(
                 backend_url,
                 &http3_headers,
                 body_bytes,
-                move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
             )
             .await
     };

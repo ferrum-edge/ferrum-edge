@@ -944,7 +944,7 @@ pub fn install_tls_source_execution_policy(
     }
 }
 
-fn effective_tls_source_executor() -> Result<TlsSourceExecutor, MaterialError> {
+pub(crate) fn effective_tls_source_executor() -> Result<TlsSourceExecutor, MaterialError> {
     if let Some(executor) = TLS_SOURCE_EXECUTION_POLICY.get() {
         return Ok(executor.clone());
     }

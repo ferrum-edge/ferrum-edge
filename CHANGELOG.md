@@ -62,6 +62,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A cold backend TLS configuration build no longer runs on the Tokio worker
+  that is serving requests (#5754). The first request to a new backend TLS
+  identity, and the first one after a cache clear or SVID rotation, used to
+  read CA bundles and client certificates and keys (and wait on remote
+  `vault://`/`aws://`/`azure://`/`gcp://` sources) inline on the reqwest,
+  direct HTTP/2, gRPC, and HTTP/3 backend paths, stalling every other request
+  and timer on that worker until the load finished. These builds now run on
+  the shared bounded TLS source executor
+  (`FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY`,
+  `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`). Concurrent misses for one TLS
+  identity on the direct HTTP/2, gRPC, and HTTP/3 pools share a single build
+  instead of each building its own; the reqwest pool already coalesces misses
+  per pool key. Cache hits are unchanged. Failures keep their existing error
+  classes and are not cached, a build that exceeds the executor deadline fails
+  closed, and a build still in flight when backend TLS or CRL reload clears the
+  cache answers its callers without being cached.
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,
   PR #5741). A client that withholds QUIC flow control parks the gateway's
