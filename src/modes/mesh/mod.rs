@@ -14890,7 +14890,8 @@ async fn arm_mesh_runtime_startup(
             source,
             index,
             std::time::Duration::from_secs(2),
-        );
+        )
+        .with_registry_dir(env_config.mesh_node_waypoint_pod_registry_dir.clone());
         manager.reconcile_once();
         let manager_shutdown = shutdown_tx.subscribe();
         owner.push_mesh_background(tokio::spawn(async move {

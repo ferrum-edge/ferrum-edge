@@ -954,8 +954,9 @@ impl std::ops::Deref for PassiveEligibilityRef {
 
 /// Cached projection of the shared active-unhealthy map onto one balancer's
 /// targets, tagged with the [`ActiveUnhealthyTargets`] generation it was
-/// computed from. Recomputed only when that generation moves — i.e. when an
-/// active probe anywhere in the gateway flips a target — never per selection.
+/// computed from. Recomputed only when that map's generation moves — i.e.
+/// when an active probe flips a target in the map this balancer is handed —
+/// never per selection.
 struct ActiveEligibility {
     /// [`ActiveUnhealthyTargets::id`] of the map this was projected from.
     map_id: u64,

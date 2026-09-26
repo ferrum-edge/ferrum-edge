@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/envoy/stock/v3/stock_xds.proto");
     println!("cargo:rerun-if-changed=proto/health.proto");
     println!("cargo:rerun-if-changed=proto/workload_api.proto");
+    println!("cargo:rerun-if-changed=proto/google/protobuf/struct.proto");
 
     protoc_preflight::ensure_protoc()
         .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
