@@ -3567,6 +3567,21 @@ pub(crate) fn size_limited_streaming_body(
         r.map(Frame::data)
             .map_err(|e| Box::new(e) as ProxyBodyError)
     });
+    size_limited_frame_stream_body(stream, max_bytes, content_length, read_timeout_ms)
+}
+
+/// The adapter chain behind [`size_limited_streaming_body`], over any backend
+/// frame stream: size limit, coalescing, a flush of the committed head before
+/// the terminal error, then the idle read timeout.
+pub(crate) fn size_limited_frame_stream_body<S>(
+    stream: S,
+    max_bytes: usize,
+    content_length: Option<u64>,
+    read_timeout_ms: u64,
+) -> ProxyBody
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, BoxError>> + Send + Unpin + 'static,
+{
     let limited = SizeLimitedStreamingResponse {
         inner: stream,
         max_bytes,
@@ -3577,7 +3592,73 @@ pub(crate) fn size_limited_streaming_body(
         COALESCE_TARGET,
         content_length,
     );
-    wrap_idle_read_timeout(coalescing, read_timeout_ms)
+    wrap_idle_read_timeout(FlushBeforeTerminalError::new(coalescing), read_timeout_ms)
+}
+
+/// Yields once before handing a committed streaming response's terminal error
+/// to the frontend.
+///
+/// A size-limited streaming response is committed before its first body poll:
+/// the status and headers are already with the frontend. Hyper's HTTP/1.1
+/// server queues that head together with every body frame it takes in the same
+/// write pass and flushes only when the body returns `Pending`; a body error in
+/// that pass aborts the connection with the queue unflushed. When the backend
+/// delivers its whole over-limit body at once (one read, one segment), the
+/// limit trips inside that first pass, so the client saw the connection close
+/// before any status line instead of the committed status followed by a
+/// truncated body. HTTP/2 likewise resets the stream before its HEADERS frame
+/// can leave.
+///
+/// Returning `Pending` once, with an immediate self-wake, lets the frontend
+/// flush the head and every byte accepted within the limit before the error
+/// ends the response. Data frames pass straight through; only the terminal
+/// error path pays the extra scheduler turn.
+struct FlushBeforeTerminalError<B> {
+    inner: B,
+    stashed_error: Option<BoxError>,
+}
+
+impl<B> FlushBeforeTerminalError<B> {
+    fn new(inner: B) -> Self {
+        Self {
+            inner,
+            stashed_error: None,
+        }
+    }
+}
+
+impl<B> http_body::Body for FlushBeforeTerminalError<B>
+where
+    B: http_body::Body<Data = Bytes, Error = BoxError> + Unpin,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if let Some(error) = this.stashed_error.take() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Err(error))) => {
+                this.stashed_error = Some(error);
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.stashed_error.is_none() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 impl<S> futures_util::Stream for SizeLimitedStreamingResponse<S>
@@ -5680,6 +5761,7 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
     let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
     let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
     let coalescing = Coalescing::new(limited, coalesce_target, content_length);
+    let coalescing = FlushBeforeTerminalError::new(coalescing);
     if let Some(deadline) = total_deadline {
         let timed = TotalDeadlineBody::new(coalescing, Some(deadline));
         let fired = timed.deadline_fired_handle();
@@ -5989,6 +6071,7 @@ pub(crate) fn size_limited_streaming_h3_body(
         advertised_content_length,
         Some(h3_effective_flush_interval(flush_interval, read_timeout_ms)),
     );
+    let body = FlushBeforeTerminalError::new(body);
     match progress {
         Some(p) => ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::with_progress(
             body,
