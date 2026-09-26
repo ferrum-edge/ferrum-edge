@@ -62,6 +62,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pass-through gRPC-Web (a route without the `grpc_web` plugin whose backend
+  already answers in gRPC-Web) no longer gains a second trailer frame on
+  HTTP/1.1 and HTTP/2 (#5758). The native gRPC dispatch ran the translation
+  adapter on the untranslated body, so after the backend's own trailer frame
+  it appended a synthesized `grpc-status: 2` frame (and would have base64
+  encoded a text body a second time). The backend's body now reaches the
+  client byte for byte, binary and text, with no synthesized trailer frame;
+  the gateway still frames its own deadline and authorization-expiry
+  terminals as gRPC-Web. The transaction log's `grpc_status` for these calls
+  is now read from the backend's final trailer frame on HTTP/1.1, HTTP/2 and
+  HTTP/3, streamed or buffered, instead of defaulting to `UNKNOWN` (2), and a
+  non-OK status there feeds backend outcome accounting the way native gRPC
+  trailers do. Translated gRPC-Web keeps reading its status from the
+  backend's HTTP/2 trailers.
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,
   PR #5741). A client that withholds QUIC flow control parks the gateway's

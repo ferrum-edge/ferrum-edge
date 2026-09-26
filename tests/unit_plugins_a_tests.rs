@@ -64,6 +64,7 @@ mod unit {
         mod graphql_tests;
         mod grpc_deadline_tests;
         mod grpc_method_router_tests;
+        mod grpc_web_passthrough_tests;
         mod grpc_web_tests;
         mod hmac_auth_tests;
         mod http_batch_response_drain_tests;

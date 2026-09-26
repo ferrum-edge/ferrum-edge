@@ -1480,3 +1480,234 @@ async fn h3_grpc_web_validates_complete_binary_and_text_request_envelopes() {
     assert_eq!(received[0].body, compressed);
     assert_eq!(received[1].body, compressed);
 }
+
+/// The complete body a pass-through gRPC-Web backend writes itself: one
+/// message and its own trailer frame (issue #5758).
+fn passthrough_grpc_web_body(text: bool, trailer: &[u8]) -> Vec<u8> {
+    let message = grpc_frame(b"pong");
+    let mut trailer_frame = vec![0x80];
+    trailer_frame.extend_from_slice(&(trailer.len() as u32).to_be_bytes());
+    trailer_frame.extend_from_slice(trailer);
+    if text {
+        let mut body = BASE64.encode(message).into_bytes();
+        body.extend_from_slice(BASE64.encode(trailer_frame).as_bytes());
+        body
+    } else {
+        let mut body = message;
+        body.extend_from_slice(&trailer_frame);
+        body
+    }
+}
+
+fn spawn_passthrough_grpc_web_backend(
+    listener: TcpListener,
+    ca_name: &str,
+    content_type: &str,
+    body: &[u8],
+) -> ScriptedTlsBackend {
+    let backend_ca = TestCa::new(ca_name).expect("backend CA");
+    let (backend_cert, backend_key) = backend_ca.valid().expect("backend leaf");
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    ScriptedTlsBackend::builder(
+        listener,
+        TlsConfig::new(backend_cert, backend_key).with_alpn(vec![b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(response))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn pass-through gRPC-Web backend")
+}
+
+fn logged_grpc_statuses(logs: &str, proxy_id: &str) -> Vec<Value> {
+    logs.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["proxy_id"] == proxy_id)
+        .map(|entry| entry["grpc_status"].clone())
+        .collect()
+}
+
+/// Issue #5758 on the HTTP/3 frontend: a route without the translator relays a
+/// gRPC-Web backend's body byte for byte (binary and text), and every route —
+/// pass-through and translated — logs the status of the trailer frame the
+/// client actually received rather than a synthesized UNKNOWN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_grpc_web_passthrough_is_byte_identical_and_logs_the_backend_status() {
+    let binary_listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind binary pass-through backend");
+    let binary_port = binary_listener.local_addr().expect("backend addr").port();
+    let binary_body = passthrough_grpc_web_body(false, b"grpc-status: 7\r\ngrpc-message: no\r\n");
+    let _binary_backend = spawn_passthrough_grpc_web_backend(
+        binary_listener,
+        "h3-grpc-web-passthrough-binary",
+        "application/grpc-web+proto",
+        &binary_body,
+    );
+
+    let text_listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind text pass-through backend");
+    let text_port = text_listener.local_addr().expect("backend addr").port();
+    let text_body = passthrough_grpc_web_body(true, b"grpc-status: 12\r\n");
+    let _text_backend = spawn_passthrough_grpc_web_backend(
+        text_listener,
+        "h3-grpc-web-passthrough-text",
+        "application/grpc-web-text+proto",
+        &text_body,
+    );
+
+    let grpc_listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind translated gRPC backend");
+    let grpc_port = grpc_listener.local_addr().expect("backend addr").port();
+    let grpc_ca = TestCa::new("h3-grpc-web-translated-status").expect("backend CA");
+    let (grpc_cert, grpc_key) = grpc_ca.valid().expect("backend leaf");
+    let _grpc_backend = ScriptedGrpcBackend::builder_tls(grpc_listener, &grpc_cert, &grpc_key)
+        .expect("backend TLS")
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
+        .step(GrpcStep::RespondStatus {
+            code: 5,
+            message: "missing",
+        })
+        .spawn()
+        .expect("spawn translated gRPC backend");
+
+    let route = |id: &str, port: u16, plugins: Value| {
+        json!({
+            "id": id,
+            "listen_path": format!("/{id}"),
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "plugins": plugins,
+        })
+    };
+    let config = json!({
+        "version": "1",
+        "proxies": [
+            route("h3-passthrough-binary", binary_port, json!([])),
+            route("h3-passthrough-text", text_port, json!([])),
+            route(
+                "h3-translated",
+                grpc_port,
+                json!([{"plugin_config_id": "h3-translated-grpc-web"}]),
+            ),
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "h3-translated-grpc-web",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "h3-translated",
+                "enabled": true,
+                "config": {},
+            },
+            {
+                "id": "h3-passthrough-access-log",
+                "plugin_name": "stdout_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": {},
+            },
+        ],
+    });
+    let (gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
+    let client = Http3Client::insecure().expect("H3 client");
+    let request = |content_type: &'static str, body: Vec<u8>| {
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", content_type)
+            .header("x-grpc-web", "1")
+            .body(Bytes::from(body))
+    };
+
+    let binary = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/h3-passthrough-binary/echo.Echo/Unary"),
+        request("application/grpc-web+proto", grpc_frame(b"ping")),
+    )
+    .await;
+    assert_eq!(binary.status, StatusCode::OK);
+    assert!(binary.body_error.is_none(), "{:?}", binary.body_error);
+    assert!(binary.trailers.is_none());
+    assert_eq!(
+        binary.body_bytes.as_ref(),
+        binary_body.as_slice(),
+        "pass-through gRPC-Web must be byte-identical"
+    );
+    let trailer_frames = grpc_web_frames(&binary.body_bytes)
+        .into_iter()
+        .filter(|(flag, _)| *flag == 0x80)
+        .count();
+    assert_eq!(trailer_frames, 1, "only the backend's own trailer frame");
+
+    let text = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/h3-passthrough-text/echo.Echo/Unary"),
+        request(
+            "application/grpc-web-text+proto",
+            BASE64.encode(grpc_frame(b"ping")).into_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(text.status, StatusCode::OK);
+    assert_eq!(
+        text.body_bytes.as_ref(),
+        text_body.as_slice(),
+        "pass-through gRPC-Web text must not be re-encoded"
+    );
+
+    let translated = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/h3-translated/echo.Echo/Unary"),
+        request("application/grpc-web+proto", grpc_frame(b"ping")),
+    )
+    .await;
+    assert_grpc_web_error(&translated, "5", "application/grpc-web+proto");
+    let translated_trailers = grpc_web_frames(&translated.body_bytes)
+        .into_iter()
+        .filter(|(flag, _)| *flag == 0x80)
+        .count();
+    assert_eq!(translated_trailers, 1, "translation emits one trailer frame");
+
+    let expected = [
+        ("h3-passthrough-binary", 7),
+        ("h3-passthrough-text", 12),
+        ("h3-translated", 5),
+    ];
+    let logs = gateway
+        .wait_for_log_contains(
+            |logs| {
+                expected
+                    .iter()
+                    .all(|(proxy_id, _)| !logged_grpc_statuses(logs, proxy_id).is_empty())
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+    for (proxy_id, status) in expected {
+        assert_eq!(
+            logged_grpc_statuses(&logs, proxy_id),
+            vec![json!(status)],
+            "{proxy_id}: the logged grpc_status must come from the delivered trailer frame; \
+             logs:\n{logs}"
+        );
+    }
+}

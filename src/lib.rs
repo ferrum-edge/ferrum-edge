@@ -12259,6 +12259,41 @@ pub mod _test_support {
         body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, true)
     }
 
+    /// Wrap a body in the pass-through gRPC-Web relay, exactly as the H1/H2
+    /// response funnels do for a route without the `grpc_web` translator.
+    pub fn proxy_body_into_grpc_web_passthrough_streaming_for_test(
+        body: crate::proxy::ProxyBody,
+        text_mode: bool,
+        http_status: u16,
+    ) -> crate::proxy::ProxyBody {
+        body.into_grpc_web_passthrough_streaming(text_mode, http_status)
+    }
+
+    /// Feed `chunks`, in order, to the pass-through gRPC-Web trailer observer
+    /// and return the terminal status it read.
+    pub fn grpc_web_trailer_status_for_test(chunks: &[&[u8]], text_mode: bool) -> Option<u32> {
+        let mut observer = crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::new(text_mode);
+        for chunk in chunks {
+            observer.push(chunk);
+        }
+        observer.status()
+    }
+
+    pub fn grpc_web_passthrough_response_text_mode_for_test(
+        ctx: &crate::plugins::RequestContext,
+        response_content_type: Option<&str>,
+    ) -> Option<bool> {
+        crate::plugins::grpc_web::passthrough_response_text_mode(ctx, response_content_type)
+    }
+
+    pub fn grpc_web_passthrough_body_trailer_status_for_test(
+        ctx: &crate::plugins::RequestContext,
+        response_content_type: Option<&str>,
+        body: &[u8],
+    ) -> Option<u32> {
+        crate::plugins::grpc_web::passthrough_body_trailer_status(ctx, response_content_type, body)
+    }
+
     pub fn take_streaming_initial_terminal_metadata_for_test(
         response_headers: &mut HashMap<String, String>,
         body_ended: bool,

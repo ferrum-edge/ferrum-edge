@@ -5875,6 +5875,13 @@ where
             return Ok(outcome);
         }
         let bytes_streamed = response_body.len() as u64;
+        // Read before the body moves into the write: a pass-through gRPC-Web
+        // response carries its status in the backend's own trailer frame.
+        let passthrough_grpc_status = crate::plugins::grpc_web::passthrough_body_trailer_status(
+            ctx,
+            response_headers.get("content-type").map(String::as_str),
+            &response_body,
+        );
         let buffered_write = async {
             if !response_body.is_empty() {
                 stream.send_data(response_body).await?;
@@ -5947,6 +5954,13 @@ where
             }
         };
 
+        if body_completed
+            && !ctx.metadata.contains_key("grpc_status")
+            && let Some(grpc_status) = passthrough_grpc_status
+        {
+            ctx.metadata
+                .insert("grpc_status".to_string(), grpc_status.to_string());
+        }
         return Ok(CrossProtocolOutcome {
             response_status,
             response_streamed: false,
@@ -6211,6 +6225,13 @@ where
     // the frame must be answered with a reset, never an appended terminal
     // (#5745).
     let mut response_write_in_flight = false;
+    // Pass-through gRPC-Web: the backend's body, trailer frame included, is
+    // relayed unchanged. The relay reads that frame so the transaction log
+    // records the status the client received instead of a synthesized UNKNOWN.
+    let mut grpc_web_passthrough = crate::plugins::grpc_web::passthrough_trailer_status_observer(
+        ctx,
+        response_headers.get("content-type").map(String::as_str),
+    );
     let stream_response = async {
         if let Some(inspector) = response_inspector {
             stream_inspected_reqwest_response(
@@ -6224,6 +6245,7 @@ where
                 route_body_deadline,
                 &mut route_deadline_cut,
                 &mut response_write_in_flight,
+                grpc_web_passthrough.as_deref_mut(),
             )
             .await
         } else {
@@ -6238,6 +6260,7 @@ where
                 route_body_deadline,
                 &mut route_deadline_cut,
                 &mut response_write_in_flight,
+                grpc_web_passthrough.as_deref_mut(),
             )
             .await
         }
@@ -6285,6 +6308,13 @@ where
     // fixed-cardinality counter was already recorded there.
     if let Some(termination) = auth_termination {
         ctx.latch_authorization_termination(termination);
+    }
+    let grpc_web_passthrough_status = grpc_web_passthrough
+        .as_deref()
+        .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::status);
+    if body_completed && let Some(grpc_status) = grpc_web_passthrough_status {
+        ctx.metadata
+            .insert("grpc_status".to_string(), grpc_status.to_string());
     }
 
     // A route deadline cut is the route's own total-duration policy, not
@@ -9850,6 +9880,9 @@ async fn stream_reqwest_response<S>(
     // Held set while a response write is in flight, for a caller that cancels
     // this relay from outside (#5745).
     write_in_flight: &mut bool,
+    // Reads a pass-through gRPC-Web backend's own trailer frame; never alters
+    // the relayed bytes.
+    mut grpc_web_passthrough: Option<&mut crate::plugins::grpc_web::GrpcWebTrailerStatusObserver>,
 ) -> (
     u64,
     bool,
@@ -9972,6 +10005,9 @@ where
                                 body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
                                 break 'outer;
                             }
+                        }
+                        if let Some(observer) = grpc_web_passthrough.as_deref_mut() {
+                            observer.push(&chunk);
                         }
                         let chunk_len = chunk.len();
                         if crate::http3::config::should_direct_send_response_chunk(
@@ -10155,6 +10191,9 @@ async fn stream_inspected_reqwest_response<S>(
     // Held set while a response write is in flight, for a caller that cancels
     // this relay from outside (#5745).
     write_in_flight: &mut bool,
+    // Reads a pass-through gRPC-Web trailer frame in the bytes this relay
+    // emits; never alters them.
+    mut grpc_web_passthrough: Option<&mut crate::plugins::grpc_web::GrpcWebTrailerStatusObserver>,
 ) -> (
     u64,
     bool,
@@ -10331,6 +10370,9 @@ where
                                 break;
                             }
                             let out_len = out.len() as u64;
+                            if let Some(observer) = grpc_web_passthrough.as_deref_mut() {
+                                observer.push(&out);
+                            }
                             if !authorized_send!(stream.send_data(out)) {
                                 break;
                             }
@@ -10355,6 +10397,9 @@ where
                                 break;
                             }
                             let fb_len = fb.len() as u64;
+                            if let Some(observer) = grpc_web_passthrough.as_deref_mut() {
+                                observer.push(&fb);
+                            }
                             if !authorized_send!(stream.send_data(fb)) {
                                 break;
                             }
@@ -10385,6 +10430,9 @@ where
                                 break;
                             }
                             let out_len = out.len() as u64;
+                            if let Some(observer) = grpc_web_passthrough.as_deref_mut() {
+                                observer.push(&out);
+                            }
                             if !authorized_send!(stream.send_data(out)) {
                                 break;
                             }
@@ -10409,6 +10457,9 @@ where
                                 break;
                             }
                             let fb_len = fb.len() as u64;
+                            if let Some(observer) = grpc_web_passthrough.as_deref_mut() {
+                                observer.push(&fb);
+                            }
                             if !authorized_send!(stream.send_data(fb)) {
                                 break;
                             }

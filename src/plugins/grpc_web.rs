@@ -3082,6 +3082,265 @@ impl GrpcWebFrameScanner {
     }
 }
 
+/// Longest trailer line [`GrpcWebTrailerStatusObserver`] buffers while looking
+/// for `grpc-status`. A well-formed `grpc-status: <code>` line is far shorter;
+/// a longer line is skipped without being retained.
+const TRAILER_STATUS_LINE_CAP: usize = 64;
+
+/// Which part of a gRPC-Web frame the observer is reading.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObservedGrpcWebFrame {
+    /// Assembling the 5-byte frame header.
+    Header,
+    /// Skipping a message payload.
+    Message,
+    /// Reading an uncompressed trailer payload line by line.
+    Trailer,
+    /// Skipping a trailer payload the observer cannot read (compressed).
+    OpaqueTrailer,
+}
+
+/// Incremental reader of the terminal `grpc-status` in a PASS-THROUGH gRPC-Web
+/// response body.
+///
+/// A route without the `grpc_web` translator relays a gRPC-Web backend's body
+/// unchanged, so the backend's own trailer frame (flag `0x80`) is the only
+/// terminal status the client receives. Transaction logging and backend
+/// outcome classification read that frame through this observer instead of
+/// synthesizing a status. The observer never alters or retains the body: a
+/// message payload is skipped by length, text mode decodes one 4-character
+/// base64 group at a time, and at most one bounded trailer line is buffered.
+///
+/// A trailer frame counts only while it is the final frame: any later frame, a
+/// truncated frame, or malformed base64 leaves no observed status.
+pub(crate) struct GrpcWebTrailerStatusObserver {
+    text_mode: bool,
+    text_group: [u8; 4],
+    text_group_len: u8,
+    header: [u8; GRPC_FRAME_HEADER_BYTES],
+    header_len: u8,
+    frame: ObservedGrpcWebFrame,
+    payload_remaining: u32,
+    line: [u8; TRAILER_STATUS_LINE_CAP],
+    line_len: u8,
+    line_overflowed: bool,
+    frame_status: Option<u32>,
+    terminal_status: Option<u32>,
+    malformed: bool,
+}
+
+impl GrpcWebTrailerStatusObserver {
+    pub(crate) fn new(text_mode: bool) -> Self {
+        Self {
+            text_mode,
+            text_group: [0u8; 4],
+            text_group_len: 0,
+            header: [0u8; GRPC_FRAME_HEADER_BYTES],
+            header_len: 0,
+            frame: ObservedGrpcWebFrame::Header,
+            payload_remaining: 0,
+            line: [0u8; TRAILER_STATUS_LINE_CAP],
+            line_len: 0,
+            line_overflowed: false,
+            frame_status: None,
+            terminal_status: None,
+            malformed: false,
+        }
+    }
+
+    /// Observe the next client-visible body bytes, in wire order.
+    pub(crate) fn push(&mut self, data: &[u8]) {
+        if self.malformed {
+            return;
+        }
+        if !self.text_mode {
+            self.push_binary(data);
+            return;
+        }
+        for &byte in data {
+            self.text_group[usize::from(self.text_group_len)] = byte;
+            self.text_group_len += 1;
+            if self.text_group_len < 4 {
+                continue;
+            }
+            self.text_group_len = 0;
+            let mut decoded = [0u8; 3];
+            // gRPC-Web text may pad at every flush boundary, so each 4-character
+            // group decodes independently.
+            match BASE64.decode_slice(self.text_group, &mut decoded) {
+                Ok(len) => self.push_binary(&decoded[..len]),
+                Err(_) => self.malformed = true,
+            }
+            if self.malformed {
+                return;
+            }
+        }
+    }
+
+    /// `grpc-status` of the body's final trailer frame, when the bytes observed
+    /// so far end exactly on that frame and it names a status.
+    pub(crate) fn status(&self) -> Option<u32> {
+        if self.malformed
+            || self.text_group_len != 0
+            || self.header_len != 0
+            || self.frame != ObservedGrpcWebFrame::Header
+        {
+            return None;
+        }
+        self.terminal_status
+    }
+
+    fn push_binary(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            if self.frame == ObservedGrpcWebFrame::Header {
+                let filled = usize::from(self.header_len);
+                let take = (GRPC_FRAME_HEADER_BYTES - filled).min(data.len());
+                self.header[filled..filled + take].copy_from_slice(&data[..take]);
+                self.header_len += take as u8;
+                data = &data[take..];
+                if usize::from(self.header_len) == GRPC_FRAME_HEADER_BYTES {
+                    self.header_len = 0;
+                    self.begin_frame();
+                }
+                continue;
+            }
+            let take = (self.payload_remaining as usize).min(data.len());
+            if self.frame == ObservedGrpcWebFrame::Trailer {
+                self.read_trailer_bytes(&data[..take]);
+            }
+            data = &data[take..];
+            self.payload_remaining -= take as u32;
+            if self.payload_remaining == 0 {
+                self.end_frame();
+            }
+        }
+    }
+
+    fn begin_frame(&mut self) {
+        let flag = self.header[0];
+        self.payload_remaining = u32::from_be_bytes([
+            self.header[1],
+            self.header[2],
+            self.header[3],
+            self.header[4],
+        ]);
+        // The trailer frame ends a gRPC-Web response; a status followed by any
+        // further frame was not terminal.
+        self.terminal_status = None;
+        self.frame_status = None;
+        self.line_len = 0;
+        self.line_overflowed = false;
+        self.frame = if flag & GRPC_FRAME_TRAILER == 0 {
+            ObservedGrpcWebFrame::Message
+        } else if flag == GRPC_FRAME_TRAILER {
+            ObservedGrpcWebFrame::Trailer
+        } else {
+            ObservedGrpcWebFrame::OpaqueTrailer
+        };
+        if self.payload_remaining == 0 {
+            self.end_frame();
+        }
+    }
+
+    fn end_frame(&mut self) {
+        if self.frame == ObservedGrpcWebFrame::Trailer {
+            // The final trailer line may omit its CRLF.
+            self.finish_trailer_line();
+            self.terminal_status = self.frame_status;
+        }
+        self.frame = ObservedGrpcWebFrame::Header;
+    }
+
+    fn read_trailer_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.finish_trailer_line();
+            } else if usize::from(self.line_len) == TRAILER_STATUS_LINE_CAP {
+                self.line_overflowed = true;
+            } else if !self.line_overflowed {
+                self.line[usize::from(self.line_len)] = byte;
+                self.line_len += 1;
+            }
+        }
+    }
+
+    fn finish_trailer_line(&mut self) {
+        let len = usize::from(self.line_len);
+        let overflowed = self.line_overflowed;
+        self.line_len = 0;
+        self.line_overflowed = false;
+        // The first `grpc-status` line wins, matching the translated path.
+        if overflowed || self.frame_status.is_some() {
+            return;
+        }
+        let line = &self.line[..len];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&byte| byte == b':') else {
+            return;
+        };
+        if !line[..colon]
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"grpc-status")
+        {
+            return;
+        }
+        self.frame_status = Some(match std::str::from_utf8(&line[colon + 1..]) {
+            Ok(value) => crate::proxy::grpc_proxy::parse_grpc_status_value(value),
+            Err(_) => u32::MAX,
+        });
+    }
+}
+
+/// Whether this exchange's response is PASS-THROUGH gRPC-Web in text (base64)
+/// framing, or `None` when it is not pass-through gRPC-Web at all.
+///
+/// Pass-through means the client spoke gRPC-Web and no `grpc_web` translator
+/// rewrote the request, so the backend answers in gRPC-Web itself. The
+/// response's own gRPC-Web media type decides the framing; the client's
+/// negotiated type is the fallback when the response names none.
+pub(crate) fn passthrough_response_text_mode(
+    ctx: &RequestContext,
+    response_content_type: Option<&str>,
+) -> Option<bool> {
+    let client_content_type = retained_response_content_type(ctx)?;
+    if request_is_grpc_web_translated(ctx) {
+        return None;
+    }
+    Some(
+        match response_content_type.filter(|ct| is_grpc_web_content_type(ct)) {
+            Some(content_type) => is_grpc_web_text(content_type),
+            None => is_grpc_web_text(client_content_type),
+        },
+    )
+}
+
+/// Start a [`GrpcWebTrailerStatusObserver`] for this exchange's response when
+/// it is PASS-THROUGH gRPC-Web (see [`passthrough_response_text_mode`]).
+///
+/// Boxed so the streaming relays that hold it across awaits pay one pointer in
+/// their future state, and only pass-through gRPC-Web pays the allocation.
+pub(crate) fn passthrough_trailer_status_observer(
+    ctx: &RequestContext,
+    response_content_type: Option<&str>,
+) -> Option<Box<GrpcWebTrailerStatusObserver>> {
+    passthrough_response_text_mode(ctx, response_content_type)
+        .map(|text_mode| Box::new(GrpcWebTrailerStatusObserver::new(text_mode)))
+}
+
+/// The terminal `grpc-status` a complete PASS-THROUGH gRPC-Web response body
+/// carries in its final trailer frame. `None` when the exchange is not
+/// pass-through gRPC-Web or the body names no terminal status.
+pub(crate) fn passthrough_body_trailer_status(
+    ctx: &RequestContext,
+    response_content_type: Option<&str>,
+    body: &[u8],
+) -> Option<u32> {
+    let text_mode = passthrough_response_text_mode(ctx, response_content_type)?;
+    let mut observer = GrpcWebTrailerStatusObserver::new(text_mode);
+    observer.push(body);
+    observer.status()
+}
+
 /// Compare an existing trailer-frame suffix against the reconciled trailers
 /// without retaining a rebuilt frame or a decoded body copy.
 fn trailer_suffix_matches_reconciled(

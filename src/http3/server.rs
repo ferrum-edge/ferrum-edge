@@ -7590,6 +7590,13 @@ async fn handle_h3_request(
         let mut stream_done = false;
         let mut bytes_streamed: u64 = 0;
         let mut body_completed = false;
+        // Pass-through gRPC-Web: the backend's body, trailer frame included, is
+        // relayed unchanged; the relay reads that frame's status for the log.
+        let mut grpc_web_passthrough =
+            crate::plugins::grpc_web::passthrough_trailer_status_observer(
+                &ctx,
+                response_headers.get("content-type").map(String::as_str),
+            );
 
         // Set when the recv_data arm consumed a backend frame; the loop head
         // re-arms `read_deadline` on the NEXT iteration so the deadline only
@@ -7772,6 +7779,9 @@ async fn handle_h3_request(
                                     ResponseStreamAction::Forward(out) => {
                                         if !out.is_empty() {
                                             let out_len = out.len() as u64;
+                                            if let Some(observer) = grpc_web_passthrough.as_mut() {
+                                                observer.push(&out);
+                                            }
                                             if !authorized_send!(stream.send_data(out)) {
                                                 break 'outer;
                                             }
@@ -7792,6 +7802,9 @@ async fn handle_h3_request(
                                             && !fb.is_empty()
                                         {
                                             let fb_len = fb.len() as u64;
+                                            if let Some(observer) = grpc_web_passthrough.as_mut() {
+                                                observer.push(&fb);
+                                            }
                                             if !authorized_send!(stream.send_data(fb)) {
                                                 break 'outer;
                                             }
@@ -7816,6 +7829,9 @@ async fn handle_h3_request(
                             ) {
                                 let data =
                                     crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                                if let Some(observer) = grpc_web_passthrough.as_mut() {
+                                    observer.push(&data);
+                                }
                                 if !authorized_send!(stream.send_data(data)) {
                                     break 'outer;
                                 }
@@ -7826,6 +7842,9 @@ async fn handle_h3_request(
 
                             let chunk_bytes =
                                 crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                            if let Some(observer) = grpc_web_passthrough.as_mut() {
+                                observer.push(&chunk_bytes);
+                            }
                             coalesce_buf.extend_from_slice(&chunk_bytes);
                             if coalesce_buf.len() >= coalesce_min_bytes {
                                 let data = coalesce_buf.split().freeze();
@@ -7926,6 +7945,9 @@ async fn handle_h3_request(
                         ResponseStreamAction::Forward(out) => {
                             if !out.is_empty() {
                                 let out_len = out.len() as u64;
+                                if let Some(observer) = grpc_web_passthrough.as_mut() {
+                                    observer.push(&out);
+                                }
                                 if !authorized_send!(stream.send_data(out)) {
                                     break 'outer;
                                 }
@@ -7937,6 +7959,9 @@ async fn handle_h3_request(
                                 && !fb.is_empty()
                             {
                                 let fb_len = fb.len() as u64;
+                                if let Some(observer) = grpc_web_passthrough.as_mut() {
+                                    observer.push(&fb);
+                                }
                                 if !authorized_send!(stream.send_data(fb)) {
                                     break 'outer;
                                 }
@@ -8130,6 +8155,14 @@ async fn handle_h3_request(
                 plugin_execution_ms,
                 true,
             );
+
+        let grpc_web_passthrough_status = grpc_web_passthrough
+            .as_deref()
+            .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::status);
+        if body_completed && let Some(grpc_status) = grpc_web_passthrough_status {
+            ctx.metadata
+                .insert("grpc_status".to_string(), grpc_status.to_string());
+        }
 
         // Native H3 drives the inspector in this task rather than a detached
         // body task. Drop it explicitly so the shared completion signal is set
@@ -9845,6 +9878,13 @@ async fn handle_h3_request(
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 proxy response: {}", e))?;
         let grpc_deadline_at = ctx.grpc_deadline_at();
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+        // A pass-through gRPC-Web response carries its status in the backend's
+        // own trailer frame, relayed unchanged; read it before the write.
+        let passthrough_grpc_status = crate::plugins::grpc_web::passthrough_body_trailer_status(
+            &ctx,
+            response_headers.get("content-type").map(String::as_str),
+            &response_body,
+        );
         let response_body_bytes = response_body.len() as u64;
         let mut bytes_received = 0;
         let mut body_completed = true;
@@ -10034,6 +10074,13 @@ async fn handle_h3_request(
             }
         }
 
+        if body_completed
+            && !ctx.metadata.contains_key("grpc_status")
+            && let Some(grpc_status) = passthrough_grpc_status
+        {
+            ctx.metadata
+                .insert("grpc_status".to_string(), grpc_status.to_string());
+        }
         // Transaction logging follows downstream response completion so a
         // deadline-triggered reset cannot be reported as a full successful
         // buffered response. `raw_request_body_bytes` remains the pre-transform
@@ -11728,6 +11775,12 @@ async fn stream_h3_open_response_to_client(
     let flush_interval =
         std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros);
     let mut coalesce_buf = BytesMut::with_capacity(coalesce_max_bytes);
+    // Pass-through gRPC-Web: the backend's body, trailer frame included, is
+    // relayed unchanged; the relay reads that frame's status for the log.
+    let mut grpc_web_passthrough = crate::plugins::grpc_web::passthrough_trailer_status_observer(
+        ctx,
+        response_headers.get("content-type").map(String::as_str),
+    );
     let mut total_streamed: usize = 0;
     let flush_timer = tokio::time::sleep(flush_interval);
     tokio::pin!(flush_timer);
@@ -11902,6 +11955,9 @@ async fn stream_h3_open_response_to_client(
                         ) {
                             let data =
                                 crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                            if let Some(observer) = grpc_web_passthrough.as_mut() {
+                                observer.push(&data);
+                            }
                             if !authorized_send!(h3_stream.send_data(data)) {
                                 break 'outer;
                             }
@@ -11912,6 +11968,9 @@ async fn stream_h3_open_response_to_client(
 
                         let chunk_bytes =
                             crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                        if let Some(observer) = grpc_web_passthrough.as_mut() {
+                            observer.push(&chunk_bytes);
+                        }
                         coalesce_buf.extend_from_slice(&chunk_bytes);
                         if coalesce_buf.len() >= coalesce_min_bytes {
                             let data = coalesce_buf.split().freeze();
@@ -12092,6 +12151,13 @@ async fn stream_h3_open_response_to_client(
     // covers a task that never reaches this statement at all.
     h3_stream.settle_committed_terminal();
 
+    let grpc_web_passthrough_status = grpc_web_passthrough
+        .as_deref()
+        .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::status);
+    if body_completed && let Some(grpc_status) = grpc_web_passthrough_status {
+        ctx.metadata
+            .insert("grpc_status".to_string(), grpc_status.to_string());
+    }
     Ok(H3StreamResult {
         status: response_status,
         backend_status: response_status,
@@ -16085,6 +16151,12 @@ async fn proxy_to_backend_h3_streaming(
     let flush_interval =
         std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros);
     let mut coalesce_buf = BytesMut::with_capacity(coalesce_max_bytes);
+    // Pass-through gRPC-Web: the backend's body, trailer frame included, is
+    // relayed unchanged; the relay reads that frame's status for the log.
+    let mut grpc_web_passthrough = crate::plugins::grpc_web::passthrough_trailer_status_observer(
+        ctx,
+        response_headers.get("content-type").map(String::as_str),
+    );
     let mut total_streamed: usize = 0;
     let flush_timer = tokio::time::sleep(flush_interval);
     tokio::pin!(flush_timer);
@@ -16268,6 +16340,9 @@ async fn proxy_to_backend_h3_streaming(
                         ) {
                             let data =
                                 crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                            if let Some(observer) = grpc_web_passthrough.as_mut() {
+                                observer.push(&data);
+                            }
                             if !authorized_send!(h3_stream.send_data(data)) {
                                 break 'outer;
                             }
@@ -16278,6 +16353,9 @@ async fn proxy_to_backend_h3_streaming(
 
                         let chunk_bytes =
                             crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                        if let Some(observer) = grpc_web_passthrough.as_mut() {
+                            observer.push(&chunk_bytes);
+                        }
                         coalesce_buf.extend_from_slice(&chunk_bytes);
 
                         if coalesce_buf.len() >= coalesce_min_bytes {
@@ -16464,6 +16542,13 @@ async fn proxy_to_backend_h3_streaming(
     // covers a task that never reaches this statement at all.
     h3_stream.settle_committed_terminal();
 
+    let grpc_web_passthrough_status = grpc_web_passthrough
+        .as_deref()
+        .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::status);
+    if body_completed && let Some(grpc_status) = grpc_web_passthrough_status {
+        ctx.metadata
+            .insert("grpc_status".to_string(), grpc_status.to_string());
+    }
     Ok(H3StreamResult {
         status: response_status,
         backend_status: response_status,
