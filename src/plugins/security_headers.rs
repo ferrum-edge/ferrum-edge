@@ -218,14 +218,7 @@ fn find_header_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Optio
 }
 
 fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
-    let keys: Vec<String> = headers
-        .keys()
-        .filter(|key| key.eq_ignore_ascii_case(name))
-        .cloned()
-        .collect();
-    for key in keys {
-        headers.remove(&key);
-    }
+    headers.retain(|key, _| !key.eq_ignore_ascii_case(name));
 }
 
 /// Resolve a built-in security header. `key` is the config field; when present
