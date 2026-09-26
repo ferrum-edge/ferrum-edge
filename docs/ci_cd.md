@@ -699,10 +699,23 @@ aggregate accepts a skipped job only when its gate was `false`:
 | `run_ebpf_kernel_live`, `run_netns_capture_live`, `run_two_cluster_live` | the three privileged ci.yml live suites | only their owner modules and harnesses; never the Cargo build graph |
 
 The same principle governs the dedicated workflows. `fips-build.yml` compiles
-the FIPS profile on a pull request only when FIPS-specific logic changes
-(`src/fips/`, `src/tls/`, `src/dtls/`, the provider-installing listeners, the
-FIPS-aware tests, the Cargo feature graph, `docs/fips.md`, and the gate's own
-workflow/scripts); `coverage.yml` skips every instrumented shard on a pull
+the FIPS profile on a pull request whenever a compiled Rust input changes. The
+trusted `ci_runtime_plan.py` `fips-build` suite prints `scope=full` for
+FIPS-specific logic (`src/fips/`, `src/tls/`, `src/dtls/`, the
+provider-installing listeners, the FIPS-aware tests, the Cargo feature graph,
+`docs/fips.md`, and the gate's own workflow/scripts) and `scope=compile` for
+every other compiled Rust input (`src/`, `tests/` outside `tests/k8s/` and
+`tests/performance/`, `benches/`, `proto/`, `custom_plugins/`). Both print
+`relevant=true`. Issue #5828: PR #5825 added inline test code under
+`src/http3/` that used quinn constructors missing under
+`--no-default-features --features fips`, skipped every FIPS lane, and broke
+`FIPS clippy` on `main`. A `compile` scope needs at least the FIPS compile
+producer and FIPS clippy over the lib and test targets. The workflow reads only
+`relevant` today, so it runs the full gate for both scopes; narrowing a
+`compile` diff to compile + clippy is a `fips-build.yml` change. That file is
+digest-frozen, so this is a direct-to-`main` change.
+
+`coverage.yml` skips every instrumented shard on a pull
 request unless the coverage controllers themselves change; the Kind live
 suites (`live_suite_path_filter.py`, `ci_runtime_plan.py`) fire only for their
 own harness, tooling, and the Kubernetes-facing modules they exist to test.
@@ -716,7 +729,8 @@ pull request or a main push.
 A regression in any of these on an ordinary source change turns `main` red
 for that commit, which makes the commit ineligible for a production release
 (see [Publish-blocking required checks](#publish-blocking-required-checks));
-it does not cost every unrelated pull request a Kind cluster or a FIPS build.
+it does not cost every unrelated pull request a Kind cluster, and a pull
+request that changes no compiled Rust input pays no FIPS build.
 
 ### Standalone Cargo workspaces
 

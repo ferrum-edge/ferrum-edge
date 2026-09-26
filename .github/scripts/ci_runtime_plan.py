@@ -20,7 +20,9 @@ from pathlib import Path, PurePosixPath
 # surfaces it exists to exercise; everything on the shared skip allowlist
 # below (source, tests, the Cargo build graph, docs, ...) skips the expensive
 # gate on a pull request and is exercised by the same suite on every push to
-# `main`. Paths that are neither sensitive nor allowlisted still force-run.
+# `main`, unless the suite also declares compile-tier patterns
+# (`SUITE_COMPILE_PATTERNS`). Paths that are neither sensitive nor allowlisted
+# still force-run.
 SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
     # Production Dockerfile smoke builds the ordinary `runtime` image and the
     # distroless `runtime-ebpf` image from the root Dockerfile. On a pull
@@ -40,12 +42,12 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
     # FIPS compile/clippy/test rebuilds the aws-lc-fips-sys module and the
     # unit/integration binaries that carry the handshake and key-admission
-    # assertions. On a pull request only FIPS-specific logic is sensitive: the
-    # crypto-provider selection and inventory (`src/fips/`, `src/tls/`, DTLS,
-    # the QUIC/TLS listeners that install a provider), the FIPS-aware tests,
-    # the Cargo feature graph, and the gate's own workflow/scripts. Every
-    # other source change is validated under the FIPS feature on the push to
-    # `main`; a commit that breaks the FIPS build is simply not releasable.
+    # assertions. These FIPS-specific surfaces need the full gate (scope
+    # `full`): the crypto-provider selection and inventory (`src/fips/`,
+    # `src/tls/`, DTLS, the QUIC/TLS listeners that install a provider), the
+    # FIPS-aware tests, the Cargo feature graph, and the gate's own
+    # workflow/scripts. Every other Rust compile input is a compile-tier path
+    # (`SUITE_COMPILE_PATTERNS`), which still makes the gate relevant.
     "fips-build": (
         r"^Cargo\.(toml|lock)$",
         r"^rust-toolchain\.toml$",
@@ -159,7 +161,8 @@ KNOWN_SAFE_PATTERNS: tuple[str, ...] = (
 )
 
 # Production images dockerignore `tests/`, so those paths cannot change the
-# image. FIPS clippy/tests compile `tests/`, so FIPS must not allowlist it.
+# image. FIPS clippy/tests compile `tests/`, so FIPS lists the compiled trees
+# as compile-tier patterns, which are checked before this allowlist.
 # NodeWaypoint allowlists the production-image-only broadening (`src/**`,
 # `vendor/**`, `.cargo/**`, `rust-toolchain.toml`, `custom_plugins/**`) so
 # those diffs skip the Kind/eBPF live job unless they also match the prior
@@ -181,6 +184,31 @@ ORDINARY_COMPILE_SAFE_PATTERNS: tuple[str, ...] = (
     r"^ebpf/",
 )
 
+# Compile-tier paths: relevant on a pull request, but only for the gate's
+# compile-and-lint subset (scope `compile`), not its FIPS-specific checks.
+#
+# Issue #5828: PR #5825 changed only `src/http3/cross_protocol.rs`, adding
+# inline `#[cfg(test)]` code that called quinn endpoint constructors which are
+# gated off under `--no-default-features --features fips`. Every FIPS lane was
+# skipped on the pull request and the break first surfaced on the push to
+# `main`. Any Rust source can reach a crate API that is feature-gated
+# differently under FIPS (quinn, the rustls providers, aws-lc-rs), so every
+# compiled Rust input must schedule at least the FIPS compile producer and FIPS
+# clippy over the lib and test targets. `tests/k8s/` (shell harnesses) and
+# `tests/performance/` (standalone workspaces) are never compiled by the root
+# crate's targets and stay on the skip allowlist. `Cargo.*`, `vendor/`,
+# `.cargo/`, `rust-toolchain.toml`, and `build.rs` are already full-gate
+# patterns above.
+SUITE_COMPILE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "fips-build": (
+        r"^src/",
+        r"^tests/(?!k8s/|performance/)",
+        r"^benches/",
+        r"^proto/",
+        r"^custom_plugins/",
+    ),
+}
+
 SUITE_SAFE_PATTERNS: dict[str, tuple[str, ...]] = {
     "production-dockerfile-smoke": KNOWN_SAFE_PATTERNS + ORDINARY_COMPILE_SAFE_PATTERNS,
     "fips-build": KNOWN_SAFE_PATTERNS + ORDINARY_COMPILE_SAFE_PATTERNS,
@@ -195,6 +223,17 @@ COMPILED_SAFE = {
     suite: tuple(re.compile(pattern) for pattern in patterns)
     for suite, patterns in SUITE_SAFE_PATTERNS.items()
 }
+COMPILED_COMPILE = {
+    suite: tuple(re.compile(pattern) for pattern in patterns)
+    for suite, patterns in SUITE_COMPILE_PATTERNS.items()
+}
+
+# Planner scopes, printed as `scope=<value>` next to `relevant=`. `none` is the
+# only scope with `relevant=false`. A workflow that only reads `relevant` runs
+# its full gate for both `full` and `compile`.
+SCOPE_FULL = "full"
+SCOPE_COMPILE = "compile"
+SCOPE_NONE = "none"
 
 
 class ChangedFilesError(Exception):
@@ -290,19 +329,91 @@ def matched_files(suite: str, changed_files: list[str]) -> list[str]:
     ]
 
 
+def compile_matched_files(suite: str, changed_files: list[str]) -> list[str]:
+    if suite not in COMPILED:
+        raise ValueError(f"unknown CI runtime suite: {suite}")
+    patterns = COMPILED_COMPILE.get(suite, ())
+    return [
+        path for path in changed_files if any(pattern.search(path) for pattern in patterns)
+    ]
+
+
 def unknown_files(suite: str, changed_files: list[str]) -> list[str]:
     if suite not in COMPILED or suite not in COMPILED_SAFE:
         raise ValueError(f"unknown CI runtime suite: {suite}")
     sensitive = COMPILED[suite]
+    compile_tier = COMPILED_COMPILE.get(suite, ())
     safe = COMPILED_SAFE[suite]
     unknown: list[str] = []
     for path in changed_files:
         if any(pattern.search(path) for pattern in sensitive):
             continue
+        if any(pattern.search(path) for pattern in compile_tier):
+            continue
         if any(pattern.search(path) for pattern in safe):
             continue
         unknown.append(path)
     return unknown
+
+
+def decide_plan(
+    suite: str,
+    changed: list[str],
+    *,
+    force_run: bool = False,
+    force_unsafe: bool = False,
+    unsafe_reason: str = "",
+) -> tuple[str, str, list[str]]:
+    """Return `(scope, reason, matched)`; every uncertain case is `full`."""
+
+    matched = matched_files(suite, changed)
+    if force_run:
+        return (
+            SCOPE_FULL,
+            "Forced run (push, merge_group, dispatch, or cold-cache proof).",
+            matched,
+        )
+    if force_unsafe:
+        return (
+            SCOPE_FULL,
+            f"Diff contained an unsafe path ({unsafe_reason}); running the live "
+            "gate rather than risking a false skip.",
+            matched,
+        )
+    if not changed:
+        return (
+            SCOPE_FULL,
+            "Empty diff; running the live gate rather than skipping.",
+            matched,
+        )
+    if matched:
+        return (
+            SCOPE_FULL,
+            "Diff matches a suite-sensitive path; running the live gate.",
+            matched,
+        )
+    unknown = unknown_files(suite, changed)
+    if unknown:
+        return (
+            SCOPE_FULL,
+            "Diff contains paths that are neither sensitive nor on the skip "
+            "allowlist; running the live gate.",
+            matched,
+        )
+    compile_matched = compile_matched_files(suite, changed)
+    if compile_matched:
+        return (
+            SCOPE_COMPILE,
+            "Diff changes compiled Rust inputs; the gate is relevant and needs "
+            "at least its compile and lint jobs.",
+            compile_matched,
+        )
+    return (
+        SCOPE_NONE,
+        "No sensitive paths matched. The cheap feature-policy / reporting "
+        "jobs still run; the expensive compile/image jobs are skipped.",
+        matched,
+    )
 
 
 def decide_relevance(
@@ -313,51 +424,30 @@ def decide_relevance(
     force_unsafe: bool = False,
     unsafe_reason: str = "",
 ) -> tuple[bool, str, list[str]]:
-    matched = matched_files(suite, changed)
-    if force_run:
-        return True, "Forced run (push, merge_group, dispatch, or cold-cache proof).", matched
-    if force_unsafe:
-        return (
-            True,
-            f"Diff contained an unsafe path ({unsafe_reason}); running the live "
-            "gate rather than risking a false skip.",
-            matched,
-        )
-    if not changed:
-        return (
-            True,
-            "Empty diff; running the live gate rather than skipping.",
-            matched,
-        )
-    if matched:
-        return (
-            True,
-            "Diff matches a suite-sensitive path; running the live gate.",
-            matched,
-        )
-    unknown = unknown_files(suite, changed)
-    if unknown:
-        return (
-            True,
-            "Diff contains paths that are neither sensitive nor on the skip "
-            "allowlist; running the live gate.",
-            matched,
-        )
-    return (
-        False,
-        "No sensitive paths matched. The cheap feature-policy / reporting "
-        "jobs still run; the expensive compile/image jobs are skipped.",
-        matched,
+    scope, reason, matched = decide_plan(
+        suite,
+        changed,
+        force_run=force_run,
+        force_unsafe=force_unsafe,
+        unsafe_reason=unsafe_reason,
     )
+    return scope != SCOPE_NONE, reason, matched
 
 
 def write_summary(
-    suite: str, relevant: bool, changed: list[str], matched: list[str], reason: str
+    suite: str,
+    relevant: bool,
+    scope: str,
+    changed: list[str],
+    matched: list[str],
+    reason: str,
 ) -> None:
     title = suite.replace("-", " ").title()
     print(f"## {title} Runtime Path Plan")
     print()
     print(f"Relevant: **{str(relevant).lower()}**")
+    print()
+    print(f"Scope: **{scope}**")
     print()
     print(reason)
     print()
@@ -434,20 +524,28 @@ def self_test() -> int:
         ("fips-build", [".github/workflows/fips-build.yml"], True),
         ("fips-build", [".github/scripts/check_fips_feature_policy.py"], True),
         ("fips-build", [".github/actions/setup-sccache/action.yml"], True),
-        # Everything else compiles under the FIPS feature on the push to main.
-        ("fips-build", ["src/proxy/tcp_proxy.rs"], False),
-        ("fips-build", ["src/plugins/cors.rs"], False),
-        ("fips-build", ["src/admin/mod.rs"], False),
-        ("fips-build", ["src/modes/mesh/mod.rs"], False),
-        ("fips-build", ["tests/unit_tests.rs"], False),
-        ("fips-build", ["tests/integration_tests.rs"], False),
-        ("fips-build", ["tests/common/mod.rs"], False),
-        ("fips-build", ["tests/scaffolding/harness.rs"], False),
-        ("fips-build", ["tests/fixtures/test_rsa_public.pem"], False),
-        ("fips-build", ["tests/functional/functional_admin_test.rs"], False),
+        # Every other compiled Rust input is compile-tier and still relevant
+        # (issue #5828). `src/http3/cross_protocol.rs` is the PR #5825 diff
+        # whose FIPS test-target break skipped every FIPS lane.
+        ("fips-build", ["src/http3/cross_protocol.rs"], True),
+        ("fips-build", ["src/proxy/tcp_proxy.rs"], True),
+        ("fips-build", ["src/plugins/cors.rs"], True),
+        ("fips-build", ["src/admin/mod.rs"], True),
+        ("fips-build", ["src/modes/mesh/mod.rs"], True),
+        ("fips-build", ["tests/unit_tests.rs"], True),
+        ("fips-build", ["tests/integration_tests.rs"], True),
+        ("fips-build", ["tests/common/mod.rs"], True),
+        ("fips-build", ["tests/scaffolding/harness.rs"], True),
+        ("fips-build", ["tests/fixtures/test_rsa_public.pem"], True),
+        ("fips-build", ["tests/functional/functional_admin_test.rs"], True),
+        ("fips-build", ["benches/proxy_bench.rs"], True),
+        ("fips-build", ["proto/ferrum.proto"], True),
+        ("fips-build", ["custom_plugins/mod.rs"], True),
+        # Trees the root crate's targets never compile stay skippable.
         ("fips-build", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
-        ("fips-build", ["proto/ferrum.proto"], False),
-        ("fips-build", ["custom_plugins/mod.rs"], False),
+        ("fips-build", ["tests/performance/multi_protocol/src/main.rs"], False),
+        ("fips-build", ["ebpf/src/lib.rs"], False),
+        ("fips-build", ["fuzz/fuzz_targets/parse.rs"], False),
         ("fips-build", ["docs/ci_cd.md"], False),
         ("fips-build", ["README.md"], False),
         ("fips-build", ["charts/ferrum-mesh/values.yaml"], False),
@@ -584,6 +682,51 @@ def self_test() -> int:
             failures.append(
                 f"{suite} {changed!r}: expected relevant={expected}, got {relevant}"
             )
+    scope_cases: list[tuple[str, list[str], str]] = [
+        # A compile-only diff needs at least FIPS compile + clippy.
+        ("fips-build", ["src/http3/cross_protocol.rs"], SCOPE_COMPILE),
+        ("fips-build", ["tests/unit_tests.rs"], SCOPE_COMPILE),
+        ("fips-build", ["src/plugins/cors.rs", "docs/plugins.md"], SCOPE_COMPILE),
+        # FIPS-specific logic, the build graph, and unknown paths keep the full gate.
+        ("fips-build", ["src/tls/mod.rs"], SCOPE_FULL),
+        ("fips-build", ["src/plugins/cors.rs", "src/tls/mod.rs"], SCOPE_FULL),
+        ("fips-build", ["Cargo.lock"], SCOPE_FULL),
+        ("fips-build", ["build.rs"], SCOPE_FULL),
+        ("fips-build", ["src/plugins/cors.rs", "brand-new-crate/src/lib.rs"], SCOPE_FULL),
+        ("fips-build", ["docs/ci_cd.md"], SCOPE_NONE),
+        ("fips-build", ["tests/k8s/mesh_e2e_sidecar/run.sh"], SCOPE_NONE),
+        # Suites without compile-tier patterns are unchanged.
+        ("production-dockerfile-smoke", ["src/main.rs"], SCOPE_NONE),
+        ("production-dockerfile-smoke", ["Dockerfile"], SCOPE_FULL),
+        ("node-waypoint-ebpf-live", ["src/proxy/tcp_proxy.rs"], SCOPE_NONE),
+        ("node-waypoint-ebpf-live", ["src/ebpf/mod.rs"], SCOPE_FULL),
+    ]
+    for suite, changed, expected_scope in scope_cases:
+        scope, _reason, _matched = decide_plan(suite, changed)
+        if scope != expected_scope:
+            failures.append(
+                f"{suite} {changed!r}: expected scope={expected_scope}, got {scope}"
+            )
+    _, _, compile_matched = decide_plan("fips-build", ["src/plugins/cors.rs", "README.md"])
+    if compile_matched != ["src/plugins/cors.rs"]:
+        failures.append("compile-scope plan must report the compile-tier paths it matched")
+    forced_scope, _, _ = decide_plan("fips-build", ["src/plugins/cors.rs"], force_run=True)
+    if forced_scope != SCOPE_FULL:
+        failures.append("a forced (push/dispatch) run must keep the full FIPS gate")
+    unsafe_scope, _, _ = decide_plan(
+        "fips-build",
+        ["src/plugins/cors.rs"],
+        force_unsafe=True,
+        unsafe_reason="control character",
+    )
+    if unsafe_scope != SCOPE_FULL:
+        failures.append("an unsafe diff must keep the full FIPS gate")
+    empty_scope, _, _ = decide_plan("fips-build", [])
+    if empty_scope != SCOPE_FULL:
+        failures.append("an empty diff must keep the full FIPS gate")
+    if not set(SUITE_COMPILE_PATTERNS) <= set(SUITE_PATTERNS):
+        failures.append("compile-tier patterns must belong to a known planner suite")
+
     empty_relevant, empty_reason, _ = decide_relevance("fips-build", [])
     if not empty_relevant or "Empty diff" not in empty_reason:
         failures.append("empty diff must force-run, not skip")
@@ -787,7 +930,7 @@ def main() -> int:
         force_unsafe = True
         unsafe_reason = error.reason
     try:
-        relevant, reason, matched = decide_relevance(
+        scope, reason, matched = decide_plan(
             args.suite,
             changed,
             force_run=args.force_run,
@@ -797,9 +940,11 @@ def main() -> int:
     except ValueError as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1
+    relevant = scope != SCOPE_NONE
     print(f"relevant={str(relevant).lower()}")
+    print(f"scope={scope}")
     print(f"matched_count={len(matched)}")
-    write_summary(args.suite, relevant, changed, matched, reason)
+    write_summary(args.suite, relevant, scope, changed, matched, reason)
     return 0
 
 
