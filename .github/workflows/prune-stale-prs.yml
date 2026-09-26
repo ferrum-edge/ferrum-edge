@@ -305,9 +305,19 @@ jobs:
             if [[ "$DRY_RUN" == "true" ]]; then
               echo "🧪 [DRY RUN] Would delete orphan branch: $branch @ $tip ($tip_date; $reason)"
             else
+              # Recheck immediately before deletion so a PR opened after the
+              # initial snapshot protects its branch.
+              if [[ "$(gh pr list --state open --head "$branch" --limit "$PR_LIST_LIMIT" \
+                --json number --jq 'length')" != "0" ]]; then
+                echo "⏭️ Skipping branch with newly opened PR: $branch"
+                continue
+              fi
+
               echo "🗑️ Deleting orphan branch: $branch @ $tip ($tip_date; $reason)"
-              if ! git push origin --delete "refs/heads/$branch"; then
-                echo "⚠️ Failed to delete $branch"
+              # Refuse the deletion if the remote tip changed after inspection.
+              if ! git push --force-with-lease="refs/heads/$branch:$tip" \
+                origin --delete "refs/heads/$branch"; then
+                echo "⚠️ Failed to delete $branch (the remote tip may have changed)"
                 continue
               fi
             fi
