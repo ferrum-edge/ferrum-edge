@@ -486,10 +486,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like the reqwest and size-limited bodies. Previously an HTTP/2 or HTTP/3
   backend that sent its headers, a small first write, and a reset together
   could end an HTTP/1.1 response before its status line reached the client.
-  The hold now also sits outside the idle read timeout and the client gRPC
-  deadline on every streaming body, so a backend error read on the same poll
-  that the idle deadline expires is reported as the backend error rather than
-  as a read timeout (#5811).
+  The hold now also sits outside the builder-level idle read timeout and gRPC
+  deadline, so a backend error read on the same poll that the idle deadline
+  expires is reported as the backend error rather than as a read timeout. Outer
+  client, route and stream-auth deadlines on the generic H2 and H3 paths still
+  wrap the finished `ProxyBody` and can win on the held turn (#5811).
 - HTTP/2 response trailers from a backend now reach an HTTP/2 client on every
   dispatch path and body mode (#5760). The reqwest relay (used for a backend
   the capability registry has not yet classified, and for routes with retries

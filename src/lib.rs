@@ -16080,7 +16080,9 @@ pub mod _test_support {
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Result<Option<bytes::Bytes>, CoalesceFrameError>> {
             let next = std::task::ready!(self.get_mut().poll_next_chunk(cx));
-            let next = next.transpose().map_err(|err| Box::new(err) as CoalesceFrameError);
+            let next = next
+                .transpose()
+                .map_err(|err| Box::new(err) as CoalesceFrameError);
             std::task::Poll::Ready(next)
         }
 

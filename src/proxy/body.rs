@@ -3630,11 +3630,12 @@ where
 /// (size-limited, coalescing, direct), the plugin-inspected body, and the
 /// direct-H2/gRPC and native-H3 bodies (size-limited, coalescing, direct).
 ///
-/// The hold sits OUTSIDE the idle read timeout and the absolute gRPC deadline.
+/// The hold sits OUTSIDE the builder-level idle read timeout and gRPC deadline.
 /// Those wrappers read an inner `Pending` as a backend wait and check their
 /// deadline on it, so a hold inside them could lose its error to a deadline
-/// that expired on the held turn. Outside, the error has already passed
-/// through them, and the held turn is never polled against a deadline.
+/// that expired on the held turn. Outer client, route, and stream-auth deadlines
+/// wrap the finished `ProxyBody` on generic H2 and H3 paths, so they can still
+/// win on the held turn.
 struct FlushBeforeTerminalError<B> {
     inner: B,
     stashed_error: Option<BoxError>,

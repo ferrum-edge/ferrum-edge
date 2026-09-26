@@ -62,8 +62,9 @@ fn over_limit_body() -> ProxyBody {
     )
 }
 
-/// One ready chunk followed at once by a backend reset, on the unlimited
-/// reqwest streaming body named by `adapter`, with the idle read timeout off.
+/// One ready chunk followed at once by a backend reset on the unlimited
+/// streaming body named by `adapter` (reqwest, direct H2/gRPC, or native H3),
+/// with the idle read timeout off.
 fn backend_reset_body(adapter: &str) -> ProxyBody {
     let chunks = vec![Bytes::from_static(b"abcdefgh")];
     unlimited_streaming_body_from_ready_chunks_then_error(adapter, chunks, 0)
@@ -269,7 +270,7 @@ async fn held_backend_error_survives_an_idle_deadline_that_expires_on_the_held_t
             Pin::new(&mut body).poll_frame(&mut cx).is_pending(),
             "{adapter}: the stalled backend read must be pending"
         );
-        tokio::time::advance(Duration::from_millis(IDLE_READ_TIMEOUT_MS)).await;
+        tokio::time::advance(Duration::from_millis(IDLE_READ_TIMEOUT_MS + 1)).await;
 
         assert!(
             Pin::new(&mut body).poll_frame(&mut cx).is_pending(),
