@@ -447,6 +447,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`IncompleteMessage`). The reqwest, direct-H2/gRPC, and native-H3
   size-limited adapters now hold the error for one scheduler turn so the
   frontend flushes first.
+- The shared buffered SSE inspection parser used by `ai_semantic_firewall` and
+  `ai_response_guard` now follows the WHATWG event-stream framing: it consumes
+  leading UTF-8 BOMs and splits lines on CRLF, LF, or a lone CR (mixed
+  freely). Previously a leading BOM or CR-only framing hid events from
+  inspection while the body was still reported as fully parsed (#5795).
 
 ### Security
 
