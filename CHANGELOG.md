@@ -565,12 +565,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Anthropic event name sent ahead of its `data:` line, another field, a `data`
   line with an empty value, or a field name or `data:` line whose value has not
   begun) now keeps that start to read the rest of the event with, so the
-  event's data is still held and inspected instead of passing through. The rest of an event that outgrew
-  `streaming.max_window_bytes` is now read as part of that uninspectable event
-  up to the blank line that ends it, so `on_error` decides it rather than it
-  being parsed as a fresh event. `ai_stream_router` and `ai_tool_governor` now
-  split SSE lines (and, for `ai_stream_router`, events) with the shared SSE
-  helpers (#5814).
+  event's data is still held and inspected instead of passing through. The
+  rest of an event that outgrew `streaming.max_window_bytes` is now read as
+  part of that uninspectable event up to the blank line that ends it, so
+  `on_error` decides it rather than it being parsed as a fresh event.
+  `ai_stream_router` and `ai_tool_governor` now split SSE lines (and, for
+  `ai_stream_router`, events) with the shared SSE helpers (#5814).
+- HTTP/3 bridge gateway error terminals (a classified backend dispatch failure
+  and a declared-oversize `502`) now write `X-Gateway-Error` after the
+  `after_proxy` hooks from the typed connection-error signal and the post-hook
+  status, as HTTP/1.1 and HTTP/2 do, so hooks can no longer see, replace,
+  duplicate, or erase the token. A hook-set non-5xx status without a connection
+  error carries no token, matching HTTP/1.1 and HTTP/2 (#5807).
 
 ### Security
 

@@ -5427,24 +5427,17 @@ where
             },
             backend_admission_elapsed,
         );
-        // The HTTP/1.1 / HTTP/2 builder's token for the same refusal: not a
-        // connection error, so the `502` reads `backend_error`.
-        let mut headers = HashMap::new();
-        crate::proxy::apply_authoritative_gateway_error_header_for_response(
-            &mut headers,
-            ctx,
-            false,
-            StatusCode::BAD_GATEWAY.as_u16(),
-        );
         // `after_proxy` has not run over this head: a gRPC-Web terminal is
-        // decorated as a gateway error terminal (#5747).
+        // decorated as a gateway error terminal (#5747). The writer adds the
+        // HTTP/1.1 / HTTP/2 builder's token for the same refusal after those
+        // hooks: not a connection error, so the `502` reads `backend_error`.
         let mut outcome = write_plain_gateway_error_terminal(
             stream,
             plugins,
             ctx,
             StatusCode::BAD_GATEWAY,
             Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
-            headers,
+            false,
             backend_start,
             bytes_sent,
         )
@@ -11405,6 +11398,11 @@ where
 /// place of the gateway's own. That terminal is written as every other
 /// authorization terminal on this bridge is, under the bounded post-deadline
 /// write grace, never through the unbounded gateway reject writer.
+///
+/// The gateway-owned `X-Gateway-Error` token is written after the hooks, from
+/// the typed `connection_error` signal and the post-hook status, as HTTP/1.1
+/// and HTTP/2 write it: a hook can neither see, erase, replace, nor duplicate
+/// it (#5807).
 #[allow(clippy::too_many_arguments)]
 async fn write_plain_gateway_error_terminal<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -11412,7 +11410,7 @@ async fn write_plain_gateway_error_terminal<S>(
     ctx: &mut RequestContext,
     status: StatusCode,
     mut body: Bytes,
-    mut headers: HashMap<String, String>,
+    connection_error: bool,
     backend_start: Instant,
     bytes_sent: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -11420,6 +11418,7 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     let mut status_code = status.as_u16();
+    let mut headers = HashMap::new();
     if !plugins.is_empty() && crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
         // Boxed: the hook runner is large, and `dispatch_plain` awaits this
         // helper from cold arms whose inline temporaries are frame slots.
@@ -11444,6 +11443,14 @@ where
         }
     }
     let status = StatusCode::from_u16(status_code).unwrap_or(status);
+    // Context-aware so a route-deadline `504` no backend held reads
+    // `request_timeout`, as proxy core's builder does.
+    crate::proxy::apply_authoritative_gateway_error_header_for_response(
+        &mut headers,
+        ctx,
+        connection_error,
+        status.as_u16(),
+    );
     write_plain_gateway_reject(
         stream,
         ctx,
@@ -11482,22 +11489,15 @@ where
             Bytes::from_static(br#"{"error":"Backend unavailable"}"#)
         }
     };
-    let mut headers = HashMap::new();
-    // Context-aware so a route-deadline `504` no backend held reads
-    // `request_timeout`, as proxy core's builder does.
-    crate::proxy::apply_authoritative_gateway_error_header_for_response(
-        &mut headers,
-        ctx,
-        attempt_result.connection_error,
-        status.as_u16(),
-    );
+    // The token is written after the `after_proxy` hooks, inside the
+    // terminal writer, from this typed dispatch signal.
     let mut outcome = write_plain_gateway_error_terminal(
         stream,
         plugins,
         ctx,
         status,
         body,
-        headers,
+        attempt_result.connection_error,
         backend_start,
         bytes_sent,
     )

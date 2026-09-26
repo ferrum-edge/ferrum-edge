@@ -303,3 +303,89 @@ fn native_h3_dispatch_failures_send_typed_gateway_error() {
         "buffered native H3 must restore X-Gateway-Error after sanitizing for the wire"
     );
 }
+
+/// Issue #5807: the HTTP/3 bridge's gateway error terminal writes
+/// `X-Gateway-Error` after the `after_proxy` hooks, as HTTP/1.1 and HTTP/2 do,
+/// from the typed `connection_error` signal. Its callers hand over that signal,
+/// never a header map that already carries the token.
+#[test]
+fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let token_writer = "apply_authoritative_gateway_error_header_for_response(";
+    let writer = cross
+        .split("async fn write_plain_gateway_error_terminal<S>(")
+        .nth(1)
+        .expect("the HTTP/3 gateway error terminal writer")
+        .split("\n}\n")
+        .next()
+        .expect("the writer body");
+    assert!(
+        writer.contains("connection_error: bool"),
+        "the writer must take the typed connection-error signal"
+    );
+    let hooks = writer
+        .find("apply_after_proxy_hooks_to_gateway_error_terminal(")
+        .expect("the writer runs the after_proxy hooks");
+    let token = writer
+        .find(token_writer)
+        .expect("the writer applies the gateway token itself");
+    let write = writer
+        .find("write_plain_gateway_reject(")
+        .expect("the writer writes through the gateway reject writer");
+    assert!(
+        hooks < token && token < write,
+        "the token must be written after the hooks and before the wire write"
+    );
+    assert_eq!(
+        writer.matches(token_writer).count(),
+        1,
+        "the token is applied exactly once, after the hooks"
+    );
+
+    let classified = cross
+        .split("async fn write_classified_backend_dispatch_error<S>(")
+        .nth(1)
+        .expect("the classified dispatch error writer")
+        .split("\n}\n")
+        .next()
+        .expect("the classified writer body");
+    assert!(
+        !classified.contains(token_writer),
+        "the classified writer must not apply the token before the hooks"
+    );
+    assert!(
+        !classified.contains("restore_authoritative_gateway_error_header"),
+        "the classified writer must not restore the token before the hooks"
+    );
+    assert!(
+        !classified.contains("insert_x_gateway_error_for_backend_failure"),
+        "the classified writer must not insert the token before the hooks"
+    );
+    assert!(
+        classified.contains("attempt_result.connection_error"),
+        "the classified writer must hand the typed signal to the terminal writer"
+    );
+
+    // The declared-oversize 502 hands the writer its non-connection signal.
+    let oversized_body = r##"br#"{"error":"Backend response body exceeds maximum size"}"#"##;
+    let body_start = cross
+        .find(oversized_body)
+        .expect("the declared-oversize response body");
+    let call_start = cross[..body_start]
+        .rfind("let mut outcome = write_plain_gateway_error_terminal(")
+        .expect("the declared-oversize terminal writer call");
+    let oversized = cross[call_start..]
+        .split(".await?;")
+        .next()
+        .expect("the declared-oversize terminal writer call");
+    let oversized_compact: String = oversized.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(
+        oversized_compact.contains(
+            "write_plain_gateway_error_terminal(stream,plugins,ctx,StatusCode::BAD_GATEWAY,"
+        ) && oversized_compact.contains("Bytes::from_static(")
+            && oversized_compact.contains("),false,backend_start,bytes_sent,")
+            && !oversized.contains(token_writer)
+            && !oversized_compact.contains("headers"),
+        "the declared-oversize 502 must hand the typed signal to the terminal writer"
+    );
+}

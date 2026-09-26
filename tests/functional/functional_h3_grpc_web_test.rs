@@ -570,7 +570,7 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
                 "backend_read_timeout_ms": 1000,
                 "backend_write_timeout_ms": 1000,
                 "backend_tls_verify_server_cert": false,
-                "plugins": [],
+                "plugins": [{"plugin_config_id": "pass-through-unavailable-transformer"}],
             },
         ],
         "consumers": [],
@@ -582,6 +582,20 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
             "proxy_id": "h3-grpc-web-pass-through-policy",
             "enabled": true,
             "config": {"deny_methods": ["echo.Echo/Unary"]},
+        }, {
+            "id": "pass-through-unavailable-transformer",
+            "plugin_name": "response_transformer",
+            "scope": "proxy",
+            "proxy_id": "h3-grpc-web-pass-through-unavailable",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "X-Gateway-Error",
+                    "value": "spoofed"
+                }]
+            }
         }],
     });
     let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
@@ -630,6 +644,16 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
     )
     .await;
     assert_grpc_web_error(&unavailable, "14", "application/grpc-web+proto");
+    assert_eq!(
+        unavailable
+            .headers
+            .get_all("x-gateway-error")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>(),
+        ["connection_failure"],
+        "a response hook must not see, replace, duplicate, or erase the gateway token"
+    );
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     backend.assert_no_step_errors().await;
