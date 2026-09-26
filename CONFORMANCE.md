@@ -199,7 +199,8 @@ body cut by `request` keeps a backend `Content-Length` advertised.
   into its RPC deadline when the rule is selected rather than at the handoff
   (stricter: gateway-side time before the handoff counts against the first
   attempt), and a gRPC budget expiry is not retried, since gRPC calls are
-  retried only after connection failures (both tracked in #5734). The
+  retried only after connection failures. Both are intentional (decided in
+  #5734; see [Rule timeouts](docs/gateway_api_conformance.md#rule-timeouts)). The
   upstream test delays only the response head, which every frontend bounds.
 - **`HTTPRouteRequestTimeout`:** no known deviation. HTTP/1.1, HTTP/2 and
   native HTTP/3 enforce `request` fully, and HTTP/3 stays advertised
