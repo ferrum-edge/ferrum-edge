@@ -584,6 +584,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counted as a message. This covers the native gRPC dispatch, the reqwest,
   direct-H2, HBONE, Unix and mesh-mTLS upload adapters, and the native HTTP/3
   backend upload paths (#5807).
+- The HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends now counts pass-through
+  gRPC-Web request messages on their decoded frames on its streamed upload,
+  its mesh-egress drain, and its unprepared buffered body, which fed no count
+  before (#5819). Its `502` for a backend client the connection pool could not
+  build is now a gateway error terminal: a gRPC-Web client's is decorated by
+  the `after_proxy` hooks, and `X-Gateway-Error: connection_failure` is written
+  after them. A test-only fault on the pooled-client acquire covers that
+  terminal over a real HTTP/3 stream (#5824).
 
 ### Security
 

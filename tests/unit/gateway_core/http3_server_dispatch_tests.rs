@@ -5673,3 +5673,88 @@ fn h3_request_handler_boxes_its_largest_dispatch_relays() {
         "boxed_dispatch_grpc_streaming must box an async trampoline"
     );
 }
+
+/// Issue #5819: the HTTP/3 cross-protocol plain bridge counts gRPC request
+/// messages on every request-body arm, in the upload's own framing, so a
+/// pass-through gRPC-Web upload counts its decoded message frames and never its
+/// trailer frame or its `grpc-web-text` base64. The native gRPC dispatch keeps
+/// its native-framing counters.
+#[test]
+fn h3_plain_bridge_counts_request_messages_in_the_upload_framing() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let run_inner = source
+        .split("async fn run_inner<S>(")
+        .nth(1)
+        .expect("cross-protocol entry")
+        .split("\n}\n")
+        .next()
+        .expect("bounded cross-protocol entry");
+    let plain_arm = run_inner
+        .split("HttpFlavor::Plain => {")
+        .nth(1)
+        .expect("plain arm")
+        .split("boxed_dispatch_plain(")
+        .next()
+        .expect("plain arm before dispatch");
+    let unprepared =
+        "if !request_body_prepared && let Some(body) = prebuffered_body.as_deref() {";
+    assert!(
+        plain_arm.contains(unprepared)
+            && plain_arm.contains("record_request_grpc_message_count(ctx, body);"),
+        "an unprepared prebuffered plain body is counted once, in its own framing"
+    );
+
+    let dispatch = source
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+    let mesh_drain = dispatch
+        .split("drain_h3_body(stream, effective_max_request_body_size_bytes),")
+        .nth(1)
+        .expect("mesh-egress upload drain")
+        .split("(Some(body), len)")
+        .next()
+        .expect("drained mesh-egress body");
+    assert!(
+        mesh_drain.contains("record_request_grpc_message_count(ctx, &body);"),
+        "the drained mesh-egress body is counted in its own framing"
+    );
+
+    let compact: String = dispatch.chars().filter(|c| !c.is_whitespace()).collect();
+    let tap =
+        "letmutreader_grpc_tap=crate::plugins::grpc_web::request_stream_grpc_message_tap(ctx);";
+    assert!(
+        compact.contains(tap),
+        "the streamed upload carries the framing-aware message tap"
+    );
+    let position = |needle: &str| {
+        dispatch
+            .find(needle)
+            .unwrap_or_else(|| panic!("streamed upload reader: missing `{needle}`"))
+    };
+    let chunk = position("let body_bytes = chunk.copy_to_bytes(len);");
+    let copy = position("reader_grpc_tap.as_ref().map(|_| body_bytes.clone())");
+    let send = position("res = tx.send(Ok(body_bytes)) => res,");
+    let count = position("tap.push(metric_data);");
+    assert!(
+        chunk < copy && copy < send && send < count,
+        "a streamed chunk is counted only after it is handed to the backend body"
+    );
+    assert!(
+        !dispatch.contains("GrpcLengthPrefixedScanner::default()")
+            && !dispatch.contains("record_native_grpc_message_count("),
+        "the plain bridge never reads a pass-through upload as native framing"
+    );
+
+    let grpc = source
+        .split("async fn dispatch_grpc<S>(")
+        .nth(1)
+        .expect("cross-protocol gRPC dispatcher");
+    assert!(
+        grpc.contains("record_native_grpc_message_count("),
+        "the native gRPC dispatch keeps its native-framing counter"
+    );
+}
