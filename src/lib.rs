@@ -4451,6 +4451,20 @@ pub mod _test_support {
         crate::proxy::forward_ws_tunnel_residual(writer, residual, offset).await
     }
 
+    /// Backend TLS config source for the WebSocket test dialers: a default
+    /// pool with no TLS policy and no CRLs, like the dialers' own defaults.
+    fn websocket_backend_tls_configs_for_test(
+        env_config: &crate::config::EnvConfig,
+    ) -> crate::connection_pool::ConnectionPool {
+        crate::connection_pool::ConnectionPool::new(
+            crate::config::PoolConfig::default(),
+            env_config.clone(),
+            crate::dns::DnsCache::new(crate::dns::DnsConfig::default()),
+            None,
+            Arc::new(Vec::new()),
+        )
+    }
+
     /// Connect to a WebSocket backend using production dialer settings that
     /// are relevant to unit tests.
     pub async fn connect_websocket_backend_for_test(
@@ -4463,14 +4477,13 @@ pub mod _test_support {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let env_config = crate::config::EnvConfig::default();
-        let crls: crate::tls::CrlList = Arc::new(Vec::new());
+        let tls_configs = websocket_backend_tls_configs_for_test(&env_config);
         let handshake = crate::proxy::connect_websocket_backend(
             backend_url,
             proxy,
             &env_config,
             &[],
-            None,
-            &crls,
+            &tls_configs,
             65_536,
             262_144,
             4_096,
@@ -4764,7 +4777,7 @@ pub mod _test_support {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let env_config = crate::config::EnvConfig::default();
-        let crls: crate::tls::CrlList = Arc::new(Vec::new());
+        let tls_configs = websocket_backend_tls_configs_for_test(&env_config);
         let client_headers: Vec<(String, String)> = if client_subprotocols.is_empty() {
             Vec::new()
         } else {
@@ -4778,8 +4791,7 @@ pub mod _test_support {
             proxy,
             &env_config,
             &client_headers,
-            None,
-            &crls,
+            &tls_configs,
             65_536,
             262_144,
             4_096,

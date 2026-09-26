@@ -19,8 +19,8 @@ use x509_parser::extensions::{GeneralName, ParsedExtension};
 use crate::config::types::{BackendTlsConfig, Proxy, validate_backend_tls_san_allow_list_entry};
 use crate::tls::san::ip_addr_from_san_bytes;
 use crate::tls::source::{
-    CertSource, CertSourceUri, MaterialError, MaterialKind, SourceScheme, TlsSourceExecutor,
-    load_material_blocking,
+    CertSource, CertSourceUri, MaterialError, MaterialKind, SourceScheme, TlsSourceAdmission,
+    TlsSourceExecutor, load_material_blocking,
 };
 use crate::tls::{
     NoVerifier, TlsPolicy, backend_client_config_builder, build_server_verifier_with_crls,
@@ -226,6 +226,14 @@ impl OwnedBackendTlsConfigInputs {
 /// hung local syscall (for example a file read on a wedged mount) wedges that
 /// key until a backend TLS / CRL reload or a restart.
 ///
+/// Fast failures (a missing file, a malformed PEM) are never cached. A failure
+/// that held its executor slot for at least the per-source budget `D` (a
+/// remote provider that is down and times out) is remembered for `D`: misses
+/// for that key fail closed immediately with the same error class instead of
+/// starting another slot-holding build, so a dead source cannot keep the
+/// shared executor saturated. [`Self::clear`] (backend TLS / CRL reload) drops
+/// every such backoff.
+///
 /// [`TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER`]:
 /// crate::tls::source::TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER
 #[derive(Clone, Default)]
@@ -239,6 +247,23 @@ pub struct BackendTlsConfigCache {
     /// insert, so a config built from pre-reload inputs cannot outlive the
     /// reload in the cache.
     clear_epoch: Arc<AtomicU64>,
+    /// Keys whose last build failed after holding an executor slot for at
+    /// least the per-source budget, with the time a new build may start.
+    slow_failures: Arc<DashMap<String, SlowBackendTlsFailure>>,
+}
+
+/// Backoff left behind by a build that failed slowly (see
+/// [`BackendTlsConfigCache`]).
+struct SlowBackendTlsFailure {
+    retry_at: tokio::time::Instant,
+    error: Arc<TlsError>,
+}
+
+/// What one executor-run build hands back to its publisher: the build result
+/// and how long it held its executor slot.
+struct TimedBackendTlsBuild {
+    result: Result<ClientConfig, TlsError>,
+    held: std::time::Duration,
 }
 
 /// Failure published to the waiters of a queued build that a backend TLS /
@@ -291,19 +316,53 @@ struct PendingBackendTlsPublisher {
     pending_builds: Arc<DashMap<String, Arc<PendingBackendTlsBuild>>>,
     clear_epoch: Arc<AtomicU64>,
     started_epoch: u64,
+    slow_failures: Arc<DashMap<String, SlowBackendTlsFailure>>,
+    /// Per-source budget: a failure that held its slot this long backs the
+    /// key off for the same span.
+    slow_failure_backoff: std::time::Duration,
     key: String,
     pending: Arc<PendingBackendTlsBuild>,
     published: bool,
 }
 
 impl PendingBackendTlsPublisher {
-    fn publish(mut self, outcome: Result<Result<ClientConfig, TlsError>, MaterialError>) {
+    fn publish(mut self, outcome: Result<TimedBackendTlsBuild, MaterialError>) {
         let outcome = match outcome {
-            Ok(Ok(config)) => Ok(self.insert(Arc::new(config))),
-            Ok(Err(error)) => Err(Arc::new(error)),
+            Ok(TimedBackendTlsBuild {
+                result: Ok(config),
+                ..
+            }) => {
+                self.slow_failures.remove(&self.key);
+                Ok(self.insert(Arc::new(config)))
+            }
+            Ok(TimedBackendTlsBuild {
+                result: Err(error),
+                held,
+            }) => {
+                let error = Arc::new(error);
+                if held >= self.slow_failure_backoff {
+                    self.record_slow_failure(&error);
+                }
+                Err(error)
+            }
             Err(error) => Err(Arc::new(backend_tls_executor_error(error))),
         };
         self.finish(outcome);
+    }
+
+    /// Back the key off before the pending entry is retired, so a caller that
+    /// no longer finds this build in flight finds the backoff instead. Checked
+    /// under the entry guard like [`Self::insert`], so a failure from inputs a
+    /// [`BackendTlsConfigCache::clear`] superseded is not remembered.
+    fn record_slow_failure(&self, error: &Arc<TlsError>) {
+        let entry = self.slow_failures.entry(self.key.clone());
+        if self.clear_epoch.load(Ordering::Acquire) != self.started_epoch {
+            return;
+        }
+        entry.insert(SlowBackendTlsFailure {
+            retry_at: tokio::time::Instant::now() + self.slow_failure_backoff,
+            error: Arc::clone(error),
+        });
     }
 
     /// Same insert contract as [`BackendTlsConfigCache::get_or_try_build`]:
@@ -383,6 +442,7 @@ impl BackendTlsConfigCache {
             retirement: Arc::new(NumericSvidRetirement::default()),
             pending: Arc::new(DashMap::with_shard_amount(shards)),
             clear_epoch: Arc::new(AtomicU64::new(0)),
+            slow_failures: Arc::new(DashMap::with_shard_amount(shards)),
         }
     }
 
@@ -398,15 +458,18 @@ impl BackendTlsConfigCache {
         self.retirement.any.store(true, Ordering::Release);
         let matcher = SvidGenerationMatcher::new(generation);
         self.configs.retain(|key, _| !matcher.matches(key));
+        self.slow_failures.retain(|key, _| !matcher.matches(key));
     }
 
     pub fn clear(&self) {
         // Epoch first: an in-flight build that registered before this clear
         // must not re-insert a config built from the pre-clear inputs. Then
-        // retire pending entries so later callers start a fresh build.
+        // retire pending entries so later callers start a fresh build, and
+        // drop slow-failure backoffs so the reloaded inputs are tried at once.
         self.clear_epoch.fetch_add(1, Ordering::AcqRel);
         self.pending.clear();
         self.configs.clear();
+        self.slow_failures.clear();
     }
 
     /// Keep only configs whose keys are in `live`.
@@ -416,6 +479,7 @@ impl BackendTlsConfigCache {
     /// retained; the request path never scans this map.
     pub fn retain_keys(&self, live: &HashSet<String>) {
         self.configs.retain(|key, _| live.contains(key));
+        self.slow_failures.retain(|key, _| live.contains(key));
     }
 
     #[allow(dead_code)] // exercised from unit tests
@@ -504,7 +568,29 @@ impl BackendTlsConfigCache {
         }
         let executor = crate::tls::source::effective_tls_source_executor()
             .map_err(backend_tls_executor_error)?;
-        Box::pin(self.build_or_join(executor, key, prepare)).await
+        Box::pin(self.build_or_join(executor, TlsSourceAdmission::RequestPath, key, prepare)).await
+    }
+
+    /// Warm `key` ahead of the first request (config load / reload).
+    ///
+    /// Same single-flight, insert, and backoff rules as [`Self::get_or_build`],
+    /// but the build is admitted as [`TlsSourceAdmission::Background`], so a
+    /// burst of prebuilds cannot take the executor slots reserved for cold
+    /// request-path builds. The caller's wait is bounded by the executor
+    /// deadline like any other; a build that outlives it still caches.
+    pub async fn prebuild<P, F>(&self, key: String, prepare: P) -> Result<(), TlsError>
+    where
+        P: FnOnce() -> F,
+        F: FnOnce() -> Result<ClientConfig, TlsError> + Send + 'static,
+    {
+        if self.configs.contains_key(&key) {
+            return Ok(());
+        }
+        let executor = crate::tls::source::effective_tls_source_executor()
+            .map_err(backend_tls_executor_error)?;
+        Box::pin(self.build_or_join(executor, TlsSourceAdmission::Background, key, prepare))
+            .await
+            .map(|_| ())
     }
 
     /// [`Self::get_or_build`] against an explicit executor. Production uses the
@@ -520,10 +606,27 @@ impl BackendTlsConfigCache {
         P: FnOnce() -> F,
         F: FnOnce() -> Result<ClientConfig, TlsError> + Send + 'static,
     {
+        self.get_or_build_with_admission(executor, TlsSourceAdmission::RequestPath, key, prepare)
+            .await
+    }
+
+    /// [`Self::get_or_build_with_executor`] under an explicit admission class
+    /// ([`Self::prebuild`] uses [`TlsSourceAdmission::Background`]).
+    pub async fn get_or_build_with_admission<P, F>(
+        &self,
+        executor: &TlsSourceExecutor,
+        admission: TlsSourceAdmission,
+        key: String,
+        prepare: P,
+    ) -> Result<Arc<ClientConfig>, TlsError>
+    where
+        P: FnOnce() -> F,
+        F: FnOnce() -> Result<ClientConfig, TlsError> + Send + 'static,
+    {
         if let Some(existing) = self.configs.get(&key) {
             return Ok(existing.clone());
         }
-        Box::pin(self.build_or_join(executor.clone(), key, prepare)).await
+        Box::pin(self.build_or_join(executor.clone(), admission, key, prepare)).await
     }
 
     /// Number of single-flight builds currently in flight.
@@ -532,9 +635,32 @@ impl BackendTlsConfigCache {
         self.pending.len()
     }
 
+    /// Whether `key` is backing off after a slow failure.
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn is_backing_off(&self, key: &str) -> bool {
+        self.slow_failures
+            .get(key)
+            .is_some_and(|failure| tokio::time::Instant::now() < failure.retry_at)
+    }
+
+    /// The remembered error while `key` backs off after a slow failure. An
+    /// expired backoff is removed so the caller starts a fresh build.
+    fn slow_failure_backoff(&self, key: &str) -> Option<TlsError> {
+        let now = tokio::time::Instant::now();
+        let failure = self.slow_failures.get(key)?;
+        if now < failure.retry_at {
+            return Some(failure.error.duplicate());
+        }
+        drop(failure);
+        self.slow_failures
+            .remove_if(key, |_, failure| now >= failure.retry_at);
+        None
+    }
+
     async fn build_or_join<P, F>(
         &self,
         executor: TlsSourceExecutor,
+        admission: TlsSourceAdmission,
         key: String,
         prepare: P,
     ) -> Result<Arc<ClientConfig>, TlsError>
@@ -546,6 +672,11 @@ impl BackendTlsConfigCache {
             backend_tls_pool_key_has_svid_field(&key),
             "BackendTlsConfigCache::get_or_build requires the key to be tagged with `|svidg=...`; call append_backend_svid_generation_key_field before this entry point"
         );
+        // A key whose source just failed slowly fails closed at once rather
+        // than holding another executor slot for the full budget.
+        if let Some(error) = self.slow_failure_backoff(&key) {
+            return Err(error);
+        }
         // This caller's total budget, queue time included. The build itself is
         // not bound by it: see `run_blocking_result_to_completion`.
         let wait_deadline = tokio::time::Instant::now() + executor.deadline();
@@ -573,6 +704,8 @@ impl BackendTlsConfigCache {
                     pending_builds: Arc::clone(&self.pending),
                     clear_epoch: Arc::clone(&self.clear_epoch),
                     started_epoch,
+                    slow_failures: Arc::clone(&self.slow_failures),
+                    slow_failure_backoff: executor.deadline(),
                     key,
                     pending: Arc::clone(&pending),
                     published: false,
@@ -584,19 +717,32 @@ impl BackendTlsConfigCache {
                 let clear_epoch = Arc::clone(&self.clear_epoch);
                 tokio::spawn(async move {
                     let outcome = executor
-                        .run_blocking_result_to_completion(move || {
+                        .run_blocking_result_to_completion_with(admission, move || {
                             // Admission can queue behind other builds. If a
                             // reload landed meanwhile, this build's result can
                             // no longer be cached, so give the slot back to
                             // fresh builds instead of running it.
                             if clear_epoch.load(Ordering::Acquire) != started_epoch {
-                                return Err(TlsError::Rustls(
-                                    RELOAD_CANCELLED_BUILD_DETAILS.to_string(),
-                                ));
+                                return Ok::<_, std::convert::Infallible>(TimedBackendTlsBuild {
+                                    result: Err(TlsError::Rustls(
+                                        RELOAD_CANCELLED_BUILD_DETAILS.to_string(),
+                                    )),
+                                    held: std::time::Duration::ZERO,
+                                });
                             }
-                            build()
+                            let started = std::time::Instant::now();
+                            let result = build();
+                            Ok(TimedBackendTlsBuild {
+                                result,
+                                held: started.elapsed(),
+                            })
                         })
                         .await;
+                    let outcome = match outcome {
+                        Ok(Ok(timed)) => Ok(timed),
+                        Ok(Err(never)) => match never {},
+                        Err(error) => Err(error),
+                    };
                     publisher.publish(outcome);
                 });
             }

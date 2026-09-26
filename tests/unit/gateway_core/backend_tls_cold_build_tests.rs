@@ -8,12 +8,15 @@
 //! build that straddles a cache clear (CRL / backend TLS reload). Waiters are
 //! bounded by the executor deadline; the build runs under a larger but still
 //! bounded background budget, and a late success is cached for the next
-//! request.
+//! request. A build that fails only after holding its executor slot for the
+//! whole per-source budget backs its key off, and background work can never
+//! take the executor slots reserved for request-path builds.
 
 use ferrum_edge::tls::backend::{BackendTlsConfigCache, TlsError};
 use ferrum_edge::tls::source::{
-    MaterialError, TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER, TlsSourceExecutor,
-    remaining_tls_source_operation_budget, resolve_on_tls_source_runtime_for_test,
+    MaterialError, TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER, TlsSourceAdmission,
+    TlsSourceExecutor, remaining_tls_source_operation_budget,
+    resolve_on_tls_source_runtime_for_test, tls_source_request_path_reserved_permits,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -817,4 +820,331 @@ fn backend_pool_managers_never_build_tls_synchronously() {
             "{path} must build cold backend TLS configs through get_or_build"
         );
     }
+}
+
+/// Build that holds its executor slot for `held`, then fails the way a remote
+/// provider that is down does.
+fn slow_failing_build(held: Duration) -> TestBuild {
+    Box::new(move || -> BuildResult {
+        std::thread::sleep(held);
+        Err(TlsError::Rustls(
+            "remote source deadline exceeded".to_string(),
+        ))
+    })
+}
+
+/// Wait until no build is in flight, bounded by [`RELEASE_TIMEOUT`].
+async fn wait_until_idle(cache: &BackendTlsConfigCache) {
+    tokio::time::timeout(RELEASE_TIMEOUT, async {
+        while cache.pending_builds() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the background build must publish");
+}
+
+/// A build that failed only after holding its executor slot for the whole
+/// per-source budget (a remote source that is down) backs its key off for one
+/// budget: misses in that window fail closed at once with the same error class
+/// and start no build, and the first miss after it builds again.
+#[tokio::test(flavor = "current_thread")]
+async fn slow_failure_backs_the_key_off_for_one_budget() {
+    const BUDGET: Duration = Duration::from_millis(200);
+
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(2, BUDGET);
+    let prepares = Arc::new(AtomicUsize::new(0));
+
+    let first_prepares = Arc::clone(&prepares);
+    let first = cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+            first_prepares.fetch_add(1, Ordering::SeqCst);
+            slow_failing_build(BUDGET + Duration::from_millis(50))
+        })
+        .await;
+    assert!(
+        matches!(first, Err(TlsError::Rustls(_))),
+        "the waiter fails closed at the budget"
+    );
+    wait_until_idle(&cache).await;
+    assert!(
+        cache.is_backing_off(STATIC_KEY),
+        "a failure that held the slot for the whole budget must back the key off"
+    );
+
+    let backed_off_prepares = Arc::clone(&prepares);
+    let started = std::time::Instant::now();
+    let backed_off = cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+            backed_off_prepares.fetch_add(1, Ordering::SeqCst);
+            ok_build()
+        })
+        .await;
+    match backed_off {
+        Err(TlsError::Rustls(details)) => assert!(
+            details.contains("remote source deadline exceeded"),
+            "the backoff must answer with the remembered failure: {details}"
+        ),
+        Err(other) => panic!("the failure class must be preserved, got {other}"),
+        Ok(_) => panic!("a key backing off must fail closed"),
+    }
+    assert!(
+        started.elapsed() < BUDGET,
+        "a backed-off miss must fail at once, not wait out the budget"
+    );
+    assert_eq!(
+        prepares.load(Ordering::SeqCst),
+        1,
+        "no build may start while the key backs off"
+    );
+    assert_eq!(cache.pending_builds(), 0);
+
+    tokio::time::sleep(BUDGET + Duration::from_millis(50)).await;
+    assert!(!cache.is_backing_off(STATIC_KEY));
+    let retry_prepares = Arc::clone(&prepares);
+    cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+            retry_prepares.fetch_add(1, Ordering::SeqCst);
+            ok_build()
+        })
+        .await
+        .expect("the first miss after the backoff builds again");
+    assert_eq!(prepares.load(Ordering::SeqCst), 2);
+    assert!(cache.contains_key(STATIC_KEY));
+    assert!(!cache.is_backing_off(STATIC_KEY));
+}
+
+/// A backend TLS / CRL reload drops slow-failure backoffs so the reloaded
+/// inputs are tried on the next miss.
+#[tokio::test(flavor = "current_thread")]
+async fn clear_drops_slow_failure_backoff() {
+    const BUDGET: Duration = Duration::from_millis(100);
+
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(2, BUDGET);
+    let _ = cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), || {
+            slow_failing_build(BUDGET + Duration::from_millis(20))
+        })
+        .await;
+    wait_until_idle(&cache).await;
+    assert!(cache.is_backing_off(STATIC_KEY));
+
+    cache.clear();
+    assert!(!cache.is_backing_off(STATIC_KEY));
+    cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), ok_build)
+        .await
+        .expect("a miss after the reload builds at once");
+    assert!(cache.contains_key(STATIC_KEY));
+}
+
+/// Parks a blocking closure until `release` is set, bounded by
+/// [`RELEASE_TIMEOUT`].
+fn park_until(release: &AtomicBool) {
+    let deadline = std::time::Instant::now() + RELEASE_TIMEOUT;
+    while !release.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Background work (refreshes, reconcile, prebuilds) can fill only its share
+/// of the executor: with every background slot parked, a cold request-path
+/// build is still admitted at once instead of queueing behind them.
+#[tokio::test(flavor = "current_thread")]
+async fn background_work_cannot_take_the_reserved_request_path_slots() {
+    assert_eq!(tls_source_request_path_reserved_permits(1), 0);
+    assert_eq!(tls_source_request_path_reserved_permits(2), 1);
+    assert_eq!(tls_source_request_path_reserved_permits(8), 2);
+
+    let executor = test_executor(4, Duration::from_secs(5));
+    assert_eq!(executor.background_blocking_concurrency(), 3);
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+
+    // One more background operation than background may run at once.
+    let background: Vec<_> = (0..4)
+        .map(|_| {
+            let executor = executor.clone();
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let operation = move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                park_until(&release);
+                Ok::<_, ()>(())
+            };
+            tokio::spawn(async move {
+                executor
+                    .run_blocking_result_to_completion_with(
+                        TlsSourceAdmission::Background,
+                        operation,
+                    )
+                    .await
+            })
+        })
+        .collect();
+    tokio::time::timeout(RELEASE_TIMEOUT, async {
+        while started.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("background work fills its share");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        3,
+        "background work must not run past its share"
+    );
+    assert_eq!(
+        executor.available_blocking_permits(),
+        1,
+        "the reserved slot stays free"
+    );
+
+    let request = tokio::time::timeout(
+        Duration::from_secs(1),
+        executor.run_blocking_result_to_completion(|| Ok::<_, ()>(7_u8)),
+    )
+    .await
+    .expect("a request-path build must be admitted while background work is parked")
+    .expect("request-path operation");
+    assert_eq!(request, Ok(7));
+
+    release.store(true, Ordering::SeqCst);
+    for task in background {
+        task.await
+            .expect("background task")
+            .expect("background operation")
+            .expect("background result");
+    }
+    assert_eq!(started.load(Ordering::SeqCst), 4);
+}
+
+/// `run_blocking` (runtime refreshes) is background work: with the background
+/// share parked it waits for admission and fails closed at its deadline
+/// rather than taking the reserved request-path slot.
+#[tokio::test(flavor = "current_thread")]
+async fn deadline_bound_refresh_work_is_admitted_as_background() {
+    let executor = test_executor(2, Duration::from_millis(100));
+    let release = Arc::new(AtomicBool::new(false));
+    let (started_tx, started_rx) = oneshot::channel();
+    let parked = tokio::spawn({
+        let executor = executor.clone();
+        let release = Arc::clone(&release);
+        async move {
+            executor
+                .run_blocking_result_to_completion_with(TlsSourceAdmission::Background, move || {
+                    let _ = started_tx.send(());
+                    park_until(&release);
+                    Ok::<_, ()>(())
+                })
+                .await
+        }
+    });
+    started_rx.await.expect("background operation started");
+
+    let refresh = executor.run_blocking(|| Ok(())).await;
+    assert!(
+        matches!(refresh, Err(MaterialError::DeadlineExceeded)),
+        "refresh work must not take the reserved slot"
+    );
+    assert_eq!(executor.available_blocking_permits(), 1);
+
+    release.store(true, Ordering::SeqCst);
+    parked
+        .await
+        .expect("parked task")
+        .expect("parked operation")
+        .expect("parked result");
+}
+
+/// A prebuild is admitted as background work, so with the background share
+/// busy it cannot start, while a request-path miss for another key still can.
+#[tokio::test(flavor = "current_thread")]
+async fn prebuild_admission_leaves_the_reserved_slot_to_requests() {
+    const OTHER_KEY: &str = "ca=|cert=|key=|sni=other|san=|verify=1|svidg=static";
+
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(2, Duration::from_millis(200));
+    let release = Arc::new(AtomicBool::new(false));
+    let (started_tx, started_rx) = oneshot::channel();
+    let parked = tokio::spawn({
+        let executor = executor.clone();
+        let release = Arc::clone(&release);
+        async move {
+            executor
+                .run_blocking_result_to_completion_with(TlsSourceAdmission::Background, move || {
+                    let _ = started_tx.send(());
+                    park_until(&release);
+                    Ok::<_, ()>(())
+                })
+                .await
+        }
+    });
+    started_rx.await.expect("background operation started");
+
+    let prebuilt = Arc::new(AtomicBool::new(false));
+    let prebuild_ran = Arc::clone(&prebuilt);
+    let prebuild = cache
+        .get_or_build_with_admission(
+            &executor,
+            TlsSourceAdmission::Background,
+            OTHER_KEY.to_string(),
+            move || -> TestBuild {
+                Box::new(move || -> BuildResult {
+                    prebuild_ran.store(true, Ordering::SeqCst);
+                    Ok(test_client_config())
+                })
+            },
+        )
+        .await;
+    assert!(prebuild.is_err(), "the prebuild waits for a background slot");
+    assert!(!prebuilt.load(Ordering::SeqCst));
+
+    cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), ok_build)
+        .await
+        .expect("a request-path miss uses the reserved slot");
+    assert!(cache.contains_key(STATIC_KEY));
+
+    release.store(true, Ordering::SeqCst);
+    parked
+        .await
+        .expect("parked task")
+        .expect("parked operation")
+        .expect("parked result");
+    wait_until_cached(&cache, OTHER_KEY).await;
+    assert!(prebuilt.load(Ordering::SeqCst));
+}
+
+/// WebSocket (`wss://`) backends take their rustls config from the cached,
+/// executor-backed `ConnectionPool` lookup instead of building one on the
+/// Tokio worker for every upgrade.
+#[test]
+fn websocket_backend_dial_never_builds_tls_synchronously() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let start = source
+        .find("pub(crate) async fn connect_websocket_backend(")
+        .expect("the WebSocket backend dialer must remain present");
+    let body = &source[start..];
+    let end = body
+        .find("\n}\n")
+        .expect("the WebSocket backend dialer must end");
+    let body = &body[..end];
+    assert!(
+        body.contains(".get_websocket_tls_config_for_backend(proxy)"),
+        "the WebSocket dialer must use the cached backend TLS config"
+    );
+    for forbidden in ["BackendTlsConfigBuilder", "build_rustls", "get_or_try_build"] {
+        assert!(
+            !body.contains(forbidden),
+            "the WebSocket dialer must not build TLS on the worker ({forbidden})"
+        );
+    }
+    assert!(
+        !source.contains("fn build_websocket_tls_connector"),
+        "the per-upgrade synchronous connector builder must stay removed"
+    );
 }

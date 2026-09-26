@@ -32,8 +32,36 @@ static TLS_MAX_MATERIAL_SIZE_BYTES: OnceLock<usize> = OnceLock::new();
 #[derive(Clone)]
 pub struct TlsSourceExecutor {
     blocking_limit: Arc<Semaphore>,
+    /// Admission gate for background work (refreshes, reconcile fingerprints,
+    /// prebuilds). It holds [`Self::background_blocking_concurrency`] permits,
+    /// and background work takes one of them before a `blocking_limit` permit,
+    /// so background work can never occupy the slots reserved for cold
+    /// request-path backend TLS builds.
+    background_limit: Arc<Semaphore>,
     max_blocking_concurrency: usize,
     deadline: Duration,
+}
+
+/// Which admission budget a [`TlsSourceExecutor`] operation draws from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsSourceAdmission {
+    /// A cold backend TLS config build a request is waiting on. Draws only
+    /// from the shared process-wide budget, including the reserved slots.
+    RequestPath,
+    /// Refreshes, reconcile work, and prebuilds. Capped below the process-wide
+    /// budget so the reserved request-path slots stay free.
+    Background,
+}
+
+/// Slots of `max_blocking_concurrency` that background work can never take:
+/// a quarter of the budget, at least one whenever the budget is at least two.
+/// A budget of one has nothing to split, so both classes share that slot.
+pub fn tls_source_request_path_reserved_permits(max_blocking_concurrency: usize) -> usize {
+    if max_blocking_concurrency < 2 {
+        0
+    } else {
+        (max_blocking_concurrency / 4).max(1)
+    }
 }
 
 static TLS_SOURCE_EXECUTION_POLICY: OnceLock<TlsSourceExecutor> = OnceLock::new();
@@ -895,8 +923,11 @@ impl TlsSourceExecutor {
                 details: "TLS source execution policy is outside the supported bounds".to_string(),
             });
         }
+        let background_permits = max_blocking_concurrency
+            - tls_source_request_path_reserved_permits(max_blocking_concurrency);
         Ok(Self {
             blocking_limit: Arc::new(Semaphore::new(max_blocking_concurrency)),
+            background_limit: Arc::new(Semaphore::new(background_permits)),
             max_blocking_concurrency,
             deadline,
         })
@@ -917,6 +948,11 @@ impl TlsSourceExecutor {
     /// Variant that preserves a caller-owned error type. This lets TLS
     /// rebuild closures run on the same executor without flattening their
     /// validation diagnostics into an executor failure.
+    ///
+    /// Every caller of this deadline-bound form is background work (runtime
+    /// refreshes and reconcile), so it is admitted under
+    /// [`TlsSourceAdmission::Background`] and cannot take the slots reserved
+    /// for cold request-path backend TLS builds.
     pub async fn run_blocking_result<T, E, F>(
         &self,
         operation: F,
@@ -927,14 +963,12 @@ impl TlsSourceExecutor {
         F: FnOnce() -> Result<T, E> + Send + 'static,
     {
         let deadline = tokio::time::Instant::now() + self.deadline;
-        let permit =
-            tokio::time::timeout_at(deadline, Arc::clone(&self.blocking_limit).acquire_owned())
-                .await
-                .map_err(|_| MaterialError::DeadlineExceeded)?
-                .map_err(|_| MaterialError::ExecutorUnavailable)?;
+        let permits = tokio::time::timeout_at(deadline, self.admit(TlsSourceAdmission::Background))
+            .await
+            .map_err(|_| MaterialError::DeadlineExceeded)??;
         let operation_deadline = std::time::Instant::now() + self.deadline;
         let task = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let _permits = permits;
             let _deadline = TlsSourceOperationDeadline::enter(operation_deadline);
             operation()
         });
@@ -957,6 +991,9 @@ impl TlsSourceExecutor {
     /// what remains of that operation deadline (see
     /// [`remaining_tls_source_operation_budget`]). Local blocking syscalls are
     /// not interruptible and are not bounded by either.
+    ///
+    /// Admitted as [`TlsSourceAdmission::RequestPath`]; see
+    /// [`Self::run_blocking_result_to_completion_with`] for the background form.
     pub async fn run_blocking_result_to_completion<T, E, F>(
         &self,
         operation: F,
@@ -966,13 +1003,27 @@ impl TlsSourceExecutor {
         E: Send + 'static,
         F: FnOnce() -> Result<T, E> + Send + 'static,
     {
-        let permit = Arc::clone(&self.blocking_limit)
-            .acquire_owned()
+        self.run_blocking_result_to_completion_with(TlsSourceAdmission::RequestPath, operation)
             .await
-            .map_err(|_| MaterialError::ExecutorUnavailable)?;
+    }
+
+    /// [`Self::run_blocking_result_to_completion`] under an explicit admission
+    /// class. Prebuilds use [`TlsSourceAdmission::Background`] so a burst of
+    /// them after a config load cannot take the reserved request-path slots.
+    pub async fn run_blocking_result_to_completion_with<T, E, F>(
+        &self,
+        admission: TlsSourceAdmission,
+        operation: F,
+    ) -> Result<Result<T, E>, MaterialError>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce() -> Result<T, E> + Send + 'static,
+    {
+        let permits = self.admit(admission).await?;
         let operation_deadline = std::time::Instant::now() + self.background_build_deadline();
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let _permits = permits;
             let _deadline = TlsSourceOperationDeadline::enter(operation_deadline);
             operation()
         })
@@ -980,10 +1031,49 @@ impl TlsSourceExecutor {
         .map_err(|_| MaterialError::ExecutorUnavailable)
     }
 
+    /// Acquire the permits `admission` needs. Background work takes its
+    /// class permit first and only then a process-wide one, so it never holds
+    /// a process-wide slot while queued and can never occupy more than
+    /// [`Self::background_blocking_concurrency`] of them.
+    async fn admit(
+        &self,
+        admission: TlsSourceAdmission,
+    ) -> Result<TlsSourcePermits, MaterialError> {
+        let background = match admission {
+            TlsSourceAdmission::RequestPath => None,
+            TlsSourceAdmission::Background => Some(
+                Arc::clone(&self.background_limit)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| MaterialError::ExecutorUnavailable)?,
+            ),
+        };
+        let blocking = Arc::clone(&self.blocking_limit)
+            .acquire_owned()
+            .await
+            .map_err(|_| MaterialError::ExecutorUnavailable)?;
+        Ok(TlsSourcePermits {
+            _blocking: blocking,
+            _background: background,
+        })
+    }
+
     /// Process-wide blocking admission bound. Reinstall equality uses this
     /// getter so the bin target and tests share one reader.
     pub fn max_blocking_concurrency(&self) -> usize {
         self.max_blocking_concurrency
+    }
+
+    /// Process-wide slots background work may occupy: the whole budget minus
+    /// [`tls_source_request_path_reserved_permits`].
+    pub fn background_blocking_concurrency(&self) -> usize {
+        self.max_blocking_concurrency
+            - tls_source_request_path_reserved_permits(self.max_blocking_concurrency)
+    }
+
+    /// Process-wide slots currently free, for tests that pin the reservation.
+    pub fn available_blocking_permits(&self) -> usize {
+        self.blocking_limit.available_permits()
     }
 
     pub fn deadline(&self) -> Duration {
@@ -997,6 +1087,14 @@ impl TlsSourceExecutor {
         let multiplier = TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER;
         self.deadline.saturating_mul(multiplier)
     }
+}
+
+/// Permits one admitted executor operation holds until its blocking closure
+/// returns. Dropped inside the blocking task, so a timed-out waiter cannot
+/// release capacity while the abandoned operation still runs.
+struct TlsSourcePermits {
+    _blocking: tokio::sync::OwnedSemaphorePermit,
+    _background: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Install the immutable process-wide TLS source execution policy.

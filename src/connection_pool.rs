@@ -12,7 +12,7 @@
 
 use crate::backend_conn_limit::ReqwestConnectionAdmission;
 use crate::config::PoolConfig;
-use crate::config::types::{GatewayConfig, Proxy};
+use crate::config::types::{DispatchKind, GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
@@ -47,6 +47,10 @@ struct ReqwestPoolManager {
     /// Caching them is what lets a cold build that outlives the requests
     /// waiting on it serve the next pool miss instead of being discarded.
     backend_reqwest_tls_configs: BackendTlsConfigCache,
+    /// rustls configs for `wss://` backend upgrades, keyed by TLS identity.
+    /// No ALPN is advertised on this transport, so the configs cannot be
+    /// shared with the ALPN-bearing caches above.
+    backend_ws_tls_configs: BackendTlsConfigCache,
     backend_svid_generation: BackendSvidGeneration,
     workload_svid_cert_path: Option<String>,
     /// Shared DestinationRule `connectionPool.tcp.maxConnections` admission
@@ -402,6 +406,7 @@ impl ConnectionPool {
             crls,
             backend_h3_tls_configs: BackendTlsConfigCache::with_shards(shards),
             backend_reqwest_tls_configs: BackendTlsConfigCache::with_shards(shards),
+            backend_ws_tls_configs: BackendTlsConfigCache::with_shards(shards),
             backend_svid_generation,
             workload_svid_cert_path,
             reqwest_conn_admission: std::sync::OnceLock::new(),
@@ -448,9 +453,9 @@ impl ConnectionPool {
         self.pool.manager().tls_config_cache_key_owned(proxy)
     }
 
-    /// Drop H3 and reqwest TLS configs whose identity is no longer in
-    /// `config`. Cold-path only (config publication); live TLS identities are
-    /// retained.
+    /// Drop H3, reqwest, and WebSocket TLS configs whose identity is no longer
+    /// in `config`. Cold-path only (config publication); live TLS identities
+    /// are retained.
     pub fn retain_live_tls_configs_from_config(&self, config: &GatewayConfig) {
         let manager = self.pool.manager();
         let mut live_tls_keys = HashSet::with_capacity(config.proxies.len());
@@ -461,9 +466,54 @@ impl ConnectionPool {
             live_reqwest_tls_keys.insert(manager.reqwest_tls_config_cache_key_owned(proxy, false));
         }
         manager.backend_h3_tls_configs.retain_keys(&live_tls_keys);
+        manager.backend_ws_tls_configs.retain_keys(&live_tls_keys);
         manager
             .backend_reqwest_tls_configs
             .retain_keys(&live_reqwest_tls_keys);
+    }
+
+    /// Warm the reqwest TLS configs a first HTTPS request needs, ahead of
+    /// that request (config load / reload).
+    ///
+    /// Covers every `HttpsPool` proxy, in the ALPN variant its effective pool
+    /// settings select. Builds run on the TLS source executor under background
+    /// admission, so they neither block a Tokio worker nor take the executor
+    /// slots reserved for request-path cold builds; identities that are
+    /// already cached, in flight, or backing off after a slow failure are not
+    /// rebuilt. Failures are logged and left to the request path, which still
+    /// fails closed.
+    pub async fn prebuild_tls_configs_from_config(&self, config: &GatewayConfig) {
+        let manager = self.pool.manager();
+        let mut seen = HashSet::new();
+        let mut builds = Vec::new();
+        for proxy in &config.proxies {
+            if proxy.dispatch_kind != DispatchKind::HttpsPool {
+                continue;
+            }
+            let enable_http2 = manager.global_config.effective_enable_http2(proxy);
+            let key = manager.reqwest_tls_config_cache_key_owned(proxy, enable_http2);
+            if manager.backend_reqwest_tls_configs.contains_key(&key) {
+                continue;
+            }
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let inputs = manager.backend_tls_inputs(proxy);
+            let build = move || inputs.builder().build_rustls_for_reqwest(enable_http2);
+            builds.push(async move {
+                let result = manager
+                    .backend_reqwest_tls_configs
+                    .prebuild(key, move || build)
+                    .await;
+                if let Err(error) = result {
+                    tracing::debug!(
+                        error = %error,
+                        "Backend TLS config prebuild failed; the first request retries it"
+                    );
+                }
+            });
+        }
+        futures_util::future::join_all(builds).await;
     }
 
     #[allow(dead_code)] // exercised from unit tests
@@ -534,6 +584,35 @@ impl ConnectionPool {
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))
     }
 
+    /// TLS configuration for `wss://` backend upgrades.
+    ///
+    /// Cached per TLS identity like the H3 config, so a WebSocket burst reuses
+    /// one `ClientConfig` instead of reading CA/client material per upgrade. A
+    /// miss is built once on the bounded TLS source executor (see
+    /// [`BackendTlsConfigCache::get_or_build`]) with the pool's live CRL
+    /// generation; concurrent misses await it and fail closed at the executor
+    /// deadline.
+    pub async fn get_websocket_tls_config_for_backend(
+        &self,
+        proxy: &Proxy,
+    ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
+        let manager = self.pool.manager();
+        manager
+            .backend_ws_tls_configs
+            .get_or_build(manager.tls_config_cache_key_owned(proxy), || {
+                let inputs = manager.backend_tls_inputs(proxy);
+                move || inputs.builder().build_rustls()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to build WebSocket backend TLS config: {}", e))
+    }
+
+    /// WebSocket-side counterpart of [`Self::backend_tls_config_cache`].
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn backend_websocket_tls_config_cache(&self) -> &BackendTlsConfigCache {
+        &self.pool.manager().backend_ws_tls_configs
+    }
+
     /// Owned, boxed form of [`Self::get_tls_config_for_backend`] for H3
     /// dispatch closures that cannot borrow the request's `Proxy`.
     ///
@@ -558,12 +637,16 @@ impl ConnectionPool {
         manager
             .backend_reqwest_tls_configs
             .drain_svid_generation(generation);
+        manager
+            .backend_ws_tls_configs
+            .drain_svid_generation(generation);
     }
 
     pub fn clear_backend_tls_config_cache(&self) {
         let manager = self.pool.manager();
         manager.backend_h3_tls_configs.clear();
         manager.backend_reqwest_tls_configs.clear();
+        manager.backend_ws_tls_configs.clear();
     }
 
     pub fn force_drain_svid_generation(&self, generation: u64) {
