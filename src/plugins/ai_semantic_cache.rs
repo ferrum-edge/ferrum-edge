@@ -1294,6 +1294,23 @@ impl AiSemanticCache {
         staging_metadata_key(self.instance_id, suffix)
     }
 
+    /// Seal `headers` verbatim (no store-side sanitization) into a Redis
+    /// envelope and run it through L2 hit admission, modelling an entry
+    /// persisted under an older header policy. Returns the status and headers
+    /// a hit would serve, or `None` when admission refuses the entry.
+    #[allow(dead_code)]
+    pub(crate) fn admit_sealed_redis_hit_for_tests(
+        &self,
+        redis_key: &str,
+        status_code: u16,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<(u16, HashMap<String, String>)> {
+        let entry = self.seal_redis_entry(redis_key, status_code, headers, body)?;
+        let hit = self.admit_redis_hit(entry, redis_key)?;
+        Some((hit.status_code, hit.headers))
+    }
+
     fn set_cache_status(&self, ctx: &mut RequestContext, status: &str) {
         if status == "HIT" {
             ctx.semantic_cache_response_replay = true;

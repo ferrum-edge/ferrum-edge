@@ -1,5 +1,6 @@
 use ferrum_edge::plugins::RequestContext;
 use ferrum_edge::plugins::utils::auth_flow::ExtractedCredential;
+use ferrum_edge::plugins::utils::cache_headers::{is_sensitive_header, sanitize_cached_headers};
 use ferrum_edge::plugins::utils::cert_hash::{sha256_base64url_no_pad, sha256_hex_lower};
 use ferrum_edge::plugins::utils::claim_resolver::{
     extract_claim_string, extract_claim_string_exact, extract_claim_values, parse_claim_path_value,
@@ -26,6 +27,7 @@ use ferrum_edge::startup::render_startup_error;
 use ferrum_edge::util::unknown_keys::reject_unknown_keys;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
+use std::collections::HashMap;
 
 #[test]
 fn unknown_key_diagnostics_keep_sorted_suggestions_when_rendered() {
@@ -1802,4 +1804,79 @@ fn openai_sse_reassembly_is_unaffected_by_anthropic_support() {
     let responses = fragment(&texts, "$.output[0].content[0].text");
     assert_eq!(responses.kind, SseTextKind::ResponsesText);
     assert_eq!(responses.text, "lo");
+}
+
+#[test]
+fn cached_header_sanitizer_strips_non_x_ratelimit_families_case_insensitively() {
+    // The IETF-draft `RateLimit` combined field and the split `RateLimit-*`
+    // fields carry the original response's remaining quota and relative reset.
+    // Storing or replaying them would make every later cache hit report a
+    // stale budget (e.g. back off on `remaining=0` long after the upstream
+    // quota recovered).
+    let mut headers = HashMap::new();
+    headers.insert("RateLimit-Remaining".to_string(), "0".to_string());
+    headers.insert("RateLimit-Reset".to_string(), "60".to_string());
+    headers.insert("ratelimit-limit".to_string(), "100".to_string());
+    headers.insert("rAtElImIt".to_string(), "\"api\";r=0;t=60".to_string());
+    headers.insert(
+        "RateLimit-Policy".to_string(),
+        "\"api\";q=100;w=60;pk=:dXNlci1h:".to_string(),
+    );
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let sanitized = sanitize_cached_headers(&headers);
+    for name in [
+        "RateLimit-Remaining",
+        "RateLimit-Reset",
+        "ratelimit-limit",
+        "rAtElImIt",
+        "RateLimit-Policy",
+    ] {
+        assert!(
+            !sanitized.contains_key(name),
+            "{name} must not be stored or replayed from a cache entry"
+        );
+    }
+    assert_eq!(
+        sanitized.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert_eq!(sanitized.len(), 1);
+}
+
+#[test]
+fn cached_header_sanitizer_ratelimit_match_is_bounded_and_keeps_existing_families() {
+    // Both rate-limit families (legacy `X-RateLimit-*` and IETF `RateLimit*`)
+    // plus the pre-existing sensitive headers stay stripped.
+    for name in [
+        "RATELIMIT",
+        "RateLimit-Policy",
+        "X-RateLimit-Remaining",
+        "x-ratelimit-reset",
+        "X-RateLimit-Policy",
+        "anthropic-ratelimit-tokens-remaining",
+        "x-ai-ratelimit-usage",
+        "Set-Cookie",
+        "Authorization",
+        "Retry-After",
+        "traceparent",
+    ] {
+        assert!(is_sensitive_header(name), "{name} should be stripped");
+    }
+
+    // Ordinary application/representation headers and near-miss names that
+    // merely contain the token are retained.
+    for name in [
+        "content-type",
+        "cache-control",
+        "etag",
+        "x-app-version",
+        "ratelimited-by",
+        "ratelimits",
+        "x-ratelimited-by",
+        "x-ai-cache-status",
+        "my-ratelimit-remaining",
+    ] {
+        assert!(!is_sensitive_header(name), "{name} should be kept");
+    }
 }

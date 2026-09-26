@@ -418,6 +418,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shrinking the limit until that window rolls out; backend failures, the
   recovery-cohort barrier, and in-flight accounting are unchanged, and
   compatible reloads keep the learned windows.
+- `request_deduplication` and `ai_semantic_cache` no longer store or replay
+  the IETF-draft rate-limit headers: the combined `RateLimit` field and every
+  `RateLimit-*` field (`-Limit`, `-Remaining`, `-Reset`, `-Policy`) are now
+  stripped case-insensitively alongside the `X-RateLimit-*` family, both before
+  storage and when an existing entry is replayed, so a cache hit no longer
+  reports the original response's stale quota or reset (#5788).
 
 ### Security
 
