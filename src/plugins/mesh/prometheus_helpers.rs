@@ -367,6 +367,9 @@ impl GrpcMessageFraming {
 /// never buffered, and text framing holds at most one partial base64 group.
 /// gRPC-Web framing counts only frames without the trailer flag bit. Base64 the
 /// scanner cannot decode stops counting for the rest of the body.
+/// Completed-message increments use `Release`, matching the buffered
+/// `fetch_max` writer, so the `Acquire` readers that emit the metric observe
+/// every count published before the body finished.
 #[derive(Clone, Debug, Default)]
 pub struct GrpcLengthPrefixedScanner {
     framing: GrpcMessageFraming,
@@ -484,7 +487,7 @@ impl GrpcLengthPrefixedScanner {
 
     fn finish_frame(&self, messages: &AtomicU64) {
         if self.frame_is_message {
-            messages.fetch_add(1, Ordering::Relaxed);
+            messages.fetch_add(1, Ordering::Release);
         }
     }
 }
