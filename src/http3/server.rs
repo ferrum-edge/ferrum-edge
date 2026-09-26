@@ -33,8 +33,7 @@ use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
 use super::peer_identity::{
-    H3ConnectionIdentity, quic_max_early_data_size, server_0rtt_handshake_succeeded,
-    zero_rtt_admitted,
+    H3ConnectionIdentity, ZeroRttCompletion, quic_max_early_data_size, zero_rtt_admitted,
 };
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
@@ -1411,6 +1410,23 @@ where
     }
 }
 
+/// Publish the 0.5-RTT handshake outcome the accept loop observed.
+fn publish_h3_zero_rtt_completion(
+    peer_identity: &H3ConnectionIdentity,
+    connection: &quinn::Connection,
+    remote: SocketAddr,
+    zero_rtt_accepted: bool,
+) {
+    let handshake_succeeded = peer_identity.publish_zero_rtt_completion(
+        zero_rtt_accepted,
+        connection.close_reason().is_none(),
+        || quinn_peer_cert_chain(connection),
+    );
+    if !handshake_succeeded {
+        debug!("HTTP/3 handshake did not complete from {} (0-RTT path)", remote);
+    }
+}
+
 /// Extract the peer certificate chain from a fully handshaken QUIC connection.
 ///
 /// Quinn returns `peer_identity()` as `Box<dyn Any>` containing
@@ -1732,13 +1748,18 @@ async fn handle_h3_connection(
     // snapshot, so the early-data flag and the peer certificate can never be
     // observed out of step. Starts with NO identity and `is_early_data = true`;
     // the post-handshake identity is published exactly once after successful
-    // handshake completion and after already-ready early streams are accepted.
+    // handshake completion.
     let peer_identity = Arc::new(H3ConnectionIdentity::pre_handshake());
-    // On the 0.5-RTT branch the completion task reports handshake outcome back
-    // to the request accept loop. That loop polls ready request streams first,
-    // so buffered early data is snapshotted before a successful handshake can
-    // publish the established identity and clear replay gating.
-    let mut handshake_completion_rx = None;
+    // On the 0.5-RTT branch the accept loop owns quinn's handshake-completion
+    // signal itself (issue #5761). Each accepted request stream re-reads it
+    // synchronously, so a stream is early data exactly when quinn handed it out
+    // before the handshake completed — never because a completion wake-up had
+    // not been scheduled yet.
+    let mut handshake_completion: ZeroRttCompletion<quinn::ZeroRttAccepted> =
+        ZeroRttCompletion::resolved();
+    // Dropped as soon as the accept loop observes the handshake outcome (or the
+    // connection task ends), which releases the 0.5-RTT handshake watchdog.
+    let mut handshake_watchdog: Option<tokio::sync::oneshot::Sender<()>> = None;
 
     // Bound the QUIC handshake so a peer that completes the UDP path-MTU
     // probe / Initial packets but never finishes TLS 1.3 cannot hold a
@@ -1760,50 +1781,37 @@ async fn handle_h3_connection(
                 let remote =
                     crate::util::client_identity::canonical_socket_addr(conn.remote_address());
                 debug!("HTTP/3 0-RTT connection accepted from {}", remote);
-                // Spawn a task that waits for the handshake to complete, then
-                // reports the outcome to the accept loop. The accept loop owns
-                // identity publication so it can drain every already-ready
-                // early request before clearing the replay flag. Requests
-                // dispatched after publication see `is_early_data = false`
-                // together with the established identity; requests dispatched
-                // before it keep seeing the pre-handshake snapshot, which
-                // carries no identity at all.
+                // The accept loop observes handshake completion and publishes
+                // the established identity; see `ZeroRttCompletion` for why it
+                // must not be relayed through another task. Requests accepted
+                // after publication see `is_early_data = false` together with
+                // the established identity; requests accepted before it keep
+                // the pre-handshake snapshot, which carries no identity at all.
+                handshake_completion = ZeroRttCompletion::pending(zero_rtt_accepted);
                 // The handshake bound also applies here: if the peer never
-                // completes TLS, the ZeroRttAccepted future never resolves and
-                // the connection would otherwise sit consuming a slot forever.
-                // Closing the connection on timeout fails any in-flight 0.5-RTT
-                // streams and deliberately leaves the slot pre-handshake — a
-                // failed or cancelled handshake must never expose an identity.
-                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-                handshake_completion_rx = Some(completion_rx);
-                let conn_for_close = conn.clone();
-                tokio::spawn(async move {
-                    let handshake_succeeded =
-                        match await_with_optional_timeout(zero_rtt_accepted, handshake_timeout)
+                // completes TLS, the completion signal never fires and the
+                // connection would otherwise sit consuming a slot forever. The
+                // watchdog closes it unless the accept loop observed the
+                // outcome first. Closing fails any in-flight 0.5-RTT streams
+                // and deliberately leaves the slot pre-handshake — a failed or
+                // cancelled handshake must never expose an identity.
+                if !handshake_timeout.is_zero() {
+                    let (outcome_observed, watchdog_released) = tokio::sync::oneshot::channel();
+                    handshake_watchdog = Some(outcome_observed);
+                    let conn_for_close = conn.clone();
+                    tokio::spawn(async move {
+                        if tokio::time::timeout(handshake_timeout, watchdog_released)
                             .await
+                            .is_err()
                         {
-                            Ok(zero_rtt_accepted) => server_0rtt_handshake_succeeded(
-                                zero_rtt_accepted,
-                                conn_for_close.close_reason().is_none(),
-                            ),
-                            Err(_elapsed) => {
-                                warn!(
-                                    "HTTP/3 handshake timed out from {} after {:?} (0-RTT path)",
-                                    remote, handshake_timeout
-                                );
-                                conn_for_close
-                                    .close(quinn::VarInt::from_u32(0), b"handshake timeout");
-                                false
-                            }
-                        };
-                    let _ = completion_tx.send(handshake_succeeded);
-                    if !handshake_succeeded {
-                        debug!(
-                            "HTTP/3 handshake did not complete from {} (0-RTT path)",
-                            remote
-                        );
-                    }
-                });
+                            warn!(
+                                "HTTP/3 handshake timed out from {} after {:?} (0-RTT path)",
+                                remote, handshake_timeout
+                            );
+                            conn_for_close.close(quinn::VarInt::from_u32(0), b"handshake timeout");
+                        }
+                    });
+                }
                 conn
             }
             Err(connecting) => {
@@ -1851,8 +1859,8 @@ async fn handle_h3_connection(
     // established snapshot (identity + `is_early_data = false`) is installed
     // before the accept loop can hand a single stream to a request task. The
     // 0-RTT branch deliberately does NOT publish here — its completion signal
-    // is consumed in the accept loop after already-ready early streams.
-    if handshake_completion_rx.is_none() {
+    // is observed by the accept loop, per accepted stream.
+    if !handshake_completion.is_pending() {
         peer_identity.publish_handshake_result(true, quinn_peer_cert_chain(&connection));
     }
     // Fail-closed live-verifier fence (issue #3857): even if this Incoming
@@ -1991,11 +1999,12 @@ async fn handle_h3_connection(
     let mut keepalive_pressure_rx = state.overload.subscribe_keepalive_pressure();
 
     loop {
-        // A QUIC early-data request and the TLS Connected event can become
-        // ready in the same scheduler turn. Poll request acceptance first so a
-        // buffered replayable stream snapshots the pre-handshake state. Only
-        // after accept is Pending may successful handshake completion publish
-        // the established identity for later 1-RTT streams.
+        // Issue #5761: on a 0.5-RTT connection, handshake completion is polled
+        // ahead of request acceptance so an already-fired signal is published
+        // before the next stream is taken. That ordering alone is not the
+        // classification guarantee — completion can land between the two
+        // polls — so every accepted stream also re-reads the signal below
+        // (`accepted_stream_snapshot`) before it is classified.
         // Issue #3857: a trust withdrawal must stop this connection from
         // admitting further request streams without waiting for the client to
         // reconnect. Racing it here means an idle multiplexed connection is torn
@@ -2006,60 +2015,32 @@ async fn handle_h3_connection(
         // keeps this loop running until `accept()` returns `Ok(None)` so
         // already-accepted streams finish. Dropping `h3_conn` here would close
         // with H3_NO_ERROR immediately and truncate in-flight work.
-        let (accepted, handshake_succeeded, send_goaway) = if let Some(completion_rx) =
-            handshake_completion_rx.as_mut()
-        {
-            tokio::select! {
-                biased;
-                accepted = h3_conn.accept() => {
-                    (Some(accepted), None, None)
-                }
-                completed = completion_rx => {
-                    (None, Some(completed.unwrap_or_default()), None)
-                }
-                _ = async {
-                    match client_trust_session.as_ref() {
-                        Some(session) => session.retired().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    close_h3_connection_for_trust_withdrawal(
-                        &quinn_conn,
-                        canonical_peer,
-                    );
-                    break;
-                }
-                _ = shutdown_rx.changed(), if !h3_goaway_sent => {
-                    (None, None, Some(H3GoawayTrigger::Shutdown))
-                }
-                _ = h3_keepalive_pressure_raised(&mut keepalive_pressure_rx), if !h3_goaway_sent => {
-                    (None, None, Some(H3GoawayTrigger::KeepalivePressure))
-                }
+        let handshake_pending = handshake_completion.is_pending();
+        let (accepted, zero_rtt_outcome, send_goaway) = tokio::select! {
+            biased;
+            zero_rtt_accepted = handshake_completion.outcome(), if handshake_pending => {
+                (None, Some(zero_rtt_accepted), None)
             }
-        } else {
-            tokio::select! {
-                biased;
-                accepted = h3_conn.accept() => {
-                    (Some(accepted), None, None)
+            accepted = h3_conn.accept() => {
+                (Some(accepted), None, None)
+            }
+            _ = async {
+                match client_trust_session.as_ref() {
+                    Some(session) => session.retired().await,
+                    None => std::future::pending().await,
                 }
-                _ = async {
-                    match client_trust_session.as_ref() {
-                        Some(session) => session.retired().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    close_h3_connection_for_trust_withdrawal(
-                        &quinn_conn,
-                        canonical_peer,
-                    );
-                    break;
-                }
-                _ = shutdown_rx.changed(), if !h3_goaway_sent => {
-                    (None, None, Some(H3GoawayTrigger::Shutdown))
-                }
-                _ = h3_keepalive_pressure_raised(&mut keepalive_pressure_rx), if !h3_goaway_sent => {
-                    (None, None, Some(H3GoawayTrigger::KeepalivePressure))
-                }
+            } => {
+                close_h3_connection_for_trust_withdrawal(
+                    &quinn_conn,
+                    canonical_peer,
+                );
+                break;
+            }
+            _ = shutdown_rx.changed(), if !h3_goaway_sent => {
+                (None, None, Some(H3GoawayTrigger::Shutdown))
+            }
+            _ = h3_keepalive_pressure_raised(&mut keepalive_pressure_rx), if !h3_goaway_sent => {
+                (None, None, Some(H3GoawayTrigger::KeepalivePressure))
             }
         };
 
@@ -2081,14 +2062,14 @@ async fn handle_h3_connection(
             break;
         }
 
-        if let Some(handshake_succeeded) = handshake_succeeded {
-            handshake_completion_rx = None;
-            let peer_certs = if handshake_succeeded {
-                quinn_peer_cert_chain(&quinn_conn)
-            } else {
-                None
-            };
-            peer_identity.publish_handshake_result(handshake_succeeded, peer_certs);
+        if let Some(zero_rtt_accepted) = zero_rtt_outcome {
+            drop(handshake_watchdog.take());
+            publish_h3_zero_rtt_completion(
+                &peer_identity,
+                &quinn_conn,
+                canonical_peer,
+                zero_rtt_accepted,
+            );
             continue;
         }
 
@@ -2133,13 +2114,28 @@ async fn handle_h3_connection(
                 let state = Arc::clone(&state);
                 let frontend_sni_hostname = frontend_sni_hostname.clone();
                 let socket_ip = Arc::clone(&socket_ip);
-                // Take ONE lock-free identity snapshot NOW — before spawning
-                // the task — so the early-data flag and the peer certificate
-                // this stream sees come from the same point in the connection
-                // lifecycle. A single `ArcSwap::load_full()`: no lock, no
-                // allocation beyond the refcount bumps the per-request cert
-                // handles already cost.
-                let identity = peer_identity.snapshot();
+                // Issue #5761: classify this stream from the handshake state at
+                // the instant quinn accepted it. While the completion signal is
+                // still pending, one non-blocking re-poll here closes the window
+                // in which a 1-RTT stream arriving with the client's `Finished`
+                // is accepted before the select above observed completion; a
+                // signal still pending now proves the stream was opened in
+                // 0-RTT. Then take ONE lock-free identity snapshot — before
+                // spawning the task — so the early-data flag and the peer
+                // certificate this stream sees come from the same point in the
+                // connection lifecycle. A single `ArcSwap::load_full()`: no
+                // lock, no allocation beyond the refcount bumps the per-request
+                // cert handles already cost.
+                let identity = peer_identity
+                    .accepted_stream_snapshot(
+                        &mut handshake_completion,
+                        || quinn_conn.close_reason().is_none(),
+                        || quinn_peer_cert_chain(&quinn_conn),
+                    )
+                    .await;
+                if !handshake_completion.is_pending() {
+                    drop(handshake_watchdog.take());
+                }
                 let cert = identity.client_cert_der.clone();
                 let chain = identity.client_cert_chain_der.clone();
                 let mtls_auth_connection_cache = identity.mtls_auth_connection_cache.clone();

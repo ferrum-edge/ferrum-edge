@@ -1028,16 +1028,33 @@ accepted 0-RTT requests the gateway forwards `Early-Data: 1` to the backend
 (same shim as plain H3 / cross-protocol bridge) so origins can apply their own
 replay-safety policy.
 
+A request counts as early data only when quinn accepted its stream before the
+TLS handshake completed. With early data enabled every H3 connection is taken
+through `into_0rtt()`, including clients that send no 0-RTT data at all, so
+the classification is made per stream, not per connection. Quinn processes no
+1-RTT packet before the handshake completes, so a stream it accepted
+mid-handshake was opened by 0-RTT data. A request sent after the handshake —
+including one that arrives in the same flight as the client's `Finished`, the
+usual case for a resumed client that sends no 0-RTT — is never answered
+`425 Too Early` and never forwarded with `Early-Data: 1`. A genuine 0-RTT
+request stays classified as early data for its whole life, even after the
+handshake completes.
+
 Peer identity and early data are published as one per-connection snapshot
 (`http3::peer_identity::H3ConnectionIdentity`, an `ArcSwap` slot read once
 per accepted request stream). The slot starts with `is_early_data = true`
-and **no** client certificate, and is republished exactly once — when the
-handshake-completion future resolves successfully and after the accept loop
-has snapshotted every already-ready request stream — with whatever peer
-certificate quinn can then report and `is_early_data = false`. Accept polling
-is biased ahead of handshake publication so a buffered early-data request
-cannot be reclassified as 1-RTT merely because both events become ready in the
-same scheduler turn. An early-data request therefore can never gain an mTLS
+and **no** client certificate, and is republished exactly once — when quinn's
+handshake-completion signal reports success on a still-open connection — with
+whatever peer certificate quinn can then report and `is_early_data = false`.
+The accept loop owns that signal itself (`ZeroRttCompletion`) rather than
+hearing about it from another task: quinn fires it in the same connection-state
+lock hold that completes the handshake, and the accept loop re-polls it without
+waiting right after each stream is accepted and before that stream's snapshot
+is taken. The re-poll is one atomic check of a oneshot, made only while the
+handshake is still pending. It takes no lock and allocates nothing. A separate
+watchdog task enforces `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` on this
+path and closes a connection whose handshake outcome the accept loop has not
+observed in time. An early-data request therefore can never gain an mTLS
 identity, and a handshake that fails, times out, or is cancelled leaves the
 slot empty and early-data-gated. Because slots are per connection, no other
 connection's identity can be observed through them.
