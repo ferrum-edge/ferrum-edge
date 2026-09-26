@@ -116,6 +116,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a `body_error_class`. For example, a relay whose workload port has no
   listener records `connection_refused`. Socket-error endings also log a
   warning, sampled to at most one per 10 seconds.
+- An Ambient mesh proxy whose node-agent registry directory is missing now
+  says so, repeatedly (#5766). `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`
+  defaults to `/run/ferrum/node-waypoint-pods` and is authoritative for the
+  inbound HBONE relay even when no node agent runs, so every declared
+  destination is refused; previously the only signal was one generic warning
+  at startup. The warning now names the directory, says whether it is missing
+  (no node agent has published it) or present but incomplete, tells the
+  operator to run the node agent or clear the variable, and repeats every 60
+  seconds while the registry stays unavailable, with the consecutive failed
+  polls and elapsed seconds. Refusal stays the default. The configuration
+  reference documents that the default is authoritative without a node agent.
 - A Gateway API HTTPRoute `RequestRedirect` whose `path.type:
   ReplacePrefixMatch` sets an empty `replacePrefixMatch` (strip the matched
   prefix) now loads on the data plane (#5752). The translator emitted an empty

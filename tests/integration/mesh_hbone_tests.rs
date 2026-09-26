@@ -33,7 +33,8 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::enrolled_destinations::{
     EnrolledPodEntry, NodeLocalEnrolledDestinations, NodeLocalEnrolledDestinationsHandle,
-    NodeLocalEnrolledDestinationsManager,
+    NodeLocalEnrolledDestinationsManager, REGISTRY_UNAVAILABLE_WARN_INTERVAL,
+    registry_unavailable_warning_due,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::modes::mesh::{
@@ -3827,6 +3828,175 @@ fn inbound_relay_registry_unsafe_oversized_or_symlinked_entry_retracts_then_reco
         Err(InboundRelayDenial::AddressNotTerminated),
         "a missing registry directory must retract rather than retain last-good"
     );
+}
+
+/// Captures formatted tracing output for the registry-diagnostic tests below.
+#[derive(Clone, Default)]
+struct RegistryLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl RegistryLogs {
+    fn warn_lines(&self, needle: &str) -> Vec<String> {
+        let bytes = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|line| line.contains("WARN") && line.contains(needle))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+impl std::io::Write for RegistryLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RegistryLogs {
+    type Writer = RegistryLogs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn capture_registry_logs() -> (RegistryLogs, tracing::subscriber::DefaultGuard) {
+    let logs = RegistryLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(logs.clone())
+        .finish();
+    (logs, tracing::subscriber::set_default(subscriber))
+}
+
+/// Issue #5766: the unavailable-registry warning fires on the first failed
+/// poll and then once per `REGISTRY_UNAVAILABLE_WARN_INTERVAL`, never per poll.
+#[test]
+fn registry_unavailable_warning_is_rate_limited_to_the_repeat_interval() {
+    let poll = std::time::Duration::from_secs(2);
+    let every = REGISTRY_UNAVAILABLE_WARN_INTERVAL.as_secs() / poll.as_secs();
+    assert_eq!(every, 30, "fixture assumes 60s at a 2s cadence");
+
+    assert!(!registry_unavailable_warning_due(0, poll));
+    assert!(registry_unavailable_warning_due(1, poll));
+    for consecutive in 2..=every {
+        assert!(
+            !registry_unavailable_warning_due(consecutive, poll),
+            "poll {consecutive} is inside the repeat interval"
+        );
+    }
+    assert!(registry_unavailable_warning_due(every + 1, poll));
+    assert!(!registry_unavailable_warning_due(every + 2, poll));
+    assert!(registry_unavailable_warning_due(2 * every + 1, poll));
+
+    // A poll interval at or beyond the repeat interval warns every poll, and a
+    // zero interval cannot divide by zero.
+    assert!(registry_unavailable_warning_due(
+        2,
+        REGISTRY_UNAVAILABLE_WARN_INTERVAL
+    ));
+    assert!(registry_unavailable_warning_due(
+        3,
+        std::time::Duration::from_secs(120)
+    ));
+    assert!(!registry_unavailable_warning_due(
+        2,
+        std::time::Duration::ZERO
+    ));
+}
+
+/// Issue #5766: an Ambient proxy with the default registry directory and no
+/// node agent refuses every declared relay destination (fail closed, by
+/// design). That state must be loud: the warning names the missing directory
+/// and the node agent, repeats while the directory stays missing, and a later
+/// node-agent publication recovers.
+#[test]
+fn registry_missing_directory_warns_with_path_and_node_agent_and_repeats() {
+    let root = tempfile::tempdir().expect("registry root");
+    let registry = root.path().join("node-waypoint-pods");
+    let rendered_path = registry.display().to_string();
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    let poll = std::time::Duration::from_secs(2);
+    let manager = NodeLocalEnrolledDestinationsManager::new(
+        Arc::new(DirectoryCaptureSource::new(&registry)),
+        index.clone(),
+        poll,
+    )
+    .with_registry_dir(&registry);
+
+    let (logs, _guard) = capture_registry_logs();
+    let missing = "registry directory does not exist";
+
+    assert!(manager.reconcile_once().is_empty());
+    let first = logs.warn_lines(missing);
+    assert_eq!(first.len(), 1, "the first failed poll warns: {first:?}");
+    assert!(
+        first[0].contains(&rendered_path),
+        "the warning names the registry directory: {}",
+        first[0]
+    );
+    assert!(first[0].contains("node agent"), "{}", first[0]);
+    assert!(first[0].contains("FERRUM_MODE=node_agent"), "{}", first[0]);
+    assert!(
+        first[0].contains("FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR"),
+        "the warning names the opt-out: {}",
+        first[0]
+    );
+    assert!(
+        !index.terminates_for(ip("10.244.5.5"), None, None),
+        "fail closed stays the default"
+    );
+
+    let every = REGISTRY_UNAVAILABLE_WARN_INTERVAL.as_secs() / poll.as_secs();
+    for _ in 1..every {
+        assert!(manager.reconcile_once().is_empty());
+    }
+    assert_eq!(
+        logs.warn_lines(missing).len(),
+        1,
+        "polls inside the repeat interval stay quiet"
+    );
+    assert!(manager.reconcile_once().is_empty());
+    assert_eq!(
+        logs.warn_lines(missing).len(),
+        2,
+        "a registry that stays missing re-warns once per interval"
+    );
+    assert_eq!(manager.consecutive_unavailable_polls(), every + 1);
+
+    // A node agent publishes the directory: the index publishes and recovery
+    // is announced once.
+    std::fs::create_dir(&registry).expect("node agent publishes the registry");
+    let own_spiffe = reviews_spiffe();
+    write_strict_registry_entry(&registry, LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
+    assert_eq!(manager.reconcile_once().len(), 1);
+    assert_eq!(manager.consecutive_unavailable_polls(), 0);
+    assert_eq!(logs.warn_lines("registry recovered").len(), 1);
+    assert!(index.terminates_for(ip("10.244.5.5"), None, None));
+
+    // A present-but-malformed registry is a different failure and says so,
+    // without claiming the node agent is missing.
+    std::fs::write(registry.join("bad name"), "x").expect("unsafe entry");
+    assert!(manager.reconcile_once().is_empty());
+    let malformed = logs.warn_lines("snapshot is incomplete or malformed");
+    assert_eq!(malformed.len(), 1, "{malformed:?}");
+    assert!(malformed[0].contains(&rendered_path), "{}", malformed[0]);
+    assert_eq!(logs.warn_lines(missing).len(), 2);
+    assert!(!index.terminates_for(ip("10.244.5.5"), None, None));
 }
 
 /// Issue #4249, the `Sidecar` half. A Sidecar shares the application pod's
