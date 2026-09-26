@@ -26,7 +26,9 @@
 
 #![cfg(unix)]
 
-use crate::common::{GatewayChildGuard, SpawnedGatewayIdentity};
+use crate::common::{
+    GatewayChildGuard, SpawnedGatewayIdentity, pin_gateway_command_rust_log,
+};
 use crate::scaffolding::port_registry::TestSocket;
 use crate::scaffolding::ports::{
     REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY, reserve_refused_tcp_port,
@@ -335,6 +337,7 @@ fn spawn_gateway(
         )
         .env("FERRUM_LOG_LEVEL", "info")
         .stdin(std::process::Stdio::null());
+    pin_gateway_command_rust_log(&mut cmd, "info");
     // Deliberately no `configure_coverage_gateway_command`: it pins the drain
     // to 0, and the drain window is what these tests measure.
     GatewayChildGuard::spawn_with_identity(
@@ -870,8 +873,7 @@ async fn test_inflight_request_completes_during_drain() {
     backend.wait_for_arrival().await;
 
     gateway.send_sigterm();
-    // Drain has provably begun once the accept loop is gone; only then may the
-    // held response proceed.
+    // The accept loop is gone; only then may the held response proceed.
     gateway.expect_proxy_port_closed("after SIGTERM").await;
     backend.release();
 
@@ -1426,7 +1428,17 @@ async fn spawn_fake_peer(kind: FakePeer) -> (SocketAddr, JoinHandle<()>) {
 /// that shows the listener closing without the drain flags set cannot pass it.
 #[test]
 fn harness_drain_begun_wait_requires_the_gateway_log_line() {
-    let logged = format!("INFO ferrum_edge::overload: {SHUTDOWN_DRAIN_BEGUN_LOG} phase=drain\n");
+    assert!(
+        !SHUTDOWN_DRAIN_BEGUN_LOG.contains(['"', '\\'])
+    );
+    let logged = format!(
+        concat!(
+            r#"{{"timestamp":"...","level":"INFO","fields":{{"message":""#,
+            "{}",
+            r#" phase=drain"}},"target":"ferrum_edge::overload"}}"#,
+        ),
+        SHUTDOWN_DRAIN_BEGUN_LOG
+    );
     assert!(output_shows_drain_begun(&logged));
     assert!(!output_shows_drain_begun(
         "INFO Proxy listener shutting down\n"

@@ -215,9 +215,8 @@ shares.
   has begun: the drain flags are set only after every listener task returns
   (issue #5821). Before you assert drain-flag behaviour from a real process,
   wait for `overload::SHUTDOWN_DRAIN_BEGUN_LOG` (`expect_drain_begun`). A hyper
-  client closes an idle connection
-  once its last `SendRequest` drops; keep the sender alive when asserting that
-  the server closed it.
+  client closes an idle connection once its last `SendRequest` drops; keep the
+  sender alive when asserting that the server closed it.
 - Readiness is not identity — and that applies to bespoke spawners too, not just `TestGateway`. `functional_websocket_test.rs::wait_for_owned_gateway` reuses the exported `probe_gateway_identity` because a bare TCP accept let a foreign H2 fixture answer (and `PROTOCOL_ERROR`-reset) an RFC 8441 Extended CONNECT handshake (issue #3435).
 - `TestGateway` mints a per-spawn-attempt admin JWT secret/issuer and `FERRUM_METRICS_BEARER_TOKEN`, and its spawn barrier requires the authenticated detail tier of `/health` plus `ready: true`; that combination is also the proof the child owns its proxy port, because `ready` flips only after every listener bind. Do not weaken it to an unauthenticated `/health` or a bare TCP accept, and do not add sleeps or test-level retries in its place.
 - Use a struct harness with `try_new()` retry wrapper or a `start_gateway_with_retry()` helper.
