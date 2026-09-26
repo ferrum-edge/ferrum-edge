@@ -47780,7 +47780,7 @@ pub(crate) fn buffered_response_body_for_test(
         grpc_request_is_web_translated,
     );
     let allowed = buffered_response_carries_backend_trailers(&ctx, is_head, status);
-    let trailers = Some(Box::new(trailers)).filter(|_| relayable && allowed);
+    let trailers = (relayable && allowed).then_some(Box::new(trailers));
     buffered_response_body(data, trailers, governor, "test")
 }
 
