@@ -2140,6 +2140,78 @@ async fn chained_governor_cut_sends_its_same_chunk_release_through_later_inspect
     }
 }
 
+/// An earlier chained inspector that clears the bytes before a `!` and
+/// defers its cut, as a chained `ai_semantic_firewall` does.
+struct DeferCutAtBang {
+    deferred: Option<Option<bytes::Bytes>>,
+}
+
+const CUT_BY_EARLIER: &[u8] = b"event: error\ndata: earlier\n\n";
+
+#[async_trait::async_trait]
+impl ResponseStreamInspector for DeferCutAtBang {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let Some(at) = chunk.iter().position(|&byte| byte == b'!') else {
+            return ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk));
+        };
+        self.deferred = Some(Some(bytes::Bytes::from_static(CUT_BY_EARLIER)));
+        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(&chunk[..at]))
+    }
+
+    fn has_deferred_cut(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    fn take_deferred_cut(&mut self, _client_line_open: bool) -> Option<bytes::Bytes> {
+        self.deferred.take().flatten()
+    }
+}
+
+#[tokio::test]
+async fn governor_after_a_deferred_cut_drops_its_pending_batch_ungoverned() {
+    // An earlier inspector clears a content frame and the start of an
+    // approval-required tool call, then defers its cut in the same chunk. The
+    // governor forwards the content frame and holds the call, which the cut
+    // truncates: in the chain's flush for the cut it drops that call without
+    // governing it, so no approval webhook runs and none of its frames leave.
+    use ferrum_edge::plugins::chain_response_stream_inspectors;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "tools": { "danger": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()) },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    let ctx = create_test_context();
+    let governor = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let cutter: Box<dyn ResponseStreamInspector> = Box::new(DeferCutAtBang { deferred: None });
+    let mut chain = chain_response_stream_inspectors(vec![cutter, governor]).expect("chain");
+
+    // The tool call's frame is cleared; its finish frame is past the cut.
+    let call_end = DENIED_TOOL_CALL.find("\n\n").expect("frame end") + 2;
+    let (pending_call, finish) = DENIED_TOOL_CALL.split_at(call_end);
+    let chunk = format!("{CONTENT_FRAME}{pending_call}!{finish}");
+    let action = chain.on_chunk(chunk.as_bytes()).await;
+    let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+        panic!("the deferred cut ends the stream");
+    };
+    let expected = [CONTENT_FRAME.as_bytes(), CUT_BY_EARLIER].concat();
+    assert_eq!(final_bytes, expected);
+    assert!(
+        !String::from_utf8_lossy(&final_bytes).contains("danger"),
+        "the truncated tool call never leaves"
+    );
+    server.verify().await;
+}
+
 #[tokio::test]
 async fn streaming_inspector_only_for_event_stream_2xx() {
     let plugin = make(streaming_config(

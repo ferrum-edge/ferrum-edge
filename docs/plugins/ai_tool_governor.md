@@ -65,7 +65,25 @@ the batch clears — so an allowed multi-choice stream is never reordered, and a
 denied one cannot leak content that arrived after the held call. With
 multi-choice (`n > 1`) streams, a batch is finalized only once **every** choice
 holding tool calls has reported a `finish_reason` (or the stream ends), and
-later tool-call deltas form a new, independently governed batch. The plugin detects `"stream": true`
+later tool-call deltas form a new, independently governed batch.
+
+When other stream-inspecting plugins (such as `ai_semantic_firewall`) run on
+the same response, they are chained, and each cut is framed after what the
+client actually received. A governor that is **not** the last stream inspector
+never puts frames it cleared into its cut: when the chunk that completes a
+denied batch also carries content frames it cleared ahead of that batch, it
+forwards those frames and defers its cut. The chain runs them through every
+later stream inspector, then sends what they released followed by the deny
+event (or just ends the stream when `response.streaming_deny_event` is off);
+if a later inspector cuts on those frames, its cut wins. Conversely, when an
+**earlier** stream inspector defers a cut and the governor follows it, the
+governor inspects the bytes that inspector cleared, but at the cut it drops a
+tool-call batch still pending, a partial event, or a body held in full
+**without governing it**: the truncated call triggers no approval webhook and
+no decision metadata, and none of its held frames are released. Only frames it
+already cleared reach the client ahead of that cut.
+
+The plugin detects `"stream": true`
 in JSON POST bodies and prefers the reqwest dispatch path for those requests.
 Inspection itself is dispatch-arm-independent: reqwest, direct HTTP/2, and
 native HTTP/3 streaming responses all drive the same inspector chain, including

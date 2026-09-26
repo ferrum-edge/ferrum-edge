@@ -6124,3 +6124,80 @@ async fn observability_only_configs_do_not_claim_the_final_request_representatio
         enforcing.enforces_final_request_body_policy(&other_scope, &other_headers, b"{}");
     assert!(!out_of_scope);
 }
+
+// ─── A deferred cut ahead of the A2A inspector (#5826) ───────────────────
+
+use ferrum_edge::plugins::{ResponseStreamInspector, chain_response_stream_inspectors};
+
+/// An earlier chained inspector that clears the bytes before a `!` and defers
+/// its cut, as a chained `ai_semantic_firewall` does.
+struct DeferCutAtBang {
+    deferred: Option<Option<Bytes>>,
+}
+
+#[async_trait::async_trait]
+impl ResponseStreamInspector for DeferCutAtBang {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let Some(at) = chunk.iter().position(|&byte| byte == b'!') else {
+            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+        };
+        self.deferred = Some(Some(Bytes::from_static(b"CUT")));
+        ResponseStreamAction::Forward(Bytes::copy_from_slice(&chunk[..at]))
+    }
+
+    fn has_deferred_cut(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    fn take_deferred_cut(&mut self, _client_line_open: bool) -> Option<Bytes> {
+        self.deferred.take().flatten()
+    }
+}
+
+#[tokio::test]
+async fn streaming_jsonrpc_observation_behind_a_deferred_cut_counts_the_cleared_event_once() {
+    // The earlier inspector clears an event in the chunk that trips its cut.
+    // The A2A inspector sees that event only in the chain's flush for the
+    // cut, and publishes one observation that counts it once.
+    let plugin = plugin(json!({}));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&plugin)];
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-stream",
+        "method": "message/stream"
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let a2a_inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("detected 2xx A2A SSE response should attach an inspector");
+    let cutter: Box<dyn ResponseStreamInspector> = Box::new(DeferCutAtBang { deferred: None });
+    let inspectors = vec![cutter, a2a_inspector];
+    let mut chain = chain_response_stream_inspectors(inspectors).expect("chain");
+    let event = json!({
+        "jsonrpc": "2.0",
+        "result": {"taskId": "task-9", "status": {"state": "working"}}
+    });
+    let cleared = format!("data: {event}\n\n");
+    let chunk = format!("{cleared}!data: [cut]\n\n");
+    let action = chain.on_chunk(chunk.as_bytes()).await;
+    let ResponseStreamAction::Terminate(Some(sent)) = action else {
+        panic!("the deferred cut ends the stream");
+    };
+    let expected = format!("{cleared}CUT");
+    assert_eq!(sent.as_ref(), expected.as_bytes());
+    drop(chain);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(sent.len() as u64))
+        .await;
+
+    assert_eq!(
+        ctx.metadata.get("a2a.stream_events").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.task_id").map(String::as_str),
+        Some("task-9")
+    );
+}

@@ -5623,11 +5623,9 @@ impl StreamInspector {
             Some(&last) => !matches!(last, b'\n' | b'\r'),
             None => self.client_line_open,
         };
-        if out.is_empty() && !line_open {
+        let event = sse_event_on_fresh_line(event, line_open);
+        if out.is_empty() {
             return ResponseStreamAction::Terminate(Some(event));
-        }
-        if line_open {
-            out.push(b'\n');
         }
         out.extend_from_slice(&event);
         ResponseStreamAction::Terminate(Some(Bytes::from(out)))

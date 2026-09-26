@@ -5104,6 +5104,15 @@ impl ToolCallStreamInspector {
         }
     }
 
+    /// End inspection without governing or releasing what is still held,
+    /// because the stream ends with another inspector's cut.
+    fn drop_ungoverned(&mut self) {
+        self.terminated = true;
+        self.held.clear();
+        self.carry.clear();
+        self.reset_batch();
+    }
+
     /// Build the terminal action after `out`, the bytes this call already
     /// cleared, so clean content released in the same chunk is not lost. They
     /// lead the payload when this is the only or last stream inspector. When a
@@ -5552,6 +5561,23 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
         }
         out.extend_from_slice(&trailing);
         ResponseStreamAction::Forward(Bytes::from(out))
+    }
+
+    /// An earlier chained inspector cut the stream after the bytes this one
+    /// last received. A pending tool-call batch, a partial event, or a body
+    /// held in full was truncated by that cut, so drop it ungoverned: no
+    /// approval webhook, no decision metadata, and no held frame released.
+    /// Only what this inspector already governed has left.
+    async fn flush_before_cut(&mut self) -> ResponseStreamAction {
+        self.drop_ungoverned();
+        ResponseStreamAction::Forward(Bytes::new())
+    }
+
+    /// The stream ended with another inspector's cut: drop anything still
+    /// held and any cut this inspector deferred, which that cut replaced.
+    fn on_downstream_terminated(&mut self) {
+        self.drop_ungoverned();
+        self.deferred_cut = None;
     }
 
     fn set_chained_client_line_open(&mut self, open: bool) {

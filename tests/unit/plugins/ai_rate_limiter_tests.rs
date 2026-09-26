@@ -9082,3 +9082,74 @@ fn reconciliation_still_corrects_a_live_reservation_at_the_record_cap() {
     );
     assert!(state.retained_records_for_test().0 <= cap);
 }
+
+// ─── A deferred cut ahead of the limiter (#5826) ─────────────────────────
+
+use ferrum_edge::plugins::{ResponseStreamInspector, chain_response_stream_inspectors};
+
+/// An earlier chained inspector that clears the bytes before a `!` and defers
+/// its cut, as a chained `ai_semantic_firewall` does.
+struct DeferCutAtBang {
+    deferred: Option<Option<Bytes>>,
+}
+
+#[async_trait::async_trait]
+impl ResponseStreamInspector for DeferCutAtBang {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let Some(at) = chunk.iter().position(|&byte| byte == b'!') else {
+            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+        };
+        self.deferred = Some(Some(Bytes::from_static(b"CUT")));
+        ResponseStreamAction::Forward(Bytes::copy_from_slice(&chunk[..at]))
+    }
+
+    fn has_deferred_cut(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    fn take_deferred_cut(&mut self, _client_line_open: bool) -> Option<Bytes> {
+        self.deferred.take().flatten()
+    }
+}
+
+#[tokio::test]
+async fn a_deferred_cut_ahead_of_the_limiter_charges_the_cleared_usage_once() {
+    // The earlier inspector clears the usage frame in the chunk that trips its
+    // cut. The limiter sees that frame only in the chain's flush for the cut,
+    // which flushes it and then tells it the stream ended with a cut, so it
+    // publishes twice; the reservation still reconciles to the reported total
+    // once.
+    let plugin = streaming_limiter("charge_estimate");
+    let mut ctx = ai_request_ctx(400, "deferred cut prompt");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(instance_reserved(&plugin, &ctx) > 0);
+
+    let usage = sse_frame(json!({
+        "choices": [{"index": 0, "delta": {"content": "hi"}}],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}
+    }));
+    let chunk = [usage.as_slice(), &b"!data: blocked\n\n"[..]].concat();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let limiter_inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("a meterable SSE stream is inspected");
+    let cutter: Box<dyn ResponseStreamInspector> = Box::new(DeferCutAtBang { deferred: None });
+    let inspectors = vec![cutter, limiter_inspector];
+    let mut chain = chain_response_stream_inspectors(inspectors).expect("chain");
+    let ResponseStreamAction::Terminate(Some(sent)) = chain.on_chunk(&chunk).await else {
+        panic!("the deferred cut ends the stream");
+    };
+    let expected = [usage.as_slice(), &b"CUT"[..]].concat();
+    assert_eq!(sent.as_ref(), expected.as_slice());
+    drop(chain);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(sent.len() as u64))
+        .await;
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        50,
+        "the reservation reconciles to the usage the cleared frame reported, once"
+    );
+}

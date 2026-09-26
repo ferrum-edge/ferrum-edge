@@ -4,7 +4,8 @@
 
 use bytes::Bytes;
 use ferrum_edge::plugins::{
-    ResponseStreamAction, ResponseStreamInspector, chain_response_stream_inspectors,
+    ResponseStreamAction, ResponseStreamInspector, ResponseStreamInspectorStage,
+    chain_response_stream_inspectors,
 };
 use std::sync::{Arc, Mutex};
 
@@ -80,8 +81,9 @@ impl ResponseStreamInspector for DeferringCutter {
     }
 }
 
-/// Logs every chunk it receives, and `<end>` when it is flushed. It forwards
-/// each chunk unchanged, or with `hold` keeps everything until its flush.
+/// Logs every chunk it receives, `<end>` when it is flushed, and `<cut>` when
+/// told the stream ended with a cut. It forwards each chunk unchanged, or with
+/// `hold` keeps everything until its flush.
 struct Recorder {
     seen: Arc<Mutex<Vec<u8>>>,
     hold: bool,
@@ -103,6 +105,10 @@ impl ResponseStreamInspector for Recorder {
         self.seen.lock().unwrap().extend_from_slice(b"<end>");
         ResponseStreamAction::Forward(std::mem::take(&mut self.held).into())
     }
+
+    fn on_downstream_terminated(&mut self) {
+        self.seen.lock().unwrap().extend_from_slice(b"<cut>");
+    }
 }
 
 /// Cuts on the first chunk it receives, without deferring.
@@ -112,6 +118,40 @@ struct CutNow;
 impl ResponseStreamInspector for CutNow {
     async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
         ResponseStreamAction::Terminate(Some(Bytes::from_static(b"LATER")))
+    }
+}
+
+/// Forwards every chunk unchanged. At the end of the stream it sends `<eof>`,
+/// but in a flush for an earlier inspector's cut it cuts with `LATE`.
+struct CutAtFlushBeforeCut;
+
+#[async_trait::async_trait]
+impl ResponseStreamInspector for CutAtFlushBeforeCut {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(Bytes::from_static(b"<eof>"))
+    }
+
+    async fn flush_before_cut(&mut self) -> ResponseStreamAction {
+        ResponseStreamAction::Terminate(Some(Bytes::from_static(b"LATE")))
+    }
+}
+
+/// A normalizer that ends the stream on its first chunk, with that chunk as
+/// its final window.
+struct NormalizeAndEnd;
+
+#[async_trait::async_trait]
+impl ResponseStreamInspector for NormalizeAndEnd {
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        ResponseStreamInspectorStage::Normalize
+    }
+
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        ResponseStreamAction::Terminate(Some(Bytes::copy_from_slice(chunk)))
     }
 }
 
@@ -148,7 +188,7 @@ async fn a_deferred_cut_sends_the_cleared_bytes_through_later_inspectors_first()
             let final_bytes = terminal(chain.on_chunk(chunk).await);
             assert_eq!(final_bytes.as_deref(), Some(expected), "{label}");
             let released = &chunk[..chunk.len() - 4];
-            let expected_seen = [released, &b"<end>"[..]].concat();
+            let expected_seen = [released, &b"<end><cut>"[..]].concat();
             assert_eq!(*seen.lock().unwrap(), expected_seen, "{label}");
         }
     }
@@ -203,7 +243,7 @@ async fn a_later_cut_on_the_cleared_bytes_wins() {
     let mut chain = chain_response_stream_inspectors(inspectors).expect("chain");
     let final_bytes = terminal(chain.on_chunk(b"a?b!c").await);
     assert_eq!(final_bytes.as_deref(), Some(&b"a\nSECOND"[..]));
-    assert_eq!(*seen.lock().unwrap(), b"a<end>");
+    assert_eq!(*seen.lock().unwrap(), b"a<end><cut>");
 }
 
 #[tokio::test]
@@ -225,6 +265,62 @@ async fn a_cut_deferred_at_the_end_of_the_stream_passes_later_inspectors_first()
             Some(&b"abc\nERR\n"[..]),
             "hold {hold}"
         );
-        assert_eq!(*seen.lock().unwrap(), b"abc\n<end>", "hold {hold}");
+        assert_eq!(*seen.lock().unwrap(), b"abc\n<end><cut>", "hold {hold}");
     }
+}
+
+#[tokio::test]
+async fn later_inspectors_are_flushed_for_the_cut_not_for_the_end_of_the_stream() {
+    // The last inspector sends `<eof>` only at the end of the stream; in the
+    // flush for a deferred cut it cuts, after the cleared bytes it released.
+    let cutter = DeferringCutter::new(b'!', Some(b"ERR"));
+    let later: Box<dyn ResponseStreamInspector> = Box::new(CutAtFlushBeforeCut);
+    let mut chain = chain_response_stream_inspectors(vec![Box::new(cutter), later]).expect("chain");
+    let final_bytes = terminal(chain.on_chunk(b"abc!xyz").await);
+    assert_eq!(final_bytes.as_deref(), Some(&b"abcLATE"[..]));
+
+    // Without a cut, the same inspector sends `<eof>` at the end.
+    let later: Box<dyn ResponseStreamInspector> = Box::new(CutAtFlushBeforeCut);
+    let (last, _seen) = recorder(false);
+    let mut chain = chain_response_stream_inspectors(vec![later, last]).expect("chain");
+    let ResponseStreamAction::Forward(sent) = chain.on_chunk(b"abc").await else {
+        panic!("no cut yet");
+    };
+    assert_eq!(sent.as_ref(), b"abc");
+    let ResponseStreamAction::Forward(sent) = chain.on_end().await else {
+        panic!("the stream ends without a cut");
+    };
+    assert_eq!(sent.as_ref(), b"<eof>");
+}
+
+#[tokio::test]
+async fn a_later_inspector_that_is_not_last_drops_what_it_released_when_it_cuts_in_its_flush() {
+    // The middle inspector releases the cleared bytes, then cuts in its flush
+    // for the cut. The last inspector never saw those bytes, so they are
+    // dropped with the middle inspector's cut rather than skip it.
+    let cutter = DeferringCutter::new(b'!', Some(b"ERR"));
+    let middle: Box<dyn ResponseStreamInspector> = Box::new(CutAtFlushBeforeCut);
+    let (last, seen) = recorder(false);
+    let mut chain =
+        chain_response_stream_inspectors(vec![Box::new(cutter), middle, last]).expect("chain");
+    let final_bytes = terminal(chain.on_chunk(b"abc!xyz").await);
+    assert_eq!(final_bytes.as_deref(), Some(&b"LATE"[..]));
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_cut_deferred_on_a_normalizers_final_window_passes_later_inspectors_first() {
+    // The normalizer ends the stream with its final window; the cutter then
+    // clears part of it and defers its cut. The last inspector sees what it
+    // cleared, is flushed, and learns the stream ended with a cut; the
+    // payload follows on a fresh line.
+    let normalizer: Box<dyn ResponseStreamInspector> = Box::new(NormalizeAndEnd);
+    let cutter = DeferringCutter::new(b'!', Some(b"ERR"));
+    let (last, seen) = recorder(false);
+    let inspectors: Vec<Box<dyn ResponseStreamInspector>> =
+        vec![Box::new(cutter), normalizer, last];
+    let mut chain = chain_response_stream_inspectors(inspectors).expect("chain");
+    let final_bytes = terminal(chain.on_chunk(b"ab!cd").await);
+    assert_eq!(final_bytes.as_deref(), Some(&b"ab\nERR"[..]));
+    assert_eq!(*seen.lock().unwrap(), b"ab<end><cut>");
 }

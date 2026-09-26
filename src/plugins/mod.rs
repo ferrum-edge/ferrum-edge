@@ -7186,9 +7186,12 @@ pub enum ResponseStreamInspectorStage {
 /// client around the later inspectors. To cut after bytes it cleared in the
 /// same call, it returns them in `Forward` and defers the cut instead (see
 /// [`Self::has_deferred_cut`]). The chain passes those bytes through every
-/// later inspector before it emits the terminal payload, so the client
-/// receives each cleared byte once, inspected by every later inspector,
-/// followed by the terminal event.
+/// later inspector, each flushed with [`Self::flush_before_cut`], before it
+/// emits the terminal payload, so the client receives each cleared byte once,
+/// inspected by every later inspector, followed by the terminal event. One
+/// exception: a later inspector that another follows and that releases some
+/// of those bytes, then cuts in its flush, has them dropped, since the
+/// inspectors after it have not passed them.
 #[async_trait]
 pub trait ResponseStreamInspector: Send {
     /// Stage used when composing multiple inspectors. Policy inspectors should
@@ -7207,9 +7210,24 @@ pub trait ResponseStreamInspector: Send {
         ResponseStreamAction::Forward(bytes::Bytes::new())
     }
 
+    /// Flush at a cut that an earlier chained inspector deferred, once this
+    /// inspector has received the bytes that inspector cleared: the stream
+    /// ends with that cut, not with the backend's end. The chain calls this
+    /// instead of [`Self::on_end`] and sends what it releases ahead of the
+    /// terminal payload. An inspector that governs whole units at their end
+    /// (such as a tool-call batch) should drop an unfinished one here rather
+    /// than govern or release it, since the cut truncated it. The default is
+    /// [`Self::on_end`].
+    async fn flush_before_cut(&mut self) -> ResponseStreamAction {
+        self.on_end().await
+    }
+
     /// Called on inspectors that already saw bytes when a later inspector cuts
-    /// the chain. Earlier inspectors can use this to discard pre-cut state that
-    /// no longer represents the client-visible stream.
+    /// the chain, and, once flushed, on the inspectors after one whose cut
+    /// the chain deferred (see [`Self::has_deferred_cut`]). Inspectors can use
+    /// this to discard pre-cut state that no longer represents the
+    /// client-visible stream, or to record that the stream ended with a cut
+    /// rather than complete.
     fn on_downstream_terminated(&mut self) {}
 
     /// Called by a chain before each hook on an inspector that a later
@@ -7223,10 +7241,10 @@ pub trait ResponseStreamInspector: Send {
     /// Whether the last hook call cut the stream after clearing the bytes it
     /// returned in `Forward`. Only an inspector that a later one follows
     /// defers a cut. The chain then runs those bytes through every later
-    /// inspector, each flushed as at the end of the stream, and ends the
-    /// stream with what they released followed by
-    /// [`Self::take_deferred_cut`]'s payload. A later inspector that cuts on
-    /// those bytes wins. The default never defers.
+    /// inspector, each flushed with [`Self::flush_before_cut`] and then told
+    /// [`Self::on_downstream_terminated`], and ends the stream with what they
+    /// released followed by [`Self::take_deferred_cut`]'s payload. A later
+    /// inspector that cuts on those bytes wins. The default never defers.
     fn has_deferred_cut(&self) -> bool {
         false
     }
@@ -7392,6 +7410,10 @@ impl ResponseStreamInspector for CompletionNotifyingInspector {
 
     async fn on_end(&mut self) -> ResponseStreamAction {
         self.inner.on_end().await
+    }
+
+    async fn flush_before_cut(&mut self) -> ResponseStreamAction {
+        self.inner.flush_before_cut().await
     }
 
     fn on_downstream_terminated(&mut self) {
@@ -7798,7 +7820,7 @@ pub async fn normalize_response_body_for_inspection(
 /// passed it; bytes the last inspector released earlier in the same call leave
 /// ahead of its terminal payload. An inspector that cuts after clearing bytes
 /// defers its cut instead: those bytes pass every later inspector and their
-/// end-of-stream flushes, then its terminal payload follows what they
+/// flushes before the cut, then its terminal payload follows what they
 /// released, unless a later inspector cuts first. The chain tracks whether the
 /// bytes it sent end mid-line and tells each inspector that a later one
 /// follows, so a cut there frames its terminal payload after what the client
@@ -7895,7 +7917,9 @@ impl ChainedResponseStreamInspector {
 
     /// Flush inspectors `from..` as the end of the stream: each receives
     /// `carry`, what the inspectors before it released, as a final chunk, and
-    /// is then flushed. `end` says how the stream ended ahead of `from`.
+    /// is then flushed, with [`ResponseStreamInspector::flush_before_cut`]
+    /// once an earlier inspector deferred a cut. `end` says how the stream
+    /// ended ahead of `from`.
     async fn flush_from(
         &mut self,
         from: usize,
@@ -7932,7 +7956,11 @@ impl ChainedResponseStreamInspector {
                 }
             }
             self.prime(index);
-            match self.inspectors[index].on_end().await {
+            let flushed = match end {
+                ChainFlushEnd::Cut(_) => self.inspectors[index].flush_before_cut().await,
+                _ => self.inspectors[index].on_end().await,
+            };
+            match flushed {
                 ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
                 ResponseStreamAction::Terminate(final_bytes)
                     if stage == ResponseStreamInspectorStage::Normalize =>
@@ -8008,8 +8036,12 @@ impl ChainedResponseStreamInspector {
     /// End the stream with `carry`, what every inspector after `owner`
     /// released of the bytes it cleared before its deferred cut, followed by
     /// that cut's terminal payload framed after what the client then holds.
-    /// Allocates only here, on a cut.
+    /// The inspectors after `owner`, now flushed, learn that the stream ended
+    /// with a cut rather than complete. Allocates only here, on a cut.
     fn emit_deferred_cut(&mut self, owner: usize, carry: bytes::Bytes) -> ResponseStreamAction {
+        for inspector in &mut self.inspectors[owner + 1..] {
+            inspector.on_downstream_terminated();
+        }
         let client_line_open = match carry.last() {
             Some(&last) => !matches!(last, b'\n' | b'\r'),
             None => self.client_line_open,
