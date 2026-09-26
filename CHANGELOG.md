@@ -143,6 +143,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanup bound. The HTTP/3 bridge's mesh backends no longer run response-body
   inspection or final-body validation plugins over a charged
   `Backend deadline exceeded` terminal, as HTTP/1.1 and HTTP/2 already did not.
+- An expired credential no longer gets one more response-plugin poll over a
+  charged `Backend deadline exceeded` terminal when an earlier RPC deadline
+  fired first (PR #5746, PR #5748). The reject-path hooks over that terminal
+  and over the gateway-generated gRPC-Web error terminals already checked the
+  credential's own deadline, but proxy core's `after_proxy` runner for the
+  charged terminal on HTTP/1.1 and HTTP/2, and the response-committed plugins
+  over the charged terminal in proxy core and on the HTTP/3 bridge, checked
+  only whether the credential's lifetime was the bound that fired. When the
+  client's `grpc-timeout` or the route's `request` timeout was earlier and the
+  credential expired after it, each of those plugins still got its one poll
+  over the request context and response. They now check the credential's own
+  deadline before polling: no plugin is polled, the expiry is recorded, and
+  proxy core answers with the fixed authorization terminal.
 - A peer that resets an HTTP/3 stream in the middle of a DATA frame no longer
   tears down the whole QUIC connection (PR #5741). The vendored `h3` frame-drain
   patch held a QUIC error back so it could decode buffered bytes first. Quinn

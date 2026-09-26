@@ -1612,6 +1612,141 @@ async fn an_elapsed_credential_gets_no_gateway_error_terminal_hook_poll() {
     );
 }
 
+/// A charged backend deadline terminal's request (#5744) whose RPC deadline
+/// (5 ms) won the composed bound and whose credential (10 ms) elapsed after it:
+/// both have passed by the time the terminal's hooks run.
+async fn charged_ctx_with_late_elapsed_credential() -> RequestContext {
+    use ferrum_edge::_test_support::{
+        end_charged_grpc_route_attempt_for_test, request_received_at_for_test,
+        set_grpc_deadline_budget_for_test, set_request_credential_deadline_for_test,
+    };
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    ctx.authenticated_identity = Some("spiffe://example/sa/api".to_string());
+    let received_at = request_received_at_for_test(&ctx);
+    let credential_at = received_at + std::time::Duration::from_millis(10);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(5));
+    set_request_credential_deadline_for_test(&mut ctx, Some(credential_at));
+    end_charged_grpc_route_attempt_for_test(&mut ctx);
+    assert!(
+        ctx.grpc_deadline_at().is_some_and(|at| at < credential_at),
+        "the RPC deadline must stay in force and win the composed bound"
+    );
+    tokio::time::advance(std::time::Duration::from_millis(20)).await;
+    ctx
+}
+
+/// Proxy core's charged-terminal `after_proxy` runner (#5746) gates on the
+/// credential's own deadline, as the reject path does (#5748): when an earlier
+/// RPC deadline won the composed bound and the credential has elapsed since,
+/// no hook is polled and the authorization terminal replaces the charged one.
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_credential_gets_no_charged_terminal_after_proxy_hook_poll() {
+    use ferrum_edge::_test_support::run_after_proxy_hooks_reject_for_test;
+
+    // Pin the authenticated-stream maximum, so the credential below is the
+    // plan's bound whatever another test published.
+    let lifetime = crate::unit::env_lock::StreamAuthMaxLifetimeGuard::new();
+    lifetime.publish(3_600);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(SlowRejectDecorator {
+        name: "ready-decorator",
+        delay: std::time::Duration::ZERO,
+        calls: Arc::clone(&calls),
+        completed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        completion: Arc::new(tokio::sync::Notify::new()),
+    })];
+    let mut ctx = charged_ctx_with_late_elapsed_credential().await;
+    let mut headers = charged_backend_deadline_headers();
+
+    let rejected =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers).await;
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an expired credential must not get a hook poll"
+    );
+    let (status, _body, headers) =
+        rejected.expect("the authorization terminal replaces the charged terminal");
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("16"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("credential expired")
+    );
+}
+
+/// Committed observers over a charged terminal gate on the credential's own
+/// deadline too: when an earlier RPC deadline won the composed bound and the
+/// credential has elapsed since, no observer is polled, on proxy core's
+/// buffered runner (whose authorization terminal replaces the charged one) and
+/// on the HTTP/3 bridge's reject-path runner (which latches the expiry).
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_credential_gets_no_charged_terminal_committed_observer_poll() {
+    use ferrum_edge::_test_support::{
+        h3_run_reject_committed_hooks_for_test,
+        run_deadline_bounded_response_committed_hooks_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY;
+
+    // Pin the authenticated-stream maximum, so the credential below is the
+    // plan's bound whatever another test published.
+    let lifetime = crate::unit::env_lock::StreamAuthMaxLifetimeGuard::new();
+    lifetime.publish(3_600);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CommittedHookProbe {
+        calls: Arc::clone(&calls),
+        observed_grpc_statuses: Arc::new(std::sync::Mutex::new(Vec::new())),
+        release: None,
+        completion: Arc::new(tokio::sync::Notify::new()),
+    })];
+
+    let mut ctx = charged_ctx_with_late_elapsed_credential().await;
+    let mut status = 200;
+    let mut headers = charged_backend_deadline_headers();
+    let mut body = bytes::Bytes::new();
+    let replaced = run_deadline_bounded_response_committed_hooks_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "proxy core: an expired credential must not get an observer poll"
+    );
+    assert!(
+        replaced,
+        "the authorization terminal replaces the charged terminal"
+    );
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("16"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("credential expired")
+    );
+
+    let mut ctx = charged_ctx_with_late_elapsed_credential().await;
+    let headers = charged_backend_deadline_headers();
+    let (replaced, _message) =
+        h3_run_reject_committed_hooks_for_test(&plugins, &mut ctx, &headers, true).await;
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "HTTP/3 bridge: an expired credential must not get an observer poll"
+    );
+    assert!(!replaced, "the gateway deadline terminal is not selected");
+    assert!(
+        ctx.metadata
+            .contains_key(STREAM_AUTH_TERMINATION_METADATA_KEY),
+        "the authorization expiry is latched"
+    );
+}
+
 /// The head of a gRPC-Web terminal and its whole body, as text.
 async fn grpc_web_terminal_parts(
     response: http::Response<ferrum_edge::proxy::ProxyBody>,

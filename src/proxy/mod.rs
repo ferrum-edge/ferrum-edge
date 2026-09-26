@@ -24971,6 +24971,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 &normalized.headers,
                 normalized.body.clone(),
                 terminal_gateway_deadline,
+                false,
             )
             .await
             {
@@ -25116,7 +25117,10 @@ enum ChargedTerminalAfterProxyHook {
 /// still decorates the terminal. A rejection from a hook that completed is
 /// ignored, so the terminal keeps its `Backend deadline exceeded` wording. An
 /// elapsed authorization lifetime is never detached: it settles the fixed
-/// authorization terminal before any hook is polled.
+/// authorization terminal before any hook is polled. The gate is the
+/// credential's own deadline, not the winning bound: when an earlier RPC
+/// deadline won the composition, a credential that has since elapsed still
+/// gets no further poll, as on the reject path.
 async fn run_charged_terminal_after_proxy_hook(
     plugin: &Arc<dyn Plugin>,
     ctx: &mut RequestContext,
@@ -25127,7 +25131,7 @@ async fn run_charged_terminal_after_proxy_hook(
         return ChargedTerminalAfterProxyHook::Skipped;
     }
     let bound = ctx.precommit_response_phase_bound();
-    if let Some(termination) = bound.expired_authorization() {
+    if let Some(termination) = bound.elapsed_authorization() {
         let result = settle_precommit_authorization_expiry(ctx, termination);
         return ChargedTerminalAfterProxyHook::Completed(result);
     }
@@ -28553,6 +28557,12 @@ pub(crate) enum ResponseCommittedHookOutcome {
 ///
 /// An authorization expiry is deliberately NOT detachable — see
 /// [`ResponseCommittedHookOutcome::AuthorizationExpired`].
+///
+/// A charged backend deadline terminal (#5744), `charged_terminal`, gives each
+/// observer one poll as the gateway deadline terminal does. Over it the
+/// authorization gate is the credential's own deadline, not the winning bound,
+/// as on the charged `after_proxy` runners: when an earlier RPC deadline won
+/// the composition, a credential that has since elapsed still gets no poll.
 pub(crate) async fn run_response_committed_hook_until_deadline(
     plugin: Arc<dyn Plugin>,
     ctx: &mut RequestContext,
@@ -28560,13 +28570,15 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
     response_headers: &HashMap<String, String>,
     response_body: Bytes,
     terminal_gateway_deadline: bool,
+    charged_terminal: bool,
 ) -> ResponseCommittedHookOutcome {
     let bound = ctx.precommit_response_phase_bound();
     let deadline = bound.deadline();
     let detached_bound = DetachedResponseCommittedBound {
         authorization_at: bound.authorization_deadline_at(),
     };
-    if !terminal_gateway_deadline && deadline.is_none() {
+    let one_poll_terminal = terminal_gateway_deadline || charged_terminal;
+    if !one_poll_terminal && deadline.is_none() {
         plugin
             .on_response_committed(
                 ctx,
@@ -28581,7 +28593,12 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
     // constructed, so a credential that is no longer authorized never gets even
     // the single courtesy poll, and no clone of the request context or the
     // protected body is handed to a future that could outlive this frame.
-    if let Some(termination) = bound.expired_authorization() {
+    let expired = if charged_terminal {
+        bound.elapsed_authorization()
+    } else {
+        bound.expired_authorization()
+    };
+    if let Some(termination) = expired {
         let family = request_upload_auth_family(ctx);
         ctx.record_authorization_termination_once(termination, family);
         return ResponseCommittedHookOutcome::AuthorizationExpired(termination);
@@ -28593,7 +28610,7 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
         Arc::new(response_headers.clone()),
         response_body,
     );
-    if terminal_gateway_deadline {
+    if one_poll_terminal {
         let completed = futures_util::future::poll_fn(|cx| {
             Poll::Ready(match std::future::Future::poll(hook.as_mut(), cx) {
                 Poll::Ready(ctx) => Some(ctx),
@@ -28795,7 +28812,8 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             *response_status,
             response_headers,
             response_body.clone(),
-            terminal_gateway_deadline || charged_terminal,
+            terminal_gateway_deadline,
+            charged_terminal,
         )
         .await
         {
@@ -28955,6 +28973,7 @@ async fn build_grpc_web_reject_response(
                 &translated.headers,
                 Bytes::from(translated.body.clone()),
                 terminal_gateway_deadline,
+                false,
             )
             .await
             {

@@ -17196,6 +17196,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
                 &committed_headers,
                 committed_body.clone(),
                 terminal_gateway_deadline,
+                false,
             )
             .await
             {
