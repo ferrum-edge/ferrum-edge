@@ -322,7 +322,10 @@ async fn http1_client_receives_no_backend_trailers() {
         assert_eq!(response.status(), reqwest::StatusCode::OK, "{name}");
         let (body, trailers) = body_and_trailers(response).await;
         assert_eq!(&body[..], BODY, "{name}");
-        assert!(trailers.is_none(), "{name}: unexpected trailers {trailers:?}");
+        assert!(
+            trailers.is_none(),
+            "{name}: unexpected trailers {trailers:?}"
+        );
     }
 }
 
@@ -438,7 +441,10 @@ async fn gateway_replaced_buffered_body_drops_backend_trailers() {
             assert_backend_trailers(name, trailers);
         } else {
             assert_ne!(&body[..], backend_body, "{name}: backend body leaked");
-            assert!(trailers.is_none(), "{name}: unexpected trailers {trailers:?}");
+            assert!(
+                trailers.is_none(),
+                "{name}: unexpected trailers {trailers:?}"
+            );
         }
     }
 }

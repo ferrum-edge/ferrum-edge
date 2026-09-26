@@ -136,13 +136,25 @@ fn only_backend_responses_that_can_carry_trailers_are_relayed() {
     assert!(can_carry(Version::HTTP_2, &[]));
     assert!(can_carry(Version::HTTP_2, &[("content-length", "15")]));
     // HTTP/1.1 carries a trailer section only inside chunked framing.
-    assert!(can_carry(Version::HTTP_11, &[("transfer-encoding", "chunked")]));
-    assert!(can_carry(Version::HTTP_11, &[("transfer-encoding", "gzip, Chunked")]));
+    assert!(can_carry(
+        Version::HTTP_11,
+        &[("transfer-encoding", "chunked")]
+    ));
+    assert!(can_carry(
+        Version::HTTP_11,
+        &[("transfer-encoding", "gzip, Chunked")]
+    ));
     assert!(!can_carry(Version::HTTP_11, &[("content-length", "15")]));
     assert!(!can_carry(Version::HTTP_11, &[]));
-    assert!(!can_carry(Version::HTTP_11, &[("transfer-encoding", "gzip")]));
+    assert!(!can_carry(
+        Version::HTTP_11,
+        &[("transfer-encoding", "gzip")]
+    ));
     // HTTP/1.0 has no chunked transfer-coding.
-    assert!(!can_carry(Version::HTTP_10, &[("transfer-encoding", "chunked")]));
+    assert!(!can_carry(
+        Version::HTTP_10,
+        &[("transfer-encoding", "chunked")]
+    ));
 }
 
 /// A reqwest streaming response whose backend cannot carry a trailer section
