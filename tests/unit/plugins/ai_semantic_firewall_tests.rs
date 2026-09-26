@@ -6852,13 +6852,9 @@ async fn fail_open_release_of_a_data_less_carry_keeps_inspecting_the_next_event(
                 let mut inspector = firewall
                     .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
                     .expect("inspector for event stream");
-                let released = release_carry_by_hold_timeout(
-                    &mut *inspector,
-                    &label,
-                    carry.as_bytes(),
-                    120,
-                )
-                .await;
+                let released =
+                    release_carry_by_hold_timeout(&mut *inspector, &label, carry.as_bytes(), 120)
+                        .await;
                 assert_eq!(released, carry.as_bytes(), "{label}");
 
                 let chunks: Vec<&[u8]> = if split {
@@ -7001,14 +6997,13 @@ async fn fail_open_release_inside_a_data_less_line_inspects_what_the_client_disp
                     let mut inspector = firewall
                         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
                         .expect("inspector for event stream");
-                    let released =
-                        release_carry_by_hold_timeout(
-                            &mut *inspector,
-                            &label,
-                            carry.as_bytes(),
-                            CARRY_HOLD_MS,
-                        )
-                        .await;
+                    let released = release_carry_by_hold_timeout(
+                        &mut *inspector,
+                        &label,
+                        carry.as_bytes(),
+                        CARRY_HOLD_MS,
+                    )
+                    .await;
                     assert_eq!(released, carry.as_bytes(), "{label}");
 
                     if leaks {
