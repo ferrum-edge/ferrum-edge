@@ -438,6 +438,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request to an uncached overflow target, and it is emitted after the cache
   shard lock is released. `ferrum_circuit_breaker_cache_admission_refused_total`
   still counts every refused admission (#5787).
+- A streaming response with no `Content-Length` that exceeds
+  `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` now reliably shows the client the
+  committed status and the bytes within the limit before it is aborted.
+  Previously, when a small over-limit body arrived in a single read, the limit
+  tripped in the same HTTP/1.1 write pass that queued the response head, and
+  the client saw the connection close before any status line
+  (`IncompleteMessage`). The reqwest, direct-H2/gRPC, and native-H3
+  size-limited adapters now hold the error for one scheduler turn so the
+  frontend flushes first.
 
 ### Security
 
