@@ -229,6 +229,42 @@ impl SpiffeIdentityConnectionCache {
     }
 }
 
+/// Whether `ctx` carries, or would admit, a verified peer SPIFFE identity
+/// (issue #5763).
+///
+/// True when a principal is already published on `ctx.peer_spiffe_id`, or when
+/// the connection's client certificate yields exactly the identity
+/// [`SpiffeIdentity::on_request_received`] would admit: one valid SPIFFE URI
+/// SAN inside a currently valid window. A certificate the listener's verifier
+/// accepted but that carries no usable SPIFFE ID is NOT a verified peer: the
+/// HBONE handlers refuse it as unauthenticated. Reads the connection-scoped
+/// extraction cache, so it adds no parse the plugin would not perform anyway;
+/// it never publishes a principal or captures a deadline on `ctx`.
+pub(crate) fn has_verified_peer_spiffe_identity(ctx: &RequestContext) -> bool {
+    if ctx.peer_spiffe_id.is_some() {
+        return true;
+    }
+    let Some(der) = ctx.tls_client_cert_der.as_deref() else {
+        return false;
+    };
+    let derived;
+    let outcome = match ctx.peer_spiffe_extraction_cache.as_deref() {
+        Some(cache) => cache.outcome(der),
+        None => {
+            derived = derive_peer_spiffe_extraction(der);
+            &derived
+        }
+    };
+    match outcome {
+        PeerSpiffeExtraction::Id { validity, .. } => {
+            validity.contains(x509_parser::time::ASN1Time::now().timestamp())
+        }
+        PeerSpiffeExtraction::NoSpiffeId
+        | PeerSpiffeExtraction::Invalid(_)
+        | PeerSpiffeExtraction::Unparsed(_) => false,
+    }
+}
+
 pub struct SpiffeIdentity;
 
 impl SpiffeIdentity {

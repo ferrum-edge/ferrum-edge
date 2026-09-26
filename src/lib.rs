@@ -179,6 +179,40 @@ pub mod _test_support {
         crate::proxy::publish_websocket_handshake_body_digests(plugins, ctx);
     }
 
+    /// Answer an inbound CONNECT relay-synthesis refusal exactly as the
+    /// dispatcher's route-miss arm does (issue #5763), delivering the
+    /// transaction line to `plugins` in place of the epoch's global chain.
+    /// `reason` is the `mesh.relay.denial_reason` label synthesis produced and
+    /// `destination` the CONNECT authority, when it carried a host and port.
+    pub async fn reject_inbound_connect_relay_synthesis_for_test(
+        state: &crate::proxy::ProxyState,
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        reason: &'static str,
+        destination: Option<(&str, u16)>,
+        is_udp_connect: bool,
+    ) -> hyper::Response<crate::proxy::body::ProxyBody> {
+        use crate::proxy::InboundConnectRelayRefusal;
+        let refusal = match destination {
+            Some((host, port)) => InboundConnectRelayRefusal::new(reason, host, port),
+            None => InboundConnectRelayRefusal {
+                reason,
+                destination: None,
+            },
+        };
+        crate::proxy::reject_inbound_connect_relay_synthesis_with_plugins(
+            state,
+            plugins,
+            ctx,
+            &refusal,
+            is_udp_connect,
+            std::time::Instant::now(),
+            false,
+            None,
+        )
+        .await
+    }
+
     pub fn websocket_backend_path_for_test(
         proxy: &crate::config::types::Proxy,
         path: &str,
@@ -15466,16 +15500,19 @@ pub mod _test_support {
     }
 
     /// Production HBONE CONNECT circuit-breaker settlement after
-    /// `connect_backend`. External tests use this so a DNS-screen 403 cannot
-    /// drift from the served HALF_OPEN accounting.
+    /// `connect_backend`. External tests use this so a DNS-screen policy
+    /// refusal (403 denial or 503 not-ready) cannot drift from the served
+    /// HALF_OPEN accounting.
     pub fn settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
         cb: &crate::circuit_breaker::CircuitBreaker,
         status: hyper::StatusCode,
+        policy_refusal: bool,
         is_half_open_probe: bool,
     ) {
         crate::proxy::settle_hbone_backend_connect_circuit_breaker_outcome(
             cb,
             status,
+            policy_refusal,
             is_half_open_probe,
         )
     }
