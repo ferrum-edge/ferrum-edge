@@ -320,7 +320,7 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
         .next()
         .expect("the writer body");
     assert!(
-        writer.contains("    connection_error: bool,\n"),
+        writer.contains("connection_error: bool"),
         "the writer must take the typed connection-error signal"
     );
     let hooks = writer
@@ -354,13 +354,28 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
         "the classified writer must not apply the token before the hooks"
     );
     assert!(
-        classified.contains("        body,\n        attempt_result.connection_error,\n"),
+        !classified.contains("restore_authoritative_gateway_error_header"),
+        "the classified writer must not restore the token before the hooks"
+    );
+    assert!(
+        !classified.contains("insert_x_gateway_error_for_backend_failure"),
+        "the classified writer must not insert the token before the hooks"
+    );
+    assert!(
+        classified.contains("attempt_result.connection_error"),
         "the classified writer must hand the typed signal to the terminal writer"
     );
 
     // The declared-oversize 502 hands the writer its non-connection signal.
+    let oversized = cross
+        .split("Backend response body exceeds maximum size")
+        .nth(1)
+        .expect("the declared-oversize response body")
+        .split(".await?;")
+        .next()
+        .expect("the declared-oversize terminal writer call");
     assert!(
-        cross.contains("exceeds maximum size\"}\"#),\n            false,\n"),
+        oversized.contains("false") && !oversized.contains(token_writer),
         "the declared-oversize 502 must hand the typed signal to the terminal writer"
     );
 }

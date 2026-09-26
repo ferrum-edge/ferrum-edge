@@ -532,10 +532,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP/3 bridge gateway error terminals (a classified backend dispatch failure
   and a declared-oversize `502`) now write `X-Gateway-Error` after the
   `after_proxy` hooks from the typed connection-error signal and the post-hook
-  status, as HTTP/1.1 and HTTP/2 do, so a hook decorating a gRPC-Web terminal
-  can no longer see, replace, or duplicate the token. The streamed gRPC message
-  scanner now publishes completed-message counts with `Release` ordering,
-  matching the buffered counter (#5807).
+  status, as HTTP/1.1 and HTTP/2 do, so hooks can no longer see, replace,
+  duplicate, or erase the token. A hook-set non-5xx status without a connection
+  error carries no token, matching HTTP/1.1 and HTTP/2 (#5807).
 
 ### Security
 

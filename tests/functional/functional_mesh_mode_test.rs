@@ -20263,7 +20263,9 @@ fn h3_mesh_http_peer_response(path: &str, body: Vec<u8>) -> hyper::Response<Full
             .status(503)
             .header("content-type", "application/json")
             .header("x-gateway-error", "spoofed_by_backend")
-            .body(Full::new(Bytes::from_static(br#"{"error":"mesh peer 503"}"#)))
+            .body(Full::new(Bytes::from_static(
+                br#"{"error":"mesh peer 503"}"#,
+            )))
     } else {
         builder
             .status(200)
