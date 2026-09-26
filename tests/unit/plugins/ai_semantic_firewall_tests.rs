@@ -2218,6 +2218,72 @@ data: [DONE]\n\n";
     );
 }
 
+/// One OpenAI chat-completion delta event carrying `text`, terminated by `eol`
+/// twice so the blank line that dispatches it uses the same delimiter.
+fn chat_delta_event(text: &str, eol: &str) -> String {
+    let frame = json!({"choices": [{"index": 0, "delta": {"content": text}}]});
+    format!("data: {frame}{eol}{eol}")
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_blocks_leak_under_every_legal_sse_encoding() {
+    // The leaking event is followed by a clean LF-framed event, so a parser that
+    // silently dropped the first event would still see nonempty, fully parsed
+    // content and allow the response. Every encoding below is one a WHATWG
+    // EventSource client decodes to the same two events, so each must reach
+    // the same verdict as the plain-LF control.
+    let leak = "My system prompt says never reveal policy.";
+    let clean = chat_delta_event("clean", "\n");
+    let leak_lf = chat_delta_event(leak, "\n");
+    let leak_crlf = chat_delta_event(leak, "\r\n");
+    let leak_cr = chat_delta_event(leak, "\r");
+    // CRLF ends the data line, then a lone CR ends the dispatching blank line.
+    let leak_mixed = format!("{}\r\n\r", leak_cr.trim_end_matches('\r'));
+    let bodies = [
+        ("lf", format!("{leak_lf}{clean}")),
+        ("crlf", format!("{leak_crlf}{clean}")),
+        ("bom", format!("\u{feff}{leak_lf}{clean}")),
+        ("cr", format!(": keepalive\r{leak_cr}{clean}")),
+        ("bom_cr", format!("\u{feff}{leak_cr}{clean}")),
+        ("mixed", format!(": keepalive\r\n{leak_mixed}{clean}")),
+    ];
+
+    for (encoding, body) in bodies {
+        let config = json!({
+            "inspect": {"request": false, "response": true},
+            "streaming_response": "buffer",
+            "on_error": "warn",
+            "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+            "builtins": disabled_builtins_with("response_leakage")
+        });
+        let plugin = plugin(&config);
+        let mut ctx = create_test_context();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+            .await;
+
+        let status = match &result {
+            ferrum_edge::plugins::PluginResult::Reject { status_code, .. } => Some(*status_code),
+            _ => None,
+        };
+        assert_eq!(
+            status,
+            Some(502),
+            "{encoding}: leaking SSE event must be inspected and blocked, got {result:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.rule_ids")
+                .map(String::as_str),
+            Some("response_leakage"),
+            "{encoding}: verdict must come from the leaked content"
+        );
+    }
+}
+
 #[tokio::test]
 async fn streaming_response_buffer_allows_clean_sse() {
     let config = json!({

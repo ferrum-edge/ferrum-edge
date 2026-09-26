@@ -16,8 +16,8 @@ use ferrum_edge::plugins::utils::query::{
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
 use ferrum_edge::plugins::utils::sse::{
-    MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseReassembler, SseText, SseTextKind,
-    parse_sse_data_frames_checked,
+    AnthropicEvent, MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseEventName,
+    SseReassembler, SseText, SseTextKind, parse_sse_data_frames_checked,
 };
 use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
@@ -1009,6 +1009,135 @@ fn canonical_policy_view_ignores_a_duplicate_only_the_strip_removes() {
     let query = canonical_query_for_policy(&ctx);
     assert!(query.is_unambiguous());
     assert_eq!(query.get("page"), Some("1"));
+}
+
+// ---------------------------------------------------------------------------
+// utils::sse — WHATWG event-stream framing (BOM, CR / LF / CRLF line endings)
+// ---------------------------------------------------------------------------
+
+/// One OpenAI chat-completion delta event carrying `text`, terminated by `eol`
+/// twice so the blank line that dispatches it uses the same delimiter.
+fn chat_delta_event(text: &str, eol: &str) -> String {
+    let frame = json!({"choices": [{"index": 0, "delta": {"content": text}}]});
+    format!("data: {frame}{eol}{eol}")
+}
+
+/// Parse a buffered SSE body and reassemble it the way the AI inspectors do,
+/// returning `(frame count, fully_parsed, reassembled assistant content)`.
+fn parse_and_reassemble(body: &str) -> (usize, bool, String) {
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    let mut reassembler = SseReassembler::new();
+    for (event, frame) in parsed.reassembly_frames() {
+        reassembler.push_event_frame(event, frame);
+    }
+    (
+        parsed.frames.len(),
+        parsed.fully_parsed,
+        reassembler.assistant_content(),
+    )
+}
+
+#[test]
+fn sse_parser_keeps_every_event_under_every_legal_line_ending_and_bom() {
+    // Each body decodes, per the WHATWG event-stream algorithm, to the same two
+    // events. A parser that lost the first one would still report the second as
+    // complete, nonempty content — so every encoding must match the LF control.
+    let blocked = "AUDIT-BLOCKED";
+    let clean = chat_delta_event("clean", "\n");
+    let blocked_lf = chat_delta_event(blocked, "\n");
+    let blocked_crlf = chat_delta_event(blocked, "\r\n");
+    let blocked_cr = chat_delta_event(blocked, "\r");
+    // CRLF ends the data line, then a lone CR ends the dispatching blank line.
+    let blocked_mixed = format!("{}\r\n\r", blocked_cr.trim_end_matches('\r'));
+    let bodies = [
+        ("lf", format!("{blocked_lf}{clean}")),
+        ("crlf", format!("{blocked_crlf}{clean}")),
+        ("bom", format!("\u{feff}{blocked_lf}{clean}")),
+        ("bom_crlf", format!("\u{feff}{blocked_crlf}{clean}")),
+        ("cr", format!(": keepalive\r{blocked_cr}{clean}")),
+        ("bom_cr", format!("\u{feff}{blocked_cr}{clean}")),
+        ("mixed", format!(": keepalive\r\n{blocked_mixed}{clean}")),
+    ];
+
+    for (encoding, body) in bodies {
+        assert_eq!(
+            parse_and_reassemble(&body),
+            (2, true, "AUDIT-BLOCKEDclean".to_string()),
+            "{encoding}: every event must be parsed and reassembled"
+        );
+    }
+}
+
+#[test]
+fn sse_parser_strips_leading_bom_from_single_event_stream() {
+    let body = format!("\u{feff}{}", chat_delta_event("AUDIT-BLOCKED", "\n"));
+    assert_eq!(
+        parse_and_reassemble(&body),
+        (1, true, "AUDIT-BLOCKED".to_string())
+    );
+}
+
+#[test]
+fn sse_parser_splits_cr_only_stream_after_comment() {
+    let body = format!(": keepalive\r{}", chat_delta_event("AUDIT-BLOCKED", "\r"));
+    assert_eq!(
+        parse_and_reassemble(&body),
+        (1, true, "AUDIT-BLOCKED".to_string())
+    );
+}
+
+#[test]
+fn sse_parser_consumes_only_one_leading_bom() {
+    // Only the stream's first U+FEFF is a BOM. A second one is part of the
+    // field name, so an EventSource client sees an unknown field and dispatches
+    // nothing — the parser must agree rather than invent a frame.
+    let body = format!("\u{feff}\u{feff}{}", chat_delta_event("x", "\n"));
+    assert_eq!(parse_and_reassemble(&body), (0, true, String::new()));
+}
+
+#[test]
+fn sse_parser_joins_multiline_data_across_cr_line_endings() {
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\r",
+        "data: \"delta\":{\"content\":\"hi\"}}]}\r\r",
+    );
+    assert_eq!(parse_and_reassemble(body), (1, true, "hi".to_string()));
+}
+
+#[test]
+fn sse_parser_reads_event_name_under_cr_framing() {
+    let body = "event: message_start\rdata: {\"type\":\"message_start\",\"message\":{}}\r\r";
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(
+        parsed.events,
+        vec![Some(SseEventName::Anthropic(AnthropicEvent::MessageStart))]
+    );
+}
+
+#[test]
+fn sse_parser_treats_colonless_data_line_as_empty_data_field() {
+    // `data` with no colon is a `data` field with an empty value, contributing
+    // an empty line to the event's data buffer — whitespace inside JSON.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\n",
+        "data\n",
+        "data: \"delta\":{\"content\":\"hi\"}}]}\n\n",
+    );
+    assert_eq!(parse_and_reassemble(body), (1, true, "hi".to_string()));
+}
+
+#[test]
+fn sse_parser_still_fails_closed_on_malformed_json_under_cr_and_bom() {
+    for body in [
+        "\u{feff}data: {not json\n\n",
+        "data: {not json\r\r",
+        "data: {not json\r\n\r\n",
+    ] {
+        let parsed = parse_sse_data_frames_checked(body.as_bytes());
+        assert!(parsed.frames.is_empty(), "{body:?}");
+        assert!(!parsed.fully_parsed, "{body:?} must not report fully parsed");
+    }
 }
 
 // ---------------------------------------------------------------------------
