@@ -33,7 +33,6 @@ use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -57,11 +56,11 @@ use crate::proxy::headers::{
 };
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
-    BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
-    append_backend_tls_pool_key_fields, append_http2_max_concurrent_streams_pool_key,
-    append_optional_pool_key_component, append_pool_key_component,
-    backend_svid_generation_for_client_cert, backend_tls_config_cache_key,
-    pool_key_host_port_prefix, write_backend_host_port_prefix,
+    BackendSvidGeneration, BackendTlsConfigCache, OwnedBackendTlsConfigInputs,
+    SvidGenerationMatcher, TlsError, append_backend_tls_pool_key_fields,
+    append_http2_max_concurrent_streams_pool_key, append_optional_pool_key_component,
+    append_pool_key_component, backend_svid_generation_for_client_cert,
+    backend_tls_config_cache_key, pool_key_host_port_prefix, write_backend_host_port_prefix,
 };
 use crate::util::body_limit::is_length_limit_error;
 
@@ -1209,43 +1208,34 @@ enum GrpcPhase1 {
 }
 
 impl GrpcPoolManager {
-    fn get_tls_config(
+    /// Cached backend rustls config for this proxy's TLS identity. A miss is
+    /// built once on the bounded TLS source executor and shared by every
+    /// concurrent miss for the same identity; this Tokio worker never reads
+    /// material.
+    async fn get_tls_config(
         &self,
         proxy: &Proxy,
         svid_generation: Option<u64>,
     ) -> Result<Arc<rustls::ClientConfig>, GrpcProxyError> {
         let cache_key = self.tls_config_cache_key_owned(proxy, svid_generation);
-        self.tls_configs.get_or_try_build(cache_key, || {
-            let crls = self.crls.load_full();
-            let mut tls_config = BackendTlsConfigBuilder {
-                proxy,
-                policy: self.tls_policy.as_deref(),
-                global_ca: self
-                    .global_env_config
-                    .tls_ca_bundle_path
-                    .as_deref()
-                    .map(Path::new),
-                global_no_verify: self.global_env_config.tls_no_verify,
-                global_client_cert: self
-                    .global_env_config
-                    .backend_tls_client_cert_path
-                    .as_deref()
-                    .map(Path::new),
-                global_client_key: self
-                    .global_env_config
-                    .backend_tls_client_key_path
-                    .as_deref()
-                    .map(Path::new),
-                crls: crls.as_ref().as_slice(),
-            }
-            .build_rustls()
+        self.tls_configs
+            .get_or_build(cache_key, || {
+                let inputs = OwnedBackendTlsConfigInputs::for_pool(
+                    proxy,
+                    self.tls_policy.as_ref(),
+                    &self.global_env_config,
+                    &self.crls,
+                );
+                move || -> Result<rustls::ClientConfig, TlsError> {
+                    let mut tls_config = inputs.builder().build_rustls()?;
+                    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+                    Ok(tls_config)
+                }
+            })
+            .await
             .map_err(|e| {
                 GrpcProxyError::Internal(format!("Failed to build backend TLS config: {}", e))
-            })?;
-
-            tls_config.alpn_protocols = vec![b"h2".to_vec()];
-            Ok(tls_config)
-        })
+            })
     }
 
     async fn create_connection(
@@ -1320,7 +1310,7 @@ impl GrpcPoolManager {
         // ALPN proof. A peer that accepts TCP but cannot establish the
         // requested protocol must not pin this pool to that DNS address.
         let result = if use_tls {
-            let tls_config = self.get_tls_config(proxy, svid_generation)?;
+            let tls_config = self.get_tls_config(proxy, svid_generation).await?;
             let connector = tokio_rustls::TlsConnector::from(tls_config);
             let server_name =
                 crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host)

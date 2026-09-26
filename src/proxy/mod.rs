@@ -7624,19 +7624,19 @@ fn push_tls_material_source(
 /// NOTE on the asymmetric drain calls: only `connection_pool`, `http2_pool`,
 /// and `grpc_pool` get a `drain_backend_tls_config_cache_svid_generation()`
 /// call on rotation — the H3 pool's TLS config cache is co-located on
-/// `connection_pool.backend_h3_tls_configs`, so it is drained transitively,
-/// and the HBONE and mesh mTLS pools build their SPIFFE client config per
-/// connect (no cache to drain). That same unconditional call also reclaims
-/// generation-keyed H2/gRPC `rr_counters`. A post-sweep late insert of a
-/// captured retired generation is removed on the cold-insert miss path
-/// (and TLS configs refuse to cache a retired numeric generation) so a
-/// default `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0` cannot leak one
-/// counter or TLS-config entry per rotation. HBONE and mesh-mTLS have no
-/// generation-keyed rr counters — they key by SVID fingerprint and keep
-/// connection drain gated on the operator drain window. All pools get a
-/// `force_drain_svid_generation()` call when the operator-configured drain
-/// window elapses, because each pool keeps its own `DashMap` of live
-/// connections.
+/// `connection_pool.backend_h3_tls_configs` (next to the reqwest rustls config
+/// cache), so it is drained transitively, and the HBONE and mesh mTLS pools
+/// build their SPIFFE client config per connect (no cache to drain). That same
+/// unconditional call also reclaims generation-keyed H2/gRPC `rr_counters`.
+/// A post-sweep late insert of a captured retired generation is removed on
+/// the cold-insert miss path (and TLS configs refuse to cache a retired
+/// numeric generation) so a default `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0`
+/// cannot leak one counter or TLS-config entry per rotation. HBONE and
+/// mesh-mTLS have no generation-keyed rr counters — they key by SVID
+/// fingerprint and keep connection drain gated on the operator drain window.
+/// All pools get a `force_drain_svid_generation()` call when the
+/// operator-configured drain window elapses, because each pool keeps its own
+/// `DashMap` of live connections.
 #[derive(Clone)]
 struct BackendPoolFamily {
     connection_pool: Arc<ConnectionPool>,
@@ -11025,7 +11025,8 @@ impl ProxyState {
                 // only parallelizes *across* targets, not within one.
                 let tls_config_result = self
                     .connection_pool
-                    .get_tls_config_for_backend(&probe_proxy);
+                    .get_tls_config_for_backend(&probe_proxy)
+                    .await;
                 let h2_fut = self.probe_h2_tls(
                     H2TlsProbeTarget {
                         probe_proxy: &probe_proxy,
@@ -56137,7 +56138,7 @@ async fn proxy_to_backend_http3(
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             grpc_messages,
-                            move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                            move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                         )
                         .await
                 } else {
@@ -56161,7 +56162,7 @@ async fn proxy_to_backend_http3(
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             grpc_messages,
-                            move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                            move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                         )
                         .await
                 };
@@ -56567,7 +56568,7 @@ async fn proxy_to_backend_http3(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         } else {
@@ -56581,7 +56582,7 @@ async fn proxy_to_backend_http3(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         };
@@ -56677,7 +56678,7 @@ async fn proxy_to_backend_http3(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         } else {
@@ -56691,7 +56692,7 @@ async fn proxy_to_backend_http3(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         };
@@ -57280,7 +57281,7 @@ async fn proxy_to_backend_http3_retry(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         } else {
@@ -57292,7 +57293,7 @@ async fn proxy_to_backend_http3_retry(
                     backend_url,
                     &http3_headers,
                     body_bytes,
-                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         };
@@ -57423,7 +57424,7 @@ async fn proxy_to_backend_http3_retry(
                 backend_url,
                 &http3_headers,
                 body_bytes,
-                move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
             )
             .await
     } else {
@@ -57435,7 +57436,7 @@ async fn proxy_to_backend_http3_retry(
                 backend_url,
                 &http3_headers,
                 body_bytes,
-                move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
             )
             .await
     };

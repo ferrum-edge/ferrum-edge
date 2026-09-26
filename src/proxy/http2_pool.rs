@@ -12,7 +12,6 @@ use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -123,11 +122,11 @@ use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::body::DirectH2RequestBody;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
-    BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
-    append_backend_tls_pool_key_fields, append_http2_max_concurrent_streams_pool_key,
-    append_optional_pool_key_component, append_pool_key_component,
-    backend_svid_generation_for_client_cert, backend_tls_config_cache_key,
-    pool_key_host_port_prefix, write_backend_host_port_prefix,
+    BackendSvidGeneration, BackendTlsConfigCache, OwnedBackendTlsConfigInputs,
+    SvidGenerationMatcher, TlsError, append_backend_tls_pool_key_fields,
+    append_http2_max_concurrent_streams_pool_key, append_optional_pool_key_component,
+    append_pool_key_component, backend_svid_generation_for_client_cert,
+    backend_tls_config_cache_key, pool_key_host_port_prefix, write_backend_host_port_prefix,
 };
 
 thread_local! {
@@ -368,7 +367,7 @@ impl Http2PoolManager {
 
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
         let pool_config = self.global_pool_config.for_proxy(proxy);
-        let tls_config = self.get_tls_config(proxy, svid_generation)?;
+        let tls_config = self.get_tls_config(proxy, svid_generation).await?;
         let connector = tokio_rustls::TlsConnector::from(tls_config);
         let server_name =
             crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host).map_err(
@@ -563,59 +562,47 @@ impl Http2PoolManager {
         builder
     }
 
-    fn get_tls_config(
+    /// Cached backend rustls config for this proxy's TLS identity. A miss is
+    /// built once on the bounded TLS source executor and shared by every
+    /// concurrent miss for the same identity; this Tokio worker never reads
+    /// material.
+    async fn get_tls_config(
         &self,
         proxy: &Proxy,
         svid_generation: Option<u64>,
     ) -> Result<Arc<rustls::ClientConfig>, Http2PoolError> {
         let cache_key = self.tls_config_cache_key_owned(proxy, svid_generation);
-        self.tls_configs.get_or_try_build(cache_key, || {
-            let crls = self.crls.load_full();
-            let mut tls_config = BackendTlsConfigBuilder {
-                proxy,
-                policy: self.tls_policy.as_deref(),
-                global_ca: self
-                    .global_env_config
-                    .tls_ca_bundle_path
-                    .as_deref()
-                    .map(Path::new),
-                global_no_verify: self.global_env_config.tls_no_verify,
-                global_client_cert: self
-                    .global_env_config
-                    .backend_tls_client_cert_path
-                    .as_deref()
-                    .map(Path::new),
-                global_client_key: self
-                    .global_env_config
-                    .backend_tls_client_key_path
-                    .as_deref()
-                    .map(Path::new),
-                crls: crls.as_ref().as_slice(),
-            }
-            .build_rustls()
+        self.tls_configs
+            .get_or_build(cache_key, || {
+                let inputs = OwnedBackendTlsConfigInputs::for_pool(
+                    proxy,
+                    self.tls_policy.as_ref(),
+                    &self.global_env_config,
+                    &self.crls,
+                );
+                move || -> Result<rustls::ClientConfig, TlsError> {
+                    let mut tls_config = inputs.builder().build_rustls()?;
+                    // Advertise both `h2` and `http/1.1` — the backend picks.
+                    // If it picks h2 we use this pool; if it picks http/1.1 the
+                    // caller (create_tls_connection) returns
+                    // `BackendSelectedHttp1` so the dispatcher can route via
+                    // reqwest. Advertising only `h2` would fail the handshake
+                    // against h1-only servers with no graceful recovery.
+                    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                    Ok(tls_config)
+                }
+            })
+            .await
             .map_err(|e| {
                 let message = format!("Failed to build backend TLS config: {}", e);
                 let source = match e {
-                    crate::tls::backend::TlsError::Io { source, .. } => {
-                        Some(InternalSource::Io(source))
-                    }
-                    crate::tls::backend::TlsError::Pem { .. }
-                    | crate::tls::backend::TlsError::Rustls(_) => {
+                    TlsError::Io { source, .. } => Some(InternalSource::Io(source)),
+                    TlsError::Pem { .. } | TlsError::Rustls(_) => {
                         Some(InternalSource::Message(message.clone()))
                     }
                 };
                 Http2PoolError::Internal { message, source }
-            })?;
-
-            // Advertise both `h2` and `http/1.1` — the backend picks.
-            // If it picks h2 we use this pool; if it picks http/1.1 the
-            // caller (create_tls_connection) returns
-            // `BackendSelectedHttp1` so the dispatcher can route via
-            // reqwest. Advertising only `h2` would fail the handshake
-            // against h1-only servers with no graceful recovery.
-            tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            Ok::<rustls::ClientConfig, Http2PoolError>(tls_config)
-        })
+            })
     }
 }
 

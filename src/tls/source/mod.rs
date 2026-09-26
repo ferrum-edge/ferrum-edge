@@ -37,7 +37,60 @@ pub struct TlsSourceExecutor {
 }
 
 static TLS_SOURCE_EXECUTION_POLICY: OnceLock<TlsSourceExecutor> = OnceLock::new();
+
+/// Multiple of the per-source budget (`FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`,
+/// [`TlsSourceExecutor::deadline`]) that caps one background
+/// run-to-completion operation such as a cold backend TLS config build.
+///
+/// A backend TLS config can resolve its CA, client certificate, and client
+/// key from three separate remote providers. Each remote wait keeps the full
+/// per-source budget, and the build as a whole may spend up to this multiple
+/// of it, so three slow but working sources resolved one after another still
+/// finish and get cached. Request waiters never wait longer than the
+/// per-source budget; only the background build runs this long.
+pub const TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER: u32 = 3;
 static TLS_SOURCE_RUNTIME: OnceLock<Result<tokio::runtime::Handle, String>> = OnceLock::new();
+
+thread_local! {
+    /// Absolute deadline of the executor-admitted blocking operation running
+    /// on this thread. Set for the duration of every executor closure so each
+    /// remote source wait inside one operation is capped by what remains of
+    /// that operation's budget, on top of its own per-source budget.
+    static TLS_SOURCE_OPERATION_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Scopes [`TLS_SOURCE_OPERATION_DEADLINE`] to one executor closure and
+/// restores the previous value when the closure returns or unwinds.
+struct TlsSourceOperationDeadline {
+    previous: Option<std::time::Instant>,
+}
+
+impl TlsSourceOperationDeadline {
+    fn enter(deadline: std::time::Instant) -> Self {
+        let previous = TLS_SOURCE_OPERATION_DEADLINE.with(|slot| slot.replace(Some(deadline)));
+        Self { previous }
+    }
+}
+
+impl Drop for TlsSourceOperationDeadline {
+    fn drop(&mut self) {
+        TLS_SOURCE_OPERATION_DEADLINE.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// How long a blocking source wait may still take: `budget`, capped by what
+/// remains of the enclosing executor operation's absolute deadline when the
+/// caller runs inside one. Zero means that deadline has already passed.
+pub fn remaining_tls_source_operation_budget(budget: Duration) -> Duration {
+    TLS_SOURCE_OPERATION_DEADLINE.with(|slot| match slot.get() {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            budget.min(remaining)
+        }
+        None => budget,
+    })
+}
 
 /// TLS material kind expected from a source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -879,8 +932,10 @@ impl TlsSourceExecutor {
                 .await
                 .map_err(|_| MaterialError::DeadlineExceeded)?
                 .map_err(|_| MaterialError::ExecutorUnavailable)?;
+        let operation_deadline = std::time::Instant::now() + self.deadline;
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _deadline = TlsSourceOperationDeadline::enter(operation_deadline);
             operation()
         });
         let result = tokio::time::timeout_at(deadline, task)
@@ -888,6 +943,41 @@ impl TlsSourceExecutor {
             .map_err(|_| MaterialError::DeadlineExceeded)?
             .map_err(|_| MaterialError::ExecutorUnavailable)?;
         Ok(result)
+    }
+
+    /// Run blocking source work to completion with no caller-side deadline.
+    ///
+    /// For owners that bound their own waiters and want a slow but successful
+    /// result instead of discarding it (the backend TLS config cache publishes
+    /// a late success so the next request hits the cache). Admission still
+    /// goes through the same process-wide semaphore, and once admitted the
+    /// operation carries an absolute deadline of
+    /// [`Self::background_build_deadline`] from admission. Every remote source
+    /// wait inside it keeps the per-source budget [`Self::deadline`], capped by
+    /// what remains of that operation deadline (see
+    /// [`remaining_tls_source_operation_budget`]). Local blocking syscalls are
+    /// not interruptible and are not bounded by either.
+    pub async fn run_blocking_result_to_completion<T, E, F>(
+        &self,
+        operation: F,
+    ) -> Result<Result<T, E>, MaterialError>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce() -> Result<T, E> + Send + 'static,
+    {
+        let permit = Arc::clone(&self.blocking_limit)
+            .acquire_owned()
+            .await
+            .map_err(|_| MaterialError::ExecutorUnavailable)?;
+        let operation_deadline = std::time::Instant::now() + self.background_build_deadline();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _deadline = TlsSourceOperationDeadline::enter(operation_deadline);
+            operation()
+        })
+        .await
+        .map_err(|_| MaterialError::ExecutorUnavailable)
     }
 
     /// Process-wide blocking admission bound. Reinstall equality uses this
@@ -898,6 +988,14 @@ impl TlsSourceExecutor {
 
     pub fn deadline(&self) -> Duration {
         self.deadline
+    }
+
+    /// Whole-operation cap for [`Self::run_blocking_result_to_completion`]:
+    /// [`TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER`] times the per-source
+    /// budget [`Self::deadline`].
+    pub fn background_build_deadline(&self) -> Duration {
+        let multiplier = TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER;
+        self.deadline.saturating_mul(multiplier)
     }
 }
 
@@ -944,7 +1042,7 @@ pub fn install_tls_source_execution_policy(
     }
 }
 
-fn effective_tls_source_executor() -> Result<TlsSourceExecutor, MaterialError> {
+pub(crate) fn effective_tls_source_executor() -> Result<TlsSourceExecutor, MaterialError> {
     if let Some(executor) = TLS_SOURCE_EXECUTION_POLICY.get() {
         return Ok(executor.clone());
     }
@@ -1678,15 +1776,33 @@ fn tls_source_runtime_handle() -> Result<tokio::runtime::Handle, String> {
     }
 }
 
+/// Test seam for `resolve_on_tls_source_runtime`'s budget handling. Not
+/// used by production code.
+#[doc(hidden)]
+pub fn resolve_on_tls_source_runtime_for_test<T, F>(future: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, String>> + Send + 'static,
+{
+    resolve_on_tls_source_runtime(future)
+}
+
 fn resolve_on_tls_source_runtime<T, F>(future: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: Future<Output = Result<T, String>> + Send + 'static,
 {
     let handle = tls_source_runtime_handle()?;
-    let deadline = effective_tls_source_executor()
+    let budget = effective_tls_source_executor()
         .map_err(|_| "TLS source execution policy is unavailable".to_string())?
         .deadline();
+    // Each source keeps the per-source budget, capped by what remains of the
+    // enclosing executor operation's absolute deadline, so a build that
+    // resolves several remote sources stays within that operation's cap.
+    let deadline = remaining_tls_source_operation_budget(budget);
+    if deadline.is_zero() {
+        return Err("TLS source resolution deadline exceeded".to_string());
+    }
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let task = handle.spawn(async move {
         let _ = result_tx.send(future.await);

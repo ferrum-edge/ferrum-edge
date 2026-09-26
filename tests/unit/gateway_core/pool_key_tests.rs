@@ -2401,6 +2401,106 @@ async fn backend_tls_config_cache_shares_arc_across_hosts() {
     assert!(Arc::ptr_eq(&first, &shared));
 }
 
+/// The H3 backend TLS lookup builds a cold miss once on the TLS source
+/// executor: concurrent misses share one `Arc`, the result is cached, and no
+/// build is left in flight.
+#[tokio::test]
+async fn h3_backend_tls_cold_misses_share_one_cached_build() {
+    ensure_crypto_provider();
+    let pool = pool_with_defaults();
+    let proxy = minimal_proxy();
+
+    let (first, second) = tokio::join!(
+        pool.get_tls_config_for_backend(&proxy),
+        pool.get_tls_config_for_backend(&proxy)
+    );
+    let first = first.expect("cold H3 backend TLS build");
+    let second = second.expect("coalesced H3 backend TLS build");
+
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.alpn_protocols, vec![b"h3".to_vec()]);
+    let cache = pool.backend_tls_config_cache();
+    assert_eq!(cache.len(), 1);
+    assert_eq!(cache.pending_builds(), 0);
+}
+
+/// Unreadable backend trust material still fails closed on the async path,
+/// with the same diagnostic prefix, and the failure is not cached.
+#[tokio::test]
+async fn h3_backend_tls_cold_miss_with_missing_ca_fails_closed() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing_ca = dir.path().join("missing-ca.pem");
+    let missing_ca = missing_ca.to_str().expect("utf-8 temp path");
+    let pool = pool_with_global_tls(None, None, Some(missing_ca), false);
+
+    let error = pool
+        .get_tls_config_for_backend(&minimal_proxy())
+        .await
+        .expect_err("a missing backend CA bundle must fail closed");
+    assert!(
+        error
+            .to_string()
+            .starts_with("Failed to build HTTP/3 backend TLS config"),
+        "{error}"
+    );
+    let cache = pool.backend_tls_config_cache();
+    assert!(cache.is_empty());
+    assert_eq!(cache.pending_builds(), 0);
+}
+
+/// The reqwest pool builds its rustls config on the TLS source executor and
+/// keeps the existing fail-closed error for unreadable trust material.
+#[tokio::test]
+async fn reqwest_cold_client_with_missing_ca_fails_closed() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing_ca = dir.path().join("missing-ca.pem");
+    let missing_ca = missing_ca.to_str().expect("utf-8 temp path");
+    let pool = pool_with_global_tls(None, None, Some(missing_ca), false);
+
+    let error = pool
+        .get_client(&minimal_proxy())
+        .await
+        .expect_err("a missing backend CA bundle must fail closed");
+    assert!(
+        error
+            .to_string()
+            .starts_with("Failed to build reqwest backend TLS config"),
+        "{error}"
+    );
+    let cache = pool.backend_reqwest_tls_config_cache();
+    assert!(cache.is_empty(), "failures are never cached");
+    assert_eq!(cache.pending_builds(), 0);
+}
+
+/// The reqwest pool caches its rustls config per TLS identity (plus ALPN
+/// variant), so reqwest clients for two endpoints with the same trust material
+/// share one cold build, and a backend TLS / CRL reload clears it.
+#[tokio::test]
+async fn reqwest_cold_clients_share_one_cached_rustls_build() {
+    ensure_crypto_provider();
+    let pool = pool_with_defaults();
+    let first = proxy_at("10.0.0.1", 8080);
+    let second = proxy_at("10.0.0.2", 8080);
+
+    pool.get_client(&first).await.expect("first client");
+    pool.get_client(&second).await.expect("second client");
+
+    let tls_key = pool.tls_config_cache_key_for_warmup(&first);
+    let cache = pool.backend_reqwest_tls_config_cache();
+    assert_eq!(cache.len(), 1, "one rustls build per TLS identity");
+    assert!(
+        cache.contains_key(&format!("alpn=h2|{tls_key}"))
+            || cache.contains_key(&format!("alpn=h1|{tls_key}")),
+        "reqwest TLS cache key must be the TLS identity plus its ALPN variant"
+    );
+    assert_eq!(cache.pending_builds(), 0);
+
+    pool.clear_backend_tls_config_cache();
+    assert!(pool.backend_reqwest_tls_config_cache().is_empty());
+}
+
 #[tokio::test]
 async fn rr_counters_do_not_grow_unbounded_under_endpoint_churn() {
     let pool = Http2ConnectionPool::default();

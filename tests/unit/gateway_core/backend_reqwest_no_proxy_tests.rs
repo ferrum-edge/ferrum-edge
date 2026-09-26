@@ -7,7 +7,6 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use futures_util::FutureExt as _;
 use std::sync::Arc;
 use std::time::Duration;
 use wiremock::MockServer;
@@ -129,6 +128,7 @@ fn minimal_proxy() -> Proxy {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // ENV_LOCK must span the async cold build so env stays set
 async fn connection_pool_backend_client_ignores_ambient_proxy_environment() {
     let proxy_server = MockServer::start().await;
     let dns = DnsCache::new(DnsConfig::default());
@@ -148,13 +148,24 @@ async fn connection_pool_backend_client_ignores_ambient_proxy_environment() {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _proxy_env = ProxyEnvGuard::point_all_at(&proxy_server.uri());
         // Backend reqwest builders call `.no_proxy()`, but keep ambient proxy
-        // variables set through the synchronous pool-miss path so a dropped
-        // `.no_proxy()` fails CI. `now_or_never` avoids holding ENV_LOCK
-        // across `.await` while the first client is created.
-        pool.get_client(&proxy)
-            .now_or_never()
-            .expect("backend pool client creation should not yield while env is set")
-            .expect("backend pool client should build")
+        // variables set until the cold build (now dispatched through the async
+        // single-flight builder) completes, so a dropped `.no_proxy()` fails
+        // CI. ENV_LOCK is deliberately held across this `.await`: releasing
+        // it earlier would let another test restore the environment while
+        // the client is still being built.
+        let client = pool
+            .get_client(&proxy)
+            .await
+            .expect("backend pool client should build");
+        let proxy_uri = proxy_server.uri();
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            assert_eq!(
+                std::env::var(key).ok().as_deref(),
+                Some(proxy_uri.as_str()),
+                "{key} must still point at the canary proxy when the client finishes building"
+            );
+        }
+        client
     };
 
     let _ = client

@@ -879,6 +879,7 @@ async fn test_http3_full_integration() {
     let tls_config = proxy_state
         .connection_pool
         .get_tls_config_for_backend(&proxy)
+        .await
         .expect("TLS config should succeed for test proxy");
     assert!(Arc::strong_count(&tls_config) > 0);
 
@@ -1117,6 +1118,7 @@ async fn test_http3_connection_performance() {
     // Test HTTP/3 client creation performance
     let tls_config = connection_pool
         .get_tls_config_for_backend(&proxy)
+        .await
         .expect("TLS config should succeed for test proxy");
 
     let start_time = std::time::Instant::now();
@@ -2309,7 +2311,7 @@ async fn h3_pool_request_reuses_an_admitted_shard_when_the_cap_refuses_creation(
                 &url,
                 &headers,
                 bytes::Bytes::new(),
-                move || Ok(tls),
+                move || std::future::ready(Ok(tls)),
             )
             .await
             .unwrap_or_else(|e| {
@@ -2380,7 +2382,7 @@ async fn h3_pool_conn_slot_is_owned_by_the_driver_not_the_pooled_handle() {
             &url,
             &headers,
             bytes::Bytes::new(),
-            move || Ok(tls),
+            move || std::future::ready(Ok(tls)),
         )
         .await
         .expect("first request establishes the one admitted QUIC connection");
@@ -2434,7 +2436,7 @@ async fn h3_pool_conn_slot_is_owned_by_the_driver_not_the_pooled_handle() {
             &url,
             &headers,
             bytes::Bytes::new(),
-            move || Ok(tls),
+            move || std::future::ready(Ok(tls)),
         )
         .await
         .expect("a replacement must be admitted once the old driver terminated");
@@ -2565,7 +2567,7 @@ async fn h3_pool_target_dispatch_caps_on_the_policy_port_under_a_target_port_rem
                 &url,
                 &headers,
                 bytes::Bytes::new(),
-                move || Ok(tls),
+                move || std::future::ready(Ok(tls)),
             )
             .await
             .unwrap_or_else(|e| panic!("buffered targeted request {attempt} must be served: {e}"));
@@ -2624,7 +2626,7 @@ async fn h3_pool_streaming_target_dispatch_caps_on_the_policy_port_under_a_remap
                 &url,
                 &headers,
                 bytes::Bytes::new(),
-                move || Ok(tls),
+                move || std::future::ready(Ok(tls)),
             )
             .await
             .unwrap_or_else(|e| panic!("streaming targeted request {attempt} must be served: {e}"));
@@ -2735,7 +2737,7 @@ async fn h3_pool_request_with_target_reuses_an_admitted_shard_when_the_cap_refus
                 &url,
                 &headers,
                 bytes::Bytes::new(),
-                move || Ok(tls),
+                move || std::future::ready(Ok(tls)),
             )
             .await
             .unwrap_or_else(|e| {
