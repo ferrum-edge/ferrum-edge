@@ -5696,8 +5696,7 @@ fn h3_plain_bridge_counts_request_messages_in_the_upload_framing() {
         .split("boxed_dispatch_plain(")
         .next()
         .expect("plain arm before dispatch");
-    let unprepared =
-        "if !request_body_prepared && let Some(body) = prebuffered_body.as_deref() {";
+    let unprepared = "if !request_body_prepared && let Some(body) = prebuffered_body.as_deref() {";
     assert!(
         plain_arm.contains(unprepared)
             && plain_arm.contains("record_request_grpc_message_count(ctx, body);"),
