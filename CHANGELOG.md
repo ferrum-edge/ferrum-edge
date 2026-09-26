@@ -379,6 +379,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shrinking the limit until that window rolls out; backend failures, the
   recovery-cohort barrier, and in-flight accounting are unchanged, and
   compatible reloads keep the learned windows.
+- The circuit-breaker cache's at-capacity warning is now rate-limited to at
+  most one line per second (with a suppressed count) instead of one line per
+  request to an uncached overflow target, and it is emitted after the cache
+  shard lock is released. `ferrum_circuit_breaker_cache_admission_refused_total`
+  still counts every refused admission (#5787).
 
 ### Security
 

@@ -6,9 +6,11 @@
 //! - **Half-Open**: After a timeout, a limited number of probe requests are allowed.
 
 use crate::config::types::CircuitBreakerConfig;
+use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 use tracing::{info, warn};
 
 const STATE_CLOSED: u8 = 0;
@@ -695,6 +697,11 @@ pub struct CircuitBreakerCache {
     /// pressure is observable before circuit breaking silently degrades to
     /// transient (stateless) breakers for every newly discovered target.
     admission_refused: AtomicU64,
+    /// Coalesces the at-capacity warning. Refused admissions arrive at request
+    /// rate (an overflow key is never cached), so the warning emits at most
+    /// once per window with a suppressed count; `admission_refused` stays exact.
+    admission_refused_warn: AtomicLogRateLimiter,
+    admission_refused_warn_epoch: Instant,
 }
 
 impl Default for CircuitBreakerCache {
@@ -722,6 +729,8 @@ impl CircuitBreakerCache {
             entry_count: AtomicUsize::new(0),
             max_entries,
             admission_refused: AtomicU64::new(0),
+            admission_refused_warn: AtomicLogRateLimiter::new(),
+            admission_refused_warn_epoch: Instant::now(),
         }
     }
 
@@ -765,32 +774,47 @@ impl CircuitBreakerCache {
         // Miss or config change: per-key entry API holds the shard write lock
         // for create/replace so concurrent same-key callers share one Arc, and
         // vacant keys reserve capacity before publishing.
-        match self.breakers.entry(key) {
+        let refused_key = match self.breakers.entry(key) {
             Entry::Occupied(mut occupied) => {
                 if occupied.get().config() == config {
                     return occupied.get().clone();
                 }
                 let cb = Arc::new(CircuitBreaker::new(config.clone()));
                 occupied.insert(cb.clone());
-                cb
+                return cb;
             }
             Entry::Vacant(vacant) => {
-                if !self.try_reserve_entry_slot() {
-                    self.admission_refused.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "Circuit breaker cache at capacity ({}), skipping new entry for {}",
-                        self.max_entries,
-                        vacant.key()
-                    );
-                    // Transient breaker: not cached, so overflow traffic does
-                    // not retain state across requests and cannot grow the map.
-                    return Arc::new(CircuitBreaker::new(config.clone()));
+                if self.try_reserve_entry_slot() {
+                    let cb = Arc::new(CircuitBreaker::new(config.clone()));
+                    vacant.insert(cb.clone());
+                    return cb;
                 }
-                let cb = Arc::new(CircuitBreaker::new(config.clone()));
-                vacant.insert(cb.clone());
-                cb
+                // Consuming the vacant entry releases the shard write lock
+                // before any diagnostic work below.
+                vacant.into_key()
             }
+        };
+
+        self.admission_refused.fetch_add(1, Ordering::Relaxed);
+        if let Some(suppressed) = self.record_admission_refused_warning() {
+            warn!(
+                max_entries = self.max_entries,
+                suppressed,
+                "Circuit breaker cache at capacity ({}), skipping new entry for {}",
+                self.max_entries,
+                refused_key
+            );
         }
+        // Transient breaker: not cached, so overflow traffic does not retain
+        // state across requests and cannot grow the map.
+        Arc::new(CircuitBreaker::new(config.clone()))
+    }
+
+    /// Rate-limit the at-capacity warning; `Some(suppressed)` means emit now.
+    fn record_admission_refused_warning(&self) -> Option<u64> {
+        let now_ms = u64::try_from(self.admission_refused_warn_epoch.elapsed().as_millis())
+            .unwrap_or(u64::MAX);
+        self.admission_refused_warn.on_event(now_ms)
     }
 
     fn try_reserve_entry_slot(&self) -> bool {
