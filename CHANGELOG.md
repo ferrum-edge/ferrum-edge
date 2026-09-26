@@ -257,6 +257,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completeness check, and a response without `Content-Length` is never treated
   as complete on a close.
 
+### Performance
+
+- `security_headers` removes matching response headers in place without allocating or cloning keys
+  (#5755).
+
 ## [0.9.7] - 2026-09-25
 
 This is the first published release after 0.9.5. It ships every change
@@ -926,8 +931,6 @@ prepared as 0.9.6, which was tagged but never published (see below).
 
 ### Performance
 
-- `security_headers` removes matching response headers in place without allocating or cloning keys
-  (#5755).
 - `ws_frame_logging` builds its payload-fingerprint HMAC key once per plugin
   instead of once per frame (#5690).
 - Circuit-breaker cache hits no longer allocate a key string (#5691).
