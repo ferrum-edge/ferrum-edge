@@ -4135,7 +4135,7 @@ fn h3_native_grpc_bidi_open_is_pre_wire_and_splits() {
         "the request head must receive the receipt-anchored deadline after connection acquisition"
     );
     let pooled_openers = client
-        .split("pub async fn open_bidi_backend_stream(")
+        .split("pub async fn open_bidi_backend_stream<")
         .nth(1)
         .unwrap()
         .split("/// Execute an HTTP/3 request, streaming the request body from a hyper")

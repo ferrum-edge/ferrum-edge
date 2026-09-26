@@ -1776,7 +1776,7 @@ fn tls_source_runtime_handle() -> Result<tokio::runtime::Handle, String> {
     }
 }
 
-/// Test seam for [`resolve_on_tls_source_runtime`]'s budget handling. Not
+/// Test seam for `resolve_on_tls_source_runtime`'s budget handling. Not
 /// used by production code.
 #[doc(hidden)]
 pub fn resolve_on_tls_source_runtime_for_test<T, F>(future: F) -> Result<T, String>

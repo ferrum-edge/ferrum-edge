@@ -63,7 +63,9 @@ fn slow_remote_source(per_source_budget: Duration, latency: Duration) -> Result<
     let allowed = remaining_tls_source_operation_budget(per_source_budget);
     if allowed < latency {
         std::thread::sleep(allowed);
-        return Err(TlsError::Rustls("remote source deadline exceeded".to_string()));
+        return Err(TlsError::Rustls(
+            "remote source deadline exceeded".to_string(),
+        ));
     }
     std::thread::sleep(latency);
     Ok(())
@@ -585,7 +587,7 @@ async fn executor_operations_carry_one_absolute_source_budget() {
 #[tokio::test(flavor = "current_thread")]
 async fn multi_source_build_past_the_request_budget_is_cached_for_a_later_request() {
     let per_source_budget = Duration::from_millis(400);
-    let source_latency = Duration::from_millis(250);
+    let source_latency = Duration::from_millis(200);
     let cache = BackendTlsConfigCache::new();
     let executor = test_executor(1, per_source_budget);
     assert!(source_latency * 3 > per_source_budget);
