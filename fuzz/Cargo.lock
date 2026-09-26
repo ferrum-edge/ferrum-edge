@@ -1467,6 +1467,7 @@ dependencies = [
  "pin-project-lite",
  "prost",
  "prost-reflect",
+ "prost-types",
  "psl",
  "quinn",
  "rcgen",

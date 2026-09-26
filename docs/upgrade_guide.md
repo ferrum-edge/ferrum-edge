@@ -42,6 +42,20 @@ UDP port must be reachable wherever the TCP port is. Size `request` and
 now cut on HTTP/3 as it already was on HTTP/1.1 and HTTP/2. See
 [Rule timeouts](gateway_api_conformance.md#rule-timeouts).
 
+**`ValidateJWTSVID` returns claims as `google.protobuf.Struct` (#5764).** The
+in-process SPIFFE Workload API (`FERRUM_MESH_WORKLOAD_API_ENABLED`) now declares
+`ValidateJWTSVIDResponse.claims = 2` as `google.protobuf.Struct`, matching the
+upstream SPIFFE `workload.proto`, instead of the JSON-encoded `bytes
+claims_json = 2` field Ferrum previously vendored. go-spiffe and other clients
+generated from the upstream proto need no change.
+
+**Client action:** a client generated from Ferrum's previous vendored
+`workload_api.proto` that parses `claims_json` as JSON must be regenerated from
+the upstream (or current vendored) proto and read `claims` as a `Struct`.
+Numbers arrive as doubles, and a token whose claims nest deeper than 32 levels
+is refused with `INVALID_ARGUMENT`. See
+[mesh.md → Workload API JWT-SVID](mesh.md#workload-api-jwt-svid).
+
 ## Upgrading to 0.9.7
 
 v0.9.7 is the first published release after 0.9.5 (`v0.9.6` was tagged but

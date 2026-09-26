@@ -15,23 +15,21 @@
 
 syntax = "proto3";
 
-// DIVERGENCE FROM UPSTREAM SPIFFE WORKLOAD API
-//
-// The only divergence from the upstream proto is the
-// `ValidateJWTSVIDResponse.claims` field: upstream uses
-// `google.protobuf.Struct`, we use a JSON-encoded `bytes` blob so the
-// generated Rust does not pull in `prost-types` for the `Struct` type — the
-// gateway never inspects the claims wire-format directly. When Phase B
-// re-introduces the JWT-SVID validate path, we can either decode JSON
-// ourselves or re-introduce the `Struct` import.
-//
+// Upstream imports the well-known `Struct` type for
+// `ValidateJWTSVIDResponse.claims`. `proto/google/protobuf/struct.proto` is a
+// verbatim copy of the protobuf well-known type so the build does not depend
+// on protoc's bundled includes; prost maps it to `prost_types::Struct`.
+import "google/protobuf/struct.proto";
+
 // Upstream intentionally declares no proto package. Keep this unqualified so
 // the gRPC service path is `/SpiffeWorkloadAPI/*`; real SPIRE agents reject a
 // packaged service such as `/spiffe.workload.SpiffeWorkloadAPI/*`.
 //
-// All field numbers, names, and types in the X.509 messages match upstream
-// byte-for-byte so this gateway is wire-compatible with real SPIRE agents
-// and any other SPIFFE Workload API implementation.
+// All field numbers, names, and types match upstream so this gateway is
+// wire-compatible with real SPIRE agents and any other SPIFFE Workload API
+// implementation. The upstream WIT-SVID profile RPCs (`FetchWITSVID`,
+// `FetchWITBundles`) are not vendored; a client calling them receives
+// `UNIMPLEMENTED`.
 
 service SpiffeWorkloadAPI {
   // Streams X.509 SVIDs to the workload. The workload is identified
@@ -135,6 +133,7 @@ message ValidateJWTSVIDRequest {
 
 message ValidateJWTSVIDResponse {
   string spiffe_id = 1;
-  // JSON-encoded claims of the SVID. See note at the top of the file.
-  bytes claims_json = 2;
+  // Claims of the validated JWT-SVID. JSON numbers are carried as doubles,
+  // per the proto3 JSON mapping of `google.protobuf.Value`.
+  google.protobuf.Struct claims = 2;
 }

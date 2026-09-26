@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (wire) — `ValidateJWTSVID` returns claims as
+  `google.protobuf.Struct`** (issue #5764). The in-process SPIFFE Workload API
+  (`FERRUM_MESH_WORKLOAD_API_ENABLED`) now returns
+  `ValidateJWTSVIDResponse.claims` as a `google.protobuf.Struct`, as the
+  upstream SPIFFE `workload.proto` declares it, instead of JSON-encoded
+  `bytes` in a renamed `claims_json` field. go-spiffe and other clients
+  generated from the upstream proto can now decode the claims. Field 2 keeps
+  its number but changes type, so a client generated from Ferrum's previous
+  vendored proto no longer reads `claims_json` as JSON and must be regenerated
+  from the upstream (or current vendored) `workload.proto`. JSON claim values
+  map to `Struct` value kinds (null, bool, string, object, array); numbers are
+  carried as doubles, as SPIRE does, so an integer claim beyond 2^53 loses
+  precision. A token whose claims nest deeper than 32 levels is refused with
+  `INVALID_ARGUMENT`, so the response stays within common protobuf decoder
+  recursion limits.
 - Native HTTP/3 now enforces Gateway API HTTPRoute rule `timeouts` (#5646)
   instead of refusing a plain request routed under them with `503`. A rule's
   `request` (`mesh_route_dispatch` `request_timeout_ms`) and `backendRequest`
@@ -84,6 +99,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `content_encoded_body`); only a body with no final trailer frame at all is
   still `UNKNOWN`. Translated gRPC-Web keeps reading its status from the
   backend's HTTP/2 trailers.
+- An Ambient mesh proxy whose node-agent registry directory is missing now
+  says so, repeatedly (#5766). `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`
+  defaults to `/run/ferrum/node-waypoint-pods` and is authoritative for the
+  inbound HBONE relay even when no node agent runs, so every declared
+  destination is refused; previously the only signal was one generic warning
+  at startup. The warning now names the directory, says whether it is missing
+  (no node agent has published it) or present but incomplete, tells the
+  operator to run the node agent or clear the variable, and repeats every 60
+  seconds while the registry stays unavailable, with the consecutive failed
+  polls and elapsed seconds. Refusal stays the default. The configuration
+  reference documents that the default is authoritative without a node agent.
 - A Gateway API HTTPRoute `RequestRedirect` whose `path.type:
   ReplacePrefixMatch` sets an empty `replacePrefixMatch` (strip the matched
   prefix) now loads on the data plane (#5752). The translator emitted an empty

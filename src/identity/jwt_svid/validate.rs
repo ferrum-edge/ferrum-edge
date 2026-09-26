@@ -36,6 +36,9 @@
 //!    [`decoding_key_for_authority`](super::decoding_key_for_authority)). `exp`
 //!    validation is mandatory; `nbf` is enforced when present; a future-dated
 //!    `iat` is refused.
+//! 7. **Claims projection** — the verified claims are size-checked and
+//!    returned as the `google.protobuf.Struct` the SPIFFE Workload API
+//!    declares, with nesting bounded (see [`claims`](super::claims)).
 //!
 //! No rejection reason ever contains token bytes, claim values, audiences, or
 //! key material.
@@ -50,8 +53,8 @@ use serde_json::{Map, Value};
 use super::{
     JWT_SVID_CLOCK_SKEW_LEEWAY_SECS, JwtSvidError, MAX_JWT_BUNDLE_TRUST_DOMAINS,
     MAX_JWT_CLAIMS_JSON_BYTES, MAX_JWT_KEY_ID_BYTES, MAX_JWT_SVID_SEGMENT_BYTES,
-    MAX_JWT_SVID_TOKEN_BYTES, decoding_key_for_authority, parse_strict_json_object,
-    validate_audience_value, validate_published_authorities,
+    MAX_JWT_SVID_TOKEN_BYTES, claims_to_struct, decoding_key_for_authority,
+    parse_strict_json_object, validate_audience_value, validate_published_authorities,
 };
 use crate::identity::ca::PublishedJwtAuthority;
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
@@ -64,9 +67,9 @@ use crate::identity::spiffe::{SpiffeId, TrustDomain};
 #[derive(Debug, Clone)]
 pub struct ValidatedJwtSvid {
     pub spiffe_id: SpiffeId,
-    /// JSON-encoded claims (the `claims_json` field of
-    /// `ValidateJWTSVIDResponse`).
-    pub claims_json: Vec<u8>,
+    /// The verified claims as a `google.protobuf.Struct` (the `claims` field
+    /// of `ValidateJWTSVIDResponse`).
+    pub claims: prost_types::Struct,
 }
 
 /// Validate a JWT-SVID against a set of per-trust-domain JWT authorities.
@@ -140,16 +143,15 @@ pub fn validate_jwt_svid(
         ));
     }
 
-    let claims_json = serde_json::to_vec(&Value::Object(claims))
-        .map_err(|e| JwtSvidError::Internal(format!("claims re-encoding failed: {e}")))?;
-    if claims_json.len() > MAX_JWT_CLAIMS_JSON_BYTES {
+    let claims_json_len = serde_json::to_vec(&claims)
+        .map_err(|e| JwtSvidError::Internal(format!("claims re-encoding failed: {e}")))?
+        .len();
+    if claims_json_len > MAX_JWT_CLAIMS_JSON_BYTES {
         return Err(JwtSvidError::InvalidToken("claims document is too large"));
     }
+    let claims = claims_to_struct(&claims)?;
 
-    Ok(ValidatedJwtSvid {
-        spiffe_id,
-        claims_json,
-    })
+    Ok(ValidatedJwtSvid { spiffe_id, claims })
 }
 
 /// Split into `(header, claims)` after checking the JWS Compact Serialization

@@ -1123,7 +1123,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         Ok(Response::new(ValidateJwtsvidResponse {
             spiffe_id: validated.spiffe_id.to_string(),
-            claims_json: validated.claims_json,
+            claims: Some(validated.claims),
         }))
     }
 }
