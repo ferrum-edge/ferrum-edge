@@ -2381,6 +2381,29 @@ impl RequestDeduplication {
         }
     }
 
+    /// Replay a stored completion through the production hit path without
+    /// the store-side header sanitization, modelling an entry persisted under
+    /// an older header policy. The stored provenance is taken from `ctx`, so
+    /// the replay is admitted and only the header handling is under test.
+    #[allow(dead_code)]
+    pub(crate) fn replay_stored_response_for_tests(
+        &self,
+        ctx: &mut RequestContext,
+        status_code: u16,
+        headers: HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let cached = CachedResponse {
+            status_code,
+            headers,
+            body: Bytes::copy_from_slice(body),
+            inserted_at: Instant::now(),
+            retention: self.ttl,
+            response_policy: ctx.response_policy_provenance(),
+        };
+        self.replay_response(ctx, &cached)
+    }
+
     fn local_publish_completed(
         &self,
         key: &str,

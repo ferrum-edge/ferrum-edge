@@ -3587,7 +3587,8 @@ expect_attributed_forged_assertion_blocked() {
   local family="${4:-4}"
   local from_record from_uid from_node from_pod destination_record dst_uid dst_node dst_pod expected_assertor
   local out_dir before_file after_file output code body err status before_count after_count attempt
-  local dispatch_not_ready_body route_not_found_body
+  local dispatch_not_ready_body route_not_found_body peer_not_ready_body
+  local relay_denied_selector relay_denied_before relay_denied_after
   from_record="$(workload_pod_record_for_app "$from")"
   IFS=$'\t' read -r from_uid from_node from_pod <<<"$from_record"
   destination_record="$(workload_pod_record_for_app "$destination")"
@@ -3609,8 +3610,20 @@ expect_attributed_forged_assertion_blocked() {
     return 1
   fi
   before_count="$(policy_deny_count_for_source_and_reasons "$before_file" "$expected_assertor" scope_missing untrusted_assertor)"
+  # A destination refuses a CONNECT for an address it does not (yet) own with
+  # the SAME 403 a policy deny uses (issue #5763), and a source waypoint
+  # surfaces either one as "tunnel rejected by peer with status 403". Only the
+  # destination-policy rejection counter tells them apart: a 403 that moved
+  # `relay_destination_denied` is ownership convergence (for example the
+  # node-local registry not yet enrolling the destination after the rollout),
+  # never the policy deny this check proves.
+  relay_denied_selector='ferrum_mesh_node_waypoint_destination_policy_rejections_total{reason="relay_destination_denied"}'
+  relay_denied_before="$(sum_ambient_metric_total "$relay_denied_selector")"
 
   dispatch_not_ready_body='{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}'
+  # A destination that has not applied its first mesh slice answers 503
+  # `hbone_relay_not_ready` (issue #5763): convergence, never a policy result.
+  peer_not_ready_body='{"error":"HBONE backend unavailable: tunnel rejected by peer with status 503"}'
   # Exact Ferrum HTTP route-miss body. A rolling NodeWaypoint restart can
   # accept the slice and report ready before outbound HTTP routes rematerialize;
   # captured traffic then hits the source waypoint and 404s instead of reaching
@@ -3627,17 +3640,35 @@ expect_attributed_forged_assertion_blocked() {
     printf '%s\n' "$output" >"$out_dir/curl.out"
     printf '%s\n' "$status" >"$out_dir/curl.status"
     if [[ "$status" -eq 0 ]] && forged_assertion_response_is_policy_rejection "$code" "$body"; then
+      relay_denied_after="$(sum_ambient_metric_total "$relay_denied_selector")"
+      if [[ "$relay_denied_after" =~ ^[0-9]+$ && "$relay_denied_before" =~ ^[0-9]+$ &&
+        "$relay_denied_after" -gt "$relay_denied_before" ]]; then
+        echo "attempt $attempt: HTTP $code was a destination OWNERSHIP refusal, not a policy deny (relay_destination_denied $relay_denied_before -> $relay_denied_after); waiting for convergence" >&2
+        relay_denied_before="$relay_denied_after"
+        if [[ "$attempt" -lt 120 ]]; then
+          sleep 0.5
+          continue
+        fi
+        echo "expected forged assertion request to fail via destination HBONE policy rejection, but the destination still refuses the relay destination itself (relay_destination_denied) after every attempt" >&2
+        return 1
+      fi
+      echo "attempt $attempt: HTTP $code is a destination policy deny (relay_destination_denied unchanged at ${relay_denied_after:-<unread>})" >&2
       break
     fi
 
     # A hosted DaemonSet rollout can report ready after accepting the slice but
     # before the restarted source NodeWaypoint has rematerialized outbound HTTP
-    # routes or per-workload HBONE target tags. Retry only those two exact
-    # fail-closed convergence responses; every other transport/HTTP outcome
-    # still fails immediately, and success still requires a destination-policy
-    # rejection plus the deny counter below. A 404 is never a policy pass.
+    # routes or per-workload HBONE target tags, or before the destination has
+    # applied its first slice. Retry only those exact fail-closed convergence
+    # responses; every other transport/HTTP outcome still fails immediately,
+    # and success still requires a destination-policy rejection plus the deny
+    # counter below. A 404 is never a policy pass.
     if [[ "$attempt" -lt 120 ]]; then
       if [[ "$status" -eq 0 && "$code" == "502" && "$body" == "$dispatch_not_ready_body" ]]; then
+        sleep 0.5
+        continue
+      fi
+      if [[ "$status" -eq 0 && "$code" == "502" && "$body" == "$peer_not_ready_body" ]]; then
         sleep 0.5
         continue
       fi
