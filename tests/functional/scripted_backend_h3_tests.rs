@@ -3454,6 +3454,10 @@ async fn h2c_frontend_h3_backend_streaming_trailers_obey_response_header_policy(
                 ("x-powered-by", "backend-trailer-bypass".to_string()),
                 // Ungoverned: nothing in the chain owns this field.
                 ("x-backend-checksum", "sha256-cafebabe".to_string()),
+                // Gateway-owned (#5759): a plain (non-gRPC) backend trailer must
+                // never forge the gateway's diagnostic fields.
+                ("x-gateway-error", "backend_error".to_string()),
+                ("x-gateway-upstream-status", "degraded".to_string()),
             ]),
             H3Step::StallFor(Duration::from_millis(100)),
         ],
@@ -3499,6 +3503,15 @@ async fn h2c_frontend_h3_backend_streaming_trailers_obey_response_header_policy(
         "an UNGOVERNED backend trailer must still be forwarded (issue #2941); trailers={:?}",
         resp.trailers
     );
+    for owned in ["x-gateway-error", "x-gateway-upstream-status"] {
+        assert!(
+            !resp.trailers.contains_key(owned) && !resp.headers.contains_key(owned),
+            "a backend-forged gateway-owned `{owned}` trailer must not reach the client \
+             (#5759); headers={:?} trailers={:?}",
+            resp.headers,
+            resp.trailers
+        );
+    }
     assert_eq!(
         resp.headers.get("x-security-policy").map(String::as_str),
         Some("gateway-enforced"),
@@ -3558,6 +3571,9 @@ async fn h2c_frontend_h3_backend_delayed_fin_trailers_obey_response_header_polic
                 ("x-backend-checksum", "sha256-delayed-policy".to_string()),
                 // Hop-by-hop: stripped on this route before the governor runs.
                 ("transfer-encoding", "chunked".to_string()),
+                // Gateway-owned (#5759): stripped on the peek route too.
+                ("x-gateway-error", "backend_error".to_string()),
+                ("x-gateway-upstream-status", "degraded".to_string()),
             ]),
             // Hold the stream open well past the 25 ms backend read timeout so
             // the trailer-phase deadline is the ONLY thing that can deliver the
@@ -3610,6 +3626,14 @@ async fn h2c_frontend_h3_backend_delayed_fin_trailers_obey_response_header_polic
         "hop-by-hop trailer name must still be stripped on this route; trailers={:?}",
         resp.trailers
     );
+    for owned in ["x-gateway-error", "x-gateway-upstream-status"] {
+        assert!(
+            !resp.trailers.contains_key(owned),
+            "a backend-forged gateway-owned `{owned}` trailer must not reach the client on \
+             the delayed-FIN route (#5759); trailers={:?}",
+            resp.trailers
+        );
+    }
     assert_eq!(
         resp.headers.get("x-security-policy").map(String::as_str),
         Some("gateway-enforced"),

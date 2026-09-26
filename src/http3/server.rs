@@ -2319,9 +2319,15 @@ async fn handle_h3_request(
         let header_size = name.as_str().len() + value.len();
         if header_size > state.max_single_header_size_bytes {
             record_h3_flavor_aware_reject(&state, detected_http_flavor, 431);
+            // Escape the client-controlled header name exactly like the H1/H2
+            // 431 body so it cannot inject into the JSON error document.
+            let escaped_name = serde_json::to_string(name.as_str())
+                .unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            // escaped_name is a quoted JSON string; strip outer quotes for embedding
+            let inner = &escaped_name[1..escaped_name.len() - 1];
             let body = format!(
                 r#"{{"error":"Request header '{}' exceeds maximum size of {} bytes"}}"#,
-                name.as_str(),
+                inner,
                 state.max_single_header_size_bytes
             );
             send_h3_error_flavor_aware(
@@ -10572,7 +10578,14 @@ pub(crate) fn finalize_h3_response_routing_headers(
     headers: &mut HashMap<String, String>,
 ) -> GatewayOwnedResponseHeaders {
     let mut owned = GatewayOwnedResponseHeaders::default();
-    headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_UPSTREAM_STATUS_HEADER));
+    // Read-only probe first: backends/hooks almost never send this field, so
+    // skip the mutating `retain` pass on the common path.
+    if headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case(X_GATEWAY_UPSTREAM_STATUS_HEADER))
+    {
+        headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_UPSTREAM_STATUS_HEADER));
+    }
     if is_fallback {
         headers.insert(X_GATEWAY_UPSTREAM_STATUS_HEADER.into(), "degraded".into());
         owned.insert(GatewayOwnedResponseHeader::GatewayUpstreamStatus);

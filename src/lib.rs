@@ -1945,10 +1945,8 @@ pub mod _test_support {
                 _ => ROUTE_REQUEST_TIMEOUT_PHASE_RETRY_BACKOFF,
             });
         }
-        let mut headers = HashMap::from([(
-            "X-Gateway-Error".to_string(),
-            "backend_timeout".to_string(),
-        )]);
+        let mut headers =
+            HashMap::from([("X-Gateway-Error".to_string(), "backend_timeout".to_string())]);
         crate::proxy::apply_authoritative_gateway_error_header_for_response(
             &mut headers,
             &ctx,

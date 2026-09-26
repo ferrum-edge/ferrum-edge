@@ -318,12 +318,27 @@ never an error message, never a client- or backend-influenced string.
 names live in one shared list
 ([`GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`](../src/proxy/headers.rs)).
 Every dispatch path strips a backend-supplied copy, in the response headers or
-the trailers, before the gateway writes its own value. That covers HTTP/1.1,
+the trailers, before any gateway value is written. That covers HTTP/1.1,
 HTTP/2, HTTP/3 (native and bridged), reqwest and direct hyper, native gRPC,
 gRPC-Web, and serverless functions, buffered or streamed. A backend therefore
-cannot make a response look gateway-attributed. The headers are not
-authenticated, though: a client should trust them only on a response it
-received from a gateway it authenticated.
+cannot make a response look gateway-attributed.
+
+The gateway then writes its own `X-Gateway-Error` only where that path
+classifies the response:
+
+- Gateway-synthesized failures (pre-wire connect/DNS/TLS `502`, backend
+  timeout and route-deadline `504`, reject-path `503`s, response-transformer
+  output-ceiling refusals) carry their token on every protocol.
+- A backend-returned 5xx carries `backend_error` on the HTTP/1.1 and HTTP/2
+  response builder and on the native HTTP/3 buffered writer.
+- A backend-returned 5xx relayed on an HTTP/3 streaming path (native or
+  bridged), or on the HTTP/3 bridge's buffered path, currently carries **no**
+  `X-Gateway-Error`: the backend's copy is stripped and nothing is written in
+  its place. An absent header there does not mean the backend succeeded; use
+  the status code and the access-log `error_class`.
+
+The headers are not authenticated, though: a client should trust them only on
+a response it received from a gateway it authenticated.
 
 ### Header tokens (`X-Gateway-Error`)
 

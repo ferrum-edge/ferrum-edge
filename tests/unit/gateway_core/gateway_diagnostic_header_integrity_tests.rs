@@ -254,6 +254,13 @@ fn h1_h2_builder_strips_both_diagnostics_through_the_shared_helper() {
         .find("resp_builder.header(\"X-Gateway-Upstream-Status\", \"degraded\")")
         .expect("the H1/H2 builder writes the degraded-routing header");
     assert!(strip < write, "strip must precede the builder's own write");
+    let error_write = builder
+        .find("resp_builder.header(\"X-Gateway-Error\"")
+        .expect("the H1/H2 builder writes the gateway error token");
+    assert!(
+        strip < error_write,
+        "strip must precede the builder's own X-Gateway-Error write"
+    );
 }
 
 // ── #5762: a route timeout no backend held is not a backend timeout ─────────
@@ -400,7 +407,9 @@ fn no_dispatch_path_interpolates_the_pool_construction_error() {
     );
     // Definition plus the first-attempt and retry call sites.
     assert_eq!(
-        proxy.matches("connection_pool_client_error_response(").count(),
+        proxy
+            .matches("connection_pool_client_error_response(")
+            .count(),
         3,
         "both reqwest attempts must answer the shared pool-failure response"
     );

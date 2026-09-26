@@ -266,9 +266,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now live in one shared list. Every backend response boundary strips a
   backend-supplied copy, in the headers or the trailers: reqwest, direct
   HTTP/2, native gRPC, native HTTP/3, the HTTP/3 bridge, and serverless
-  functions, buffered or streamed. The gateway then writes its own value. The
-  headers are still unauthenticated, so trust them only on a response from a
-  gateway the client authenticated.
+  functions, buffered or streamed. The gateway then writes its own value
+  where it classifies the response: on every gateway-synthesized failure, and
+  on a backend 5xx through the HTTP/1.1 / HTTP/2 builder and the native HTTP/3
+  buffered writer. A backend 5xx relayed on an HTTP/3 streaming path or the
+  HTTP/3 bridge's buffered path currently gets no `X-Gateway-Error` (the
+  forged copy is still stripped). The headers are still unauthenticated, so
+  trust them only on a response from a gateway the client authenticated.
 - The vendored `h3` frame-drain patch (001) now defers only QUIC connection
   errors behind buffered bytes, matching the updated upstream fix
   (hyperium/h3#339). PR #5741 exempted a peer stream reset, but every other

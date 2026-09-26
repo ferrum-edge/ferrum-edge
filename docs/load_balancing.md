@@ -729,7 +729,9 @@ stale-config fences are unchanged (they do not carry `X-Gateway-Error`).
 
 Both headers are gateway-owned. On every protocol and dispatch path, the
 gateway strips a backend-supplied copy (header or trailer) before it writes its
-own value, so a backend cannot forge either one. They are not authenticated,
+own value, so a backend cannot forge either one. A backend-returned 5xx relayed
+on an HTTP/3 streaming path or the HTTP/3 bridge's buffered path currently
+carries no `X-Gateway-Error` at all (see the linked page). They are not authenticated,
 so trust them only on a response from a gateway you authenticated. See
 [error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
 

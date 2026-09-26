@@ -40654,9 +40654,11 @@ async fn handle_proxy_request_inner(
 
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
-    //   X-Gateway-Error: connection_failure | backend_timeout | backend_error
-    //     | circuit_breaker_open | overload | config_stale | concurrency_limit
-    //     (open-breaker / overload / stale / concurrency 503s use reject paths)
+    //   X-Gateway-Error: connection_failure | backend_timeout | request_timeout
+    //     | backend_error | circuit_breaker_open | overload | config_stale
+    //     | concurrency_limit (request_timeout = route timeout fired before any
+    //     backend held the request; open-breaker / overload / stale /
+    //     concurrency 503s use reject paths)
     //   X-Gateway-Upstream-Status: degraded (when routing via all-unhealthy fallback)
     if let Some(value) = gateway_error_token {
         resp_builder = resp_builder.header("X-Gateway-Error", value);
