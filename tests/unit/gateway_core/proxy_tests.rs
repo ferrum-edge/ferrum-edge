@@ -2317,7 +2317,7 @@ fn direct_h2_body_size_hint_does_not_leak_incoming_exact_length() {
     // hyper reconstruct Content-Length and finish without Ready(None).
     let source = include_str!("../../../src/proxy/body.rs");
     let arm = source
-        .split("struct DirectH2Body {")
+        .split("struct DirectH2Body<B = Incoming> {")
         .nth(1)
         .expect("DirectH2Body")
         .split("/// Wraps a streaming HTTP/2 response body with a per-frame idle read deadline.")

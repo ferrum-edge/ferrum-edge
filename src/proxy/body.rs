@@ -3577,8 +3577,8 @@ pub(crate) fn size_limited_streaming_body(
 }
 
 /// The adapter chain behind [`size_limited_streaming_body`], over any backend
-/// frame stream: size limit, coalescing, a flush of the committed head before
-/// the terminal error, then the idle read timeout.
+/// frame stream: size limit, coalescing, the idle read timeout, then a flush
+/// of the committed head before the terminal error.
 pub(crate) fn size_limited_frame_stream_body<S>(
     stream: S,
     max_bytes: usize,
@@ -3598,7 +3598,7 @@ where
         COALESCE_TARGET,
         content_length,
     );
-    wrap_idle_read_timeout(FlushBeforeTerminalError::new(coalescing), read_timeout_ms)
+    wrap_idle_read_timeout_and_error_hold(coalescing, read_timeout_ms)
 }
 
 /// Yields once before handing a committed streaming response's terminal error
@@ -3626,9 +3626,15 @@ where
 /// prove they did. Data frames pass straight through; only the terminal error
 /// path pays the extra scheduler turn.
 ///
-/// Wraps every committed reqwest streaming body (size-limited, coalescing,
-/// direct), the plugin-inspected streaming body, and the size-limited
-/// direct-H2/gRPC and native-H3 bodies.
+/// Wraps every committed streaming response body: the reqwest bodies
+/// (size-limited, coalescing, direct), the plugin-inspected body, and the
+/// direct-H2/gRPC and native-H3 bodies (size-limited, coalescing, direct).
+///
+/// The hold sits OUTSIDE the idle read timeout and the absolute gRPC deadline.
+/// Those wrappers read an inner `Pending` as a backend wait and check their
+/// deadline on it, so a hold inside them could lose its error to a deadline
+/// that expired on the held turn. Outside, the error has already passed
+/// through them, and the held turn is never polled against a deadline.
 struct FlushBeforeTerminalError<B> {
     inner: B,
     stashed_error: Option<BoxError>,
@@ -3660,10 +3666,6 @@ where
         }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Err(error))) => {
-                // An outer idle read timeout sees this `Pending` as a backend
-                // wait. If its deadline, armed by an earlier real wait, expires
-                // on this same poll, it records a timeout instead of the held
-                // error. That edge case is tracked in a follow-up issue.
                 this.stashed_error = Some(error);
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -3800,7 +3802,9 @@ enum H3FrameSourceState {
     Done,
 }
 
-trait H3RecvStream {
+/// The backend half of a native-H3 request stream an [`H3FrameSource`] reads:
+/// h3's request stream in production, a scripted stream in tests.
+pub(crate) trait H3RecvStream {
     fn poll_recv_data_bytes(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -4665,14 +4669,17 @@ where
     }
 }
 
-struct DirectH2Body {
-    inner: Incoming,
+struct DirectH2Body<B = Incoming> {
+    inner: B,
     content_length: Option<u64>,
 }
 
-impl http_body::Body for DirectH2Body {
+impl<B> http_body::Body for DirectH2Body<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+{
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = B::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -4809,11 +4816,13 @@ where
     type Data = Bytes;
     // `BoxError` (not a concrete enum) because this wrapper is placed OUTERMOST
     // — directly around the `Coalescing` adapter (whose `Error` is already
-    // `BoxError`) — rather than inside it. The outermost placement keeps the
-    // deadline from elapsing while a buffered sub-target frame waits on a SLOW
-    // DOWNSTREAM CLIENT: under client backpressure hyper stops polling this
-    // wrapper entirely, and when polling resumes the coalescer delivers the
-    // buffered frame as `Ready` (resetting `waiting`) before any deadline check.
+    // `BoxError`) — rather than inside it; only the terminal-error flush hold
+    // (`FlushBeforeTerminalError`) sits outside it. The outermost placement
+    // keeps the deadline from elapsing while a buffered sub-target frame waits
+    // on a SLOW DOWNSTREAM CLIENT: under client backpressure hyper stops
+    // polling this wrapper entirely, and when polling resumes the coalescer
+    // delivers the buffered frame as `Ready` (resetting `waiting`) before any
+    // deadline check.
     // Placing the timer INSIDE the coalescer would instead let a client-drain
     // stall elapse a deadline armed during an earlier backend-pending — a false
     // positive the outermost placement avoids.
@@ -5451,16 +5460,18 @@ fn reqwest_response_frames(
     }
 }
 
-/// Outermost idle `backend_read_timeout_ms` wrapper for reqwest streaming
-/// bodies. `0` skips the wrapper so long-lived streams stay unbounded.
-fn wrap_idle_read_timeout<B>(body: B, read_timeout_ms: u64) -> ProxyBody
+/// Outer wrappers for a committed streaming body: the idle
+/// `backend_read_timeout_ms` deadline (`0` skips it so long-lived streams stay
+/// unbounded), then [`FlushBeforeTerminalError`] around it.
+fn wrap_idle_read_timeout_and_error_hold<B>(body: B, read_timeout_ms: u64) -> ProxyBody
 where
     B: http_body::Body<Data = Bytes, Error = BoxError> + Send + Unpin + 'static,
 {
     if read_timeout_ms > 0 {
-        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(body, read_timeout_ms)))
+        let timed = IdleReadTimeoutBody::new(body, read_timeout_ms);
+        ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(timed)))
     } else {
-        ProxyBody::streaming(Box::pin(body))
+        ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(body)))
     }
 }
 
@@ -5478,8 +5489,8 @@ pub(crate) fn coalescing_body(
 }
 
 /// The adapter chain behind [`coalescing_body`], over any backend frame
-/// stream: coalescing, a flush of the committed head before a terminal error,
-/// then the idle read timeout.
+/// stream: coalescing, the idle read timeout, then a flush of the committed
+/// head before a terminal error.
 pub(crate) fn coalescing_frame_stream_body<S>(
     stream: S,
     content_length: Option<u64>,
@@ -5500,7 +5511,7 @@ where
         content_length,
         flush_after,
     );
-    wrap_idle_read_timeout(FlushBeforeTerminalError::new(body), read_timeout_ms)
+    wrap_idle_read_timeout_and_error_hold(body, read_timeout_ms)
 }
 
 pub(crate) fn direct_streaming_body(
@@ -5516,8 +5527,8 @@ pub(crate) fn direct_streaming_body(
 }
 
 /// The adapter chain behind [`direct_streaming_body`], over any backend frame
-/// stream: pass-through frames, a flush of the committed head before a
-/// terminal error, then the idle read timeout.
+/// stream: pass-through frames, the idle read timeout, then a flush of the
+/// committed head before a terminal error.
 pub(crate) fn direct_frame_stream_body<S>(
     stream: S,
     content_length: Option<u64>,
@@ -5530,7 +5541,7 @@ where
         inner: stream,
         content_length,
     };
-    wrap_idle_read_timeout(FlushBeforeTerminalError::new(body), read_timeout_ms)
+    wrap_idle_read_timeout_and_error_hold(body, read_timeout_ms)
 }
 
 /// Build a streaming response body fed by [`run_response_inspection`] over an
@@ -5882,37 +5893,55 @@ pub(crate) async fn run_proxy_body_response_inspection(
 /// The wrapper is interposed BEFORE the `Coalescing` adapter so the stash-
 /// then-flush trailer logic in `Coalescing<Incoming>` still works on the
 /// already-filtered map.
-pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
-    body: Incoming,
+///
+/// `body` is hyper's `Incoming` in production; tests drive the same chain
+/// with a scripted body.
+pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers<B>(
+    body: B,
     content_length: Option<u64>,
     coalesce_target: usize,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
     trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
-) -> ProxyBody {
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     // Bound the backend read so a backend that sends headers then stalls cannot
     // pin the streaming relay indefinitely. Two mutually-exclusive regimes
     // (issue #1649): `total_deadline` (a client `grpc-timeout`) is an ABSOLUTE
     // end-to-end deadline via `TotalDeadlineBody`; otherwise `read_timeout_ms`
     // (`backend_read_timeout_ms`) is a PER-FRAME idle timeout via
-    // `IdleReadTimeoutBody`. Either deadline wraps the coalescer OUTERMOST (not
-    // the raw body inside it): the coalescer only reports `Pending` once it has
-    // no buffered frame left to flush AND the backend is pending, so a per-frame
+    // `IdleReadTimeoutBody`. Either deadline wraps the coalescer (not the raw
+    // body inside it): the coalescer only reports `Pending` once it has no
+    // buffered frame left to flush AND the backend is pending, so a per-frame
     // idle deadline measures genuine backend-read waits and never fires while a
-    // sub-target frame is buffered waiting on a slow downstream client.
+    // sub-target frame is buffered waiting on a slow downstream client. Only
+    // the terminal-error flush hold sits outside the deadline.
     let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
     let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
+    wrap_h2_deadline_and_error_hold(coalescing, read_timeout_ms, total_deadline)
+}
+
+/// Outer wrappers for a committed coalescing direct-H2/gRPC streaming body:
+/// one of the two mutually-exclusive backend deadlines (issue #1649), then
+/// [`FlushBeforeTerminalError`] around it.
+fn wrap_h2_deadline_and_error_hold<B>(
+    body: B,
+    read_timeout_ms: u64,
+    total_deadline: Option<tokio::time::Instant>,
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes, Error = BoxError> + Send + Unpin + 'static,
+{
     if let Some(deadline) = total_deadline {
-        let timed = TotalDeadlineBody::new(coalescing, Some(deadline));
+        let timed = TotalDeadlineBody::new(body, Some(deadline));
         let fired = timed.deadline_fired_handle();
-        ProxyBody::streaming(Box::pin(timed)).with_client_grpc_deadline_fired_flag(fired)
-    } else if read_timeout_ms > 0 {
-        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(
-            coalescing,
-            read_timeout_ms,
-        )))
+        let held = FlushBeforeTerminalError::new(timed);
+        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_fired_flag(fired)
     } else {
-        ProxyBody::streaming(Box::pin(coalescing))
+        wrap_idle_read_timeout_and_error_hold(body, read_timeout_ms)
     }
 }
 
@@ -5931,24 +5960,12 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
 ) -> ProxyBody {
     // See `coalescing_h2_body_strip_hop_by_hop_trailers` for the two
     // mutually-exclusive deadline regimes (issue #1649). Either wraps the
-    // coalescer OUTERMOST so a per-frame idle deadline never fires while a
-    // buffered sub-target frame is waiting on a slow downstream client.
+    // coalescer so a per-frame idle deadline never fires while a buffered
+    // sub-target frame is waiting on a slow downstream client.
     let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
     let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
     let coalescing = Coalescing::new(limited, coalesce_target, content_length);
-    let coalescing = FlushBeforeTerminalError::new(coalescing);
-    if let Some(deadline) = total_deadline {
-        let timed = TotalDeadlineBody::new(coalescing, Some(deadline));
-        let fired = timed.deadline_fired_handle();
-        ProxyBody::streaming(Box::pin(timed)).with_client_grpc_deadline_fired_flag(fired)
-    } else if read_timeout_ms > 0 {
-        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(
-            coalescing,
-            read_timeout_ms,
-        )))
-    } else {
-        ProxyBody::streaming(Box::pin(coalescing))
-    }
+    wrap_h2_deadline_and_error_hold(coalescing, read_timeout_ms, total_deadline)
 }
 
 /// Direct (non-coalesced) HTTP/2 streaming body wrapped in
@@ -5956,13 +5973,20 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
 /// [`coalescing_h2_body_strip_hop_by_hop_trailers`] for the gRPC streaming
 /// path's `response_buffer_cutoff_bytes == 0 && max_response_body_size_bytes
 /// == 0` zero-buffering branch.
-pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
-    body: Incoming,
+///
+/// `body` is hyper's `Incoming` in production; tests drive the same chain
+/// with a scripted body.
+pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers<B>(
+    body: B,
     content_length: Option<u64>,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
     trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
-) -> ProxyBody {
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     use http_body_util::BodyExt;
 
     let direct = DirectH2Body {
@@ -5973,19 +5997,23 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
     // direct body directly — `Strip` forwards frames without buffering. Both
     // `TotalDeadlineBody` (absolute client `grpc-timeout`, issue #1649) and
     // `IdleReadTimeoutBody` (per-frame `backend_read_timeout_ms`) already yield
-    // `BoxError`, so no `map_err` is needed in those branches.
+    // `BoxError`, so no `map_err` is needed in those branches. The
+    // terminal-error flush hold wraps each branch outermost, outside the
+    // deadline.
     if let Some(deadline) = total_deadline {
         let timed = TotalDeadlineBody::new(direct, Some(deadline));
         let fired = timed.deadline_fired_handle();
         let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);
-        ProxyBody::streaming(Box::pin(stripped)).with_client_grpc_deadline_fired_flag(fired)
+        let held = FlushBeforeTerminalError::new(stripped);
+        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_fired_flag(fired)
     } else if read_timeout_ms > 0 {
         let timed = IdleReadTimeoutBody::new(direct, read_timeout_ms);
         let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);
-        ProxyBody::streaming(Box::pin(stripped))
+        ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(stripped)))
     } else {
         let stripped = StripHopByHopTrailers::with_trailer_governor(direct, trailer_governor);
-        ProxyBody::streaming(Box::pin(stripped.map_err(|e| Box::new(e) as BoxError)))
+        let stripped = stripped.map_err(|e| Box::new(e) as BoxError);
+        ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(stripped)))
     }
 }
 
@@ -6159,8 +6187,8 @@ fn h3_read_progress(read_timeout_ms: u64) -> Option<Arc<H3ReadProgress>> {
 /// `Content-Length` when the header is absent — so an ordinary streamed response
 /// passes `None` there even though the completeness gate still gets the value.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn coalescing_h3_body(
-    recv_stream: crate::http3::client::H3RequestStream,
+pub(crate) fn coalescing_h3_body<S>(
+    recv_stream: S,
     method: Arc<str>,
     status: u16,
     completeness_content_length: Option<u64>,
@@ -6170,7 +6198,10 @@ pub(crate) fn coalescing_h3_body(
     flush_interval: Duration,
     read_timeout_ms: u64,
     trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
-) -> ProxyBody {
+) -> ProxyBody
+where
+    S: H3RecvStream + Send + Unpin + 'static,
+{
     let progress = h3_read_progress(read_timeout_ms);
     let source = H3FrameSource::new(
         recv_stream,
@@ -6193,13 +6224,26 @@ pub(crate) fn coalescing_h3_body(
         advertised_content_length,
         Some(h3_effective_flush_interval(flush_interval, read_timeout_ms)),
     );
+    wrap_h3_idle_read_timeout_and_error_hold(body, read_timeout_ms, progress)
+}
+
+/// Outer wrappers for a committed native-H3 streaming body: the idle read
+/// deadline that shares `progress` with the [`H3FrameSource`] (absent when no
+/// read timeout is configured), then [`FlushBeforeTerminalError`] around it.
+fn wrap_h3_idle_read_timeout_and_error_hold<B>(
+    body: B,
+    read_timeout_ms: u64,
+    progress: Option<Arc<H3ReadProgress>>,
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes, Error = BoxError> + Send + Unpin + 'static,
+{
     match progress {
-        Some(p) => ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::with_progress(
-            body,
-            read_timeout_ms,
-            Some(p),
-        ))),
-        None => ProxyBody::streaming(Box::pin(body)),
+        Some(p) => {
+            let timed = IdleReadTimeoutBody::with_progress(body, read_timeout_ms, Some(p));
+            ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(timed)))
+        }
+        None => ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(body))),
     }
 }
 
@@ -6246,15 +6290,7 @@ pub(crate) fn size_limited_streaming_h3_body(
         advertised_content_length,
         Some(h3_effective_flush_interval(flush_interval, read_timeout_ms)),
     );
-    let body = FlushBeforeTerminalError::new(body);
-    match progress {
-        Some(p) => ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::with_progress(
-            body,
-            read_timeout_ms,
-            Some(p),
-        ))),
-        None => ProxyBody::streaming(Box::pin(body)),
-    }
+    wrap_h3_idle_read_timeout_and_error_hold(body, read_timeout_ms, progress)
 }
 
 /// `completeness_content_length` is the backend's declared length, used ONLY by
@@ -6264,15 +6300,18 @@ pub(crate) fn size_limited_streaming_h3_body(
 /// `Content-Length` when the header is absent — so an ordinary streamed response
 /// passes `None` there even though the completeness gate still gets the value.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn direct_streaming_h3_body(
-    recv_stream: crate::http3::client::H3RequestStream,
+pub(crate) fn direct_streaming_h3_body<S>(
+    recv_stream: S,
     method: Arc<str>,
     status: u16,
     completeness_content_length: Option<u64>,
     advertised_content_length: Option<u64>,
     read_timeout_ms: u64,
     trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
-) -> ProxyBody {
+) -> ProxyBody
+where
+    S: H3RecvStream + Send + Unpin + 'static,
+{
     let progress = h3_read_progress(read_timeout_ms);
     let source = H3FrameSource::new(
         recv_stream,
@@ -6286,14 +6325,7 @@ pub(crate) fn direct_streaming_h3_body(
         source,
         content_length: advertised_content_length,
     };
-    match progress {
-        Some(p) => ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::with_progress(
-            body,
-            read_timeout_ms,
-            Some(p),
-        ))),
-        None => ProxyBody::streaming(Box::pin(body)),
-    }
+    wrap_h3_idle_read_timeout_and_error_hold(body, read_timeout_ms, progress)
 }
 
 #[cfg(test)]

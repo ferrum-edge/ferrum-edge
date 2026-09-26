@@ -481,6 +481,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response before its status line reached the client. On HTTP/1.1 the client
   now sees the committed status and the bytes already received, then a
   truncated body. On HTTP/2 and HTTP/3 the turn is best effort (#5802).
+- The direct HTTP/2 and gRPC and the native HTTP/3 unlimited streaming
+  response bodies now hold a backend error or reset for one scheduler turn,
+  like the reqwest and size-limited bodies. Previously an HTTP/2 or HTTP/3
+  backend that sent its headers, a small first write, and a reset together
+  could end an HTTP/1.1 response before its status line reached the client.
+  The hold now also sits outside the idle read timeout and the client gRPC
+  deadline on every streaming body, so a backend error read on the same poll
+  that the idle deadline expires is reported as the backend error rather than
+  as a read timeout (#5811).
 - HTTP/2 response trailers from a backend now reach an HTTP/2 client on every
   dispatch path and body mode (#5760). The reqwest relay (used for a backend
   the capability registry has not yet classified, and for routes with retries

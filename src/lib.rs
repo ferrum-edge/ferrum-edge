@@ -15914,28 +15914,181 @@ pub mod _test_support {
         )
     }
 
-    /// The unlimited HTTP/1.1 / HTTP/2-via-reqwest streaming response body
-    /// named by `adapter` (`"direct"` or `"coalescing"`), fed from `chunks`
-    /// that are all ready at once and followed at once by a backend read error,
-    /// as when a backend resets right after a small first write. A
-    /// `read_timeout_ms` of 0 turns the idle read timeout off.
+    /// The unlimited streaming response body named by `adapter`, fed from
+    /// `chunks` that are all ready at once and followed at once by a backend
+    /// read error, as when a backend resets right after a small first write.
+    /// A `read_timeout_ms` of 0 turns the idle read timeout off.
+    ///
+    /// `adapter` picks the production builder: `"direct"` or `"coalescing"`
+    /// (reqwest), `"h2_direct"` or `"h2_coalescing"` (direct HTTP/2 and gRPC),
+    /// `"h3_direct"` or `"h3_coalescing"` (native HTTP/3). The
+    /// `"h2_direct_grpc_deadline"` and `"h2_coalescing_grpc_deadline"`
+    /// variants replace the idle read timeout with a client gRPC deadline
+    /// `read_timeout_ms` from now.
     pub fn unlimited_streaming_body_from_ready_chunks_then_error(
         adapter: &str,
         chunks: Vec<bytes::Bytes>,
         read_timeout_ms: u64,
     ) -> crate::proxy::body::ProxyBody {
-        use crate::proxy::body::{coalescing_frame_stream_body, direct_frame_stream_body};
+        let backend = ScriptedBackendReset {
+            pending_first: false,
+            chunks: chunks.into(),
+            reset_pending: true,
+        };
+        unlimited_streaming_body_over(adapter, backend, read_timeout_ms)
+    }
 
-        let error: CoalesceFrameError = Box::new(std::io::Error::other("backend reset"));
-        let frames = chunks
-            .into_iter()
-            .map(|chunk| Ok::<_, CoalesceFrameError>(http_body::Frame::data(chunk)))
-            .chain(std::iter::once(Err(error)));
-        let stream = futures_util::stream::iter(frames);
+    /// The unlimited streaming response body named by `adapter` (see
+    /// [`unlimited_streaming_body_from_ready_chunks_then_error`]) over a
+    /// backend whose first read is `Pending` (it wakes its task at once) and
+    /// whose next read is a backend reset, as when a backend stalls and then
+    /// fails without sending any body bytes.
+    pub fn unlimited_streaming_body_pending_once_then_error(
+        adapter: &str,
+        read_timeout_ms: u64,
+    ) -> crate::proxy::body::ProxyBody {
+        let backend = ScriptedBackendReset {
+            pending_first: true,
+            chunks: std::collections::VecDeque::new(),
+            reset_pending: true,
+        };
+        unlimited_streaming_body_over(adapter, backend, read_timeout_ms)
+    }
+
+    fn unlimited_streaming_body_over(
+        adapter: &str,
+        backend: ScriptedBackendReset,
+        read_timeout_ms: u64,
+    ) -> crate::proxy::body::ProxyBody {
+        use crate::proxy::body::{
+            coalescing_frame_stream_body, coalescing_h2_body_strip_hop_by_hop_trailers,
+            coalescing_h3_body, direct_frame_stream_body,
+            direct_streaming_h2_body_strip_hop_by_hop_trailers, direct_streaming_h3_body,
+        };
+        use futures_util::TryStreamExt;
+
+        let deadline = || tokio::time::Instant::now() + Duration::from_millis(read_timeout_ms);
         match adapter {
-            "direct" => direct_frame_stream_body(stream, None, read_timeout_ms),
-            "coalescing" => coalescing_frame_stream_body(stream, None, read_timeout_ms, None),
+            "direct" => {
+                let stream = backend.map_err(|err| Box::new(err) as CoalesceFrameError);
+                direct_frame_stream_body(stream, None, read_timeout_ms)
+            }
+            "coalescing" => {
+                let stream = backend.map_err(|err| Box::new(err) as CoalesceFrameError);
+                coalescing_frame_stream_body(stream, None, read_timeout_ms, None)
+            }
+            "h2_direct" => direct_streaming_h2_body_strip_hop_by_hop_trailers(
+                http_body_util::StreamBody::new(backend),
+                None,
+                read_timeout_ms,
+                None,
+                None,
+            ),
+            "h2_direct_grpc_deadline" => direct_streaming_h2_body_strip_hop_by_hop_trailers(
+                http_body_util::StreamBody::new(backend),
+                None,
+                0,
+                Some(deadline()),
+                None,
+            ),
+            "h2_coalescing" => coalescing_h2_body_strip_hop_by_hop_trailers(
+                http_body_util::StreamBody::new(backend),
+                None,
+                default_coalesce_target_bytes(),
+                read_timeout_ms,
+                None,
+                None,
+            ),
+            "h2_coalescing_grpc_deadline" => coalescing_h2_body_strip_hop_by_hop_trailers(
+                http_body_util::StreamBody::new(backend),
+                None,
+                default_coalesce_target_bytes(),
+                0,
+                Some(deadline()),
+                None,
+            ),
+            "h3_direct" => direct_streaming_h3_body(
+                backend,
+                Arc::from("GET"),
+                200,
+                None,
+                None,
+                read_timeout_ms,
+                None,
+            ),
+            "h3_coalescing" => coalescing_h3_body(
+                backend,
+                Arc::from("GET"),
+                200,
+                None,
+                None,
+                crate::http3::config::H3_COALESCE_MIN_FLOOR,
+                crate::http3::config::H3_COALESCE_MAX_CAP,
+                Duration::from_millis(2),
+                read_timeout_ms,
+                None,
+            ),
             other => panic!("unknown unlimited streaming adapter {other:?}"),
+        }
+    }
+
+    /// A scripted backend body for the unlimited streaming adapters: an
+    /// optional first `Pending`, then `chunks` all ready at once, then one
+    /// backend reset, then end of stream. It is both a frame stream (reqwest,
+    /// direct HTTP/2) and a native-H3 receive stream.
+    struct ScriptedBackendReset {
+        pending_first: bool,
+        chunks: std::collections::VecDeque<bytes::Bytes>,
+        reset_pending: bool,
+    }
+
+    impl ScriptedBackendReset {
+        fn poll_next_chunk(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<bytes::Bytes, std::io::Error>>> {
+            if std::mem::take(&mut self.pending_first) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            if let Some(chunk) = self.chunks.pop_front() {
+                return std::task::Poll::Ready(Some(Ok(chunk)));
+            }
+            if std::mem::take(&mut self.reset_pending) {
+                let error = std::io::Error::other("backend reset");
+                return std::task::Poll::Ready(Some(Err(error)));
+            }
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    impl futures_util::Stream for ScriptedBackendReset {
+        type Item = Result<http_body::Frame<bytes::Bytes>, std::io::Error>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let next = std::task::ready!(self.get_mut().poll_next_chunk(cx));
+            std::task::Poll::Ready(next.map(|chunk| chunk.map(http_body::Frame::data)))
+        }
+    }
+
+    impl crate::proxy::body::H3RecvStream for ScriptedBackendReset {
+        fn poll_recv_data_bytes(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<Option<bytes::Bytes>, CoalesceFrameError>> {
+            let next = std::task::ready!(self.get_mut().poll_next_chunk(cx));
+            let next = next.transpose().map_err(|err| Box::new(err) as CoalesceFrameError);
+            std::task::Poll::Ready(next)
+        }
+
+        fn poll_recv_trailers_map(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<Option<http::HeaderMap>, CoalesceFrameError>> {
+            std::task::Poll::Ready(Ok(None))
         }
     }
 
