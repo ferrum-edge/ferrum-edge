@@ -1,7 +1,7 @@
 # hyper-util: release an HTTP/1 sender once its dispatcher stops reading
 
 > Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
-> Any change to `vendor/hyper-util-0.1.20-ferrum-patched/` must regenerate the
+> Any change to `vendor/hyper-util-0.1.21-ferrum-patched/` must regenerate the
 > drift manifest (`scripts/update_vendor_integrity.sh`).
 
 ## Status
@@ -57,14 +57,24 @@ and `try_recv` found nothing.
 
 ## Patch
 
-The base is the crates.io `hyper-util` 0.1.20 source (package checksum
-`96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0`, upstream
-commit `b23a13e2b7ee73e15ba008cd9b19dcd2d3861957`). Only
+The base is the crates.io `hyper-util` 0.1.21 source (package checksum
+`ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff`, upstream
+commit `23a868965964c1d6bb1b94f30ba4c420a4bebe7c`). Only
 `src/client/legacy/client.rs` differs; the unified diff is
 [`hyper-util-release-h1-sender-on-dispatch-close.patch`](hyper-util-release-h1-sender-on-dispatch-close.patch).
 The crate's `.github/`, `Cargo.lock`, `Cargo.toml.orig`, `.gitignore` and
 `.cargo_vcs_info.json` are not vendored. `examples/` and `tests/` are kept
 because the published manifest names them as explicit targets.
+
+The patch was first carried on 0.1.20 (PR #5719). 0.1.21 still holds the only
+HTTP/1 sender across the response wait, so the patch was rebased onto it with
+the same behavior and tests. 0.1.21 moves the crate to edition 2024, where
+`PoolClient::try_send_request`'s return-position `impl Future` would capture
+its `&mut self` borrow and stop `try_send_request` from moving the pooled
+connection into `await_pooled_response` while the send is pending. The patch
+therefore adds `+ use<B>` to that signature; hyper's send future owns
+everything it needs. The regression module also drops the `Future` imports
+that the edition 2024 prelude now provides.
 
 `try_send_request` now hands the queued request's response future and the
 pooled connection to `await_pooled_response`, which waits through
@@ -171,8 +181,8 @@ The `pooled_http1` tests run `await_pooled_response`, the step
 The `Vendored Patch Regressions` CI job runs them with
 
 ```bash
-cargo test --manifest-path vendor/hyper-util-0.1.20-ferrum-patched/Cargo.toml --features full --lib ferrum_release_on_close_tests
-cargo test --manifest-path vendor/hyper-util-0.1.20-ferrum-patched/Cargo.toml --features full --test legacy_client
+cargo test --manifest-path vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml --features full --lib ferrum_release_on_close_tests
+cargo test --manifest-path vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml --features full --test legacy_client
 ```
 
 The second command runs hyper-util's own legacy-client suite. It covers
@@ -199,7 +209,7 @@ in-progress sends publish). Then:
 
 1. Remove the `hyper-util` line from `[patch.crates-io]` in `Cargo.toml` and
    `tests/performance/mesh/Cargo.toml`.
-2. `git rm -r vendor/hyper-util-0.1.20-ferrum-patched/`, and restore the
+2. `git rm -r vendor/hyper-util-0.1.21-ferrum-patched/`, and restore the
    registry `source`/`checksum` lines in `Cargo.lock` and
    `tests/performance/mesh/Cargo.lock` with a normal lockfile update.
 3. Remove the inventory row and the lifecycle entry, drop the CI step, and

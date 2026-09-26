@@ -1713,8 +1713,8 @@ jobs:
         # suite re-checks ordinary keep-alive, reuse, and close behavior
         # through the patched send path.
         run: |
-          cargo test --manifest-path vendor/hyper-util-0.1.20-ferrum-patched/Cargo.toml --features full --lib ferrum_release_on_close_tests
-          cargo test --manifest-path vendor/hyper-util-0.1.20-ferrum-patched/Cargo.toml --features full --test legacy_client
+          cargo test --manifest-path vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml --features full --lib ferrum_release_on_close_tests
+          cargo test --manifest-path vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml --features full --test legacy_client
 
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

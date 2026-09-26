@@ -47,6 +47,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ports, so their UDP port must be reachable, and a response longer than the
   rule's `request` or `backendRequest` is now cut on HTTP/3 as it already was
   on HTTP/1.1 and HTTP/2.
+- The vendored hyper-util that keeps a pooled HTTP/1.1 connection's close from
+  stranding a queued backend request (#5714) is rebased from 0.1.20 onto
+  hyper-util 0.1.21 (`vendor/hyper-util-0.1.21-ferrum-patched/`). 0.1.21
+  still holds the closed connection's only request sender while it waits
+  (upstream report hyperium/hyper#4202), so the patch and its regression tests
+  carry over with the same behavior. Under 0.1.21's edition 2024, the patched
+  send path declares that its send future does not borrow the connection
+  (`use<B>`). The rebase brings in 0.1.21's upstream fixes (CONNECT response
+  validation, SOCKS proxy fixes, idle-interval cancellation) and adds `base64`
+  0.23.1 to the lockfiles next to 0.22.1. hyper-util's `TokioExecutor` no
+  longer carries the current `tracing` span into spawned tasks; Ferrum opens
+  no spans, so its logs are unchanged.
 
 ### Fixed
 

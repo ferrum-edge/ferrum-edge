@@ -30,7 +30,7 @@ h3-quinn = { path = "../vendor/h3-quinn-0.0.10-ferrum-patched" }
 tungstenite = { path = "../vendor/tungstenite-0.29.0-ferrum-patched" }
 tokio-tungstenite = { path = "../vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
 dimpl = { path = "../vendor/dimpl-0.6.1-ferrum-patched" }
-hyper-util = { path = "../vendor/hyper-util-0.1.20-ferrum-patched" }
+hyper-util = { path = "../vendor/hyper-util-0.1.21-ferrum-patched" }
 
 [[bin]]
 name = "traceparent"
