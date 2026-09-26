@@ -158,16 +158,14 @@ async fn a_deferred_cut_sends_the_cleared_bytes_through_later_inspectors_first()
 async fn a_deferred_silent_cut_sends_only_the_cleared_bytes() {
     let cutter = DeferringCutter::new(b'!', None);
     let (later, _seen) = recorder(true);
-    let mut chain =
-        chain_response_stream_inspectors(vec![Box::new(cutter), later]).expect("chain");
+    let mut chain = chain_response_stream_inspectors(vec![Box::new(cutter), later]).expect("chain");
     let final_bytes = terminal(chain.on_chunk(b"abc!xyz").await);
     assert_eq!(final_bytes.as_deref(), Some(&b"abc"[..]));
 
     // Nothing cleared and no payload: the stream just ends.
     let cutter = DeferringCutter::new(b'!', None);
     let (later, _seen) = recorder(false);
-    let mut chain =
-        chain_response_stream_inspectors(vec![Box::new(cutter), later]).expect("chain");
+    let mut chain = chain_response_stream_inspectors(vec![Box::new(cutter), later]).expect("chain");
     assert_eq!(terminal(chain.on_chunk(b"!xyz").await), None);
 }
 
@@ -177,8 +175,7 @@ async fn a_deferred_cut_frames_its_payload_after_what_the_client_already_holds()
     // call sent, which end mid-line.
     let cutter = DeferringCutter::new(b'!', Some(b"ERR"));
     let (later, _seen) = recorder(false);
-    let mut chain =
-        chain_response_stream_inspectors(vec![Box::new(cutter), later]).expect("chain");
+    let mut chain = chain_response_stream_inspectors(vec![Box::new(cutter), later]).expect("chain");
     let ResponseStreamAction::Forward(sent) = chain.on_chunk(b"ab").await else {
         panic!("no cut yet");
     };
@@ -192,8 +189,7 @@ async fn a_later_cut_on_the_cleared_bytes_wins() {
     // A later inspector that cuts outright.
     let cutter = DeferringCutter::new(b'!', Some(b"ERR"));
     let later: Box<dyn ResponseStreamInspector> = Box::new(CutNow);
-    let mut chain =
-        chain_response_stream_inspectors(vec![Box::new(cutter), later]).expect("chain");
+    let mut chain = chain_response_stream_inspectors(vec![Box::new(cutter), later]).expect("chain");
     let final_bytes = terminal(chain.on_chunk(b"abc!xyz").await);
     assert_eq!(final_bytes.as_deref(), Some(&b"LATER"[..]));
 

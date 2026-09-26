@@ -130,7 +130,9 @@ use super::utils::ai_providers::{detect_response_provider, detect_sse_provider};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::json_escape::escape_json_string;
 use super::utils::response_body::read_response_body_bounded;
-use super::utils::sse::{encode_sse_error_event, is_sse_request, sse_event_on_fresh_line, sse_lines};
+use super::utils::sse::{
+    encode_sse_error_event, is_sse_request, sse_event_on_fresh_line, sse_lines,
+};
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector,

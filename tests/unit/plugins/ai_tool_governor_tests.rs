@@ -2117,7 +2117,11 @@ async fn chained_governor_cut_sends_its_same_chunk_release_through_later_inspect
         };
         assert_eq!(final_bytes, expected, "chained");
         let expected_seen = [content.as_bytes(), &b"<end>"[..]].concat();
-        assert_eq!(*seen.lock().unwrap(), expected_seen, "seen once, then flushed");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            expected_seen,
+            "seen once, then flushed"
+        );
         assert!(
             !String::from_utf8_lossy(&final_bytes).contains("danger"),
             "the denied tool call never leaves"
