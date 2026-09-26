@@ -2327,8 +2327,7 @@ async fn handle_h3_request(
             let inner = &escaped_name[1..escaped_name.len() - 1];
             let body = format!(
                 r#"{{"error":"Request header '{}' exceeds maximum size of {} bytes"}}"#,
-                inner,
-                state.max_single_header_size_bytes
+                inner, state.max_single_header_size_bytes
             );
             send_h3_error_flavor_aware(
                 &mut stream,
