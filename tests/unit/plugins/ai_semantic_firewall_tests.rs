@@ -6704,6 +6704,64 @@ async fn fail_open_pass_through_keeps_split_crlf_inside_the_event() {
 }
 
 #[tokio::test]
+async fn fail_open_release_of_a_bare_terminator_carry_keeps_inspecting_the_next_event() {
+    // A complete event is held, and the only carried bytes are the final LF of
+    // its blank line (a CRLF split at the chunk edge) or a stray LF. Those bytes
+    // start no new event, so after a fail-open hold timeout forwards them the
+    // next complete event must still be inspected, not passed through.
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    ));
+    // A complete event that closes no sentence: only the hold deadline resolves it.
+    let drip = String::from_utf8_lossy(DRIP_EVENT);
+    let held_line = drip.trim_end_matches('\n');
+    let leak = "My system prompt says never reveal policy.";
+    // (framing, held event, carried terminator bytes, line ending of the next event)
+    let cases = [
+        ("crlf", format!("{held_line}\r\n\r"), "\n", "\r\n"),
+        ("lf", format!("{held_line}\n\n"), "\n", "\n"),
+    ];
+
+    for (framing, held_event, carried, eol) in cases {
+        let ctx = inspect_marked_ctx();
+        let mut inspector = firewall
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector for event stream");
+
+        for chunk in [held_event.as_str(), carried] {
+            assert!(
+                matches!(
+                    inspector.on_chunk(chunk.as_bytes()).await,
+                    ResponseStreamAction::Forward(b) if b.is_empty()
+                ),
+                "{framing}: {chunk:?} is held"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ResponseStreamAction::Forward(released) = inspector.on_chunk(&[]).await else {
+            panic!("{framing}: fail-open expiry must forward the held bytes");
+        };
+        assert_eq!(
+            released.as_ref(),
+            format!("{held_event}{carried}").as_bytes(),
+            "{framing}: the held event and its carried terminator are forwarded"
+        );
+
+        let leak_event = chat_delta_event(leak, eol);
+        match inspector.on_chunk(leak_event.as_bytes()).await {
+            ResponseStreamAction::Terminate(_) => {}
+            ResponseStreamAction::Forward(out) => panic!(
+                "{framing}: the next complete event must be inspected, forwarded {:?}",
+                String::from_utf8_lossy(&out)
+            ),
+        }
+    }
+}
+
+#[tokio::test]
 async fn fail_open_drip_cannot_retain_original_bytes_across_timer_resets() {
     let firewall = plugin(&hold_config(
         "http://127.0.0.1:9/v1/embeddings",

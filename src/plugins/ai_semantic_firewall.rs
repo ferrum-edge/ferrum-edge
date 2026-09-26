@@ -4306,11 +4306,12 @@ impl StreamWindowEngine {
     }
 
     /// Release every byte that caused the current hold without inspecting it:
-    /// complete held events and any un-terminated `carry`. When `carry` was
-    /// non-empty, enter [`passthrough_to_event_end`] so the remainder of that
+    /// complete held events and any un-terminated `carry`. When `carry` holds
+    /// field bytes, enter [`passthrough_to_event_end`] so the remainder of that
     /// same SSE event is never absorbed as a fresh inspectable event (its
-    /// prefix already left the gateway uninspected). Used only by the fail-open
-    /// hold-timeout path; returns the raw bytes to forward immediately.
+    /// prefix already left the gateway uninspected). A `carry` of bare line
+    /// terminators is forwarded without entering pass-through. Used only by the
+    /// fail-open hold-timeout path; returns the raw bytes to forward immediately.
     fn force_release_held(&mut self) -> Vec<u8> {
         let mut out = if let Some(last) = self.held.last() {
             // Reuse `release()` so the cleared-offset rebase and overlap draining
@@ -4323,14 +4324,21 @@ impl StreamWindowEngine {
         };
         if !self.carry.is_empty() {
             out.extend_from_slice(&self.carry);
-            // The first bytes of the next chunk may complete a blank-line
-            // boundary that started in this already-forwarded prefix. Retain
-            // only a detection copy of the final two bytes before clearing the
-            // held carry; they must never be emitted a second time.
-            let keep = self.carry.len().min(2);
-            self.passthrough_tail = self.carry[self.carry.len() - keep..].to_vec();
+            // A carry of only CR/LF (such as the LF of a CRLF split from the
+            // held event's blank line) started no new event: forwarding it
+            // leaves nothing to finish uninspected, and pass-through here
+            // would forward the NEXT complete event uninspected.
+            if self.carry.iter().any(|b| !matches!(b, b'\r' | b'\n')) {
+                // The first bytes of the next chunk may complete a blank-line
+                // boundary that started in this already-forwarded prefix.
+                // Retain only a detection copy of the final two bytes before
+                // clearing the held carry; they must never be emitted a second
+                // time.
+                let keep = self.carry.len().min(2);
+                self.passthrough_tail = self.carry[self.carry.len() - keep..].to_vec();
+                self.passthrough_to_event_end = true;
+            }
             self.carry.clear();
-            self.passthrough_to_event_end = true;
         }
         out
     }

@@ -92,7 +92,9 @@ use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, read_response_body_bounded,
 };
 use super::utils::sink_loss::{SinkLossReason, record_dropped as record_sink_loss};
-use super::utils::sse::{split_sse_line_terminator, sse_lines, sse_lines_inclusive, strip_sse_boms};
+use super::utils::sse::{
+    split_sse_line_terminator, sse_lines, sse_lines_inclusive, strip_sse_boms,
+};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, DeferredBatchingLogger,
     HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, LoggerHooks, PluginHttpClient, build_batch_config,

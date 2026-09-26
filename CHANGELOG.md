@@ -476,14 +476,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leading UTF-8 BOMs and splits lines on CRLF, LF, or a lone CR (mixed
   freely). Previously a leading BOM or CR-only framing hid events from
   inspection while the body was still reported as fully parsed (#5795).
-- The remaining SSE paths now share that parser's line splitting and leading-BOM
-  policy, so CR-only and mixed CR/LF/CRLF event streams are handled like LF
-  ones: windowed `ai_semantic_firewall` inspection finds event boundaries
-  (including a CRLF split across transport chunks) and ends fail-open
-  pass-through where the forwarded event ends, `ai_transcript_audit`
-  reassembles and redacts
-  every captured frame, and `ai_response_guard` redact mode rewrites such
-  streams instead of rejecting them (#5803).
+- Windowed `ai_semantic_firewall` streaming inspection, `ai_transcript_audit`
+  SSE capture, and the `ai_response_guard` SSE rewriters now share that
+  parser's line splitting and leading-BOM policy, so CR-only and mixed
+  CR/LF/CRLF event streams are handled like LF ones on these three paths. The
+  firewall finds event boundaries (including a CRLF split across transport
+  chunks) and ends fail-open pass-through where the forwarded event ends; a
+  hold timeout that forwards only a leftover line terminator no longer starts
+  pass-through, so the next event is still inspected. `ai_transcript_audit`
+  reassembles and redacts every captured frame, and `ai_response_guard` redact
+  mode rewrites such streams instead of rejecting them (#5803).
 
 ### Security
 
