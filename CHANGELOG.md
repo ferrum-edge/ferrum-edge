@@ -438,12 +438,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request to an uncached overflow target, and it is emitted after the cache
   shard lock is released. `ferrum_circuit_breaker_cache_admission_refused_total`
   still counts every refused admission (#5787).
-- HTTP active health probes now drain small response bodies (up to 64 KiB,
-  within at most 1 second and the probe timeout) before releasing the
-  response, so a health endpoint that sends its body after its headers keeps
-  its HTTP/1.1 connection in the idle pool instead of opening a new connection
-  on every probe. Oversized, stalled, or failing bodies are abandoned without
-  changing the status-based verdict (#5791).
+- HTTP active health probes now decide the verdict and record latency from the
+  response headers, then drain small response bodies in the background (up to
+  64 KiB, within at most 1 second and the remaining probe timeout) so a health
+  endpoint that sends its body after its headers can return its HTTP/1.1
+  connection to the idle pool. Oversized, stalled, or failing bodies are
+  abandoned without changing the verdict (#5791).
 
 ### Security
 

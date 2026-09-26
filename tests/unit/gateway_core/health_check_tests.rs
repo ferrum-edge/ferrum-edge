@@ -3330,8 +3330,8 @@ async fn http_probe_stalled_body_keeps_status_verdict_and_is_time_bounded() {
         "a stalled body must not override the status verdict: {failure:?}"
     );
     assert!(
-        elapsed < Duration::from_secs(5),
-        "body drain must be time-bounded independently of the probe timeout, took {elapsed:?}"
+        elapsed < Duration::from_millis(500),
+        "a stalled response body must not delay the header-time verdict, took {elapsed:?}"
     );
 }
 

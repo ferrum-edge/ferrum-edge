@@ -570,7 +570,7 @@ upstreams:
 4. After `unhealthy_threshold` consecutive failures (bad status code, timeout, or connection error), the target is marked **unhealthy** and excluded from load balancing.
 5. After `healthy_threshold` consecutive successes, the target is marked **healthy** again and re-included.
 
-**Connection pooling:** Active health check probes share a single HTTP client configured with the gateway's global connection pool settings (keep-alive, idle timeout, HTTP/2, TCP keep-alive). This means health check connections behave like regular proxy traffic and benefit from connection reuse. The verdict comes from the status code alone; the probe then drains up to 64 KiB of response body for at most 1 second (further capped by the remaining probe timeout) so the connection can return to the idle pool. A larger, stalled, or failing body is abandoned and its connection closed without changing the verdict.
+**Connection pooling:** Active health check probes share a single HTTP client configured with the gateway's global connection pool settings (keep-alive, idle timeout, HTTP/2, TCP keep-alive). This means health check connections behave like regular proxy traffic and benefit from connection reuse. The verdict and least-latency sample come from the response headers. The probe then drains up to 64 KiB of response body in the background for at most 1 second (further capped by the remaining probe timeout) so the connection can return to the idle pool. A larger, stalled, or failing body is abandoned without changing the verdict or delaying the next probe.
 
 **TLS:** Health probes accept self-signed certificates by default since backends in internal environments often use self-signed certs.
 

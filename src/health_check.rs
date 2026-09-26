@@ -3253,25 +3253,28 @@ async fn http_probe(
     }
     let started = tokio::time::Instant::now();
     match request.send().await {
-        Ok(mut resp) => {
+        Ok(resp) => {
             let status = resp.status().as_u16();
             let healthy = if healthy_status_codes.is_empty() {
                 (200..300).contains(&status)
             } else {
                 healthy_status_codes.contains(&status)
             };
-            // The verdict is decided by the status alone. Drain a small body so
-            // the HTTP/1.1 connection can return to the idle pool; a body that is
-            // oversized, stalled, or fails mid-read is abandoned (the connection
-            // is closed) without changing the verdict.
+            // The verdict is decided by the response headers. Drain a small body
+            // in the background so the HTTP/1.1 connection can return to the idle
+            // pool; a body that is oversized, stalled, or fails mid-read is
+            // abandoned without changing the verdict or delaying the probe loop.
             let drain_budget = timeout
                 .saturating_sub(started.elapsed())
                 .min(HTTP_PROBE_BODY_DRAIN_TIMEOUT);
-            match tokio::time::timeout(drain_budget, drain_probe_body(&mut resp)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(reason)) => debug!(reason, "HTTP health probe body not drained"),
-                Err(_) => debug!("HTTP health probe body drain timed out"),
-            }
+            drop(tokio::spawn(async move {
+                let mut resp = resp;
+                match tokio::time::timeout(drain_budget, drain_probe_body(&mut resp)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(reason)) => debug!(reason, "HTTP health probe body not drained"),
+                    Err(_) => debug!("HTTP health probe body drain timed out"),
+                }
+            }));
             if healthy {
                 ProbeOutcome::success()
             } else {
