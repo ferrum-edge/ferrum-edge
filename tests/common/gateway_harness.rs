@@ -518,6 +518,18 @@ impl GatewayChildGuard {
         }
     }
 
+    /// Raw captured stderr + stdout, stderr first. Empty when the guard was
+    /// built with [`GatewayChildGuard::new`], which captures nothing.
+    ///
+    /// Unscrubbed, so it is for matching log lines only. Print
+    /// [`startup_diagnostics`](Self::startup_diagnostics) instead.
+    pub fn read_captured_output(&self) -> std::io::Result<String> {
+        match &self.startup_output {
+            Some(output) => output.read_combined(),
+            None => Ok(String::new()),
+        }
+    }
+
     /// Borrow the child for readiness probes (`try_wait`) and log reads.
     pub fn child_mut(&mut self) -> &mut Child {
         self.child
@@ -604,6 +616,22 @@ impl GatewayStartupOutput {
             ports,
             secrets,
         })
+    }
+
+    fn read_combined(&self) -> std::io::Result<String> {
+        let read = |stream: &str| -> std::io::Result<String> {
+            let bytes = std::fs::read(self.directory.path().join(stream))?;
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let mut combined = read("stderr")?;
+        let stdout = read("stdout")?;
+        if !stdout.is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&stdout);
+        }
+        Ok(combined)
     }
 
     fn diagnostics(&self) -> String {

@@ -577,6 +577,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status, as HTTP/1.1 and HTTP/2 do, so hooks can no longer see, replace,
   duplicate, or erase the token. A hook-set non-5xx status without a connection
   error carries no token, matching HTTP/1.1 and HTTP/2 (#5807).
+- Database, file, dp and mesh modes now log
+  `Shutdown drain begun: Connection: close hint and
+  new-request rejection are active` at `info` once the shutdown drain flags are
+  set. A closed proxy port does not mean drain has begun, because the flags are
+  set only after every listener task returns, including the HTTP/3 listener's
+  own drain. The graceful-shutdown functional test now waits for this line
+  before it releases a held response, instead of treating the closed port as
+  proof, which removes a race that made it flaky (#5821). The `cp` mode has no
+  proxy and does not enter the proxy drain phase.
 - Streamed pass-through gRPC-Web uploads now count request messages on their
   decoded frames, as the buffered arms do. A `grpc-web-text` upload is decoded
   from base64 across chunk boundaries, including concatenated padded segments,
@@ -593,14 +602,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already cleared, such as the pass-through rest of an event whose data the
   client already holds, now leave ahead of the error event (when the firewall
   is the only or last stream inspector) instead of being dropped, so that
-  event ends intact; a silent `cut_silent` cut sends them too before the stream
+  event ends intact; a `cut_silent` cut sends them too before the stream
   ends. In a chain of stream inspectors the LF follows what the client
   actually received, and a last inspector's cut at the end of the stream keeps
   the bytes it released just before. A chained firewall that is not the last
   stream inspector still drops its own same-chunk releases at a cut, including
   a fail-open pass-through rest, so backend bytes never skip the later
   inspectors; in that configuration the error event's data may still be
-  unparseable (#5826) (#5820).
+  unparseable (#5826; #5820).
 
 ### Security
 
