@@ -1,5 +1,6 @@
 use super::plugin_utils::create_test_proxy;
 use ferrum_edge::_test_support::{
+    ai_semantic_cache_admit_sealed_redis_hit_for_test,
     ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test,
     ai_semantic_cache_cache_budget_used_for_test,
     ai_semantic_cache_clear_redis_quarantine_for_test,
@@ -3132,6 +3133,99 @@ async fn test_sensitive_response_headers_not_replayed_on_cache_hit() {
         }
         _ => panic!("Expected cache HIT (RejectBinary), got {:?}", result),
     }
+}
+
+#[tokio::test]
+async fn test_ietf_ratelimit_headers_not_replayed_on_cache_hit() {
+    // The non-`X-` IETF-draft rate-limit family (`RateLimit` combined field
+    // and split `RateLimit-*` fields, including `RateLimit-Policy`) reports
+    // the original response's quota and reset. A cache hit must not replay
+    // it, or clients pace themselves against a stale budget.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+    let body_json = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "quota?"}]
+    });
+    let body_str = serde_json::to_string(&body_json).unwrap();
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx1.metadata
+        .insert("request_body".to_string(), body_str.clone());
+    let mut req = HashMap::new();
+    req.insert("content-type".to_string(), "application/json".to_string());
+    let _ = drive_cache_lookup(&plugin, &mut ctx1, &req).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    response_headers.insert("RateLimit-Remaining".to_string(), "0".to_string());
+    response_headers.insert("RateLimit-Reset".to_string(), "60".to_string());
+    response_headers.insert("RateLimit".to_string(), "\"api\";r=0;t=60".to_string());
+    response_headers.insert("RateLimit-Policy".to_string(), "\"api\";q=100".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx1, 200, &response_headers, br#""answer""#)
+        .await;
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx2.metadata.insert("request_body".to_string(), body_str);
+    let result = drive_cache_lookup(&plugin, &mut ctx2, &req).await;
+    match result {
+        PluginResult::RejectBinary { headers, .. } => {
+            assert!(
+                !headers
+                    .keys()
+                    .any(|k| k.to_ascii_lowercase().starts_with("ratelimit")),
+                "IETF rate-limit headers must not be replayed: {headers:?}"
+            );
+            assert_eq!(headers.get("x-ai-cache-status").unwrap(), "HIT");
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+        }
+        _ => panic!("Expected cache HIT (RejectBinary), got {:?}", result),
+    }
+}
+
+#[test]
+fn test_redis_hit_resanitizes_ratelimit_headers_from_persisted_entry() {
+    // An authentic L2 entry sealed before the current header policy still
+    // carries quota headers; admission must re-sanitize rather than replay
+    // what was stored.
+    let plugin = make_plugin(json!({"redis_integrity_key": REDIS_INTEGRITY_KEY_FOR_TESTS}));
+    let stored = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("x-app-version".to_string(), "7".to_string()),
+        ("RateLimit-Remaining".to_string(), "0".to_string()),
+        ("ratelimit-reset".to_string(), "60".to_string()),
+        ("rAtElImIt".to_string(), "\"api\";r=0;t=60".to_string()),
+        ("RateLimit-Policy".to_string(), "\"api\";q=100".to_string()),
+        ("X-RateLimit-Remaining".to_string(), "0".to_string()),
+        ("Set-Cookie".to_string(), "session=stored".to_string()),
+    ]);
+    let (status, headers) = ai_semantic_cache_admit_sealed_redis_hit_for_test(
+        &plugin,
+        "persisted-entry",
+        200,
+        &stored,
+        br#"{"answer":"cached"}"#,
+    )
+    .expect("an authentic, fresh JSON entry must be admitted");
+    assert_eq!(status, 200);
+    let mut names: Vec<&str> = headers.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["content-type", "x-app-version"],
+        "L2 admission must strip every stored quota header and keep ordinary headers"
+    );
 }
 
 // -------------------------------------------------------------------------

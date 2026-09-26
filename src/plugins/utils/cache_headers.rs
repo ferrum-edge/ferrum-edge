@@ -41,6 +41,11 @@ const SENSITIVE_EXACT_HEADERS: &[&str] = &[
     // Per-request retry signal — the stored value reflects the original
     // response's retry timing and is misleading on a cache hit.
     "retry-after",
+    // IETF `draft-ietf-httpapi-ratelimit-headers` combined structured field
+    // (`RateLimit: "api";r=0;t=60`). It carries the original response's
+    // remaining quota and relative reset, which are stale on any cache hit.
+    // The split `RateLimit-*` family is covered by the `ratelimit-` prefix.
+    "ratelimit",
 ];
 
 /// Case-insensitive prefixes for sensitive header families. These exist
@@ -56,8 +61,22 @@ const SENSITIVE_EXACT_HEADERS: &[&str] = &[
 ///   (`-limit`, `-remaining`, `-window`, `-usage`) and future additions.
 /// - `anthropic-ratelimit-` covers Anthropic's rate-limit family
 ///   (`anthropic-ratelimit-requests-limit`, `-tokens-remaining`, etc.).
-const SENSITIVE_HEADER_PREFIXES: &[&str] =
-    &["x-ratelimit-", "x-ai-ratelimit-", "anthropic-ratelimit-"];
+/// - `ratelimit-` covers the non-`X-` IETF-draft split fields
+///   (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`) that
+///   libraries such as express-rate-limit emit, AND `RateLimit-Policy`.
+///   The policy field is stripped deliberately rather than kept as static
+///   metadata: servers select policies per client tier, and later draft
+///   revisions attach a partition key (`pk`) identifying the original
+///   caller's quota partition. Neither is valid for another client sharing
+///   the cache entry, and the gateway cannot tell a static policy from a
+///   partition-bearing one without trusting the upstream's value — so the
+///   whole family goes, matching how `x-ratelimit-policy` is already handled.
+const SENSITIVE_HEADER_PREFIXES: &[&str] = &[
+    "x-ratelimit-",
+    "x-ai-ratelimit-",
+    "anthropic-ratelimit-",
+    "ratelimit-",
+];
 
 /// Return whether `name` is a per-request tracing or request-correlation
 /// header whose value must not affect request identity or be replayed from a

@@ -941,6 +941,12 @@ fn spiffe_identity_global_plugin_config() -> PluginConfig {
 /// and the supplied mesh block, so `udp`-marked CONNECTs reach the relay
 /// synthesis path.
 pub(super) fn create_egress_udp_gateway_state(mesh: MeshConfig) -> ProxyState {
+    create_inbound_relay_gateway_state(Some(mesh))
+}
+
+/// [`create_egress_udp_gateway_state`] with an optional mesh block: `None` is
+/// a terminator that has not applied its first mesh slice yet.
+fn create_inbound_relay_gateway_state(mesh: Option<MeshConfig>) -> ProxyState {
     let spiffe_plugin = spiffe_identity_global_plugin_config();
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
@@ -959,7 +965,7 @@ pub(super) fn create_egress_udp_gateway_state(mesh: MeshConfig) -> ProxyState {
         frontend_tls_source_namespace: None,
         frontend_tls_certificate_sources: Vec::new(),
         trust_bundles: None,
-        mesh: Some(Box::new(mesh)),
+        mesh: mesh.map(Box::new),
         http_tls_listen_ports: Default::default(),
         mesh_revision: None,
         node_waypoint_udp_steer_destinations: Vec::new(),
@@ -987,6 +993,38 @@ pub(super) fn create_egress_udp_gateway_state(mesh: MeshConfig) -> ProxyState {
     )
     .expect("proxy state")
     .0
+}
+
+/// Serve `state` on a PLAINTEXT inbound mesh listener: no mTLS, so a CONNECT
+/// carries no client certificate and no peer SPIFFE identity.
+async fn start_plaintext_inbound_gateway(
+    state: ProxyState,
+) -> (std::net::SocketAddr, watch::Sender<bool>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind gateway");
+    let addr = listener.local_addr().expect("gateway local addr");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = start_proxy_listener_with_bound_listener_and_mesh_direction(
+            listener,
+            state,
+            shutdown_rx,
+            None,
+            Some(MeshTrafficDirection::Inbound),
+        )
+        .await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, shutdown_tx)
+}
+
+/// Collect a CONNECT refusal's body as text, tolerating a reset after it.
+async fn refusal_body_text(body: h2::RecvStream) -> String {
+    let body = tokio::time::timeout(std::time::Duration::from_secs(2), collect_h2_body(body))
+        .await
+        .unwrap_or_else(|_| Bytes::new());
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 async fn start_egress_udp_gateway(
@@ -1152,10 +1190,17 @@ async fn egress_udp_unadmitted_destination_is_refused() {
         .await
         .expect("udp CONNECT response")
         .expect("udp CONNECT response");
+    // Issue #5763: a synthesis-time refusal is the documented 403, not a
+    // route-miss 404, and carries the datagram flavor's body.
     assert_eq!(
         resp.status(),
-        StatusCode::NOT_FOUND,
+        StatusCode::FORBIDDEN,
         "an unadmitted external UDP destination must never open a relay socket"
+    );
+    let text = refusal_body_text(resp.into_body()).await;
+    assert!(
+        text.contains("HBONE UDP relay destination not allowed"),
+        "the refusal must carry the UDP relay-destination body. body={text}"
     );
 
     shutdown_tx.send(true).expect("shutdown gateway");
@@ -1187,11 +1232,202 @@ async fn egress_udp_empty_allowlist_admits_nothing() {
         .await
         .expect("udp CONNECT response")
         .expect("udp CONNECT response");
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = refusal_body_text(resp.into_body()).await;
+    assert!(
+        text.contains("HBONE UDP relay destination not allowed"),
+        "the refusal must carry the UDP relay-destination body. body={text}"
+    );
 
     shutdown_tx.send(true).expect("shutdown gateway");
     external_handle.abort();
     conn_task.abort();
+}
+
+/// Issue #5763: an authenticated byte-stream CONNECT naming a destination this
+/// terminator does not own is refused at relay synthesis with the documented
+/// `403` and relay-destination body — never a route-miss `404` — and nothing is
+/// dialed. An empty slice terminates for nothing, so `127.0.0.1` is refused as
+/// `address_not_terminated_here` before any plugin runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_relay_synthesis_refusal_is_documented_403() {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
+    let (backend_addr, mut hit_rx, backend) =
+        start_counting_tcp_backend(IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+    let state = create_egress_udp_gateway_state(MeshConfig::default());
+    let (gateway_addr, shutdown_tx) =
+        start_egress_udp_gateway(state, hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let req = Request::builder()
+        .method(Method::CONNECT)
+        .uri(backend_addr.to_string())
+        .body(())
+        .expect("byte-stream CONNECT");
+    let (response_fut, _request_body) = sender.send_request(req, false).expect("send CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("CONNECT response")
+        .expect("CONNECT response");
+    let status = resp.status();
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        collect_h2_body(resp.into_body()),
+    )
+    .await
+    .unwrap_or_else(|_| Bytes::new());
+    let hits = observe_backend_hits(&mut hit_rx, std::time::Duration::from_millis(500)).await;
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    backend.abort();
+    conn_task.abort();
+
+    let body_text = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a synthesis-time relay refusal must be the documented 403, not a route-miss \
+         404. body={body_text}"
+    );
+    assert!(
+        body_text.contains("HBONE relay destination not allowed"),
+        "the refusal must carry the relay-destination body. body={body_text}"
+    );
+    assert_eq!(hits, Some(0), "a refused CONNECT must dial nothing");
+}
+
+/// Issue #5763: a PEERLESS CONNECT refused at relay synthesis gets the
+/// unauthenticated-peer terminal the HBONE handlers answer, not the
+/// destination-denial one, so it learns nothing about which destinations this
+/// terminator owns. The listener is plaintext, so the CONNECTs carry no client
+/// certificate and no SPIFFE identity; the empty slice refuses both authorities.
+#[tokio::test(flavor = "multi_thread")]
+async fn peerless_connect_refused_at_synthesis_gets_unauthenticated_peer_terminal() {
+    let (backend_addr, mut hit_rx, backend) =
+        start_counting_tcp_backend(IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+    let mesh = MeshConfig::default();
+    // The gateway listens on 127.0.0.1, so that is the accepted local address
+    // synthesis decides with. Refusing the authority there is what makes the
+    // answers below attributable to synthesis rather than to a handler gate.
+    let synthesis_decision = mesh.inbound_relay_destination_decision(
+        "127.0.0.1",
+        backend_addr.port(),
+        Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+    );
+    assert!(
+        synthesis_decision.is_err(),
+        "synthesis must refuse the authority, or this test never exercises it"
+    );
+    let state = create_egress_udp_gateway_state(mesh);
+    let (gateway_addr, shutdown_tx) = start_plaintext_inbound_gateway(state).await;
+    let stream = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect gateway");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, conn) = h2::client::handshake(stream).await.expect("h2 handshake");
+    let conn_task = tokio::spawn(conn);
+
+    let req = Request::builder()
+        .method(Method::CONNECT)
+        .uri(backend_addr.to_string())
+        .body(())
+        .expect("byte-stream CONNECT");
+    let (response_fut, _request_body) = sender.send_request(req, false).expect("send CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("CONNECT response")
+        .expect("CONNECT response");
+    let status = resp.status();
+    let text = refusal_body_text(resp.into_body()).await;
+
+    let (udp_response_fut, _udp_request_body) = sender
+        .send_request(udp_connect_request(&backend_addr.to_string()), false)
+        .expect("send udp CONNECT");
+    let udp_resp = tokio::time::timeout(std::time::Duration::from_secs(5), udp_response_fut)
+        .await
+        .expect("udp CONNECT response")
+        .expect("udp CONNECT response");
+    let udp_status = udp_resp.status();
+    let udp_text = refusal_body_text(udp_resp.into_body()).await;
+    let hits = observe_backend_hits(&mut hit_rx, std::time::Duration::from_millis(500)).await;
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    backend.abort();
+    conn_task.abort();
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={text}");
+    assert!(
+        text.contains("HBONE tunnel requires an authenticated mesh peer"),
+        "a peerless refusal must be the unauthenticated-peer terminal. body={text}"
+    );
+    assert_eq!(udp_status, StatusCode::FORBIDDEN, "body={udp_text}");
+    assert!(
+        udp_text.contains("HBONE UDP tunnel requires an authenticated mesh peer"),
+        "a peerless datagram refusal must be the unauthenticated-peer terminal. \
+         body={udp_text}"
+    );
+    assert_eq!(hits, Some(0), "a refused CONNECT must dial nothing");
+}
+
+/// Issue #5763: before its first mesh slice is applied a terminator cannot
+/// decide destination ownership at all. That is a readiness condition,
+/// answered `503` with the `hbone_relay_not_ready` body rather than the `403`
+/// that means a real authorization denial, and nothing is dialed.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_relay_synthesis_without_mesh_slice_is_not_ready() {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
+    let (backend_addr, mut hit_rx, backend) =
+        start_counting_tcp_backend(IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+    let state = create_inbound_relay_gateway_state(None);
+    let (gateway_addr, shutdown_tx) =
+        start_egress_udp_gateway(state, hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let req = Request::builder()
+        .method(Method::CONNECT)
+        .uri(backend_addr.to_string())
+        .body(())
+        .expect("byte-stream CONNECT");
+    let (response_fut, _request_body) = sender.send_request(req, false).expect("send CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("CONNECT response")
+        .expect("CONNECT response");
+    let status = resp.status();
+    let text = refusal_body_text(resp.into_body()).await;
+
+    let (udp_response_fut, _udp_request_body) = sender
+        .send_request(udp_connect_request(&backend_addr.to_string()), false)
+        .expect("send udp CONNECT");
+    let udp_resp = tokio::time::timeout(std::time::Duration::from_secs(5), udp_response_fut)
+        .await
+        .expect("udp CONNECT response")
+        .expect("udp CONNECT response");
+    let udp_status = udp_resp.status();
+    let udp_text = refusal_body_text(udp_resp.into_body()).await;
+    let hits = observe_backend_hits(&mut hit_rx, std::time::Duration::from_millis(500)).await;
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    backend.abort();
+    conn_task.abort();
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={text}");
+    assert!(
+        text.contains("HBONE relay not ready"),
+        "a slice-less terminator must answer the not-ready body. body={text}"
+    );
+    assert_eq!(
+        udp_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "body={udp_text}"
+    );
+    assert!(
+        udp_text.contains("HBONE UDP relay not ready"),
+        "a slice-less terminator must answer the UDP not-ready body. body={udp_text}"
+    );
+    assert_eq!(hits, Some(0), "a refused CONNECT must dial nothing");
 }
 
 /// The relay is authenticated: a `udp`-marked CONNECT to an ADMITTED external
@@ -2351,8 +2587,9 @@ fn inbound_relay_resolved_loopback_screen_is_wired_on_tcp_and_udp_dial_paths() {
     );
 }
 
-/// A gateway-side HBONE DNS-screen 403 after `check_circuit_breaker` admitted a
-/// HALF_OPEN probe must release that slot without changing backend health.
+/// A gateway-side HBONE DNS-screen policy refusal (403 denial or 503
+/// not-ready) after `check_circuit_breaker` admitted a HALF_OPEN probe must
+/// release that slot without changing backend health, whatever its status.
 /// Real connection failures still trip the breaker.
 #[test]
 fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
@@ -2373,26 +2610,29 @@ fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
     assert_eq!(cb.state_name(), "half_open");
     assert_eq!(cb.half_open_in_flight(), 1);
 
-    settle_hbone_backend_connect_circuit_breaker_outcome_for_test(&cb, StatusCode::FORBIDDEN, true);
-    assert_eq!(
-        cb.state_name(),
-        "half_open",
-        "DNS-screen 403 must not reopen the breaker"
-    );
-    assert_eq!(
-        cb.half_open_in_flight(),
-        0,
-        "DNS-screen 403 must release the HALF_OPEN probe slot"
-    );
-    assert!(
-        cb.can_execute().is_ok(),
-        "after a health-neutral denial the next probe must still be admissible"
-    );
-    assert_eq!(cb.half_open_in_flight(), 1);
+    for status in [StatusCode::FORBIDDEN, StatusCode::SERVICE_UNAVAILABLE] {
+        settle_hbone_backend_connect_circuit_breaker_outcome_for_test(&cb, status, true, true);
+        assert_eq!(
+            cb.state_name(),
+            "half_open",
+            "DNS-screen {status} policy refusal must not reopen the breaker"
+        );
+        assert_eq!(
+            cb.half_open_in_flight(),
+            0,
+            "DNS-screen {status} policy refusal must release the HALF_OPEN probe slot"
+        );
+        assert!(
+            cb.can_execute().is_ok(),
+            "after a health-neutral refusal the next probe must still be admissible"
+        );
+        assert_eq!(cb.half_open_in_flight(), 1);
+    }
 
     settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
         &cb,
         StatusCode::BAD_GATEWAY,
+        false,
         true,
     );
     assert_eq!(
@@ -2404,40 +2644,71 @@ fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
 }
 
 /// The byte-stream CONNECT error arm must settle the selected-target breaker
-/// through the production helper: FORBIDDEN (DNS-screen policy) is neutral,
-/// every other connect failure is a failure. Double-settlement is forbidden.
+/// through the ONE production helper: a DNS-screen relay refusal is neutral,
+/// every other connect failure is a failure. `connect_backend` returns only the
+/// denial; the handler derives its terminal once via
+/// `record_inbound_relay_refusal`. Double-settlement is forbidden.
 #[test]
 fn inbound_hbone_dns_screen_denial_settles_half_open_via_production_helper() {
     let src = include_str!("../../src/proxy/hbone_proxy.rs");
-    let collapsed: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        collapsed.contains(
-            "settle_hbone_backend_connect_circuit_breaker_outcome( &cb, err.status, cb_probe.take_slot(), );"
-        ),
-        "connect_backend error arm must settle the same selected-target breaker"
-    );
+    let collapsed = collapsed_tokens(src);
+    let helper = "settle_hbone_backend_connect_circuit_breaker_outcome";
     assert_eq!(
-        collapsed
-            .matches("settle_hbone_backend_connect_circuit_breaker_outcome")
-            .count(),
+        collapsed.matches(helper).count(),
         2,
         "helper definition plus the one connect_backend error-arm call site"
     );
     assert!(
         collapsed.contains(
-            "if status == StatusCode::FORBIDDEN { cb.record_neutral(is_half_open_probe); } else { cb.record_failure(status.as_u16(), true, is_half_open_probe); }"
+            "if policy_refusal { cb.record_neutral(is_half_open_probe); } else { cb.record_failure(status.as_u16(), true, is_half_open_probe); }"
         ),
-        "FORBIDDEN DNS-screen denials must record_neutral; other connect failures record_failure"
+        "policy refusals must record_neutral; other connect failures record_failure"
     );
-    let connect_err_arm = collapsed
-        .split("\"HBONE backend connection failed\"")
-        .nth(1)
-        .expect("connect_backend error logging")
-        .split("ctx.metadata.insert( \"error_class\"")
-        .next()
-        .expect("error_class metadata after breaker settlement");
+
+    let tcp = collapsed_tokens(rust_fn_body(src, "async fn connect_backend("));
     assert!(
-        !connect_err_arm.contains("record_failure") && !connect_err_arm.contains("record_neutral"),
+        tcp.contains(
+            "Err(denial) => return Err(HboneConnectFailure::RelayDenied(denial.as_str())),"
+        ),
+        "connect_backend must return only the screen's denial"
+    );
+    assert!(
+        !tcp.contains("inbound_relay_refusal_terminal")
+            && !tcp.contains("record_inbound_relay_refusal"),
+        "connect_backend must not derive the refusal terminal"
+    );
+
+    let (_, connect_err_arm) = collapsed
+        .split_once("let backend = match connect_backend(")
+        .expect("handle_hbone_request must dial through connect_backend");
+    let (connect_err_arm, _) = connect_err_arm
+        .split_once("ctx.metadata .insert(\"error_class\".to_string(), class.to_string());")
+        .expect("the connect error arm must end by stamping error_class");
+    assert!(
+        connect_err_arm.contains(
+            "let terminal = record_inbound_relay_refusal(ctx, denial, Some(destination), false);"
+        ),
+        "the handler must derive the TCP refusal terminal once, from the shared recorder"
+    );
+    assert!(
+        connect_err_arm.contains("(err.status, err.body, err.phase, err.class, false)"),
+        "a backend DNS/dial failure must never settle as a policy refusal"
+    );
+    assert!(
+        connect_err_arm.contains(
+            "settle_hbone_backend_connect_circuit_breaker_outcome( &cb, status, policy_refusal, cb_probe.take_slot(), );"
+        ),
+        "connect_backend error arm must settle the same selected-target breaker"
+    );
+    assert_eq!(
+        connect_err_arm.matches(helper).count(),
+        1,
+        "the connect error arm must settle through the helper exactly once"
+    );
+    assert!(
+        !connect_err_arm.contains("record_failure")
+            && !connect_err_arm.contains("record_neutral")
+            && !connect_err_arm.contains("record_success"),
         "the connect error arm must not double-settle beside the helper"
     );
 }
@@ -4266,12 +4537,14 @@ fn reviews_and_ratings_mesh(bindings: Vec<MeshWaypointBinding>) -> MeshConfig {
 // synthesized inbound HBONE relay (`MeshSlice::from_gateway_config` does not
 // project `GatewayConfig.plugin_configs`; file source accepts only MeshConfig;
 // xDS reverse translation does not carry operator plugins). The functional
-// cases therefore prove synthesis-time 404. These in-process tests invoke the
-// real dispatcher → `handle_hbone_request` / `handle_hbone_udp_request` path
-// with a normal GatewayConfig plugin cache: CONNECT names a dest B terminates
-// for, a global `mesh_route_dispatch` rewrites onto C, and each handler must
-// 403 with zero backend hits. Deleting either re-check fails these tests;
-// a synthesis 404 would mean this setup never reached the handlers.
+// cases therefore prove synthesis-time refusal. These in-process tests invoke
+// the real dispatcher → `handle_hbone_request` / `handle_hbone_udp_request`
+// path with a normal GatewayConfig plugin cache: CONNECT names a dest B
+// terminates for, a global `mesh_route_dispatch` rewrites onto C, and each
+// handler must 403 with zero backend hits. Deleting either re-check fails
+// these tests. Synthesis refusals answer the same documented 403 (issue
+// #5763), so each driver first proves the guard ADMITS B's authority — the 403
+// can then only come from a handler re-check.
 
 fn is_usable_non_loopback_unicast(ip: IpAddr) -> bool {
     match ip {
@@ -4395,8 +4668,8 @@ fn post_plugin_refusal_mesh(b_port: u16, c_ip: IpAddr, c_port: u16) -> MeshConfi
         // Issue #4249 bound the loopback arm to the per-address port the
         // terminator actually owns, so the Sidecar-shaped fixture must project
         // B's own-address ports the way the apply path does. Without this the
-        // control CONNECT to 127.0.0.1 is refused `PortNotDeclared` and the
-        // test sees a 404 instead of C's ownership 403.
+        // control CONNECT to 127.0.0.1 is refused `PortNotDeclared` at
+        // synthesis and never reaches C's post-plugin ownership re-check.
         inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
             relay_guard_workload("svc-b", &["127.0.0.1"], &[b_port]),
         ]),
@@ -4755,8 +5028,21 @@ async fn drive_post_plugin_third_workload_refusal(flavor: PostPluginConnectFlavo
     };
     let c_port = c_addr.port();
     let b_port = if c_port == 18080 { 18081 } else { 18080 };
+    let mesh = post_plugin_refusal_mesh(b_port, c_ip, c_port);
+    // The gateway listens on 127.0.0.1, so that is the accepted local address
+    // synthesis decides with. Admitting B here is what makes the 403 below
+    // attributable to the handler re-check rather than to synthesis.
+    assert_eq!(
+        mesh.inbound_relay_destination_decision(
+            "127.0.0.1",
+            b_port,
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ),
+        Ok(()),
+        "synthesis must admit B's own authority, or this setup never reaches the handlers"
+    );
     let state = create_post_plugin_third_workload_state(
-        post_plugin_refusal_mesh(b_port, c_ip, c_port),
+        mesh,
         global_mesh_route_dispatch_to(&c_ip.to_string(), c_port),
     );
     let (gateway_addr, shutdown_tx) =
@@ -4818,9 +5104,8 @@ async fn drive_post_plugin_third_workload_refusal(flavor: PostPluginConnectFlavo
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "post-plugin re-check must return 404-distinct 403; 404 means synthesis \
-         never reached the handler, 200/502 means the override or guard did not \
-         fire. body={body_text}"
+        "post-plugin re-check must return 403; 200/502 means the override or \
+         guard did not fire. body={body_text}"
     );
     assert!(
         body_text.contains("relay destination not allowed"),
