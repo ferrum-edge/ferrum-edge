@@ -105,16 +105,16 @@ Once `hyperium/h3` releases a version with the variant:
 
 1. **Update the registry floor.** Bump `h3 = "X.Y.Z"` in `Cargo.toml`
    `[dependencies]` to the version that includes the variant.
-2. **Drop the vendored crate** — but ONLY if patch 001 has also been
-   retired and the vendored copy contains no other Ferrum-only changes:
+2. **Drop the vendored crate** — but ONLY if patches 001, 003, 004, and 005
+   have also been retired and the vendored copy contains no other Ferrum-only
+   changes:
    - Remove the `h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }` line
      from the `[patch.crates-io]` block in `Cargo.toml`.
    - `git rm -r vendor/h3-0.0.8-ferrum-patched`.
    - `cargo build` — confirm we're now pulling `h3` from crates.io.
-   - Run the WS-over-H3 functional harness once it lands in-tree. The
-     harness should call `Protocol::WEB_SOCKET` directly and will fail
-     to compile if the registry release doesn't include the variant under
-     the same name.
+   - Run `tests/unit/gateway_core/http3_websocket_tests.rs`. It calls
+     `h3::ext::Protocol::WEB_SOCKET` directly and fails to compile if the
+     registry release doesn't include the variant under the same name.
 3. **Leave the gateway code in place** — the WebSocket-over-HTTP/3
    handler in `src/http3/websocket.rs` doesn't depend on this patch
    structurally, only on the `Protocol::WEB_SOCKET` symbol it adds.

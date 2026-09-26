@@ -14,9 +14,9 @@ File mode allows Ferrum Edge to load and manage configurations from static YAML/
 
 ## Test Files
 
-### Unit Tests: `tests/config_file_loader_tests.rs`
+### Unit Tests: `tests/unit/config/config_file_loader_tests.rs`
 
-Comprehensive unit tests for configuration file loading, covering:
+Unit tests for configuration file loading (part of the `unit_tests` target), covering:
 
 - **Basic Loading**
   - YAML configuration loading
@@ -27,8 +27,9 @@ Comprehensive unit tests for configuration file loading, covering:
   - Loading complete configs with proxies, consumers, and plugins
   - Field parsing validation
 
-- **Backend Protocols**
-  - All supported protocols: `http`, `https`, `ws`, `wss`, `grpc`, `h3`
+- **Backend Schemes**
+  - `http` and `https` parsing, `https` default for HTTP-family proxies
+  - `h3` rejected as a `backend_scheme`
 
 - **Authentication Modes**
   - Single auth mode
@@ -58,26 +59,25 @@ Comprehensive unit tests for configuration file loading, covering:
   - Preservation of configuration state during reload
 
 - **Error Handling**
-  - Missing configuration files
+  - Missing configuration files and missing `version`
   - Malformed YAML
   - Malformed JSON
   - Empty configurations
+  - Unknown fields, oversized files, non-regular files, and torn (partially written) files
 
 - **Format Fallback**
-  - Unknown extension handling
-  - YAML fallback behavior
-  - JSON fallback behavior
+  - Unknown extensions are parsed as YAML (which also accepts JSON)
 
-### Functional Tests: `tests/functional_file_mode_test.rs`
+### Functional Tests: `tests/functional/functional_file_mode_test.rs`
 
-End-to-end functional tests for the running gateway. These tests are marked with `#[ignore]` as they require building the binary and managing live processes.
+End-to-end tests against a running gateway, started through the shared `TestGateway` harness (reserved ports, per-spawn credentials, automatic cleanup). They are marked `#[ignore]` because they build and run the `ferrum-edge` binary. Hosted CI runs them in the `Functional Tests (application)` shard.
 
 #### Test: `test_file_mode_basic_request_routing`
 
 Verifies basic request routing through the gateway:
 
 1. Creates a temporary config file with one proxy
-2. Starts a local echo HTTP server on port 9999
+2. Starts a local echo HTTP server on a reserved port
 3. Starts the gateway binary with `FERRUM_MODE=file`
 4. Sends a test request through the proxy at `/echo/test-path`
 5. Verifies the request is routed correctly and returns 200 OK
@@ -97,16 +97,12 @@ Verifies configuration reload on SIGHUP signal:
 2. Starts echo server and gateway
 3. Verifies initial proxy is accessible
 4. Updates the config file to add a second proxy
-5. Sends SIGHUP signal to the gateway process
+5. Sends SIGHUP signal to the gateway process (Unix only)
 6. Verifies the new proxy is accessible after reload
-7. Confirms old proxy still works
 
 **What it tests:**
 - SIGHUP signal handling
 - Live configuration reloading
-- No downtime during reload
-- Multiple proxies after reload
-- Configuration file watching and refresh logic
 
 #### Test: `test_file_mode_empty_config`
 
@@ -135,45 +131,45 @@ Verifies routing to multiple backend services:
 - Multiple proxy configurations
 - Routing to different backends
 - Path isolation between proxies
-- Concurrent requests to different backends
+
+#### Test: `test_file_mode_consumer_identity_headers_forwarded`
+
+Verifies that when `key_auth` authenticates a consumer, the consumer identity headers reach the backend (checked with a header-echo server).
+
+#### Test: `test_file_mode_namespace_filtering`
+
+Verifies `FERRUM_NAMESPACE` filtering: with proxies in two namespaces, only the proxies in the gateway's namespace are routable.
 
 ## Running the Tests
 
-### Run All Unit Tests (Default)
+### Run Unit Tests
 
 ```bash
-cargo test --test config_file_loader_tests
+cargo test --test unit_tests config_file_loader
 ```
 
-This runs all unit tests which don't require building the binary or managing processes.
+These don't require the gateway binary or live processes.
 
 ### Run Functional Tests
 
-Functional tests require the gateway binary to be built:
+The harness runs `cargo build --bin ferrum-edge` once per test process (set `FERRUM_SKIP_GATEWAY_BUILD=1` to use an existing binary):
 
 ```bash
 # Run a specific functional test
-cargo test --test functional_file_mode_test -- --ignored --nocapture test_file_mode_basic_request_routing
+cargo test --test functional_tests test_file_mode_basic_request_routing -- --ignored --nocapture
 
-# Run all functional tests
-cargo test --test functional_file_mode_test -- --ignored --nocapture
-
-# Run with verbose output to see gateway logs
-RUST_LOG=debug cargo test --test functional_file_mode_test -- --ignored --nocapture
-```
-
-### Run All Tests (Both Unit and Functional)
-
-```bash
-cargo test --lib --test config_file_loader_tests
-cargo test --test functional_file_mode_test -- --ignored --nocapture
+# Run all file-mode functional tests
+cargo test --test functional_tests functional_file_mode -- --ignored --nocapture
 ```
 
 ## Configuration File Format
 
+See [File Mode Configuration Format](configuration.md#file-mode-configuration-format) for the canonical reference. The loader requires `version`, `proxies`, and `plugin_configs`; `consumers` and `upstreams` are optional.
+
 ### Basic YAML Structure
 
 ```yaml
+version: "1"
 proxies:
   - id: "proxy-id"
     listen_path: "/api"
@@ -219,8 +215,8 @@ FERRUM_FILE_CONFIG_PATH=/path/to/config.yaml
 # Operating mode
 FERRUM_MODE=file
 
-# Optional: Logging level (default: warn)
-RUST_LOG=ferrum_edge=debug
+# Optional: Logging level (default: warn). RUST_LOG, if set, takes precedence.
+FERRUM_LOG_LEVEL=debug
 
 # Optional: Proxy ports (defaults: 8000 for HTTP, 8443 for HTTPS)
 FERRUM_PROXY_HTTP_PORT=8000
@@ -235,8 +231,8 @@ FERRUM_ADMIN_HTTPS_PORT=9443
 
 The tests cover:
 
-- **Configuration Loading**: 25+ unit tests for various config scenarios
-- **Supported Protocols**: 6 backend protocols (http, https, ws, wss, grpc, h3)
+- **Configuration Loading**: ~80 unit tests for various config scenarios
+- **Backend Schemes**: `http`/`https` parsing and `h3` rejection
 - **Authentication**: 2 auth modes (single, multi) with 3 credential types
 - **Scoping**: Global, proxy-specific, and proxy-group plugin scoping
 - **Timeouts**: Backend connection, read, and write timeouts
@@ -253,40 +249,29 @@ The tests cover:
 Enable verbose logging:
 
 ```bash
-RUST_LOG=debug cargo test --test config_file_loader_tests -- --nocapture
+cargo test --test unit_tests config_file_loader -- --nocapture
 ```
 
 Check the test output for specific assertion failures, especially around field parsing and type conversion.
 
 ### Functional Test Failures
 
-Enable detailed output:
+Run with `--nocapture`; a failed gateway spawn prints the child's exit status, ports, and stdout/stderr tails.
 
 ```bash
-RUST_LOG=debug cargo test --test functional_file_mode_test -- --ignored --nocapture
+cargo test --test functional_tests functional_file_mode -- --ignored --nocapture
 ```
 
 Common issues:
 
-1. **Port Already in Use**: Kill existing gateway processes
+1. **Build failures or stale binary**: The harness builds `target/debug/ferrum-edge` unless `FERRUM_SKIP_GATEWAY_BUILD=1` is set, in which case it uses whatever binary exists
+   ```bash
+   cargo build --bin ferrum-edge
+   ```
+
+2. **Leftover gateway processes**: Ports come from the shared test port registry and spawns retry on fresh ports, but orphaned gateways from an aborted run can still hold ports
    ```bash
    pkill -f ferrum-edge
-   ```
-
-2. **Build Failures**: Clean and rebuild
-   ```bash
-   cargo clean
-   cargo build --release
-   ```
-
-3. **Network Issues**: Verify localhost connectivity
-   ```bash
-   netstat -tulpn | grep 8080
-   ```
-
-4. **Permission Denied**: Ensure executable permissions on the binary
-   ```bash
-   chmod +x target/release/ferrum-edge
    ```
 
 ## Adding New Tests
@@ -297,6 +282,7 @@ Common issues:
 #[test]
 fn test_new_feature() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api"
@@ -308,7 +294,13 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap()).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .unwrap();
 
     // Add assertions
     assert_eq!(config.proxies.len(), 1);
@@ -321,45 +313,36 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_new_functionality() {
-    use std::fs::File;
-    use std::io::Write;
-    use tempfile::TempDir;
+    let backend = spawn_http_echo().await.expect("spawn echo");
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "proxy-1"
+    listen_path: "/api"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {port}
+plugin_configs: []
+"#,
+        port = backend.port
+    );
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
+    // Reserves ports, retries on collisions, and kills the child on drop.
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .spawn()
+        .await
+        .expect("start gateway");
 
-    // Create config
-    let mut config_file = File::create(&config_path).unwrap();
-    config_file.write_all(b"...").unwrap();
-    drop(config_file);
-
-    // Start services
-    let gateway_process = start_gateway_in_file_mode(config_path.to_str().unwrap());
-
-    // Run test assertions
-
-    // Cleanup
-    if let Ok(mut proc) = gateway_process {
-        let _ = proc.kill();
-    }
+    let response = reqwest::get(gateway.proxy_url("/api/test")).await.unwrap();
+    assert!(response.status().is_success());
 }
 ```
 
 ## Continuous Integration
 
-For CI/CD pipelines, run tests in this order:
-
-1. Unit tests (fast, no dependencies):
-   ```bash
-   cargo test --test config_file_loader_tests
-   ```
-
-2. Functional tests (slower, requires binary build):
-   ```bash
-   cargo test --test functional_file_mode_test -- --ignored --test-threads=1
-   ```
-
-Using `--test-threads=1` prevents port conflicts when multiple functional tests run simultaneously.
+Hosted CI runs the unit tests in the `Unit Tests` jobs and the file-mode functional tests in the `Functional Tests (application)` shard (`.github/workflows/ci.yml`). The shared port registry makes `--test-threads=1` unnecessary.
 
 ## Known Limitations
 
@@ -367,11 +350,7 @@ Using `--test-threads=1` prevents port conflicts when multiple functional tests 
 
 2. **Functional Tests on Windows**: File mode tests use Unix signal handling (SIGHUP). Windows versions need process management alternatives.
 
-3. **Port Conflicts**: Tests use fixed ports (8080, 8443, 9999, etc.). Ensure these are available during testing.
-
-4. **Binary Caching**: Tests rebuild the binary each run. Use `--release` mode for faster builds in CI.
-
-5. **Timeout Sensitivity**: SIGHUP reload tests rely on timing. On slow systems, may need to increase wait times.
+3. **Timeout Sensitivity**: The SIGHUP reload test waits a fixed 2 seconds after signalling; slow systems may need a longer wait.
 
 ## Security Notes
 
@@ -383,8 +362,8 @@ Using `--test-threads=1` prevents port conflicts when multiple functional tests 
 
 ## Future Improvements
 
-Generic "add TLS/WebSocket/rate-limit/auth/stress" bullets are superseded by
-current functional coverage (most suites already run file-mode gateways).
+Generic "add TLS/WebSocket/rate-limit/auth/stress" items are already covered
+by other functional suites (most of which run file-mode gateways).
 
 ### Covered elsewhere
 
@@ -393,10 +372,7 @@ current functional coverage (most suites already run file-mode gateways).
 - Rate limiting plugins — `functional_redis_rate_limiting_test` + plugin network suites
 - Authentication plugin integration — `functional_file_mode_test` key_auth path + [Auth & ACL Functional Testing](functional_testing_auth_acl.md)
 - High proxy-count stress — scheduled `.github/workflows/scaling-regression.yml` (and `functional_load_stress_test` / `functional_scale_perf_test`)
-
-### Exact residual
-
-- Live OIDC / OAuth2 introspection integration coverage — [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333) (delivered in service-integration)
+- Live OIDC / OAuth2 introspection integration coverage — service-integration suite ([#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333))
 
 ### Explicit non-goal
 

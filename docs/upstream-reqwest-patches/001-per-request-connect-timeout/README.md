@@ -46,18 +46,12 @@ they're applied per-request and override the (now absent) client default.
 ## Patch fidelity
 
 The upstream PR diff (`reqwest-3017.patch`) was authored against
-reqwest's `master` branch. v0.13.2 was tagged earlier, so two log-line
-context strings differ from `master`:
-
-| File              | Upstream context (master)                                    | v0.13.2 context                                          |
-| ----------------- | ------------------------------------------------------------ | -------------------------------------------------------- |
-| `src/connect.rs`  | `log::debug!("proxy({proxy:?}) intercepts '{:?}'", dst.host());` | `log::debug!("proxy({proxy:?}) intercepts '{dst:?}'");` |
-| `src/connect.rs`  | `log::debug!("starting new connection '{:?}'", dst.host());` | `log::debug!("starting new connection: {dst:?}");`      |
-
-Both are unrelated cleanups; the patch itself is identical apart from
-those two context lines. The applied patch in the vendor directory uses
-the v0.13.2 context. The original PR diff is preserved verbatim in
-`reqwest-3017.patch` for audit purposes.
+reqwest's `master` branch and is preserved verbatim for audit purposes. The
+v0.13.3 base carries the same `src/connect.rs` context lines as `master`
+(`log::debug!("proxy({proxy:?}) intercepts '{:?}'", dst.host());` and
+`log::debug!("starting new connection '{:?}'", dst.host());`), so the vendored
+source matches the PR diff. The earlier v0.13.2 base needed those two
+log-line context strings adjusted.
 
 The provider-selection deviation is documented independently under
 `../002-selectable-rustls-provider/`; it is not part of upstream PR #3017.
@@ -69,8 +63,7 @@ The provider-selection deviation is documented independently under
   and to remove the `[[example]]` / `[[test]]` blocks that pointed at
   files we did not copy. The `dev-dependencies` block is left intact but
   unused.
-- `LICENSE-APACHE`, `LICENSE-MIT`, `README.md`, `CHANGELOG.md` — verbatim
-  upstream
+- `LICENSE-APACHE`, `LICENSE-MIT`, `README.md` — verbatim upstream
 
 `examples/` and `tests/` are intentionally NOT vendored — we depend on
 reqwest as a library, not as a test target. Skipping them avoids pulling
@@ -80,29 +73,32 @@ in `wasm-bindgen-test` and other transitive dev-deps that are not in our
 ## Retirement plan
 
 When upstream PR #3017 lands and ships in a reqwest release that we want
-to consume:
+to consume. The vendored crate also carries patches 002–004, so steps 2–3
+wait until those are retired too; until then, drop only this patch's hunks
+from the vendored source.
 
 1. **Bump the registry version of reqwest** (`Cargo.toml` `[dependencies]`)
    to whatever release contains the merged PR.
-2. **Drop the `[patch.crates-io]` block** from the workspace `Cargo.toml`
-   (the block is at the bottom of the file, separated by a comment header).
-3. **Delete the vendor directory**: `rm -rf vendor/reqwest-0.13.3-ferrum-patched/`.
-   If `vendor/` becomes empty, delete it too.
-4. **Delete this docs directory**: `rm -rf docs/upstream-reqwest-patches/001-per-request-connect-timeout/`.
-   If `docs/upstream-reqwest-patches/` becomes empty, delete it too.
+2. **Remove the `reqwest` line** from the `[patch.crates-io]` block in the
+   workspace `Cargo.toml` and its mirror in `tests/performance/mesh/Cargo.toml`.
+3. **Delete the vendor directory**: `git rm -r vendor/reqwest-0.13.3-ferrum-patched/`,
+   then regenerate the drift manifest (`scripts/update_vendor_integrity.sh`).
+4. **Retire the governance records**: remove the inventory row in
+   `docs/dependency-policy.md` and the entry in
+   `docs/vendored-patch-lifecycle.json`, and delete or retire this docs directory
+   per the [retirement procedure](../../dependency-policy.md#retiring-a-vendored-patch).
 5. **Leave the call-site changes alone.** The proxy-dispatch code in
    `src/proxy/mod.rs`, `src/http3/cross_protocol.rs`, and the absence of
    client-level `.connect_timeout()` in `src/connection_pool.rs` all use
    the upstream API as proposed — once the registry version contains it,
    the call sites need no further changes.
-6. **Update CLAUDE.md** if the "Connection Pool Keys > Policy cross-proxy
-   sharing" paragraph still references the vendored patch. Replace the
-   `vendor/...` reference with a note that per-request `connect_timeout`
-   landed upstream in reqwest vX.Y.Z.
-7. **Run the regression test**: `cargo test --test integration_tests
-   connection_pool::test_connect_timeout_does_not_fragment_pool
-   connection_pool::test_pooled_client_exposes_per_request_connect_timeout`
-   — these stay valid and continue to guard the contract.
+6. **Update any docs** that still reference the vendored patch with a note
+   that per-request `connect_timeout` landed upstream in reqwest vX.Y.Z.
+7. **Run the regression tests**: `cargo test --test integration_tests
+   test_connect_timeout_does_not_fragment_pool
+   test_pooled_client_exposes_per_request_connect_timeout`
+   (`tests/integration/connection_pool_tests.rs`) — these stay valid and
+   continue to guard the contract.
 
 If upstream rejects the PR or the API ships under a different name, port
 the call sites to the new API and update step 5 accordingly.
@@ -116,7 +112,7 @@ curl -sL https://patch-diff.githubusercontent.com/raw/seanmonstar/reqwest/pull/3
   -o docs/upstream-reqwest-patches/001-per-request-connect-timeout/reqwest-3017.patch
 ```
 
-Then in a scratch clone of `seanmonstar/reqwest` at tag `v0.13.2`,
-re-apply with the v0.13.2 context fixes, copy `src/` over the vendored
-directory, and re-run `cargo build --lib && cargo test --test unit_tests
+Then in a scratch clone of `seanmonstar/reqwest` at tag `v0.13.3`, re-apply
+the diff together with patches 002–004, copy `src/` over the vendored
+directory, regenerate the drift manifest, and re-run `cargo build --lib && cargo test --test unit_tests
 && cargo test --test integration_tests`.

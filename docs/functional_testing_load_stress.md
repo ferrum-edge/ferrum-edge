@@ -1,6 +1,6 @@
 # Load & Stress Testing Guide
 
-This document describes the comprehensive load and stress test suite for the Ferrum Edge (`functional_load_stress_test.rs`). The test exercises the gateway under realistic production-like conditions with large configuration sets, mixed authentication, varied payload sizes, concurrent admin API mutations, and includes both in-process (reqwest) and native C (wrk) load generators to isolate client overhead from gateway overhead.
+This document describes the load and stress test in `tests/functional/functional_load_stress_test.rs`. It drives the gateway with a large configuration, mixed authentication, varied payload sizes, and concurrent admin API mutations, using both an in-process (reqwest) and a native C (wrk) load generator to separate client overhead from gateway overhead.
 
 ## Overview
 
@@ -48,11 +48,11 @@ The test uses a high-throughput hyper-based backend server embedded in the test 
 
 ### Build Mode
 
-The test builds and uses a **release binary** (`cargo build --release`) for production-realistic performance numbers. If only a debug binary is available, it will use that with a warning.
+The test runs `cargo build --release --bin ferrum-edge` before starting and uses the release binary for production-realistic numbers. If only a debug binary exists, it uses that with a warning.
 
 ### Database Selection
 
-The test **defaults to PostgreSQL** if the `ferrum-load-test-pg` Docker container is running, and **falls back to SQLite** otherwise. This is a single test function — no separate variants to manage.
+The test **defaults to PostgreSQL** if the `ferrum-load-test-pg` Docker container is running, and **falls back to SQLite** otherwise. Both cases run from the single test function.
 
 ## Prerequisites
 
@@ -62,7 +62,7 @@ The test **defaults to PostgreSQL** if the `ferrum-load-test-pg` Docker containe
 cargo build --release --bin ferrum-edge
 ```
 
-The test will also trigger this build automatically if the release binary is missing, but pre-building saves time.
+The test always runs this build first; pre-building makes that step a quick no-op.
 
 ### PostgreSQL (Recommended)
 
@@ -95,7 +95,7 @@ No additional setup required. A temporary SQLite database is created automatical
 
 ### wrk (Optional, Recommended)
 
-For the native load generator comparison phase (Phase 4), install wrk:
+For the native load generator comparison (Phase 4), install wrk:
 
 ```bash
 # macOS
@@ -110,27 +110,29 @@ If wrk is not installed, Phase 4 is automatically skipped with instructions to i
 ## Running the Test
 
 ```bash
-cargo test --test functional_tests test_load_stress_10k_proxies \
-  --all-features -- --ignored --nocapture
+cargo test --test functional_tests test_load_stress_10k_proxies -- --ignored --nocapture
 ```
 
-> **Note**: This test is skipped in CI via `--skip test_load_stress` in the GitHub Actions workflow. It is designed for manual execution on developer machines or dedicated performance testing environments.
+Do not add `--all-features`: the `crypto-ring` and `fips` features are mutually exclusive.
+
+> **Note**: PR CI excludes this test (the `ci.yml` nextest filter `not test(/test_load_stress_10k_proxies/)`). It runs weekly against PostgreSQL in the scheduled `.github/workflows/scaling-regression.yml` workflow, and can be run manually on developer machines or dedicated performance environments.
 
 ## Test Phases
 
-### Phase 1: Provisioning
+Phase numbers match the test's console output.
 
-Resources are created via the batch admin API (`POST /batch?apply=async`, issue #4139) in chunks of 100 — each chunk commits durably and answers `202 Accepted` with a covering `X-Ferrum-Config-Cursor` instead of paying a synchronous poll-loop reload; the harness proves the whole graph live with one blocking `GET /config/apply-status` on the highest cursor before its convergence gates run:
+### Provisioning
 
-1. **Consumers** (10,000) - Created first for referential integrity
-2. **Proxies** (10,000) - Created with backend pointing to embedded hyper server
+Resources are created via the batch admin API (`POST /batch?apply=async`, issue #4139) in chunks of 100. Each chunk commits durably and answers `202 Accepted` with an `X-Ferrum-Config-Cursor`, so no chunk waits for a synchronous reload. The harness then makes one blocking `GET /config/apply-status` call on the highest cursor to prove the whole graph is live:
+
+1. **Consumers** (10,000) - Created first for referential integrity, with their credentials inline in the same batch (issue #4116)
+2. **Proxies** (10,000) - Backend points at the embedded hyper server
 3. **Plugin configs** (30,000) - Auth + ACL + rate limiting per proxy
-4. **Credentials** (10,000) - Set via `PUT /consumers/{id}/credentials/{type}` with 20 concurrent requests
-5. **Open proxies** (1,000) - No-plugin proxies for baseline measurement
+4. **Open proxies** (1,000) - No-plugin proxies for baseline measurement
 
-After provisioning, the test waits for the DB poller to load the config and verifies a sample proxy from each auth group is routable.
+After the apply cursor is live, bounded convergence gates (up to 5 minutes) confirm sample proxies from each auth group and the open-proxy set are routable.
 
-### Phase 2: Concurrency Ramp (With Plugins)
+### Phase 1: Concurrency Ramp (With Plugins)
 
 Four 30-second load test phases at increasing concurrency, using all auth types and payload sizes:
 
@@ -143,11 +145,11 @@ Four 30-second load test phases at increasing concurrency, using all auth types 
 
 Each phase reports RPS, success rate, and full latency distribution (P50/P95/P99/P99.9/Max).
 
-### Phase 3: No-Plugin Baseline
+### Phase 2: No-Plugin Baseline
 
 Same concurrency ramp (50 -> 100 -> 200 -> 400) against the 1,000 open proxies with **no plugins attached**. This isolates pure proxy overhead (route matching, connection pooling, body streaming, header construction) from plugin execution cost (auth crypto, ACL checks, rate limiting).
 
-### Phase 4: Admin Mutations Under Load
+### Phase 3: Admin Mutations Under Load
 
 Runs for 30 seconds at concurrency=100 while a separate task performs admin API mutations every 200ms:
 
@@ -155,9 +157,9 @@ Runs for 30 seconds at concurrency=100 while a separate task performs admin API 
 - **Update** an existing proxy (rotate through all 10k)
 - **Delete** the temporary proxy + plugin
 
-The test compares P99 latency and RPS against the Phase 2 baseline at the same concurrency level to quantify the impact of config reloads on request latency.
+The test compares P99 latency and RPS against the Phase 1 ramp result at the same concurrency level to quantify the impact of config reloads on request latency.
 
-### Phase 5: wrk Comparison (if wrk is installed)
+### Phase 4: wrk Comparison (if wrk is installed)
 
 Runs the same test scenarios using **wrk**, a native C load generator, to isolate how much of the throughput ceiling comes from the Rust reqwest client vs the gateway itself.
 
@@ -312,7 +314,7 @@ The test asserts that success rate stays above **50%** across all phases. If it 
 
 ## Gateway Configuration
 
-The test configures the gateway with optimized connection pool settings matching the multi-protocol performance test:
+The test configures the gateway with tuned connection pool and flow-control settings:
 
 ### Connection Pool Tuning
 
@@ -358,11 +360,11 @@ The test configures the gateway with optimized connection pool settings matching
 | `FERRUM_DB_POLL_INTERVAL` | 30 | Production default. Wave-end convergence is driven by the blocking `GET /config/apply-status` cursor gate (which raises an immediate poll wake), not the interval; a 2s interval kept the poller in continuous full reloads during deferred provisioning and starved the database (issue #4139) |
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | (set) | HMAC-SHA256 hashing for `basic_auth` |
 
-> **Note on `FERRUM_POOL_MAX_IDLE_PER_HOST`**: This value must be >= your peak concurrency level. If set too low, the gateway creates new TCP connections per request instead of reusing pooled ones, causing massive performance degradation (10x+ RPS drop). The performance tests use 200 to match the wrk connection count.
+> **Note on `FERRUM_POOL_MAX_IDLE_PER_HOST`**: This value must be >= your peak concurrency level. If set too low, the gateway opens new TCP connections instead of reusing pooled ones, causing a large (10x+) RPS drop. The shell-based performance scripts under `tests/performance/` use 200 to match the wrk connection count.
 
 ## Understanding reqwest vs wrk Performance Gap
 
-A key insight from this test is the throughput gap between the reqwest-based phases and the wrk-based phases. With HTTP/1.1 backend pool, the gap is ~6-8x (10k vs 75k RPS). With HTTP/2 backend pool, the gap shrinks to ~2x (31k vs 69k RPS). This is **not** a gateway limitation — it's a client-side bottleneck:
+The reqwest-based phases report much lower throughput than the wrk phases. In one earlier run (different from the example tables above), the HTTP/1.1 backend pool gap was ~6-8x (10k vs 75k RPS) and the HTTP/2 gap ~2x (31k vs 69k RPS). This is a client-side bottleneck, **not** a gateway limitation:
 
 | Factor | reqwest (in-process) | wrk (native C) |
 |--------|---------------------|-----------------|
@@ -377,9 +379,9 @@ The reqwest numbers represent a realistic scenario of an application calling thr
 
 ### What the wrk numbers tell us
 
-With wrk at c=200 achieving ~77k RPS with key_auth (3 plugins per proxy), the gateway adds roughly **2.5ms average latency per request** over the pure backend. This breaks down approximately as:
+In that same earlier run, wrk at c=200 reached ~77k RPS with key_auth (3 plugins per proxy), and the gateway added roughly **2.5ms average latency per request** over the pure backend. Approximate breakdown:
 
-1. **Route matching** (~0.1ms) — binary search over 10k sorted routes
+1. **Route matching** (~0.1ms) — longest-prefix match over 10k pre-sorted routes, with a bounded (host, path) lookup cache
 2. **Auth credential extraction + crypto** (~0.3-0.5ms) — API key hash lookup, or JWT decode, or HMAC verify
 3. **Consumer index lookup** (~0.05ms) — O(1) by credential
 4. **ACL check** (~0.02ms) — group membership check
@@ -388,7 +390,7 @@ With wrk at c=200 achieving ~77k RPS with key_auth (3 plugins per proxy), the ga
 7. **HTTP header construction** (~0.1ms) — X-Forwarded-For, Host, etc.
 8. **Body streaming** (~0.5-1.5ms) — depends on payload size, zero-copy for no-body GETs
 
-No request or response body parsing occurs for these plugins — bodies stream through as raw byte chunks via `ProxyBody::Streaming`.
+No request or response body parsing occurs for these plugins — bodies stream through as raw byte chunks (`ProxyBody` streaming variants in `src/proxy/body.rs`).
 
 ## Tuning the Test
 
@@ -426,7 +428,7 @@ Key constants at the top of `functional_load_stress_test.rs`:
 
 ### Test hangs during provisioning
 
-The credential-setting phase makes 10k individual HTTP requests (20 concurrently). On slower machines this can take several minutes. Check the test output for progress updates.
+Provisioning posts 21,000 resources plus 30,000 plugin configs in batches of 100 and then waits for the apply cursor. On slower machines this can take several minutes. Check the test output for per-phase progress.
 
 ### Low success rate at high concurrency
 
@@ -453,7 +455,7 @@ docker ps --filter name=ferrum-load-test-pg
 
 ### Config not loaded after provisioning
 
-The test waits 5 seconds for the DB poller (configured at 2-second interval). If proxies return 404, increase the wait time or check gateway logs for config loading errors.
+The test waits on the batch apply cursor and then polls sample routes for up to 5 minutes (`CONFIG_CONVERGENCE_MAX_WAIT_SECS` in `tests/common/scheduled_scaling.rs`). If that gate fails, its panic message lists the last per-sample outcomes; check gateway logs for config loading errors.
 
 ### Debug build performance
 

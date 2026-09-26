@@ -1,6 +1,6 @@
 # Infrastructure Sizing Guide
 
-This guide helps you estimate the CPU and memory resources needed to run Ferrum Edge based on your expected workload. Use it to right-size your deployment — whether on bare metal, VMs, containers, or Kubernetes.
+Estimate the CPU, memory, and file descriptors Ferrum Edge needs for your workload, on bare metal, VMs, containers, or Kubernetes.
 
 ## Key Factors That Affect Resource Usage
 
@@ -176,9 +176,9 @@ pool_memory ≈ num_upstream_hosts × max_idle_per_host × 20 KB
 **Connection pool warmup:** When `FERRUM_POOL_WARMUP_ENABLED=true` (the default), the gateway pre-establishes connections to all HTTP-family backends at startup. This adds a small amount of time to startup (typically sub-second for most configs, depending on backend latency and `FERRUM_POOL_WARMUP_CONCURRENCY`) but eliminates first-request latency spikes. The warmed connections consume the same memory as connections created during normal traffic. For Kubernetes deployments, account for warmup time in your `startupProbe.initialDelaySeconds`. See [connection_pooling.md](connection_pooling.md#connection-pool-warmup) for configuration details.
 
 **Recommendations:**
-- With HTTP/2 enabled, a single connection can multiplex many requests — reduce `max_idle_per_host` to 4–16.
-- For backends with bursty traffic patterns, increase `max_idle_per_host` to avoid connection churn.
-- Lower `idle_timeout` if your backends aggressively close idle connections.
+- With HTTP/2 enabled, a single connection can multiplex many requests — reduce `FERRUM_POOL_MAX_IDLE_PER_HOST` to 4–16 (it is global-only; there is no per-proxy override).
+- For backends with bursty traffic patterns, increase `FERRUM_POOL_MAX_IDLE_PER_HOST` to avoid connection churn.
+- Lower `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` (or the per-proxy `pool_idle_timeout_seconds`) if your backends aggressively close idle connections.
 
 ## How Load Balancing Affects Resources
 
@@ -215,10 +215,10 @@ Understanding where CPU cycles are spent helps you optimize for your specific wo
 | Route matching (cache miss) | Low | Pre-sorted prefix scan, result cached |
 | Plugin execution (JWT/key auth) | Low | Local validation against secrets, no external calls |
 | Plugin execution (JWKS auth) | Low | Local JWT validation using cached IdP public keys |
-| Plugin execution (rate limit) | Very low | In-memory atomic counters |
+| Plugin execution (rate limit) | Very low | In-memory counters locally; `sync_mode: "redis"` adds one Redis round trip per decision |
 | Plugin execution (custom plugins) | Variable | Depends on plugin logic; see [Custom Plugins](../CUSTOM_PLUGINS.md) |
 | Load balancer target selection | Very low | Atomic operations; consistent hashing does one hash per request |
-| DNS resolution (cache hit) | Very low | In-memory, background-refreshed at 75% TTL |
+| DNS resolution (cache hit) | Very low | In-memory, background-refreshed at 90% of TTL by default (`FERRUM_DNS_REFRESH_THRESHOLD_PERCENT`) |
 | HTTP/2 frame processing | Low | Multiplexing reduces total connection overhead |
 | HTTP/3 (QUIC) encryption | Medium–High | Per-packet encryption vs per-record in TLS |
 | Body proxying | Low | Streaming with minimal copying |
@@ -270,7 +270,7 @@ These settings control the gateway's ability to handle high connection concurren
 
 **`FERRUM_WEBSOCKET_MAX_CONNECTIONS`** — Caps long-lived upgraded WebSocket sessions separately from the global TCP connection pool. This protects API-heavy deployments from idle WebSocket exhaustion without adding work to the HTTP request path or the WebSocket frame-forwarding loop. Use the `rate_limiting` plugin as the companion defense for upgrade floods.
 
-**`FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP`** — Caps those same upgraded sessions per resolved client IP so one source cannot consume the entire global budget, including over multiplexed H2/H3 Extended CONNECT. Default `0` leaves existing deployments unchanged. Source IP follows the trusted-proxy walk: forwarding headers are ignored from untrusted peers.
+**`FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP`** — Caps those same upgraded sessions per resolved client IP so one source cannot consume the entire global budget, including over multiplexed H2/H3 Extended CONNECT. Default `0` disables the per-IP cap. Source IP follows the trusted-proxy walk: forwarding headers are ignored from untrusted peers.
 
 ### Runtime Threading
 
@@ -288,7 +288,7 @@ These settings control the gateway's ability to handle high connection concurren
 
 ### Memory Allocator
 
-Ferrum Edge uses **jemalloc** as the global memory allocator on Linux and macOS. jemalloc reduces heap fragmentation and improves allocation throughput under high concurrency compared to the system allocator. This is the same allocator used by nginx, Redis, and most high-performance Rust services. No configuration is needed — it is enabled automatically at compile time.
+Ferrum Edge uses **jemalloc** as the global memory allocator on all non-Windows platforms. jemalloc reduces heap fragmentation and improves allocation throughput under high concurrency compared to the system allocator. This is the same allocator used by nginx, Redis, and most high-performance Rust services. No configuration is needed — it is enabled automatically at compile time.
 
 ## Scaling Strategies
 
@@ -305,7 +305,7 @@ Run multiple Ferrum Edge instances behind an external load balancer.
 
 - Use **Control Plane / Data Plane mode** for centralized configuration with distributed traffic handling.
 - Data Plane instances are stateless (config fetched from Control Plane) and can be autoscaled based on CPU or RPS metrics.
-- Rate limiting and least-connections load balancing state is per-instance — use external solutions for globally consistent behavior across instances.
+- Least-connections load balancing state and local-mode rate-limit counters are per instance. For fleet-wide request or token budgets, run `rate_limiting` or `ai_rate_limiter` with `sync_mode: "redis"` (see [plugins.md](plugins.md#rate_limiting)).
 - Consistent hashing load balancing works well across instances when all instances share the same upstream target configuration (achieved automatically in CP/DP mode).
 
 ### Kubernetes Sizing Example

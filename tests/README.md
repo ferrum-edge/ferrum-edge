@@ -1,120 +1,76 @@
 # Ferrum Edge Test Suite
 
-Comprehensive test suite for Ferrum Edge, organized by test type and component.
+Test suite for Ferrum Edge, organized by test type and component.
 
 ## Directory Structure
 
+Each top-level `tests/*.rs` file (or `[[test]]` entry in the root `Cargo.toml`)
+is its own test target. Directories hold the modules those targets compile.
+
 ```
 tests/
-├── README.md                           # This file
-├── config.yaml                         # Test configuration fixture
-├── certs/                              # TLS certificates for testing
+├── README.md                     # This file
+├── config.yaml                   # Test configuration fixture
+├── certs/, fixtures/             # TLS certificates, keys, MaxMind and k8s fixtures
 │
-├── unit_tests.rs                       # Entry point: unit test crate
-├── unit/
-│   ├── mod.rs
-│   ├── plugins/                        # Plugin unit tests
-│   │   ├── mod.rs
-│   │   ├── plugin_utils.rs             # Shared plugin test helpers
-│   │   ├── access_control_tests.rs     # Consumer access control
-│   │   ├── basic_auth_tests.rs         # Basic auth plugin
-│   │   ├── http_logging_tests.rs       # HTTP logging plugin
-│   │   ├── jwt_auth_plugin_tests.rs    # JWT auth plugin
-│   │   ├── key_auth_tests.rs           # Key auth plugin
-│   │   ├── jwks_auth_tests.rs           # JWKS auth plugin
-│   │   ├── plugin_cache_tests.rs       # Plugin cache logic
-│   │   ├── plugin_integration_tests.rs # Plugin creation and scope
-│   │   ├── rate_limiting_tests.rs      # Rate limiting plugin
-│   │   ├── rejection_logging_tests.rs  # Rejection logging behavior
-│   │   ├── request_transformer_tests.rs
-│   │   ├── response_transformer_tests.rs
-│   │   ├── hmac_auth_tests.rs          # HMAC auth plugin (24 tests)
-│   │   ├── ip_restriction_tests.rs     # IP restriction plugin (32 tests)
-│   │   ├── bot_detection_tests.rs      # Bot detection plugin (39 tests)
-│   │   ├── correlation_id_tests.rs     # Correlation ID plugin (39 tests)
-│   │   ├── stdout_logging_tests.rs     # Stdout logging plugin
-│   │   └── transaction_debugger_tests.rs
-│   ├── config/                         # Configuration parsing tests
-│   │   ├── mod.rs
-│   │   ├── admin_enhanced_tls_tests.rs # Admin TLS/mTLS config
-│   │   ├── admin_listeners_tests.rs    # Listener config parsing
-│   │   ├── config_file_loader_tests.rs # YAML/JSON file loading (26 tests)
-│   │   ├── config_types_tests.rs       # Config struct validation
-│   │   ├── env_config_tests.rs         # Env var parsing (40+ tests)
-│   │   ├── frontend_tls_tests.rs       # Frontend TLS config
-│   │   ├── pool_config_tests.rs        # Pool config defaults/overrides
-│   │   └── separate_listeners_tests.rs # HTTP/HTTPS listener config
-│   ├── admin/                          # Admin API tests
-│   │   ├── mod.rs
-│   │   ├── admin_jwt_auth_tests.rs     # JWT verification, expiry
-│   │   ├── admin_read_only_tests.rs    # Read-only mode
-│   │   └── admin_tests.rs             # Admin API handlers
-│   └── gateway_core/                   # Core data structure tests
-│       ├── mod.rs
-│       ├── consumer_index_tests.rs     # Consumer lookup index
-│       ├── dns_tests.rs               # DNS cache and resolution
-│       ├── proxy_tests.rs             # Proxy routing and URL building
-│       ├── router_cache_tests.rs       # Router cache matching (29 tests)
-│       └── websocket_auth_tests.rs     # WebSocket auth config
+├── unit_tests.rs                 # Unit target: config, admin, tls, identity, secrets,
+│                                 #   cli, notifications, util, build, logging, openapi
+├── unit_plugins_a_tests.rs       # Unit target: plugin test files a–j
+├── unit_plugins_b_tests.rs       # Unit target: plugin test files k–z
+├── unit_gateway_core_tests.rs    # Unit target: core runtime (router, proxy, DNS, ...)
+├── unit/                         # Modules for the four unit targets, one directory
+│                                 #   per area (plugins/, config/, gateway_core/, ...)
 │
-├── integration_tests.rs                # Entry point: integration test crate
-├── integration/
-│   ├── mod.rs
-│   ├── backend_mtls_tests.rs           # Backend mutual TLS
-│   ├── connection_pool_tests.rs        # Connection pool with real connections
-│   ├── cp_dp_grpc_tests.rs            # CP/DP gRPC communication
-│   ├── grpc_proxy_tests.rs            # gRPC reverse proxy (in-process)
-│   └── http3_integration_tests.rs      # HTTP/3 flow tests
+├── integration_tests.rs          # Integration target
+├── integration/                  # In-process servers; no gateway binary
 │
-├── functional_tests.rs                 # Entry point: functional test crate
-├── functional/
-│   ├── mod.rs
-│   ├── functional_cp_dp_test.rs        # CP/DP mode: gRPC + DB TLS
-│   ├── functional_database_test.rs     # Database mode: SQLite + Admin API + proxy
-│   ├── functional_file_mode_test.rs    # File mode: YAML config + SIGHUP reload
-│   ├── functional_load_balancer_test.rs # Load balancing: algorithms, health checks, failover
-│   ├── functional_grpc_test.rs         # gRPC proxying: h2c echo, errors, metadata
-│   └── functional_websocket_test.rs    # WebSocket proxying: ws/wss echo
+├── functional_tests.rs           # Functional target (#[ignore], spawns the binary)
+├── functional/                   # End-to-end tests; see SCALE_PERF_TEST.md
 │
-├── secrets_functional/                 # External secret backends, own [[test]] crate
-│   └── ...                             # Vault/AWS via testcontainers; GCP/Azure via wiremock
-├── service_integration/                # External middleware via OSS containers, own [[test]] crate
-│   ├── README.md                       # What it covers + recipe for adding services
-│   ├── common/containers.rs            # Consul + OpenLDAP fixtures, fail_in_ci_else_skip
-│   ├── consul.rs                       # Consul SD: ConsulDiscoverer::discover() parsing
-│   └── ldap.rs                         # ldap_auth bind / search-then-bind / group membership
+├── conformance_tests.rs          # Mesh/Istio/xDS conformance target
+├── conformance/                  # ga_contract.yaml + per-category modules
 │
-├── helpers/
-│   └── bin/                            # Standalone test server binaries
-│       ├── websocket_echo_server.rs    # WS echo server (port 8080)
-│       ├── secure_echo_server_simple.rs # Secure echo server (port 8443)
-│       └── websocket_gateway_test.rs   # WS gateway integration binary
+├── secrets_functional/           # [[test]]: secret backends (Vault/AWS containers,
+│                                 #   GCP/Azure wiremock fakes)
+├── service_integration/          # [[test]]: external middleware via OSS containers
+├── acme_dns01/                   # [[test]]: ACME DNS-01 hook tests (feature `acme`)
+├── k8s_istio_status_cas_live.rs  # Hosted kind test (istio-status-cas-live.yml)
 │
-└── performance/                        # Performance/load testing (separate crate)
-    ├── Cargo.toml
-    ├── README.md
-    ├── backend_server.rs
-    ├── run_perf_test.sh
-    ├── quick_test.sh
-    └── *.lua                           # wrk test scripts
+├── common/                       # Shared helpers (gateway harness, echo servers, ...)
+├── scaffolding/                  # Protocol backends/clients, port registry, harness
+├── scenarios/                    # Catalog of scripted failure modes
+├── support/                      # Tracing/diagnostic capture helpers
+├── helpers/bin/                  # Standalone test server binaries
+├── scripts/                      # Setup scripts (e.g. setup_db_tls.sh)
+│
+├── k8s/                          # Kubernetes live suites (kind), shared lib/
+└── performance/                  # Benchmark harnesses (separate Cargo workspaces)
 ```
 
 ## Running Tests
 
-### All Unit + Integration Tests (fast, no external services)
+### All Default Tests
 ```bash
 cargo test
 ```
 
+Runs every test target except `#[ignore]` tests (functional and live suites).
+Most container-backed tests in `service_integration` and `secrets_functional`
+self-skip when Docker is unavailable; the Kafka TLS acceptance tests do not.
+
 ### By Category
 ```bash
-# Unit tests only (~519 tests, runs in seconds)
+# Unit tests (four targets; each runs in seconds once built)
 cargo test --test unit_tests
+cargo test --test unit_plugins_a_tests
+cargo test --test unit_plugins_b_tests
+cargo test --test unit_gateway_core_tests
 
 # Integration tests only (in-process servers, mock certs)
 cargo test --test integration_tests
 
-# Functional tests (spawn real binary, require build first)
+# Functional tests (spawn the real binary; build it first)
+cargo build --bin ferrum-edge
 cargo test --test functional_tests -- --ignored --nocapture
 ```
 
@@ -134,6 +90,7 @@ Kubernetes live suites should source helpers from `tests/k8s/lib/`:
 
 ### By Test Name Pattern
 ```bash
+cargo test unit::plugins::cors_tests  # One module, searched across every target
 cargo test plugin           # All plugin-related tests
 cargo test config           # All configuration tests
 cargo test admin            # All admin API tests
@@ -142,8 +99,9 @@ cargo test dns              # DNS tests
 ```
 
 ### Functional Tests (individually)
-Functional tests are marked `#[ignore]` since they spawn the gateway binary.
-They require `cargo build` first (debug profile).
+Functional tests are marked `#[ignore]` because they spawn the gateway binary.
+Build it first with `cargo build --bin ferrum-edge`; the harness uses
+`target/debug/ferrum-edge` (or `FERRUM_EDGE_TEST_BIN` when set).
 
 ```bash
 # Database mode: full CRUD + proxy routing + plugin configs
@@ -166,9 +124,9 @@ cargo test --test functional_tests functional_load_balancer -- --ignored --nocap
 ```
 
 ### Service Integration Tests (external middleware via OSS containers)
-These validate the REAL integration code against live third-party software run
+These validate the real integration code against live third-party software run
 as local containers (`testcontainers`/Docker). With Docker available they run;
-without it they self-skip (and hard-fail in CI). See
+without it most of them self-skip (and hard-fail in CI). See
 [`service_integration/README.md`](service_integration/README.md).
 
 ```bash
@@ -184,15 +142,21 @@ cargo test --test service_integration oauth2_introspection
 
 # ClickHouse JSONEachRow chargeback insert (issue #4441)
 cargo test --test service_integration clickhouse
+
+# Kafka (Redpanda), MySQL, and PostgreSQL/MySQL database TLS
+cargo test --test service_integration kafka
+cargo test --test service_integration mysql
+cargo test --test service_integration db_tls
 ```
 
 ### Performance Tests
 ```bash
 cd tests/performance
-cargo build --release
-./run_perf_test.sh          # Full benchmark suite
-./quick_test.sh             # Quick smoke test
+./run_perf_test.sh          # Local HTTP/1.1 wrk smoke test
 ```
+
+See [`performance/README.md`](performance/README.md) for the full suite index
+(multi-protocol, payload-size, mesh Criterion, mesh DNS/HBONE E2E).
 
 ## Test Categories Explained
 
@@ -209,5 +173,6 @@ databases, but they do not spawn the gateway binary.
 the full request lifecycle. They are gated behind `#[ignore]` to keep the
 default `cargo test` fast.
 
-**Performance tests** use wrk and lua scripts to measure throughput and latency
-under load. They live in a separate Cargo workspace.
+**Performance tests** measure throughput and latency under load with wrk,
+Criterion, and custom load generators. Each harness under `tests/performance/`
+is its own Cargo workspace.

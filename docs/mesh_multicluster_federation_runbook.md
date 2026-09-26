@@ -26,12 +26,11 @@ The static federation suite remains the GA east-west datapath gate. The
 separate poller suite supplies the churn/retention evidence without changing or
 weakening that established contract.
 
-Remediation that made federation activation bidirectional and observable
-(effective trust-bundle set for outbound mTLS and inbound SPIFFE verification;
-`FERRUM_MESH_FEDERATION_FAIL_OPEN` bootstrap/fail-closed semantics; last-good
-preservation on transient poll failure; `GET /mesh/remote-clusters` discovery
-and trust freshness) is part of the current product contract documented in
-`docs/mesh.md` and exercised by the harness above.
+The product contract these harnesses exercise — the effective trust-bundle set
+for outbound mTLS and inbound SPIFFE verification,
+`FERRUM_MESH_FEDERATION_FAIL_OPEN` bootstrap semantics, last-good preservation
+on transient poll failure, and `GET /mesh/remote-clusters` discovery and trust
+freshness — is documented in `docs/mesh.md`.
 
 ## Required Topology
 
@@ -122,19 +121,16 @@ The configured peer row must show:
 
 ## Harness
 
-The scheduled harness entry point is:
+There are two entry points:
 
 ```bash
-tests/k8s/multicluster-federation/run.sh
+tests/k8s/multicluster-federation/run.sh        # static federation + datapath
+tests/k8s/multicluster-poller-partition/run.sh  # poller partition / retention
 ```
 
-The independent poller lifecycle entry point is:
+### Poller partition fixture
 
-```bash
-tests/k8s/multicluster-poller-partition/run.sh
-```
-
-It uses two real Ferrum CPs and DPs. Each DP polls the peer's native
+`multicluster-poller-partition/run.sh` uses two real Ferrum CPs and DPs. Each DP polls the peer's native
 `MeshSubscribe` endpoint and HTTPS trust-bundle endpoint through a separate
 Toxiproxy TCP passthrough. Discovery uses a private CA, client certificate,
 per-remote secret selected by `discovery_credential_ref`, and the peer's stable
@@ -155,7 +151,9 @@ or fault-container names, and GitHub-hosted runs include `run_id`/`run_attempt`
 in all names. Diagnostics omit Secrets and ConfigMaps, redact proxy upstreams,
 and retain only admin summaries, metrics, events, and bounded logs.
 
-It runs in two modes:
+### Federation datapath fixture
+
+`multicluster-federation/run.sh` runs in two modes:
 
 - **Live datapath (default):** creates two SPIRE-federated kind clusters
   (per-cluster trust domains `cluster-a.test`/`cluster-b.test`, manual
@@ -222,10 +220,9 @@ It runs in two modes:
   because the chart's east-west Service is ClusterIP-only and not cross-cluster
   reachable; the chart is covered by the dedicated `Helm Chart` CI job.
 
-Diagnostics are recorded under `${ARTIFACT_DIR:-.context/multicluster-federation}`.
-Preflight requires `docker`, `kind`, `kubectl`, `curl`, and `python3` and
-intentionally fails when they are unavailable; do not treat a skipped local run
-as validation evidence. The live mode also runs two Stage-3 failure-injection
+Diagnostics are recorded under `${ARTIFACT_DIR:-.context/multicluster-federation}`
+(see [Current Validation Status](#current-validation-status) for preflight
+requirements). The live mode also runs two Stage-3 failure-injection
 scenarios (gated): peer-trust revocation (drop the federated bundle from the dest
 slice + reload → A→B fails closed → restore → recover) and dest endpoint
 black-hole (scale `svc` to 0 → A→B fails fast → scale up + re-render gateway →

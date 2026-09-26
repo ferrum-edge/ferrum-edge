@@ -9,7 +9,7 @@ When you submit a spec, Ferrum Edge:
 1. Parses the document (JSON or YAML).
 2. Extracts Ferrum resources from the `x-ferrum-*` extension fields.
 3. Validates each resource against the same rules as the individual admin endpoints.
-4. Persists everything atomically (SQL transaction / MongoDB best-effort).
+4. Persists everything atomically (one SQL or replica-set MongoDB transaction; best-effort on standalone MongoDB, see [Atomicity and retries](#atomicity-and-retries)).
 5. Stores the compressed spec bytes with a SHA-256 content hash for later retrieval.
 
 **Hot-path isolation**: the `api_specs` table is admin-only metadata. The gateway runtime never reads spec rows, never loads them into `GatewayConfig`, and never distributes them via gRPC. Submitting or updating a spec does not interrupt or affect in-flight requests.
@@ -113,7 +113,7 @@ At least one of `hosts` or `listen_path` must be set for HTTP-family proxies. Th
 
 ### `x-ferrum-upstream` (optional)
 
-A single `Upstream` object. Fields follow the same schema as `POST /upstreams` — see [admin_api.md](admin_api.md#upstreams). When present, the upstream is created and the proxy's `upstream_id` is automatically linked to it.
+A single `Upstream` object. Fields follow the same schema as `POST /upstreams` — see [admin_api.md](admin_api.md#upstreams). When present, the upstream is created and the proxy's `upstream_id` is set to it. If `x-ferrum-proxy` already sets a different `upstream_id`, the spec is rejected with 422 `ProxyUpstreamIdMismatch`.
 
 ### `x-ferrum-plugins` (optional)
 
@@ -170,7 +170,7 @@ x-ferrum-validate:
 - `false` or `null` — do not generate the plugin.
 - object — generate the plugin and apply the listed settings.
 
-The object form is a **closed** fixed-field object. Accepted keys are exactly `mode`, `request`, `response`, `validate_request`, `validate_response`, `bypass`, `fail_on_unknown_operation`, `fail_on_missing_response_schema`, `max_body_bytes`, `error_response`, and `error_truncate_chars`; `request` and `response` accept only `enabled` and `content_types`, and `bypass` accepts only `paths`, `methods`, `consumers`, and `header_present`. Any other key — including `operations`, which is always regenerated from the document — is rejected with HTTP 400 and a spelling suggestion. Unknown keys used to be copied verbatim into the generated plugin config, so a misspelled enforcement control deployed successfully with the weaker default still in force. The generated plugin config itself is closed the same way at construction; see [openapi_validator.md](openapi_validator.md#strict-config-admission).
+The object form is a **closed** fixed-field object. Accepted keys are exactly `mode`, `request`, `response`, `validate_request`, `validate_response`, `bypass`, `fail_on_unknown_operation`, `fail_on_missing_response_schema`, `max_body_bytes`, `error_response`, and `error_truncate_chars`; `request` and `response` accept only `enabled` and `content_types`, and `bypass` accepts only `paths`, `methods`, `consumers`, and `header_present`. Any other key — including `operations`, which is always regenerated from the document — is rejected with HTTP 400 and a spelling suggestion, so a misspelled enforcement control cannot silently fall back to a weaker default. The generated plugin config itself is closed the same way at construction; see [openapi_validator.md](openapi_validator.md#strict-config-admission).
 
 The importer walks `paths.{path}`, resolves local Path Item `$ref`s first, then enumerates HTTP methods and resolves local schema `$ref`s inside request/response content:
 
@@ -189,7 +189,7 @@ Supported `$ref` forms:
 - Draft 2020-12 plain-name anchors (OpenAPI 3.1+): `#Order` resolves to the schema object that declares `"$anchor": "Order"` in the current schema resource. Nested anchors inside applicator / `$defs` subschemas and schemas under `components.pathItems` are included. `$anchor` / `$id` / `id` / `$ref` fields in non-schema OpenAPI data (for example `x-ferrum-plugins` config) or in schema annotation payloads (`default` / `examples` / `const` / `enum`) are not interpreted during schema indexing or expansion. Duplicate anchors in one resource and missing anchors fail closed.
 - Draft 7 plain-name anchors (Swagger 2.0 / OpenAPI 3.0.x): `#Order` resolves via a fragment-only `"$id": "#Order"` (or Draft-4 `"id"`) in the current resource. Draft 7 names begin with a letter and may contain letters, digits, `-`, `_`, `.`, or `:`. The OpenAPI 3.1+ `$anchor` keyword is not consulted for 2.0 / 3.0.x documents.
 - Local `$id` resource scope: an absolute or relative `$ref` whose URI (without fragment) matches an `$id` declared on a Schema Object in the same document resolves locally, including fragments such as `https://example.com/schemas/order.json#OrderBody`. Duplicate same-document resource `$id` URIs fail closed. `$id` also rebases the JSON Pointer fragments evaluated inside that resource, including a `$ref` in the *same* Schema Object: `{"$id": "https://example.com/wrapper.json", "$ref": "#/components/schemas/Order"}` addresses `/components/schemas/Order` within the wrapper, not within the OpenAPI document, and fails closed with an error naming the resource that was searched. Reference the target by its own `$id` (or move the `$id`) instead.
-- **External / cross-document `$ref` (opt-in)**: relative and absolute references that leave the in-document resource set are resolved only when **both** `FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED=true` and the per-spec `x-ferrum-external-refs` extension enable resolution. Each reference is resolved against the containing document's canonical base URI (not always the root). Absent either gate, external refs return HTTP 422 `UnsupportedExternalRef` (historical fail-closed default). See [External `$ref` policy](#external-ref-policy) below.
+- **External / cross-document `$ref` (opt-in)**: relative and absolute references that leave the in-document resource set are resolved only when **both** `FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED=true` and the per-spec `x-ferrum-external-refs` extension enable resolution. Each reference is resolved against the containing document's canonical base URI (not always the root). Absent either gate, external refs return HTTP 422 `UnsupportedExternalRef`. See [External `$ref` policy](#external-ref-policy) below.
 
 URI fragments are percent-decoded deterministically before classification; percent-escape hex case is canonicalized for resource identity, and malformed percent-escapes are rejected. Malformed, duplicated, or unresolved local references (including Path Item refs) return HTTP 422 `SchemaReference`; external `$ref`s that are not admitted by policy return HTTP 422 `UnsupportedExternalRef`; reference chains deeper than the documented ceiling return HTTP 422 `SchemaTooDeep`; a `$ref` chain that re-enters a target still being expanded returns HTTP 422 `SchemaReferenceCycle`; and a reference expansion that exceeds the per-expansion budget (500,000 materialized values / the generated-config byte ceiling) or the cumulative per-document budget (2,000,000 materialized values / twice the generated-config byte ceiling, across every expansion in the document) returns HTTP 422 `SchemaTooLarge`. Generated request/response media entries, multipart encoding headers, response statuses, and complete operations are charged against the byte budget before they can accumulate into an oversized table; JSON escaping is included in that accounting.
 
@@ -211,15 +211,15 @@ For full runtime settings and metadata keys, see [openapi_validator.md](openapi_
 
 ## What is NOT allowed in specs
 
-The following are rejected at parse time with a 400 error:
+The following are rejected with HTTP 422 (the `code` field of the error body is shown in parentheses):
 
-- **`x-ferrum-consumers`** — use `POST /consumers` directly. Credentials cannot be embedded in spec documents.
-- **Plugin `scope: global` or `scope: proxy_group`** — only proxy-scoped plugins are allowed. A single shared plugin instance across multiple proxies cannot be expressed via a single-proxy spec bundle.
-- **Plugin `proxy_id` mismatch** — if `proxy_id` is set on a plugin, it must match the spec's proxy ID.
-- **Forbidden keys in plugin `config`** — the plugin `config` object is walked recursively. Any of the following keys at any nesting depth triggers a 400 `PluginContainsCredentials` error: `credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`.
+- **`x-ferrum-consumers`** (`ConsumerExtensionNotAllowed`) — use `POST /consumers` directly. Credentials cannot be embedded in spec documents.
+- **Plugin `scope: global` or `scope: proxy_group`** (`PluginInvalidScope`) — only proxy-scoped plugins are allowed. A single shared plugin instance across multiple proxies cannot be expressed via a single-proxy spec bundle.
+- **Plugin `proxy_id` mismatch** (`PluginProxyIdMismatch`) — if `proxy_id` is set on a plugin, it must match the spec's proxy ID.
+- **Forbidden keys in plugin `config`** (`PluginContainsCredentials`) — the plugin `config` object is walked recursively. Any of the following keys at any nesting depth is rejected: `credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`.
 - **External `$ref`s without opt-in policy** — when process policy or `x-ferrum-external-refs` leave resolution disabled, external Path Item and schema `$ref`s fail closed with HTTP 422 `UnsupportedExternalRef`.
 
-  Note the distinction: a `plugin_name: "jwt"` plugin is fine — the check walks the plugin's `config` *value*, not the plugin metadata fields. A JWT plugin with `config: { secret_lookup: env, validation: { validate_exp: true } }` passes; one with `config: { jwt: { secret: "abc" } }` fails.
+The credential-key check walks the plugin's `config` *value*, not the plugin metadata, so a plugin named `jwt` is fine. A JWT plugin with `config: { secret_lookup: env, validation: { validate_exp: true } }` passes; one with `config: { jwt: { secret: "abc" } }` fails.
 
 ### External `$ref` policy {#external-ref-policy}
 
@@ -274,7 +274,7 @@ x-ferrum-external-refs:
 | `created_at` | timestamp | Set on POST; preserved on PUT |
 | `updated_at` | timestamp | Set on POST and PUT |
 
-**Uniqueness**: a `UNIQUE(namespace, proxy_id)` constraint ensures at most one spec per proxy per namespace. Spec identity itself is `(namespace, id)`: the SQL primary key is composite and the MongoDB durable key is `_id = "{namespace}:{id}"`, so two tenants may hold specs with the same bare id and the foreign key can only ever reach a proxy in the spec's own namespace (issue #4627).
+**Uniqueness**: a `UNIQUE(namespace, proxy_id)` constraint ensures at most one spec per proxy per namespace. Spec identity itself is `(namespace, id)`: the SQL primary key is composite and the MongoDB durable key is `_id = "{namespace}:{id}"`, so two tenants may hold specs with the same bare id and the foreign key can only ever reach a proxy in the spec's own namespace.
 
 **Body size limit**: controlled by `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25). Returns 413 when exceeded.
 
@@ -300,8 +300,7 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 |---|---|---|
 | `database` | Supported | Supported |
 | `cp` (Control Plane) | Supported — proxy/upstream/plugins are distributed to DPs via gRPC; the spec row itself stays on the CP and is not distributed | Supported |
-| `dp` (Data Plane) | 503 Service Unavailable (no database) | 503 Service Unavailable (no database) |
-| `file` | 403 Forbidden (read-only mode) | 503 Service Unavailable (no database) |
+| `dp` (Data Plane), `file`, `mesh` | 403 Forbidden (read-only mode) | 503 Service Unavailable (no database) |
 
 ## Atomicity and retries
 
@@ -460,7 +459,7 @@ To keep the filter correct, tag names must not contain any of the following char
 
 Tags with forbidden characters are rejected at submit time with HTTP 422 `InvalidTagName`. MongoDB uses native array membership and is not affected by the `LIKE` limitation, but the same character restrictions apply for consistency.
 
-**If you extend this whitelist in `src/admin/api_specs/extractor.rs`, you must also update the `has_tag` query in `src/config/db_loader.rs` to add an `ESCAPE` clause and pre-escape the tag value.**
+**Maintainer note:** if you allow any of these characters in `src/admin/api_specs/extractor.rs`, you must also update the `has_tag` query in `src/config/db_loader.rs` to add an `ESCAPE` clause and pre-escape the tag value.
 
 ```bash
 # Filter examples

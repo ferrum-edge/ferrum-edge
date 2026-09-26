@@ -1,22 +1,22 @@
 # Hosted H2/native-gRPC acquisition profiling (#5588)
 
 This is diagnostic plumbing, **not an optimization or measured performance
-result**. `bench-pool-profile` is default off. It enables the existing
-`bench-h1-profile` allocator foundation, without modifying its source, 206-counter
-schema, four allocation scopes, exporter or H1 report. There is one global
-allocator: the existing Jemalloc forwarding wrapper. No new dependency, cache,
-pool ownership scheme, retry, wait, readiness poll or production policy is added.
+result**. The `bench-pool-profile` Cargo feature is off by default. It enables
+the `bench-h1-profile` allocator foundation and reuses it unchanged (206-counter
+schema, four allocation scopes, exporter and H1 report). There is one global
+allocator: the existing Jemalloc forwarding wrapper. The feature adds no
+dependency, cache, pool ownership scheme, retry, wait, readiness poll or
+production policy.
 
 The existing FIPS optional-feature inventory includes `fips,bench-pool-profile`,
 which transitively enables the H1 observer. Its resolved dependency graph and
 compilation receive the same hosted gates; this is functional coverage, not
 a separate cryptographic certification claim.
 
-The branch starts at PR5614's `3cd9296c2fea0a21d385c723999142d34b89f006`, itself
-based on PR5602. Those parents remain root-owned. PR5602 recorded adaptive
-70 KiB H2 and gRPC correctness failures; PR5613 owns guard diagnosis. This lane
-fixes adaptive windows **false**, and does not imply those failures are resolved.
-Root must decide correctness before accepting affected performance rates.
+This lane pins adaptive H2 windows **off**. PR #5602 recorded adaptive-window
+correctness failures for H2 and gRPC at 70 KiB (guard diagnosis is tracked
+separately, #5613); this lane does not imply those failures are resolved, and
+correctness must be settled before affected performance rates are accepted.
 
 ## Source coverage and interpretation
 
@@ -135,30 +135,27 @@ Reports enumerate every expected arm/pair/size, including absent or malformed
 samples, and retain raw capture failures and specific traffic rejection reasons.
 The report command exits nonzero when any traffic row fails. Reports
 verify same revision/config/environment, and same image for profile repetitions.
-`fully_measured_comparison_eligible` stays false pending root's external correctness
-disposition. No failed repetition is silently removed from a favorable average.
+`fully_measured_comparison_eligible` stays false until the external correctness
+question above is settled. No failed repetition is silently removed from a favorable average.
 
 ## Hosted checks and bounded manual campaign
 
-No project code, formatter, lint, compiler, test, benchmark or container was run
-locally. Only static inspection, data/text edits and `git diff --check` are local
-validation. `.github/workflows/pool-internal-profile.yml` runs on PRs that edit the pool
-profiler itself and daily on the `main` tip
+`.github/workflows/pool-internal-profile.yml` runs its checks job on PRs that
+edit the pool profiler itself, daily on the `main` tip, and on manual dispatch
 (see `docs/ci_cd.md` -> "Optional PR lanes and post-merge validation"),
 with pinned external actions, the shared Rust build setup and native prerequisites
 including `libcurl4-openssl-dev`. It registers feature-on formatting/lint/binary
 build, bounded publication tests, migrated/nested poll allocation and cancellation
 tests, real generic-pool coalescing/error tests, a live H2/gRPC purpose/hit/miss
 test, existing key/lifecycle contracts with observers on/off, and collector tests.
-These are **unexecuted registrations**, not passing-check claims.
-The existing hosted collector-test discovery also covers the actual report and
+The hosted collector-test discovery also covers the actual report and
 CLI exit status with producer-generated H2 annotations: complete H2/gRPC matrices
 in both modes, direct/observer-off controls, absent/empty/malformed diagnostics,
 unusable gauges, typed error/suppression status and independent phase failures.
 Negative cases require the full matrix and unchanged failed samples to be retained.
 
-Root alone may dispatch `pool-internal-profile.yml` at the reviewed branch. The
-worker neither dispatches nor waits for CI. The manual matrix is explicit:
+The measurement matrix runs only on manual dispatch (`workflow_dispatch`) of
+`pool-internal-profile.yml`, after the checks job passes:
 
 | Protocol | Payload bytes | Offered workers | Per-cell campaign |
 | --- | --- | --- | --- |
@@ -187,9 +184,8 @@ Source/lock/config/compiler/binary/build-ID/image/hardware/kernel/boot records a
 debug artifacts accompany the raw paired samples.
 
 `--pool-profile calibration|profile` selects the new manifest/schema explicitly.
-The ordinary disabled `experiment.json`, H1 reports, frozen benchmark workflow
-and immutable policy files are untouched. Shared harness edits are gated by that
-selector. Root must review parent integration overlaps in `process_usage.py`,
-the runner and pool/proxy files, validate hosted results, and retain CPU/stream
-credit/streaming and issue #5588 obligations independently. Nothing here closes
-#5588 or asserts measured cost, materiality or throughput gain.
+Without that selector the harness behaves as before: the ordinary disabled
+`experiment.json`, H1 reports, frozen benchmark workflow and immutable policy
+files are unaffected. CPU, stream-credit and streaming attribution for issue
+#5588 remain open. Nothing here closes #5588 or asserts measured cost,
+materiality or throughput gain.

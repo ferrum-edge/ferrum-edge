@@ -1,9 +1,10 @@
 # Hosted unit compilation diagnostics
 
-The CI Unit Tests job retains `unit-compile-diagnostics-RUN_ID-ATTEMPT` for seven
-days, including on failure when the runner can still upload artifacts. A lost
-runner may prevent both upload and final log delivery. No local execution is
-needed to inspect these files.
+Each CI Unit Tests shard retains `unit-compile-diagnostics-SHARD-RUN_ID-ATTEMPT`,
+and the ACME Feature Tests job retains `acme-compile-diagnostics-RUN_ID-ATTEMPT`.
+Both are kept for seven days and are uploaded on failure too, as long as the
+runner can still upload artifacts. A lost runner may prevent both upload and
+final log delivery. No local execution is needed to inspect these files.
 
 Each default and ACME precompile produces a Cargo `--timings` HTML report and a
 five-second procfs sample stream. Cargo reports individual compilation units,
@@ -52,7 +53,6 @@ protocol category, byte count, loopback peer, backend port, and connection index
 on protocol-handshake errors. It never logs those bytes or relaxes the fixture's
 error assertion. This captures evidence for an unresolved intermittent fixture
 failure; it is not a claim that the sending path has been repaired.
-
 
 ## Scheduling comparison
 

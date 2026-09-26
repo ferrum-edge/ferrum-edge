@@ -22,9 +22,10 @@ Closing tracker for the Phase-8 gap-fill continuation: [#2032](https://github.co
 | Scenario catalog | `tests/scenarios/catalog.rs` |
 | Functional coverage | `tests/functional/scripted_backend_*.rs`, plus capability/retry/overload/plugin-network suites that consume the scaffolding |
 
-Patterns (unchanged): `Stdio::null()` unless stdout is read; retry-aware port
-allocation; `try_new()` harness retries; pre-bound listeners; fresh temp dirs
-per retry.
+Current patterns: file-backed child stdout/stderr capture with null stdin;
+leased ports from the shared registry (`tests/scaffolding/port_registry.rs`);
+3-attempt spawn retries on fresh ports; pre-bound listeners; fresh temp dirs per
+retry. See [Functional Testing Guide](../functional_testing.md#subprocess-harness-process-identity).
 
 ## Design principles (still normative)
 

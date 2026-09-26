@@ -74,9 +74,9 @@ below.
 
 ## Graceful shutdown and GOAWAY
 
-HTTP/3 now matches H1/H2 graceful shutdown (issue #4429). The QUIC listener
-still stops accepting new handshakes when the process shutdown watch fires,
-but each already-accepted connection is spawned with a clone of that watch.
+HTTP/3 graceful shutdown matches H1/H2 (issue #4429). The QUIC listener
+stops accepting new handshakes when the process shutdown watch fires, and each
+already-accepted connection is spawned with a clone of that watch.
 
 On drain the connection task calls the vendored
 `h3::server::Connection::shutdown(0)` API, which writes an HTTP/3 GOAWAY whose
@@ -90,9 +90,7 @@ last stream ID is the last request already accepted. The peer therefore:
 The accept loop keeps polling after GOAWAY until `accept()` returns `Ok(None)`
 or `FERRUM_SHUTDOWN_DRAIN_SECONDS` expires. Only then does the listener close
 remaining QUIC connections with the canonical HTTP/3 no-error code
-`H3_NO_ERROR` (`0x0100`) and reason `shutdown`. The previous
-`CONNECTION_CLOSE` with application code `0` is gone: that QUIC transport
-close reset remaining work instead of completing GOAWAY.
+`H3_NO_ERROR` (`0x0100`) and reason `shutdown`.
 
 Which of those two terminals a connection takes depends on the peer:
 
@@ -108,8 +106,8 @@ Which of those two terminals a connection takes depends on the peer:
   the endpoint with `H3_NO_ERROR`. Expect planned restarts to spend the full
   `FERRUM_SHUTDOWN_DRAIN_SECONDS` when such peers are connected.
 
-`FERRUM_SHUTDOWN_DRAIN_SECONDS` semantics are unchanged. The H3 listener still
-bounds its own `endpoint.open_connections()` wait with that budget, then the
+The H3 listener bounds its own `endpoint.open_connections()` wait with
+`FERRUM_SHUTDOWN_DRAIN_SECONDS`, then the
 serving mode's `begin_shutdown_drain` / `wait_for_drain` waits on
 `OverloadState` (`ConnectionGuard` / `RequestGuard`). Each H3 Incoming is
 registered with exactly one `ConnectionGuard` in the accept-loop spawn
@@ -121,7 +119,6 @@ and they observe the cloned process shutdown watch so drain can emit Close
 
 CONNECT-UDP tunnels that were already accepted keep relaying for the H3
 listener drain window. New CONNECT-UDP streams after GOAWAY are refused.
-`src/http3/connect_udp.rs` is otherwise unchanged.
 
 ### GOAWAY under overload keepalive pressure (issue #4542)
 
@@ -186,10 +183,10 @@ Because every path enforces the rule's timeouts, HTTP/3 stays advertised (`Alt-S
 When the matched proxy has `backend_scheme: https`, the concrete backend target has already been classified as H3-capable, and the request flavor is `Plain`, the gateway keeps the request entirely on QUIC:
 
 - Request body: streamed frame-by-frame via `Http3ConnectionPool::request_streaming_body()`, reading from `RequestStream::recv_data()` on the frontend and `send_data()` on the backend-side stream. No buffering.
-- Response body: streamed back via `CoalescingH3Body` / `DirectH3Body` with the coalesce knobs below.
+- Response body: written straight to the client stream with the shared H3 coalescing window (see [Coalescing and frame cadence](#coalescing-and-frame-cadence)).
 - Zero copies of the body to userspace at either end; h3's chunks are `Bytes` pass-throughs.
 
-The same native QUIC fast path now also serves **`Grpc`** flavor via `dispatch_grpc_native_h3()`, and it is **fully bidirectional**. The response body streams back through the shared QUIC coalescer, and the terminal `grpc-status` / `grpc-message` trailer is forwarded after response-direction hop-by-hop stripping and response-header-policy reconciliation of its application metadata (the reserved status fields always survive — see [Native gRPC terminal metadata](#native-grpc-terminal-metadata)). This is the **only** path that can reach an H3-only gRPC backend, because the gRPC pool (`GrpcConnectionPool`) speaks only HTTP/2 (h2 TLS / h2c). It is gated to the streamable case (no retry / body-plugin buffering, no reqwest-forcing plugin); unary, server-streaming, client-streaming, and bidirectional RPCs are all supported. Retry / body-buffering gRPC still falls through to the H2 gRPC bridge. Every downstream DATA/coalescer write is deadline-biased: expiry before the first client-visible DATA completes with `grpc-status: 4`, including simultaneous readiness, while expiry after any visible DATA resets because a length-prefixed message may be partial. CB / passive-health key off the HTTP transport status (gRPC failures ride on HTTP 200); the adaptive-concurrency sample maps a non-OK backend `grpc-status` to a 5xx, matching the H2 streaming gRPC bridge.
+The same native QUIC fast path also serves **`Grpc`** flavor via `dispatch_grpc_native_h3()`, and it is **fully bidirectional**. The response body streams back through the shared QUIC coalescer, and the terminal `grpc-status` / `grpc-message` trailer is forwarded after response-direction hop-by-hop stripping and response-header-policy reconciliation of its application metadata (the reserved status fields always survive — see [Native gRPC terminal metadata](#native-grpc-terminal-metadata)). This is the **only** path that can reach an H3-only gRPC backend, because the gRPC pool (`GrpcConnectionPool`) speaks only HTTP/2 (h2 TLS / h2c). It is gated to the streamable case (no retry / body-plugin buffering, no reqwest-forcing plugin); unary, server-streaming, client-streaming, and bidirectional RPCs are all supported. Retry / body-buffering gRPC still falls through to the H2 gRPC bridge. Every downstream DATA/coalescer write is deadline-biased: expiry before the first client-visible DATA completes with `grpc-status: 4`, including simultaneous readiness, while expiry after any visible DATA resets because a length-prefixed message may be partial. CB / passive-health key off the HTTP transport status (gRPC failures ride on HTTP 200); the adaptive-concurrency sample maps a non-OK backend `grpc-status` to a 5xx, matching the H2 streaming gRPC bridge.
 
 ### Committed streaming responses always reset on a non-clean exit (issue #4112 / #4363)
 
@@ -220,11 +217,9 @@ the wire before the response-termination hooks and transaction logging await;
 `abort_committed()` latches `force_reset` and applies `stop_stream` immediately.
 That latch is authorization-first: a later `finish()` that returns `Ok` cannot
 disarm it. Settle skips the reset only for a proven clean authorized FIN
-(`clean_finish && !force_reset`); otherwise it always retries `stop_stream`.
-A previous `reset_applied` flag set *before* a no-op abort skipped the Drop
-retry, and `quinn::SendStream::drop` then FINned — which is how a stalled
-client observed `recv_data() == Ok(None)` after the credential had already been
-counted as expired (issue #4363). `h3-quinn`'s `reset` ignores Quinn errors and
+(`clean_finish && !force_reset`); otherwise it always retries `stop_stream`,
+so a no-op abort can never let `quinn::SendStream::drop` FIN a stream whose
+credential was already counted as expired (issue #4363). `h3-quinn`'s `reset` ignores Quinn errors and
 does not clear a cancelled `send_data`'s `writing` buffer, so the first abort
 while a write is parked can be a no-op; Drop retries after that future is gone.
 `stop_stream` is idempotent, matching `ConnectUdpSendHalf`.
@@ -249,8 +244,8 @@ request handler, so they cannot move it into the owning guard. They hold it in
 same inverted predicate, the same `force_reset` latch, the same `Drop`
 backstop, the same explicit settle after the relay loop, differing only in that
 the guard borrows rather than owns. Every reset site in the committed region
-goes through `abort_committed()` so a write can no longer reach the send half
-around the guard and a no-op abort cannot skip Drop's retry.
+goes through `abort_committed()`, so no write can reach the send half around
+the guard and a no-op abort cannot skip Drop's retry.
 
 In both borrowing relays the disarm is a SINGLE site, and the invariant that
 makes that safe is stronger than the native relay's: inside the committed region
@@ -264,11 +259,9 @@ set — locked by
 `native_plain_h3_streaming_relays_are_authorization_first_at_backend_eos` in
 `tests/unit/gateway_core/http3_server_dispatch_tests.rs`.
 
-As with the native relay, the behaviour change beyond the drop hazard is that
-the `H3TrailerFinishError::Client` and header-commit `ClientWriteFailed` exits
-now RESET instead of implicitly finishing. The client's stream is already gone
-in those cases, so it is not observable; it matches what `cross_protocol.rs`
-already ships.
+The `H3TrailerFinishError::Client` and header-commit `ClientWriteFailed` exits
+also RESET rather than implicitly finishing. The client's stream is already
+gone in those cases, so this is not observable; it matches `cross_protocol.rs`.
 
 ### Full-duplex native H3 gRPC (issue #3283)
 
@@ -318,19 +311,19 @@ The four `recv_response` `.map_err` sites in [src/http3/client.rs](../src/http3/
 
 Out of scope: the `recv_data` Err path is recovered by `drain_h3_response_body` only when the body was already complete — a close mid-body produces a truncated response, which IS a real protocol fault from the backend's perspective and stays on the transport-failure path so the registry downgrades.
 
-**Why the recv_response 502 is unavoidable here (and how to remove it).** The 502 itself is a symptom of an h3-crate bug, not a gateway design choice. `FrameStream::try_recv` propagates a QUIC connection error before the frame decoder gets a chance to consume bytes that may already be buffered in `BufRecvStream::buf` from a previous wake — exactly the case when a coalesced UDP datagram delivers HEADERS + CONNECTION_CLOSE in the same recv batch. Tracked as `docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/` with a drafted issue, PR description, and unified diff against `h3 0.0.8`. When the upstream fix merges (or we vendor the patch ourselves per the lifecycle README in that directory), `recv_response` will return the buffered HEADERS frame instead of erroring — the 502 disappears, but the gateway-side suppression in this section is still correct on its own merits and stays.
+**The h3 frame-drain patch.** Stock `h3 0.0.8` `FrameStream::try_recv` propagates a QUIC connection error before the frame decoder consumes bytes already buffered in `BufRecvStream::buf` — exactly the case when a coalesced UDP datagram delivers HEADERS + CONNECTION_CLOSE in one recv batch — which turned a complete response into a 502. The vendored `vendor/h3-0.0.8-ferrum-patched/` crate carries the fix (`docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/`), so `recv_response` returns the buffered HEADERS frame in that case. The gateway-side suppression in this section remains correct on its own for a graceful close that arrives before any HEADERS were buffered, and it stays.
 
 **Retry semantics for graceful-close 502s.** `GracefulRemoteClose` is post-wire by construction: the request reached the backend (and may have been processed) before the close arrived. The synthetic 502 it produces therefore reports `connection_error=false`, which means the gateway-level retry loop respects `retryable_methods` instead of treating it as a free idempotent replay. In practice:
 
 - **Idempotent methods (GET / HEAD / OPTIONS) with `retry_on_connect_failure: true`**: NOT retried — these requests reached the wire, so `retry_on_connect_failure` does not apply. To retry them on a graceful-close 502, add `502` to `retryable_status_codes` (and ensure GET is in `retryable_methods`).
 - **Non-idempotent methods (POST / PUT / DELETE / PATCH)**: NOT retried under any default config — replaying a request the backend may have processed risks duplicate side effects. Operators who want retry-on-502 for POST must explicitly opt in via both `retryable_status_codes: [502]` AND adding the method to `retryable_methods`.
-- **Pre-wire failures (DNS / TLS / connect refused)** continue to honor `retry_on_connect_failure` regardless of method, exactly as before this PR.
+- **Pre-wire failures (DNS / TLS / connect refused)** honor `retry_on_connect_failure` regardless of method.
 
-The same `request_reached_wire`-derived predicate drives the circuit breaker (`record_failure(connection_error=false)`) and the load-balancer outcome reporting in `record_backend_outcome`, so a graceful close does not trip `failure_threshold` counters as a transport fault and the target's least-latency EWMA receives its real backend-processing latency. The buffered-response path's pre-fix predicate (`err_class.is_some()`) over-reported every post-wire class — `ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `ReadWriteTimeout` included — as a connection error; the new `h3_class_implies_connection_error` helper corrects all of them, not just `GracefulRemoteClose`.
+The same `request_reached_wire`-derived predicate drives the circuit breaker (`record_failure(connection_error=false)`) and the load-balancer outcome reporting in `record_backend_outcome`, so a graceful close does not trip `failure_threshold` counters as a transport fault and the target's least-latency EWMA receives its real backend-processing latency. Every other post-wire class (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `ReadWriteTimeout`) is likewise not a connection error.
 
 **Per-target dispatch contract**: The retry loop in `proxy_to_backend_inner` (see [src/proxy/mod.rs](../src/proxy/mod.rs)) captures the dispatch decision per current target and threads it through every attempt:
 
-- **Same target across attempts** → reuse the captured `current_dispatch_h3`. An H3 retry against the same backend that just failed at the H3 layer must stay on H3 — switching to reqwest mid-attempt would replay the same body to the same backend across protocols, and the failed H3 attempt may already have flushed headers / body before the reset / timeout / protocol error surfaced. That cross-protocol same-target replay would bypass `proxy.retry.retry_on_methods` and could duplicate non-idempotent requests. Same-protocol replay (H3 → H3) is fine and is the retry loop's normal job, gated by `retry_on_methods`.
+- **Same target across attempts** → reuse the captured `current_dispatch_h3`. An H3 retry against the same backend that just failed at the H3 layer must stay on H3 — switching to reqwest mid-attempt would replay the same body to the same backend across protocols, and the failed H3 attempt may already have flushed headers / body before the reset / timeout / protocol error surfaced. That cross-protocol same-target replay would bypass `retry.retryable_methods` and could duplicate non-idempotent requests. Same-protocol replay (H3 → H3) is fine and is the retry loop's normal job, gated by `retryable_methods`.
 - **Load-balancer rotation to a different upstream target** → recompute `current_dispatch_h3 = supports_native_http3_backend(&state, &proxy, current_target)` for the new target. The registry's per-target classification is the source of truth: mixed-capability upstreams (target A speaks H3, target B is H1-only) MUST switch transports here, otherwise the snapshot from target A's classification would force `proxy_to_backend_http3_retry` against B's H1-only backend → 502 forever. Per-target lookup is O(1) (`DashMap` + thread-local key buffer), so the recompute is cheap; `Unknown` and `Unsupported` both gracefully fall to reqwest, so an un-pre-warmed target degrades safely until the periodic refresh classifies it.
 
 The dispatch decision is captured by the OUTER code and threaded into `proxy_to_backend` as `dispatch_h3` (rather than re-read inside it) so a concurrent `mark_h3_unsupported` / refresh between the outer capture and the inner async DNS resolve cannot split a single attempt's dispatch in half. `mark_h3_unsupported` still fires on every H3 transport failure, but its effect is scoped to the NEXT decision (next attempt's recompute, or the next request).
@@ -339,7 +332,7 @@ The dispatch decision is captured by the OUTER code and threaded into `proxy_to_
 
 **Streaming downgrade parity.** Mid-body and trailer-boundary transport faults on the *plain* native-H3 streaming relays (inline `handle_h3_request` streaming, `stream_h3_open_response_to_client`, `proxy_to_backend_h3_streaming`) call `mark_h3_unsupported` exactly like the native gRPC streaming path, so a backend that accepts headers and then RSTs every response body is downgraded once instead of failing every request until the next refresh. All of these sites keep the graceful-close exclusion explicit: `is_h3_graceful_close` (`H3_NO_ERROR` / GOAWAY) suppresses the downgrade even when the body was left incomplete, because the raw stream classifier maps a graceful teardown to `ConnectionClosed` (only the pool's `classify_h3_error` carries the typed `GracefulRemoteClose`).
 
-For faster recovery than "one failed attempt to detect H3 broke", the right tool is connection-establishment happy-eyeballs (try QUIC with a short deadline, fall back to TCP+TLS before any request is sent) — not silent same-attempt transport switching. Tracked as a future Phase-9 candidate.
+For faster recovery than "one failed attempt to detect H3 broke", the right tool is connection-establishment happy-eyeballs (try QUIC with a short deadline, fall back to TCP+TLS before any request is sent) — not silent same-attempt transport switching. That is not implemented.
 
 Pool-key identity must stay aligned with the capability registry for this to work correctly. Direct backend keys include `scheme|host|port|dns_override|CA|mTLS cert|mTLS key|verify`, so two proxies with different resolver pinning or mTLS material never share a classified / pooled QUIC connection. HBONE-capable targets add the sidecar HBONE port to the capability key so tunnel probes and downgrades do not bleed across targets that share the same application host/port. `Http3ConnectionPool::pool_key_for_target` takes `&Proxy` (not just host/port) for the same reason, and `create_connection_to_target` honors `proxy.dns_override` / `dns_cache_ttl_seconds`.
 
@@ -354,7 +347,7 @@ When the stream FIN and the connection-level frame coalesce into the same UDP da
 
 `drain_h3_response_body` (`src/http3/client.rs`) handles this at the `recv_data` boundary in every buffered H3 response read site (`Http3ConnectionPool::do_request`, `Http3Client::request`, the buffered branch of `proxy_to_backend_http3`). When the error matches `is_h3_graceful_close` (typed `is_h3_no_error()` for `H3_NO_ERROR`, Display string for the `non_exhaustive` `RemoteClosing` variant) AND the body is `is_response_body_complete` (Content-Length exact match, or HEAD / 204 / 304 with empty body — RFC 9110 §6.4.1, §15.3.5, §15.4.5), the loop breaks normally and returns the buffered body. Stream-level resets (`StreamError::RemoteTerminate { code: H3_NO_ERROR }`) are intentionally NOT recovered — a stream reset means the server aborted *this stream*, which doesn't tell us the response was complete.
 
-The two H3 streaming forwarders in `http3/server.rs` (`handle_h3_request`, `proxy_to_backend_h3_streaming`) apply the same predicates inline. Both now count received bytes unconditionally — the prior gating on `state.max_response_body_size_bytes > 0` left the counter at zero when operators set `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0` to disable the limit, which broke the `received == content_length` completeness check exactly for the deployments most likely to see the race.
+The two H3 streaming forwarders in `http3/server.rs` (`handle_h3_request`, `proxy_to_backend_h3_streaming`) apply the same predicates inline. Both count received bytes unconditionally, so the `received == content_length` completeness check still works when `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0` disables the size limit.
 
 Tests: `h3_buffered_response_survives_graceful_close_race`, `h3_goaway_after_complete_body_is_treated_as_graceful`, `h3_stream_reset_after_partial_body_is_not_treated_as_graceful` (`tests/integration/http3_integration_tests.rs`). The scripted backend skips `stream.finish()` and emits `CloseConnectionWithCode(0x100)` / `SendGoaway(0)` / `SendStreamReset(0x100)` directly so the recovery path is deterministic on every platform — no FIN/close race to win.
 
@@ -519,7 +512,7 @@ The coalesce loop is identical across the two paths — source of bytes differs 
 
 `grpc-status` and `grpc-message` are mandatory gRPC signalling carried in HTTP trailers (RFC 9110 §6.5). The H3 crate supports trailers via `RequestStream::send_trailers(HeaderMap)` at the client-facing end. On the backend side:
 
-- **Streaming request trailers** — after H3 request DATA reaches EOF, the H3-to-H2 pump reads the optional request trailer block and emits it as `Frame::trailers` through `GrpcBody::Channel` before clean H2 END_STREAM. The native H3 relay uses the same sanitizer, and since issue #4148 so do the HTTP/1.1 and HTTP/2 request paths — see [Backend Request Trailers](plugin_execution_order.md#backend-request-trailers). Hop-by-hop names, reserved gateway assertions, credentials, forwarding identity, the initial-section-only `Via` intermediary chain, and the gateway-owned `Early-Data` marker are removed; malformed trailer blocks fail the upload closed rather than being converted into a clean truncated request. Application metadata such as request checksums remains eligible for forwarding.
+- **Streaming request trailers** — after H3 request DATA reaches EOF, the H3-to-H2 pump reads the optional request trailer block and emits it as `Frame::trailers` through `GrpcBody::Channel` before clean H2 END_STREAM. The native H3 relay uses the same sanitizer, and so do the HTTP/1.1 and HTTP/2 request paths (issue #4148) — see [Backend Request Trailers](plugin_execution_order.md#backend-request-trailers). Hop-by-hop names, reserved gateway assertions, credentials, forwarding identity, the initial-section-only `Via` intermediary chain, and the gateway-owned `Early-Data` marker are removed; malformed trailer blocks fail the upload closed rather than being converted into a clean truncated request. Application metadata such as request checksums remains eligible for forwarding.
 
 - **Buffered gRPC response** — the gRPC pool extracts trailers into a `HashMap<String, String>` before returning; the bridge converts them to a `HeaderMap` and sends via `send_trailers()` after the data frames.
 - **Streaming gRPC response** — the bridge polls hyper `Incoming::frame()`; when a `Frame::trailers()` variant is seen, the `HeaderMap` is stashed, the data loop exits cleanly, and the stashed trailers are forwarded via `send_trailers()` — after response-direction hop-by-hop stripping and response-header-policy reconciliation of the section's application metadata. `grpc-status`, `grpc-message`, and `grpc-status-details-bin` are reserved and always survive that reconciliation; see [Native gRPC terminal metadata](#native-grpc-terminal-metadata).
@@ -720,10 +713,9 @@ three signals. Three details differ from the buffered path:
   case variants on either side are ambiguous and the trailer is dropped. The
   buffered path applies the identical rule.
 
-Everything else is unchanged: the trailer read timeout and its error
+Reconciliation does not change the trailer read timeout and its error
 classification, connection/accounting release, H3 capability downgrade on
-trailer-boundary transport faults, and client-disconnect semantics all behave
-exactly as before. Native gRPC over H3 inlines its own trailer finish and
+trailer-boundary transport faults, or client-disconnect semantics. Native gRPC over H3 inlines its own trailer finish and
 reconciles there instead, as a gRPC terminal section — see
 [Native gRPC terminal metadata](#native-grpc-terminal-metadata).
 
@@ -788,7 +780,7 @@ redacts `x-internal-debug` is therefore a no-op when the backend sends that fiel
 only as a trailer — the operator's trust boundary is crossed by streaming alone,
 since forcing the same response to buffer applies the rule correctly.
 
-Every native streaming gRPC relay now applies the same three governance signals
+Every native streaming gRPC relay applies the same three governance signals
 to its terminal metadata, at the trailer frame and before the trailers reach the
 client:
 
@@ -813,8 +805,8 @@ mutated the matching header, or — for an `Unbounded` chain such as
 request-scoped route overrides, so each relay carries a precomputed,
 request-scoped boundary to the trailer frame instead.
 
-An auth/logging-only chain still forwards gRPC application trailers untouched,
-exactly as before (issue #2941).
+An auth/logging-only chain forwards gRPC application trailers untouched
+(issue #2941).
 
 ### Translated gRPC-Web terminal frames
 
@@ -897,7 +889,7 @@ HAProxy, Envoy when configured as a forward proxy) still bootstrap
 WebSockets over HTTP/1.1 Upgrade or HTTP/2 Extended CONNECT — RFC 9220
 adoption on the server side is still emerging. The H3 frontend therefore
 bridges through the same `WsBackendHandshake` Direct/Mesh enum the H1/H2
-frontends dispatch: plaintext targets use `connect_websocket_backend()`,
+frontends dispatch: direct (untagged) targets use `connect_websocket_backend()`,
 and `mesh.hbone` / `mesh.mtls` targets use `connect_mesh_websocket_backend()`.
 From the backend's perspective, a WebSocket arriving via H3 is
 indistinguishable from one arriving via any other frontend.
@@ -962,10 +954,6 @@ The gateway's H3 path is therefore identical to H1 and H2:
   protocol error and the client is closed with code `1002` by the same
   shared close mapping H1/H2 use.
 
-Before issue #5011 this was inverted: the H3 bridge attributed an
-unmasked-frame mandate to "RFC 9220 §5" and closed masked client frames
-with `1002`, so no standards-compliant client could exchange data over an
-H3 WebSocket route.
 
 ### Tunnel mode
 
@@ -1088,8 +1076,9 @@ do without early data configured.
 ### Disabling H3 WebSocket
 
 Set `FERRUM_HTTP3_WEBSOCKET_ENABLED=false` to disable the bridge. With
-this off the H3 server does NOT advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL`,
-so compliant H3 clients won't attempt Extended CONNECT. As defense in
+this off (and CONNECT-UDP not enabled) the H3 server does NOT advertise
+`SETTINGS_ENABLE_CONNECT_PROTOCOL`, so compliant H3 clients won't attempt
+Extended CONNECT. As defense in
 depth, the bridge itself also returns 501 if a client somehow sends
 Extended CONNECT anyway. Plain H3, gRPC over H3, and the native H3
 backend pool keep working — only the WebSocket bridge is gated.
@@ -1298,15 +1287,14 @@ the request-receipt instant, before the tunnel exists:
   rejection path instead, never both.
 
 An **unauthenticated** tunnel admitted no principal, so it has no authorization
-lifetime: no timer is registered for it and every bound above applies exactly as
-before.
+lifetime: no timer is registered for it and only the other bounds above apply.
 
 #### The tunnel idle timeout and the QUIC connection idle timeout
 
 A CONNECT-UDP tunnel is a stream of one QUIC connection, and a tunnel carrying
 no datagram generates no QUIC activity either — so a connection idle limit
 below the tunnel's idle limit closes the tunnel first, and the configured
-tunnel bound is never reached. With the shipped defaults that gap was real:
+tunnel bound is never reached. The shipped defaults have exactly that gap:
 `FERRUM_HTTP3_IDLE_TIMEOUT` is 30 seconds while
 `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` is the 120 seconds RFC 9298
 §3.2 asks for.
@@ -1505,7 +1493,7 @@ closed. This is deliberately not general policy reauthentication.
 
 The H3 connection loop detects QUIC connection migration (RFC 9000 §9) — a client that changes its local address mid-connection (common on mobile network handoffs between Wi-Fi and cellular) continues the same connection with a new 4-tuple. The loop compares `quinn::Connection::remote_address()` against a cached `SocketAddr` before each request dispatch; the comparison is two integer fields (IP + port) so the zero-allocation path is the common case. The formatted IP string (`Arc<str>`) is only re-created when the address actually changes.
 
-This ensures IP-based rate-limit keys and access logs reflect the client's current IP after migration, not the stale IP from connection establishment. Earlier code cached the address once per connection — that was a security issue where migrated clients bypassed per-IP rate limits, now fixed.
+This ensures IP-based rate-limit keys, per-IP limits, and access logs reflect the client's current IP after migration, not the stale IP from connection establishment, so a migrated client cannot bypass per-IP limits.
 
 ## Request-header arrival deadline (issue #4537)
 
@@ -1610,7 +1598,7 @@ kill the process.
 
 | Value | Source | Effect |
 |---|---|---|
-| Frontend `SETTINGS_MAX_FIELD_SECTION_SIZE` | `FERRUM_MAX_HEADER_SIZE_BYTES`, floored at 16 KiB, capped at 768,000 bytes, clamped into the QUIC varint range | Advertised to the client, and enforced by frontend QPACK decoding. Before this the listener advertised `VarInt::MAX` (2^62-1) while enforcing the configured limit only after a complete decode. |
+| Frontend `SETTINGS_MAX_FIELD_SECTION_SIZE` | `FERRUM_MAX_HEADER_SIZE_BYTES`, floored at 16 KiB, capped at 768,000 bytes, clamped into the QUIC varint range | Advertised to the client, and enforced by frontend QPACK decoding. |
 | Buffered non-`DATA` frame ceiling | 2x the frontend field-section size | On frontend and pooled backend connections, a frame whose **declared** payload length exceeds it is refused before a single payload byte is buffered. |
 | Backend decoded response field-section ceiling | The smaller of the buffered non-`DATA` frame ceiling and 768,000 bytes | On pooled backend connections, QPACK decoding stops before a compact response can expand into more fields than `http::HeaderMap` can be constructed with (24,576 entries; QPACK accounts 32 bytes per decoded field). |
 
@@ -1652,9 +1640,7 @@ into a bound the operator never configured (which would also make the H3
 frontend disagree with H1 and H2 about the same setting). For the same reason it
 also refuses a `FERRUM_MAX_HEADER_SIZE_BYTES` above **768,000** bytes: above
 that bound the advertised `SETTINGS_MAX_FIELD_SECTION_SIZE` would have to be
-capped and would no longer be the operator's policy. This is a **breaking**
-startup-validation change for anyone who had configured a header policy above
-768,000 bytes.
+capped and would no longer be the operator's policy.
 
 This bound lives in the vendored `h3` crate; see
 [`docs/upstream-h3-patches/005-max-buffered-frame-len/`](upstream-h3-patches/005-max-buffered-frame-len/README.md)
@@ -1666,7 +1652,7 @@ The QUIC flow-control windows are split by **trust plane**, because the frontend
 
 The *frontend* defaults are conservative because the H3 listener serves untrusted clients: 256 KiB per stream, 2 MiB receive budget per connection, and 2 MiB send budget per connection (`FERRUM_HTTP3_STREAM_RECEIVE_WINDOW`, `FERRUM_HTTP3_RECEIVE_WINDOW`, `FERRUM_HTTP3_SEND_WINDOW`). The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows.
 
-The *backend* pool (gateway-to-upstream) has its own triple — 8 MiB stream / 32 MiB connection / 8 MiB send — tunable with `FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW`, `FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW`, and `FERRUM_HTTP3_BACKEND_SEND_WINDOW`. Keeping the planes separate is the point: a single shared triple meant restoring backend throughput also re-opened the untrusted-client amplification exposure that the hardened frontend defaults closed (issue #4755). Every backend QUIC connection — the pooled direct-backend dial, the explicit-target/retry dial, and the standalone `Http3Client` — is built from one shared `build_backend_transport_config`, so no backend path can silently fall back to quinn's own defaults.
+The *backend* pool (gateway-to-upstream) has its own triple — 8 MiB stream / 32 MiB connection / 8 MiB send — tunable with `FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW`, `FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW`, and `FERRUM_HTTP3_BACKEND_SEND_WINDOW`. Keeping the planes separate is the point: with a single shared triple, raising backend throughput would also widen the untrusted-client amplification exposure the conservative frontend defaults close (issue #4755). Every backend QUIC connection — the pooled direct-backend dial, the explicit-target/retry dial, and the standalone `Http3Client` — is built from one shared `build_backend_transport_config`, so no backend path can silently fall back to quinn's own defaults.
 
 Both triples are validated at startup with the same bounds: `0` is refused (a zero credit budget stalls the connection in that direction) and the four receive windows must fit in a QUIC variable-length integer (`[1, 2^62-1]`).
 
@@ -1691,7 +1677,7 @@ The frontend HTTP/2 listener applies the same conservative-by-default philosophy
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | H3 backend connection idle eviction |
 | `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `32,768` | Response coalesce flush target. Clamped to `[H3_COALESCE_MIN_FLOOR=1 KiB, H3_COALESCE_MAX_CAP=1 MiB]`. |
 | `FERRUM_HTTP3_COALESCE_MAX_BYTES` | `32,768` | Response coalesce buffer capacity. Same H3-specific bounds — see [docs/response_body_streaming.md](response_body_streaming.md#response-body-coalescing) for the cross-protocol coalescing architecture. |
-| `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | Response coalesce time-based flush interval. H3-specific (the H1/H2-via-reqwest path uses opportunistic Pending-flush instead, so it has no flush-interval knob). |
+| `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | Response coalesce time-based flush interval. H3-specific (the reqwest path flushes on `Pending` by default; its optional hold window is `FERRUM_RESPONSE_COALESCE_FLUSH_MS`). |
 | `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | `32` | Cross-protocol bridge mpsc capacity (range: 1–1024) |
 | `FERRUM_HTTP3_WEBSOCKET_ENABLED` | `true` | Advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accept RFC 9220 Extended CONNECT WebSocket. See [WebSocket over HTTP/3](#websocket-over-http3-rfc-9220-extended-connect). |
 | `FERRUM_HTTP3_CONNECT_UDP_ENABLED` | `false` | Accept RFC 9298 UDP proxying Extended CONNECT (`:protocol=connect-udp`). Off by default; `501` while disabled. **Process-wide:** every H3 HTTP route whose routing and `allowed_methods` policy admits CONNECT can match a `/udp/host/port/` suffix — use a dedicated MASQUE route/host/path, authentication/authorization, and explicit method filters on routes that must not expose CONNECT. Requires a build target with a do-not-fragment socket option (Linux/Android, macOS) because RFC 9298 §3.1 forbids introducing IP fragmentation — elsewhere `true` is a startup validation error. CONNECT-UDP in TLS 1.3 early data is always `425`, even when `CONNECT` is in `FERRUM_TLS_EARLY_DATA_METHODS`. See [CONNECT-UDP over HTTP/3](#connect-udp-over-http3-rfc-9298). |

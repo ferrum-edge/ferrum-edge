@@ -190,8 +190,8 @@ runs after merge.
 
 ### 5. Superseded runs were never cancelled in 16 side workflows
 
-Sixteen path-filtered workflows had no `concurrency:` block, and
-`h3-live-comparison` explicitly disabled cancellation:
+Fifteen path-filtered workflows had no `concurrency:` block, and
+`h3-live-comparison` explicitly disabled cancellation (16 in total):
 
 - `benchmark-harness-lockfile`, `benchmark-harness-tests`
 - `ci-latency-report`

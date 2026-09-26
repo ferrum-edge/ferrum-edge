@@ -69,25 +69,27 @@ paths:
   when adding typed fields, and never infer trust from a global field-name
   allowlist. SQL literals, fixed migration/listener/fault labels, and
   schema-only constants are not document-value interpolation.
-- Scope of #5591: `src/config`, `src/modes`, `src/cli.rs`, `src/startup.rs`,
+- Converted scope: `src/config`, `src/modes`, `src/cli.rs`, `src/startup.rs`,
   `src/gateway_entry.rs`, `src/config_sources`, `src/grpc`, `src/capture`, and
-  `src/plugins/waf`.
-  Withholding is conditional on safe producer interpolation:
-  apostrophe-leading single-quoted values, bare values,
-  and retained third-party parser text can still expose supplied data. Do not
-  describe the renderer alone as fail-closed for arbitrary diagnostic text.
-- The mechanical producer/emitter contract is
-  `tests/unit/cli/diagnostic_source_guard_tests.rs` (registered in `cli/mod.rs`).
-  Its explicit `ROOTS` list covers the above roots except `src/capture`, whose
-  generated shell commands also use quoted interpolation. Capture parsing has
-  rendered-output and captured-log regressions. The guard scans every Rust file
-  in its roots, plus the converted shared unknown-key, rate-limit, socket-host,
-  byte-budget, replay-partition and response-body helpers and notifications,
-  including multiline/nested macros
-  and raw strings, for single-quoted interpolation in diagnostic macros and for
-  named error/message captures in `warn!`/`error!` without a sanitizer call in
-  that statement. Its exact, commented exception list contains SQL query syntax,
-  not document-value diagnostics. Keep schema names in backticks. The guard
-  prevents those syntax regressions in scope; it cannot infer whether arbitrary
-  bare arguments are document values or prove third-party errors safe. Retain
-  rendered-output/captured-log regressions for semantic and emission coverage.
+  `src/plugins/waf`. Withholding depends on safe producer interpolation:
+  apostrophe-leading single-quoted values, bare values, and retained
+  third-party parser text can still expose supplied data. Do not describe the
+  renderer alone as fail-closed for arbitrary diagnostic text.
+- The mechanical producer/emitter guard is
+  `tests/unit/cli/diagnostic_source_guard_tests.rs` (registered in
+  `tests/unit/cli/mod.rs`).
+  - Its `ROOTS` list covers the scope above except `src/capture` (whose
+    generated shell commands legitimately use quoted interpolation; capture
+    parsing relies on rendered-output and captured-log regressions instead),
+    plus `src/notifications` and the shared unknown-key, rate-limit,
+    socket-host, byte-budget, replay-partition and response-body helpers.
+  - It scans every Rust file in those roots, including multiline/nested macros
+    and raw strings, for single-quoted interpolation in diagnostic macros and
+    for named error/message captures in `warn!`/`error!` without a sanitizer
+    call in the same statement. Its exact, commented exception list
+    (`SINGLE_QUOTE_EXCEPTIONS`) contains SQL query syntax only, never
+    document-value diagnostics.
+  - It catches syntax regressions only; it cannot tell whether a bare argument
+    is a document value or prove third-party errors safe. Keep schema names in
+    backticks and keep rendered-output/captured-log regressions for semantic
+    and emission coverage.

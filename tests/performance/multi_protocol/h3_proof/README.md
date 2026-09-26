@@ -140,7 +140,7 @@ registration is not a claim that this revision has passed them.
   HTTP 200/exact body, no retry/fallback, phase and endpoint-drain contracts stay
   in force. Existing client frontend TLS verification remains explicitly insecure.
 
-The new `.github/workflows/h3-live-comparison.yml` has read-only permissions and
+The `.github/workflows/h3-live-comparison.yml` workflow has read-only permissions and
 pinned actions. PR checks compile features, run semantic contracts and real
 fixtures, a short real four-arm gateway smoke, and the bounded fairness gate. Its manual job reuses that
 same workflow's compiled and hashed Ferrum/harness/observer artifacts after the

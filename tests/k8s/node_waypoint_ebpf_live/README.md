@@ -12,62 +12,73 @@ calls it must provide a disposable cluster with:
 - `kubectl`, `helm`, `curl`, and node-level `bpftool` access through
   `kubectl debug node/...`.
 
-The script renders the chart first and fails if an enabled eBPF node-agent or
-NodeWaypoint proxy would use a non-`-ebpf` image. It then installs the chart,
-installs a minimal SPIRE Server/Agent fixture by default, registers per-node
-NodeWaypoint SVID entries, checks that every ambient NodeWaypoint pod reports a
-fail-closed SPIRE Agent identity proof
-(`ferrum_mesh_cert_expiry_seconds{spiffe_id=<per-node>,source="spire_agent"}`
-with positive expiry, `ferrum_mesh_ca_health{ca_type="spire_agent"} 1`, and
-`ferrum_mesh_trust_bundle_version{trust_domain=<domain>,source="spire_agent"}`
->= 1), checks
-`/metrics` for `ferrum_node_agent_capture_state{state="ready"} 1`, proves the
-explicit ingress redirect interface set for IPv4 and IPv6, then injects an
-existing but wrong route device both across a replacement startup and as
-post-start route drift. In both cases the node-agent must withdraw readiness
-with bounded topology metrics and recover only after the original routes are
-restored. The harness then collects BPF program/link/map evidence with
-`bpftool`, creates same-node and cross-node
-source/destination pods, verifies `src-a` Service ClusterIP traffic is admitted,
-verifies `src-b` Service ClusterIP and direct Pod-IP attempts are rejected by the
-live `AuthorizationPolicy`, and forces the `src-a` workload to be recreated with
-a new UID on the same IPv4 address so stale source identity and registry state
-cannot be reused or block the replacement; the runtime identity snapshot for the
-replacement must not contain the deleted pod's old UID. The same-IPv4 reuse
-assertion also waits for the replacement source allow path and post-recreation
-deny regression check to succeed before passing. It is specific to the default
-`kind-dual-stack-node-waypoint-ebpf` profile and its host-local CNI lease files;
-other disposable profiles retain the non-forced delete/recreate stale-cleanup
-check without requiring `stale_ip_reuse`. In
-production SPIRE mode it also verifies that every ambient DaemonSet pod rejects
-plaintext and no-client-SVID connections to the HBONE listener. The
-no-client-SVID probe uses a valid authority-form CONNECT target
-and accepts only a transport/protocol failure or Ferrum's explicit
-`{"error":"Mesh authorization denied: missing per-pod policy scope"}` 403 denial,
-not a generic non-200 response. It then temporarily pins the trusted HBONE
-assertor inventory to a wrong SPIFFE ID to prove authenticated but untrusted
-asserted workload identity fails closed with an attributed policy deny and
-recovers after the default inventory is restored. That forged-assertion probe
-accepts a direct 403 or the source-side 502 wrapper that explicitly reports the
-destination HBONE CONNECT was rejected with 403; in both cases the destination
-policy-deny counter for the expected NodeWaypoint assertor must increase.
-The production SPIRE pass also restarts the SPIRE Agent DaemonSet and the
-NodeWaypoint ambient DaemonSet, then waits for fresh SPIRE Agent SVID metrics,
-registry/mesh-slice readiness including destination `node_waypoint` metadata
-(not just resource counts), fresh source admission, allow traffic, an HTTP 403
-policy deny (a Ferrum route-miss 404 is not a deny), and
-plaintext/no-client-SVID HBONE rejection before recording
-`node_waypoint.identity.spire_restart_recovery`. It also asserts ADR
-observability counter movement:
-`node_waypoint.observability.hbone_handshake_inbound_tls_failure` (after
-plaintext HBONE rejection),
-`node_waypoint.observability.asserted_identity_rejected` (after forged
-assertor rejection), and
-`node_waypoint.observability.hbone_handshake_outbound_success` (after
-cross-node Service allow).
-On dual-stack clusters it also requires the IPv6 pod-netns ready
-markers, IPv6 Service allow/deny behavior, and an IPv6 direct Pod-IP bypass
-guard.
+The script performs these checks:
+
+1. **Render preflight** — renders the chart and fails if an enabled eBPF
+   node-agent or NodeWaypoint proxy would use a non-`-ebpf` image.
+2. **Install and identity** — installs the chart and (by default) a minimal
+   SPIRE Server/Agent fixture, registers per-node NodeWaypoint SVID entries, and
+   checks that every ambient NodeWaypoint pod reports a fail-closed SPIRE Agent
+   identity proof
+   (`ferrum_mesh_cert_expiry_seconds{spiffe_id=<per-node>,source="spire_agent"}`
+   with positive expiry, `ferrum_mesh_ca_health{ca_type="spire_agent"} 1`, and
+   `ferrum_mesh_trust_bundle_version{trust_domain=<domain>,source="spire_agent"}`
+   >= 1).
+3. **Capture readiness and ingress topology** — checks `/metrics` for
+   `ferrum_node_agent_capture_state{state="ready"} 1`, proves the explicit
+   ingress redirect interface set for IPv4 and IPv6, then injects an existing
+   but wrong route device both across a replacement startup and as post-start
+   route drift. In both cases the node-agent must withdraw readiness with
+   bounded topology metrics and recover only after the original routes are
+   restored.
+4. **BPF evidence** — collects BPF program/link/map evidence with `bpftool`.
+5. **Policy datapath** — creates same-node and cross-node source/destination
+   pods, verifies `src-a` Service ClusterIP traffic is admitted, and verifies
+   `src-b` Service ClusterIP and direct Pod-IP attempts are rejected by the live
+   `AuthorizationPolicy`.
+6. **Same-IPv4 reuse** — forces the `src-a` workload to be recreated with a new
+   UID on the same IPv4 address so stale source identity and registry state
+   cannot be reused or block the replacement; the runtime identity snapshot for
+   the replacement must not contain the deleted pod's old UID. The assertion
+   also waits for the replacement source allow path and a post-recreation deny
+   regression check. It is specific to the default
+   `kind-dual-stack-node-waypoint-ebpf` profile and its host-local CNI lease
+   files; other disposable profiles keep the non-forced delete/recreate
+   stale-cleanup check without requiring `stale_ip_reuse`.
+7. **Production SPIRE HBONE checks** (production SPIRE mode only):
+   - every ambient DaemonSet pod rejects plaintext and no-client-SVID
+     connections to the HBONE listener. The no-client-SVID probe uses a valid
+     authority-form CONNECT target and accepts only a transport/protocol
+     failure or Ferrum's explicit
+     `{"error":"Mesh authorization denied: missing per-pod policy scope"}` 403,
+     not a generic non-200 response;
+   - the trusted HBONE assertor inventory is temporarily pinned to a wrong
+     SPIFFE ID to prove authenticated but untrusted asserted workload identity
+     fails closed with an attributed policy deny, then recovers after the
+     default inventory is restored. The probe accepts a direct 403 or the
+     source-side 502 wrapper that explicitly reports the destination HBONE
+     CONNECT was rejected with 403; in both cases the destination policy-deny
+     counter for the expected NodeWaypoint assertor must increase;
+   - the SPIRE Agent and NodeWaypoint ambient DaemonSets are restarted, then the
+     harness waits for fresh SPIRE Agent SVID metrics, registry/mesh-slice
+     readiness including destination `node_waypoint` metadata (not just
+     resource counts), fresh source admission, allow traffic, an HTTP 403 policy
+     deny (a Ferrum route-miss 404 is not a deny), and plaintext/no-client-SVID
+     HBONE rejection before recording
+     `node_waypoint.identity.spire_restart_recovery`.
+8. **Observability counters** — asserts ADR counter movement:
+   `node_waypoint.observability.hbone_handshake_inbound_tls_failure` (after
+   plaintext HBONE rejection),
+   `node_waypoint.observability.asserted_identity_rejected` (after forged
+   assertor rejection), and
+   `node_waypoint.observability.hbone_handshake_outbound_success` (after
+   cross-node Service allow).
+9. **Dual-stack** — on dual-stack clusters it also requires the IPv6 pod-netns
+   ready markers, IPv6 Service allow/deny behavior, and an IPv6 direct Pod-IP
+   bypass guard.
+
+The UDP and DTLS listener checks described below run after the traffic checks
+and before the IPv6 checks.
 
 The chart render preflight and live install both verify the production identity
 profile: `ambient.spire.enabled=true` must mount the SPIRE Agent Workload API

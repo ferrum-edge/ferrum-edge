@@ -13,8 +13,7 @@ An explicitly configured `price_per_call: 0` meters matching calls with
 status has no row unless bandwidth pricing applies. Successful WebSocket
 handshakes use the `101` pricing tier and `protocol: ws` for H1 Upgrade and H2/H3
 Extended CONNECT alike. The latter retain `http_status_code: 200` (or their actual
-2xx wire status); rejected handshakes keep their error-status pricing. gRPC
-terminal-status pricing is unchanged.
+2xx wire status); rejected handshakes keep their error-status pricing.
 
 ## Durability Contract
 
@@ -314,8 +313,7 @@ pricing with at least one strictly positive per-byte rate, or
 `request_mirror` shadow summaries (`mirror: true`) still reach the sink log
 hook for observability/correlation with other logging plugins, but they are
 never consumer-billable. Per-event and snapshot exports charge only the
-primary client-facing HTTP summary; WebSocket and stream accounting are
-unchanged.
+primary client-facing HTTP summary.
 
 Every unit price is an IEEE-754 binary64 value that must be finite,
 non-negative, and at most `1e288`. Per-event mode multiplies each transaction's
@@ -517,7 +515,7 @@ identifiers must not be retained in the billing warehouse.
 
 ```json
 {
-  "name": "api_chargeback_sink",
+  "plugin_name": "api_chargeback_sink",
   "config": {
     "mode": "per_event",
     "pricing_tiers": [
@@ -563,9 +561,14 @@ identifiers must not be retained in the billing warehouse.
 }
 ```
 
-`currency` and `pricing_version` are operator labels copied verbatim into every
-exported row. Each is required, must not be blank after trimming, and is
-admitted only up to 512 UTF-8 bytes.
+Apart from the pricing, credential, and label fields, every `clickhouse`,
+`batch`, `retry`, `spool`, and `snapshot` value above is the default (plus
+`spool.compression: "zstd"` and `mode: "per_event"`); only `clickhouse.url` and
+one pricing dimension are required.
+
+`currency` (default `USD`) and `pricing_version` (default `default`) are
+operator labels copied verbatim into every exported row. Each must not be blank
+after trimming and is admitted only up to 512 UTF-8 bytes.
 
 Fire-and-forget (lossy) async inserts require an explicit opt-in that cannot be
 confused with durable mode:
@@ -806,10 +809,8 @@ Claim disposition:
   the live replay pipeline. Losing claim authorization is **not** a retryable
   storage failure, so it never enters the release path: it is reported as
   `unauthorized <stage>` wrapping the original pathname-scoped refusal verbatim,
-  counted in the sink's failure metrics, and returned. Reporting it as retryable
-  would attempt a release that is correctly refused anyway, but would replace the
-  diagnostic that says where authorization was actually lost with the refusal's
-  own. The stages are:
+  counted in the sink's failure metrics, and returned, so the diagnostic names
+  the step where authorization was lost. The stages are:
 
   | Stage | Claim-bound step |
   | --- | --- |
@@ -1245,7 +1246,7 @@ published generation.
 for the process lifetime, even after all sinks are removed. It uses fixed-size
 process storage, with no retained policy IDs or retired runtime registry. Current
 instance status counters remain generation-local diagnostics; top-level totals and
-Prometheus counters are cumulative. Existing metric names are preserved:
+Prometheus counters are cumulative. Metrics:
 
 - `chargeback_sink_events_enqueued_total`
 - `chargeback_sink_events_exported_total`

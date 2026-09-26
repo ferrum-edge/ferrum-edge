@@ -44,7 +44,8 @@ declare the stable baseline, as defined in
 A pre-1.0 source tag by itself does not freeze the schema.
 
 Breaking changes that have already landed are listed per release in
-[Breaking changes in 0.9.0](upgrade_guide.md#breaking-changes-in-090).
+[upgrade_guide.md](upgrade_guide.md) (for example,
+[Breaking changes in 0.9.0](upgrade_guide.md#breaking-changes-in-090)).
 
 ### What is stable enough to build on today
 

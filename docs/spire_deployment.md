@@ -49,7 +49,7 @@ Ferrum supports two CA backends selected by [`FERRUM_MESH_CA_BACKEND`](configura
 | Backend | Use it for | What it does |
 |---|---|---|
 | `internal` | **Development, single-node tests, demos.** Ferrum self-issues SVIDs from a root key on disk. | Holds the CA private key locally, signs SVIDs in-process. Convenient because there are no external dependencies, but the operator owns the root key and has no rotation story beyond restarting Ferrum with new files. |
-| `spire` | **Production.** | Delegates issuance and rotation to a separately-operated SPIRE Agent over its Workload API UDS. Ferrum never sees a CA private key. |
+| `spire` (aliases `spire_agent`, `spire-agent`) | **Production.** | Delegates issuance and rotation to a separately-operated SPIRE Agent over its Workload API UDS. Ferrum never sees a CA private key. |
 
 Production deployments should always use `spire`. The wired mesh runtime path
 is `start_spire_agent_mesh_svid_source` in
@@ -111,8 +111,7 @@ Ferrum consumes federated bundles two ways:
    `federated: Vec<TrustBundle>`) to data planes. Each entry in `federated`
    names its `trust_domain` and the X.509/JWT authorities for that remote
    cluster. This is the bootstrap path.
-2. **Pull-based federation poller** ([`src/modes/mesh/federation.rs`](../src/modes/mesh/federation.rs),
-   shipped in [PR #880](https://github.com/ferrum-edge/ferrum-edge/pull/880)):
+2. **Pull-based federation poller** ([`src/modes/mesh/federation.rs`](../src/modes/mesh/federation.rs)):
    a background task hits each `RemoteCluster.federation_endpoint` over HTTPS
    on [`FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS`](configuration.md)
    (default 300s) and overlays the fetched bundle onto `TrustBundleSet.federated`
@@ -358,7 +357,7 @@ ambient:
 ```
 
 When enabled, the chart renders the `spire-agent-socket` hostPath mount and
-sets `FERRUM_MESH_CA_BACKEND=spire_agent`,
+sets `FERRUM_MESH_CA_BACKEND=spire_agent` (an alias of `spire`),
 `FERRUM_MESH_SPIRE_AGENT_SOCKET`, `FERRUM_MESH_WORKLOAD_SPIFFE_ID`, and
 `FERRUM_MESH_PRODUCTION_MODE` for the ambient mesh proxy. Those env vars are
 chart-managed in this mode; set the `ambient.spire` values instead of also
@@ -380,9 +379,8 @@ identity state.
 
 ### North-south gateway pods (database / file / dp / cp modes)
 
-The gateway uses the same gateway-SVID watch path that PR-#880's trust-bundle
-changes documented. SPIRE writes the SVID to disk for the gateway to pick up,
-and Ferrum polls the files for atomic content changes once per second (see
+The gateway reads its SVID from files that a SPIRE helper writes to disk.
+Ferrum polls the files for atomic content changes once per second (see
 `run_gateway_svid_source_rotation_loop` in
 [`src/identity/svid_source_watch.rs`](../src/identity/svid_source_watch.rs)).
 
@@ -482,10 +480,9 @@ bundles through its dedicated fetch loop, retains the last good identity across
 reconnects, and publishes rotations to the live TLS slots. The reusable
 `SpireAgentCa` / `WorkloadApiClient` adapter can decode a bounded
 `FetchJWTBundles` stream when explicitly constructed, but mesh startup does not
-construct that adapter or start its JWT stream today. This change therefore
-makes no production claim that SPIRE JWT authorities back Ferrum validation.
-The active X.509 consumption does **not** amount to issuance, and none of it
-makes a Workload API servable here.
+construct that adapter or start its JWT stream, so SPIRE JWT authorities do not
+back Ferrum validation. Consuming X.509 SVIDs is not issuance and does not make
+a Workload API servable here.
 
 Workloads that need SVID **mint** under a SPIRE deployment should call their
 local SPIRE agent's Workload API directly (that is the socket SPIRE authorizes
@@ -528,16 +525,16 @@ Ferrum exposes these mesh identity series on the Prometheus endpoint
 
 The Helm chart's
 [`PrometheusRule`](../charts/ferrum-mesh/templates/alerts-prometheusrule.yaml)
-adds alerts on cert-expiring-soon, rotation failures, CA unhealthy, and SVID
-expiry below one hour out of the box — see
-[Alerting reference](#alerting-reference) below. When the bundled Grafana
-dashboards land under `charts/ferrum-mesh/dashboards/`, the certificate-posture
-dashboard renders all four series with operator-friendly variable selectors.
+adds alerts on cert-expiring-soon, rotation failures, CA unhealthy, and
+critical SVID expiry out of the box — see
+[Alerting reference](#alerting-reference) below. The bundled Grafana dashboard
+`charts/ferrum-mesh/dashboards/certificate-posture.json` renders all four
+series with variable selectors.
 
 ## Multi-cluster federation
 
-This builds on the federation poller from
-[PR #880](https://github.com/ferrum-edge/ferrum-edge/pull/880).
+This uses the pull-based federation poller described under
+[Topology options](#multi-cluster-federated-spire).
 
 ### 1. Choose distinct trust domains per cluster
 
@@ -659,9 +656,11 @@ climbs past `2 * FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS`,
 increasing.
 
 **Impact**: cross-cluster mTLS continues to verify against the last-good
-cached bundle (fail-closed). New peer SVIDs minted under a rotated *remote* CA
-will not validate until the bundle refreshes. Same-cluster traffic is
-unaffected.
+cached bundle until it is older than
+[`FERRUM_MESH_FEDERATION_MAX_STALE_SECONDS`](configuration.md) (default 3600s);
+after that the bundle is withdrawn and cross-cluster verification fails
+closed. New peer SVIDs minted under a rotated *remote* CA will not validate
+until the bundle refreshes. Same-cluster traffic is unaffected.
 
 **Recovery**:
 
@@ -703,8 +702,8 @@ expired chain).
 
 The Helm chart at [`charts/ferrum-mesh`](../charts/ferrum-mesh) ships a
 `PrometheusRule` ([alerts-prometheusrule.yaml](../charts/ferrum-mesh/templates/alerts-prometheusrule.yaml))
-that includes the identity / federation alerts when
-`observability.alerts.enabled=true`. The defaults shipped are:
+that includes the identity / federation alerts when `observability.enabled=true`
+(and `observability.alerts.enabled`, default `true`). The defaults shipped are:
 
 | Alert | Severity | Expression |
 |---|---|---|
@@ -712,7 +711,7 @@ that includes the identity / federation alerts when
 | `FerrumMeshSvidExpiringCritical` | critical | `min by (spiffe_id, source) (ferrum_mesh_cert_expiry_seconds) < observability.alerts.svidExpiringCriticalSeconds` (default 10m) |
 | `FerrumMeshCertificateRotationFailures` | critical | `sum by (spiffe_id, source) (increase(ferrum_mesh_cert_rotation_failures_total[10m])) > 0` |
 | `FerrumMeshCaUnhealthy` | critical | `min by (ca_type) (ferrum_mesh_ca_health) == 0` |
-| `FerrumMeshFederationBundleStale` | warning | `max by (trust_domain) (ferrum_mesh_federation_bundle_age_seconds) > observability.alerts.federationBundleStaleSeconds` (default 5m, or `2 * poll_interval`) |
+| `FerrumMeshFederationBundleStale` | warning | `max by (trust_domain) (ferrum_mesh_federation_bundle_age_seconds) > observability.alerts.federationBundleStaleSeconds` (default 600s, i.e. `2 * poll_interval`) |
 | `FerrumMeshFederationPollFailures` | warning | `sum by (trust_domain, endpoint) (increase(ferrum_mesh_federation_poll_failures_total[10m])) > 0` |
 
 `FerrumMeshCaUnhealthy` is your single-best signal that the SPIRE Agent UDS

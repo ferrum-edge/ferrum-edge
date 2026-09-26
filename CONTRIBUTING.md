@@ -1,6 +1,6 @@
 # Contributing to Ferrum Edge
 
-Thank you for your interest in contributing to Ferrum Edge! This document provides guidelines and instructions for contributing to this high-performance edge proxy built in Rust.
+Thank you for your interest in contributing to Ferrum Edge! This guide covers how to set up, build, test, and submit changes.
 
 ## Table of Contents
 
@@ -8,12 +8,14 @@ Thank you for your interest in contributing to Ferrum Edge! This document provid
 - [Getting Started](#getting-started)
 - [Development Environment](#development-environment)
 - [Making Changes](#making-changes)
+- [Build-Out Schema Policy](#build-out-schema-policy)
 - [Changelog Policy](#changelog-policy)
 - [Testing](#testing)
 - [Pull Request Process](#pull-request-process)
 - [Commit Message Guidelines](#commit-message-guidelines)
 - [Documentation](#documentation)
 - [Questions](#questions)
+- [License](#license)
 
 ## Code of Conduct
 
@@ -38,7 +40,8 @@ This project and everyone participating in it is governed by our [Code of Conduc
 
 ### Prerequisites
 
-- **Rust** toolchain (stable 1.85+)
+- **Rust** toolchain — latest stable. `rust-toolchain.toml` pins `channel = "stable"`, and CI
+  runs clippy with `-D warnings` on the current stable, so keep your local toolchain up to date.
 - **protoc** (Protocol Buffers compiler) - required for gRPC code generation
 - **cmake** and **curl development headers** — required to compile librdkafka from
   source (`rdkafka` `cmake-build` + vendored TLS for `kafka_logging`). A missing
@@ -155,7 +158,7 @@ cargo fmt --check
   - `modes/` - Operating mode implementations
   - `proxy/` - Reverse proxy core
   - `plugins/` - Plugin system
-  - `tls/` - TLS/DTLS handling
+  - `tls/`, `dtls/` - TLS and DTLS handling
 - `tests/` - Integration and functional tests
 - `docs/` - Documentation
 - `proto/` - Protocol Buffer definitions
@@ -201,8 +204,11 @@ section in the same pull request.
 ### Running Tests
 
 ```bash
-# Unit tests (fast, no I/O)
-cargo test --test unit_tests
+# Unit tests (fast, no I/O). The unit suite is split into four targets:
+cargo test --test unit_tests               # config, admin, TLS, identity, secrets, CLI
+cargo test --test unit_plugins_a_tests     # plugin tests a–j
+cargo test --test unit_plugins_b_tests     # plugin tests k–z
+cargo test --test unit_gateway_core_tests  # core runtime
 
 # Integration tests (component interaction)
 cargo test --test integration_tests
@@ -246,25 +252,26 @@ For performance-sensitive changes:
 
 ```bash
 cd tests/performance/multi_protocol
-./run_benchmarks.sh
+./run_protocol_test.sh all
 ```
+
+See [`tests/performance/multi_protocol/README.md`](tests/performance/multi_protocol/README.md) for options.
 
 ## Pull Request Process
 
-1. **Update documentation** for any changed functionality
-2. **Add tests** for new code
-3. **Ensure all tests pass**:
+1. **Add tests** for new code
+2. **Ensure all tests pass**:
    ```bash
    cargo test
    cargo test -- --ignored
    ```
-4. **Run linting**:
+3. **Run linting**:
    ```bash
    cargo clippy --all-targets -- -D warnings
    cargo fmt --check
    ```
-5. **Update relevant docs** if changing user-facing features
-6. **Submit your PR** with a clear description of the changes
+4. **Update documentation** for changed user-facing behavior (see [Documentation](#documentation))
+5. **Submit your PR** with a clear description of the changes
 
 ### PR Title Format
 

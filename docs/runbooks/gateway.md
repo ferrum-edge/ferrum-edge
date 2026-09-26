@@ -21,7 +21,7 @@ admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, **or** a source IP inside
 | `GET /live` | none | Liveness only: `{"status":"ok"}`. Proves the process is up and the admin listener is accepting. |
 | `GET /health` | none → `status` + `ready` only; credentialed → full diagnostics | Credentialed: DB type/pool stats, `database_polling`, `config_rejected`, mesh state, sanitized listener failures, `jwks_trust`. |
 | `GET /status` | same tiering as `/health` | Same coarse/detailed split. |
-| `GET /overload` | none → `{level}` only; credentialed → full snapshot | Shedding actions, active connections/requests, per-resource current/limit, RED drop probability, draining flag. |
+| `GET /overload` | none → `{level}` only; credentialed → full snapshot | Shedding `actions`, active connections/requests, per-resource `current`/`max` under `pressure`, `red_drop_probability_pct`, `draining`. |
 | `GET /metrics` | credentialed (401 otherwise) | Prometheus exposition. Requires one globally scoped `prometheus_metrics` plugin for the request/latency families. |
 | `GET /metrics/runtime` | admin JWT | Cached JSON runtime snapshot. |
 | `GET /backend-capabilities` | admin JWT | Negotiated upstream protocol capabilities per destination. |
@@ -83,9 +83,9 @@ corresponding upstream errors and no overload signal.
    `ferrum_backend_duration_ms` (upstream) and `ferrum_edge_overhead_ms`
    (Ferrum's own cost). If backend duration tracks total, the upstream is slow
    and the gateway is fine.
-2. `GET /overload` (credentialed) — `event_loop_latency_seconds` and the
-   per-resource `current`/`limit` pairs show whether the runtime itself is
-   saturated.
+2. `GET /overload` (credentialed) — `pressure.event_loop_latency_us` and the
+   per-resource `current`/`max` pairs under `pressure` show whether the runtime
+   itself is saturated (metric: `ferrum_overload_event_loop_latency_seconds`).
 3. `ferrum_connection_pool_entries` versus
    `ferrum_connection_pool_max_idle_per_host` — pool churn adds a connect
    handshake to requests that should have reused a connection.
@@ -98,8 +98,8 @@ overload; a synchronous plugin (external authorization, remote rate limiting)
 on the hot path.
 
 **Remediation.** Scale or fix the upstream when backend duration dominates.
-When gateway overhead dominates, raise `max_idle_per_host` for the affected
-destination, verify DNS caching, and check for CPU throttling on the pod. If a
+When gateway overhead dominates, raise `FERRUM_POOL_MAX_IDLE_PER_HOST` (a
+global setting), verify DNS caching, and check for CPU throttling on the pod. If a
 remote-dependency plugin dominates, lower its timeout so it fails fast rather
 than holding requests.
 
@@ -114,9 +114,9 @@ itself.
 
 **First checks.**
 
-1. `GET /overload` (credentialed) — the full snapshot names the level, the
-   active actions, `draining`, `red_drop_probability_ratio`, and every
-   `resource` with its `current` and `limit`.
+1. `GET /overload` (credentialed) — the full snapshot names the `level`, the
+   active `actions`, `draining`, `red_drop_probability_pct`, and every resource
+   under `pressure` with its `current` and `max`.
 2. `ferrum_overload_resource_current / ferrum_overload_resource_limit` per
    `resource` identifies which budget is exhausted (connections, requests,
    memory, file descriptors, ports).
@@ -134,7 +134,7 @@ rolling restart draining connections.
 expected and will clear. Otherwise scale out replicas, or raise the specific
 exhausted limit if the pod has headroom. For port exhaustion, check
 `ferrum_overload_port_exhaustion_events_total` and increase connection reuse
-(`max_idle_per_host`) rather than raising the limit. See
+(`FERRUM_POOL_MAX_IDLE_PER_HOST`) rather than raising the limit. See
 [overload_manager.md](../overload_manager.md) for the full threshold model.
 
 **Escalation.** Page capacity/on-call when shedding persists after scaling out,
@@ -348,8 +348,9 @@ pool; TLS expiry on the database connection; an invalid configuration mutation
 to `1` and admin writes are accepted again — the poll loop recovers on its own
 and needs no gateway restart. For `validation_rejected`, find and repair the
 offending resource through the admin API (writes remain enabled precisely for
-this). For `migration_gate`, apply the pending migrations (`ferrum-edge
-migrate`, or `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS` for custom plugin schema).
+this). For `migration_gate`, apply the pending migrations (`ferrum-edge run
+--mode migrate` with `FERRUM_MIGRATE_ACTION=up`, or
+`FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS` for custom plugin schema).
 
 **Do not** restart the gateway to "reconnect": a restart risks losing the
 last known-good configuration if the database is still unreachable at startup,

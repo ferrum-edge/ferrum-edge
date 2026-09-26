@@ -1,20 +1,18 @@
 # CORS Plugin
 
-This document explains how to configure the Cross-Origin Resource Sharing (CORS) plugin in Ferrum Edge.
-
 ## Overview
 
 The CORS plugin handles the [CORS protocol](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS) at the gateway level, so backend services do not need to implement CORS themselves. It intercepts preflight `OPTIONS` requests, validates their requested methods and headers, validates origins on actual requests, and injects the required `Access-Control-*` response headers on cross-origin HTTP and gRPC-Web responses.
 
 ### What the plugin does
 
-1. **Preflight interception** -- When a browser sends an `OPTIONS` request with `Origin` and `Access-Control-Request-Method` headers, the native direct plugin validates the origin and requested method against the configured allow-lists. If both pass, it responds with `204 No Content` and all required CORS headers. If either fails, it responds with `403 Forbidden` and a descriptive error body. The request never reaches the backend unless `preflight_continue` is enabled.
+1. **Preflight interception** -- When a browser sends an `OPTIONS` request with `Origin` and `Access-Control-Request-Method` headers, the native direct plugin validates the origin and requested method against the configured allow-lists. If both pass, it responds with `204 No Content` and all required CORS headers. If either fails (or a requested header is not allowed), it responds with `403 Forbidden` and a JSON error body. The request never reaches the backend unless `preflight_continue` is enabled.
 
 2. **Actual-request origin enforcement** -- Non-preflight requests that carry an `Origin` header are checked against the allowed origins list. A native direct policy rejects disallowed origins with `403 Forbidden` and the JSON body `{"error":"CORS origin not allowed"}`; an Istio projection forwards unmatched actual requests while stripping every upstream `Access-Control-*` response field and adding no gateway CORS authorization fields. `allowed_methods` and `allowed_headers` are preflight policy only: they never reject an actual request or re-authorize headers on that phase.
 
 3. **Response header injection** -- For allowed cross-origin requests that pass through to the backend, the plugin injects `Access-Control-Allow-Origin`, `Vary`, and optionally `Access-Control-Allow-Credentials` and `Access-Control-Expose-Headers` into the backend response before it reaches the client. Every participating CORS policy merges `Origin` into `Vary`, including responses to originless or unmatched requests. Preflight responses also vary on `Access-Control-Request-Method` and `Access-Control-Request-Headers`. Existing `Vary` tokens and `Vary: *` are preserved.
 
-Denials use JSON objects with a fixed `error` message. Denied method and header values are not reflected. Successful preflights keep their empty response bodies.
+Denials use a JSON object with a fixed `error` message (`CORS origin not allowed`, `CORS method not allowed`, or `CORS header not allowed`). Denied method and header values are not reflected. Successful preflights keep their empty response bodies.
 
 ## Configuration
 
@@ -230,7 +228,7 @@ This allows:
 - `https://preview.example.com` ❌ (does not start with `https://preview-`)
 - `https://app.example.com.evil.com` ❌ (regex is a **full** match, not a substring search)
 
-> **Note:** this example is **uncredentialed**. `{prefix: "https://preview-"}` matching behaviour is unchanged — but because `starts_with` does not terminate at an origin boundary it also matches `https://preview-evil.com`, so this prefix form **cannot be combined with `allow_credentials: true`** (see [Credentials](#credentials-and-wildcard-origins) above).
+> **Note:** this example is **uncredentialed**. Because `starts_with` does not stop at an origin boundary, `{prefix: "https://preview-"}` also matches `https://preview-evil.com`, so this prefix form **cannot be combined with `allow_credentials: true`** (see [Credentials](#credentials-and-wildcard-origins) above).
 
 > **Semantics:** `exact` is a literal, case-sensitive, byte-for-byte comparison with the request `Origin` header (see the note above). `prefix` is a literal, case-sensitive byte-prefix of the `Origin`. `regex` is an RE2 pattern (the `regex` crate) that must match the **entire** `Origin` — there is no implicit `.*` on either end — mirroring how Ferrum evaluates Istio `StringMatch` regex elsewhere. Use `(?i)` inside the pattern for case-insensitive regex matching.
 
@@ -250,7 +248,7 @@ OpenAPI applies `maxLength: 512` to every matcher form, including native exact
 origins. JSON Schema counts characters; the runtime additionally checks the
 512-byte UTF-8 budget, so a non-ASCII value can reach that limit sooner.
 
-The `regex` crate is finite-automaton based, so a hostile pattern cannot cause catastrophic backtracking; the bounds above additionally cap compile-time memory and per-match cache growth. An empty or whitespace-only `exact`, an empty `prefix` (which would match every origin), and an invalid or over-complex pattern are all rejected when the plugin is created. A non-empty prefix that does not terminate at an origin boundary — anything but the `scheme://host:` form, including `https://app.example.com`, `https://app.`, `https://app.example.com:8443`, `https://`, and `h` — is admitted without credentials but is **not** a strict origin policy; combined with `allow_credentials: true` it is refused. Regex universality is probed against a fixed set of reserved DNS-shaped origins (`.invalid` / `.example` / `.test`) rather than IP literals, so a hostname-character-class regex such as `https://[\\w.-]+` is correctly classified as effectively universal, while an anchored host-constraining pattern such as `^https://[a-z0-9-]+\\.example\\.com$` stays strict. The same predicates gate the Istio VirtualService translator and native/file mesh validation, so an unrepresentable source policy is reported as a deferred field instead of failing plugin construction later.
+The `regex` crate is finite-automaton based, so a hostile pattern cannot cause catastrophic backtracking; the bounds above additionally cap compile-time memory and per-match cache growth. An empty or whitespace-only `exact`, an empty `prefix` (which would match every origin), and an invalid or over-complex pattern are all rejected when the plugin is created. Prefixes other than `scheme://host:` and host-unconstrained regexes are admitted without credentials but refused with `allow_credentials: true` (regex universality is probed against reserved `.invalid` / `.example` / `.test` origins; see [Credentials and Wildcard Origins](#credentials-and-wildcard-origins)). The same predicates gate the Istio VirtualService translator and native/file mesh validation, so an unrepresentable source policy is reported as a deferred field instead of failing plugin construction later.
 
 ### Example 6: Backend Handles OPTIONS
 
@@ -290,7 +288,7 @@ authoritative over the browser-facing response fields:
   while preserving unrelated response headers, preventing a shared-cache replay
   from widening the gateway policy;
 - omitted/empty method and header lists stay empty, and omitted `maxAge` stays
-  absent; and
+  absent;
 - `StringMatch.exact: "*"` and legacy `allowOrigin: ["*"]` mean allow-all;
 - every OTHER `StringMatch.exact` value (and every legacy `allowOrigin` entry) is
   projected onto this plugin's **literal** `{ exact: … }` matcher, byte-for-byte.
@@ -372,8 +370,8 @@ Browser                    Gateway (CORS Plugin)
   |                              |-- Check origin: NOT allowed ---
   |                              |
   |<---- 403 Forbidden ---------|
-  |   Body: "CORS origin        |
-  |          not allowed"        |
+  |   {"error":"CORS origin     |
+  |      not allowed"}           |
 ```
 
 ### Preflight Rejected (Disallowed Method)
@@ -389,8 +387,8 @@ Browser                    Gateway (CORS Plugin)
   |                              |-- Check method: NOT allowed --
   |                              |
   |<---- 403 Forbidden ---------|
-  |   Body: "CORS method not    |
-  |          allowed: TRACE"     |
+  |   {"error":"CORS method     |
+  |      not allowed"}           |
 ```
 
 ### Actual Cross-Origin Request (Allowed)
@@ -419,8 +417,8 @@ Browser                    Gateway (CORS Plugin)
   |   Origin: https://evil.com  |-- origin NOT allowed ----------
   |                              |
   |<---- 403 Forbidden ---------|
-  |   Body: "CORS origin        |
-  |          not allowed"        |
+  |   {"error":"CORS origin     |
+  |      not allowed"}           |
 ```
 
 ## Response Headers Reference
@@ -444,7 +442,7 @@ Browser                    Gateway (CORS Plugin)
 cargo test --test unit_plugins_a_tests -- cors_tests
 
 # Run a specific test
-cargo test --test unit_plugins_a_tests -- cors_tests::test_preflight_with_allowed_origin -- --nocapture
+cargo test --test unit_plugins_a_tests cors_tests::test_preflight_with_allowed_origin -- --nocapture
 ```
 
 ### Manual Testing with curl
@@ -485,17 +483,17 @@ curl -v http://localhost:8000/api/users
 
    The `Origin` header value does not match any entry in `allowed_origins`. Exact origins must include the scheme (e.g., `https://example.com`, not `example.com`). Origin matching is case-insensitive. If using wildcard subdomain patterns (e.g., `*.company.com`), note that the bare domain (`https://company.com`) does not match — add it as a separate exact entry if needed.
 
-2. **403 "CORS method not allowed"**
+2. **403 "CORS method not allowed" / "CORS header not allowed"**
 
-   The `Access-Control-Request-Method` in the preflight request names a method not in `allowed_methods`. Add the method to the list or check the client request.
+   The preflight's `Access-Control-Request-Method` names a method not in `allowed_methods`, or `Access-Control-Request-Headers` names a header not in `allowed_headers`. Add it to the list or check the client request.
 
 3. **Credentials not working with wildcard origins**
 
-   `allow_credentials: true` requires a host-constraining origin policy. Exact wildcard origins log a warning and disable credentials. Opaque exact `null` and an effectively universal prefix or regex (`https://`, `chrome-extension://`, `.*`, `https://.*`, and any hostname-character-class pattern such as `https://[\\w.-]+`) are refused at config load instead of silently dropping credentials. A prefix must terminate at an origin boundary — only the `scheme://host:` form pins the host, because prefix matching is an unbounded `starts_with`; a bare `https://app.example.com`, `https://app.`, or `https://preview-` is refused. Specify `{exact: ...}`, the native `*.example.com` wildcard-subdomain form, an anchored host-constraining regex, or a `scheme://host:` prefix to enable credentials.
+   `allow_credentials: true` requires a host-constraining origin policy. Exact wildcard origins log a warning and disable credentials; opaque exact `null` and effectively universal prefixes or regexes (including any prefix other than `scheme://host:`) are refused at config load. See [Credentials and Wildcard Origins](#credentials-and-wildcard-origins) for the accepted forms.
 
 4. **CORS headers missing on responses**
 
-   The plugin only adds response headers when the request includes an `Origin` header. Requests without `Origin` (same-origin or non-browser clients) pass through without CORS headers.
+   The plugin adds `Access-Control-*` response headers only when the request includes an `Origin` header. Requests without `Origin` (same-origin or non-browser clients) pass through without them (only `Vary: Origin` is added).
 
 5. **Preflight requests reaching the backend**
 
@@ -519,7 +517,7 @@ Look for log lines starting with `cors:` for preflight approvals, rejections, an
 
 3. **Limit exposed headers.** Only expose response headers that the front-end application actually needs access to via JavaScript.
 
-4. **Use credentials carefully.** `allow_credentials: true` means cookies and authorization headers are sent on cross-origin requests. Only enable this when your front-end application requires it, and always pair it with a host-constraining origin policy. Exact `*` drops credentials; opaque exact `null` and an effectively universal prefix or regex are refused. Prefer `{exact: ...}`, the native `*.example.com` wildcard-subdomain form, or an anchored host-constraining regex; a prefix is host-constraining only in the `scheme://host:` form.
+4. **Use credentials carefully.** `allow_credentials: true` means cookies and authorization headers are sent on cross-origin requests. Only enable this when your front-end application requires it, and always pair it with a host-constraining origin policy (see [Credentials and Wildcard Origins](#credentials-and-wildcard-origins)).
 
 5. **Do not treat `cors_origin` metadata as authorization.** The plugin may write `ctx.metadata["cors_origin"]` as an observability mirror. The matched origin used for `Access-Control-Allow-Origin` and trailer ownership lives in private request state; later plugins cannot change the reflected origin by mutating or deleting that metadata key.
 

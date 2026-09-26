@@ -28,17 +28,17 @@ Ferrum Edge is in active build-out with no deployed-user compatibility obligatio
 ```bash
 ferrum-edge run [OPTIONS]
 ferrum-edge validate [OPTIONS]
-ferrum-edge reload [--pid PID]
+ferrum-edge reload [-p/--pid PID]
 ferrum-edge version [--json]
-ferrum-edge health [-p PORT] [--host H] [--tls] [--tls-no-verify] [--live]
-ferrum-edge ambient-udp-preflight [-s PATH] [--timeout-seconds N] [-v]
+ferrum-edge health [-s PATH] [-p PORT] [--host H] [--tls] [--tls-no-verify] [--live]
+ferrum-edge ambient-udp-preflight [-s PATH] [--timeout-seconds N] [--host-proc-root PATH] [-v]
 ```
 
 `ambient-udp-preflight` is the privileged one-shot Ambient UDP node preflight: it removes
 superseded UDP capture placements on this node and publishes the node-scoped cleanup proof the
 host placement requires before it serves.
 
-`run`/`validate` flags: `-s/--settings <PATH>`, `-c/--spec <PATH>`, `-m/--mode <MODE>`, `-v/--verbose`. Precedence is CLI > env > conf file > smart defaults > hardcoded. CLI flags become env vars through `apply_run_overrides()` / `apply_validate_overrides()` before `CONF_FILE_CACHE` reads in `main.rs`.
+`run`/`validate` flags: `-s/--settings <PATH>`, `-c/--spec <PATH>`, `-m/--mode <MODE>`, `--fips-mode <off|enforce>`, `-v/--verbose`; `validate` also takes `--allow-empty-namespace`. Precedence is CLI > env > conf file > smart defaults > hardcoded. CLI flags become env vars through `apply_run_overrides()` / `apply_validate_overrides()` (`src/cli.rs`) before anything reads `CONF_FILE_CACHE`; the startup pipeline is `run_gateway_cli()` in `src/gateway_entry.rs`, which `src/main.rs` includes.
 
 ```bash
 cargo build
@@ -57,7 +57,7 @@ Prerequisite: `protoc`; `build.rs` runs `tonic_build` on `proto/ferrum.proto`.
 
 Test what changed and let CI run the full matrix. For Rust changes, run `cargo fmt --all -- --check`, targeted clippy, and relevant tests. Docs/comment-only changes usually need `git diff --check`. Config/schema/spec/template changes need validation of the changed surface and Rust checks only if Rust changed.
 
-Target by scope: public APIs use `cargo test --test <unit target> <filter>` (the unit suite is four targets: `unit_tests` for config/admin/tls/identity/secrets/cli, `unit_plugins_a_tests` and `unit_plugins_b_tests` for plugin test files starting a–j / k–z, `unit_gateway_core_tests` for core runtime; `cargo test unit::plugins::cors_tests` searches every target); cross-module behavior uses `cargo test --test integration_tests <filter>`; proxy hot-path changes use `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`. Avoid adding new inline source tests; prefer external unit tests, integration tests, or focused test-only helpers under `tests/`.
+Target by scope: public APIs use `cargo test --test <unit target> <filter>` (the unit suite is four targets: `unit_tests` for config/admin/tls/identity/secrets/cli/notifications/util, `unit_plugins_a_tests` / `unit_plugins_b_tests` for plugin test files a–j / k–z, `unit_gateway_core_tests` for core runtime; a bare `cargo test unit::plugins::cors_tests` searches every target); cross-module behavior uses `cargo test --test integration_tests <filter>`; proxy hot-path changes use `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`. Avoid adding new inline source tests; prefer external unit tests, integration tests, or focused test-only helpers under `tests/`.
 
 Run the full local suite only for shared infrastructure, cross-module refactors, pre-release work, or when CI is congested. Leave `CARGO_TARGET_DIR` unset across parallel worktrees; inside one workspace, run fmt, clippy, and tests sequentially.
 
@@ -97,7 +97,7 @@ Run the full local suite only for shared infrastructure, cross-module refactors,
 
 ## Startup And Shutdown
 
-Startup order: jemalloc on non-Windows, CLI parse/env overrides, rustls ring provider, external secret resolution on a single-threaded runtime, non-blocking tracing stdout, `validate` exit point, `overload::raise_fd_limit()`, `EnvConfig` parse, multi-threaded tokio, mode dispatch, SIGINT/SIGTERM via `watch::channel`.
+Startup order: jemalloc on non-Windows, CLI parse/env overrides, rustls crypto provider (ring, or AWS-LC FIPS on a `--features fips` build), external secret resolution on a single-threaded runtime, non-blocking tracing stdout, `validate` exit point, `overload::raise_fd_limit()`, `EnvConfig` parse, multi-threaded tokio, mode dispatch, SIGINT/SIGTERM via `watch::channel`.
 
 Serving modes initialize TLS policy, frontend/admin TLS, DTLS, backend TLS validation, CP/DP gRPC TLS, stream port validation, stream listener binds, DNS warmup, optional pool warmup, and overload monitoring. Stream listener bind is fatal in database/file mode and non-fatal in DP.
 
@@ -106,18 +106,14 @@ Graceful shutdown: stop accept loops, set `OverloadState.draining=true`, add `Co
 ## Runtime And Admin Invariants
 
 - Port `0` on proxy/admin HTTP ports or inside `FERRUM_CP_GRPC_LISTEN_ADDR` disables plaintext and is excluded from `reserved_gateway_ports()`.
-- Admin API validates JWTs but never mints them. DB/CP require `FERRUM_ADMIN_JWT_SECRET` >= 32 chars; file mode generates a random read-only secret at startup.
-- `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` makes namespace-scoped admin routes require a JWT `ns` claim (same shapes as the CP/DP gRPC plane) authorizing the `X-Ferrum-Namespace` value; default off keeps the header a routing selector. Enforcement lives in `src/admin/mod.rs` (`is_namespace_scoped_route` + `enforce_namespace_claim`); malformed `ns` claims fail closed at authentication.
-- Observability endpoints are tiered by default: `/live` is always unauthenticated and minimal (`{"status":"ok"}`); `/health`+`/status` return only `status`+`ready` unauthenticated and full diagnostics only when authenticated; `/overload` returns a coarse `{level}` unauthenticated and the full snapshot only when authenticated; `/metrics` returns `401` unless authenticated. "Authenticated" = valid admin JWT OR matching `FERRUM_METRICS_BEARER_TOKEN` OR a `FERRUM_METRICS_ALLOWED_CIDRS` source IP (`MetricsAuthPolicy` / `observability_detail_allowed` in `src/admin/mod.rs`). Do not regress these surfaces back to unauthenticated detail.
-- `/health` DB check remains cached 15s via lock-free `ArcSwap`; refreshes are single-flight (`AdminState.db_health_refresh`, `cached_db_health_connected`) with a 5s probe timeout; do not expose the DB pool to unauthenticated floods.
-- `/metrics/runtime` JSON remains JWT-authenticated and cached via lock-free `ArcSwap`.
-- `GET /cluster` is JWT-authenticated: CP returns connected DPs; DP returns CP connection state.
+- Admin API validates JWTs but never mints them. DB/CP require `FERRUM_ADMIN_JWT_SECRET` >= 32 chars; file mode generates a random read-only secret at startup when it is unset.
+- Admin observability endpoints (`/live`, `/health`, `/status`, `/overload`, `/metrics`) are tiered: unauthenticated callers get only minimal status, never diagnostic detail. Do not regress them to unauthenticated detail or let unauthenticated probes reach the DB pool. Details: `.claude/rules/admin-api-specs.md`.
 - Overload manager uses atomic load-shedding flags, RED between thresholds, and `CachePadded` hot atomics. Do not collapse hot flags/counters onto shared cache lines.
 - External secret suffixes resolve before config load: `_VAULT`, `_AWS`, `_AZURE`, `_GCP`, `_FILE`. Provider conflicts for one base key are errors.
 
 ## Source Layout
 
-- `src/{main,cli,startup}.rs`: CLI, startup, mode dispatch, signals
+- `src/{main,gateway_entry,cli,startup}.rs`: CLI, startup, mode dispatch, signals
 - `src/admin/`: REST API, JWT, backup/audit, API specs
 - `src/config/`: domain model, env config, file/db loaders, migrations, validation
 - `src/modes/`: database/file/cp/dp/mesh/injector/node-agent/migrate runtimes
@@ -125,7 +121,7 @@ Graceful shutdown: stop accept loops, set `OverloadState.draining=true`, add `Co
 - `src/plugins/`, `custom_plugins/`: plugin trait, built-ins, custom plugin loading
 - `src/grpc/`, `proto/`: CP/DP and mesh gRPC APIs
 - `src/tls/`, `src/secrets/`, `src/identity/`: TLS, secret resolution, SPIFFE/SVID identity
-- `src/{overload,load_balancer,health_check,circuit_breaker,retry,pool,connection_pool,router_cache,plugin_cache,consumer_index}.rs`: shared runtime infrastructure
+- `src/{overload,load_balancer,health_check,circuit_breaker,retry,connection_pool,router_cache,plugin_cache,consumer_index}.rs`, `src/pool/`: shared runtime infrastructure
 - `tests/{unit,integration,functional,conformance,performance}/`: test suites and protocol benchmarks
 
 ## Environment References

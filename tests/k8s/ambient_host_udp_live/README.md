@@ -57,9 +57,8 @@ differ from the parent-captured identity and from `/proc/1/ns/net`. An
 environment flag such as `FERRUM_HOST_UDP_LIVE_IN_OUTER_NETNS` is never accepted
 as proof (operators can forge it on the host).
 
-The hosted workflow also wraps execution in `unshare --net` explicitly. That
-defense-in-depth layer composes with the runner's own outer netns; the trusted
-relevance / `changes` job is untouched.
+The hosted workflow additionally wraps the run step in `unshare --net` as
+defense in depth; the runner still creates its own outer netns inside it.
 
 Contract details:
 

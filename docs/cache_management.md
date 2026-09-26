@@ -10,6 +10,7 @@ Ferrum Edge uses several in-memory caches to achieve lock-free, zero-allocation 
   - [DNS Cache](#dns-cache)
   - [Status Code Counters](#status-code-counters)
   - [Per-IP Request Counters](#per-ip-request-counters)
+  - [Per-IP WebSocket Session Counters](#per-ip-websocket-session-counters)
   - [Circuit Breaker Cache](#circuit-breaker-cache)
   - [Health Check State](#health-check-state)
 - [Plugin Caches](#plugin-caches)
@@ -24,6 +25,7 @@ Ferrum Edge uses several in-memory caches to achieve lock-free, zero-allocation 
   - [Request Deduplication](#request-deduplication)
   - [SOAP WS-Security Nonce Cache](#soap-ws-security-nonce-cache)
   - [LDAP Auth Cache](#ldap-auth-cache)
+  - [OAuth2 Introspection Cache](#oauth2-introspection-cache)
   - [JWKS Cache](#jwks-cache)
   - [TCP Connection Throttle](#tcp-connection-throttle)
   - [API Chargeback](#api-chargeback)
@@ -46,13 +48,13 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### Router Cache
 
-**What it stores:** Resolved `(host, path) -> proxy` lookup results, including negative lookups (no route matched). Separate partitions for prefix and regex matches.
+**What it stores:** Resolved `(host, path) -> proxy` lookup results, including negative lookups (no route matched). Separate partitions for prefix and regex/exact-path matches. See [Request Routing](routing.md#cache-architecture).
 
-**Default limit:** Auto-scales as `max(10_000, proxies x 3)`.
+**Default limit:** Auto-scales as `proxies x 3`, clamped to `[10_000, 1_000_000]`.
 
 **Env var:** `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (set to 0 for auto-scaling, or an explicit value to cap memory).
 
-**Cleanup mechanism:** When the cache exceeds the max, a `DashMap::retain()` sweep evicts the oldest entries. The cache is rebuilt entirely on config reload.
+**Cleanup mechanism:** When a partition reaches the max, frequency-aware sample eviction removes the least-frequently-used entry from a bounded sample. Entries are tagged with the route-table generation, so a config reload invalidates every cached result.
 
 ### DNS Cache
 
@@ -108,7 +110,7 @@ When the cache reaches the max entry count, new circuit breaker entries for prev
 
 ### Health Check State
 
-**What it stores:** Active probe results (shared per-upstream) and passive failure counters (isolated per-proxy). See the Health Check Architecture section in CLAUDE.md for the full two-layer design.
+**What it stores:** Active probe results (shared per-upstream) and passive failure counters (isolated per-proxy). See [Health Checks](load_balancing.md#health-checks) for the full two-layer design.
 
 **Default limit:** No hard entry cap -- bounded by the number of configured upstreams and proxies.
 
@@ -294,7 +296,7 @@ at construction without disclosing credentials.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRUM_ROUTER_CACHE_MAX_ENTRIES` | `0` (auto) | Router lookup cache size. `0` = auto-scale as `max(10_000, proxies x 3)` |
+| `FERRUM_ROUTER_CACHE_MAX_ENTRIES` | `0` (auto) | Router lookup cache size. `0` = auto-scale as `proxies x 3`, clamped to `[10_000, 1_000_000]`; explicit values are clamped to `[1_000, 10_000_000]` |
 | `FERRUM_DNS_CACHE_MAX_SIZE` | `10000` | Maximum DNS cache entries |
 | `FERRUM_DNS_TTL_OVERRIDE_SECONDS` | Disabled | Global DNS TTL override (native record TTL used by default) |
 | `FERRUM_DNS_MIN_TTL_SECONDS` | `5` | Minimum TTL floor for DNS records |

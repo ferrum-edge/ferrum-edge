@@ -300,7 +300,7 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key
 | `POST /batch` (all-or-nothing config graph) | **Rejected with `501` before any mutation** | Supported — the whole graph commits in one transaction |
 | `POST`/`PUT`/`DELETE /namespaces` (registry CRUD) | **Rejected with `501` before any mutation** | Supported — the whole tenant mutation commits in one transaction |
 | Change-stream-triggered config reloads | Not available (periodic polling only) | Available, opt-in via `FERRUM_MONGO_CHANGE_STREAM_ENABLED` |
-| Read preference routing | Not available | Available |
+| Read preference routing | Not available | Available to other clients (Ferrum's config store always reads from the primary) |
 | Automatic failover | Not available | Automatic |
 
 For production, a **replica set is strongly recommended**. Setting `FERRUM_MONGO_REPLICA_SET` (or `?replicaSet=...` in the connection string) enables true multi-document ACID transactions for `delete_proxy` / `update_proxy` — the proxy document, its proxy-scoped plugin configs, API-spec owner metadata and generated upstreams when applicable, config-change records, and the orphaned-proxy_group cleanup all commit atomically.
@@ -323,9 +323,9 @@ fails atomically (nothing applied), so split very large imports into several
 Without a replica set, hand-managed proxies still use a fail-safe sequential
 ordering: the proxy document is deleted **before** its plugin configs, so a
 partial failure can only leave orphaned plugin configs (no proxy references
-them). Orphans are recoverable; the previous order — plugin configs first —
-could leave a proxy in the DB referencing now-deleted plugin_config IDs, which
-validation rejects on every subsequent polling cycle until manually cleaned up.
+them). Orphans are recoverable; the reverse order could leave a proxy
+referencing deleted plugin_config IDs, which validation would reject on every
+polling cycle until manually cleaned up.
 
 Namespace registry CRUD (`POST /namespaces`, `PUT /namespaces/{name}`,
 `DELETE /namespaces/{name}`, issue #3955) has the same requirement. A rename or
@@ -343,12 +343,10 @@ do not reseed a deleted default. Startup does not materialize resource-derived
 names or maintain a compatibility marker. This single-document initialization
 also works on standalone MongoDB; registry CRUD still requires a replica set.
 
-Registry
-lookups and vacancy checks scan both durable `_id` and embedded `name`, then
-require them to agree; a split identity is typed corruption, never an absent
-name that create or rename may reuse. Confirmed cascade delete scans both the
-embedded
-`namespace` field and the durable key identity for consumers, the consumer
+Registry lookups and vacancy checks scan both durable `_id` and embedded `name`,
+then require them to agree; a split identity is typed corruption, never an
+absent name that create or rename may reuse. Confirmed cascade delete scans both
+the embedded `namespace` field and the durable key identity for consumers, the consumer
 identity index, and the gateway trust bundle, and aborts as typed registry
 corruption if those identities disagree, so a key-only or mismatched document
 cannot be ignored or deleted under the wrong tenant. Rename uses the same
@@ -370,14 +368,13 @@ operations return `501 Not Implemented` before touching anything and name
 `GET /namespaces` and `GET /namespaces/{name}` remain available, and SQL
 backends are unaffected.
 
-`POST /restore` shares that strict cascade. Its destructive clear no longer
-issues a blind `delete_many` over `consumers` and `consumer_identity_index`: it
-validates each document's durable `_id = "{namespace}:{suffix}"` against the
-embedded `namespace` and identity value first, and deletes only the identities it
-validated. This is a **behavior change on an existing endpoint** — a split
-identity that only a hand-edited database or an out-of-band writer can produce
-now aborts the restore as typed registry corruption (redacted `500`, rolled back,
-prior configuration retained) instead of being deleted blindly. Deleting a
+`POST /restore` shares that strict cascade. Its destructive clear of `consumers`
+and `consumer_identity_index` validates each document's durable
+`_id = "{namespace}:{suffix}"` against the embedded `namespace` and identity
+value first, and deletes only the identities it validated. A split identity
+(which only a hand-edited database or an out-of-band writer can produce) aborts
+the restore as typed registry corruption (redacted `500`, rolled back, prior
+configuration retained) instead of being deleted blindly. Deleting a
 document whose durable key belongs to another tenant would be a cross-tenant
 deletion, and ignoring it would leave the target namespace half-cleared before
 the import, so this check is deliberately fail-closed. Repair or deliberately
@@ -391,7 +388,7 @@ description or registry timestamps into the authenticated target namespace. See
 A direct `DELETE /proxies/{id}` for an API-spec-owned proxy is different: its
 ownership cascade spans the proxy, scoped plugins, the `api_specs` owner
 document, generated upstreams, and their `config_changes`. Standalone MongoDB
-now returns `501 Not Implemented` before the first ownership-graph mutation and
+returns `501 Not Implemented` before the first ownership-graph mutation and
 names `FERRUM_MONGO_REPLICA_SET` (or the `replicaSet` URL option) as the
 remediation. The response is redacted and no resource IDs, BSON documents, or
 database URL are exposed. Ordinary hand-managed proxy deletion remains
@@ -588,10 +585,9 @@ _id = "{namespace}:{id}"
 
 matching the SQL `PRIMARY KEY (namespace, id)`. The namespace charset forbids
 `:`, so the first `:` is an unambiguous delimiter and no two `(namespace, id)`
-pairs can collide. `consumers` has used this shape since issue #2121; the other
-four adopted it in issue #4627 so a resource id is unique **per namespace**
-rather than globally: two tenants may each own a `payments` upstream, and one
-tenant can no longer reserve an id another tenant needs.
+pairs can collide. A resource id is therefore unique **per namespace** rather
+than globally: two tenants may each own a `payments` upstream, and one tenant
+cannot reserve an id another tenant needs.
 
 The serde-serialized `id` and `namespace` fields remain in every document, and
 every read strips `_id` before deserializing. **Hand-written queries and
@@ -675,10 +671,9 @@ If you insert `config_changes` documents by hand, write
 double is accepted for compatibility with that shell default, but `NumberLong`
 is the type Ferrum stores and the one to use.
 
-A `sequence` value that no reader can decode no longer wedges the gateway. The
+A `sequence` value that no reader can decode does not wedge the gateway: the
 full-reload fallback logs a warning and continues with a `0` watermark rather
 than aborting, so fresh config is still published; the next incremental poll
 re-reads the retained change log.
-
 
 Standalone MongoDB does not provide multi-document transactions, so resource writes and their `config_changes` records cannot be made crash-atomic. Ferrum therefore forces standalone MongoDB pollers through the full-load fallback path instead of accepting an incremental cursor that could miss a resource mutation whose change record was not committed.

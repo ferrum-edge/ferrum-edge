@@ -1,15 +1,15 @@
 # Admin API: Runtime Metrics
 
-The Ferrum Edge Admin API exposes a comprehensive runtime metrics endpoint that provides a real-time snapshot of the gateway's internal state. This endpoint is designed for building dashboards, monitoring integrations, and operational visibility.
+`GET /admin/metrics` returns a JSON snapshot of the gateway's internal runtime state for dashboards and monitoring integrations. This page also summarizes the related `/metrics`, `/live`, and `/health` endpoints.
 
-For the DOC-10 executable Prometheus family contract — exact names, types, HELP text, stable label keys, owning subsystem, and bundled alert/dashboard classification — see [prometheus_metrics.md](prometheus_metrics.md) and the machine-readable inventory [`prometheus_metric_contract.json`](prometheus_metric_contract.json).
+For the full Prometheus family reference (exact names, types, HELP text, label keys, owning subsystem, and bundled alert/dashboard coverage) see [prometheus_metrics.md](prometheus_metrics.md) and the machine-readable inventory [`prometheus_metric_contract.json`](prometheus_metric_contract.json).
 
 ## Overview
 
 | Endpoint | Method | Auth | Cache | Description |
 |----------|--------|------|-------|-------------|
 | `/live` | GET | None | None | Liveness probe — always `{"status":"ok"}`, no internals |
-| `/admin/metrics` | GET | JWT required | 5-second TTL | Comprehensive runtime metrics (JSON) |
+| `/admin/metrics` | GET | JWT required | 5-second TTL | Runtime state snapshot (JSON) |
 | `/metrics` | GET | JWT / metrics token / allowed CIDR | 5-second TTL (configurable via `render_cache_ttl_seconds`); process-static families are exempt — see below | Prometheus exposition format, including request, AI token/cost, and TLS certificate metrics |
 | `/health` | GET | None (tiered) | None | `status`+`ready` unauthenticated; full diagnostics require auth |
 
@@ -46,8 +46,21 @@ transition.
 
 ### Metrics vs Prometheus vs Health
 
-- **`/admin/metrics`** — Rich JSON with connection pools, circuit breakers, health checks, cache stats, load balancer state, consumer index breakdown, rate limiter counters, and database rejected-delta polling state in database mode. Ideal for custom dashboards.
-- **`/metrics`** — Prometheus text format with per-proxy request counters (bounded standard-method/`OTHER` labels and terminal `grpc_status` for gRPC), process log-sink health/queue/loss/I/O counters, latency histograms, WebSocket session/duration/traffic families, AI usage families (`ferrum_ai_prompt_tokens_total`, `ferrum_ai_completion_tokens_total`, `ferrum_ai_tokens_total`, and `ferrum_ai_estimated_cost_currency_units_total`), fixed-cardinality JWKS trust families (`ferrum_jwks_trust_stores`, `ferrum_jwks_trust_age_seconds`, `ferrum_jwks_refresh_failures_total`, and `ferrum_jwks_consecutive_failures`, labeled only by closed trust state or failure class and never by URL/`kid`/token/claim/key data), the aggregate built-in rate-limit rejection counter, label-safe `request_mirror` lifecycle counters (`ferrum_request_mirror_{dispatched,completed,request_timeouts,request_failures,drain_timeouts,drain_failures,drain_truncations,cancellations,concurrency_drops,budget_drops}_total` — no URLs, header names, or plugin IDs), bounded-cardinality notification delivery counters/gauges (`ferrum_notification_delivery_{attempted,succeeded,failed_transient,failed_permanent,backpressure_dropped,abandoned_at_deadline}_total` and `ferrum_notification_delivery_in_flight` labeled only by fixed `channel_type` ∈ {slack,teams,discord,webhook,email}, plus `ferrum_notification_delivery_rejected_total` and `ferrum_notification_delivery_abandoned_total` which add a fixed compiled-in `reason` label — no operator channel names, endpoint URLs, or peer-supplied strings ever become labels), TLS certificate inventory gauges (`ferrum_tls_cert_expiry_seconds`, `ferrum_tls_cert_not_before_seconds`) served from a cached, non-secret inventory snapshot with explicit freshness (`ferrum_tls_inventory_snapshot_timestamp_seconds`, `ferrum_tls_inventory_snapshot_max_age_seconds`) — a scrape performs no certificate, private-key, Kubernetes, HSM, or cloud-secret I/O and never blocks on a provider; the snapshot is refreshed by a bounded single-flight background task governed by `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS`, certificate rotation counters (`ferrum_tls_cert_rotations_total`), TLS source watcher outcomes (`ferrum_tls_source_refresh_total`), source fetch duration histograms (`ferrum_tls_source_fetch_duration_seconds`), source fetch failure counters (`ferrum_tls_source_fetch_failures_total`), bounded database rejected-delta metrics (`ferrum_database_delta_rejections_total`, `ferrum_database_delta_backoff_bucket`, `ferrum_database_delta_forced_full_reloads_total`, `ferrum_database_delta_recoveries_total`), poll-task freshness (`ferrum_database_poll_last_completed_timestamp_seconds` — advances on every normally completed poll outcome including a handled error, so it detects poll-task death, not a database outage), configuration-source availability and bounded poll-failure reasons (`ferrum_database_config_source_connected`, `ferrum_database_poll_failures_total{reason}` with `reason` ∈ {connectivity, validation_rejected, migration_gate} — the outage signal, fed from the same shared flag the admin API uses to gate writes), the fixed-cardinality MongoDB config-change watcher families when enabled (`ferrum_database_change_stream_connected`, `ferrum_database_change_stream_degraded_reason{reason}`, `ferrum_database_change_stream_events_total`, `ferrum_database_change_stream_reconnects_total`, `ferrum_database_change_stream_invalidations_total`, `ferrum_database_change_stream_history_losses_total`), fixed-cardinality DP ConfigSync lifecycle metrics (`ferrum_configsync_delta_rejections_total`, `ferrum_configsync_divergence_recoveries_total`, `ferrum_configsync_diverged`, `ferrum_configsync_fenced_full_snapshots_total`), admin connection-limiter metrics (`ferrum_admin_active_connections`, `ferrum_admin_max_connections`, `ferrum_admin_rejected_connections_total{reason}`), CP gRPC pre-authentication connection-limiter metrics (`ferrum_cp_grpc_active_connections`, `ferrum_cp_grpc_max_connections`, `ferrum_cp_grpc_max_connections_per_ip`, `ferrum_cp_grpc_rejected_connections_total{reason}` — control-plane mode only, fixed cardinality), and — when the published configuration includes an active `__mesh_bpf_metrics` instance (NodeWaypoint auto-inject) — the BPF families under the plugin's configured prefix (default `ferrum_mesh_bpf_*`, including fixed-bucket SRTT, SYN-to-ACK, and captured accept-to-first-application-byte latency histograms; stable zeros when no BPF consumer is attached). AI labels are limited to `proxy_id`, a bounded provider family, and the configured namespace; cost retains sub-micro precision during accumulation, then atomically publishes the rounded aggregate in currency units with exactly six decimal places. Requires one globally scoped `prometheus_metrics` plugin. **Gated by default** — see the auth note above; configure a metrics bearer token or an allowed scrape CIDR for Prometheus/Grafana.
+- **`/admin/metrics`** — JSON with connection pools, circuit breakers, health checks, cache stats, load-balancer state, consumer index breakdown, rate-limiter counters, and (in `database` and `cp` modes) database polling state. Use it for custom dashboards.
+- **`/metrics`** — Prometheus text format. Requires one globally scoped `prometheus_metrics` plugin and is **gated by default** (see the auth note above); configure a metrics bearer token or an allowed scrape CIDR for Prometheus/Grafana. Families include:
+  - Per-proxy request counters (bounded standard-method/`OTHER` method labels; terminal `grpc_status` for gRPC), latency histograms, and WebSocket session/duration/traffic families.
+  - AI usage: `ferrum_ai_prompt_tokens_total`, `ferrum_ai_completion_tokens_total`, `ferrum_ai_tokens_total`, `ferrum_ai_estimated_cost_currency_units_total`. Labels are limited to `proxy_id`, a bounded provider family, and the configured namespace. Cost keeps sub-micro precision while accumulating and is published rounded to six decimal places.
+  - JWKS trust: `ferrum_jwks_trust_stores`, `ferrum_jwks_trust_age_seconds`, `ferrum_jwks_refresh_failures_total`, `ferrum_jwks_consecutive_failures`, labeled only by closed trust state or failure class (never URL, `kid`, token, claim, or key data).
+  - The aggregate built-in rate-limit rejection counter.
+  - `request_mirror` lifecycle counters: `ferrum_request_mirror_{dispatched,completed,request_timeouts,request_failures,drain_timeouts,drain_failures,drain_truncations,cancellations,concurrency_drops,budget_drops}_total` (no URLs, header names, or plugin IDs).
+  - Notification delivery: `ferrum_notification_delivery_{attempted,succeeded,failed_transient,failed_permanent,backpressure_dropped,abandoned_at_deadline}_total` and `ferrum_notification_delivery_in_flight`, labeled only by `channel_type` (`slack`, `teams`, `discord`, `webhook`, `email`); `ferrum_notification_delivery_rejected_total` and `ferrum_notification_delivery_abandoned_total` add a fixed `reason` label. Channel names, endpoint URLs, and peer-supplied strings never become labels.
+  - TLS certificates: inventory gauges `ferrum_tls_cert_expiry_seconds` and `ferrum_tls_cert_not_before_seconds`, served from a cached, non-secret snapshot with freshness gauges `ferrum_tls_inventory_snapshot_timestamp_seconds` and `ferrum_tls_inventory_snapshot_max_age_seconds`. A scrape performs no certificate, private-key, Kubernetes, HSM, or cloud-secret I/O; a bounded single-flight background task refreshes the snapshot per `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS`. Also `ferrum_tls_cert_rotations_total`, `ferrum_tls_source_refresh_total`, `ferrum_tls_source_fetch_duration_seconds`, and `ferrum_tls_source_fetch_failures_total`.
+  - Database polling: rejected-delta metrics (`ferrum_database_delta_rejections_total`, `ferrum_database_delta_backoff_bucket`, `ferrum_database_delta_forced_full_reloads_total`, `ferrum_database_delta_recoveries_total`); poll-task freshness `ferrum_database_poll_last_completed_timestamp_seconds` (advances on every normally completed poll, including a handled error, so it detects a dead poll task, not a database outage); and the outage signals `ferrum_database_config_source_connected` and `ferrum_database_poll_failures_total{reason}` with `reason` in `connectivity`, `validation_rejected`, `migration_gate` (fed from the same flag the Admin API uses to gate writes).
+  - MongoDB config-change watcher (when enabled): `ferrum_database_change_stream_connected`, `ferrum_database_change_stream_degraded_reason{reason}`, `ferrum_database_change_stream_events_total`, `ferrum_database_change_stream_reconnects_total`, `ferrum_database_change_stream_invalidations_total`, `ferrum_database_change_stream_history_losses_total`.
+  - DP ConfigSync lifecycle: `ferrum_configsync_delta_rejections_total`, `ferrum_configsync_divergence_recoveries_total`, `ferrum_configsync_diverged`, `ferrum_configsync_fenced_full_snapshots_total`.
+  - Connection limiters: admin (`ferrum_admin_active_connections`, `ferrum_admin_max_connections`, `ferrum_admin_rejected_connections_total{reason}`) and, in `cp` mode only, CP gRPC pre-authentication (`ferrum_cp_grpc_active_connections`, `ferrum_cp_grpc_max_connections`, `ferrum_cp_grpc_max_connections_per_ip`, `ferrum_cp_grpc_rejected_connections_total{reason}`).
+  - Process log-sink health, queue, loss, and I/O counters (see [Process log-sink policy](#process-log-sink-policy)).
+  - Mesh BPF families, when the published configuration includes an active `__mesh_bpf_metrics` instance (NodeWaypoint auto-inject): emitted under the plugin's configured prefix (default `ferrum_mesh_bpf_*`), including fixed-bucket SRTT, SYN-to-ACK, and accept-to-first-application-byte latency histograms. Series report stable zeros when no BPF consumer is attached.
 - **`/live`** / **`/health`** — Liveness and readiness probes for load balancers and orchestrators. Point Kubernetes **liveness** at `/live` (always minimal+unauthenticated) and **readiness** at `/health` (returns `status`+`ready` unauthenticated). Detailed diagnostics — DB connectivity/pool, cached-config counts, `database_polling.status: "degraded"` (a repeatedly rejected incremental delta while serving last known-good config), `database_polling.last_poll_completed_at` (poll-task freshness in database/cp modes), `database_polling.change_stream` (bounded MongoDB change-stream watcher state when enabled — a reload-latency signal that never forces `degraded`), and independent stdout/access-log versus stderr sink health/loss/last-failure state — are returned only to authenticated callers.
 
 ### Process log-sink policy
@@ -87,12 +100,12 @@ Requires a valid JWT in the `Authorization: Bearer <token>` header. This endpoin
 
 ### Caching
 
-The response is cached for **5 seconds** to avoid performance overhead from frequent polling. The `X-Cache` response header indicates whether the response was served from cache:
+The response is cached process-wide for **5 seconds**. The `X-Cache` response header shows whether it came from the cache:
 
-- `X-Cache: hit` — Served from the 5-second cache
+- `X-Cache: hit` — Served from the cache
 - `X-Cache: miss` — Freshly computed (first request or cache expired)
 
-This means polling more frequently than every 5 seconds will return the same data. For dashboards, a 5–10 second refresh interval is recommended.
+Polling more often than every 5 seconds returns the same data.
 
 ### Example Request
 
@@ -290,7 +303,7 @@ Top-level gateway info and throughput counters.
 | `requests_per_second` | integer | Average requests per second over the last metrics window |
 | `status_codes_per_second` | object | Average per-second rate of each HTTP status code over the last metrics window |
 | `metrics_window_seconds` | integer | Window size in seconds used for per-second rate calculations (configurable via `FERRUM_STATUS_METRICS_WINDOW_SECONDS`, default 30) |
-| `config_last_updated_at` | string (RFC 3339) | Timestamp of the last successful config load/reload. `null` in CP mode without proxy state |
+| `config_last_updated_at` | string (RFC 3339) | Timestamp of the last successful config load/reload. `null` in `cp` and `node_agent` modes (no proxy state) |
 | `config_source_status` | string | Lock-free snapshot of the DB config source: `"online"` when a DB-backed mode reports `db_available=true` (configured and dynamically reachable), `"offline"` when a configured DB is unavailable (`db_available=false`), and `"n/a"` when the mode has no DB-backed config source (`file`, `dp`, `mesh`, `node_agent`). Control-plane (`cp`) reports `online`/`offline` even though `proxy_state` is absent. Never derived from a per-request database probe. |
 | `proxy_count` | integer | Number of proxy routes in the active config |
 | `consumer_count` | integer | Number of consumers in the active config |
@@ -314,7 +327,7 @@ The `http` pool has additional detail fields:
 |-------|-------------|
 | `total_pools` | Distinct backend pool entries |
 | `max_idle_per_host` | Max idle connections kept per host (`FERRUM_POOL_MAX_IDLE_PER_HOST`) |
-| `idle_timeout_seconds` | Seconds before idle connections are evicted |
+| `idle_timeout_seconds` | Seconds before idle connections are evicted (`FERRUM_POOL_IDLE_TIMEOUT_SECONDS`) |
 | `entries_per_host` | Map of pool key to connection count |
 
 ### `circuit_breakers`
@@ -419,6 +432,35 @@ Pre-built hash map indexes for O(1) credential lookup during authentication. The
 - A `tracked_key_count` approaching 100K may indicate a DDoS or scanner generating many unique source IPs
 - Under normal traffic, this count should correlate with the number of unique clients in your active window duration
 
+### `tcp_connection_throttle`
+
+Static description of how the `tcp_connection_throttle` plugin enforces limits.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enforcement_scope` | string | Always `process_local`: connection counters live only in this process |
+| `replica_limit_behavior` | string | Always `configured_limit_per_replica`: each replica enforces the configured limit independently, so the deployment-wide allowance can reach the limit multiplied by the number of replicas receiving that client's connections |
+
+### `database_polling`
+
+Present only in `database` and `cp` modes, once the database poll loop has registered its metrics. Omitted in every other mode. The field shapes are defined by the `DatabaseDeltaPollingMetrics` schema in [`openapi.yaml`](../openapi.yaml).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `config_source_connected` | boolean | Whether the config database is currently reachable. Same flag as `/health` `database.available` and the `ferrum_database_config_source_connected` gauge |
+| `poll_failures_by_reason` | object | Poll failure counts keyed by `connectivity`, `validation_rejected`, `migration_gate` (every key always present) |
+| `rejected_deltas_total` | integer | Incremental config deltas rejected by validation |
+| `rejected_deltas_by_resource_category` | object | Rejections keyed by `none`, `proxy`, `consumer`, `plugin_config`, `upstream`, `mixed` |
+| `consecutive_identical_rejections` | integer | Consecutive rejections of the same delta |
+| `current_backoff_bucket` | string | One of `none`, `lt_5s`, `lt_30s`, `lt_5m`, `gte_5m`, `max` |
+| `current_backoff_seconds` | integer | Current retry backoff after a rejected delta |
+| `forced_full_reloads_total` | integer | Full config reloads forced after delta rejections |
+| `recoveries_total` | integer | Times polling left the `degraded` state |
+| `last_resource_category` | string | Resource category of the most recent rejection |
+| `last_poll_completed_at` | string (RFC 3339) | *(optional)* Last normally completed poll, including handled errors. Absent until the first poll finishes |
+| `degraded` | object or null | Set while a rejected delta keeps the gateway on its last known-good config; `null` otherwise |
+| `change_stream` | object | *(optional)* MongoDB config-change watcher state; present only when a watcher is running |
+
 ## Dashboard Tips
 
 ### Key Indicators to Monitor
@@ -437,16 +479,17 @@ Pre-built hash map indexes for O(1) credential lookup during authentication. The
 
 ### Polling Interval
 
-The endpoint caches responses for 5 seconds, so polling faster than every 5 seconds wastes bandwidth without gaining fresher data. A **10-second interval** is a good default for dashboards.
+Because responses are cached for 5 seconds, a **10-second interval** is a good default for dashboards.
 
 ### Modes without proxy state
 
-In Control Plane (`cp`) and node-agent (`node_agent`) modes, the process has no proxy state. The response returns zero values for runtime counters, empty `connection_pools` / `caches` objects, and still reports `gateway.mode`. Mesh mode serves the full proxy-backed payload with `gateway.mode` set to `mesh`.
+Control Plane (`cp`) and node-agent (`node_agent`) processes have no proxy state. Their response zeroes the runtime counters (including `uptime_seconds` and `metrics_window_seconds`), returns empty `connection_pools` and `caches` objects, sets `config_last_updated_at` to `null`, and still reports `gateway.mode` and `ferrum_version`. `cp` still reports `config_source_status` as `online`/`offline` and includes `database_polling`. Mesh mode serves the full proxy-backed payload with `gateway.mode` set to `mesh`.
 
-The default-off `bench-pool-profile` build adds the fixed integer-only
-`ferrum_pool_profile_*` schema to the same authenticated `/metrics` response.
-It retains the H1 observer contract, without a new allocator or labels. See
-[pool profiling coverage and completeness](pool_internal_profile.md) and
-`tests/performance/multi_protocol/pool_profile_schema.json` for phase/outcome,
-sampling, loss, tail and observer-cost meanings. Poll duration is elapsed
-execution, not CPU time or stream-credit wait.
+### Pool profiling build
+
+Builds with the default-off `bench-pool-profile` Cargo feature add the fixed, integer-only
+`ferrum_pool_profile_*` families to the same authenticated `/metrics` response.
+See [pool profiling coverage and completeness](pool_internal_profile.md) and
+`tests/performance/multi_protocol/pool_profile_schema.json` for what each
+phase, outcome, sampling, loss, and tail field means. Poll duration is elapsed
+execution time, not CPU time or stream-credit wait.

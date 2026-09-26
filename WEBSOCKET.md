@@ -12,7 +12,7 @@ WebSocket requests are classified once by `detect_http_flavor()` and routed sepa
 | HTTP/2 | Extended CONNECT with `:protocol=websocket` (RFC 8441) | `200 OK` (no H1 upgrade headers) |
 | HTTP/3 | Extended CONNECT with `:protocol=websocket` (RFC 9220) | `200 OK` over QUIC DATA frames |
 
-The H3 frontend is gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default: `true`). When disabled, the H3 listener does not advertise Extended CONNECT support and returns `501` to WebSocket CONNECT requests. See [FEATURES.md](FEATURES.md) and [docs/http3.md](docs/http3.md).
+The H3 frontend is gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default: `true`). When disabled, WebSocket CONNECT requests over H3 get `501`, and the listener stops advertising Extended CONNECT unless CONNECT-UDP is enabled. See [FEATURES.md](FEATURES.md) and [docs/http3.md](docs/http3.md).
 
 Client-to-server frame masking is RFC 6455 §5.1 on all three frontends. RFC 8441 §5 and RFC 9220 §3 bootstrap the session over a CONNECT stream and then hand it to RFC 6455 unchanged, so there is no HTTP/2 or HTTP/3 masking exemption: the gateway unmasks masked client frames before the frame plugins run, re-encodes them under the backend transport's own role, and closes a client that sends an unmasked frame with `1002`.
 
@@ -22,7 +22,7 @@ Common path after classification:
 2. **Authentication & Authorization** - All WebSocket connections go through the full plugin authentication and authorization pipeline, the same pipeline used for HTTP requests
 3. **Handshake** - H1 returns `101 Switching Protocols`; H2/H3 Extended CONNECT returns `200 OK`
 4. **Connection takeover** - H1 extracts `OnUpgrade` and spawns the relay task; H2/H3 open the tunneled stream directly
-5. **Bidirectional forwarding** - `handle_websocket_proxying()` splits both client and backend streams, forwarding messages in both directions via `tokio::select!`
+5. **Bidirectional forwarding** - `run_websocket_proxy()` relays frames in both directions between the client and backend streams
 
 ```
 Client <--ws--> Gateway <--ws/wss--> Backend
@@ -32,7 +32,7 @@ The gateway terminates the client WebSocket connection and opens a separate conn
 
 ## TLS for `wss://` Backends
 
-Backend `wss://` dials build a `rustls` client config through `build_websocket_tls_connector()` (same `BackendTlsConfigBuilder` / `build_root_cert_store` path as HTTP/HTTPS backends) and connect via Ferrum's own dial path: TCP is opened first, the byte-level `WsActivityIo` idle adapter is installed under TLS, then `client_async_tls_with_config()` completes the handshake on that stream. Ferrum deliberately does **not** use `connect_async_tls_with_config()` — that helper dials TCP internally and cannot install the idle adapter beneath the TLS layer.
+Backend `wss://` dials use a `rustls` client config from `get_websocket_tls_config_for_backend()` (built with the same `BackendTlsConfigBuilder` as HTTP/HTTPS backends and cached per TLS identity). Ferrum opens the TCP connection itself, installs the byte-level `WsActivityIo` idle adapter under TLS, then completes the handshake with `client_async_tls_with_config()`. It does **not** use `connect_async_tls_with_config()`, because that helper dials TCP internally and cannot install the idle adapter beneath TLS.
 
 - **TLS library**: rustls (not native-tls/OpenSSL)
 - **Root CA store (exclusive, first match wins)**:
@@ -79,17 +79,15 @@ Transport- and protocol-level relay failures also publish a defined Close so pee
 
 `FERRUM_WEBSOCKET_TUNNEL_MODE` defaults to `false`. When enabled for an
 HTTP/1.1 or HTTP/2 WebSocket session with no frame-level plugins, Ferrum Edge
-bypasses WebSocket frame parsing after the upgrade and relays bytes with raw
-bidirectional TCP copy. This improves throughput for large payloads, but frame
+bypasses WebSocket frame parsing after the upgrade and relays raw bytes in
+both directions. This improves throughput for large payloads, but frame
 inspection, per-frame size limits, and frame counters are unavailable. Attach a
 frame-level plugin or leave tunnel mode disabled when those features are
 required.
 
 Tunnel takeover preserves any backend bytes read together with the
 `101 Switching Protocols` response and forwards them before starting the raw
-relay. This is important for server-push protocols: discarding the WebSocket
-codec's buffered bytes during takeover would lose an initial frame coalesced
-with the upgrade response.
+relay, so a server-push frame coalesced with the upgrade response is not lost.
 
 Tunnel mode does not apply to HTTP/3 WebSockets. QUIC has no underlying raw TCP
 stream to copy, so H3 sessions always use frame parsing and retain frame-level

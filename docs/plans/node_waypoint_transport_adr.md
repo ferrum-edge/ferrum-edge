@@ -13,8 +13,7 @@ checks on a two-worker kind cluster. It also proves plaintext/no-client-SVID
 HBONE listener probes are rejected and that authenticated HBONE baggage from an
 untrusted assertor fails closed under destination policy. Authenticated
 node-to-node transport and destination-side NodeWaypoint policy enforcement are
-wired through the
-SPIFFE-mTLS HBONE relay path. The destination-side pod-veth tc guard now drops
+wired through the SPIFFE-mTLS HBONE relay path. The destination-side pod-veth tc guard now drops
 unmarked direct traffic to enrolled pod IPs and admits only backend dials made
 by the destination NodeWaypoint relay with the authorized socket mark.
 

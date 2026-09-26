@@ -111,8 +111,6 @@ MIT/Apache-2.0 license is already allowed.
 - Loader coverage pins configured ordering and leaf/private-key validation.
 - UDP logging continues to use the same shared loader and cached chain owner.
 
-Hosted CI is the formatter, lint, build, and test gate for this patch.
-
 ## Retirement
 
 Retire the vendor copy only after a compatible upstream release:
@@ -125,9 +123,13 @@ Retire the vendor copy only after a compatible upstream release:
    construction, clone drop, fallback, replacement, and shutdown; and
 4. preserves Ferrum's supported ECDSA P-256/P-384 and constructor APIs.
 
-Then remove the `[patch.crates-io]` row, vendor directory, integrity manifest,
-status-script row, CI vendor regression step, and this inventory entry. Keep
-the Ferrum interoperability tests against the upstream release.
+Then remove the `[patch.crates-io]` rows (root `Cargo.toml` and
+`tests/performance/mesh/Cargo.toml`), the vendor directory, its
+`vendor/VENDOR_INTEGRITY.sha256` entries and `GOVERNED_VENDOR_LOCKFILES`
+allowlist entry, the `Vendored Patch Regressions` CI step, the inventory row in
+`docs/dependency-policy.md`, and the entry in
+`docs/vendored-patch-lifecycle.json`. Keep the Ferrum interoperability tests
+against the upstream release.
 
 ## Upstream hand-off
 

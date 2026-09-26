@@ -42,6 +42,7 @@ cargo test --test service_integration mysql
 cargo test --test service_integration oidc
 cargo test --test service_integration oauth2_introspection
 cargo test --test service_integration clickhouse
+cargo test --test service_integration db_tls
 ```
 
 The MySQL custom-plugin recovery test requires the pedagogical example at
@@ -51,8 +52,10 @@ test prints `SKIP … example_audit_plugin not compiled in` before starting
 Docker.
 
 **With Docker:** the containers start and the assertions run.
-**Without Docker:** each test prints `SKIP <test>: <service> unavailable …` and
-returns green — the suite stays runnable on a developer machine with no Docker.
+**Without Docker:** most tests print `SKIP <test>: <service> unavailable …` and
+pass, so the suite stays runnable on a developer machine with no Docker. The
+Kafka TLS acceptance tests are the exception: they always require their broker
+(see [Kafka acceptance split](#kafka-acceptance-split)).
 
 The skip/fail decision lives in `common::containers::fail_in_ci_else_skip`: in CI
 (`CI` env var set, which GitHub Actions sets automatically) a container that
@@ -139,20 +142,18 @@ blast radius but cannot say what stalled.
 
 Readiness is confirmed by **active polling** (Consul leader endpoint; LDAP
 `ldapadd` retry; Redpanda metadata fetch; a MySQL connection; Hydra discovery;
-ClickHouse `/ping`),
-not by matching a startup log line —
-so the helpers do not depend on which stream a given image logs to.
+ClickHouse `/ping`), not by matching a startup log line, so the helpers do not
+depend on which stream a given image logs to.
 
 ## CI
 
 `.github/workflows/ci.yml` job `test-service-integration` runs on
-`ubuntu-latest` (Docker available). Consul, LDAP, Kafka, MySQL, OIDC,
-OAuth2 introspection, and ClickHouse run in one nextest `--no-fail-fast`
-invocation, which
-preserves per-test reporting and continues after one backend fails without
-allocating a second runner. It is wired into the `test` aggregation gate, so it
-blocks merge on failure. Hydra (or any provider) startup failure is a hard
-failure in CI.
+`ubuntu-latest` (Docker available). Every module (`consul`, `ldap`, `kafka`,
+`mysql`, `oidc`, `oauth2_introspection`, `clickhouse`, `host_port_allocation`,
+`db_tls`) runs in one `cargo nextest run --no-fail-fast` invocation, which keeps
+per-test reporting and continues past a failing backend without a second
+runner. The job feeds the `test` aggregation gate, so a failure blocks merge.
+Hydra (or any provider) startup failure is a hard failure in CI.
 
 ## Hydra / OIDC / introspection runbook (#3333)
 
@@ -178,8 +179,8 @@ What it drives against live Hydra:
    fan out; reserved `Authorization` mapping is rejected at config time;
    client-supplied claim destinations are overwritten only with verified values.
 5. Negatives: wrong state, missing correlation cookie, nonce mismatch (Hydra
-   signs a different nonce than Ferrum sealed into the pending-flow cookie), wrong issuer via explicit live
-   endpoints (signed-token `iss` rejection), wrong audience, and live token
+   signs a different nonce than Ferrum sealed into the pending-flow cookie),
+   wrong issuer via explicit live endpoints (signed-token `iss` rejection), wrong audience, and live token
    endpoint + unrelated JWKS (signature failure). Subject is proven positively
    via successful login; multi-audience `azp` enforcement remains unit-covered.
 6. Short idle/absolute TTLs observe re-challenge after margin sleeps that do
@@ -239,8 +240,8 @@ Hosted Redpanda covers the broker-dependent acceptance contract from #2548 /
 - unknown-topic rejection after local admission
 - broker-side oversized-message rejection (`max.message.bytes` on the topic)
 - delivery timeout via `acks=all` against a docker-paused broker (Redpanda
-  v24.2 does not materialize Kafka's topic `min.insync.replicas`; produce the
-  producer while live, then pause so ack cannot complete)
+  v24.2 does not materialize Kafka's topic `min.insync.replicas`; create the
+  producer while the broker is live, then pause so the ack cannot complete)
 - immediate `queue.buffering.max.messages=1` saturation while a prior record is
   stuck on that paused broker
 - successful bounded finalize after delivery
@@ -281,9 +282,8 @@ primary, then accepts a valid reload and reconnects after removing the source CA
 Fixtures prove readiness through their published host ports, and fail in CI when
 unavailable.
 
-Run this module through `cargo test --test service_integration db_tls` on a
-Docker-enabled test host. These tests were added without executing project code
-or tooling locally; validation for this change is the pushed head's hosted CI.
+Run this module with `cargo test --test service_integration db_tls` on a
+Docker-enabled host.
 
 ## Adding another external service
 

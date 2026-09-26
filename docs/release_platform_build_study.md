@@ -25,11 +25,11 @@ See the [GitHub runner reference](https://docs.github.com/en/actions/reference/r
 Confirm the actual host measurements when comparing compile time, memory and
 swap. This experiment does not select a new production release runner.
 
-The study installs and explicitly selects Rust 1.98.1 with RUSTUP_TOOLCHAIN,
+The study installs and explicitly selects Rust 1.98.1 with `RUSTUP_TOOLCHAIN`,
 then checks the active rustc/Cargo versions and installed target before building.
-This prevents rust-toolchain.toml from selecting an older cached stable toolchain.
-It uses cloud-secrets and the existing fat-LTO/one-unit
-release profile, preserves Apple deployment floors and the canonical fast
+This prevents `rust-toolchain.toml` from selecting an older cached stable
+toolchain. It uses the `cloud-secrets` feature and the existing
+fat-LTO/one-codegen-unit release profile, preserves Apple deployment floors and the canonical fast
 linker setup, and copies the checksum-pinned Windows protoc/NASM setup from
 the release producer. Each run starts with an empty target directory and
 compiler wrappers disabled. It does not restore or publish build caches.
@@ -58,27 +58,28 @@ physical-memory measurements. Sampling itself has overhead. Cargo units overlap,
 codegen does not isolate LLVM optimization from linking, and build-script time
 is not exclusively native compilation. Keep those distinctions in any report.
 
-After build evidence validates, explicit workflow steps execute the generated
-gateway's version command from RUNNER_TEMP using the hosted Bash shell; the full job fails if that smoke
-check fails. The profiler's validation_complete field covers build evidence,
-while version.txt and the successful smoke step establish host execution.
+After build evidence validates, explicit workflow steps run the generated
+gateway's version command from `RUNNER_TEMP` in the hosted Bash shell; the job
+fails if that smoke check fails. The profiler's `validation_complete` field
+covers build evidence, while `version.txt` and the successful smoke step
+establish host execution.
 macOS also records Mach-O load commands. This is a host smoke check, not proof
 of the oldest supported OS, complete ABI compatibility, installation behavior,
 or a full protocol/performance matrix. ARM64 Cross and GNU sysroot profiling
 remain separate required work; this workflow cannot replace their protected
 producers or their ABI gates.
 
-Only data/log/report extensions from study-results are uploaded. Executables
+Only data/log/report extensions from `study-results` are uploaded. Executables
 remain in the runner's temporary target directory; no image, release asset or
 version tag is published. PR/main events execute only telemetry contracts;
 expensive platform compilation requires manual dispatch. The eight contracts
 run on Linux, macOS and Windows before any build; native hosts also validate
 a live memory snapshot of the owned Python process (that one check skips on
-Linux). Process sampling is
-limited to the Cargo process and descendants and excludes command arguments.
-Existing Cargo timing reports are copied even when compilation fails, before
-parsing validation. Logs and samples are flushed during compilation and retained by the always-run
-upload step when possible; an abrupt runner loss can still prevent upload.
+Linux). Process sampling is limited to the Cargo process and descendants and
+excludes command arguments. Existing Cargo timing reports are copied even when
+compilation fails, before parsing validation. Logs and samples are flushed
+during compilation and retained by the always-run upload step when possible;
+an abrupt runner loss can still prevent upload.
 
 Before adopting a shipping-profile change, require an agreed runtime-regression
 budget and the affected-platform runtime/ABI/install/image evidence. This study

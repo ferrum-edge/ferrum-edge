@@ -1,6 +1,6 @@
 # Ferrum Edge Architecture
 
-This document provides a comprehensive overview of the Ferrum Edge codebase architecture to help new developers understand the project structure and contribute effectively.
+An overview of how the Ferrum Edge codebase is organized, for developers getting oriented before contributing.
 
 ## High-Level Architecture
 
@@ -26,8 +26,11 @@ The directory trees below are representative excerpts; see the cited paths for t
 
 ```
 src/
-├── main.rs                    # Application entry point and CLI argument parsing
+├── main.rs                    # Binary entry point
+├── cli.rs                     # CLI subcommands and flag → env overrides
+├── startup.rs                 # Startup sequence and mode dispatch
 ├── lib.rs                     # Library root with public API exports
+├── overload.rs                # Overload manager and load shedding
 ├── circuit_breaker.rs         # Three-state circuit breaker (Closed/Open/Half-Open)
 ├── config_delta.rs            # Incremental config updates for CP/DP
 ├── connection_pool.rs         # HTTP client connection pooling with mTLS support
@@ -54,8 +57,7 @@ src/
 │       ├── mod.rs             # Migration registry
 │       └── v001_initial_schema.rs  # Initial database schema
 ├── dns/                       # DNS resolution and caching
-│   ├── mod.rs                 # DNS module exports, DnsCacheResolver for HTTP clients
-│   └── resolver.rs            # Async DNS resolver with caching
+│   └── mod.rs                 # DnsCache (TTL, stale-while-revalidate, background refresh) and DnsCacheResolver
 ├── dtls/                      # DTLS support (frontend termination, backend origination)
 │   └── mod.rs                 # DTLS certificate helpers
 ├── grpc/                      # gRPC CP/DP communication
@@ -73,12 +75,14 @@ src/
 │   ├── data_plane.rs          # Data Plane mode
 │   ├── database.rs            # Database mode
 │   ├── file.rs                # File mode
-│   └── migrate.rs             # Database migration mode
-├── plugins/                   # Plugin system (75+ built-in plugins)
+│   ├── injector.rs            # Kubernetes sidecar injector webhook
+│   ├── mesh/                  # Service-mesh data plane
+│   ├── migrate.rs             # Database migration mode
+│   └── node_agent.rs          # Per-node eBPF capture manager
+├── plugins/                   # Plugin system (80+ built-in plugins)
 │   ├── mod.rs                 # Plugin framework, registry, and priority constants
 │   ├── access_control.rs      # Consumer-based authorization
 │   ├── basic_auth.rs          # HTTP Basic auth with HMAC-SHA256 password hashes
-│   ├── body_transform.rs      # Request/response body transformation
 │   ├── body_validator.rs      # JSON/XML request body validation
 │   ├── bot_detection.rs       # Bot detection and mitigation
 │   ├── correlation_id.rs      # Correlation ID generation and propagation
@@ -88,24 +92,25 @@ src/
 │   ├── http_logging.rs        # HTTP endpoint logging
 │   ├── ip_restriction.rs      # IP-based access control
 │   ├── jwks_auth.rs           # JWKS multi-provider JWT validation
-│   ├── jwks_cache.rs          # Global shared JWKS key store cache
-│   ├── jwks_store.rs          # JWKS key store with background refresh
 │   ├── jwt_auth.rs            # HS256 JWT authentication
 │   ├── key_auth.rs            # API key authentication
 │   ├── loki_logging.rs        # Loki push API logging with batched label-based streams
 │   ├── mtls_auth.rs           # Mutual TLS client certificate authentication
 │   ├── otel_tracing.rs        # OpenTelemetry distributed tracing
 │   ├── prometheus_metrics.rs  # Prometheus metrics export
-│   ├── rate_limiting.rs       # In-memory rate limiting
+│   ├── rate_limiting.rs       # Local and Redis-backed rate limiting
 │   ├── request_termination.rs # Early response / request termination
 │   ├── request_transformer.rs # Header/query modification
 │   ├── response_caching.rs    # Response caching
 │   ├── response_transformer.rs # Response header modification
 │   ├── stdout_logging.rs      # JSON transaction logging to stdout via the non-blocking writer
 │   ├── transaction_debugger.rs # Verbose request/response diagnostics (tracing::debug on transaction_debug target)
-│   └── utils/                 # Plugin utilities
+│   └── utils/                 # Shared plugin helpers
 │       ├── mod.rs
-│       └── http_client.rs     # Shared HTTP client for plugin outbound calls
+│       ├── body_transform.rs  # Request/response body transformation
+│       ├── http_client.rs     # Shared HTTP client for plugin outbound calls
+│       ├── jwks_cache.rs      # Global shared JWKS key store cache
+│       └── jwks_store.rs      # JWKS key store with background refresh
 ├── proxy/                     # Proxy request handling
 │   ├── mod.rs                 # ProxyState, handle_proxy_request, URL building
 │   ├── body.rs                # ProxyBody sum type (Full/Tracked) for response streaming
@@ -143,7 +148,10 @@ tests/
 ├── fixtures/                           # RSA key fixtures for auth plugin tests
 ├── scripts/                            # Test setup scripts (e.g., DB TLS)
 │
-├── unit_tests.rs                       # Entry point: unit test crate
+├── unit_tests.rs                       # Unit target: config, admin, TLS, identity, secrets, CLI
+├── unit_plugins_a_tests.rs             # Unit target: plugin tests a–j
+├── unit_plugins_b_tests.rs             # Unit target: plugin tests k–z
+├── unit_gateway_core_tests.rs          # Unit target: core runtime
 ├── unit/                               # Unit tests by component
 │   ├── plugins/                        # Plugin tests
 │   ├── config/                         # Configuration parsing tests
@@ -157,6 +165,9 @@ tests/
 ├── functional_tests.rs                 # Entry point: functional test crate
 ├── functional/                         # End-to-end functional tests
 │
+├── conformance_tests.rs                # Entry point: Istio/xDS/Gateway API conformance
+├── conformance/
+│
 ├── helpers/bin/                        # Standalone test server binaries
 │
 └── performance/                        # Performance/load testing (separate crate)
@@ -165,35 +176,7 @@ tests/
 
 ### **Documentation (`docs/`)**
 
-```
-docs/
-├── admin_backup_restore.md     # Admin backup and restore API
-├── admin_batch_api.md          # Admin batch operations API
-├── admin_read_only_mode.md     # Admin API read-only mode
-├── backend_mtls.md             # Backend mTLS configuration
-├── ci_cd.md                    # CI/CD pipeline documentation
-├── client_ip_resolution.md     # Client IP resolution and trusted proxies
-├── cors_plugin.md              # CORS plugin configuration
-├── cp_dp_mode.md               # Control Plane / Data Plane architecture
-├── database_tls.md             # Database TLS configuration
-├── dns_resolver.md             # DNS resolver configuration
-├── docker.md                   # Docker deployment guide
-├── error_classification.md     # Error classification and gateway headers
-├── frontend_tls.md             # Frontend TLS/mTLS configuration
-├── functional_testing.md       # CP/DP functional testing guide
-├── functional_testing_auth_acl.md  # Auth/ACL functional testing
-├── functional_testing_database.md  # Database mode testing
-├── functional_testing_file_mode.md # File mode testing
-├── infrastructure_sizing.md    # Infrastructure sizing guide
-├── load_balancing.md           # Load balancing, health checks, retry, circuit breaker
-├── migrations.md               # Database migration documentation
-├── pingora_comparison.md       # Pingora comparison analysis
-├── plugin_execution_order.md   # Plugin priority and execution order
-├── response_body_streaming.md  # Response body streaming vs buffering
-├── routing.md                  # Routing and path matching
-├── size_limits.md              # Request/response size limits
-└── tcp_udp_proxy.md            # TCP/UDP stream proxy documentation
-```
+See the [documentation index](docs/README.md), which lists every document under `docs/` grouped by audience.
 
 ## Core Components
 
@@ -221,7 +204,7 @@ The configuration system provides flexible configuration management through mult
 The proxy engine handles all request routing and processing with **consistent security for HTTP and WebSocket**:
 
 **Key Features**:
-- **Router cache** with pre-sorted route table and bounded path lookup cache with random-sample eviction (`src/router_cache.rs`)
+- **Router cache** with pre-sorted route table and bounded path lookup cache with frequency-aware (Count-Min Sketch) sampled eviction (`src/router_cache.rs`)
 - Longest prefix match routing with O(1) cache hits for repeated paths
 - Route table rebuilt atomically via ArcSwap on config changes — never on the hot request path
 - **Plugin cache** returns `Arc<Vec<...>>` for zero-allocation per-request plugin retrieval; pre-computes response body buffering requirements per proxy to avoid per-request iteration (`src/plugin_cache.rs`)
@@ -317,7 +300,7 @@ Distributes traffic across multiple backend targets within an upstream group:
 **Key Features**:
 - Six algorithms: round robin, weighted round robin (smooth WRR), least connections, least latency, consistent hashing (150 vnodes), random
 - Atomic rebuild on config changes — no requests dropped during reconfiguration
-- Active health checks (periodic HTTP probes) and passive health checks (response monitoring)
+- Active health checks (periodic HTTP, TCP, UDP, or gRPC probes) and passive health checks (response monitoring)
 - Passive recovery timer (`healthy_after_seconds`) for automatic target restoration
 - Connection errors always count as passive health check failures
 - All-unhealthy fallback: routes to all targets rather than returning errors
@@ -345,7 +328,7 @@ High-performance HTTP client connection pooling with backend mTLS support:
 
 Extensible plugin architecture for authentication, authorization, and transformations:
 
-**Plugin categories** (representative — see [docs/plugins.md](docs/plugins.md) for the full set of 75+ built-in plugins):
+**Plugin categories** (representative — see [docs/plugins.md](docs/plugins.md) for the full set of 80+ built-in plugins):
 - **Authentication**: `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth`, `mtls_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`
 - **Authorization**: `access_control`, `ip_restriction`
 - **Security**: `cors`, `bot_detection`
@@ -354,22 +337,22 @@ Extensible plugin architecture for authentication, authorization, and transforma
 - **Caching**: `response_caching`
 - **Observability**: `stdout_logging`, `http_logging`, `tcp_logging`, `loki_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics`, `otel_tracing`
 
-**Plugin Lifecycle**:
-1. **Request Phase**: Authentication → Authorization → Rate Limiting
-2. **Response Phase**: Logging → Metrics
-3. **Error Phase**: Error handling and logging
+**Plugin Lifecycle** (HTTP family; each phase runs matching plugins in priority order, lower number first):
+1. **Request phase**: `on_request_received` → `authenticate` → `authorize` → `before_proxy` (plus request-body hooks and backend admission)
+2. **Response phase**: `after_proxy` → response-body hooks (`on_response_body`, `on_final_response_body`)
+3. **Logging**: `log` with the completed transaction summary
+
+Stream, WebSocket, and UDP traffic use their own hooks (`on_stream_connect` / `on_stream_disconnect`, `on_ws_frame`, `on_udp_datagram`). See [docs/plugin_execution_order.md](docs/plugin_execution_order.md).
 
 ### **6. Admin API (`src/admin/`)**
 
 RESTful API for dynamic configuration management:
 
-**Endpoints**:
-- `/proxies` - Proxy CRUD operations
-- `/consumers` - Consumer management
-- `/plugins` - Plugin configuration
-- `/upstreams` - Upstream CRUD operations
-- `/health` - Health check endpoint
-- `/backup` and `/restore` - Configuration backup/restore
+**Endpoints** (representative — see [docs/admin_api.md](docs/admin_api.md) and [openapi.yaml](openapi.yaml)):
+- `/proxies`, `/consumers`, `/upstreams` - CRUD
+- `/plugins` (available plugin names) and `/plugins/config` - plugin configuration CRUD
+- `/live`, `/health`, `/status`, `/overload`, `/metrics` - probes and observability
+- `/backup`, `/restore`, `/batch` - backup/restore and batch operations
 - JWT-based authentication and authorization
 
 ### **7. Operating Modes (`src/modes/`)**
@@ -487,7 +470,7 @@ The gateway is designed to scale to **10,000+ proxy/consumer resources** and **3
 
 | Component | Lookup | Lock Type | Notes |
 |-----------|--------|-----------|-------|
-| Route matching | O(1) cache hit / O(routes) fallback | Lock-free ArcSwap | DashMap path cache with random-sample eviction |
+| Route matching | O(1) cache hit / O(routes) fallback | Lock-free ArcSwap | DashMap path cache with frequency-aware sampled eviction |
 | Plugin lookup | O(1) HashMap | Lock-free ArcSwap | Returns `Arc<Vec<...>>` — zero Vec allocation per request; buffering flag pre-computed |
 | Consumer auth | O(1) per credential type | Lock-free ArcSwap | Separate indexes per type (no format!() allocation) |
 | Upstream lookup | O(1) HashMap | Lock-free ArcSwap | Pre-built index avoids linear scan |
@@ -500,7 +483,7 @@ The gateway is designed to scale to **10,000+ proxy/consumer resources** and **3
 - **ArcSwap everywhere**: Config updates are atomic pointer swaps. Readers never block, even during config reload with 10k+ resources.
 - **Pre-computed indexes**: Plugin configs are indexed by `proxy_id` at build time (O(P+C) rebuild instead of O(P×C)). Consumer credentials are split into separate HashMaps per type. Load balancer target keys are pre-computed strings.
 - **Zero per-request allocation in plugin lookup**: `PluginCache::get_plugins()` returns `Arc<Vec<Arc<dyn Plugin>>>` — a single Arc clone, not N Arc clones + Vec allocation. Response body buffering requirements and Alt-Svc headers are pre-computed at config load time to eliminate per-request `format!()` and `.any()` iterator overhead.
-- **Random-sample cache eviction**: RouterCache evicts ~25% of entries when full instead of clearing the entire cache, preventing thundering-herd O(routes) scans.
+- **Bounded sampled cache eviction**: when full, RouterCache samples a bounded set of candidates and evicts the least frequently used (Count-Min Sketch) instead of clearing the whole cache, so eviction stays O(sample size) and avoids thundering-herd O(routes) rescans.
 - **No locks on the hot path**: All request-path reads use `ArcSwap::load()` (lock-free) or `DashMap` (per-bucket sharded locks). No `Mutex` or `RwLock` in the request pipeline.
 
 ### **Config Rebuild Performance**
@@ -527,7 +510,7 @@ In-flight requests continue using the previous config snapshot via Arc reference
    ↓
 3. Router Cache Lookup (O(1) cache hit or pre-sorted prefix scan)
    ↓
-4. Plugin Pipeline (auth → authz → rate limit)
+4. Request Plugin Phases (on_request_received → authenticate → authorize → before_proxy)
    ↓
 5. Load Balancer Target Selection (if upstream configured)
    ↓
@@ -539,7 +522,7 @@ In-flight requests continue using the previous config snapshot via Arc reference
    ↓
 9. Response Processing (stream or buffer based on response_body_mode)
    ↓
-10. Plugin Response Pipeline
+10. Response Plugin Phases (after_proxy → response-body hooks), then log
    ↓
 11. Client Response
 ```
@@ -602,14 +585,14 @@ The project uses comprehensive testing at multiple levels:
 - Include end-to-end scenarios (e.g., router cache → URL mapping → backend URL)
 
 ### **Plugin Testing**
-- `plugin_utils.rs` provides shared test utilities
+- `tests/unit/plugins/plugin_utils.rs` provides shared test utilities
 - Each plugin has dedicated test files
 - Test plugin lifecycle and configuration
 
 ### **Performance Testing**
 - `tests/performance/` directory contains CI overhead benchmarks (`ci_overhead_bench.py`)
 - `tests/performance/multi_protocol/` contains multi-protocol benchmark suite (HTTP/1.1, HTTP/2, HTTP/3, gRPC, TCP, UDP, WebSocket)
-- Automated self-relative performance regression testing in CI (gateway vs direct backend overhead ratio)
+- Scheduled self-relative performance regression workflow (`.github/workflows/performance-regression.yml`, gateway vs direct backend overhead ratio)
 
 ## Getting Started for New Developers
 
@@ -621,8 +604,8 @@ git clone https://github.com/ferrum-edge/ferrum-edge.git
 cd ferrum-edge
 cargo build
 
-# Run tests
-cargo test --all-features
+# Run tests (do not use --all-features: `crypto-ring` and `fips` are mutually exclusive)
+cargo test
 
 # Start with example config
 FERRUM_MODE=file \
@@ -643,18 +626,19 @@ cargo run -- run
 #### **New Plugin**
 1. Create plugin file in `src/plugins/`
 2. Implement `Plugin` trait
-3. Add a priority constant in `src/plugins/mod.rs`
+3. Add a priority constant in the `priority` module of `src/plugins/mod.rs`
 4. Override `supported_protocols()` to declare protocol support
-5. Register in the plugin registry (`create_plugin()` match arm in `mod.rs`)
+5. Register the constructor in `create_plugin_with_http_client()` and add a `BUILTIN_PLUGIN_REGISTRATIONS` entry (which feeds `available_plugins()`)
 6. Add unit tests in `tests/unit/plugins/`
-7. Update `FEATURES.md`, `README.md`, and `docs/plugin_execution_order.md`
+7. Update `FEATURES.md`, `README.md`, `docs/plugins.md`, `docs/plugin_execution_order.md`, `BUILTIN_PLUGIN_PARITY_META` in `src/plugins/builtin_parity.rs`, and `openapi.yaml` (CI checks registry/doc parity)
 
 #### **New Configuration Option**
 1. Add field to appropriate struct in `src/config/types.rs` with `#[serde(default)]`
 2. Add environment variable parsing in `src/config/env_config.rs`
-3. If database-stored: update migration in `src/config/migrations/` and `db_loader.rs`
-4. Update `openapi.yaml` if the Admin API exposes it
-5. Add tests
+3. If database-stored: fold the column into the baseline schema (`src/config/migrations/sql_dialect.rs`; MongoDB `mongo_index_plan.rs`) and update `db_loader.rs` — no new migration versions during build-out (see [CONTRIBUTING.md](CONTRIBUTING.md#build-out-schema-policy))
+4. For a new `FERRUM_*` variable, document it in `docs/configuration.md` and `ferrum.conf`
+5. Update `openapi.yaml` if the Admin API exposes it
+6. Add tests
 
 #### **New Admin API Endpoint**
 1. Add handler in `src/admin/mod.rs`
@@ -717,18 +701,21 @@ pub struct MyConfig {
 
 ### **2. Testing**
 ```bash
-# Unit tests
-cargo test --test unit_tests --all-features
+# Unit tests (four targets)
+cargo test --test unit_tests
+cargo test --test unit_plugins_a_tests
+cargo test --test unit_plugins_b_tests
+cargo test --test unit_gateway_core_tests
 
 # Integration tests
-cargo test --test integration_tests --all-features
+cargo test --test integration_tests
 
 # Functional / E2E tests (requires binary build)
 cargo build --bin ferrum-edge
-cargo test --test functional_tests --all-features -- --ignored
+cargo test --test functional_tests -- --ignored
 
 # All tests
-cargo test --all-features
+cargo test
 ```
 
 ### **3. Building**

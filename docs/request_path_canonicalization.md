@@ -16,7 +16,7 @@ gateway evaluates policy on the raw target while the backend framework
 percent-decodes path segments before dispatch, a client can pick a spelling
 that misses an operator's rule and still reaches the protected handler:
 
-| Client sends    | Operator rule | Old gateway reading | Backend dispatches |
+| Client sends    | Operator rule | Raw-target reading  | Backend dispatches |
 | --------------- | ------------- | ------------------- | ------------------ |
 | `/%61dmin`      | `/admin`      | `/%61dmin` — no hit | `/admin`           |
 | `/api%2Fadmin`  | `/api/admin`  | one segment         | two segments       |
@@ -203,28 +203,25 @@ Transaction logs record the canonical path.
 
 ## Operational impact
 
-This is a behavior change for four shapes of traffic that previously succeeded:
+Four shapes of traffic are refused with `400`. Clients and APIs that send them
+must change:
 
-- Targets with encoded separators (`%2F`, `%252F`) were folded into `/` for
-  route lookup and now receive `400`. Folding changes segment structure, so a
-  folded route decision could still disagree with a backend that does not
-  decode; refusing cannot. APIs that carry an encoded `/` inside a path
+- Targets with encoded separators (`%2F`, `%252F`). Folding them into `/` would
+  change segment structure and could still disagree with a backend that does
+  not decode; refusing cannot. APIs that carry an encoded `/` inside a path
   parameter must move that value into the query string or a header.
-- Targets with a `.` or `..` segment now receive `400`, whether the segment was
+- Targets with a `.` or `..` segment, whether the segment was
   written literally (`/a/../b`, `literal_dot_segment`) or produced by a percent
   escape (`/a/%2e%2e/b`, `ambiguous_dot_segment`). Clients that relied on the
   gateway forwarding a relative target must send the resolved path. A `.` inside
   a segment (`/v1.0/users`, `/a/.hidden`) is unaffected.
-- Targets with a literal backslash now receive `400` (`literal_backslash`),
-  alongside the encoded `%5C` form.
+- Targets with a literal backslash (`literal_backslash`), alongside the
+  encoded `%5C` form.
 - Targets carrying an escape of a byte outside the `pchar` decode set — `%20`
   for space, `%7B`/`%5B` for brackets, and any percent-encoded non-ASCII text
-  such as `/caf%C3%A9` — now receive `400` (`unrepresentable_escape`). This is
-  the broadest of the four: **percent-encoded spaces and percent-encoded
-  non-ASCII path segments are no longer accepted at all.** The gateway will not
-  retain the escape (policy would read a spelling the application resolves
-  differently) and will not decode it (the decoded byte is one the backend URL
-  parser cannot carry or re-encodes), so it refuses. APIs that need spaces or
+  such as `/caf%C3%A9` (`unrepresentable_escape`). This is the broadest of the
+  four: **percent-encoded spaces and percent-encoded non-ASCII path segments
+  are not accepted at all**, for the reasons given in the rejection table. APIs that need spaces or
   non-ASCII text in a resource identifier should carry that value in the query
   string, a header, or a body field, or use a `pchar`-legal identifier in the
   path. Note that this is a rule about escapes: a client that sends non-ASCII
@@ -243,9 +240,9 @@ divergence this representation exists to eliminate.
 - `docs/plugins.md` — `waf`, `openapi_validator`, `request_termination`,
   `hmac_auth`
 - `docs/mesh.md` — Istio `AuthorizationPolicy` `paths:` / `notPaths:` matching,
-  which runs on this canonical path (issues #1701 and #4149). `mesh_authz`
+  which runs on this canonical path. `mesh_authz`
   re-runs the canonicalizer before it evaluates a rule and denies with `403`
   rather than matching a target it cannot reduce to one reading.
-- `src/router_cache.rs` `normalize_encoded_slashes()` — the predecessor helper,
-  retained only for backend listen-path stripping, which needs the router's own
-  offset coordinate system
+- `src/router_cache.rs` `normalize_encoded_slashes()` — an older helper that is
+  a no-op on canonical paths; it is kept so backend listen-path stripping uses
+  the same offset coordinate system as the router

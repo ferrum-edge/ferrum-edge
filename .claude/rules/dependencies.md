@@ -24,8 +24,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 - Ferrum carries vendored upstream crates under `vendor/**`, wired via
   `[patch.crates-io]` in `Cargo.toml`: `sqlx-core 0.8.6`, `reqwest 0.13.3`,
-  `h3 0.0.8` (three patches), `h3-quinn 0.0.10`, `tungstenite 0.29.0`,
-  `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, and `hyper-util 0.1.20`.
+  `h3 0.0.8`, `h3-quinn 0.0.10`, `tungstenite 0.29.0`,
+  `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, and `hyper-util 0.1.21`.
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
   `docs/vendored-patch-lifecycle.json`. Keep them, the
@@ -272,7 +272,7 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   `FERRUM_DB_TLS_MODE=verify-ca` with no configured CA.
 - hyper-util HTTP/1 sender release (issue #5714): the vendored
   `--lib ferrum_release_on_close_tests` in
-  `vendor/hyper-util-0.1.20-ferrum-patched/src/client/legacy/client.rs` plus
+  `vendor/hyper-util-0.1.21-ferrum-patched/src/client/legacy/client.rs` plus
   the vendored `--test legacy_client` suite, run by the `test-vendor-patches`
   job. A request enqueued while its pooled HTTP/1 connection closes can miss
   the dispatcher's drain; releasing the only sender lets tokio drop the stranded

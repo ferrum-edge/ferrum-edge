@@ -95,9 +95,9 @@ ferrum-edge version
 
 Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64. Releases ship raw platform binaries plus adjacent `.sha256` checksum files (for example `ferrum-edge-linux-x86_64` and `ferrum-edge-linux-x86_64.sha256`).
 
-Pin an explicit release tag in download URLs. Production artifacts are published only for version tags; merging main no longer refreshes a moving `latest` build. GitHub's `/releases/latest` endpoint skips prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and pin deployments to that version.
+Pin an explicit release tag in download URLs. Production artifacts are published only for version tags; main CI does not publish a moving `latest` build. GitHub's `/releases/latest` endpoint skips prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and pin deployments to that version.
 
-Feature availability by release: resource labels (`labels` / `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig) landed on `main` in [#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483) on 2026-09-12. Published artifacts through **v0.9.4** reject `labels` with ``unknown field `labels` ``. **v0.9.5 is the first tagged release with resource labels**; use v0.9.5 or later. See the [upgrade guidance](docs/upgrade_guide.md#upgrading-to-095) for database and CP/DP rollout requirements. Companion clients that inject `labels.provisioned-by` require matching gateway builds: Git Forge Ops ≥ [#218](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/pull/218), Nexus ≥ [#245](https://github.com/ferrum-edge/ferrum-nexus/pull/245), and Foundry ≥ [#340](https://github.com/ferrum-edge/ferrum-foundry/pull/340).
+Feature availability by release: resource labels (`labels` / `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig, [#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483)) require **v0.9.5 or later**; artifacts through v0.9.4 reject `labels` with ``unknown field `labels` ``. See the [upgrade guidance](docs/upgrade_guide.md#upgrading-to-095) for database and CP/DP rollout requirements. Companion clients that inject `labels.provisioned-by` require matching gateway builds: Git Forge Ops ≥ [#218](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/pull/218), Nexus ≥ [#245](https://github.com/ferrum-edge/ferrum-nexus/pull/245), and Foundry ≥ [#340](https://github.com/ferrum-edge/ferrum-foundry/pull/340).
 
 ```bash
 # Example: Linux x86_64
@@ -288,7 +288,7 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 | `FERRUM_DB_URL` | DB/CP | — | Database connection string |
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
 
-For the full list of 300+ environment variables, see [docs/configuration.md](docs/configuration.md).
+For the full list of environment variables, see [docs/configuration.md](docs/configuration.md).
 
 Operational note: all logging flows through bounded **non-blocking writers** (fixed record and byte admission → dedicated background threads → stdout/stderr), so log calls never block request-processing threads. Keep application logs on `stdout`/`stderr` by default. In containers, let the container runtime or platform collect and rotate the stream. On VMs, prefer running Ferrum Edge under `systemd` or another supervisor and let `journald`, `rsyslog`, `logrotate`, or a host log agent handle retention and rotation. Only add application-level file logging if you have a specific requirement for local log files. Under extreme throughput, size `FERRUM_LOG_BUFFER_CAPACITY` and `FERRUM_LOG_BUFFER_BYTES` together; increasing the record limit alone cannot increase admission when the byte budget is already full. New events are dropped and counted when either bound is reached so collector backpressure cannot stall the gateway.
 
@@ -422,7 +422,7 @@ See [docs/routing.md](docs/routing.md) for detailed routing behavior.
 |----------|--------|-------|
 | **HTTP/1.1** | `backend_scheme: http` / `https` | Default, with connection pooling |
 | **HTTP/2** | ALPN-negotiated on `https` | Automatic via `pool_enable_http2: true`; startup capability classification decides when the direct H2 pool is used; body-size limits are enforced in-path on that pool |
-| **HTTP/3** | `backend_scheme: https` | Startup capability classification probes HTTPS backends for H3 support and plain HTTP traffic uses QUIC automatically when supported |
+| **HTTP/3** | `backend_scheme: https` | Startup capability classification probes HTTPS backends for H3 support; ordinary (non-gRPC, non-WebSocket) requests to targets classified as H3-capable use QUIC automatically |
 | **WebSocket** | Runtime-detected from `Upgrade: websocket` (H1.1) or `:protocol=websocket` Extended CONNECT (H2 RFC 8441, H3 RFC 9220) on any HTTP-family proxy | `backend_scheme: http` → `ws://` upstream; `https` → `wss://`. Same plugin pipeline across all three frontends; H3 sessions controlled by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default on) |
 | **gRPC** | Runtime-detected from `content-type: application/grpc*` on any HTTP-family proxy | HTTP/2 with trailer support on both `http` (h2c) and `https` (ALPN) schemes |
 | **TCP** | `backend_scheme: tcp` / `tcps` | Dedicated-port stream proxy (plaintext or TLS) |
@@ -433,7 +433,7 @@ See [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) for TCP/UDP/DTLS proxy config
 ## Load Balancing & Resilience
 
 - **Six algorithms**: Round Robin, Weighted Round Robin, Least Connections, Least Latency, Consistent Hashing, Random
-- **Health checks**: Active probes (HTTP, TCP SYN, UDP) and passive monitoring
+- **Health checks**: Active probes (HTTP, TCP connect, UDP, gRPC health) and passive monitoring
 - **Circuit breaker**: Three-state pattern (Closed/Open/Half-Open)
 - **Retry**: Connection and HTTP-level retries with fixed/exponential backoff
 - **Service discovery**: DNS-SD, Kubernetes, and Consul providers
@@ -530,8 +530,8 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 
 | Issue | Solution |
 |---|---|
-| `FERRUM_MODE not set` | Set the `FERRUM_MODE` environment variable |
-| `duplicate listen_path` | Ensure all proxy `listen_path` values are unique |
+| `Invalid FERRUM_MODE ""` | Set `FERRUM_MODE` (or pass `--mode`). File mode is inferred only when a spec path is available; see [docs/cli.md](docs/cli.md) |
+| `duplicate listen_path(s) found` | Ensure all proxy `listen_path` values are unique |
 | `Database connection failed` | Verify `FERRUM_DB_TYPE` and `FERRUM_DB_URL` |
 | `401 on Admin API` | Check JWT is signed with `FERRUM_ADMIN_JWT_SECRET` |
 | `404 on proxy request` | Verify request path matches a configured `listen_path` |
@@ -583,7 +583,7 @@ Start at the [documentation index](docs/README.md) — every document under
 
 ## CI/CD
 
-On every push to `main` and PR: format check, tests (unit + integration + E2E), clippy, and performance regression testing. Version tags trigger multi-platform release builds with Docker images.
+On every PR and push to `main`: format check, clippy, and unit, integration, and functional (E2E) tests. Performance regression suites run on a schedule rather than per PR. Version tags trigger multi-platform release builds with Docker images.
 
 See [docs/ci_cd.md](docs/ci_cd.md) for pipeline details.
 
@@ -592,9 +592,12 @@ See [docs/ci_cd.md](docs/ci_cd.md) for pipeline details.
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-feature`)
 3. Write tests for new functionality
-4. Ensure all tests pass (`cargo test --all-features`)
-5. Run `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt`
+4. Ensure tests pass (`cargo test`, plus `cargo test -- --ignored` for functional tests)
+5. Run `cargo clippy --all-targets -- -D warnings` and `cargo fmt --all`
 6. Submit a pull request
+
+Do not use `--all-features`: the `crypto-ring` and `fips` features are mutually
+exclusive. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
 
 ## License
 

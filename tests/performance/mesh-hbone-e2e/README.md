@@ -29,12 +29,13 @@ Mesh mode (`FERRUM_MODE=mesh`) requires a live native `MeshSubscribe` gRPC consu
 ## Quickstart
 
 ```bash
-# From the repo root:
-cargo build --release --example hbone_perf_fixture
-
 # From this directory:
 ./run.sh --duration 30 --concurrency 50 --payload-size 1024
 ```
+
+Without `--skip-build`, `run.sh` builds the `hbone_perf_fixture` example in the
+repo root and the harness binaries here (`cargo build --release`). With
+`--skip-build` it requires those binaries to exist already.
 
 ## Flags
 
@@ -43,7 +44,7 @@ cargo build --release --example hbone_perf_fixture
 | `--duration N` | 30 | Seconds to run each phase |
 | `--concurrency N` | 50 | Concurrent in-flight requests |
 | `--payload-size N` | 1024 | Request body bytes |
-| `--skip-build` | off | Reuse existing binaries (use after first run) |
+| `--skip-build` | off | Reuse existing release binaries (fails if any is missing) |
 | `--json` | off | Machine-readable per-phase reports |
 | `--sidecar-port N` | 15008 | HBONE listener port on the stub sidecar |
 

@@ -20,7 +20,7 @@
 
 ### SQLite (`test_scale_perf_30k_proxies`)
 
-Uses an in-memory SQLite database -- always available, no external dependencies. Good baseline for testing gateway hot-path performance, though SQLite's single-writer lock limits admin API write throughput at scale.
+Uses a SQLite database file in a temporary directory -- always available, no external dependencies. Good baseline for testing gateway hot-path performance, though SQLite's single-writer lock limits admin API write throughput at scale.
 
 ### PostgreSQL (`test_scale_perf_30k_proxies_postgres`)
 
@@ -60,7 +60,7 @@ The test automatically skips if the container isn't running, and drops the `ferr
 
 The test runs in 10 batches. Each batch:
 
-1. Creates 3,000 resources via the **batch admin API** (`POST /batch`):
+1. Creates 12,000 resources for 3,000 new proxies via the **batch admin API** (`POST /batch`):
    - 3,000 consumers (with unique `keyauth` API keys), sent in chunks of 100
    - 3,000 proxies (unique listen paths `/svc/0` through `/svc/29999`), sent in chunks of 100
    - 6,000 plugin configs (key_auth + access_control per proxy), sent in chunks of 100
@@ -74,23 +74,27 @@ After all 10 batches, a summary table is printed comparing RPS and latency perce
 ## How to Run
 
 ```bash
-# Build the gateway binary first (release mode required for meaningful perf numbers)
-cargo build --release
+# Release build (the harness also runs `cargo build --release` itself and falls
+# back to a debug binary with a warning; debug numbers are not meaningful)
+cargo build --release --bin ferrum-edge
 
-# SQLite variant (no external dependencies)
-cargo test --test functional_tests test_scale_perf_30k_proxies \
-  --all-features -- --ignored --nocapture
+# SQLite variant (no external dependencies). `--exact` keeps the filter from
+# also matching the _postgres and _mongodb variants.
+cargo test --test functional_tests -- --ignored --nocapture \
+  --exact functional::functional_scale_perf_test::test_scale_perf_30k_proxies
 
-# PostgreSQL variant (requires Docker container above)
+# PostgreSQL variant (requires the Docker container above)
 cargo test --test functional_tests test_scale_perf_30k_proxies_postgres \
-  --all-features -- --ignored --nocapture
+  -- --ignored --nocapture
 
-# MongoDB variant (requires Docker container above)
+# MongoDB variant (requires the Docker container above)
 cargo test --test functional_tests test_scale_perf_30k_proxies_mongodb \
-  --all-features -- --ignored --nocapture
+  -- --ignored --nocapture
 ```
 
-The `--nocapture` flag is important -- without it you won't see the progress output or the results table.
+Do not add `--all-features`: it enables both `crypto-ring` and `fips`, which is a
+compile error. `--nocapture` is needed to see the progress output and results
+table. `.github/workflows/scaling-regression.yml` runs the same tests in CI.
 
 ## Configuration
 
@@ -106,9 +110,9 @@ Constants at the top of the test file control the test parameters:
 
 ## Batch Admin API
 
-The test uses the `POST /batch` endpoint introduced to improve admin write throughput at scale. Instead of 12,000 individual HTTP requests per batch (4 resources x 3,000), it sends ~120 batch requests (3,000 / 100 chunks x 4 resource types). Each request is persisted in a single database transaction covering its whole graph, eliminating per-row transaction overhead. Because the request is all-or-nothing, any non-success response means nothing from that request was applied.
+The test uses the `POST /batch` endpoint to keep admin writes fast at scale. Instead of 12,000 individual HTTP requests per batch (4 resources x 3,000), it sends ~120 batch requests (3,000 / 100 chunks x 4 resource types). Each request is persisted in a single database transaction covering its whole graph, eliminating per-row transaction overhead. Because the request is all-or-nothing, any non-success response means nothing from that request was applied.
 
-Every chunk posts with **`?apply=async`** (issue #4139): the graph commits durably and the gateway answers `202 Accepted` with an `X-Ferrum-Config-Cursor` header instead of paying one synchronous poll-loop reload per chunk — the per-chunk reload cost is what pushed the MongoDB leg past its job budget (issue #4136), because reload time grows with total config size. The harness keeps the highest cursor it saw across the wave and, before each measurement, proves the whole wave live with ONE blocking `GET /config/apply-status?epoch=E&sequence=S&wait_ms=30000` — a `rejected` or `unverifiable` cursor aborts loudly. The pre-existing data-plane convergence gate (probing sample proxies end to end) still runs afterwards as the routability proof. This is the recommended bulk-provisioning recipe for any client doing high-churn admin writes at scale.
+Every chunk posts with **`?apply=async`** (issue #4139): the graph commits durably and the gateway answers `202 Accepted` with an `X-Ferrum-Config-Cursor` header instead of paying one synchronous poll-loop reload per chunk (reload time grows with total config size, which pushed the MongoDB leg past its job budget, issue #4136). The harness keeps the highest cursor it saw across the wave and, before each measurement, proves the whole wave live with one blocking `GET /config/apply-status?epoch=E&sequence=S&wait_ms=30000`; a `rejected` or `unverifiable` cursor aborts the run. The data-plane convergence gate (probing sample proxies end to end) then runs as the routability proof. This is the recommended bulk-provisioning recipe for any client doing high-churn admin writes at scale.
 
 ## Example Output
 

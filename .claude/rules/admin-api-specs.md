@@ -22,12 +22,12 @@ paths:
 
 ## Admin API Invariants
 
-- Admin API validates JWTs but never mints them. Operators pre-sign tokens externally.
-- DB and CP modes require `FERRUM_ADMIN_JWT_SECRET` of at least 32 chars because their admin APIs are writable.
+- Admin API validates JWTs but never mints them; operators pre-sign tokens externally. DB and CP modes require `FERRUM_ADMIN_JWT_SECRET` of at least 32 chars because their admin APIs are writable.
 - File and DP admin surfaces are read-only where configured and must reject writes.
+- `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` makes namespace-scoped admin routes require a JWT `ns` claim (same shapes as the CP/DP gRPC plane) authorizing the `X-Ferrum-Namespace` value; the default (off) keeps the header a routing selector only. Enforcement: `is_namespace_scoped_route` + `enforce_namespace_claim` in `src/admin/mod.rs`. Malformed `ns` claims fail closed at authentication.
 - Observability surfaces are tiered (`MetricsAuthPolicy` + `observability_detail_allowed` in `src/admin/mod.rs`): `/live` is always unauthenticated and returns only `{"status":"ok"}`; `/health`+`/status` return `status`+`ready` unauthenticated and full diagnostics only when authenticated; `/overload` returns coarse `{level}` unauthenticated and the full snapshot only when authenticated; `/metrics` returns `401` unless authenticated. "Authenticated" = valid admin JWT OR matching `FERRUM_METRICS_BEARER_TOKEN` OR a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. Do not regress these to unauthenticated detail.
-- `/health` (and `/overload`) still respond unauthenticated so liveness/LB probes work; the DB check remains cached 15s via `AdminState.CachedDbHealthResult` so unauthenticated probes cannot flood the pool. Refreshes are single-flight (`AdminState.db_health_refresh` + `cached_db_health_connected`) with a 5s probe timeout: at most one DB health query runs per refresh window while cache hits stay lock-free.
-- `/health` response includes `database.pool` stats when connected, but only in the authenticated (detailed) tier.
+- `/health` (and `/overload`) still respond unauthenticated so liveness/LB probes work. The DB check stays cached for 15s in the lock-free `AdminState.cached_db_health` (`ArcSwap<Option<CachedDbHealthResult>>`) so unauthenticated probes cannot flood the pool. Refreshes are single-flight (`AdminState.db_health_refresh` + `cached_db_health_connected()`) with a 5s probe timeout: at most one DB health query runs per refresh window while cache hits stay lock-free.
+- The `/health` response includes `database.pool` stats when connected, but only in the authenticated (detailed) tier.
 - `/metrics/runtime` remains JWT-authenticated and cached through `runtime_metrics_cache()`.
 - `GET /cluster` is JWT-authenticated. CP returns connected DPs from `DpNodeRegistry`; DP returns CP connection state including primary/fallback and `last_config_received_at`.
 - `GET /backend-capabilities` and `POST /backend-capabilities/refresh` are JWT-authenticated and expose only classifications plus probe timestamps.
@@ -58,9 +58,9 @@ paths:
 ## Extraction And Validation
 
 - Spec-extracted resources must use the same admission path as direct admin POSTs.
-- Reuse `Proxy::normalize_fields()`, `validate_fields()`, `plugins::validate_plugin_config()`, and uniqueness checks.
+- Reuse `Proxy::normalize_fields()`, `validate_fields()`, the `plugins::validate_plugin_config*` helpers, and the `check_*_unique` uniqueness checks.
 - Do not fork validation logic for specs.
-- Main entrypoint is `extract_and_validate()` in `src/admin/api_specs/handlers.rs`.
+- Pipeline: `extract_admitted()` (bounded admission) runs `extract_with_external_refs()` from `src/admin/api_specs/extractor.rs`, then `validate_bundle()` in `src/admin/api_specs/handlers.rs` applies the shared admission checks.
 - Reject `x-ferrum-consumers`; consumers and credentials are managed through consumer endpoints.
 - Reject plugin `scope != proxy` inside specs.
 - Reject plugin `proxy_id` that differs from the spec proxy ID.

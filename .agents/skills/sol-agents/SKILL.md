@@ -80,7 +80,6 @@ Do not discard unexplained changes in an existing worktree; reconstruct and pres
 - `xhigh`: reserve for very high-stakes tasks that need lots of thinking — security boundaries,
   concurrency and lifecycle bugs, protocol correctness, difficult root-cause analysis, or repeated
   failure at `high`. Prefer one focused `xhigh` worker over a fleet of them.
-
 - `max`: use for the hardest problems requiring more reasoning than `xhigh`.
 - `ultra`: use when explicitly requested for maximum reasoning with automatic task delegation.
   This is a Codex harness option advertised by the installed model catalog, not an API effort.
@@ -134,8 +133,10 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents, grok-agents, or any
-.agents/skills/*/scripts/dispatch-agent.sh), and do not manually spawn nested workers.
+skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents,
+grok-agents, composer-agents, qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
+opencode-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not manually spawn
+nested workers.
 Codex-managed automatic delegation is permitted only when the controller explicitly selected `ultra`.
 ```
 
@@ -203,7 +204,8 @@ into prompts. Never put credentials, tokens, cookies, or secrets in prompts or w
 - An explicitly requested review receives no response: verify the trigger, bot identity,
   availability, and head SHA before posting another trigger.
 - Model, effort, or service-tier mismatch: stop the worker, record the exact diagnostic, correct
-  the launch contract, and relaunch. Never claim a selected effort, `gpt-6-sol`, or fast mode without launch evidence.
+  the launch contract, and relaunch. Never claim a selected effort, `gpt-6-sol`, or fast mode
+  without launch evidence.
 
 ## Model contract source
 

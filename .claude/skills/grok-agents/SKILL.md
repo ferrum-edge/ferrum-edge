@@ -17,8 +17,8 @@ do not duplicate them in this directory.
   --effort <low|medium|high|xhigh|max>
 ```
 
-`--effort` selects the Grok reasoning SKU. Append `--fast` only when the user explicitly requests
-fast mode for that dispatch or fleet.
+`--effort` selects the Grok reasoning SKU (default `high`; `max` clamps to `xhigh`). Append
+`--fast` only when the user explicitly requests fast mode for that dispatch or fleet.
 
 Read the canonical skill before dispatch for preflight, isolation, prompt construction, failure
 handling, and verification. For implementer mode, read

@@ -9,11 +9,12 @@ upstream.
 
 - **Priority:** `4055` (Response band, immediately after `compression`).
 - **Protocols:** HTTP only. Native gRPC wire frames are not compressed.
-- **Lifecycle:** the per-request buffering gate admits candidate JSON `POST`
-  bodies; `before_proxy` rewrites direct-dispatch metadata and privately stages
-  bounded state; `transform_request_body_with_context` produces the final wire
-  bytes (with `transform_request_body` retained for context-free compatibility);
-  `on_final_request_body_with_context` enforces marker-sanitation failures.
+- **Lifecycle:** request buffering is enabled only for candidate JSON `POST`
+  bodies; `before_proxy` rewrites direct-dispatch metadata and stages bounded
+  state; `transform_request_body_with_context` produces the final wire bytes
+  (`transform_request_body` remains for context-free callers);
+  `on_final_request_body_with_context` rejects requests whose marker
+  sanitation failed.
 - **Failure policy:** `KeepLastKnownGood` — a bad config is rejected at
   load/reload without failing an already-serving cache.
 
@@ -171,35 +172,34 @@ plugins and after `compression` request decompression:
 - `ai_prompt_shield` (2925), `ai_semantic_firewall` (2968), and
   `ai_request_guard` (2975) see the original content — compression never blinds
   PII detection, prompt-injection detection, or request validation.
-- `ai_semantic_cache` (4057) now looks up **after** this plugin, over the
+- `ai_semantic_cache` (4057) looks up **after** this plugin, over the
   compressed backend-visible prompt and after this plugin's final hook has
   enforced any staged marker-sanitization rejection. A cached completion is
   therefore keyed to the bytes the provider would actually receive, and a hit
-  can never bypass a rejection this plugin already decided on. Deployments that
-  enable compression will see keys change once, at cutover.
+  can never bypass a rejection this plugin already decided on. Enabling
+  compression on a route changes its cache keys, so existing entries stop
+  matching.
 - `compression` (4050) can decode opt-in gzip/brotli request bodies before the
   compressor rewrites the standard backend-dispatch body.
 
-On the standard backend-dispatch path, the context-aware request-body transform
-produces the compressed bytes actually sent upstream. For already-plaintext JSON
-uploads, `before_proxy` also rewrites `ctx.metadata["request_body"]` so direct
-dispatchers that consume that metadata can forward the compressed prompt. The
-plugin stages results of at most 65,536 bytes privately and reuses them when the
-authoritative input is unchanged; larger results are not duplicated beside
-request metadata and are recomputed on normal wire dispatch under the same work
-budget. Digest validation for staged results uses the immutable 1,048,576-byte
-body ceiling, so marker-only sanitation above `max_scan_bytes` can still reuse
-its staged output. If an earlier wire transform changed the bytes, the plugin
-discards any stage and recomputes against the actual representation. Auto-family
-admission continues to use the original incoming operation path even when
-routing rewrites the backend path, so staged reuse, recomputation, and the
-65,536-byte threshold cannot change eligibility. The path snapshot is one
-private typed value per request, shared by all compressor instances rather than
-stored in public metadata. Opt-in gzip/brotli decompression therefore compresses
-and measures the resulting plaintext on the standard path. `ai_federation`
-consumes the authoritative final request body after decompression and the
-context-aware transform, so provider dispatch uses that same compressed
-representation for plaintext and opt-in compressed uploads.
+How the compressed body reaches the backend:
+
+- On the standard backend-dispatch path, the context-aware request-body
+  transform produces the bytes actually sent upstream. With opt-in gzip/brotli
+  request decompression, the decompressed plaintext is what gets compressed and
+  measured.
+- For already-plaintext JSON uploads, `before_proxy` also rewrites
+  `ctx.metadata["request_body"]` so direct dispatchers that read that metadata
+  forward the compressed prompt.
+- Results of at most 65,536 bytes are staged privately and reused when the
+  input is unchanged; larger results are recomputed at wire dispatch under the
+  same work budget. If an earlier wire transform changed the bytes, the stage is
+  discarded and the plugin recomputes against the actual body.
+- `auto` family admission always uses the original incoming path, even when
+  routing rewrites the backend path, so staging and recomputation cannot change
+  eligibility.
+- `ai_federation` consumes the final request body after decompression and this
+  transform, so provider dispatch uses the same compressed representation.
 
 The final context-aware body hook is the fail-closed backstop for decoded
 representations. For example, if request decompression produces more than the

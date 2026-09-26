@@ -1,29 +1,28 @@
 # Database Mode Functional Testing
 
-This document describes the comprehensive functional test suite for ferrum-edge
-in database mode, including the required CI backend × behavior matrix.
+This document describes the database-mode functional test suite, including
+the required CI backend × behavior matrix.
 
 ## Backend × behavior matrix
 
 Hosted CI owns these cells in the `Functional Tests (data-plane)` and `Functional Tests (data-plane-runtime)` jobs
-(`.github/workflows/ci.yml`). That job provisions Redis, MongoDB (plaintext +
+(`.github/workflows/ci.yml`). These shards provision Redis, MongoDB (plaintext +
 TLS/mTLS), PostgreSQL, and MySQL (plaintext + TLS), sets explicit
 `FERRUM_TEST_*_URL` values, and enables fail-closed mode via
 `FERRUM_DB_BACKENDS_REQUIRED=1` and `FERRUM_DB_TLS_REQUIRED=1`. A
-missing/unreachable expected backend fails the job instead of silently skipping.
+missing/unreachable expected backend fails the shard instead of silently skipping.
 
 The shard runs four mongod instances: the standalone on `27017` (the required
 backend for the cells below, and for the documented `POST /batch` 501 refusal),
 a single-node replica set on `27020` for the multi-document transactional batch
 and gateway trust-bundle paths, TLS on `27018` (verify-full and require modes),
-and mTLS on `27019`. The
-replica set is opt-in through `FERRUM_TEST_MONGO_REPLICA_SET` rather than
+and mTLS on `27019`. The replica set is opt-in through `FERRUM_TEST_MONGO_REPLICA_SET` rather than
 `FERRUM_DB_BACKENDS_REQUIRED`, but once declared an unreachable member fails the
 cell instead of skipping. Mongo TLS/mTLS cells fail closed under
 `FERRUM_DB_TLS_REQUIRED=1`.
 
-Local developers keep the historical opt-out: leave those required flags unset
-and omit backend URLs / containers; suites print `SKIPPED` and return success.
+Locally, leave those required flags unset and omit backend URLs / containers;
+suites print `SKIPPED` and return success.
 
 Shared CI PostgreSQL/MySQL containers are resumed defensively at the start of
 SQL-backed cells (`ensure_shared_sql_containers_resumed`) so a prior
@@ -98,17 +97,15 @@ behavior across the backends in the matrix above. Coverage includes:
 - Authentication and authorization via JWT tokens
 - Proper cleanup of resources
 
-The historical SQLite-focused harness in `functional_database_test.rs` remains
-the deep lifecycle walkthrough for a single embedded backend; the matrix rows
-above are what required CI must keep green for dialect parity.
+`functional_database_test.rs` is a single-backend (SQLite) lifecycle
+walkthrough; the matrix rows above are what required CI must keep green for
+dialect parity.
 
 ## Running the Test
 
 ### Prerequisites
 
-- Rust toolchain (1.70+)
-- Cargo
-- SQLite development libraries (usually included with the system)
+- Rust stable toolchain (pinned by `rust-toolchain.toml`)
 - For PostgreSQL/MySQL/MongoDB cells: running servers (or Docker) and the matching `FERRUM_TEST_*_URL`
 - Optional fail-closed local gate: `FERRUM_DB_BACKENDS_REQUIRED=1` / `FERRUM_DB_TLS_REQUIRED=1`
 - ~30 seconds per backend lifecycle (gateway startup time)
@@ -116,11 +113,8 @@ above are what required CI must keep green for dialect parity.
 ### Execute the Test
 
 ```bash
-# Run the functional test (ignored by default)
-cargo test --test functional_tests functional_database -- --ignored --nocapture
-
-# Or with verbose logging
-RUST_LOG=debug cargo test --test functional_tests functional_database -- --ignored --nocapture
+# Run the SQLite lifecycle test (ignored by default)
+cargo test --test functional_tests functional_database_test -- --ignored --nocapture
 
 # Cross-backend parity cells (requires live Postgres/MySQL URLs)
 FERRUM_TEST_POSTGRES_URL=postgres://ferrum:ferrum@127.0.0.1:5432/ferrum \
@@ -135,12 +129,10 @@ The test produces detailed output for each major step:
 ```
 === Starting Database Mode Functional Test ===
 
+Echo backend started on port 54321
 Test harness created:
-  Database: /tmp/.../test.db
   Proxy URL: http://127.0.0.1:12345
   Admin URL: http://127.0.0.1:12346
-
-Echo backend started on port 54321
 
 --- Test 1: Create Proxy ---
 ✓ Proxy created successfully
@@ -155,30 +147,25 @@ Echo backend started on port 54321
 
 ## Test Harness Architecture
 
-### DatabaseModeTestHarness
-
-The `DatabaseModeTestHarness` struct manages the complete test environment:
+The test uses the shared `TestGateway` harness (`tests/common/gateway_harness.rs`):
 
 ```rust
-struct DatabaseModeTestHarness {
-    temp_dir: TempDir,           // Temporary directory for test artifacts
-    gateway_process: Option<Child>, // Gateway process handle
-    proxy_base_url: String,      // URL for proxy traffic (port randomized)
-    admin_base_url: String,      // URL for admin API (port randomized)
-    jwt_secret: String,          // JWT signing secret
-    jwt_issuer: String,          // JWT issuer identifier
-    admin_port: u16,             // Randomly selected admin port
-    proxy_port: u16,             // Randomly selected proxy port
-}
+let mut gateway = TestGateway::builder()
+    .mode_database_sqlite()
+    .jwt_issuer("ferrum-edge-test")
+    .log_level("info")
+    .db_poll_interval_seconds(2)
+    .spawn()
+    .await?;
 ```
 
 ### Key Features
 
-1. **Port Randomization**: Binds to port 0 to let the OS assign random available ports, avoiding conflicts
-2. **Automatic Cleanup**: Drop implementation ensures gateway process is terminated and temporary files cleaned up
-3. **JWT Generation**: Produces valid, signed JWT tokens for Admin API authentication
-4. **Gateway Startup**: Builds binary in release mode and starts with database mode environment variables
-5. **Health Polling**: Waits up to 30 seconds for gateway to be ready before running tests
+1. **Port reservation**: Admin and proxy ports come from the shared test port registry; a failed spawn retries (up to 3 attempts) on fresh ports
+2. **Automatic cleanup**: `Drop` kills the gateway process and removes the temporary directory
+3. **JWT generation**: Mints a per-spawn admin JWT secret and exposes a signed token via `gateway.auth_header()`
+4. **Gateway binary**: Runs `cargo build --bin ferrum-edge` once per test process (skip with `FERRUM_SKIP_GATEWAY_BUILD=1`), then uses `target/debug/ferrum-edge` by default
+5. **Health polling**: Waits up to 30 seconds (`health_timeout`) for the gateway to be ready before running tests
 
 ## Test Cases
 
@@ -326,10 +313,10 @@ Lists all proxies.
 | Variable | Value | Purpose |
 |----------|-------|---------|
 | `FERRUM_MODE` | `database` | Operating mode |
-| `FERRUM_ADMIN_JWT_SECRET` | `change-me-to-a-32-character-admin-secret` | JWT signing secret |
+| `FERRUM_ADMIN_JWT_SECRET` | (random, per spawn attempt) | JWT signing secret |
 | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge-test` | JWT issuer claim |
 | `FERRUM_DB_TYPE` | `sqlite` | Database type |
-| `FERRUM_DB_URL` | `sqlite:////tmp/xxx/test.db` | Database connection string |
+| `FERRUM_DB_URL` | SQLite file in the harness temp directory | Database connection string |
 | `FERRUM_DB_POLL_INTERVAL` | `2` | Database poll interval (seconds) |
 | `FERRUM_PROXY_HTTP_PORT` | (random) | Proxy HTTP port |
 | `FERRUM_ADMIN_HTTP_PORT` | (random) | Admin API HTTP port |
@@ -342,8 +329,8 @@ The test uses SQLite with the following schema (automatically created):
 **proxies table**
 - `id` (TEXT): Proxy identifier, unique within its namespace
 - `namespace` (TEXT): Owning tenant; `PRIMARY KEY (namespace, id)`
-- `listen_path` (TEXT NOT NULL UNIQUE): Path the proxy listens on
-- `backend_scheme` (TEXT): Backend protocol (http/https)
+- `listen_path` (TEXT, nullable): Path the proxy listens on (stream proxies use `listen_port` instead)
+- `backend_scheme` (TEXT, default `https`): Backend scheme
 - `backend_host` (TEXT): Backend hostname
 - `backend_port` (INTEGER): Backend port number
 - `strip_listen_path` (INTEGER): Whether to strip listen path from requests
@@ -356,22 +343,23 @@ The test uses SQLite with the following schema (automatically created):
 - `custom_id` (TEXT): Custom identifier
 - ... (credential and timing fields)
 
-**plugins_config table**
-- `id` (TEXT PRIMARY KEY): Plugin config identifier
-- `name` (TEXT): Plugin name
-- `scope` (TEXT): Scope (proxy, consumer, global)
-- `target_id` (TEXT): Target proxy/consumer ID
-- `config` (JSON): Plugin configuration
+**plugin_configs table**
+- `id` (TEXT): Plugin config identifier
+- `namespace` (TEXT): Owning tenant; `PRIMARY KEY (namespace, id)`
+- `plugin_name` (TEXT): Plugin name
+- `scope` (TEXT, default `global`): `global`, `proxy`, or `proxy_group`
+- `proxy_id` (TEXT): Target proxy ID for proxy-scoped configs
+- `config` (TEXT): Plugin configuration as JSON
+- ... (enabled, priority, trigger and timing fields)
 
 ## Echo Backend Server
 
-The test starts a simple in-process echo backend server that:
+The test starts the shared in-process echo backend (`spawn_http_echo` in
+`tests/common/echo_servers.rs`), which:
 
-1. Listens on a random available port
-2. Accepts TCP connections
-3. Reads HTTP requests
-4. Returns `{"status":"ok","echo":true}` for any request
-5. Runs until test completes
+1. Listens on a reserved port (the listener stays bound, so there is no rebind race)
+2. Returns `200 {"echo":"<request path>"}` for any path except `/health`, which returns `{"status":"healthy"}`
+3. Runs until the test completes
 
 This allows testing the complete request-response path through the gateway without external dependencies.
 
@@ -379,25 +367,23 @@ This allows testing the complete request-response path through the gateway witho
 
 ### Test Timeout (30 seconds)
 
-**Symptom**: Test fails with "Gateway did not start within 30 seconds"
+**Symptom**: Gateway spawn fails after the 30-second health timeout
 
 **Cause**: Gateway process not starting or database not initializing
 
 **Solution**:
-- Ensure SQLite is installed: `sqlite3 --version`
-- Check build logs: `cargo build --release 2>&1`
-- Verify disk space in /tmp
-- Try with `FERRUM_LOG_LEVEL=debug` for more details
+- Check that `cargo build --bin ferrum-edge` succeeds
+- Verify disk space in the temp directory
+- Read the child stdout/stderr tails included in the readiness failure message
 
 ### Port Already in Use
 
 **Symptom**: "Address already in use" error
 
-**Cause**: Random port selection hit occupied port (unlikely but possible)
+**Cause**: A process outside the test port registry took a reserved port
 
 **Solution**:
-- Run test again (different ports will be selected)
-- Check for lingering processes: `lsof -i :PORT`
+- The harness already retries on fresh ports; if all attempts fail, check for lingering processes: `lsof -i :PORT`
 
 ### Database Lock
 
@@ -417,8 +403,7 @@ This allows testing the complete request-response path through the gateway witho
 
 **Solution**:
 - Check system time is correct
-- Verify JWT secret matches in harness and gateway
-- Ensure token generation uses same algorithm (HS256)
+- Use `gateway.auth_header()` so the token is signed with that spawn's secret and issuer (HS256)
 
 ## Performance Expectations
 
@@ -447,7 +432,7 @@ Example:
 // Test N: Your Test Name
 println!("\n--- Test N: Your Test Name ---");
 let response = client
-    .post(format!("{}/endpoint", harness.admin_base_url))
+    .post(gateway.admin_url("/endpoint"))
     .header("Authorization", &auth_header)
     .json(&data)
     .send()
@@ -460,8 +445,7 @@ println!("✓ Test description");
 
 ## Future Enhancements
 
-Broad "add X testing" bullets from the original checklist are reconciled against
-current functional coverage. Retain only exact residuals.
+The original "add X testing" checklist, reconciled against current coverage.
 
 ### Covered (do not reopen as missing database-mode work)
 
@@ -475,11 +459,8 @@ current functional coverage. Retain only exact residuals.
 - [x] Consumer authentication testing — see [Auth & ACL Functional Testing](functional_testing_auth_acl.md)
 - [x] Rate limiting verification — `functional_redis_rate_limiting_test` + plugin network suites
 - [x] Performance / scale stress — `tests/performance/multi_protocol/` plus scheduled `.github/workflows/scaling-regression.yml` (30k/10k suites excluded from PR shards by design)
-
-### Exact residuals (live trackers)
-
-- [ ] MongoDB replica-set **change-stream-triggered** config wakeups (polling remains the authoritative backstop) — [#3330](https://github.com/ferrum-edge/ferrum-edge/issues/3330)
 - [x] Live OIDC relying-party / OAuth2 introspection service-integration coverage — [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333)
+- [x] MongoDB replica-set **change-stream-triggered** config wakeups (polling remains the authoritative backstop) — [#3330](https://github.com/ferrum-edge/ferrum-edge/issues/3330) (`src/config/config_change_watch.rs`)
 
 ## Testing with MongoDB
 
@@ -496,7 +477,7 @@ docker run -d --name mongo-test -p 27017:27017 mongo:7
 # are already available.
 
 # Build the gateway
-cargo build
+cargo build --bin ferrum-edge
 ```
 
 ### Running Tests

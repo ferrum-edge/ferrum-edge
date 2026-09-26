@@ -1,12 +1,12 @@
 # Features — Ferrum Edge
 
-A comprehensive feature list for Ferrum Edge.
+A feature-by-feature summary of Ferrum Edge. Each item links to, or is detailed in, the reference docs under [docs/](docs/README.md).
 
 ## Protocol Support
 
 - **HTTP/1.1** with keep-alive connection pooling
-- **HTTP/2** via ALPN negotiation on TLS connections; H2-capable HTTPS backends use the multiplexed direct-H2 pool with in-path body-size enforcement (default nonzero limits no longer force the reqwest path)
-- **HTTP/3** (QUIC) on the same port as HTTPS with streaming responses (backpressure-aware adaptive coalescing), configurable idle timeout, max streams, QUIC flow-control windows, and per-backend connection pooling
+- **HTTP/2** via ALPN negotiation on TLS connections; H2-capable HTTPS backends use the multiplexed direct-H2 pool with in-path body-size enforcement, so configured body-size limits do not force the slower reqwest path
+- **HTTP/3** (QUIC, opt-in via `FERRUM_ENABLE_HTTP3=true`) on the same port number as HTTPS (UDP) with streaming responses (backpressure-aware adaptive coalescing), configurable idle timeout, max streams, QUIC flow-control windows, and per-backend connection pooling
 - **WebSocket** (`ws`/`wss`) with transparent upgrade handling — HTTP/1.1 Upgrade (RFC 6455), HTTP/2 Extended CONNECT (RFC 8441), and HTTP/3 Extended CONNECT (RFC 9220, `:protocol=websocket` over QUIC). All three frontends share the same plugin pipeline (`on_ws_frame`, `on_ws_disconnect`, sticky-session cookies); the H3 frontend bridges to HTTP/1.1-Upgrade backends (RFC 6455 §5.1 client masking applies on every hop — RFC 9220 / RFC 8441 Extended CONNECT bootstrap the session without changing framing). Gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default `true`)
 - **gRPC** (`grpc`/`grpcs`) with HTTP/2 trailer support and full plugin compatibility
 - **TCP** stream proxying with TLS termination, origination, passthrough, and configurable idle timeout
@@ -39,7 +39,7 @@ A comprehensive feature list for Ferrum Edge.
 ## Load Balancing
 
 - Six algorithms: round robin, weighted round robin, least connections, least latency, consistent hashing (IP/header/cookie sticky sessions), random
-- Active health checks (HTTP, TCP SYN, UDP probes) with configurable thresholds
+- Active health checks (HTTP, TCP connect, UDP, and gRPC `grpc.health.v1` probes) with configurable thresholds
 - Passive health monitoring with automatic failover
 - Circuit breaker (Closed/Open/Half-Open) preventing cascading failures
 - Retry logic with fixed and exponential backoff strategies for HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket — see [docs/retry.md](docs/retry.md)
@@ -195,12 +195,17 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **HTTP Logging** — batched delivery to external endpoints with retry and custom headers (Datadog, Splunk, New Relic, Sumo Logic, Axiom, Logtail, Elastic, Azure Monitor, and more)
 - **Loki Logging** — batched delivery to Grafana Loki with label-based stream grouping, gzip compression, and multi-tenant support
 - **UDP Logging** — batched delivery to external UDP/DTLS endpoints with optional DTLS encryption and client certificate support
+- **TCP Logging** — batched newline-delimited JSON delivery to a remote TCP or TLS endpoint
+- **WebSocket Logging** (`ws_logging`) — batched delivery of transaction, stream, and WebSocket-disconnect entries to a remote `ws://`/`wss://` endpoint
+- **Kafka Logging** — asynchronous delivery of HTTP and stream summaries to Apache Kafka (librdkafka handles batching, compression, and delivery retries)
+- **StatsD Logging** — request, stream, and WebSocket-disconnect metrics sent over UDP to StatsD-compatible servers (StatsD, Datadog, Telegraf)
 - **Transaction Debugger** — verbose request/response diagnostics via `tracing::debug` with header redaction (development only)
 - **Correlation ID** — UUID generation and propagation
 - **Prometheus Metrics** — exposition format endpoint
 - **Proxy Alerts** — per-proxy / per-team in-gateway anomaly notifications. Watches `log()` / `on_stream_disconnect()` / WebSocket disconnect hooks and dispatches to Slack / Microsoft Teams / Discord / generic webhook (PagerDuty Events v2, etc.) / SMTP email (STARTTLS or implicit TLS, never plaintext) when configured rules breach. Rule types: error rate %, status-code count, gRPC-status count/rate (terminal application codes `0..=16` or `OTHER`, independent of HTTP status), latency percentile (p50/p95/p99 of backend or stream duration via fixed log-scale buckets), error-class spike (DNS / TLS / connect failures), stream disconnect-cause spike. Per-`(rule, proxy, channel)` cooldown, opt-in recovery notifications, optional UTC quiet hours. Channel layer lives in the reusable `src/notifications/` module — see `docs/notifications.md` and `docs/proxy_alerts.md`
 - **Runtime Metrics Endpoint** — JWT-gated `/metrics/runtime` JSON snapshot with process/system metrics, HTTP status windows, error classes, DNS outcomes, backend pool churn, TCP reset counts, bounded log counters, and overload state
-- **API Chargeback** — per-consumer API usage charge tracking with three pricing dimensions: per-call pricing by HTTP status code (`pricing_tiers`), bandwidth pricing per byte sent/received (`bandwidth_pricing`), and per-connection pricing for stream sessions (`stream_connection_pricing`). Bandwidth and stream-session charges cover TCP / TCP+TLS / UDP / DTLS proxies in addition to HTTP / gRPC / WebSocket, so L4 traffic now appears in chargeback output. Exposed via `/charges` admin endpoint in Prometheus and JSON formats for external billing integration
+- **API Chargeback** — per-consumer API usage charge tracking with three pricing dimensions: per-call pricing by HTTP status code (`pricing_tiers`), bandwidth pricing per byte sent/received (`bandwidth_pricing`), and per-connection pricing for stream sessions (`stream_connection_pricing`). Bandwidth and stream-session charges cover TCP / TCP+TLS / UDP / DTLS proxies in addition to HTTP / gRPC / WebSocket, so L4 traffic appears in chargeback output. Exposed via `/charges` admin endpoint in Prometheus and JSON formats for external billing integration
+- **API Chargeback Sink** (`api_chargeback_sink`) — durable ClickHouse export of chargeback records with its own queue, on-disk spool, and replay, independent of `api_chargeback`; see [docs/plugins/api_chargeback_sink.md](docs/plugins/api_chargeback_sink.md)
 - **OpenTelemetry Tracing** — W3C Trace Context propagation + OTLP/HTTP span export with batching, custom headers, rich semantic attributes, and propagation-only mode. Mesh Telemetry can also fan out sampled spans from `workload_metrics` to inline Zipkin, Datadog, Lightstep, and OpenTelemetry providers
 - **Customizable Transaction Log Schema** — per-plugin `schema:` (or shared `transaction_log_schema` with `schema_ref:`) lets operators rename keys, drop fields, reorder output, inject static stamping, emit derived fields (`status_class`/`outcome`/`backend_host`/`summary_kind`), flatten metadata, and choose timestamp format — without forking the gateway. Applies to stdout / http / tcp / udp / ws / kafka / loki JSON output and statsd tag rename / omit. Sensitive-key redaction always applies. See `docs/log_schema.md`.
 
@@ -235,7 +240,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
   - `TCP_FASTOPEN` on server sockets — saves 1 RTT for repeat clients with cached TFO cookies, configurable queue length (`FERRUM_TCP_FASTOPEN_ENABLED`, `FERRUM_TCP_FASTOPEN_QUEUE_LEN`)
   - `IP_BIND_ADDRESS_NO_PORT` on all outbound sockets (HTTP/2 pool, gRPC pool, TCP stream proxy, HTTP/3 QUIC) — defers ephemeral port allocation to `connect()` for 4-tuple co-selection, preventing port exhaustion under high outbound connection rates
   - **Port exhaustion detection** — EADDRNOTAVAIL errors are classified as `PortExhaustion` across all connection paths, logged at `error` level with remediation guidance, and tracked via a monotonic counter on `GET /overload`
-- **Thread-local Date header caching** — caches the RFC 2822 formatted date string per-thread with second-granularity refresh, avoiding `SystemTime::now()` + formatting (~100ns) on every response
+- **Thread-local Date header caching** — caches the formatted HTTP `Date` value (IMF-fixdate) per-thread with second-granularity refresh, avoiding `SystemTime::now()` + formatting (~100ns) on every response
 - **Lazy timeout initialization** — defers tokio timer wheel allocation until the inner future returns `Pending`, so fast-path operations (e.g., buffered I/O reads that complete immediately) never allocate a timer
 - **TCP_INFO kernel diagnostics** (Linux) — `getsockopt(TCP_INFO)` access for kernel-level RTT, retransmit, and congestion window metrics on stream proxy connections
 
@@ -292,7 +297,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - Admin API connection cap (`FERRUM_ADMIN_MAX_CONNECTIONS`, default 1024; optional per-IP `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP`) — bounds management-plane connections independently of the data-plane `FERRUM_MAX_CONNECTIONS`; enforced after the CIDR allowlist and before the TLS handshake, with `ferrum_admin_active_connections` / `ferrum_admin_rejected_connections_total` metrics
 - CP gRPC pre-authentication connection cap (`FERRUM_CP_GRPC_MAX_CONNECTIONS`, default 1024; per-IP `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP`, default 64) — bounds unauthenticated CP gRPC sockets before any TLS/mTLS handshake task is allocated and through the served HTTP/2 session, shared across certificate reloads, with `ferrum_cp_grpc_active_connections` / `ferrum_cp_grpc_rejected_connections_total` metrics
 - Finite bearer authorization leases for ConfigSync, local/cross-cluster native MeshSubscribe, and SotW/delta ADS — streams close at verified JWT expiry, accepted-key removal, or `FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS` without heartbeat renewal; fixed-cardinality termination metrics distinguish the cause
-- Opt-in Via header (RFC 9110 §7.6.3) on request and response paths (`FERRUM_ADD_VIA_HEADER`)
+- Via header (RFC 9110 §7.6.3) on request and response paths, on by default (`FERRUM_ADD_VIA_HEADER=false` disables it)
 - Opt-in Forwarded header (RFC 7239) alongside X-Forwarded-* (`FERRUM_ADD_FORWARDED_HEADER`); when enabled Ferrum owns the outbound value and discards client-supplied `Forwarded` on every backend transport
 - Certificate Revocation List (CRL) checking across all TLS/DTLS surfaces (`FERRUM_TLS_CRL_FILE_PATH`) — full-chain revocation including issuing intermediates, enforced CRL validity windows at admission and at handshake time, and retained tolerance for chains no configured CRL covers
 
@@ -307,7 +312,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 
 - Six subcommands: `run` (foreground gateway), `validate` (config check), `reload` (SIGHUP — a config reload in file mode and in mesh mode with a local file/xDS config source; a logged no-op in every other mode), `health`, `version`, `ambient-udp-preflight` (privileged Ambient UDP node preflight)
 - Smart path defaults — `ferrum-edge run` works zero-config when `./ferrum.conf` and `./resources.yaml` exist
-- Mode inference — `--spec` auto-sets file mode when no mode is configured
+- Mode inference — file mode is inferred when a spec path is available (`--spec`, `FERRUM_FILE_CONFIG_PATH`, or smart path discovery) and no mode is configured
 - Configuration precedence: CLI flag > env var > conf file > smart defaults > hardcoded defaults
 - See [docs/cli.md](docs/cli.md) for the full reference
 
@@ -344,7 +349,7 @@ Any `FERRUM_*` environment variable can be loaded from an external secret source
 - **Environment variable** — `FERRUM_X=value` (direct value)
 - **File** — `FERRUM_X_FILE=/run/secrets/x` (Docker secrets, K8s volume mounts, Vault Agent file injection)
 
-**Optional backends (Cargo feature flags, zero impact on default binary size):**
+**Optional backends (Cargo feature flags, not in a default `cargo build`; `cloud-secrets` enables all four, and published release binaries and images are built with it):**
 - **HashiCorp Vault** — `FERRUM_X_VAULT=secret/data/gw#key` (feature: `secrets-vault`)
 - **AWS Secrets Manager** — `FERRUM_X_AWS=arn:aws:secretsmanager:...` (feature: `secrets-aws`)
 - **GCP Secret Manager** — `FERRUM_X_GCP=projects/P/secrets/S/versions/V` (feature: `secrets-gcp`)
@@ -504,6 +509,6 @@ Every backend fetch is wrapped in the same per-fetch timeout envelope — the cl
 ## Deployment
 
 - Single binary, mode selected via environment variable
-- Docker multi-stage build with distroless runtime (zero OS-level CVEs, ~30MB image)
-- Docker Compose profiles for SQLite, PostgreSQL, and CP/DP topologies
-- CI pipeline: unit tests, functional tests, lint, performance regression
+- Docker multi-stage build with a distroless (`gcr.io/distroless/cc`) nonroot runtime image
+- Docker Compose setups for SQLite (default), PostgreSQL, MongoDB, and CP/DP topologies
+- CI pipeline: unit, integration, and functional tests plus lint on every PR; performance regression suites on a schedule

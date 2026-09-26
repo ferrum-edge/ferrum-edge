@@ -47,7 +47,8 @@ equivalent `&self` + `'static` `stopped` watch:
 1. Bump the workspace `h3-quinn` dependency to that release.
 2. Keep the vendored crate until patch 001 is also retired (they share one vendor directory).
 3. When both active h3-quinn patches are available upstream, remove the
-   `h3-quinn` `[patch.crates-io]` entry and delete
+   `h3-quinn` `[patch.crates-io]` entry (root and
+   `tests/performance/mesh/Cargo.toml`) and delete
    `vendor/h3-quinn-0.0.10-ferrum-patched`.
 4. Move this directory under
    `docs/upstream-h3-quinn-patches/_retired/002-send-stream-stopped-watch/`

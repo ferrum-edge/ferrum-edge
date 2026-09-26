@@ -42,14 +42,14 @@ Record peak memory as well as elapsed time; on macOS `/usr/bin/time -l` supplies
 both. Compare the hosted **Candidate policy self-test** job against its baseline.
 The lexical-reuse experiment's original **CI Plan** and **Trusted Cross Build
 Policy** jobs ran the reviewed base verifier, so its passing candidate test
-alone did not demonstrate lower planning latency. That end-to-end measurement requires reviewed landing
-and subsequent PR/merge-group runs. Keep their required checks intact.
+alone did not demonstrate lower planning latency. That end-to-end measurement
+requires the change to land and subsequent PR/merge-group runs. Keep their
+required checks intact.
 
 Local timing and hosted results are recorded on the experiment PR linked from
 [#4668](https://github.com/ferrum-edge/ferrum-edge/issues/4668). A faster parser
 alone does not establish a shorter whole-PR critical path; compare artifact
 compilation, Unit Tests, and other required workflows separately.
-
 
 ## Parallel trusted validation (#4680)
 
@@ -58,8 +58,10 @@ still spent **6m21s** in CI Plan; its policy step consumed **316s**, from
 06:33:52 to 06:39:08 UTC. These are the issue's baseline measurements, not
 results from the parallel-policy implementation.
 
-`CI Policy` now performs the same complete trusted self-tests and workflow
-validation as an independent read-only job. CI Plan retains authenticated,
+`CI Policy` now performs the trusted workflow validation as an independent
+read-only job. (The verifier's static `--self-test` later moved out of the
+per-event path into `trusted-policy-candidate.yml`, which runs when
+`.github/scripts/**` or `.github/workflows/**` change.) CI Plan retains authenticated,
 immutable-base planning, diff hygiene, formatting, and shard coverage. Both
 jobs pin their own trust source without consuming candidate planner output.
 Every `Tests` aggregate, including light mode, requires successful policy and
@@ -100,11 +102,9 @@ missing result, and missing/invalid completion output; extraction cases cover
 PR live-base ancestry, merge-group identity, main/manual checkout identity,
 transport failure, and failed/interrupted verifier execution.
 
-No local builds, tests, or timing runs were performed for this implementation;
-exact pushed-head remote CI is the validation authority. The immutable-base
-policy may reject the workflow migration itself because it changes previously
-frozen CI executable surfaces. Keep that result visible and report it to the
-controller. Do not weaken the guard, change branch protection, or treat a
-policy bypass as successful exact-SHA release evidence. End-to-end timing
-requires a reviewed adoption and subsequent runs; until then all candidate
-performance and CI results above remain pending.
+Exact pushed-head remote CI is the validation authority; no local timing runs
+back these results. The immutable-base policy may reject the workflow migration
+itself because it changes previously frozen CI executable surfaces. Keep that
+result visible. Do not weaken the guard, change branch protection, or treat a
+policy bypass as successful exact-SHA release evidence. Until the change is
+adopted and later runs are measured, the results above remain pending.

@@ -31,9 +31,10 @@ namespace-scoped admin routes both require an `ns` claim on a **single-namespace
 CP. A **multi-namespace** CP (`cp.namespaces` with more than one entry, or `*`)
 needs neither value: both planes engage the `ns` claim requirement automatically,
 and admin tokens without an `ns` claim are refused with `403` on namespace-scoped
-routes (including `/backup` and `/restore`). Both values render in `database`, `file`, `cp`, and `dp` modes (any
-mode that serves the admin API) and are reserved so `env` / `extraEnv` cannot
-desync them.
+routes (including `/backup` and `/restore`). `admin.requireNamespaceClaim`
+renders in every mode (all serve the admin API); `cp.requireNamespaceClaim`
+renders only in `cp` mode. Both env vars are reserved so `env` / `extraEnv`
+cannot desync them.
 
 The `mode` value is first-class and required. `mesh` / `injector` / `node_agent`
 fail at template time with a pointer to [`ferrum-mesh`](../ferrum-mesh).
@@ -73,15 +74,14 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   binary hard-fails on a non-loopback **plaintext** admin bind unless you also
   set one of `admin.allowedCidrs`, admin TLS (`tls.admin` or a complete
   `FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE` pair, with `ports.adminHttp=0`), or
-  `admin.allowInsecureHttp=true` with `networkPolicy.enabled=true`; TLS on 9443 does not protect a still-live
-  plaintext listener on 9000. Any allowlist that covers a whole address family
+  `admin.allowInsecureHttp=true` with `networkPolicy.enabled=true`; TLS on
+  9443 does not protect a still-live plaintext listener on 9000. Any allowlist that covers a whole address family
   is rejected as ineffective protection, including `/0`, mapped IPv6 `/96`
   spellings that canonicalize to IPv4 `/0`, and full-coverage CIDR unions.
   Every entry is strictly validated so a typo fails at render instead of
   crash-looping the pod. If computed exec probes are enabled,
   `admin.allowedCidrs` must contain source `127.0.0.1` (for example
-  `127.0.0.0/8`, `127.0.0.1/32`, or the bare IP)
-  because the admin TCP filter does not special-case loopback. An IPv6 wildcard
+  `127.0.0.0/8`, `127.0.0.1/32`, or the bare IP) because the admin TCP filter does not special-case loopback. An IPv6 wildcard
   or loopback bind (`::` or `::1`) shifts probes to `--host ::1` and requires an
   entry containing `::1` (such as `::/127`, `::1/128`, or bare `::1`) — an
   unspecified IPv6 bind is not guaranteed to accept v4-mapped `127.0.0.1`.
@@ -117,17 +117,17 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   or a complete `FERRUM_CP_GRPC_TLS_{CERT,KEY}_SOURCE` pair. Prefer TLS plus
   `tls.dpGrpc` trust pinning for production; the dev opt-in flows through the
   first-class `grpc.allowPlaintext`.
-  IPv6 CP binds are bracketed automatically (`::` → `[::]:50051`). A loopback CP
-  Both bare and balanced bracketed IPv6 are accepted; malformed literals and
-  mismatched brackets fail at render. A loopback CP bind is unreachable through
-  `cp.service`, so the chart requires
-  `cp.service.enabled=false` with it; `ports.cpGrpc=0` disables the CP gRPC
-  listener (the gRPC container port and CP Service are omitted). `cp.grpcBindAddress`
-  must be an IP literal — the runtime parses `FERRUM_CP_GRPC_LISTEN_ADDR` as an
-  IP:port socket address and rejects hostnames like `localhost` at boot, so the
-  chart rejects non-IP binds at render. DP CP URLs are validated for both scheme
-  (http/https/grpc/grpcs) and a non-empty host, so typos and host-less values (e.g.
-  `https://`) fail at render, not at boot.
+  `cp.grpcBindAddress` must be an IP literal — the runtime parses
+  `FERRUM_CP_GRPC_LISTEN_ADDR` as an IP:port socket address and rejects
+  hostnames like `localhost` at boot, so the chart rejects non-IP binds at
+  render. IPv6 binds may be bare or balanced-bracketed and are bracketed
+  automatically (`::` → `[::]:50051`); malformed literals and mismatched
+  brackets fail at render. A loopback CP bind is unreachable through
+  `cp.service`, so the chart requires `cp.service.enabled=false` with it;
+  `ports.cpGrpc=0` disables the CP gRPC listener (the gRPC container port and
+  CP Service are omitted). DP CP URLs are validated for both scheme
+  (http/https/grpc/grpcs) and a non-empty host, so typos and host-less values
+  (e.g. `https://`) fail at render, not at boot.
 - **Chart-managed env is protected.** Every `FERRUM_*` var the chart renders from
   first-class values (mode, DB, JWTs, ports, bind address, allowlist, TLS paths,
   shutdown drain, DP URLs, DP stale-config fence, gRPC plaintext opt-in, K8s controller/pod-discovery
@@ -146,11 +146,8 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   `FERRUM_CP_DP_GRPC_JWT_SECRET`); other managed names such as `FERRUM_MODE`
   are rejected because the chart renders their direct value too.
 - **Kubernetes CRD controller is off.** `k8sController.enabled` defaults to
-  `false`. `mode=cp` renders `FERRUM_K8S_CONTROLLER_ENABLED=false` and
-  `FERRUM_K8S_POD_DISCOVERY_ENABLED=false` so the in-cluster binary default
-  cannot start un-granted core watches (issue #4384). Setting
-  `k8sController.enabled=true` fails render; use
-  [`ferrum-mesh`](../ferrum-mesh) instead.
+  `false` and setting it `true` fails render; see
+  [Control plane + data plane pair](#control-plane--data-plane-pair).
 - **TLS and `_FILE` Secret mounts are non-root readable.** They default to mode
   `0440` with pod `fsGroup: 65532`, matching the distroless nonroot image. Both
   `secretVolumeDefaultMode` and `podSecurityContext` are overridable for images
@@ -318,8 +315,8 @@ would 403-retry for the life of the process. `k8sController.enabled` therefore
 defaults to `false` and `mode=cp` emits `FERRUM_K8S_CONTROLLER_ENABLED=false`
 plus `FERRUM_K8S_POD_DISCOVERY_ENABLED=false`. Setting `k8sController.enabled=true`
 fails render with a pointer to [`ferrum-mesh`](../ferrum-mesh) (`controlPlane.rbac`),
-which is the designated controller. Both env names are reserved so `env` /
-`extraEnv` cannot re-enable the watches.
+which is the designated controller (issue #4384). Both env names are reserved
+so `env` / `extraEnv` cannot re-enable the watches.
 
 ### Data plane stale-config fence
 
@@ -473,8 +470,9 @@ freshness alerts render only in `database` and `cp` modes. The frontend TLS
 handshake alert renders only when `metrics.alerts.frontendTlsHandshakeErrorsPerSecond`
 is set above `0`: `reason="error"` counts every rustls accept failure, including
 mid-handshake client disconnects and scanners, so a `0` threshold would fire
-permanently on an internet-facing listener. Enabling metrics does **not** change `admin.bindAddress`; you must
-explicitly expose admin for cluster scraping:
+permanently on an internet-facing listener. Enabling metrics does **not**
+change `admin.bindAddress`; you must explicitly expose admin for cluster
+scraping:
 
 ```yaml
 metrics:
@@ -526,8 +524,7 @@ See [`docs/admin_metrics.md`](../../docs/admin_metrics.md) and
 [`docs/prometheus_metrics.md`](../../docs/prometheus_metrics.md) for the metric
 families and bundled alert expressions.
 
-
-### Audit spool with a read-only root
+## Audit spool with a read-only root
 
 Enabling `FERRUM_ADMIN_AUDIT_ENABLED=true` with
 `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` requires a writable spool

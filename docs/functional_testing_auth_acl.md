@@ -1,27 +1,27 @@
 # Authentication & ACL Functional Testing
 
-This document describes the comprehensive end-to-end functional test suite for authentication, access control, and multi-auth flows in ferrum-edge.
+This document describes the end-to-end functional tests for authentication, access control, and multi-auth flows.
 
 ## Overview
 
-The functional test (`tests/functional/functional_auth_acl_test.rs`) validates the complete authentication and authorization pipeline across all supported auth plugins. It exercises 40 test cases covering:
+`tests/functional/functional_auth_acl_test.rs` validates the authentication and authorization pipeline across the auth plugins. Its main test, `test_auth_acl_comprehensive`, runs the 40 numbered cases below, covering:
 
 - **Key Auth**: API key authentication via header and query parameter
 - **Basic Auth**: Username/password authentication with HMAC-SHA256 password hashes
 - **JWT Auth**: HS256-signed token authentication with per-consumer secrets
-- **HMAC Auth**: HMAC-signed request authentication with replay protection
+- **HMAC Auth**: HMAC-signed request authentication with a `Date` freshness window
 - **Access Control (ACL)**: Consumer allow/deny lists for authorization
 - **Multi-Auth mode**: First-success-wins across multiple auth plugins
 - **Consumer CRUD lifecycle**: Credential management and its effect on live auth
+
+The same file also holds focused tests: `test_access_control_allows_jwks_authenticated_identity_when_enabled`, `test_basic_auth_plus_acl`, `test_jwt_auth_plus_acl`, `test_hmac_auth_plus_acl`, `test_hmac_v2_backend_sees_exactly_one_mutation_for_a_replayed_request`, and `test_hmac_v2_content_digest_forwards_original_body`.
 
 ## Running the Test
 
 ### Prerequisites
 
 - Rust toolchain
-- Cargo
-- SQLite development libraries
-- Gateway binary must be compilable (`cargo build`)
+- A buildable gateway binary (the shared `TestGateway` harness runs `cargo build --bin ferrum-edge` unless `FERRUM_SKIP_GATEWAY_BUILD=1`)
 
 ### Execute the Test
 
@@ -47,7 +47,7 @@ The test takes approximately 60 seconds:
 
 The test follows a specific ordering to satisfy database foreign key constraints:
 
-1. **Start gateway** in database mode with a temporary SQLite database
+1. **Start gateway** in database mode with a temporary SQLite database (via `TestGateway`)
 2. **Create consumers** (alice, bob, charlie) with various credential types
 3. **Create bare proxies** (9 proxies, no plugin associations yet)
 4. **Create plugin configs** with `proxy_id` FK referencing existing proxies
@@ -113,9 +113,9 @@ The test follows a specific ordering to satisfy database foreign key constraints
 
 | # | Test | Request | Expected |
 |---|------|---------|----------|
-| 17 | Valid signature | HMAC-SHA256 over `GET\n/hmacauth\n<date>` | 200 OK |
+| 17 | Valid signature | HMAC-SHA256 over the `ferrum-hmac-v1` signing string | 200 OK |
 | 18 | Wrong secret | Signature computed with wrong key | 401 |
-| 19 | Missing Date header | No Date header (replay protection) | 401 |
+| 19 | Missing Date header | No Date header (freshness check) | 401 |
 | 20 | Unknown consumer | `username="nonexistent"` | 401 |
 | 21 | Missing auth header | No Authorization header | 401 |
 
@@ -180,10 +180,10 @@ Multi-auth mode executes auth plugins sequentially; first success stops iteratio
 | Variable | Value | Purpose |
 |----------|-------|---------|
 | `FERRUM_MODE` | `database` | Operating mode |
-| `FERRUM_ADMIN_JWT_SECRET` | `change-me-to-a-32-character-admin-secret` | JWT signing secret for admin API |
+| `FERRUM_ADMIN_JWT_SECRET` | `test-admin-jwt-secret-key-1234567890` | JWT signing secret for admin API |
 | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge-auth-test` | JWT issuer claim |
 | `FERRUM_DB_TYPE` | `sqlite` | Database type |
-| `FERRUM_DB_URL` | `sqlite://<temp>/test.db?mode=rwc` | Database connection string |
+| `FERRUM_DB_URL` | `sqlite:<temp>/test.db?mode=rwc` | Database connection string |
 | `FERRUM_DB_POLL_INTERVAL` | `2` | Database poll interval (seconds) |
 | `FERRUM_PROXY_HTTP_PORT` | (random) | Proxy HTTP port |
 | `FERRUM_ADMIN_HTTP_PORT` | (random) | Admin API HTTP port |
@@ -219,17 +219,18 @@ Plugins execute by priority (lower = first):
 
 ### HMAC Signing String
 
-The HMAC signature is computed over: `METHOD\nPATH\nDATE`
+The `/hmacauth` proxy uses `signing_profile: ferrum-hmac-v1` (with `allow_unsafe_replayable_v1: true`). The signature is computed over:
 
-Example for `GET /hmacauth` with date `Thu, 26 Mar 2026 10:00:00 +0000`:
+```text
+ferrum-hmac-v1\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
 ```
-GET\n/hmacauth\nThu, 26 Mar 2026 10:00:00 +0000
-```
+
+`ferrum-hmac-v2` appends a trailing `{NONCE}` field. The test helpers are in `tests/common/hmac_helpers.rs`; see [`hmac_auth`](plugins.md#hmac_auth) for the field definitions.
 
 ### JWT Token Notes
 
-- The `jsonwebtoken` crate has a default leeway of 60 seconds for expiration validation
-- The expired token test uses -300 seconds offset to ensure clear expiration
+- `jwt_auth` uses the configurable `leeway_secs` (default `0`, max `300`) for expiration validation
+- The expired token test uses a -300 second offset, so it stays expired under any allowed leeway
 - Consumer lookup uses the `sub` claim by default (configurable via `consumer_claim_field`)
 
 ## References

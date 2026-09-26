@@ -1,23 +1,22 @@
 # Multi-namespace control plane (MESH-T2-A)
 
-Before T2-A, every Ferrum Edge control plane (CP) instance served exactly one
-namespace. Multi-tenant Kubernetes deployments had to run one CP per
-namespace, multiplying the operational footprint. T2-A lifts that
-restriction with three coordinated changes:
+By default a Ferrum Edge control plane (CP) serves exactly one namespace, so
+multi-tenant deployments would need one CP per namespace. A multi-namespace CP
+removes that restriction with three pieces:
 
-1. A CP **scope** abstraction (`FERRUM_CP_NAMESPACES`) that declares which
-   namespaces the CP serves.
+1. A CP **scope** (`FERRUM_CP_NAMESPACES`) that declares which namespaces the
+   CP serves.
 2. Per-namespace **broadcast partitioning** in the CP gRPC server so each
    DP only ever receives its own namespace's config.
 3. A **JWT tenancy claim** (`ns`) that pins which namespaces a token bearer
    is authorised to subscribe to, independent of the CP scope. The claim is
-   automatically required for `Set` and `All` scopes — on the CP↔DP gRPC
-   config plane and, since issue #4529, on the REST admin plane too, so both
-   planes treat namespace as the same authorisation boundary.
+   automatically required for `Set` and `All` scopes on both the CP↔DP gRPC
+   config plane and the REST admin plane (issue #4529), so both planes treat
+   namespace as the same authorisation boundary.
 
-This document is the operator guide for adopting it. The pre-T2-A
-single-namespace deployment path is the default and remains byte-identical
-when neither new env var is set.
+This document is the operator guide for adopting it. When neither
+`FERRUM_CP_NAMESPACES` nor `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` is set, the CP
+keeps the default single-namespace behavior.
 
 ## Env var reference
 
@@ -45,9 +44,10 @@ remain the way to require `ns` claims on a **single-namespace** CP.
 > unless the token carries an `ns` claim. Re-mint operator tokens with `ns`
 > before widening the CP scope.
 
-Both vars live in `[cp_dp]` of `ferrum.conf` next to
-`FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`. The scope is also surfaced in the
-CP startup logs (`CP mode: serving N namespaces: [...]`).
+Both CP vars live in the *Control Plane / Data Plane (CP/DP)* section of
+`ferrum.conf` next to `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`. The resolved scope
+is printed in the CP startup log (`CP mode: serving single namespace ...`,
+`... N namespaces: [...]`, or `... ALL namespaces (cluster-wide)`).
 
 ## Scope resolution
 
@@ -73,13 +73,9 @@ with explicit entries (validation error).
 
 ## Per-namespace broadcast partitioning
 
-Pre-T2-A the CP used one `tokio::broadcast::Sender<ConfigUpdate>` shared by
-every subscribed DP, and DPs ignored cross-namespace rows after receiving
-them. That was acceptable for a single-namespace CP but leaks resources
-once the CP serves multiple namespaces.
-
-T2-A replaces the single sender with a per-namespace `DashMap` of senders.
-Each subscriber connects to exactly one channel (its own namespace), so a
+A single broadcast channel shared by every DP would leak other namespaces'
+resources onto the wire once a CP serves more than one namespace. The CP
+therefore keeps a per-namespace `DashMap` of broadcast senders. Each subscriber connects to exactly one channel (its own namespace), so a
 delta written into namespace A is invisible to subscribers in namespace B.
 The initial snapshot is filtered to the DP's namespace before serialisation
 — the wire never carries cross-namespace data.
@@ -87,8 +83,9 @@ The initial snapshot is filtered to the DP's namespace before serialisation
 The DP-side `dp_client::filter_config_to_namespace` filter still runs as a
 defense-in-depth backstop: if a future CP regression were to bypass the
 per-namespace filter, the DP would still drop the cross-namespace rows
-before applying them. Both filters use the canonical
-`config.proxies[i].namespace == requested_namespace` check.
+before applying them. Both filters keep only resources (proxies, consumers,
+plugin configs, upstreams, and namespace-qualified listener/TLS entries) whose
+`namespace` equals the requested namespace.
 
 ### Memory footprint
 
@@ -439,14 +436,12 @@ shared-CA certificate can never *widen* what a credential permits. Two tenants
 issued leaves by one CA are separated by their credentials and (when present)
 by their SPIFFE namespaces — never by the fact that both chains validate.
 
-**Upgrade note — align the two namespace keyspaces.** This intersection is new
-behavior: before it, a CP/DP mTLS peer certificate contributed nothing to
-authorization. A SPIFFE namespace is the *workload's* namespace (in Kubernetes,
+**Align the two namespace keyspaces.** A SPIFFE namespace is the *workload's* namespace (in Kubernetes,
 the pod's), while `SubscribeRequest.namespace` / `FERRUM_NAMESPACE` is the
 *Ferrum configuration* namespace. Mesh data planes align by construction. A
 plain `dp`-mode gateway does not have to: if it presents a SPIFFE client
 certificate from, say, `ns/ferrum-system` while subscribing to configuration
-namespace `ferrum`, the intersection is empty and the CP now answers
+namespace `ferrum`, the intersection is empty and the CP answers
 `PermissionDenied` ("not authorized for any namespace"). Fix it by aligning the
 Ferrum namespace with the workload namespace, or by presenting a CP/DP gRPC
 client certificate that carries no SPIFFE URI SAN (which contributes no
@@ -521,9 +516,8 @@ distributed.
    is a typical pattern.
 
 2. **Roll CPs first**: deploy the new binary with the existing
-   `FERRUM_NAMESPACE` and `FERRUM_CP_NAMESPACES` unset. Behavior is
-   byte-identical to the pre-T2-A path; verify via the existing
-   single-namespace CP smoke tests.
+   `FERRUM_NAMESPACE` and `FERRUM_CP_NAMESPACES` unset. The CP still serves
+   a single namespace; verify with your existing single-namespace smoke tests.
 
 3. **Build the trust bundle**: create one verification credential per tenant
    and write `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` (see

@@ -117,7 +117,7 @@ trust-bundle format, and migration steps.
 
 | Failure | Impact | Recovery |
 |---------|--------|----------|
-| Single CP goes down | DPs in that region use cached config; failover works only if another listed CP serves the same namespace | Automatic via `FERRUM_DP_CP_GRPC_URLS` when scopes match |
+| Single CP goes down | DPs in that region use cached config (bounded by `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`, default 1 hour); failover works only if another listed CP serves the same namespace | Automatic via `FERRUM_DP_CP_GRPC_URLS` when scopes match |
 | CP + its DPs go down (full region) | Other regions continue serving their own namespaces. Admin writes to the down region's namespace persist in the DB but DPs there do not receive updates until a CP serving that namespace is back | Restore regional CP or hot-standby CP with matching scope |
 | Database node goes down | DB cluster handles failover internally. CPs continue with cached config during brief failover. **Admin mutations fail closed** while Ferrum is on a `FERRUM_DB_FAILOVER_URLS` entry unless `FERRUM_DB_FAILOVER_ALLOW_WRITES=true` | Prefer a writer/virtual-IP endpoint for `FERRUM_DB_URL` so promotion stays transparent; see below |
 | Network partition between regions | DPs keep serving cached config. CP reads/writes depend on database writer and quorum reachability; a single-primary or minority partition is not independently writable, and Ferrum must not manufacture multi-primary behavior with failover-write opt-in | Restore writer/quorum connectivity. Do not enable failover writes on asynchronous standbys |
@@ -126,7 +126,7 @@ trust-bundle format, and migration steps.
 
 | Capability | Single CP | Multi-Region HA |
 |-----------|-----------|-----------------|
-| DP continues serving during CP outage | Yes (cached config) | Yes (cached config) |
+| DP continues serving during CP outage | Yes (cached config, up to `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`) | Yes (cached config, same bound) |
 | Config writes during CP outage | No (CP unreachable) | **Partial** — another region's CP can admin-write via `X-Ferrum-Namespace`, but DPs in the down region do not receive updates until a CP serving their namespace recovers |
 | Config writes during DB outage | No | **No** by default — failover URLs are read-only for admin mutations (503). Point `FERRUM_DB_URL` at the cluster writer/leader endpoint instead |
 | Region-level fault isolation | No | **Yes** (each region operates independently) |
@@ -259,7 +259,7 @@ SQLite is a single-file embedded database with no built-in replication. It is id
 - No replication — a single file on one machine
 - `FERRUM_DB_FAILOVER_URLS` has no effect (all URLs would point to the same file)
 
-**Use SQLite for**: development, testing, single-instance file-mode deployments.
+**Use SQLite for**: development, testing, and single-instance database-mode deployments.
 
 **Use PostgreSQL or MySQL for**: production multi-region deployments.
 
@@ -415,8 +415,10 @@ FERRUM_NAMESPACE=us-east   # or us-west, us-central per region
 FERRUM_DB_TYPE=mongodb
 FERRUM_DB_URL=mongodb://mongo-east:27017,mongo-west:27017,mongo-central:27017/ferrum?replicaSet=rs0
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051
-FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET_US_EAST
+FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET_US_EAST   # the region's own secret
 FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET
+FERRUM_CP_GRPC_TLS_CERT_PATH=/certs/server.pem
+FERRUM_CP_GRPC_TLS_KEY_PATH=/certs/server-key.pem
 ```
 
 **All DPs (same-namespace CP URLs only):**
@@ -427,6 +429,7 @@ FERRUM_NAMESPACE=us-east
 FERRUM_DP_CP_GRPC_URLS=https://cp-east:50051,https://cp-east-standby:50051
 FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET_US_EAST
 FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET
+FERRUM_DP_GRPC_TLS_CA_CERT_PATH=/certs/ca.pem
 ```
 
 ## Operational Notes
@@ -444,7 +447,7 @@ Observability endpoints are tiered. Unauthenticated `/health` and `/status` retu
 - Each CP's authenticated `/health` detail shows database connectivity and pool stats — monitor these to detect DB issues
 - Authenticated `/health` also reports `database.failover_topology` and
   `admin_writes_enabled` while on a failover URL (see [admin_api.md](admin_api.md))
-- Each DP's authenticated `/health` detail shows `cached_config` with `loaded_at` — stale timestamps indicate CP disconnection
+- Each DP's authenticated `/health` detail shows `cached_config` with `loaded_at` and a `dp_config` object (`cp_authority`, `snapshot_age_seconds`, `stale`) — see [cp_dp_mode.md](cp_dp_mode.md#bounded-last-known-good-configuration-age)
 - Authenticated `/overload` detail shows resource pressure — useful for capacity planning
 
 ### Scaling CPs

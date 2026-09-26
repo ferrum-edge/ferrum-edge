@@ -62,9 +62,10 @@ alone therefore does not establish an error-free benchmark.
 The CPU-model mismatch confounds both compilation and protocol comparisons;
 raw throughput differences cannot be attributed to LTO/codegen settings. The
 observed thin executable is 21.6% larger. These are preliminary measurements,
-not evidence for shipping adoption. The paired workflow above addresses the host mismatch and validates complete
-samples. Its first result and required repair are documented below; the
-platform/ABI and agreed-budget gates still apply.
+not evidence for shipping adoption. The paired workflow above addresses the
+host mismatch and validates complete samples. Its first result and required
+repair are documented below; the platform/ABI and agreed-budget gates still
+apply.
 
 ## Paired study and TCP benchmark shutdown correction
 

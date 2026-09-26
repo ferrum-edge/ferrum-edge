@@ -2,17 +2,17 @@
 
 Performance comparison suite that benchmarks **Ferrum Edge** against **Kong**, **Tyk**, **KrakenD**, and **Envoy** under identical conditions.
 
-**All gateways run inside Docker containers** for apples-to-apples comparison. The Docker overhead is shared equally across all platforms, eliminating the unfair advantage that native binaries previously had over Docker-gated gateways.
+**All gateways run inside Docker containers**, so every gateway pays the same Docker overhead.
 
-> **How to read these results:** The absolute throughput numbers (req/s) are not representative of production performance — Docker Desktop on macOS adds significant overhead to all gateways. What matters is the **relative percentage difference** between gateways. Since every gateway runs in the same Docker environment with the same networking penalty, a gateway that is 15% faster here will be roughly 15% faster in production too. Focus on the gaps between gateways, not the raw numbers.
+> **How to read these results:** The absolute throughput numbers (req/s) are not representative of production performance — Docker Desktop on macOS adds significant overhead to all gateways. What matters is the **relative percentage difference** between gateways, which reflects each gateway's own efficiency. Compare the gaps, not the raw numbers.
 
 ## Why All-Docker?
 
-Previous benchmarks ran some gateways as native binaries while others ran in Docker. This created an unfair comparison — Docker Desktop on macOS imposes 60-80% throughput reduction (measured via Envoy native vs Docker: 87K vs 17K req/s = 5x gap). By running **every** gateway in Docker:
+Mixing native binaries with Docker containers is not a fair comparison: Docker Desktop on macOS cuts throughput by 60-80% (Envoy measured 87K req/s native vs 17K req/s in Docker). Running **every** gateway in Docker gives:
 
 - **Equal overhead**: All gateways pay the same Docker networking and VM penalty
-- **Relative differences are meaningful**: A 15% gap in Docker reflects a real 15% efficiency difference in the gateway itself, regardless of the absolute numbers
-- **Reproducible**: Anyone with Docker can run the benchmark without installing native packages
+- **Meaningful relative differences**: A gap between gateways reflects a difference in the gateways themselves
+- **Reproducibility**: Anyone with Docker can run the benchmark without installing native packages
 
 The backend echo server runs natively on the host since it is a shared constant (not a gateway being benchmarked) and identical for all tests.
 
@@ -25,19 +25,17 @@ Each gateway is tested as a reverse proxy with four scenarios:
 | **HTTP (plaintext)** | Client → Gateway (port 8000) → Backend. Measures raw proxy overhead. |
 | **HTTPS (TLS termination)** | Client → Gateway (port 8443, TLS) → Backend (plaintext). Measures TLS handshake and encryption overhead at the gateway. |
 | **E2E TLS (full encryption)** | Client → Gateway (port 8443, TLS) → Backend (TLS, port 3443). Measures full end-to-end encryption where the gateway re-encrypts traffic to the backend. |
-| **Key-Auth (HTTP + authentication)** | Client → Gateway (port 8000, HTTP) → Backend. Each request includes an API key header (`apikey: test-api-key`) validated by the gateway's key-auth plugin. Measures authentication overhead. Ferrum, Kong, Tyk, and Envoy (KrakenD key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation. |
+| **Key-Auth (HTTP + authentication)** | Client → Gateway (port 8000, HTTP, `/api/echo-auth`) → Backend `/api/echo`. Each request includes an API key header (`apikey: test-api-key`) validated by the gateway's key-auth plugin. Measures authentication overhead. Ferrum, Kong, Tyk, and Envoy (KrakenD key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation. |
 
-Two endpoints are tested per proxy scenario:
-- `/health` — instant backend response, measures pure gateway latency
-- `/api/users` — 100 microsecond simulated delay, represents a typical API call
+Every scenario sends the same workload: a ~10 KB JSON `POST` to `/api/echo`, which the backend echoes back, so each run measures request and response body proxying (wrk scripts in `comparison/lua/`).
 
-A direct backend baseline (no gateway) is run first for both HTTP and HTTPS comparison.
+A direct backend baseline (no gateway) runs first over HTTP and HTTPS; the HTTPS baseline also serves as the E2E TLS baseline.
 
 ### Test Approach
 
 - **All gateways run in Docker** — Ferrum is built into a Docker image from source; Kong, Tyk, KrakenD, and Envoy use official Docker images
 - Gateways are tested **sequentially** (one at a time) to avoid resource contention
-- Each test gets a **5-second warm-up** (results discarded) before the measured 30-second run
+- Each test gets a **5-second warm-up** (results discarded) before the measured 30-second run (defaults; see [Configuration](#configuration))
 - The same backend echo server, wrk parameters, and endpoints are used across all gateways
 
 ## Prerequisites
@@ -127,11 +125,11 @@ The script pulls the specified Docker image tags automatically. Results are over
 | **KrakenD** | `krakend:${KRAKEND_VERSION}` | Official Docker Hub image |
 | **Envoy** | `envoyproxy/envoy:v${ENVOY_VERSION}` | Official Docker Hub image |
 
-The Ferrum image uses a multi-stage build with a Rust builder stage and a slim Debian runtime stage. Dependencies are cached in a separate layer for fast rebuilds when only source code changes.
+The Ferrum image uses a multi-stage build with a Rust builder stage and a distroless Debian (`gcr.io/distroless/cc-debian13`) runtime stage. Dependencies are cached in a separate layer for fast rebuilds when only source code changes.
 
 ## Interpreting Results
 
-The HTML report contains six sections:
+The HTML report contains six results sections, followed by a methodology and caveats note:
 
 ### 1. Direct Backend Baseline
 Raw backend throughput and latency without any gateway, for both HTTP and HTTPS. This is the theoretical maximum. Any gateway will add overhead.
@@ -161,13 +159,11 @@ Per-gateway comparison of HTTP vs HTTPS vs E2E TLS performance. Shows the RPS dr
 - **Red cells** = worst in category
 
 ### Reading the numbers
-Since all gateways run in Docker on the same host, the absolute req/s values are lower than what you'd see in production. **Compare the percentage gaps, not the raw numbers.** For example, if Ferrum shows 28K req/s and Kong shows 20K req/s, that's a 40% efficiency advantage for Ferrum — and that gap will hold in any deployment environment (bare metal, VMs, Kubernetes).
+**Compare the percentage gaps, not the raw numbers** (see the note at the top). For example, if Ferrum shows 28K req/s and Kong shows 20K req/s, Ferrum has a 40% efficiency advantage in that scenario.
 
 ## Findings (All-Docker, April 2026)
 
-The following results were collected on macOS (Apple Silicon M3 Max) with 8 threads, 100 connections, and 30-second measured runs. All gateways ran in Docker containers for apples-to-apples comparison.
-
-> **Reminder:** The raw req/s numbers are depressed by Docker Desktop overhead. Focus on the **percentage differences** between gateways — those reflect real efficiency gaps in each gateway's architecture.
+The following results were collected on macOS (Apple Silicon M3 Max) with 8 threads, 100 connections, and 30-second measured runs, all gateways in Docker. They predate the current ~10 KB `POST /api/echo` workload: they used `GET` requests to `/health` (instant backend response) and `/api/users` (100 µs simulated backend delay), with key-auth on `/api/users-auth`. A new run produces a different table.
 
 ### Raw Proxy Performance
 
@@ -245,11 +241,11 @@ To add a new gateway (e.g., NGINX, Traefik, HAProxy):
 
 1. **Create config files** in `comparison/configs/` for the gateway (use `BACKEND_HOST` placeholder)
 2. **Add functions** to `run_comparison.sh`:
-   - `start_<gateway>_http()` / `start_<gateway>_https()` — launch the Docker container
+   - `start_<gateway>_http()` / `start_<gateway>_https()` / `start_<gateway>_e2e_tls()` — launch the Docker container
    - `stop_<gateway>()` — remove the container
    - `test_<gateway>()` — orchestrate HTTP + HTTPS + E2E TLS test sequences
 3. **Add the gateway name** to the `GATEWAYS` list in `scripts/generate_comparison_report.py`
 4. **Call `test_<gateway>()`** in the `main()` function of `run_comparison.sh`
 5. **Add a `should_skip` check** so users can skip it via `SKIP_GATEWAYS`
 
-Each test function should follow the pattern: start container → run_wrk (per endpoint) → stop container. Use the same ports (8000/8443) since gateways run sequentially.
+Each test function should follow the pattern: start container → `run_wrk_post` → stop container (key-auth tests use `run_wrk_key_auth`). Use the same ports (8000/8443) since gateways run sequentially.

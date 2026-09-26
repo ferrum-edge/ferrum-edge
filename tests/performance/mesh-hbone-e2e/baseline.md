@@ -53,8 +53,6 @@ overhead_percent = ((direct_rps - gateway_hbone_rps) / direct_rps) * 100
 ```
 
 Computed from the mean RPS across clean repetitions of the same scenario.
-Latency p50/p95/p99 are means of per-run quantiles and are **not** inputs to the
-overhead percent.
 
 ## Commands
 

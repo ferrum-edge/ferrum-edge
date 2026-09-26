@@ -4,7 +4,7 @@ What Ferrum Edge defends, what each trust boundary assumes about the peer on the
 other side, which attacker capabilities are in scope, and — explicitly — which
 residual risks the shipped controls do **not** cover.
 
-This document describes the gateway as it exists today (`0.9.0`, pre-release). It
+This document describes the gateway as it exists today (`0.9.x`, pre-1.0). It
 is a statement of current posture, not a roadmap. Where a control is partial, the
 gap is written down rather than softened. The operational counterpart is
 [hardening.md](hardening.md); every control named here is configured there.
@@ -74,9 +74,13 @@ and body stalls; replayed datagrams on stream proxies.
   [Default rules ship monitor-only](waf.md#default-rules-ship-monitor-only--and-how-to-enforce-them).
   The WAF's own scope limits are stated in
   [Scope: what the WAF does and does not do](waf.md#scope-what-the-waf-does-and-does-not-do).
-- With `FERRUM_TRUSTED_PROXIES` unset, forwarded client addresses are trusted on
-  the strength of network position alone. That is sound only where the path to
-  the load balancer cannot carry spoofed sources.
+- With `FERRUM_TRUSTED_PROXIES` unset (the default), `X-Forwarded-For` is
+  ignored and the socket peer is the client address. Behind a load balancer,
+  IP-based controls (IP restriction, per-IP limits, logging) therefore see the
+  load balancer's address until you list its CIDRs. Listing a peer means trusting
+  whatever forwarded addresses it sends, which is sound only where the path to
+  that peer cannot carry spoofed sources —
+  [client_ip_resolution.md](client_ip_resolution.md).
 - Frontend TLS live reload is **opt-in** (`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`
   defaults to `false`), so by default a compromised frontend key is replaced by a
   configuration reload or restart, not by a hot rotation. Inline PEM material is

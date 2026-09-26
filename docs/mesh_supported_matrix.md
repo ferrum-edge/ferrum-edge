@@ -20,15 +20,15 @@ coverage matrix is emitted by the conformance suite to
 | **Dev-only** | Gated behind a build feature or dev opt-in; not in the default published image. | Observational. |
 | **Out-of-scope** | Explicit non-goal, documented so operators stop asking. | Pinned `OutOfScope` in conformance. |
 
-The **prescriptive** distinction is the point: before this contract the
-conformance suite was observational ("all-green by design") and a promised
-feature could be silently downgraded. Now a GA feature that regresses breaks its
-own test. See `tests/conformance/ga_scope.rs` for the gate.
+The **prescriptive** distinction is the point: the rest of the conformance
+suite is observational, but a GA feature that regresses breaks its own test, so
+a promised feature cannot be silently downgraded. See
+`tests/conformance/ga_scope.rs` for the gate.
 
 The GA contract **grows incrementally** — a feature is enrolled only once we
 are prepared to fail CI on its regression. The source of truth is
 `tests/conformance/ga_contract.yaml`. The **Stable sidecar traffic surface is
-now enrolled vertically** (semantic assertion → contract row → required live
+enrolled vertically** (semantic assertion → contract row → required live
 assertion): PeerAuthentication STRICT, AuthorizationPolicy ALLOW/DENY,
 RequestAuthentication JWT, DestinationRule `connectTimeout`/`maxConnections`,
 and VirtualService CORS, each backed by a `sidecar.*` live assertion the
@@ -36,16 +36,16 @@ and VirtualService CORS, each backed by a `sidecar.*` live assertion the
 visibility and lookup-namespace resolution are also GA-enrolled and live
 blocking: the sidecar fixture drives those behaviors on the captured client
 egress datapath against a multi-namespace DestinationRule model and requires
-both emitted assertion IDs to pass. VS CORS's prior deferral closed with issue #1973 — the mesh slice now carries
+both emitted assertion IDs to pass. For VS CORS, the mesh slice carries
 `virtual_service_cors_policies` and the client sidecar synthesizes the `cors`
-plugin onto its materialized outbound routes. **SPIFFE identity plumbing
-(SPIRE Agent CA) is now enrolled too** (`mesh.identity.spire_svid_issuance`):
+plugin onto its materialized outbound routes (issue #1973). **SPIFFE identity
+plumbing (SPIRE Agent CA) is enrolled too** (`mesh.identity.spire_svid_issuance`):
 semantics pinned by the `mesh_spiffe_identity` conformance module (SPIFFE ID
 parse + Istio `ns/sa` convention, URI-SAN SVID extraction, the inbound
 peer-SVID verification decision, the fail-closed SVID slot, and `spire_agent`
 backend selection), live-gated by the required `sidecar.spire.workload_entries`
 and `sidecar.peer_auth.strict_mtls_authenticated` assertions. **Native
-`MeshSubscribe` config transport is now enrolled as well**
+`MeshSubscribe` config transport is enrolled as well**
 (`mesh.config_transport.native_subscribe`, issue #2002 / #3855): semantics pinned by
 the `mesh_config_transport` conformance module (the namespace-scoped
 `MeshSlice` snapshot build MeshSubscribe serves from, `content_eq`
@@ -140,7 +140,7 @@ CI today."
   are live-gated; the job verifier-loads and attaches the IPv4/IPv6 captured-TCP
   first-byte hooks while the hosted Rust suites cover timestamp rejection,
   lifecycle bounds, ABI decoding, and the Prometheus histogram contract; the
-  production identity profile now covers Workload API SVID
+  production identity profile covers Workload API SVID
   issuance, plaintext/no-client-SVID HBONE rejection, forged assertor rejection,
   SPIRE Agent plus NodeWaypoint restart recovery; the ADR observability
   counter-movement assertion IDs
@@ -217,8 +217,8 @@ need them, or because they are blocked upstream / architecturally:
   way (DENY still applies, ALLOW/AUDIT cannot match). HTTP-family, raw TCP, TLS
   passthrough, and captured mesh inbound all carry it.
 - **IPv6 ambient / node-waypoint capture** — sidecar serves IPv6 fully, and the
-  NodeWaypoint eBPF live gate now admits captured IPv6 Service traffic through a
-  pod-netns `[::1]` listener with `.ready6` evidence. The mesh slice now has a
+  NodeWaypoint eBPF live gate admits captured IPv6 Service traffic through a
+  pod-netns `[::1]` listener with `.ready6` evidence. The mesh slice has a
   `Workload.node_waypoint` destination endpoint contract. Kubernetes pod
   discovery populates it from trusted ready host-network NodeWaypoint proxy
   Pods in `FERRUM_K8S_CONTROLLER_NAMESPACE`, preferring the proxy pod's
@@ -234,7 +234,7 @@ need them, or because they are blocked upstream / architecturally:
   destination-visible, CP-scope-authorized, and bearer-`ns`-authorized
   workloads before namespace/service slice narrowing.
   Explicit no-CA/no-identity development runs retain the temporary plaintext
-  fallback and built-in assertor defaults. The pod-veth tc guard now drops
+  fallback and built-in assertor defaults. The pod-veth tc guard drops
   unmanaged direct Pod-IP attempts to enrolled destination pods unless the
   destination HBONE relay set the authorized socket mark. The live gate also
   forces source workload IPv4 reuse in the disposable kind CNI and proves the
@@ -257,11 +257,9 @@ need them, or because they are blocked upstream / architecturally:
   then applies **exactly the same rule as the TCP stream path**: it is denied
   whenever any enforcing namespace/selector-scoped `AuthorizationPolicy` is
   loaded, and it falls through to mesh-wide evaluation in a mesh that carries
-  only mesh-wide policies (which is fully evaluable without a per-pod scope, and
-  is the pre-#3286 behaviour for those meshes). It is therefore not true that
-  every unattributable UDP/DTLS session is refused at the session boundary
-  regardless of policy — scoped enforcement is what makes the refusal.
-  Admitted sessions are re-authorized per datagram, so pod churn, veth reuse,
+  only mesh-wide policies (which are fully evaluable without a per-pod scope).
+  So an unattributable session is refused only when scoped policy is loaded, not
+  unconditionally at the session boundary. Admitted sessions are re-authorized per datagram, so pod churn, veth reuse,
   and registry removal terminate them; a datagram that merely names an
   established session's (forgeable) source tuple from a different ingress
   interface is refused on its own without ending that session. A scoped
@@ -274,10 +272,10 @@ need them, or because they are blocked upstream / architecturally:
   (issue #3286 root review). Materializing a listener does not make it
   reachable: a workload addressing its Service ClusterIP has that datagram
   DNAT-ed by kube-proxy to a backing pod and then DROPPED by the pod-veth guard,
-  so the Service path was a black hole and only a direct dial to a trusted node
-  address worked. Transparent steering (`raw` `--notrack` + `mangle` mark +
+  so without steering only a direct dial to a trusted node address works.
+  Transparent steering (`raw` `--notrack` + `mangle` mark +
   Ferrum-owned `fwmark`/`local` route, scoped `-i <pod veth> -d <ClusterIP>
-  --dport <port>`) now delivers that datagram to the materialized listener
+  --dport <port>`) delivers that datagram to the materialized listener
   **without rewriting it**, so the source address, the ingress interface, and
   the original destination all survive and the reply is sourced back from the
   ClusterIP through a transparent socket. What is and is not covered:
@@ -434,7 +432,7 @@ need them, or because they are blocked upstream / architecturally:
 
   The DTLS material itself comes from the DTLS-specific
   `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` (+ optional
-  `FERRUM_DTLS_CLIENT_CA_CERT_PATH`), which mesh mode now loads at startup and
+  `FERRUM_DTLS_CLIENT_CA_CERT_PATH`), which mesh mode loads at startup and
   the PeerAuthentication live-reload path rebuilds from. `FERRUM_FRONTEND_TLS_*`
   is deliberately NOT reused: on a mesh proxy that pair is the inbound TCP
   listener's server identity, and sharing it would let configuring a DTLS
@@ -527,6 +525,7 @@ ledger unless they change the support contract.
 
 | Deferral | Issue | Doc anchor |
 |---|---|---|
+| _None open._ | — | — |
 
 Completed historical rows (do **not** re-list as open): EgressGateway UDP `ServiceEntry` materialization (#3263 — external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT to the configured gateway; still no UDP/DTLS listener, by design); Ambient UDP capture producer + privileged live source-capture **and enrolled-destination** e2e (#2013 / #2038 / #3621 — `functional_mesh_live_source_capture_udp_manager_hbone_round_trip` covers source-capture through HBONE to an echo bound inside the enrolled destination pod netns, and `node-waypoint-ebpf-live` independently proves the marked backend datagram is admitted through the enrolled-pod `tc_inbound` guard while unmarked traffic is dropped); Ambient native gRPC over HBONE on the standard H1/H2 frontend (#3728 — the shared nested-HTTP/2 transport now serves every frontend; native gRPC still deliberately bypasses the generic HTTP/1.1 HBONE dispatch); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); general opaque-TLS SNI L4 routing outside passthrough (#3264 — an ordinary `tcp` stream listener that terminates nothing routes by normalized `server_name`, with fail-closed admission for indeterminate ClientHellos; see [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md#opaque-tls-sni-routing)); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 

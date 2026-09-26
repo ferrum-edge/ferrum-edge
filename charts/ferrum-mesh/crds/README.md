@@ -30,4 +30,4 @@ helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
   --take-ownership --set crds.adoptExisting=true
 ```
 
-See `docs/upgrade_guide.md`.
+See [`docs/upgrade_guide.md`](../../../docs/upgrade_guide.md).

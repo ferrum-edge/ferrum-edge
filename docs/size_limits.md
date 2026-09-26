@@ -15,7 +15,7 @@ Ferrum Edge enforces configurable size limits on request headers, request bodies
 | `FERRUM_MAX_QUERY_PARAMS` | `usize` | `100` | Maximum number of query parameters allowed. Set to `0` for unlimited. |
 | `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `usize` | `4194304` (4MB) | Maximum total received gRPC payload size in bytes. For unary RPCs this is effectively a per-message limit. For streaming RPCs it caps the cumulative body size. Set to `0` for unlimited. |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | `usize` | `16777216` (16MB) | Maximum WebSocket frame size in bytes. Also sets max message size to 4x frame size. |
-| `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | `usize` | `131072` (128KB) | WebSocket write buffer size. Data is buffered up to this size before flushing to the transport. Default (128 KB) is optimal for 10KB-100KB payloads. Increase to `4194304` (4 MB) for workloads with large WS frames (1 MB+). Only applies when frame-level plugins are active; without plugins, the gateway uses zero-overhead raw TCP tunneling. |
+| `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | `usize` | `131072` (128KB) | WebSocket write buffer size. Data is buffered up to this size before flushing to the transport. The default suits 10KB-100KB payloads; increase to `4194304` (4 MB) for large frames (1 MB+). Applies to the frame-parsed relay; unused by tunnel mode (`FERRUM_WEBSOCKET_TUNNEL_MODE=true` with no frame-level plugins), which copies raw bytes. |
 | `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES` | `usize` | `4194304` (4MB) | Maximum bytes admitted from any TLS material source before whole-value buffering. Default and hard maximum are both 4 MiB; `0` is rejected (not unlimited). See [TLS Material Source Ceiling](#tls-material-source-ceiling). |
 | `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` | `usize` | `16777216` (16MB) | Hard ceiling on each persistent TLS state JSON document. See [TLS Persistent State Document Ceiling](#tls-persistent-state-document-ceiling). |
 | `FERRUM_TLS_MANAGED_MAX_RECORDS` | `usize` | `1024` | Logical create ceiling for managed-TLS records; overwrite/delete remain available. |
@@ -107,7 +107,7 @@ Ordinary plain-HTTPS traffic prefers the multiplexed direct HTTP/2 pool whenever
 | Response body | Declared transferable `Content-Length` over limit | `502` / `ResponseBodyTooLarge` before body bytes flow. `HEAD` / `1xx` / `204`/`205`/`304` representation lengths are exempt. |
 | Response body | Unknown length / mid-stream | Size-limited H2 body adapters; post-commit stream termination after the limit |
 
-`SizeLimitedIncoming` treats `max_bytes = 0` as deny-all. A **nonzero** operator cap is passed to the limiter as that budget. Operator `0` (unlimited) on ordinary direct-H2 does **not** wrap `SizeLimitedIncoming`: the client `Incoming` is forwarded with only the early-return cancel channel, which is the Jun 19 hot path the HTTP/2 protocol bench uses (`FERRUM_MAX_*_BODY_SIZE_BYTES=0`, issue #3942). That passthrough arm tallies DATA frames in a plain `u64` (no per-frame atomic) and publishes `bytes_sent_observed` once at end-of-stream, body error, cancellation, or `Drop`. HTTP/2 may still return backend response headers while that upload is in hyper's detached pipe; transaction summaries and `api_chargeback` wait for that publication rather than freezing a header-flush snapshot. Mesh/HBONE pools that share a limiter-typed sender still map `0` to `usize::MAX` before constructing the adapter.
+`SizeLimitedIncoming` itself treats `max_bytes = 0` as deny-all, so a **nonzero** operator cap is passed through as the budget. Operator `0` (unlimited) on ordinary direct-H2 does **not** wrap `SizeLimitedIncoming`: the client `Incoming` is forwarded with only the early-return cancel channel (the path the HTTP/2 protocol bench exercises with `FERRUM_MAX_*_BODY_SIZE_BYTES=0`, issue #3942). That passthrough counts DATA bytes in a plain `u64` and publishes `bytes_sent_observed` once at end-of-stream, body error, cancellation, or `Drop`. Because HTTP/2 can return backend response headers while the upload is still in flight, transaction summaries and `api_chargeback` wait for that publication instead of using a snapshot taken at header flush. Mesh/HBONE pools that share a limiter-typed sender map `0` to `usize::MAX` before constructing the adapter.
 
 Backend TLS SNI overrides use the same in-path enforcement. Combinations direct-H2 cannot serve (retry body replay, request-body-buffering plugins, `pool_enable_http2: false`) fall through to the reqwest HTTP/1.1 SNI dial when an SNI override is present; they are **admitted**, not rejected at config admission. A dial that genuinely cannot be constructed still fails closed at runtime with a `502` — see [DestinationRule TLS SNI](mesh.md).
 
@@ -132,7 +132,7 @@ The same size-limit knobs apply to HTTP/3, but client-visible outcomes are **not
 
 ## Admin API Body Limit
 
-The Admin API enforces a **1 MiB** (1,048,576 bytes) request body size limit on all endpoints. This is a fixed limit independent of the proxy size limits above. Requests exceeding this limit receive a `413 Payload Too Large` response.
+The Admin API caps request bodies at **1 MiB** (1,048,576 bytes), independent of the proxy size limits above. Two routes have their own caps: `POST /restore` (`FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`, default 100) and `POST`/`PUT /api-specs` (`FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB`, default 25). Oversized bodies receive `413 Payload Too Large`; slow bodies are also bounded by `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS`. See [Admin API — Request body admission](admin_api.md#request-body-admission).
 
 ## TLS Material Source Ceiling
 
@@ -283,8 +283,7 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | Field | Limit | Description |
 |-------|-------|-------------|
 | `name` | 255 chars | Optional proxy name |
-| `listen_path` (non-regex) | 500 chars | Path prefix or `=/` exact path for route matching |
-| `listen_path` (regex) | 1024 chars | Maximum regex pattern length (e.g., `~^/api/v\d+`) |
+| `listen_path` | 500 chars | Path prefix, `=/` exact path, or `~` regex (e.g., `~^/api/v\d+`) |
 | `backend_host` | 255 chars | Backend hostname (matches DNS spec max of 253) |
 | `backend_path` | 2048 chars | Backend path prefix |
 | `hosts` | 100 entries, 253 chars each | Hostname list with format validation |
@@ -346,9 +345,9 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | `active.timeout_ms` | 1–86,400,000 | Probe timeout |
 | `active.healthy_threshold` | 1–10,000 | Healthy transition threshold |
 | `active.unhealthy_threshold` | 1–10,000 | Unhealthy transition threshold |
-| `active.healthy_status_codes` | 50 entries, 100–599 | Valid HTTP status code range |
+| `active.healthy_status_codes` | 500 entries, 100–599 | Valid HTTP status code range |
 | `active.udp_probe_payload` | 2048 chars | UDP probe hex payload |
-| `passive.unhealthy_status_codes` | 50 entries, 100–599 | Valid HTTP status code range |
+| `passive.unhealthy_status_codes` | 500 entries, 100–599 | Valid HTTP status code range |
 | `passive.unhealthy_threshold` | 1–10,000 | Failure threshold |
 | `passive.unhealthy_window_seconds` | 1–86,400 | Sliding window duration |
 | `passive.healthy_after_seconds` | 0–86,400 | Auto-recovery timer (0 = disabled) |
@@ -381,8 +380,8 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | Field | Limit | Description |
 |-------|-------|-------------|
 | `plugin_name` | 255 chars | Plugin name |
-| `config` (JSON size) | 1 MiB | Maximum serialized config size |
-| `config` (nesting depth) | 10 levels | Maximum JSON nesting |
+| `config` (JSON size) | 1 MiB | Maximum serialized config size (14 MiB for `openapi_validator`) |
+| `config` (nesting depth) | 10 levels | Maximum JSON nesting (64 for `openapi_validator`) |
 
 ### Circuit Breaker Fields
 
@@ -392,14 +391,14 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | `success_threshold` | 1–10,000 | Successes to close |
 | `timeout_seconds` | 1–86,400 | Open-state duration. `cooldown_seconds` is accepted as an input alias and is never returned. |
 | `half_open_max_requests` | 1–10,000 | Probe requests in half-open |
-| `failure_status_codes` | 50 entries, 100–599 | Status codes that count as failure |
+| `failure_status_codes` | 500 entries, 100–599 | Status codes that count as failure |
 
 ### Retry Config Fields
 
 | Field | Limit | Description |
 |-------|-------|-------------|
 | `max_retries` | 0–100 | Maximum retry attempts |
-| `retryable_status_codes` | 50 entries, 100–599 | Status codes eligible for retry |
+| `retryable_status_codes` | 500 entries, 100–599 | Status codes eligible for retry |
 | `retryable_methods` | 9 entries max | Must be valid HTTP methods (GET, POST, PUT, etc.) |
 | `backoff.delay_ms` (fixed) | 0–300,000 | Fixed backoff delay (max 5 minutes) |
 | `backoff.base_ms` (exponential) | 0–300,000 | Exponential base delay |
@@ -413,7 +412,7 @@ All string fields reject ASCII control characters (null bytes, escape sequences,
 - **Referential integrity**: Proxy `upstream_id` must reference an existing upstream
 - **Plugin multiplicity**: A proxy may have multiple instances of the same plugin type (e.g., two `http_logging` for different destinations). Use `priority_override` to control execution order when needed
 - **Host/path uniqueness**: No two proxies can share overlapping host + listen_path combinations
-- **Stream proxy rules**: TCP/UDP proxies require `listen_port`; HTTP proxies must not set it. In database mode, `listen_port` is also validated against gateway reserved ports (proxy/admin/gRPC) and checked for OS-level availability. In CP mode, local port checks are skipped since proxies run on remote DP nodes
+- **Stream proxy rules**: TCP/UDP proxies require `listen_port` and must not set `listen_path`; HTTP proxies may set `listen_port` only to scope routing to one frontend port. In database mode, `listen_port` is also validated against gateway reserved ports (proxy/admin/gRPC) and checked for OS-level availability. In CP mode, local port checks are skipped since proxies run on remote DP nodes
 
 These limits are enforced during:
 - Admin API `POST`/`PUT` operations on all resource types
