@@ -190,14 +190,17 @@ fn unrelated_upstream_active_failure_does_not_touch_this_balancer() {
 
 #[test]
 fn active_snapshot_is_not_reused_across_different_active_maps() {
-    // Two active maps at the same process-wide generation: a balancer that
-    // cached map A's projection must recompute when handed map B.
+    // Two active maps at the same generation: a balancer that cached map A's
+    // projection must recompute when handed map B.
     let targets = make_targets(3);
     let lb = balancer(&targets);
     let map_a = ActiveUnhealthyTargets::new();
     let map_b = ActiveUnhealthyTargets::new();
+    // A's only entry belongs to another upstream, so A projects all-healthy.
+    map_a.insert(target_key("default|other-upstream", &targets[0]), 1);
     map_b.insert(target_key(UPSTREAM_KEY, &targets[0]), 1);
     assert_eq!(map_a.generation(), map_b.generation());
+    assert_ne!(map_a.id(), map_b.id());
 
     let ctx_a = HealthContext {
         active_unhealthy: &map_a,
@@ -715,12 +718,14 @@ fn passive_projection_table_evicts_beyond_cap_without_losing_correctness() {
 
 #[test]
 fn active_unhealthy_targets_publish_generation_only_on_change() {
+    // The generation is per map instance, so exact deltas are stable even
+    // while other tests mutate their own maps in parallel.
     let active = ActiveUnhealthyTargets::new();
     let g0 = active.generation();
 
     assert_eq!(active.insert("a".into(), 1), None);
     let g1 = active.generation();
-    assert!(g1 > g0);
+    assert_eq!(g1, g0 + 1);
 
     // Removing an absent key is not a mutation.
     assert!(active.remove("missing").is_none());
@@ -745,16 +750,59 @@ fn active_unhealthy_targets_publish_generation_only_on_change() {
         VacantInsert::Inserted
     );
     let g2 = active.generation();
-    assert!(g2 > g1);
+    assert_eq!(g2, g1 + 1);
     assert_eq!(active.get("b").map(|v| *v), Some(3));
 
     // Retain that keeps everything is not a mutation; one that drops is.
     active.retain(|_, _| true);
     assert_eq!(active.generation(), g2);
     active.retain(|key, _| key == "a");
-    assert!(active.generation() > g2);
+    assert_eq!(active.generation(), g2 + 1);
     assert_eq!(active.len(), 1);
     assert!(active.iter().all(|entry| entry.key() == "a"));
+
+    // Removing a present key publishes exactly once.
+    assert!(active.remove("a").is_some());
+    assert_eq!(active.generation(), g2 + 2);
+}
+
+#[test]
+fn active_unhealthy_generation_is_isolated_per_map_instance() {
+    let targets = make_targets(3);
+    let lb = balancer(&targets);
+    let ours = ActiveUnhealthyTargets::new();
+    let other = ActiveUnhealthyTargets::new();
+    let ctx = HealthContext {
+        active_unhealthy: &ours,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+    let g0 = ours.generation();
+    assert_eq!(
+        selected_hosts(&lb, Some(&ctx), 12),
+        hosts(&targets, &[0, 1, 2])
+    );
+
+    // Churn on an unrelated checker's map must not move ours, so our
+    // balancer's cached projection stays valid.
+    for i in 0..16 {
+        other.insert(format!("default|other::{i}"), 1);
+        other.remove(&format!("default|other::{i}"));
+    }
+    other.clear();
+    assert_eq!(ours.generation(), g0);
+    assert_eq!(
+        selected_hosts(&lb, Some(&ctx), 12),
+        hosts(&targets, &[0, 1, 2])
+    );
+
+    // Our own mutation still publishes and is honored.
+    ours.insert(target_key(UPSTREAM_KEY, &targets[2]), 1);
+    assert_eq!(ours.generation(), g0 + 1);
+    assert_eq!(
+        selected_hosts(&lb, Some(&ctx), 12),
+        hosts(&targets, &[0, 1])
+    );
 }
 
 #[test]
