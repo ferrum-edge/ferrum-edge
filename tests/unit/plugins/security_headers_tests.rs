@@ -49,6 +49,22 @@ async fn adds_secure_defaults_and_strips_fingerprinting_headers() {
 }
 
 #[tokio::test]
+async fn removes_all_case_insensitive_header_values_in_place() {
+    let plugin = SecurityHeaders::new(&json!({ "remove": ["X-Remove", "x-absent"] })).unwrap();
+    let mut ctx = ctx();
+    let mut headers = HashMap::from([
+        ("X-Remove".to_string(), "first".to_string()),
+        ("x-REMOVE".to_string(), "second".to_string()),
+        ("keep".to_string(), "value".to_string()),
+    ]);
+
+    plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+
+    assert!(headers.keys().all(|key| !key.eq_ignore_ascii_case("x-remove")));
+    assert_eq!(headers.get("keep").map(String::as_str), Some("value"));
+}
+
+#[tokio::test]
 async fn opt_in_hsts_csp_and_custom_headers_are_applied() {
     let plugin = SecurityHeaders::new(&json!({
         "hsts": true,

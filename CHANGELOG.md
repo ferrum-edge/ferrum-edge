@@ -926,6 +926,8 @@ prepared as 0.9.6, which was tagged but never published (see below).
 
 ### Performance
 
+- `security_headers` removes matching response headers in place without allocating or cloning keys
+  (#5755).
 - `ws_frame_logging` builds its payload-fingerprint HMAC key once per plugin
   instead of once per frame (#5690).
 - Circuit-breaker cache hits no longer allocate a key string (#5691).
