@@ -1736,12 +1736,20 @@ async fn collect_plain_response_within_attempt(
     })
 }
 
-/// Headers for a buffered-collection failure. A read or route timeout `504`
-/// carries the `backend_timeout` `X-Gateway-Error` token, as proxy core's does.
-fn plain_collect_failure_headers(status: u16) -> HashMap<String, String> {
+/// Headers for a buffered-collection failure. Every such refusal is a
+/// post-wire 5xx, tokened as proxy core tokens the same collector failure: a
+/// read or route timeout `504` is `backend_timeout`; an oversized body, a
+/// body read error (`502`), and an exhausted retention budget (`503`) are
+/// `backend_error`.
+fn plain_collect_failure_headers(ctx: &RequestContext, status: u16) -> HashMap<String, String> {
     let mut headers = HashMap::new();
-    if status == StatusCode::GATEWAY_TIMEOUT.as_u16() {
-        crate::proxy::insert_x_gateway_error_for_backend_failure(&mut headers, false, status);
+    if status >= 500 {
+        crate::proxy::apply_authoritative_gateway_error_header_for_response(
+            &mut headers,
+            ctx,
+            false,
+            status,
+        );
     }
     headers
 }
@@ -5419,6 +5427,15 @@ where
             },
             backend_admission_elapsed,
         );
+        // The HTTP/1.1 / HTTP/2 builder's token for the same refusal: not a
+        // connection error, so the `502` reads `backend_error`.
+        let mut headers = HashMap::new();
+        crate::proxy::apply_authoritative_gateway_error_header_for_response(
+            &mut headers,
+            ctx,
+            false,
+            StatusCode::BAD_GATEWAY.as_u16(),
+        );
         // `after_proxy` has not run over this head: a gRPC-Web terminal is
         // decorated as a gateway error terminal (#5747).
         let mut outcome = write_plain_gateway_error_terminal(
@@ -5427,7 +5444,7 @@ where
             ctx,
             StatusCode::BAD_GATEWAY,
             Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
-            HashMap::new(),
+            headers,
             backend_start,
             bytes_sent,
         )
@@ -5648,7 +5665,7 @@ where
                     error_class,
                     backend_admission_elapsed,
                 );
-                let mut reject_headers = plain_collect_failure_headers(reject_status);
+                let mut reject_headers = plain_collect_failure_headers(ctx, reject_status);
                 // `after_proxy` already decorated this head: a gRPC-Web terminal
                 // carries its provenance-known gateway decorations (CORS)
                 // instead of running the hooks a second time (#5747).

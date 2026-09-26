@@ -23,7 +23,7 @@ use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{
     SseEventName, SseReassembler, SseText, SseTextKind, encode_sse_error_event,
     is_gemini_stream_frame, is_tgi_stream_frame, last_paragraph_boundary, last_sentence_boundary,
-    parse_sse_data_frames_checked,
+    parse_sse_data_frames_checked, sse_event_end, sse_event_end_after,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -3801,16 +3801,19 @@ impl StreamWindowEngine {
         let mut scan = self.passthrough_tail.clone();
         let prefix_len = scan.len();
         scan.extend_from_slice(chunk);
-        if let Some(end) = next_event_end(&scan) {
+        if let Some(end) = sse_event_end(&scan) {
             self.passthrough_to_event_end = false;
             self.passthrough_tail.clear();
             // Forward only bytes from this chunk; the lookback was already sent.
             let consumed = end.saturating_sub(prefix_len).min(chunk.len());
             (chunk[..consumed].to_vec(), consumed)
         } else {
-            // Keep a 2-byte lookback so `\n` + `\n` / `\n` + `\r\n` spanning a
-            // chunk edge is still recognized. Forward the entire chunk now so
-            // pass-through cannot re-accumulate an unbounded hold.
+            // Keep a 2-byte lookback so a blank line spanning a chunk edge is
+            // still recognized under every legal terminator mix, including a CR
+            // ending this chunk whose LF starts the next (one CRLF). The scanned
+            // bytes hold no boundary, so two bytes always cover the terminator
+            // that may end them. Forward the entire chunk now so pass-through
+            // cannot re-accumulate an unbounded hold.
             let keep = scan.len().min(2);
             self.passthrough_tail = scan[scan.len() - keep..].to_vec();
             (chunk.to_vec(), chunk.len())
@@ -3944,7 +3947,7 @@ impl StreamWindowEngine {
             };
         }
 
-        if let Some(end) = next_event_end(&self.carry) {
+        if let Some(end) = sse_event_end(&self.carry) {
             // Budget pressure from ALREADY-HELD events must never make this
             // complete, valid event uninspectable: inspect and drain the pending
             // window first (the caller releases it, freeing the budget) and
@@ -4014,7 +4017,7 @@ impl StreamWindowEngine {
         // single event still forces the uninspectable overflow below. The
         // complete event is absorbed by the `carry` branch on the next step, so
         // its budget projection sees only what is actually retained.
-        let boundary = next_event_boundary_in_chunk(&self.carry, chunk);
+        let boundary = sse_event_end_after(&self.carry, chunk);
         let wanted = boundary.unwrap_or(chunk.len());
         if wanted > capacity && !self.held.is_empty() {
             // The bytes this step wants do not fit what the held backlog left
@@ -4029,7 +4032,7 @@ impl StreamWindowEngine {
         }
         let consumed = wanted.min(capacity);
         self.carry.extend_from_slice(&chunk[..consumed]);
-        if next_event_end(&self.carry).is_none()
+        if sse_event_end(&self.carry).is_none()
             && (self.input_window_bytes() >= self.config.max_window_bytes
                 || self.retained_bytes() >= self.config.max_window_bytes)
         {
@@ -4061,7 +4064,7 @@ impl StreamWindowEngine {
         // already-held backlog can make a valid trailing event look
         // uninspectable. At end of stream an un-terminated tail is absorbed as
         // its own event, so it is charged the same way.
-        let pending_len = next_event_end(&self.carry).unwrap_or(self.carry.len());
+        let pending_len = sse_event_end(&self.carry).unwrap_or(self.carry.len());
         if pending_len > 0 && !self.event_fits_budget(pending_len) && !self.held.is_empty() {
             return IngestStep {
                 consumed: 0,
@@ -4070,7 +4073,7 @@ impl StreamWindowEngine {
             };
         }
 
-        let progressed = if let Some(end) = next_event_end(&self.carry) {
+        let progressed = if let Some(end) = sse_event_end(&self.carry) {
             let raw: Vec<u8> = self.carry.drain(..end).collect();
             self.absorb_event(raw, false);
             true
@@ -4303,11 +4306,12 @@ impl StreamWindowEngine {
     }
 
     /// Release every byte that caused the current hold without inspecting it:
-    /// complete held events and any un-terminated `carry`. When `carry` was
-    /// non-empty, enter [`passthrough_to_event_end`] so the remainder of that
+    /// complete held events and any un-terminated `carry`. When `carry` holds
+    /// field bytes, enter [`passthrough_to_event_end`] so the remainder of that
     /// same SSE event is never absorbed as a fresh inspectable event (its
-    /// prefix already left the gateway uninspected). Used only by the fail-open
-    /// hold-timeout path; returns the raw bytes to forward immediately.
+    /// prefix already left the gateway uninspected). A `carry` of bare line
+    /// terminators is forwarded without entering pass-through. Used only by the
+    /// fail-open hold-timeout path; returns the raw bytes to forward immediately.
     fn force_release_held(&mut self) -> Vec<u8> {
         let mut out = if let Some(last) = self.held.last() {
             // Reuse `release()` so the cleared-offset rebase and overlap draining
@@ -4320,14 +4324,21 @@ impl StreamWindowEngine {
         };
         if !self.carry.is_empty() {
             out.extend_from_slice(&self.carry);
-            // The first bytes of the next chunk may complete a blank-line
-            // boundary that started in this already-forwarded prefix. Retain
-            // only a detection copy of the final two bytes before clearing the
-            // held carry; they must never be emitted a second time.
-            let keep = self.carry.len().min(2);
-            self.passthrough_tail = self.carry[self.carry.len() - keep..].to_vec();
+            // A carry of only CR/LF (such as the LF of a CRLF split from the
+            // held event's blank line) started no new event: forwarding it
+            // leaves nothing to finish uninspected, and pass-through here
+            // would forward the NEXT complete event uninspected.
+            if self.carry.iter().any(|b| !matches!(b, b'\r' | b'\n')) {
+                // The first bytes of the next chunk may complete a blank-line
+                // boundary that started in this already-forwarded prefix.
+                // Retain only a detection copy of the final two bytes before
+                // clearing the held carry; they must never be emitted a second
+                // time.
+                let keep = self.carry.len().min(2);
+                self.passthrough_tail = self.carry[self.carry.len() - keep..].to_vec();
+                self.passthrough_to_event_end = true;
+            }
             self.carry.clear();
-            self.passthrough_to_event_end = true;
         }
         out
     }
@@ -4381,50 +4392,6 @@ fn frame_is_unmapped_governed(frame: &Value) -> bool {
         return false;
     }
     event_type.is_some() || looks_like_governed_response_json(frame)
-}
-
-/// Byte index just past the end of the first complete SSE event in `buf` (the
-/// first blank line), or `None` if no event has fully arrived yet.
-///
-/// SSE line terminators are `\n` or `\r\n` and may be mixed within one stream, so
-/// a blank line is any of `\n\n`, `\r\n\r\n`, `\n\r\n`, or `\r\n\n`. Scans for the
-/// earliest such boundary: a `\n` immediately followed by another line terminator
-/// (`\n` or `\r\n`).
-fn next_event_end(buf: &[u8]) -> Option<usize> {
-    for (i, &b) in buf.iter().enumerate() {
-        if b != b'\n' {
-            continue;
-        }
-        match buf.get(i + 1) {
-            Some(b'\n') => return Some(i + 2),
-            Some(b'\r') if buf.get(i + 2) == Some(&b'\n') => return Some(i + 3),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// How many bytes of `chunk` complete the next SSE event, given the partial
-/// `carry` already accumulated (which by construction holds no complete event).
-///
-/// Allocation-free: an event terminator can only straddle the seam through the
-/// last one or two bytes of `carry`, so those two cases are checked directly and
-/// everything else is found by scanning `chunk` alone. Used to take exactly one
-/// event out of a coalesced transport write instead of the whole budget.
-fn next_event_boundary_in_chunk(carry: &[u8], chunk: &[u8]) -> Option<usize> {
-    let ends_with_lf_cr =
-        carry.len() >= 2 && carry[carry.len() - 2] == b'\n' && carry[carry.len() - 1] == b'\r';
-    if ends_with_lf_cr && chunk.first() == Some(&b'\n') {
-        return Some(1);
-    }
-    if carry.last() == Some(&b'\n') {
-        match chunk.first() {
-            Some(b'\n') => return Some(1),
-            Some(b'\r') if chunk.get(1) == Some(&b'\n') => return Some(2),
-            _ => {}
-        }
-    }
-    next_event_end(chunk)
 }
 
 /// Whether `ch` belongs to a script that is counted one token per character
@@ -8544,18 +8511,6 @@ mod stream_window_tests {
             eng.release().is_empty(),
             "detect mode holds no raw bytes for release"
         );
-    }
-
-    #[test]
-    fn next_event_end_handles_lf_and_crlf() {
-        assert_eq!(next_event_end(b"data: x\n\nrest"), Some(9));
-        assert_eq!(next_event_end(b"data: x\r\n\r\nrest"), Some(11));
-        assert_eq!(next_event_end(b"data: x\n"), None);
-        // Mixed blank-line terminators (Codex round-8): \n\r\n and \r\n\n.
-        assert_eq!(next_event_end(b"data: x\n\r\nrest"), Some(10));
-        assert_eq!(next_event_end(b"data: x\r\n\nrest"), Some(10));
-        // A lone CR is not a blank-line terminator here; no false positive.
-        assert_eq!(next_event_end(b"data: x\ny\n"), None);
     }
 
     fn token_cfg(

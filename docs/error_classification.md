@@ -343,6 +343,15 @@ classifies the response:
 - An HTTP/3 bridge attempt whose reqwest connection-pool client could not be
   built answers its `502` with `connection_failure`, exactly as the HTTP/1.1
   and HTTP/2 builder does for the same shared pool-failure response.
+- A backend response whose declared `Content-Length` exceeds the effective
+  response ceiling is refused with a `502` carrying `backend_error` (the
+  refusal is not a connection error) on every protocol: the HTTP/1.1 and
+  HTTP/2 builder, the native HTTP/3 buffered path, the three native HTTP/3
+  streaming relays, and the HTTP/3 bridge. A body found too large while it is
+  collected carries the same token. On the HTTP/3 bridge's buffered path so do
+  the other collection refusals, as on HTTP/1.1 and HTTP/2: a body read error
+  `502` and an exhausted retained-response budget `503` read `backend_error`,
+  and a read timeout `504` reads `backend_timeout`.
 
 The contract covers the HTTP response headers and HTTP trailers. It does not
 cover a pass-through gRPC-Web backend's in-body trailer frame. On a route

@@ -7282,6 +7282,147 @@ async fn non_openai_sse_capture_keeps_per_frame_redacted_fallback() {
     assert!(excerpt.contains("content_block_delta"), "got: {excerpt}");
 }
 
+/// Drive raw SSE bytes through the streaming tee in the given transport chunks
+/// and return the exported response excerpt.
+async fn streamed_sse_excerpt(chunks: &[&[u8]]) -> String {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let mut total = 0u64;
+    for chunk in chunks {
+        let _ = inspector.on_chunk(chunk).await;
+        total += chunk.len() as u64;
+    }
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
+        .await;
+    let records = wait_for_records(&server).await;
+    records[0]["response_body"]
+        .as_str()
+        .expect("response excerpt")
+        .to_string()
+}
+
+/// Split `body` into transport chunks at every CRLF, so each CR ends one chunk
+/// and its LF starts the next.
+fn split_between_cr_and_lf(body: &str) -> Vec<&[u8]> {
+    let bytes = body.as_bytes();
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    for (index, pair) in bytes.windows(2).enumerate() {
+        if pair == b"\r\n" {
+            chunks.push(&bytes[start..=index]);
+            start = index + 1;
+        }
+    }
+    chunks.push(&bytes[start..]);
+    chunks
+}
+
+#[tokio::test]
+async fn sse_split_pii_is_redacted_under_cr_mixed_and_bom_framing() {
+    // Every capture below frames the same OpenAI chunks with a line-ending mix
+    // an EventSource client decodes identically. Reassembly must split lines as
+    // the shared SSE parser does; otherwise the excerpt falls back to raw-text
+    // redaction, which cannot see an SSN split across `delta.content` fragments.
+    let chunk = |content: &str| {
+        json!({
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": content}}]
+        })
+        .to_string()
+    };
+    let [first, second, third] = ["your ssn is 123-", "45-67", "89 ok"].map(chunk);
+    let mixed = [
+        ": keepalive\r\n".to_string(),
+        format!("data: {first}\r\n\r"),
+        format!("data: {second}\r\r\n"),
+        format!("data: {third}\n\r"),
+        "data: [DONE]\r\n\r\n".to_string(),
+    ]
+    .concat();
+    let captures = [
+        (
+            "cr",
+            format!("data: {first}\r\rdata: {second}\r\rdata: {third}\r\rdata: [DONE]\r\r"),
+        ),
+        ("mixed", mixed),
+        (
+            "boms_cr",
+            format!("\u{feff}\u{feff}data: {first}\r\rdata: {second}\r\rdata: {third}\r\r"),
+        ),
+    ];
+
+    for (framing, capture) in captures {
+        let excerpt = streamed_sse_excerpt(&split_between_cr_and_lf(&capture)).await;
+        assert!(
+            !excerpt.contains("123-45-6789") && !excerpt.contains("45-67"),
+            "{framing}: split-delta SSN must not survive reassembled redaction: {excerpt}"
+        );
+        assert!(
+            excerpt.contains("[REDACTED:ssn:"),
+            "{framing}: reassembled excerpt must carry the redaction placeholder: {excerpt}"
+        );
+        assert!(
+            excerpt.contains("sse_reassembled"),
+            "{framing}: excerpt must be the reassembled completion text: {excerpt}"
+        );
+        assert!(
+            excerpt.contains("your ssn is"),
+            "{framing}: non-PII completion text must survive reassembly: {excerpt}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn per_frame_sse_redaction_splits_cr_mixed_and_bom_framing() {
+    // Non-OpenAI frames keep per-frame redaction, which must still see each
+    // frame as its own JSON document so field-name redaction applies to it.
+    let first = r#"{"type":"message_start","message":{"id":"msg_1"}}"#;
+    let second = r#"{"type":"content_block_delta","delta":{"password":"hunter2-plain-value"}}"#;
+    let captures = [
+        ("cr", format!("data: {first}\r\rdata: {second}\r\r")),
+        ("mixed", format!("data: {first}\r\r\ndata: {second}\r\n\r")),
+        (
+            "bom_crlf",
+            format!("\u{feff}data: {first}\r\n\r\ndata: {second}\r\n\r\n"),
+        ),
+    ];
+
+    for (framing, capture) in captures {
+        let excerpt = streamed_sse_excerpt(&split_between_cr_and_lf(&capture)).await;
+        assert!(
+            !excerpt.contains("hunter2-plain-value"),
+            "{framing}: sensitive field must be redacted in every frame: {excerpt}"
+        );
+        assert!(
+            excerpt.contains("content_block_delta") && excerpt.contains("message_start"),
+            "{framing}: both frames must be exported: {excerpt}"
+        );
+        assert!(
+            !excerpt.contains("sse_reassembled"),
+            "{framing}: non-OpenAI frames must not claim reassembly: {excerpt}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn metadata_only_empty_redaction_patterns_rejected() {
     // metadata_only still exports the request-derived model/tool_names through

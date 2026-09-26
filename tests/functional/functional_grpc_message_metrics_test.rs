@@ -17,7 +17,9 @@
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use crate::scaffolding::backends::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+use crate::scaffolding::backends::{
+    GrpcStep, H2Step, MatchHeaders, MatchRpc, ScriptedGrpcBackend, ScriptedH2Backend,
+};
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
 use crate::scaffolding::harness::GatewayHarness;
@@ -454,4 +456,113 @@ async fn h3_grpc_message_metrics_are_nonzero_and_exact() {
         return;
     }
     panic!("failed to spawn H3 gateway after retries: {last_err}");
+}
+
+async fn wait_for_response_message_metric(gateway: &GatewayHarness, expected: u64) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let metrics = gateway.metrics().await.expect("scrape metrics");
+        let responses = metric_line_value(&metrics, "ferrum_mesh_response_messages_total{");
+        if responses == Some(expected) || std::time::Instant::now() >= deadline {
+            return metrics;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A gRPC-Web length-prefixed frame with an explicit flag byte.
+fn grpc_web_frame(flag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = grpc_frame(payload);
+    out[0] = flag;
+    out
+}
+
+/// Pass-through gRPC-Web (a route WITHOUT the `grpc_web` plugin, in front of a
+/// backend that already answers in gRPC-Web) on the HTTP/2 frontend, streamed
+/// and buffered (#5784). The mesh response message counter reports the
+/// backend's decoded message frames: its `0x80` trailer frame is metadata, and
+/// `grpc-web-text` base64 is decoded rather than scanned as framing.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_web_passthrough_message_metrics_count_decoded_frames() {
+    let mut binary = grpc_web_frame(0x00, b"a");
+    binary.extend_from_slice(&grpc_web_frame(0x00, b"b"));
+    binary.extend_from_slice(&grpc_web_frame(0x80, b"grpc-status: 0\r\n"));
+    // A text-mode backend flushes each segment independently padded.
+    let mut text = BASE64.encode(grpc_web_frame(0x00, b"a")).into_bytes();
+    text.extend_from_slice(BASE64.encode(grpc_web_frame(0x00, b"b")).as_bytes());
+    let trailer = BASE64.encode(grpc_web_frame(0x80, b"grpc-status: 0\r\n"));
+    text.extend_from_slice(trailer.as_bytes());
+
+    for (label, content_type, backend_body) in [
+        ("binary", "application/grpc-web+proto", binary),
+        ("text", "application/grpc-web-text+proto", text),
+    ] {
+        for body_mode in ["stream", "buffer"] {
+            let reservation = reserve_port().await.expect("reserve backend port");
+            let backend_port = reservation.port;
+            let _backend = ScriptedH2Backend::builder_plain(reservation.into_listener())
+                .repeat_script(true)
+                .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+                .step(H2Step::DrainRequestBody)
+                .step(H2Step::RespondHeaders(vec![
+                    (":status", "200".into()),
+                    ("content-type", content_type.into()),
+                ]))
+                .step(H2Step::RespondData {
+                    data: Bytes::from(backend_body.clone()),
+                    end_stream: true,
+                })
+                .spawn()
+                .expect("spawn pass-through backend");
+
+            let config = json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "grpc-web-passthrough-msg-metrics",
+                    "listen_path": "/grpc",
+                    "backend_scheme": "http",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "response_body_mode": body_mode,
+                }],
+                "consumers": [],
+                "plugin_configs": mesh_metric_plugins(),
+            });
+            let gateway = GatewayHarness::builder()
+                .file_config(serde_yaml::to_string(&config).expect("yaml"))
+                .env("FERRUM_ACCEPT_THREADS", "1")
+                .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+                .spawn()
+                .await
+                .expect("spawn gateway");
+
+            let proxy_host = gateway
+                .proxy_base_url()
+                .trim_start_matches("http://")
+                .to_string();
+            let mut request = grpc_web_frame(0x00, b"one");
+            if label == "text" {
+                request = BASE64.encode(&request).into_bytes();
+            }
+            let client_body =
+                send_h2_grpc_web(&proxy_host, "/grpc/my.Echo/Echo", content_type, request)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}/{body_mode} gRPC-Web request: {e}"));
+            assert_eq!(
+                client_body.as_ref(),
+                backend_body.as_slice(),
+                "{label}/{body_mode}: a pass-through body is relayed unchanged"
+            );
+
+            let metrics = wait_for_response_message_metric(&gateway, 2).await;
+            assert_eq!(
+                metric_line_value(&metrics, "ferrum_mesh_response_messages_total{"),
+                Some(2),
+                "{label}/{body_mode}: the pass-through response counter counts the decoded \
+                 message frames only:\n{metrics}"
+            );
+        }
+    }
 }

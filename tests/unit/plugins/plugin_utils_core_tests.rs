@@ -17,7 +17,8 @@ use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
 use ferrum_edge::plugins::utils::sse::{
     AnthropicEvent, MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseEventName,
-    SseReassembler, SseText, SseTextKind, parse_sse_data_frames_checked,
+    SseReassembler, SseText, SseTextKind, parse_sse_data_frames_checked, split_sse_line_terminator,
+    sse_event_end, sse_event_end_after, sse_lines, sse_lines_inclusive, strip_sse_boms,
 };
 use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
@@ -1181,6 +1182,127 @@ fn sse_parser_still_fails_closed_on_malformed_json_under_cr_and_bom() {
             !parsed.fully_parsed,
             "{body:?} must not report fully parsed"
         );
+    }
+}
+
+#[test]
+fn sse_line_splitter_keeps_each_terminator_and_round_trips() {
+    let body = ": c\rdata: a\r\ndata: b\n\r\r\nz";
+    let inclusive: Vec<&str> = sse_lines_inclusive(body).collect();
+    assert_eq!(
+        inclusive,
+        [": c\r", "data: a\r\n", "data: b\n", "\r", "\r\n", "z"]
+    );
+    assert_eq!(inclusive.concat(), body);
+    let split: Vec<(&str, &str)> = inclusive
+        .iter()
+        .copied()
+        .map(split_sse_line_terminator)
+        .collect();
+    assert_eq!(
+        split,
+        [
+            (": c", "\r"),
+            ("data: a", "\r\n"),
+            ("data: b", "\n"),
+            ("", "\r"),
+            ("", "\r\n"),
+            ("z", ""),
+        ]
+    );
+    assert_eq!(
+        sse_lines(body).collect::<Vec<_>>(),
+        [": c", "data: a", "data: b", "", "", "z"]
+    );
+    assert_eq!(sse_lines("").count(), 0);
+}
+
+#[test]
+fn sse_bom_policy_strips_every_leading_bom_and_nothing_else() {
+    assert_eq!(strip_sse_boms("\u{feff}\u{feff}data: x\r"), "data: x\r");
+    assert_eq!(strip_sse_boms("data: \u{feff}x\n"), "data: \u{feff}x\n");
+    assert_eq!(strip_sse_boms(""), "");
+}
+
+#[test]
+fn sse_event_end_finds_blank_lines_under_every_terminator_mix() {
+    let cases: [(&[u8], Option<usize>); 17] = [
+        (b"data: x\n\nrest", Some(9)),
+        (b"data: x\r\n\r\nrest", Some(11)),
+        (b"data: x\r\rrest", Some(9)),
+        (b"data: x\n\r\nrest", Some(10)),
+        (b"data: x\r\n\nrest", Some(10)),
+        (b"data: x\n\rrest", Some(9)),
+        (b"data: x\r\n\rrest", Some(10)),
+        (b"data: x\r\r\nrest", Some(10)),
+        // One line end is not an event end, whatever its form.
+        (b"data: x\n", None),
+        (b"data: x\r\n", None),
+        (b"data: x\ny\n", None),
+        (b"data: x\ry\r", None),
+        // A final CR may still be half of a CRLF, so it cannot end a line
+        // that the next byte might continue...
+        (b"data: x\r", None),
+        // ...but as the second line end it already dispatches the event.
+        (b"data: x\r\n\r", Some(10)),
+        (b"data: x\r\r", Some(9)),
+        // The buffer starts inside a line, so a leading terminator ends it.
+        (b"\ndata: x\r\r", Some(10)),
+        (b"", None),
+    ];
+    for (buf, expected) in cases {
+        assert_eq!(
+            sse_event_end(buf),
+            expected,
+            "{:?}",
+            String::from_utf8_lossy(buf)
+        );
+    }
+}
+
+#[test]
+fn sse_event_end_after_joins_a_cr_and_lf_split_across_chunks() {
+    // The CR ending `carry` and the LF starting `chunk` are one CRLF.
+    assert_eq!(sse_event_end_after(b"data: x\r", b"\n\r\nnext"), Some(3));
+    assert_eq!(
+        sse_event_end_after(b"data: x\r", b"\ndata: y\r\r"),
+        Some(10)
+    );
+    assert_eq!(sse_event_end_after(b"data: x\r", b"\n"), None);
+    assert_eq!(sse_event_end_after(b"data: x\r", b"\n\r"), Some(2));
+    // A CR followed by a CR is two line ends: the event is complete.
+    assert_eq!(sse_event_end_after(b"data: x\r", b"\rnext"), Some(1));
+    assert_eq!(sse_event_end_after(b"data: x\r", b"\r\nnext"), Some(2));
+    assert_eq!(sse_event_end_after(b"data: x\n", b"\rnext"), Some(1));
+    assert_eq!(sse_event_end_after(b"data: x\r\n", b"\r"), Some(1));
+    assert_eq!(sse_event_end_after(b"data: x\r", b""), None);
+    assert_eq!(sse_event_end_after(b"", b"data: x\r\r"), Some(9));
+}
+
+#[test]
+fn sse_event_end_after_matches_a_contiguous_scan_at_every_split() {
+    let bodies: [&[u8]; 6] = [
+        b": c\rdata: {\"a\":1}\r\rdata: {\"b\":2}\r\r",
+        b"data: x\r\ndata: y\r\n\r\n",
+        b"data: x\r\n\rnext\r\r",
+        b"data: x\r\r\nnext\n\n",
+        b"data: x\n\r\nnext\r\n\n",
+        b"data: x\ry\r\nz\n\r",
+    ];
+    for body in bodies {
+        for split in 0..=body.len() {
+            let (carry, chunk) = body.split_at(split);
+            // The streaming caller only asks once `carry` holds no event.
+            if sse_event_end(carry).is_some() {
+                continue;
+            }
+            assert_eq!(
+                sse_event_end_after(carry, chunk),
+                sse_event_end(body).map(|end| end - split),
+                "{:?} split at {split}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 }
 
