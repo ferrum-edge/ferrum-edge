@@ -2,6 +2,7 @@
 
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::plugins::utils::sse::encode_sse_error_event;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, ai_response_guard::AiResponseGuard,
@@ -7216,6 +7217,645 @@ async fn a_second_fail_open_release_forwards_only_what_followed_the_event_start(
         assert_cut_before_leak(&mut *inspector, &label, &[leak_event.as_bytes()], leak).await;
     });
     join_all(runs).await;
+}
+
+/// The events a WHATWG `EventSource` client dispatches for `stream`, as
+/// `(event type, data)`. Lines end at CRLF, LF or a lone CR; a blank line
+/// dispatches the buffered event unless its data buffer is empty; an
+/// unterminated final line is never processed.
+fn whatwg_sse_events(stream: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(stream).into_owned();
+    let mut rest = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let mut events = Vec::new();
+    let mut event_type = String::new();
+    let mut data = String::new();
+    while let Some(eol) = rest.find(['\r', '\n']) {
+        let line = &rest[..eol];
+        let eol_len = 1 + usize::from(rest[eol..].starts_with("\r\n"));
+        rest = &rest[eol + eol_len..];
+        if line.is_empty() {
+            if !data.is_empty() {
+                data.pop();
+                let kind = if event_type.is_empty() {
+                    "message".to_string()
+                } else {
+                    event_type.clone()
+                };
+                events.push((kind, std::mem::take(&mut data)));
+            }
+            event_type.clear();
+            continue;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
+        };
+        match field {
+            "event" => event_type = value.to_string(),
+            "data" => {
+                data.push_str(value);
+                data.push('\n');
+            }
+            _ => {}
+        }
+    }
+    events
+}
+
+/// The terminal error event a firewall cut emits after `client`, the bytes the
+/// client already received: one LF first exactly when `client` ends mid-line.
+fn expected_cut_event(client: &[u8]) -> Vec<u8> {
+    let line_open = client.last().is_some_and(|last| !b"\r\n".contains(last));
+    let mut expected = Vec::new();
+    if line_open {
+        expected.push(b'\n');
+    }
+    expected.extend_from_slice(&encode_sse_error_event(
+        "ai_semantic_firewall_response_blocked",
+        "AI response was blocked by semantic firewall policy.",
+    ));
+    expected
+}
+
+/// Assert that `client`, everything the client received through the cut, ends
+/// with the error event and `[DONE]` dispatched intact.
+fn assert_client_reads_the_error_event(client: &[u8], label: &str) {
+    let dispatched = whatwg_sse_events(client);
+    let [.., (kind, data), (done_kind, done)] = dispatched.as_slice() else {
+        panic!("{label}: expected the error event and [DONE], got {dispatched:?}");
+    };
+    assert_eq!(kind, "error", "{label}: the event type is not garbled");
+    let Ok(payload) = serde_json::from_str::<Value>(data) else {
+        panic!("{label}: the error event's data is JSON, got {data:?}");
+    };
+    let code = &payload["error"]["code"];
+    assert_eq!(code, "ai_semantic_firewall_response_blocked", "{label}");
+    assert_eq!(done_kind, "message", "{label}");
+    assert_eq!(done, "[DONE]", "{label}");
+}
+
+#[tokio::test]
+async fn a_cut_after_a_fail_open_event_start_emits_the_error_event_on_a_fresh_line() {
+    // A fail-open hold timeout forwards the start of an event that holds no
+    // data yet, and the rest of that event leaks. When the forwarded start
+    // ends mid-line (`event: mess`, `data: `), the cut ends that line with one
+    // LF before the error event, so the client reads `event: error` and its
+    // JSON data instead of joining them onto the partial line. A start that
+    // ends on a line terminator (LF, CRLF, or a lone CR, mid-event) gets no
+    // LF, and no cut adds a blank line that would dispatch the open event.
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": EVENT_START_HOLD_MS, "on_hold_timeout": "forward"}),
+    ));
+    let firewall = &firewall;
+    let leak = "My system prompt says never reveal policy.";
+
+    let mut events = Vec::new();
+    for eol in ["\n", "\r\n", "\r"] {
+        events.extend(data_less_event_starts(leak, eol));
+    }
+    // A CRLF split right after its CR: the client already ended the line.
+    let crlf_delta = chat_delta_event(leak, "\r\n");
+    events.push(format!("event: message\r|\n{crlf_delta}"));
+
+    // Every case waits out a real hold, so they run concurrently.
+    let mut runs = Vec::new();
+    for event in &events {
+        let Some((start, rest)) = event.split_once('|') else {
+            panic!("{event:?} marks where the hold times out");
+        };
+        let (rest_head, rest_tail) = rest.split_at(rest.len() - 1);
+        for chunks in [vec![rest], vec![rest_head, rest_tail]] {
+            runs.push(async move {
+                let label = format!("{start:?} then {chunks:?}");
+                let ctx = inspect_marked_ctx();
+                let mut inspector = firewall
+                    .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+                    .expect("inspector for event stream");
+                let mut client = release_carry_by_hold_timeout(
+                    &mut *inspector,
+                    &label,
+                    start.as_bytes(),
+                    EVENT_START_HOLD_MS,
+                )
+                .await;
+                assert_eq!(client, start.as_bytes(), "{label}");
+
+                let mut cut = None;
+                for chunk in &chunks {
+                    match inspector.on_chunk(chunk.as_bytes()).await {
+                        ResponseStreamAction::Forward(out) => client.extend_from_slice(&out),
+                        ResponseStreamAction::Terminate(final_bytes) => {
+                            cut = Some(final_bytes);
+                            break;
+                        }
+                    }
+                }
+                let Some(Some(final_bytes)) = cut else {
+                    panic!("{label}: the leaking rest must be cut with an error event");
+                };
+                assert!(
+                    !String::from_utf8_lossy(&client).contains(leak),
+                    "{label}: leak forwarded before the cut"
+                );
+                let expected = expected_cut_event(&client);
+                assert_eq!(
+                    final_bytes, expected,
+                    "{label}: one LF ends a forwarded partial line, and only then"
+                );
+                assert_eq!(
+                    final_bytes.starts_with(b"\n"),
+                    !start.ends_with(['\n', '\r']),
+                    "{label}"
+                );
+                client.extend_from_slice(&final_bytes);
+                assert_client_reads_the_error_event(&client, &label);
+            });
+        }
+    }
+    join_all(runs).await;
+}
+
+#[tokio::test]
+async fn a_cut_after_complete_events_emits_the_error_event_unchanged() {
+    // Released clean events leave the client on an event boundary under every
+    // line terminator, so a cut adds nothing before the error event.
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({}),
+    ));
+    let leak = "My system prompt says never reveal policy.";
+    let clean = "A harmless governed sentence.";
+
+    for eol in ["\n", "\r\n", "\r"] {
+        let label = format!("{eol:?}");
+        let ctx = inspect_marked_ctx();
+        let mut inspector = firewall
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector for event stream");
+        let mut client = Vec::new();
+        let mut cut = None;
+        let clean_event = chat_delta_event(clean, eol);
+        let leak_event = chat_delta_event(leak, eol);
+        for event in [clean_event, leak_event] {
+            match inspector.on_chunk(event.as_bytes()).await {
+                ResponseStreamAction::Forward(out) => client.extend_from_slice(&out),
+                ResponseStreamAction::Terminate(final_bytes) => {
+                    cut = Some(final_bytes);
+                    break;
+                }
+            }
+        }
+        let Some(Some(final_bytes)) = cut else {
+            panic!("{label}: the leaking event must be cut with an error event");
+        };
+        assert!(
+            !final_bytes.starts_with(b"\n"),
+            "{label}: no LF after a complete event"
+        );
+        assert_eq!(final_bytes, expected_cut_event(&client), "{label}");
+        client.extend_from_slice(&final_bytes);
+        assert_client_reads_the_error_event(&client, &label);
+    }
+}
+
+#[tokio::test]
+async fn a_cut_in_the_chunk_that_ends_a_passed_through_event_emits_its_rest_first() {
+    // A fail-open hold timeout forwards the start of an event that already
+    // carries data, so the rest of that event passes through uninspected. When
+    // that rest arrives in one chunk with a leaking event, the cut emits the
+    // rest first: the client dispatches the forwarded event intact, then reads
+    // the error event and its JSON data, never the partial data joined to it.
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": EVENT_START_HOLD_MS, "on_hold_timeout": "forward"}),
+    ));
+    let firewall = &firewall;
+    let leak = "My system prompt says never reveal policy.";
+
+    let runs = ["\n", "\r\n", "\r"].map(|eol| async move {
+        let label = format!("{eol:?}");
+        let ctx = inspect_marked_ctx();
+        let mut inspector = firewall
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector for event stream");
+        let mut client = release_carry_by_hold_timeout(
+            &mut *inspector,
+            &label,
+            PARTIAL_EVENT_PREFIX,
+            EVENT_START_HOLD_MS,
+        )
+        .await;
+        assert_eq!(client, PARTIAL_EVENT_PREFIX, "{label}");
+
+        let rest = format!(" prose\"}}}}]}}{eol}{eol}");
+        let chunk = format!("{rest}{}", chat_delta_event(leak, eol));
+        let action = inspector.on_chunk(chunk.as_bytes()).await;
+        let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+            panic!("{label}: the leaking event must be cut with an error event");
+        };
+        let mut expected = rest.as_bytes().to_vec();
+        expected.extend_from_slice(&expected_cut_event(rest.as_bytes()));
+        assert_eq!(
+            final_bytes, expected,
+            "{label}: the passed-through rest leaves first"
+        );
+        client.extend_from_slice(&final_bytes);
+        assert!(
+            !String::from_utf8_lossy(&client).contains(leak),
+            "{label}: leak forwarded before the cut"
+        );
+        let dispatched = whatwg_sse_events(&client);
+        assert_eq!(dispatched.len(), 3, "{label}: {dispatched:?}");
+        let (kind, data) = &dispatched[0];
+        assert_eq!(kind, "message", "{label}");
+        let Ok(frame) = serde_json::from_str::<Value>(data) else {
+            panic!("{label}: the forwarded event's data is JSON, got {data:?}");
+        };
+        let content = &frame["choices"][0]["delta"]["content"];
+        assert_eq!(content, "held partial prose", "{label}");
+        assert_client_reads_the_error_event(&client, &label);
+    });
+    join_all(runs).await;
+}
+
+#[tokio::test]
+async fn a_cut_after_a_partial_bom_release_ends_the_open_line() {
+    // A fail-open hold timeout forwards the start of a stream-start BOM. A
+    // client decodes a BOM cut short as a character that opens a line, so a
+    // cut ends that line with one LF whether the rest of the BOM left before
+    // the cut, left with it, or never came. After a whole BOM that LF is a
+    // blank line with nothing buffered, which dispatches nothing.
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": CARRY_HOLD_MS, "on_hold_timeout": "forward"}),
+    ));
+    let leak = "My system prompt says never reveal policy.";
+    let bom = "\u{feff}".as_bytes();
+
+    for eol in ["\n", "\r\n", "\r"] {
+        let leak_event = chat_delta_event(leak, eol);
+        for held in 1..bom.len() {
+            let (carry, rest) = bom.split_at(held);
+            let with_rest = [rest, leak_event.as_bytes()].concat();
+            // (chunks after the release, bytes the cut itself emits first)
+            let shapes: [(Vec<&[u8]>, &[u8]); 3] = [
+                (vec![rest, leak_event.as_bytes()], b""),
+                (vec![with_rest.as_slice()], rest),
+                (vec![leak_event.as_bytes()], b""),
+            ];
+            for (shape, (chunks, emitted)) in shapes.into_iter().enumerate() {
+                let label = format!("{held} BOM bytes {eol:?} shape {shape}");
+                let ctx = inspect_marked_ctx();
+                let mut inspector = firewall
+                    .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+                    .expect("inspector for event stream");
+                let mut client =
+                    release_carry_by_hold_timeout(&mut *inspector, &label, carry, CARRY_HOLD_MS)
+                        .await;
+                assert_eq!(client, carry, "{label}");
+
+                let mut cut = None;
+                for chunk in chunks {
+                    match inspector.on_chunk(chunk).await {
+                        ResponseStreamAction::Forward(out) => client.extend_from_slice(&out),
+                        ResponseStreamAction::Terminate(final_bytes) => {
+                            cut = Some(final_bytes);
+                            break;
+                        }
+                    }
+                }
+                let Some(Some(final_bytes)) = cut else {
+                    panic!("{label}: the leaking event must be cut with an error event");
+                };
+                let before_event = [client.as_slice(), emitted].concat();
+                let mut expected = emitted.to_vec();
+                expected.extend_from_slice(&expected_cut_event(&before_event));
+                assert_eq!(final_bytes, expected, "{label}");
+                assert!(
+                    final_bytes[emitted.len()..].starts_with(b"\n"),
+                    "{label}: one LF ends the line the BOM bytes opened"
+                );
+                client.extend_from_slice(&final_bytes);
+                let dispatched = whatwg_sse_events(&client);
+                assert_eq!(dispatched.len(), 2, "{label}: {dispatched:?}");
+                assert_client_reads_the_error_event(&client, &label);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cut_at_the_end_of_the_stream_follows_what_the_client_holds() {
+    // The leaking event arrives without the blank line that ends it, so the
+    // cut comes from `on_end`. After a released event start that ends
+    // mid-line, one LF ends that line first; after the passed-through rest of
+    // an event that already carries data, the client is on an event boundary
+    // and nothing is added. Either way the client reads the error event.
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": EVENT_START_HOLD_MS, "on_hold_timeout": "forward"}),
+    ));
+    let firewall = &firewall;
+    let leak = "My system prompt says never reveal policy.";
+    let partial = String::from_utf8_lossy(PARTIAL_EVENT_PREFIX).into_owned();
+
+    let mut runs = Vec::new();
+    for eol in ["\n", "\r\n", "\r"] {
+        let leak_event = chat_delta_event(leak, eol);
+        let unterminated = &leak_event[..leak_event.len() - eol.len()];
+        let data_less_next = format!("age{eol}{unterminated}");
+        let data_rest_next = format!(" prose\"}}}}]}}{eol}{eol}{unterminated}");
+        let cases = [
+            ("event: mess".to_string(), data_less_next, true),
+            (partial.clone(), data_rest_next, false),
+        ];
+        for (start, next, line_open) in cases {
+            runs.push(async move {
+                let label = format!("{start:?} then {next:?}");
+                let ctx = inspect_marked_ctx();
+                let mut inspector = firewall
+                    .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+                    .expect("inspector for event stream");
+                let mut client = release_carry_by_hold_timeout(
+                    &mut *inspector,
+                    &label,
+                    start.as_bytes(),
+                    EVENT_START_HOLD_MS,
+                )
+                .await;
+                assert_eq!(client, start.as_bytes(), "{label}");
+                let action = inspector.on_chunk(next.as_bytes()).await;
+                let ResponseStreamAction::Forward(out) = action else {
+                    panic!("{label}: an unterminated event is held, not cut");
+                };
+                client.extend_from_slice(&out);
+                let action = inspector.on_end().await;
+                let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+                    panic!("{label}: the leaking tail must be cut at the end of the stream");
+                };
+                assert!(
+                    !String::from_utf8_lossy(&client).contains(leak),
+                    "{label}: leak forwarded before the cut"
+                );
+                assert_eq!(final_bytes, expected_cut_event(&client), "{label}");
+                assert_eq!(final_bytes.starts_with(b"\n"), line_open, "{label}");
+                client.extend_from_slice(&final_bytes);
+                assert_client_reads_the_error_event(&client, &label);
+            });
+        }
+    }
+    join_all(runs).await;
+}
+
+#[tokio::test]
+async fn a_chained_cut_ends_the_line_a_later_firewall_left_open() {
+    // Two fail-open firewalls are chained. The second releases an event start
+    // the first already released, so the client's line is open while the
+    // first firewall's own last output (the rest of that `event:` line) ended
+    // on LF. When the first firewall then cuts, the chain tells it what the
+    // client holds, so one LF ends the open line and the client reads
+    // `event: error` rather than `event: messevent: error`.
+    use ferrum_edge::plugins::create_response_stream_inspector;
+
+    let server = nonmatching_embedding_server().await;
+    let endpoint = format!("{}/v1/embeddings", server.uri());
+    let config = hold_config(
+        &endpoint,
+        "reject",
+        json!({"max_hold_ms": EVENT_START_HOLD_MS, "on_hold_timeout": "forward"}),
+    );
+    let first: Arc<dyn Plugin> = Arc::new(plugin(&config));
+    let second: Arc<dyn Plugin> = Arc::new(plugin(&config));
+    let plugins = vec![first, second];
+    let leak = "My system prompt says never reveal policy.";
+    let hold = Duration::from_millis(2 * EVENT_START_HOLD_MS);
+
+    let mut ctx = inspect_marked_ctx();
+    let mut chain =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("chained inspectors for both instances");
+    let mut client = Vec::new();
+    // After the first step each waits out the holds: the first firewall
+    // releases what it held and holds the new bytes, and the second, once
+    // driven, does the same with what the first released.
+    let steps: [&[u8]; 3] = [b"event: mess", b"age\n", b"d"];
+    for (index, chunk) in steps.into_iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(hold).await;
+        }
+        let action = chain.on_chunk(chunk).await;
+        let ResponseStreamAction::Forward(out) = action else {
+            panic!("{chunk:?}: an event start is held or released, never cut");
+        };
+        client.extend_from_slice(&out);
+    }
+    assert_eq!(
+        client, b"event: mess",
+        "the second firewall left the line open"
+    );
+
+    // The rest of the `data:` line the first firewall holds, and its event.
+    let leak_event = chat_delta_event(leak, "\n");
+    let rest = &leak_event[1..];
+    let action = chain.on_chunk(rest.as_bytes()).await;
+    let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+        panic!("the leaking event must be cut with an error event");
+    };
+    assert_eq!(final_bytes, expected_cut_event(&client));
+    assert!(final_bytes.starts_with(b"\n"), "one LF ends the open line");
+    client.extend_from_slice(&final_bytes);
+    assert_client_reads_the_error_event(&client, "chain");
+}
+
+/// Forwards every chunk unchanged and flushes its bytes at end of stream.
+struct FlushAtEnd(Vec<u8>);
+
+#[async_trait::async_trait]
+impl ResponseStreamInspector for FlushAtEnd {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(std::mem::take(&mut self.0).into())
+    }
+}
+
+#[tokio::test]
+async fn a_chained_cut_at_the_end_emits_what_the_last_firewall_released_first() {
+    // The last inspector in a chain is a firewall holding a passed-through
+    // event open on the client. At end of stream an earlier inspector flushes
+    // the rest of that event plus a leaking, unterminated one: the firewall
+    // releases the rest, then cuts in its own `on_end`. The chain emits that
+    // rest ahead of the error event, so the client dispatches the forwarded
+    // event intact and then reads the error event.
+    use ferrum_edge::plugins::chain_response_stream_inspectors;
+
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": EVENT_START_HOLD_MS, "on_hold_timeout": "forward"}),
+    ));
+    let firewall = &firewall;
+    let leak = "My system prompt says never reveal policy.";
+
+    let runs = ["\n", "\r\n", "\r"].map(|eol| async move {
+        let label = format!("{eol:?}");
+        let leak_event = chat_delta_event(leak, eol);
+        let unterminated = &leak_event[..leak_event.len() - eol.len()];
+        let rest = format!("\"}}}}]}}{eol}{eol}");
+        let flush = format!("{rest}{unterminated}").into_bytes();
+        let ctx = inspect_marked_ctx();
+        let inspector = firewall
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector for event stream");
+        let flusher: Box<dyn ResponseStreamInspector> = Box::new(FlushAtEnd(flush));
+        let inspectors = vec![flusher, inspector];
+        let mut chain = chain_response_stream_inspectors(inspectors).expect("chain");
+
+        let action = chain.on_chunk(PARTIAL_EVENT_PREFIX).await;
+        let ResponseStreamAction::Forward(held) = action else {
+            panic!("{label}: the partial event is held");
+        };
+        assert!(held.is_empty(), "{label}");
+        tokio::time::sleep(Duration::from_millis(2 * EVENT_START_HOLD_MS)).await;
+        let ResponseStreamAction::Forward(released) = chain.on_chunk(b" prose").await else {
+            panic!("{label}: a fail-open hold timeout releases the partial event");
+        };
+        let mut client = released.to_vec();
+        let mut expected_client = PARTIAL_EVENT_PREFIX.to_vec();
+        expected_client.extend_from_slice(b" prose");
+        assert_eq!(client, expected_client, "{label}");
+
+        let action = chain.on_end().await;
+        let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+            panic!("{label}: the leaking tail must be cut at the end of the stream");
+        };
+        let mut expected = rest.as_bytes().to_vec();
+        expected.extend_from_slice(&expected_cut_event(rest.as_bytes()));
+        assert_eq!(
+            final_bytes, expected,
+            "{label}: the released rest leaves first"
+        );
+        client.extend_from_slice(&final_bytes);
+        let dispatched = whatwg_sse_events(&client);
+        assert_eq!(dispatched.len(), 3, "{label}: {dispatched:?}");
+        let Ok(frame) = serde_json::from_str::<Value>(&dispatched[0].1) else {
+            panic!("{label}: the forwarded event's data is JSON, got {dispatched:?}");
+        };
+        let content = &frame["choices"][0]["delta"]["content"];
+        assert_eq!(content, "held partial prose", "{label}");
+        assert_client_reads_the_error_event(&client, &label);
+    });
+    join_all(runs).await;
+}
+
+/// Two chained instances of the firewall `config`.
+fn chained_firewalls(config: &Value) -> Box<dyn ResponseStreamInspector> {
+    use ferrum_edge::plugins::create_response_stream_inspector;
+
+    let first: Arc<dyn Plugin> = Arc::new(plugin(config));
+    let second: Arc<dyn Plugin> = Arc::new(plugin(config));
+    let plugins = vec![first, second];
+    let mut ctx = inspect_marked_ctx();
+    create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+        .expect("chained inspectors for both instances")
+}
+
+#[tokio::test]
+async fn a_non_last_chained_firewall_cut_drops_its_same_chunk_release() {
+    // One chunk carries a clean event and then a leaking one. Alone, a
+    // firewall releases the clean event and cuts after it. Chained ahead of
+    // another inspector, the first firewall's release has not passed that
+    // inspector, so its cut carries only the error event: no backend byte
+    // skips a later inspector.
+    let server = nonmatching_embedding_server().await;
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({}),
+    );
+    let leak = "My system prompt says never reveal policy.";
+    let clean_event = chat_delta_event("A harmless governed sentence.", "\n");
+    let chunk = format!("{clean_event}{}", chat_delta_event(leak, "\n"));
+
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let action = inspector.on_chunk(chunk.as_bytes()).await;
+    let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+        panic!("a lone firewall cuts the leaking event with an error event");
+    };
+    let mut expected = clean_event.as_bytes().to_vec();
+    expected.extend_from_slice(&expected_cut_event(clean_event.as_bytes()));
+    assert_eq!(final_bytes, expected, "the clean event leaves first");
+
+    let mut chain = chained_firewalls(&config);
+    let action = chain.on_chunk(chunk.as_bytes()).await;
+    let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+        panic!("the first firewall cuts the leaking event with an error event");
+    };
+    let expected = expected_cut_event(b"");
+    assert_eq!(final_bytes, expected, "no backend bytes");
+}
+
+#[tokio::test]
+async fn a_silent_cut_still_sends_what_the_same_chunk_cleared() {
+    // `cut_silent` sends no error event, but the clean event the same chunk
+    // cleared still leaves before the stream ends, as it would ahead of an
+    // error event. Chained ahead of another inspector, the first firewall
+    // drops that release, so the chain ends the stream with nothing.
+    let server = nonmatching_embedding_server().await;
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"on_violation": "cut_silent"}),
+    );
+    let leak_event = chat_delta_event("My system prompt says never reveal policy.", "\n");
+    let clean_event = chat_delta_event("A harmless governed sentence.", "\n");
+    let chunk = format!("{clean_event}{leak_event}");
+
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let action = inspector.on_chunk(chunk.as_bytes()).await;
+    let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
+        panic!("a lone silent cut sends the clean event");
+    };
+    assert_eq!(final_bytes, clean_event.as_bytes(), "clean event only");
+
+    // Nothing cleared: a silent cut sends nothing at all.
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let action = inspector.on_chunk(leak_event.as_bytes()).await;
+    assert!(
+        matches!(action, ResponseStreamAction::Terminate(None)),
+        "{action:?}"
+    );
+
+    let mut chain = chained_firewalls(&config);
+    let action = chain.on_chunk(chunk.as_bytes()).await;
+    assert!(
+        matches!(action, ResponseStreamAction::Terminate(None)),
+        "no backend bytes: {action:?}"
+    );
 }
 
 #[tokio::test]

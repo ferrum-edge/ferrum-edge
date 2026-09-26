@@ -593,6 +593,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counted as a message. This covers the native gRPC dispatch, the reqwest,
   direct-H2, HBONE, Unix and mesh-mTLS upload adapters, and the native HTTP/3
   backend upload paths (#5807).
+- A windowed `ai_semantic_firewall` stream cut that follows forwarded bytes
+  ending mid-line (such as a fail-open hold timeout that released an event
+  start like `event: mess` or `data: `) now ends that line with one LF before
+  the terminal error event, so clients read `event: error` and its JSON data
+  instead of joining them onto the partial line. No blank line is added, so the
+  partial start merges harmlessly into the error event. Bytes the same chunk
+  already cleared, such as the pass-through rest of an event whose data the
+  client already holds, now leave ahead of the error event (when the firewall
+  is the only or last stream inspector) instead of being dropped, so that
+  event ends intact; a `cut_silent` cut sends them too before the stream
+  ends. In a chain of stream inspectors the LF follows what the client
+  actually received, and a last inspector's cut at the end of the stream keeps
+  the bytes it released just before. A chained firewall that is not the last
+  stream inspector still drops its own same-chunk releases at a cut, including
+  a fail-open pass-through rest, so backend bytes never skip the later
+  inspectors; in that configuration the error event's data may still be
+  unparseable (#5826; #5820).
 - The HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends now counts pass-through
   gRPC-Web request messages on their decoded frames on its streamed upload,
   its mesh-egress drain, and its unprepared buffered body, which fed no count

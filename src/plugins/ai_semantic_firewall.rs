@@ -3765,7 +3765,9 @@ struct StreamWindowEngine {
     store_frames: bool,
     reassembler: SseReassembler,
     /// Raw bytes received but not yet split into a complete SSE event. Bounded
-    /// by `max_window_bytes` so an un-terminated event cannot grow unbounded.
+    /// by `max_window_bytes` so an un-terminated event cannot grow unbounded;
+    /// the rest of a force-flushed event may exceed it by the one framing byte
+    /// saved as its context.
     carry: Vec<u8>,
     /// How many leading bytes of `carry` are context only: they already left
     /// the gateway, or belong to an event already absorbed into `held`. They
@@ -5069,6 +5071,17 @@ struct StreamInspector {
     hold: Option<HoldState>,
     /// Whether the one-time hold-timeout warning has fired for this response.
     hold_timeout_logged: Arc<AtomicBool>,
+    /// Whether the bytes the client already received end mid-line (the last
+    /// is neither CR nor LF), such as a fail-open release of an event start.
+    /// A cut then ends that line before its error event, so the client never
+    /// reads the event's first line as the rest of the forwarded one. Tracked
+    /// from this inspector's own output, or set by a chain when a later
+    /// inspector still sees that output.
+    client_line_open: bool,
+    /// Whether a later chained inspector still sees this inspector's output.
+    /// A cut's payload then goes to the client around that inspector, so it
+    /// must not carry the backend bytes this call already cleared.
+    feeds_inspector: bool,
 }
 
 impl StreamInspector {
@@ -5137,6 +5150,8 @@ impl StreamInspector {
             detect_provider_error_logged: Arc::new(AtomicBool::new(false)),
             hold,
             hold_timeout_logged: Arc::new(AtomicBool::new(false)),
+            client_line_open: false,
+            feeds_inspector: false,
         }
     }
 
@@ -5566,11 +5581,56 @@ impl StreamInspector {
         });
         ResponseStreamAction::Terminate(final_bytes)
     }
-}
 
-#[async_trait]
-impl ResponseStreamInspector for StreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    /// Frame a cut's error event after `released`, the bytes this call already
+    /// cleared (clean windows and fail-open releases, including the rest of an
+    /// event whose start the client already holds). They leave first, so that
+    /// event ends on its blank line rather than merging into the error event.
+    /// Then one LF ends a line the client still holds open, so it reads the
+    /// error event from a fresh line. Never a blank line, which would dispatch
+    /// an open event. A silent cut (no error event) still sends `released`
+    /// before the stream ends. When a later chained inspector has not passed
+    /// `released`, it is dropped. Allocates only here, on a cut.
+    fn cut_after(&self, released: Vec<u8>, action: ResponseStreamAction) -> ResponseStreamAction {
+        let ResponseStreamAction::Terminate(event) = action else {
+            return action;
+        };
+        let mut out = released;
+        if self.feeds_inspector {
+            out.clear();
+        }
+        let Some(event) = event else {
+            // No error event follows, so no line needs ending.
+            if out.is_empty() {
+                return ResponseStreamAction::Terminate(None);
+            }
+            return ResponseStreamAction::Terminate(Some(Bytes::from(out)));
+        };
+        let line_open = match out.last() {
+            Some(&last) => !matches!(last, b'\n' | b'\r'),
+            None => self.client_line_open,
+        };
+        if out.is_empty() && !line_open {
+            return ResponseStreamAction::Terminate(Some(event));
+        }
+        if line_open {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(&event);
+        ResponseStreamAction::Terminate(Some(Bytes::from(out)))
+    }
+
+    /// Record whether `action` forwards bytes that leave a line open on the
+    /// client.
+    fn note_forwarded(&mut self, action: &ResponseStreamAction) {
+        if let ResponseStreamAction::Forward(bytes) = action
+            && let Some(&last) = bytes.last()
+        {
+            self.client_line_open = !matches!(last, b'\n' | b'\r');
+        }
+    }
+
+    async fn inspect_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
@@ -5602,7 +5662,9 @@ impl ResponseStreamInspector for StreamInspector {
                 if self.hold_expired() {
                     match self.on_hold_expired("accumulate") {
                         ResponseStreamAction::Forward(bytes) => released.extend_from_slice(&bytes),
-                        terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                        terminate @ ResponseStreamAction::Terminate(_) => {
+                            return self.cut_after(released, terminate);
+                        }
                     }
                     // Expiry may have entered pass-through for a partial event;
                     // drain any remainder already present in this same chunk.
@@ -5624,7 +5686,9 @@ impl ResponseStreamInspector for StreamInspector {
                             ResponseStreamAction::Forward(bytes) => {
                                 released.extend_from_slice(&bytes);
                             }
-                            terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                            terminate @ ResponseStreamAction::Terminate(_) => {
+                                return self.cut_after(released, terminate);
+                            }
                         }
                         // `act_on_window` can itself expire the hold while
                         // awaiting a verdict. A fail-open expiry may have
@@ -5653,7 +5717,9 @@ impl ResponseStreamInspector for StreamInspector {
                 if self.hold_expired() {
                     match self.on_hold_expired("accumulate") {
                         ResponseStreamAction::Forward(bytes) => released.extend_from_slice(&bytes),
-                        terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                        terminate @ ResponseStreamAction::Terminate(_) => {
+                            return self.cut_after(released, terminate);
+                        }
                     }
                 }
                 ResponseStreamAction::Forward(Bytes::from(released))
@@ -5681,7 +5747,7 @@ impl ResponseStreamInspector for StreamInspector {
         }
     }
 
-    async fn on_end(&mut self) -> ResponseStreamAction {
+    async fn inspect_end(&mut self) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
@@ -5697,7 +5763,9 @@ impl ResponseStreamInspector for StreamInspector {
                 if self.hold_expired() {
                     match self.on_hold_expired("accumulate") {
                         ResponseStreamAction::Forward(bytes) => released.extend_from_slice(&bytes),
-                        terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                        terminate @ ResponseStreamAction::Terminate(_) => {
+                            return self.cut_after(released, terminate);
+                        }
                     }
                 }
                 if self.window.in_passthrough() {
@@ -5711,7 +5779,9 @@ impl ResponseStreamInspector for StreamInspector {
                             ResponseStreamAction::Forward(bytes) => {
                                 released.extend_from_slice(&bytes);
                             }
-                            terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                            terminate @ ResponseStreamAction::Terminate(_) => {
+                                return self.cut_after(released, terminate);
+                            }
                         }
                         // A verdict timeout can enter fail-open pass-through
                         // after the pre-loop check. End-of-stream has no later
@@ -5739,6 +5809,26 @@ impl ResponseStreamInspector for StreamInspector {
                 ResponseStreamAction::Forward(Bytes::new())
             }
         }
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for StreamInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let action = self.inspect_chunk(chunk).await;
+        self.note_forwarded(&action);
+        action
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        let action = self.inspect_end().await;
+        self.note_forwarded(&action);
+        action
+    }
+
+    fn set_chained_client_line_open(&mut self, open: bool) {
+        self.client_line_open = open;
+        self.feeds_inspector = true;
     }
 
     fn on_downstream_terminated(&mut self) {
