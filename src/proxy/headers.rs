@@ -1826,7 +1826,9 @@ pub(crate) fn reconcile_streaming_backend_trailers(
 /// the policy removed — or contradicts what the policy set — on the wire. The
 /// paths that cross it are the buffered native-HTTP/3 send path, the plain
 /// native/refined HTTP/3 STREAMING relays, the plain direct-HTTP/2 streaming
-/// relay, and — via [`TrailerSectionKind::NativeGrpcTerminal`] — every native
+/// relay, the reqwest streaming relay and the buffered H1/H2 response builder
+/// (issue #5760, both through the same owned governor), and — via
+/// [`TrailerSectionKind::NativeGrpcTerminal`] — every native
 /// STREAMING gRPC relay (the direct-H2 gRPC pool path, the mesh-mTLS
 /// `StreamingH2` relay, the H3-to-H2 cross-protocol gRPC bridge, and
 /// `dispatch_grpc_native_h3`). The streaming families reach this function

@@ -425,7 +425,9 @@ impl http_body::Body for TrackedBody {
 /// `response_body_mode = Buffer`, but a non-empty gRPC response must still end
 /// with an HTTP/2 trailers frame carrying `grpc-status`. `Full<Bytes>` cannot
 /// emit that terminal frame, so this tiny body yields the buffered DATA once,
-/// then the sanitized trailers collected from the backend.
+/// then the sanitized trailers collected from the backend. Buffered plain-HTTP
+/// responses that carried trailers use the same shape
+/// ([`ProxyBody::buffered_with_trailers`]).
 struct BufferedGrpcBody {
     data: Option<Bytes>,
     trailers: Option<HeaderMap>,
@@ -890,6 +892,14 @@ impl ProxyBody {
     /// is empty.
     pub(crate) fn buffered_grpc_with_trailers(data: impl Into<Bytes>, trailers: HeaderMap) -> Self {
         Self::streaming(Box::pin(BufferedGrpcBody::new(data.into(), trailers)))
+    }
+
+    /// Create a buffered plain-HTTP response body that emits DATA followed by
+    /// the backend's already-sanitized trailer section (issue #5760). Same
+    /// frame shape as [`Self::buffered_grpc_with_trailers`]; the separate name
+    /// keeps plain-response callers from reading as gRPC.
+    pub(crate) fn buffered_with_trailers(data: Bytes, trailers: HeaderMap) -> Self {
+        Self::streaming(Box::pin(BufferedGrpcBody::new(data, trailers)))
     }
 
     /// Translate a live native-gRPC body into an incremental gRPC-Web body.
@@ -3514,10 +3524,10 @@ impl http_body::Body for CountingIncoming {
 
 // -- SizeLimitedStreamingResponse ---------------------------------------------
 
-/// A size-limited streaming adapter over a reqwest response byte stream.
+/// A size-limited streaming adapter over a reqwest response frame stream.
 ///
-/// Wraps a reqwest response's `bytes_stream()` and counts bytes as they flow
-/// through. If the accumulated size exceeds `max_bytes`, yields an error frame.
+/// Counts DATA bytes as they flow through; trailer frames pass untouched. If
+/// the accumulated size exceeds `max_bytes`, yields an error frame.
 /// This allows streaming response bodies to the client while still enforcing
 /// `max_response_body_size_bytes` without buffering the entire body into memory.
 ///
@@ -3540,13 +3550,9 @@ pub(crate) fn size_limited_streaming_body(
     max_bytes: usize,
     content_length: Option<u64>,
     read_timeout_ms: u64,
+    trailers: ReqwestResponseTrailers,
 ) -> ProxyBody {
-    use futures_util::StreamExt;
-
-    let stream = response.bytes_stream().map(|r| {
-        r.map(Frame::data)
-            .map_err(|e| Box::new(e) as ProxyBodyError)
-    });
+    let stream = reqwest_response_frames(response, trailers);
     let limited = SizeLimitedStreamingResponse {
         inner: stream,
         max_bytes,
@@ -5218,6 +5224,82 @@ impl<S: H3RecvStream + Unpin> http_body::Body for DirectH3Body<S> {
     }
 }
 
+/// What a reqwest-dispatched streaming response does with the backend's trailer
+/// section.
+///
+/// `Response::bytes_stream()` yields DATA only, so the reqwest relay used to
+/// drop every trailer while the direct HTTP/2 relay forwarded them — whether a
+/// client saw its trailers depended on which dispatch path the backend's
+/// capability record selected (issue #5760). The relay now reads real frames,
+/// and this decides what happens to the trailer frame.
+pub(crate) struct ReqwestResponseTrailers {
+    relay: bool,
+    /// Response-header policy boundary, applied after hop-by-hop stripping.
+    /// `None` when the chain has nothing that could govern a trailer.
+    governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+}
+
+impl ReqwestResponseTrailers {
+    /// The client cannot receive a trailer section on this response, so no
+    /// response-policy evidence was captured for one. Drop it at the source
+    /// rather than forward an ungoverned section.
+    pub(crate) fn drop_all() -> Self {
+        Self {
+            relay: false,
+            governor: None,
+        }
+    }
+
+    /// Forward the trailer section after hop-by-hop stripping and, when
+    /// present, the response-header policy boundary.
+    pub(crate) fn relay(
+        governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    ) -> Self {
+        Self {
+            relay: true,
+            governor,
+        }
+    }
+}
+
+/// Frame-level view of a reqwest response body: DATA frames pass through and
+/// the trailer frame is sanitized or dropped per [`ReqwestResponseTrailers`].
+struct ReqwestResponseFrames {
+    body: StripHopByHopTrailers<reqwest::Body>,
+    relay_trailers: bool,
+}
+
+impl futures_util::Stream for ReqwestResponseFrames {
+    type Item = Result<Frame<Bytes>, BoxError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            match http_body::Body::poll_frame(Pin::new(&mut this.body), cx) {
+                Poll::Ready(Some(Ok(frame))) if frame.is_trailers() && !this.relay_trailers => {}
+                Poll::Ready(Some(Ok(frame))) => return Poll::Ready(Some(Ok(frame))),
+                Poll::Ready(Some(Err(err))) => {
+                    return Poll::Ready(Some(Err(Box::new(err) as BoxError)));
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Read a reqwest response as HTTP frames, trailers included.
+fn reqwest_response_frames(
+    response: reqwest::Response,
+    trailers: ReqwestResponseTrailers,
+) -> ReqwestResponseFrames {
+    let body = http::Response::<reqwest::Body>::from(response).into_body();
+    ReqwestResponseFrames {
+        body: StripHopByHopTrailers::with_trailer_governor(body, trailers.governor),
+        relay_trailers: trailers.relay,
+    }
+}
+
 /// Outermost idle `backend_read_timeout_ms` wrapper for reqwest streaming
 /// bodies. `0` skips the wrapper so long-lived streams stay unbounded.
 fn wrap_idle_read_timeout<B>(body: B, read_timeout_ms: u64) -> ProxyBody
@@ -5236,12 +5318,9 @@ pub(crate) fn coalescing_body(
     content_length: Option<u64>,
     read_timeout_ms: u64,
     flush_after: Option<Duration>,
+    trailers: ReqwestResponseTrailers,
 ) -> ProxyBody {
-    use futures_util::StreamExt;
-
-    let stream = response
-        .bytes_stream()
-        .map(|r| r.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
+    let stream = reqwest_response_frames(response, trailers);
     #[cfg(feature = "bench-h1-profile")]
     let stream = crate::h1_profile::ObservedStream::new(stream, 1);
     // `flush_after: None` makes the adapter flush on the first `Pending`, so on
@@ -5262,12 +5341,9 @@ pub(crate) fn direct_streaming_body(
     response: reqwest::Response,
     content_length: Option<u64>,
     read_timeout_ms: u64,
+    trailers: ReqwestResponseTrailers,
 ) -> ProxyBody {
-    use futures_util::StreamExt;
-
-    let stream = response
-        .bytes_stream()
-        .map(|r| r.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
+    let stream = reqwest_response_frames(response, trailers);
     #[cfg(feature = "bench-h1-profile")]
     let stream = crate::h1_profile::ObservedStream::new(stream, 0);
     let body = DirectStreamBody {
@@ -5334,6 +5410,9 @@ where
 /// than forwarded unbounded just because each window was clean. A live
 /// `backend_read_timeout_ms` is an idle-between-chunks bound on `stream.next()`
 /// only — inspector time is not charged, and `0` leaves the wait unbounded.
+///
+/// A relayed backend trailer section is sent after the inspector's final
+/// `on_end()` release, never ahead of bytes it still holds.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_response_inspection(
     response: reqwest::Response,
@@ -5343,12 +5422,14 @@ pub(crate) async fn run_response_inspection(
     read_timeout_ms: u64,
     _reqwest_backend_guard: Option<crate::runtime_metrics::ReqwestBackendRequestGuard>,
     _lb_connection_guard: super::LoadBalancerConnectionGuard,
+    trailers: ReqwestResponseTrailers,
 ) {
     use crate::plugins::ResponseStreamAction;
     use futures_util::StreamExt;
 
-    let mut stream = response.bytes_stream();
+    let mut stream = reqwest_response_frames(response, trailers);
     let mut total_received: usize = 0;
+    let mut trailing_frame: Option<Frame<Bytes>> = None;
     // Built ONLY when the bound is live (issue #4074): `0` is the documented
     // opt-out that long-lived SSE routes rely on, and an unconditional `Sleep`
     // made every such relay construct timer state and read the clock for a
@@ -5374,7 +5455,7 @@ pub(crate) async fn run_response_inspection(
                 tokio::time::Instant::now() + std::time::Duration::from_millis(read_timeout_ms),
             );
         }
-        let chunk = tokio::select! {
+        let frame = tokio::select! {
             biased;
             _ = tx.closed() => return,
             _ = super::optional_sleep_elapsed(read_deadline.as_mut()), if read_timeout_active => {
@@ -5390,47 +5471,53 @@ pub(crate) async fn run_response_inspection(
             }
             next = stream.next() => next,
         };
-        let Some(chunk) = chunk else { break };
-        match chunk {
-            Ok(bytes) => {
-                total_received = total_received.saturating_add(bytes.len());
-                if max_response_body_size_bytes > 0 && total_received > max_response_body_size_bytes
-                {
-                    // Operator response-size cap exceeded: stop and surface a body
-                    // error, instead of forwarding an unbounded stream. Use the
-                    // SAME message as the non-inspected size-limited path so
-                    // `classify_body_error` tags it `ResponseBodyTooLarge`.
-                    let _ = tx
-                        .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                            "response body exceeds maximum size",
-                        ) as BoxError))
-                        .await;
-                    return;
+        let Some(frame) = frame else { break };
+        let bytes = match frame {
+            Ok(frame) => match frame.into_data() {
+                Ok(bytes) => bytes,
+                Err(frame) => {
+                    // The backend's trailer frame must stay behind any bytes the
+                    // inspector still holds for `on_end()`.
+                    trailing_frame = Some(frame);
+                    continue;
                 }
-                let action = tokio::select! {
-                    biased;
-                    _ = tx.closed() => return,
-                    action = inspector.on_chunk(&bytes) => action,
-                };
-                match action {
-                    ResponseStreamAction::Forward(out) => {
-                        if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
-                            return; // client dropped the receiver
-                        }
-                    }
-                    ResponseStreamAction::Terminate(final_bytes) => {
-                        if let Some(fb) = final_bytes
-                            && !fb.is_empty()
-                        {
-                            let _ = tx.send(Ok(Frame::data(fb))).await;
-                        }
-                        return; // drop tx → downstream EOF; drop stream → cancel backend
-                    }
+            },
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        };
+        total_received = total_received.saturating_add(bytes.len());
+        if max_response_body_size_bytes > 0 && total_received > max_response_body_size_bytes {
+            // Operator response-size cap exceeded: stop and surface a body
+            // error, instead of forwarding an unbounded stream. Use the
+            // SAME message as the non-inspected size-limited path so
+            // `classify_body_error` tags it `ResponseBodyTooLarge`.
+            let _ = tx
+                .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                    "response body exceeds maximum size",
+                ) as BoxError))
+                .await;
+            return;
+        }
+        let action = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            action = inspector.on_chunk(&bytes) => action,
+        };
+        match action {
+            ResponseStreamAction::Forward(out) => {
+                if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
+                    return; // client dropped the receiver
                 }
             }
-            Err(e) => {
-                let _ = tx.send(Err(Box::new(e) as BoxError)).await;
-                return;
+            ResponseStreamAction::Terminate(final_bytes) => {
+                if let Some(fb) = final_bytes
+                    && !fb.is_empty()
+                {
+                    let _ = tx.send(Ok(Frame::data(fb))).await;
+                }
+                return; // drop tx → downstream EOF; drop stream → cancel backend
             }
         }
     }
@@ -5442,10 +5529,14 @@ pub(crate) async fn run_response_inspection(
     };
     match action {
         ResponseStreamAction::Forward(out) => {
-            if !out.is_empty() {
-                let _ = tx.send(Ok(Frame::data(out))).await;
+            if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
+                return;
+            }
+            if let Some(frame) = trailing_frame {
+                let _ = tx.send(Ok(frame)).await;
             }
         }
+        // A policy cut ends the body without the backend's trailer section.
         ResponseStreamAction::Terminate(final_bytes) => {
             if let Some(fb) = final_bytes
                 && !fb.is_empty()

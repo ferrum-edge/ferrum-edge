@@ -244,9 +244,10 @@ fn eager_backend_collection_publishes_charged_bytes_without_a_copy() {
          reconciling an opaque read afterwards (GHSA-pwcm-6rh8-f2gh)"
     );
     assert!(
-        collector.contains("response.bytes_stream()"),
-        "the eager path must consume the body as a chunk stream; awaiting \
-         `bytes()` materializes an allocation of opaque capacity first"
+        collector.contains("reqwest_body_frames(response)"),
+        "the eager path must consume the body as a frame stream; awaiting \
+         `bytes()` materializes an allocation of opaque capacity first, and \
+         `bytes_stream()` drops the backend trailer section (issue #5760)"
     );
     assert!(
         collector.contains("into_charged_bytes()"),

@@ -154,6 +154,7 @@ fn test_backend_response_carries_resolved_ip() {
         connection_error: false,
         backend_resolved_ip: Some("10.244.1.42".to_string()),
         error_class: None,
+        buffered_trailers: None,
     };
 
     // Simulate what handle_proxy_request does: extract the IP and put it in the summary
@@ -176,6 +177,7 @@ fn test_backend_response_none_ip_on_connection_failure() {
         connection_error: true,
         backend_resolved_ip: None,
         error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionRefused),
+        buffered_trailers: None,
     };
 
     assert!(resp.connection_error);
@@ -505,6 +507,7 @@ fn test_backend_response_carries_error_class() {
         connection_error: true,
         backend_resolved_ip: None,
         error_class: Some(ErrorClass::ConnectionTimeout),
+        buffered_trailers: None,
     };
 
     assert_eq!(resp.error_class, Some(ErrorClass::ConnectionTimeout));

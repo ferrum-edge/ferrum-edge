@@ -8980,6 +8980,7 @@ async fn handle_h3_request(
                     headers: HashMap::new(),
                     backend_resolved_ip: None,
                     error_class: result.error_class,
+                    buffered_trailers: None,
                 },
                 attempt,
             ) {
@@ -11217,6 +11218,7 @@ async fn proxy_to_backend_h3_refined_response(
                 connection_error: false,
                 backend_resolved_ip: None,
                 error_class: None,
+                buffered_trailers: None,
             },
             0,
         )

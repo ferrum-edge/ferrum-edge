@@ -944,22 +944,26 @@ fn every_streaming_h2_body_constructor_carries_the_trailer_governor() {
 #[test]
 fn native_grpc_and_translated_grpc_web_are_both_governed_on_the_h2_arm() {
     let src = include_str!("../../../src/proxy/mod.rs");
-    // The gate is shared by the direct-H2 relay and the H1/H2 frontend ->
-    // native-H3 BACKEND relay, so its binding is `streaming_trailer_policy`
-    // rather than an H2-only name. Anchored on the `let` + its `if matches!(`
-    // head so this cannot latch onto some other mention of the binding.
+    // The gate is shared by the direct-H2 relay, the H1/H2 frontend ->
+    // native-H3 BACKEND relay, the reqwest relay, and buffered bodies that
+    // carried a trailer section, so its binding is `streaming_trailer_policy`
+    // rather than an H2-only name. Anchored on the `let` that opens the gate's
+    // condition so this cannot latch onto some other mention of the binding.
     let gate = src
-        .split("let streaming_trailer_policy = if matches!(")
+        .split("let hyper_or_h3_streaming_relay =")
         .nth(1)
         .expect("streaming H2 trailer policy gate")
         .split("Some((pre_policy, section, unbounded))")
         .next()
         .expect("bounded gate region");
-    // Both streaming bodies whose backend TRAILERS frame crosses this boundary
-    // enter the gate; neither may be filtered out of it.
+    // Every body whose backend trailer section crosses this boundary enters
+    // the gate; none may be filtered out of it (issue #5760 added the reqwest
+    // relay and buffered collections).
     for arm in [
         "ResponseBody::StreamingH2(_)",
         "ResponseBody::StreamingH3(_)",
+        "|| reqwest_trailers_relayed",
+        "|| buffered_response_trailers.is_some()",
     ] {
         assert!(
             gate.contains(arm),
@@ -1001,6 +1005,7 @@ fn native_grpc_and_translated_grpc_web_are_both_governed_on_the_h2_arm() {
     for term in [
         "streaming_h2_native_grpc",
         "streaming_h3_native_grpc",
+        "streaming_reqwest_native_grpc",
         "grpc_request_is_web_translated",
     ] {
         assert!(
@@ -1082,7 +1087,7 @@ fn streaming_h2_capture_precedes_the_first_response_header_phase() {
     // response BUILDER has taken its gateway-authored writes.
     let src = include_str!("../../../src/proxy/mod.rs");
     let capture_at = src
-        .find("let streaming_trailer_policy = if matches!(")
+        .find("let streaming_trailer_policy = if ")
         .expect("streaming H2 trailer policy capture");
     let seal_at = src
         .find("let mut streaming_trailer_governor = None;")
@@ -1121,10 +1126,14 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
         .split("let mut body = if let Some(inspector) = response_inspector {")
         .next()
         .expect("bounded streaming H2 body-construction region");
-    let constructors = region
+    let h2_arm = region
+        .split("ResponseBody::StreamingH2(mut resp) => {")
+        .nth(1)
+        .expect("plain streaming H2 arm");
+    let constructors = h2_arm
         .matches("_h2_body_strip_hop_by_hop_trailers(")
         .count();
-    let governed = region.matches("streaming_trailer_governor.take()").count();
+    let governed = h2_arm.matches("streaming_trailer_governor.take()").count();
     assert_eq!(
         constructors, 4,
         "the plain streaming H2 arm should build exactly four body variants"
@@ -1162,6 +1171,56 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
         seal.contains("response_trailer_policy_prefixes_shared()"),
         "the seal must carry the precomputed policy-prefix Arc into the governor"
     );
+}
+
+#[test]
+fn every_reqwest_streaming_dispatch_site_carries_the_trailer_decision() {
+    // Issue #5760: the reqwest relay reads real frames, so its backend trailer
+    // section reaches the client exactly like the direct-H2 relay's. The arm
+    // resolves ONE trailer decision (governed relay, or drop when the client
+    // cannot receive a trailer section) and every mutually-exclusive body it
+    // builds — the inspector task plus the three streaming adapters — must
+    // receive it. A branch built without it would not compile, but one built
+    // from a second, ungoverned `relay(None)` would forward the section
+    // outside the response-header policy.
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let arm = src
+        .split("reqwest_backend_guard,\n        } => {")
+        .nth(1)
+        .expect("reqwest streaming arm")
+        .split("ResponseBody::StreamingH2(mut resp) => {")
+        .next()
+        .expect("bounded reqwest streaming arm");
+    assert_eq!(
+        arm.matches("ReqwestResponseTrailers::relay(").count(),
+        1,
+        "the reqwest arm must build exactly one relaying trailer decision"
+    );
+    assert_eq!(
+        arm.matches("streaming_trailer_governor.take()").count(),
+        1,
+        "the relaying decision must carry the sealed trailer governor"
+    );
+    assert!(
+        arm.contains("if reqwest_trailers_relayed {"),
+        "the relay must be gated by the same flag that decided evidence capture"
+    );
+    for constructor in [
+        "run_response_inspection(",
+        "direct_streaming_body(",
+        "size_limited_streaming_body(",
+        "coalescing_body(",
+    ] {
+        let call = arm
+            .split(constructor)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing {constructor} in the reqwest arm"));
+        let args = call.split(')').next().unwrap_or_default();
+        assert!(
+            args.contains("reqwest_trailers"),
+            "{constructor} must receive the arm's trailer decision"
+        );
+    }
 }
 
 #[test]
@@ -1665,7 +1724,7 @@ fn the_grpc_web_adapter_wraps_the_governed_body_from_the_outside() {
         "Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {",
         // Generic relay (mesh-mTLS `StreamingH2`): the adapter is applied after
         // the whole `match` that built the governed body.
-        "let streaming_trailer_policy = if matches!(",
+        "let streaming_trailer_policy = if ",
     ] {
         let region = src.split(arm).nth(1).expect("relay region not found");
         let governed = region

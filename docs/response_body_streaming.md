@@ -998,6 +998,25 @@ See [docs/size_limits.md](size_limits.md) for the full size limit enforcement ar
 
 Both protocols support streaming. By default, streaming responses use `ProxyBody::Stream` — a zero-overhead passthrough with no per-frame tracking. When `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true`, the gateway calls `base_body.into_tracked(backend_start)` on the same base body the regular streaming path produces — so the tracked path inherits coalescing, the small-response eager buffer cutoff, and any `SizeLimitedStreamingResponse` wrapping. There is no separate "tracked + coalesced" or "tracked + size-limited" constructor; tracking is a transformation applied on top of whatever streaming dispatch the regular path picked. Per-frame cost: one atomic store via `StreamingMetrics`, plus one deferred `tokio::spawn` per streaming request.
 
+#### Response trailer contract (HTTP/1.1 and HTTP/2 frontends)
+
+A backend's trailer section reaches the client whenever the client can receive one, whichever internal dispatch path and body mode served the response (issue #5760). The only exceptions are the documented policy drops below.
+
+| Frontend | Backend leg | Streamed response | Buffered response (`response_body_mode: buffer`, a body-buffering plugin, or the small-response eager buffer) |
+|----------|-------------|-------------------|------------------------------------------------------------------------|
+| HTTP/2 | Direct HTTP/2 pool (`h2_tls = supported`) | Relayed | Relayed after the buffered DATA |
+| HTTP/2 | reqwest (`Unknown`/`Unsupported` capability, retries, request-body buffering) | Relayed | Relayed after the buffered DATA |
+| HTTP/2 | Native HTTP/3 backend | Relayed | Dropped (the buffered H3 drain keeps the body only) |
+| HTTP/2 | Sidecar mTLS | Relayed | Relayed after the buffered DATA (plain HTTP) |
+| HTTP/2 | HBONE / Unix socket (inner HTTP/1.1) | Relayed | Dropped |
+| HTTP/1.1 | Any | Not sent | Not sent |
+
+HTTP/1.1 clients never receive a trailer section from this handler: hyper writes chunked trailers only for names the response declares in a `Trailer` field, and the final response-header sanitizer strips `Trailer` as a hop-by-hop field. The reqwest relay therefore drops the trailer frame at the source for HTTP/1.1 clients and captures no policy evidence for it. Native gRPC keeps its own trailer handling (the direct gRPC pool), and translated gRPC-Web re-encodes terminal metadata as a body frame; neither uses the buffered plain-HTTP trailer section above.
+
+Every relayed section is governed exactly like the direct-HTTP/2 streaming relay's (next section): response-direction hop-by-hop names are stripped, then the response-header policy boundary drops any field the configured policy governs. A buffered response carries no backend trailers when the gateway replaced the body (plugin reject, a late gateway-selected terminal), for `HEAD`, or for a status that forbids content.
+
+Before issue #5760 the reqwest relay read `Response::bytes_stream()`, which yields DATA only, and every buffered collector kept the body only. Which path a response took depended on whether the capability registry had already classified the backend, so the same configuration relayed trailers on one run and dropped them on the next.
+
 #### Backend trailers on the direct-HTTP/2 streaming path
 
 A direct-H2 streaming response (`ResponseBody::StreamingH2`) commits its initial HEADERS frame before the backend's TRAILERS frame exists, so it crosses the same response-header policy boundary the native-H3 streaming relays cross. Every direct / size-limited / coalescing variant of that arm therefore installs the same reconciliation, described in full in [docs/http3.md → Backend trailers and response header policy](http3.md#backend-trailers-and-response-header-policy): declared `Plugin::response_trailer_policy()` names and prefixes, the observed pre-policy mutation witness, and the fail-closed `Unbounded` arm (`response_transformer`). Without it, `security_headers` configured with `{"remove": ["x-powered-by"]}` is a no-op on the initial header map when the backend sends `x-powered-by` only as a trailer, and the field lands on the wire after the policy already ran. The same absent→absent gap lets a trailer-only `content-encoding`, validator, or `x-amz-checksum-*` reintroduce representation metadata that `ai_stream_router`'s Anthropic SSE normalization already invalidated; that plugin declares the shared exact-name inventory plus the checksum prefixes, preserving unrelated application trailers.
@@ -1057,9 +1076,9 @@ Helper constructors:
 - `ProxyBody::full(data)` — Create a buffered body from bytes
 - `ProxyBody::from_string(s)` — Create a buffered body from a string
 - `ProxyBody::empty()` — Create an empty body
-- `body::coalescing_body(response, content_length)` — Create a streaming body with chunk coalescing (128 KB target). Default for reqwest-backed HTTP/1.1 responses. Builds `Coalescing<ReqwestFrameSource>`.
-- `body::direct_streaming_body(response, content_length)` — Zero-overhead passthrough for reqwest streams. Used when both `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` and `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0`.
-- `body::size_limited_streaming_body(response, max_bytes, content_length)` — Streaming body with frame-by-frame size enforcement via `SizeLimitedStreamingResponse` + coalescing. Used when `max_response_body_size_bytes > 0` and the **backend** did not declare a canonical Content-Length (captured before `after_proxy`; a hook-authored field cannot skip this constructor).
+- `body::coalescing_body(response, content_length, read_timeout_ms, flush_after, trailers)` — Create a streaming body with chunk coalescing (128 KB target). Default for reqwest-backed HTTP/1.1 responses. Builds `Coalescing<ReqwestFrameSource>` over the response's real frames; `trailers` (`ReqwestResponseTrailers`) relays the governed trailer section or drops it when the client cannot receive one.
+- `body::direct_streaming_body(response, content_length, read_timeout_ms, trailers)` — Zero-overhead passthrough for reqwest streams. Used when both `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` and `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0`.
+- `body::size_limited_streaming_body(response, max_bytes, content_length, read_timeout_ms, trailers)` — Streaming body with frame-by-frame size enforcement via `SizeLimitedStreamingResponse` + coalescing. Used when `max_response_body_size_bytes > 0` and the **backend** did not declare a canonical Content-Length (captured before `after_proxy`; a hook-authored field cannot skip this constructor).
 - `body::coalescing_h2_body(body, content_length, coalesce_target)` — H2 DATA frame coalescing for gRPC streaming and HTTP/2 direct pool. Builds `Coalescing<Incoming>`. Trailer-safe.
 - `body::direct_streaming_h2_body(body, content_length)` — Zero-overhead H2 passthrough; used for the large-response bypass and the H2 fast path.
 - `body::coalescing_h3_body(recv_stream, content_length, coalesce_min, coalesce_max, flush_interval)` — Bridges h3's `recv_data()` API to `http_body::Body` with chunk coalescing. Builds `Coalescing<H3FrameSource>`. Used for H1/H2 frontend → H3 backend streaming via `ResponseBody::StreamingH3`.

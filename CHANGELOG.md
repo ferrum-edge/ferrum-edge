@@ -379,6 +379,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shrinking the limit until that window rolls out; backend failures, the
   recovery-cohort barrier, and in-flight accounting are unchanged, and
   compatible reloads keep the learned windows.
+- HTTP/2 response trailers from a backend now reach an HTTP/2 client on every
+  dispatch path and body mode (#5760). The reqwest relay (used for a backend
+  the capability registry has not yet classified, and for routes with retries
+  or request-body buffering) read only DATA and dropped the trailer section, as
+  did every buffered collection (`response_body_mode: buffer`, body-buffering
+  plugins, and the small-response eager buffer) on the reqwest, direct-HTTP/2,
+  and sidecar-mTLS paths. The same configuration could therefore relay
+  trailers on one run and drop them on the next. These paths now read real
+  frames and forward the trailer section after hop-by-hop stripping and the
+  same response-header policy reconciliation the direct-HTTP/2 streaming relay
+  applies. HTTP/1.1 clients still receive no trailer section.
 
 ### Security
 
