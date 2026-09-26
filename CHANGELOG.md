@@ -90,13 +90,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A reqwest retry attempt whose backend client cannot be built now answers the
-  same fixed `502` `{"error":"Bad Gateway"}` body as the first attempt. Before,
-  the retry body embedded the client-construction error text verbatim. That
-  text could include backend TLS material locations and was not always valid
-  JSON. The detail now goes only to the operator log, and the status, error
-  class, and `X-Gateway-Error` token are unchanged. The first attempt, the
-  retry, and the HTTP/3 bridge now share one fixed body.
 - An Ambient mesh proxy whose node-agent registry directory is missing now
   says so, repeatedly (#5766). `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`
   defaults to `/run/ferrum/node-waypoint-pods` and is authoritative for the
@@ -244,6 +237,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over the request context and response. They now check the credential's own
   deadline before polling: no plugin is polled, the expiry is recorded, and
   proxy core answers with the fixed authorization terminal.
+- A reqwest retry attempt whose backend client cannot be built now answers the
+  same fixed `502` `{"error":"Bad Gateway"}` body as the first attempt. Before,
+  the retry body embedded the client-construction error text verbatim. That
+  text could include backend TLS material locations and was not always valid
+  JSON. The detail now goes only to the operator log, and the status, error
+  class, and `X-Gateway-Error` token are unchanged. The first attempt, the
+  retry, and the HTTP/3 bridge now share one fixed body.
 - A peer that resets an HTTP/3 stream in the middle of a DATA frame no longer
   tears down the whole QUIC connection (PR #5741). The vendored `h3` frame-drain
   patch held a QUIC error back so it could decode buffered bytes first. Quinn
