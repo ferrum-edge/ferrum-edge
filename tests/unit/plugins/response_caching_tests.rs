@@ -5392,6 +5392,71 @@ async fn test_connection_scoped_and_proxy_auth_fields_are_not_retained() {
     );
 }
 
+/// Rate-limit fields describe the original client's quota at the moment the
+/// origin produced the response. A shared-cache HIT consumes no origin quota
+/// and belongs to a different client, so the stored copy must drop the whole
+/// family (IETF `RateLimit` / `RateLimit-*`, `X-RateLimit-*`, and provider
+/// variants) or every later HIT reports the original caller's `r=0`.
+#[tokio::test]
+async fn test_rate_limit_fields_are_not_retained() {
+    let plugin = default_plugin();
+    let request = HashMap::new();
+    let response = advisory_headers(&[
+        ("cache-control", "public, max-age=300"),
+        ("RateLimit", "\"api\";r=0;t=60"),
+        ("RateLimit-Policy", "\"api\";q=100;w=60"),
+        ("ratelimit-remaining", "0"),
+        ("RateLimit-Reset", "60"),
+        ("X-RateLimit-Limit", "100"),
+        ("x-ratelimit-remaining-tokens", "0"),
+        ("X-AI-RateLimit-Remaining", "0"),
+        ("anthropic-ratelimit-requests-remaining", "0"),
+        // Near-miss names outside the family are ordinary fields.
+        ("ratelimiter", "edge"),
+        ("x-ratelimited-by", "upstream"),
+        ("content-type", "application/json"),
+    ]);
+
+    advisory_miss_cycle(&plugin, "/api/quota", &request, 200, &response, b"{}").await;
+
+    let hit = advisory_lookup(&plugin, "/api/quota", &request).await;
+    let (_, body, replayed) = expect_reject(hit);
+    assert_eq!(body, b"{}");
+    for stripped in [
+        "RateLimit",
+        "RateLimit-Policy",
+        "ratelimit-remaining",
+        "RateLimit-Reset",
+        "X-RateLimit-Limit",
+        "x-ratelimit-remaining-tokens",
+        "X-AI-RateLimit-Remaining",
+        "anthropic-ratelimit-requests-remaining",
+    ] {
+        assert!(
+            !replayed
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(stripped)),
+            "`{stripped}` must not be replayed from cache: {replayed:?}"
+        );
+    }
+    for (kept, value) in [
+        ("ratelimiter", "edge"),
+        ("x-ratelimited-by", "upstream"),
+        ("content-type", "application/json"),
+    ] {
+        assert_eq!(
+            replayed.get(kept).map(String::as_str),
+            Some(value),
+            "`{kept}` is not a rate-limit field and must survive: {replayed:?}"
+        );
+    }
+    assert_eq!(
+        response.get("RateLimit").map(String::as_str),
+        Some("\"api\";r=0;t=60"),
+        "only the retained copy is narrowed; the origin response is untouched"
+    );
+}
+
 /// GHSA-v7fj-73gm-h625: statuses whose caching semantics the plugin does not
 /// implement cannot be configured as cacheable.
 #[test]

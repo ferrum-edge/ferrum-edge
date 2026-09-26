@@ -405,6 +405,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `content_encoded_body`); only a body with no final trailer frame at all is
   still `UNKNOWN`. Translated gRPC-Web keeps reading its status from the
   backend's HTTP/2 trailers.
+- `response_caching` no longer stores or replays rate-limit fields: the
+  combined IETF `RateLimit` field and every `RateLimit-*`, `X-RateLimit-*`,
+  `X-AI-RateLimit-*`, and `Anthropic-RateLimit-*` field are stripped
+  case-insensitively from the retained entry, so a cache hit no longer reports
+  the original client's stale quota (for example `r=0`) until the entry
+  expires. The response that produced the miss is unchanged. `ai_federation`
+  now relays a provider's combined `RateLimit` field alongside the
+  `RateLimit-*` fields it already relayed (#5790).
 - `adaptive_concurrency` now relearns an obsolete minimum-latency baseline
   (#5737). The baseline was an all-time minimum, so one unusually fast success
   (a tiny `200`, a `304`, a cache hit) tightened the latency target forever:
@@ -424,6 +432,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stripped case-insensitively alongside the `X-RateLimit-*` family, both before
   storage and when an existing entry is replayed, so a cache hit no longer
   reports the original response's stale quota or reset (#5788).
+
+- The circuit-breaker cache's at-capacity warning is now rate-limited to at
+  most one line per second (with a suppressed count) instead of one line per
+  request to an uncached overflow target, and it is emitted after the cache
+  shard lock is released. `ferrum_circuit_breaker_cache_admission_refused_total`
+  still counts every refused admission (#5787).
+- A streaming response with no `Content-Length` that exceeds
+  `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` now reliably shows the client the
+  committed status and the bytes within the limit before it is aborted.
+  Previously, when a small over-limit body arrived in a single read, the limit
+  tripped in the same HTTP/1.1 write pass that queued the response head, and
+  the client saw the connection close before any status line
+  (`IncompleteMessage`). The reqwest, direct-H2/gRPC, and native-H3
+  size-limited adapters now hold the error for one scheduler turn so the
+  frontend flushes first.
 
 ### Security
 
