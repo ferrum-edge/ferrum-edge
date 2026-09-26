@@ -343,10 +343,7 @@ async fn run_chunked_backend(listener: TcpListener) {
 
 /// Returns `(Some(status), body_result)` when response headers were received
 /// before the proxy reset the H2 stream, and `(None, Err(reset_error))` when
-/// the proxy reset the stream during the request-send phase (an equally valid
-/// "body reset" outcome — see the caller's assertion). The send-phase reset
-/// happens when the proxy's chunked-response size limit fires before any
-/// response bytes can be flushed to the client.
+/// the stream was reset before any response headers arrived.
 async fn send_h2_get(proxy_port: u16) -> (Option<u16>, Result<String, String>) {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
@@ -417,21 +414,19 @@ async fn functional_chunked_response_size_limit_http2_streaming_body_resets_afte
 
     let (status, body) = send_h2_get(harness.proxy_port).await;
 
-    // The proxy must abort the H2 response when the streaming chunked body
-    // exceeds the limit. Two equivalent outcomes are accepted:
-    //   * Headers arrive (status 200), then the body collect errors when the
-    //     proxy resets the stream mid-body.
-    //   * The proxy resets the stream before any headers can be flushed —
-    //     `send_request` surfaces the RST_STREAM directly. This is a hyper
-    //     scheduling race observed on the GitHub-hosted runner; semantically
-    //     it is the same "body reset" outcome.
+    // The response is committed before the limit trips, and the gateway holds
+    // the size-limit error for one scheduler turn so h2's connection task can
+    // send the HEADERS frame before the stream reset. The client must see the
+    // committed status, then a body that fails with the reset.
+    assert_eq!(
+        status,
+        Some(200),
+        "the committed status must reach the client before the stream reset (body={body:?})"
+    );
     assert!(
         body.is_err(),
         "H2 downstream body should reset when unknown-length backend body exceeds limit"
     );
-    if let Some(s) = status {
-        assert_eq!(s, 200, "if headers arrived, the proxy must report 200");
-    }
 }
 
 #[ignore]

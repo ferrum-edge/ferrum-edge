@@ -750,7 +750,7 @@ impl http_body::Body for GrpcWebPassthroughBody {
                 if let Some(messages) = this.grpc_messages.as_ref() {
                     let counted = this.observer.messages();
                     if counted > this.messages_published {
-                        messages.fetch_add(counted - this.messages_published, Ordering::Relaxed);
+                        messages.fetch_add(counted - this.messages_published, Ordering::Release);
                         this.messages_published = counted;
                     }
                 }
@@ -3604,21 +3604,31 @@ where
 /// Yields once before handing a committed streaming response's terminal error
 /// to the frontend.
 ///
-/// A size-limited streaming response is committed before its first body poll:
-/// the status and headers are already with the frontend. Hyper's HTTP/1.1
-/// server queues that head together with every body frame it takes in the same
-/// write pass and flushes only when the body returns `Pending`; a body error in
-/// that pass aborts the connection with the queue unflushed. When the backend
-/// delivers its whole over-limit body at once (one read, one segment), the
-/// limit trips inside that first pass, so the client saw the connection close
-/// before any status line instead of the committed status followed by a
-/// truncated body. HTTP/2 likewise resets the stream before its HEADERS frame
-/// can leave.
+/// A streaming response is committed before its first body poll: the status
+/// and headers are already with the frontend. Hyper's HTTP/1.1 server queues
+/// that head together with every body frame it takes in the same write pass.
+/// It flushes the queue when the body returns `Pending` or when its write
+/// buffer fills; a body error in that pass aborts the connection with the
+/// queue unflushed. When the backend delivers its whole over-limit body at
+/// once (one read, one segment), the limit trips inside that first pass, so
+/// the client saw the connection close before any status line instead of the
+/// committed status followed by a truncated body. A backend error or reset
+/// that arrives with the first bytes ends the response the same way. HTTP/2
+/// likewise resets the stream before its HEADERS frame can leave.
 ///
-/// Returning `Pending` once, with an immediate self-wake, lets the frontend
-/// flush the head and every byte accepted within the limit before the error
-/// ends the response. Data frames pass straight through; only the terminal
-/// error path pays the extra scheduler turn.
+/// Returning `Pending` once, with an immediate self-wake, hands the frontend a
+/// write pass that ends without the error. On HTTP/1.1 the same connection
+/// task flushes the head and every accepted byte at the end of that pass, so
+/// a reading client deterministically sees them first. On HTTP/2 and HTTP/3
+/// the flush runs on another task (h2's connection task, quinn's driver), so
+/// the turn is best effort: under tokio it almost always lets the head and
+/// the data leave first, but it does not prove they did. Data frames pass
+/// straight through; only the terminal error path pays the extra scheduler
+/// turn.
+///
+/// Wraps every committed reqwest streaming body (size-limited, coalescing,
+/// direct), the plugin-inspected streaming body, and the size-limited
+/// direct-H2/gRPC and native-H3 bodies.
 struct FlushBeforeTerminalError<B> {
     inner: B,
     stashed_error: Option<BoxError>,
@@ -5460,6 +5470,21 @@ pub(crate) fn coalescing_body(
     let stream = reqwest_response_frames(response, trailers);
     #[cfg(feature = "bench-h1-profile")]
     let stream = crate::h1_profile::ObservedStream::new(stream, 1);
+    coalescing_frame_stream_body(stream, content_length, read_timeout_ms, flush_after)
+}
+
+/// The adapter chain behind [`coalescing_body`], over any backend frame
+/// stream: coalescing, a flush of the committed head before a terminal error,
+/// then the idle read timeout.
+pub(crate) fn coalescing_frame_stream_body<S>(
+    stream: S,
+    content_length: Option<u64>,
+    read_timeout_ms: u64,
+    flush_after: Option<Duration>,
+) -> ProxyBody
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, BoxError>> + Send + Unpin + 'static,
+{
     // `flush_after: None` makes the adapter flush on the first `Pending`, so on
     // a backend leg that yields one frame per read it never reaches
     // `COALESCE_TARGET`. On an HTTP/1.1 frontend every such chunk is charged its
@@ -5471,7 +5496,7 @@ pub(crate) fn coalescing_body(
         content_length,
         flush_after,
     );
-    wrap_idle_read_timeout(body, read_timeout_ms)
+    wrap_idle_read_timeout(FlushBeforeTerminalError::new(body), read_timeout_ms)
 }
 
 pub(crate) fn direct_streaming_body(
@@ -5483,11 +5508,25 @@ pub(crate) fn direct_streaming_body(
     let stream = reqwest_response_frames(response, trailers);
     #[cfg(feature = "bench-h1-profile")]
     let stream = crate::h1_profile::ObservedStream::new(stream, 0);
+    direct_frame_stream_body(stream, content_length, read_timeout_ms)
+}
+
+/// The adapter chain behind [`direct_streaming_body`], over any backend frame
+/// stream: pass-through frames, a flush of the committed head before a
+/// terminal error, then the idle read timeout.
+pub(crate) fn direct_frame_stream_body<S>(
+    stream: S,
+    content_length: Option<u64>,
+    read_timeout_ms: u64,
+) -> ProxyBody
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, BoxError>> + Send + Unpin + 'static,
+{
     let body = DirectStreamBody {
         inner: stream,
         content_length,
     };
-    wrap_idle_read_timeout(body, read_timeout_ms)
+    wrap_idle_read_timeout(FlushBeforeTerminalError::new(body), read_timeout_ms)
 }
 
 /// Build a streaming response body fed by [`run_response_inspection`] over an
@@ -5500,6 +5539,11 @@ pub(crate) fn direct_streaming_body(
 /// (re-coalescing would batch windows and defeat that). It is the poll/async
 /// bridge for H1/H2: the async inspection runs in a detached task while this
 /// poll-based body just drains the channel.
+///
+/// The inspection task can queue released bytes and its terminal error (size
+/// limit, backend error, idle read timeout) before the frontend's first poll,
+/// so the error is held for one scheduler turn like every other committed
+/// streaming body.
 pub(crate) fn inspected_streaming_body(
     rx: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, BoxError>>,
 ) -> ProxyBody {
@@ -5508,7 +5552,7 @@ pub(crate) fn inspected_streaming_body(
         inner: stream,
         content_length: None,
     };
-    ProxyBody::streaming(Box::pin(body))
+    ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(body)))
 }
 
 /// Build a streaming response body from a gateway-owned frame source.

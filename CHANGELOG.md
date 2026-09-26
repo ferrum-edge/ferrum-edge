@@ -462,6 +462,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request to an uncached overflow target, and it is emitted after the cache
   shard lock is released. `ferrum_circuit_breaker_cache_admission_refused_total`
   still counts every refused admission (#5787).
+- The unlimited reqwest streaming response bodies now hold a backend error or
+  reset for one scheduler turn, and the plugin-inspected streaming body does
+  the same for its size-limit, backend, and idle-timeout errors. Previously a
+  backend that sent a small first write and then failed could end an HTTP/1.1
+  response before its status line reached the client. On HTTP/1.1 the client
+  now sees the committed status and the bytes already received, then a
+  truncated body. On HTTP/2 and HTTP/3 the turn is best effort (#5802).
 - HTTP/2 response trailers from a backend now reach an HTTP/2 client on every
   dispatch path and body mode (#5760). The reqwest relay (used for a backend
   the capability registry has not yet classified, and for routes with retries
@@ -478,14 +485,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one (HTTP/1.x `Content-Length` or close-delimited) skips the trailer policy
   capture entirely.
 - A streaming response with no `Content-Length` that exceeds
-  `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` now reliably shows the client the
-  committed status and the bytes within the limit before it is aborted.
-  Previously, when a small over-limit body arrived in a single read, the limit
-  tripped in the same HTTP/1.1 write pass that queued the response head, and
-  the client saw the connection close before any status line
-  (`IncompleteMessage`). The reqwest, direct-H2/gRPC, and native-H3
-  size-limited adapters now hold the error for one scheduler turn so the
-  frontend flushes first.
+  `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` now shows the client the committed
+  status and the bytes within the limit before it is aborted. Previously, when
+  a small over-limit body arrived in a single read, the limit tripped in the
+  same HTTP/1.1 write pass that queued the response head, and the client saw
+  the connection close before any status line (`IncompleteMessage`). The
+  reqwest, direct-H2/gRPC, and native-H3 size-limited adapters now hold the
+  error for one scheduler turn so the frontend can flush first. On HTTP/1.1
+  the task that polls the body also flushes it, so the ordering is
+  deterministic. On HTTP/2 and HTTP/3 the flush runs on a separate task (h2's
+  connection task, quinn's driver), so the turn is best effort, though it
+  almost always lets the head leave first (#5801).
 - The shared buffered SSE inspection parser used by `ai_semantic_firewall` and
   `ai_response_guard` now follows the WHATWG event-stream framing: it consumes
   leading UTF-8 BOMs and splits lines on CRLF, LF, or a lone CR (mixed
