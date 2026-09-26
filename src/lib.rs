@@ -15914,6 +15914,49 @@ pub mod _test_support {
         )
     }
 
+    /// The unlimited HTTP/1.1 / HTTP/2-via-reqwest streaming response body
+    /// named by `adapter` (`"direct"` or `"coalescing"`), fed from `chunks`
+    /// that are all ready at once and followed at once by a backend read error,
+    /// as when a backend resets right after a small first write. A
+    /// `read_timeout_ms` of 0 turns the idle read timeout off.
+    pub fn unlimited_streaming_body_from_ready_chunks_then_error(
+        adapter: &str,
+        chunks: Vec<bytes::Bytes>,
+        read_timeout_ms: u64,
+    ) -> crate::proxy::body::ProxyBody {
+        use crate::proxy::body::{coalescing_frame_stream_body, direct_frame_stream_body};
+
+        let error: CoalesceFrameError = Box::new(std::io::Error::other("backend reset"));
+        let frames = chunks
+            .into_iter()
+            .map(|chunk| Ok::<_, CoalesceFrameError>(http_body::Frame::data(chunk)))
+            .chain(std::iter::once(Err(error)));
+        let stream = futures_util::stream::iter(frames);
+        match adapter {
+            "direct" => direct_frame_stream_body(stream, None, read_timeout_ms),
+            "coalescing" => coalescing_frame_stream_body(stream, None, read_timeout_ms, None),
+            other => panic!("unknown unlimited streaming adapter {other:?}"),
+        }
+    }
+
+    /// The plugin-inspected streaming response body after its inspection task
+    /// has already queued every chunk in `chunks` and then the response size
+    /// limit error, as when a small SSE response overruns the limit in a single
+    /// backend read.
+    pub fn inspected_streaming_body_from_ready_chunks_then_limit_error(
+        chunks: Vec<bytes::Bytes>,
+    ) -> crate::proxy::body::ProxyBody {
+        let (tx, rx) = tokio::sync::mpsc::channel(chunks.len() + 1);
+        for chunk in chunks {
+            tx.try_send(Ok(http_body::Frame::data(chunk)))
+                .expect("channel has room for every chunk");
+        }
+        let error: CoalesceFrameError = "response body exceeds maximum size".into();
+        tx.try_send(Err(error))
+            .expect("channel has room for the terminal error");
+        crate::proxy::body::inspected_streaming_body(rx)
+    }
+
     /// One scripted backend event for [`CoalesceProbe`].
     #[derive(Clone, Debug)]
     pub enum CoalesceStep {
