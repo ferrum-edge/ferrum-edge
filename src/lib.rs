@@ -15917,11 +15917,12 @@ pub mod _test_support {
     /// The unlimited HTTP/1.1 / HTTP/2-via-reqwest streaming response body
     /// named by `adapter` (`"direct"` or `"coalescing"`), fed from `chunks`
     /// that are all ready at once and followed at once by a backend read error,
-    /// as when a backend resets right after a small first write. The idle read
-    /// timeout is off.
+    /// as when a backend resets right after a small first write. A
+    /// `read_timeout_ms` of 0 turns the idle read timeout off.
     pub fn unlimited_streaming_body_from_ready_chunks_then_error(
         adapter: &str,
         chunks: Vec<bytes::Bytes>,
+        read_timeout_ms: u64,
     ) -> crate::proxy::body::ProxyBody {
         use crate::proxy::body::{coalescing_frame_stream_body, direct_frame_stream_body};
 
@@ -15932,8 +15933,8 @@ pub mod _test_support {
             .chain(std::iter::once(Err(error)));
         let stream = futures_util::stream::iter(frames);
         match adapter {
-            "direct" => direct_frame_stream_body(stream, None, 0),
-            "coalescing" => coalescing_frame_stream_body(stream, None, 0, None),
+            "direct" => direct_frame_stream_body(stream, None, read_timeout_ms),
+            "coalescing" => coalescing_frame_stream_body(stream, None, read_timeout_ms, None),
             other => panic!("unknown unlimited streaming adapter {other:?}"),
         }
     }

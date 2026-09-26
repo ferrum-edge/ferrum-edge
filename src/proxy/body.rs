@@ -3619,12 +3619,12 @@ where
 /// Returning `Pending` once, with an immediate self-wake, hands the frontend a
 /// write pass that ends without the error. On HTTP/1.1 the same connection
 /// task flushes the head and every accepted byte at the end of that pass, so
-/// a reading client deterministically sees them first. On HTTP/2 and HTTP/3
-/// the flush runs on another task (h2's connection task, quinn's driver), so
-/// the turn is best effort: under tokio it almost always lets the head and
-/// the data leave first, but it does not prove they did. Data frames pass
-/// straight through; only the terminal error path pays the extra scheduler
-/// turn.
+/// once the socket accepts the write, a reading client deterministically sees
+/// them first. On HTTP/2 and HTTP/3 the flush runs on another task (h2's
+/// connection task, quinn's driver), so the turn is best effort: under tokio
+/// it almost always lets the head and the data leave first, but it does not
+/// prove they did. Data frames pass straight through; only the terminal error
+/// path pays the extra scheduler turn.
 ///
 /// Wraps every committed reqwest streaming body (size-limited, coalescing,
 /// direct), the plugin-inspected streaming body, and the size-limited
@@ -3660,6 +3660,10 @@ where
         }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Err(error))) => {
+                // An outer idle read timeout sees this `Pending` as a backend
+                // wait. If its deadline, armed by an earlier real wait, expires
+                // on this same poll, it records a timeout instead of the held
+                // error. That edge case is tracked in a follow-up issue.
                 this.stashed_error = Some(error);
                 cx.waker().wake_by_ref();
                 Poll::Pending

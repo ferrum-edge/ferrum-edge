@@ -20,10 +20,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body::Body;
+use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -36,6 +37,8 @@ use ferrum_edge::proxy::body::ProxyBody;
 
 const LIMIT: usize = 8;
 const BACKEND_RESET: &str = "backend reset";
+/// A non-zero idle read timeout, far longer than any test runs.
+const IDLE_READ_TIMEOUT_MS: u64 = 30_000;
 
 /// Two ready chunks: the first fits the limit exactly, the second overruns it.
 fn over_limit_body() -> ProxyBody {
@@ -49,10 +52,10 @@ fn over_limit_body() -> ProxyBody {
 }
 
 /// One ready chunk followed at once by a backend reset, on the unlimited
-/// reqwest streaming body named by `adapter`.
+/// reqwest streaming body named by `adapter`, with the idle read timeout off.
 fn backend_reset_body(adapter: &str) -> ProxyBody {
     let chunks = vec![Bytes::from_static(b"abcdefgh")];
-    unlimited_streaming_body_from_ready_chunks_then_error(adapter, chunks)
+    unlimited_streaming_body_from_ready_chunks_then_error(adapter, chunks, 0)
 }
 
 fn direct_backend_reset_body() -> ProxyBody {
@@ -85,7 +88,11 @@ impl Wake for WakeCounter {
 
 /// Polls `body` to its terminal error: the accepted bytes, then one `Pending`
 /// with exactly one self-wake, then an error containing `expected_error`.
-fn assert_error_yields_once_after_the_accepted_bytes(mut body: ProxyBody, expected_error: &str) {
+/// Returns the error message.
+fn assert_error_yields_once_after_the_accepted_bytes(
+    mut body: ProxyBody,
+    expected_error: &str,
+) -> String {
     let wakes = Arc::new(WakeCounter::default());
     let waker = Waker::from(Arc::clone(&wakes));
     let mut cx = Context::from_waker(&waker);
@@ -122,6 +129,7 @@ fn assert_error_yields_once_after_the_accepted_bytes(mut body: ProxyBody, expect
         message.contains(expected_error),
         "unexpected error: {message}"
     );
+    message
 }
 
 #[test]
@@ -142,6 +150,24 @@ fn coalescing_body_backend_reset_yields_once_after_the_accepted_bytes() {
     assert_error_yields_once_after_the_accepted_bytes(
         coalescing_backend_reset_body(),
         BACKEND_RESET,
+    );
+}
+
+#[tokio::test]
+async fn direct_body_backend_reset_yields_once_through_the_idle_read_timeout() {
+    // The idle read timeout wraps the held error. The held turn's `Pending`
+    // arms its deadline and passes through, and the next poll must hand out
+    // the backend error, not a timeout.
+    let chunks = vec![Bytes::from_static(b"abcdefgh")];
+    let body = unlimited_streaming_body_from_ready_chunks_then_error(
+        "direct",
+        chunks,
+        IDLE_READ_TIMEOUT_MS,
+    );
+    let message = assert_error_yields_once_after_the_accepted_bytes(body, BACKEND_RESET);
+    assert!(
+        !message.contains("read timeout"),
+        "the held backend error must not turn into a timeout: {message}"
     );
 }
 
@@ -228,4 +254,67 @@ async fn http1_client_sees_the_committed_status_before_a_coalescing_body_backend
 async fn http1_client_sees_the_committed_status_before_the_inspected_body_over_limit_abort() {
     let response = serve_once_over_http1(inspected_over_limit_body).await;
     assert_committed_head_then_truncated_body(&response);
+}
+
+/// Serves one response whose body is `make_body()` over a real hyper HTTP/2
+/// connection and returns the status the client saw and its body result.
+///
+/// On the test's current-thread runtime the FIFO run queue polls h2's
+/// connection task, woken when the stream queued its HEADERS and DATA, before
+/// the stream task that the held error woke. The connection task therefore
+/// writes the HEADERS frame before the stream reset, deterministically.
+async fn serve_once_over_http2(make_body: fn() -> ProxyBody) -> (u16, Result<Bytes, String>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind frontend");
+    let addr = listener.local_addr().expect("frontend addr");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let service = service_fn(move |_req: Request<Incoming>| async move {
+            Ok::<_, std::convert::Infallible>(Response::new(make_body()))
+        });
+        // The stream ends with the body error by design.
+        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    });
+
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .expect("h2 handshake");
+    let client_conn = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let request = Request::builder()
+        .uri("http://test/")
+        .body(Empty::<Bytes>::new())
+        .expect("build request");
+    let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+        .await
+        .expect("response headers in time")
+        .expect("the committed status must reach the client before the stream reset");
+    let status = response.status().as_u16();
+    let body = tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+        .await
+        .expect("the body ends in time")
+        .map(|collected| collected.to_bytes())
+        .map_err(|err| err.to_string());
+
+    drop(sender);
+    client_conn.abort();
+    server.abort();
+    (status, body)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn http2_client_sees_the_committed_status_before_the_over_limit_reset() {
+    let (status, body) = serve_once_over_http2(over_limit_body).await;
+    assert_eq!(status, 200, "the committed status must reach the client");
+    assert!(
+        body.is_err(),
+        "the over-limit body must end with the stream reset: {body:?}"
+    );
 }

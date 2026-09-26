@@ -492,10 +492,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the connection close before any status line (`IncompleteMessage`). The
   reqwest, direct-H2/gRPC, and native-H3 size-limited adapters now hold the
   error for one scheduler turn so the frontend can flush first. On HTTP/1.1
-  the task that polls the body also flushes it, so the ordering is
-  deterministic. On HTTP/2 and HTTP/3 the flush runs on a separate task (h2's
-  connection task, quinn's driver), so the turn is best effort, though it
-  almost always lets the head leave first (#5801).
+  the task that polls the body also flushes it, so once the socket accepts the
+  write the ordering is deterministic. On HTTP/2 and HTTP/3 the flush runs on
+  a separate task (h2's connection task, quinn's driver), so the turn is best
+  effort, though it almost always lets the head leave first (#5801).
 - The shared buffered SSE inspection parser used by `ai_semantic_firewall` and
   `ai_response_guard` now follows the WHATWG event-stream framing: it consumes
   leading UTF-8 BOMs and splits lines on CRLF, LF, or a lone CR (mixed

@@ -416,12 +416,15 @@ async fn functional_chunked_response_size_limit_http2_streaming_body_resets_afte
 
     // The response is committed before the limit trips, and the gateway holds
     // the size-limit error for one scheduler turn so h2's connection task can
-    // send the HEADERS frame before the stream reset. The client must see the
-    // committed status, then a body that fails with the reset.
-    assert_eq!(
-        status,
-        Some(200),
-        "the committed status must reach the client before the stream reset (body={body:?})"
+    // send the HEADERS frame before the stream reset. On the gateway's
+    // multi-thread runtime that turn is best effort: another worker can poll
+    // the self-woken stream task before the connection task writes HEADERS,
+    // and the reset then discards them. The deterministic ordering is pinned
+    // on a current-thread runtime by
+    // `http2_client_sees_the_committed_status_before_the_over_limit_reset`.
+    assert!(
+        matches!(status, None | Some(200)),
+        "unexpected H2 status before the stream reset: {status:?} (body={body:?})"
     );
     assert!(
         body.is_err(),
