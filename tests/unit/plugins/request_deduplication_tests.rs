@@ -5591,11 +5591,7 @@ fn test_replay_resanitizes_ratelimit_headers_from_persisted_entry() {
         ("x-app-version".to_string(), "7".to_string()),
     ]);
     let result = request_deduplication_replay_stored_response_for_test(
-        &plugin,
-        &mut ctx,
-        201,
-        stored,
-        b"{}",
+        &plugin, &mut ctx, 201, stored, b"{}",
     );
     match result {
         PluginResult::RejectBinary {
