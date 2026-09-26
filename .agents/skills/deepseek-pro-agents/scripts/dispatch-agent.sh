@@ -5,10 +5,10 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
-    '                         [--model alibaba-token-plan/deepseek-v4-pro-0813]' \
+    '                         [--model alibaba-token-plan/deepseek-v4.1-flash]' \
     '                         [--effort medium|high|xhigh|max]' \
     '' \
-    'Pinned to alibaba-token-plan/deepseek-v4-pro-0813. --model is accepted only when' \
+    'Pinned to alibaba-token-plan/deepseek-v4.1-flash. --model is accepted only when' \
     'it names that exact model; any other value is refused. The dated snapshot' \
     'is the only variant this skill dispatches.' \
     '' \
@@ -22,7 +22,7 @@ usage() {
 
 worktree=''
 prompt_file=''
-model='alibaba-token-plan/deepseek-v4-pro-0813'
+model='alibaba-token-plan/deepseek-v4.1-flash'
 effort=''
 
 while (($#)); do
@@ -92,7 +92,7 @@ fi
 # Hard pin: this skill dispatches exactly one model variant. --model survives only
 # for CLI parity with sibling skills and to let a caller restate the pin; it cannot
 # select a different Qwen/DeepSeek variant or a rolling alias.
-readonly PINNED_MODEL='alibaba-token-plan/deepseek-v4-pro-0813'
+readonly PINNED_MODEL='alibaba-token-plan/deepseek-v4.1-flash'
 if [[ "$model" != "$PINNED_MODEL" ]]; then
   printf 'Refusing model: %s\n' "$model" >&2
   printf 'This skill is pinned to %s and dispatches no other variant.\n' \

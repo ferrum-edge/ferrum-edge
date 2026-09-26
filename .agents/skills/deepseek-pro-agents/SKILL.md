@@ -6,7 +6,7 @@ description: Dispatch and orchestrate local opencode DeepSeek V4 Pro agents via 
 # DeepSeek V4 Pro agents
 
 Act as the orchestrator. Treat local opencode processes running
-`alibaba-token-plan/deepseek-v4-pro-0813` as implementation workers. Own task decomposition,
+`alibaba-token-plan/deepseek-v4.1-flash` as implementation workers. Own task decomposition,
 worktree isolation, liveness, independent diff review, and the final merge recommendation. Require
 each worker to carry its assigned scope through the stopping point in the prompt. Never accept a
 worker's report without checking the repository and GitHub state yourself.
@@ -52,7 +52,7 @@ prompt, including continuation prompts and any permitted nested delegation.
    - `~/.opencode/bin/opencode`, `/opt/homebrew/bin/opencode`, `/usr/local/bin/opencode`,
    - `opencode` on `PATH`.
 3. Confirm the model resolves: `<opencode> models` must list
-   `alibaba-token-plan/deepseek-v4-pro-0813`.
+   `alibaba-token-plan/deepseek-v4.1-flash`.
    The model is served by the `alibaba-token-plan` provider block in the operator's
    `opencode.json`. Stop and report the exact error if the model list or a run is rejected.
 4. Confirm the credential. That provider block resolves
@@ -61,7 +61,7 @@ prompt, including continuation prompts and any permitted nested delegation.
    set `ALIBABA_TOKEN_PLAN_API_KEY_FILE` to a readable absolute path holding it, before
    dispatching. The launcher fails closed on a missing key rather than letting opencode surface a
    bare `No API-key provided` mid-run. Never echo, log, or commit the key.
-5. Use the pinned model `alibaba-token-plan/deepseek-v4-pro-0813`. This is a **hard pin**: the
+5. Use the pinned model `alibaba-token-plan/deepseek-v4.1-flash`. This is a **hard pin**: the
    launcher refuses `--model` (exit 2) unless it names exactly that model, so no other
    Qwen/DeepSeek variant and no rolling alias is dispatchable from this skill. Do not
    substitute a different provider or model.
@@ -106,7 +106,7 @@ one long-lived execution session:
 this provider exposes no documented effort tiers. Do not claim an effort level was applied.
 
 The launcher resolves the opencode binary, verifies the credential, verifies the worktree root,
-pins `alibaba-token-plan/deepseek-v4-pro-0813` on the write-enabled `build` agent, and runs
+pins `alibaba-token-plan/deepseek-v4.1-flash` on the write-enabled `build` agent, and runs
 `opencode run --auto` with the prompt fed on stdin. Delete the temporary prompt after the worker
 exits.
 
@@ -200,4 +200,4 @@ Never put credentials, tokens, cookies, or secrets in prompts or worker logs.
 - An explicitly requested review receives no response: verify the trigger, bot identity,
   availability, and head SHA before posting another trigger.
 - Model mismatch: stop the worker, record the exact diagnostic, correct the launch contract, and
-  relaunch. Never claim `alibaba-token-plan/deepseek-v4-pro-0813` without launch evidence.
+  relaunch. Never claim `alibaba-token-plan/deepseek-v4.1-flash` without launch evidence.

@@ -1,4 +1,4 @@
 interface:
   display_name: "DeepSeek V4 Pro Agents"
   short_description: "Orchestrate DeepSeek V4 Pro coding agents via the opencode CLI"
-  default_prompt: "Use $deepseek-pro-agents to dispatch alibaba-token-plan/deepseek-v4-pro-0813 agents for this Ferrum Edge task."
+  default_prompt: "Use $deepseek-pro-agents to dispatch alibaba-token-plan/deepseek-v4.1-flash agents for this Ferrum Edge task."
