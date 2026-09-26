@@ -425,6 +425,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   storage and when an existing entry is replayed, so a cache hit no longer
   reports the original response's stale quota or reset (#5788).
 
+- The circuit-breaker cache's at-capacity warning is now rate-limited to at
+  most one line per second (with a suppressed count) instead of one line per
+  request to an uncached overflow target, and it is emitted after the cache
+  shard lock is released. `ferrum_circuit_breaker_cache_admission_refused_total`
+  still counts every refused admission (#5787).
+
 ### Security
 
 - A backend can no longer forge the gateway-owned `X-Gateway-Error` or

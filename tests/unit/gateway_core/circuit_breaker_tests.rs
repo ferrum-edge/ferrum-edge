@@ -7,6 +7,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::proxy::{ConfigApplyOutcome, HalfOpenProbeGuard, ProxyState};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 fn default_config() -> CircuitBreakerConfig {
@@ -1967,7 +1968,7 @@ fn test_cache_can_execute_returns_probe_flag() {
 /// CONCURRENTLY with the reopen — the only way to exercise those races.
 #[test]
 fn test_half_open_bound_and_no_wedge_under_admit_reopen_race_stress() {
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32};
     use std::thread;
 
     const MAX: u32 = 4;
@@ -2643,6 +2644,65 @@ fn ceiling_refusals_are_counted_and_a_scoped_prune_restores_admission() {
             .state_name(),
         "open",
         "a cached breaker accumulates failures and opens"
+    );
+}
+
+/// Counts WARN events emitted by the circuit breaker module.
+struct CircuitBreakerWarnCounter(Arc<AtomicUsize>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CircuitBreakerWarnCounter {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let metadata = event.metadata();
+        if *metadata.level() == tracing::Level::WARN
+            && metadata.target() == "ferrum_edge::circuit_breaker"
+        {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A fixed overflow target refused at request rate must not warn per request:
+/// the at-capacity warning is coalesced while the refusal metric stays exact
+/// (issue #5787). Cached hits keep their shared breaker.
+#[test]
+fn ceiling_refusal_warning_is_rate_limited_but_metric_is_exact() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    const REFUSALS: u64 = 1_000;
+    let cache = CircuitBreakerCache::with_max_entries(1);
+    let config = default_config();
+    let warnings = Arc::new(AtomicUsize::new(0));
+    let subscriber =
+        tracing_subscriber::registry().with(CircuitBreakerWarnCounter(Arc::clone(&warnings)));
+
+    tracing::subscriber::with_default(subscriber, || {
+        let cached = cache.get_or_create("audit", "p", Some("backend-a:80"), &config);
+        for _ in 0..REFUSALS {
+            cache.get_or_create("audit", "p", Some("backend-b:80"), &config);
+        }
+        let hit = cache.get_or_create("audit", "p", Some("backend-a:80"), &config);
+        assert!(
+            Arc::ptr_eq(&cached, &hit),
+            "cached hits must keep returning the shared breaker"
+        );
+    });
+
+    assert_eq!(cache.len(), 1);
+    assert_eq!(
+        cache.admission_refused_total(),
+        REFUSALS,
+        "every refused admission must be counted"
+    );
+    let emitted = warnings.load(Ordering::Relaxed);
+    assert!(emitted >= 1, "the first refusal must still warn");
+    // One emit per 1s window; the loop completes far inside a couple of windows.
+    assert!(
+        emitted <= 2,
+        "refusal warnings must be rate-limited, got {emitted} for {REFUSALS} refusals"
     );
 }
 
