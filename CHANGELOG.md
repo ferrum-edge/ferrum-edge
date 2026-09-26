@@ -519,6 +519,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass-through, so the next event is still inspected. `ai_transcript_audit`
   reassembles and redacts every captured frame, and `ai_response_guard` redact
   mode rewrites such streams instead of rejecting them (#5803).
+- HTTP/3 bridge gateway error terminals (a classified backend dispatch failure
+  and a declared-oversize `502`) now write `X-Gateway-Error` after the
+  `after_proxy` hooks from the typed connection-error signal and the post-hook
+  status, as HTTP/1.1 and HTTP/2 do, so a hook decorating a gRPC-Web terminal
+  can no longer see, replace, or duplicate the token. The streamed gRPC message
+  scanner now publishes completed-message counts with `Release` ordering,
+  matching the buffered counter (#5807).
 
 ### Security
 

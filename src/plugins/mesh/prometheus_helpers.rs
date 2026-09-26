@@ -334,6 +334,10 @@ pub fn count_grpc_length_prefixed_messages(data: &[u8]) -> u64 {
 }
 
 /// Incremental scanner for gRPC length-prefixed messages spanning DATA frames.
+///
+/// Completed-message increments use `Release`, matching the buffered
+/// `fetch_max` writer, so the `Acquire` readers that emit the metric observe
+/// every count published before the body finished.
 #[derive(Debug, Default)]
 pub struct GrpcLengthPrefixedScanner {
     header: [u8; 5],
@@ -350,7 +354,7 @@ impl GrpcLengthPrefixedScanner {
                 let next = left.saturating_sub(take as u32);
                 if next == 0 {
                     self.remaining = None;
-                    messages.fetch_add(1, Ordering::Relaxed);
+                    messages.fetch_add(1, Ordering::Release);
                 } else {
                     self.remaining = Some(next);
                 }
@@ -373,7 +377,7 @@ impl GrpcLengthPrefixedScanner {
             ]);
             self.header_filled = 0;
             if len == 0 {
-                messages.fetch_add(1, Ordering::Relaxed);
+                messages.fetch_add(1, Ordering::Release);
             } else {
                 self.remaining = Some(len);
             }
