@@ -1028,17 +1028,33 @@ accepted 0-RTT requests the gateway forwards `Early-Data: 1` to the backend
 (same shim as plain H3 / cross-protocol bridge) so origins can apply their own
 replay-safety policy.
 
-A request counts as early data only when quinn accepted its stream before the
-TLS handshake completed. With early data enabled every H3 connection is taken
-through `into_0rtt()`, including clients that send no 0-RTT data at all, so
-the classification is made per stream, not per connection. Quinn processes no
-1-RTT packet before the handshake completes, so a stream it accepted
-mid-handshake was opened by 0-RTT data. A request sent after the handshake —
-including one that arrives in the same flight as the client's `Finished`, the
-usual case for a resumed client that sends no 0-RTT — is never answered
-`425 Too Early` and never forwarded with `Early-Data: 1`. A genuine 0-RTT
-request stays classified as early data for its whole life, even after the
-handshake completes.
+A request counts as early data only when the handshake was still pending
+when the accept loop checked it, right after accepting the request's stream.
+With early data enabled every H3 connection is taken through `into_0rtt()`,
+including clients that send no 0-RTT data at all, so the classification is
+made per stream, not per connection. Quinn processes no 1-RTT packet before
+the handshake completes, so a stream classified this way was opened by 0-RTT
+data. A request sent after the handshake — including one that arrives in the
+same flight as the client's `Finished`, the usual case for a resumed client
+that sends no 0-RTT — is never answered `425 Too Early` and never forwarded
+with `Early-Data: 1`. A request classified as early data stays early data for
+its whole life, even after the handshake completes.
+
+The classification is not identical to quinn's per-stream
+`RecvStream::is_0rtt()`. Only one direction holds: a request classified as
+early data is always one quinn marks as 0-RTT. The reverse does not hold. A
+stream quinn marks as 0-RTT is treated as a 1-RTT request when the handshake
+completes before the accept loop checks it. That happens when the handshake
+completes between quinn accepting the stream and the check, for 0-RTT streams
+still queued in quinn when the handshake completed, and for reordered 0-RTT
+packets that open a stream after the client's `Finished`. This relaxation is
+deliberate. A replayed copy of 0-RTT data can never complete a handshake,
+because the attacker lacks the client's keys, so every gateway instance that
+receives a replay handles it as early data: the method allowlist, `425 Too
+Early`, and `Early-Data: 1` still apply to it. RFC 8470 §6.2 requires
+instances to agree only on how they handle a request *before* the handshake
+completes, and §6.4 allows a server to process early data received after the
+handshake completes when replays are handled consistently.
 
 Peer identity and early data are published as one per-connection snapshot
 (`http3::peer_identity::H3ConnectionIdentity`, an `ArcSwap` slot read once
@@ -1051,10 +1067,13 @@ hearing about it from another task: quinn fires it in the same connection-state
 lock hold that completes the handshake, and the accept loop re-polls it without
 waiting right after each stream is accepted and before that stream's snapshot
 is taken. The re-poll is one atomic check of a oneshot, made only while the
-handshake is still pending. It takes no lock and allocates nothing. A separate
-watchdog task enforces `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` on this
-path and closes a connection whose handshake outcome the accept loop has not
-observed in time. An early-data request therefore can never gain an mTLS
+handshake is still pending, and it runs outside tokio's cooperative budget so
+a busy accept loop cannot mistake an already-fired signal for a pending one.
+It takes no lock and allocates nothing. A separate watchdog task enforces
+`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` on this path: the timeout
+bounds how long the accept loop may take to observe the handshake outcome, and
+the watchdog closes the connection if the loop has not observed it in time.
+An early-data request therefore can never gain an mTLS
 identity, and a handshake that fails, times out, or is cancelled leaves the
 slot empty and early-data-gated. Because slots are per connection, no other
 connection's identity can be observed through them.

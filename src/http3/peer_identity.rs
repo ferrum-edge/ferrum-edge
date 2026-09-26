@@ -24,12 +24,14 @@
 //!    identity quinn then reports.
 //! 3. [`ZeroRttCompletion`] — the accept loop's own view of quinn's
 //!    handshake-completion signal. Each request stream is classified from the
-//!    handshake state at the instant that stream was accepted (issue #5761):
-//!    [`H3ConnectionIdentity::accepted_stream_snapshot`] re-reads the signal
-//!    synchronously right after the stream is accepted, so a 1-RTT request that
-//!    arrives in the same flight as the client's `Finished` can never be
-//!    classified as early data merely because the completion wake-up had not
-//!    been scheduled yet.
+//!    handshake state the accept loop observes right after accepting it
+//!    (issue #5761): [`H3ConnectionIdentity::accepted_stream_snapshot`]
+//!    re-reads the signal without waiting, so a 1-RTT request that arrives in
+//!    the same flight as the client's `Finished` can never be classified as
+//!    early data merely because the completion wake-up had not been scheduled
+//!    yet. A 0-RTT stream can still be classified 1-RTT when the handshake
+//!    completed before that re-read; [`ZeroRttCompletion`] explains why that
+//!    relaxation is safe (RFC 8470 §6.2).
 //!
 //! The rules that make this fail-closed:
 //!
@@ -116,14 +118,27 @@ pub fn server_0rtt_handshake_succeeded(zero_rtt_accepted: bool, connection_is_op
 /// `Connected` and fires this signal within one hold of the connection-state
 /// lock, and `accept_bi` takes that same lock. So once a request stream has
 /// been accepted, one non-blocking poll here that still finds the signal
-/// pending proves quinn handed the stream out mid-handshake — exactly what
-/// quinn records per stream as `RecvStream::is_0rtt()`. Quinn drops 1-RTT
+/// pending proves quinn handed the stream out mid-handshake, which quinn also
+/// records for that stream as `RecvStream::is_0rtt()`. Quinn drops 1-RTT
 /// packets until the handshake completes, so such a stream was opened by 0-RTT
 /// data. A stream opened by 1-RTT data always finds the signal fired.
 /// Relaying the signal through a spawned task (the pre-#5761 design) added a
 /// scheduler hop, so a 1-RTT request arriving in the same flight as the
 /// client's `Finished` could be accepted before the relayed signal and wrongly
 /// classified as early data.
+///
+/// Only that one direction holds: "signal pending at the re-poll" implies
+/// `is_0rtt()`, not the reverse. A stream quinn marks as 0-RTT is classified
+/// 1-RTT when the handshake completes before the re-poll: between quinn
+/// accepting the stream and the re-poll, for 0-RTT streams still queued in
+/// quinn when the handshake completed, and for reordered 0-RTT packets that
+/// open a stream after the client's `Finished`. That relaxation is deliberate.
+/// A replay can never complete a handshake (it lacks the client's keys), so
+/// every replayed copy stays early data and is refused or forwarded with
+/// `Early-Data: 1` by whichever instance receives it. RFC 8470 §6.2 requires
+/// only that instances agree on requests acted on *before* the handshake
+/// completes, and §6.4 permits processing early data received after
+/// completion when replays are handled consistently.
 ///
 /// The inner future is polled only while pending and dropped as soon as it
 /// resolves, so it is never polled after completion. No lock and no
@@ -178,12 +193,18 @@ where
 
     /// Observe the completion signal without waiting: `Some(value)` if it has
     /// fired and was not observed before, `None` otherwise.
+    ///
+    /// Polled outside tokio's cooperative budget. Quinn's signal is a tokio
+    /// oneshot receiver, which reports `Pending` once the task has spent its
+    /// budget even when the value is already there. Inside the budget, a busy
+    /// accept loop would read an already-fired signal as pending and classify
+    /// a 1-RTT stream as early data.
     pub async fn observe_now(&mut self) -> Option<bool> {
-        std::future::poll_fn(|cx| match self.poll_outcome(cx) {
+        let observe = std::future::poll_fn(|cx| match self.poll_outcome(cx) {
             Poll::Ready(zero_rtt_accepted) => Poll::Ready(Some(zero_rtt_accepted)),
             Poll::Pending => Poll::Ready(None),
-        })
-        .await
+        });
+        tokio::task::unconstrained(observe).await
     }
 }
 
@@ -341,8 +362,11 @@ impl H3ConnectionIdentity {
     /// for the completion. If the signal is still pending, the handshake was
     /// still in progress when quinn accepted the stream, which means the stream
     /// was opened by 0-RTT packets: it keeps the pre-handshake (early data,
-    /// no identity) snapshot. On a connection whose handshake completed before
-    /// the accept loop started this is one lock-free load.
+    /// no identity) snapshot. The converse does not hold: a 0-RTT stream is
+    /// classified 1-RTT when the handshake completed before this re-poll (see
+    /// [`ZeroRttCompletion`] for why that is safe). On a connection whose
+    /// handshake completed before the accept loop started this is one
+    /// lock-free load.
     pub async fn accepted_stream_snapshot<F>(
         &self,
         completion: &mut ZeroRttCompletion<F>,

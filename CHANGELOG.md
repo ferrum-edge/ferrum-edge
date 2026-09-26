@@ -70,11 +70,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as the client's `Finished`, which is typical for a resumed client that sends
   no 0-RTT data, could be accepted before that signal and classified as early
   data. The accept loop now tracks quinn's completion signal itself and checks
-  it again for every accepted stream. A request is early data only when quinn
-  accepted its stream before the handshake completed, which means the stream
-  was opened by 0-RTT data. Genuine 0-RTT requests are still method-gated and
-  marked `Early-Data: 1`. The check is one atomic load per stream, made only
-  while the handshake is pending.
+  it again for every accepted stream, outside tokio's cooperative budget. A
+  request is early data only when the handshake was still pending at that
+  check, which means the stream was opened by 0-RTT data; such requests are
+  still method-gated and marked `Early-Data: 1`. The reverse does not hold: a
+  0-RTT request whose stream is checked after the handshake completed is
+  handled as a 1-RTT request. A replay can never complete a handshake, so every
+  instance still handles replayed copies as early data, which is what RFC 8470
+  §6.2 requires. The check is one atomic load per stream, made only while the
+  handshake is pending.
 
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,

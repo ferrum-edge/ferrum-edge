@@ -1423,8 +1423,17 @@ fn publish_h3_zero_rtt_completion(
         || quinn_peer_cert_chain(connection),
     );
     if !handshake_succeeded {
-        debug!("HTTP/3 handshake did not complete from {} (0-RTT path)", remote);
+        debug_h3_zero_rtt_handshake_failed(remote);
     }
+}
+
+/// Log a 0.5-RTT connection whose observed completion signal reported that the
+/// handshake did not complete.
+fn debug_h3_zero_rtt_handshake_failed(remote: SocketAddr) {
+    debug!(
+        "HTTP/3 handshake did not complete from {} (0-RTT path)",
+        remote
+    );
 }
 
 /// Extract the peer certificate chain from a fully handshaken QUIC connection.
@@ -1791,10 +1800,14 @@ async fn handle_h3_connection(
                 // The handshake bound also applies here: if the peer never
                 // completes TLS, the completion signal never fires and the
                 // connection would otherwise sit consuming a slot forever. The
-                // watchdog closes it unless the accept loop observed the
-                // outcome first. Closing fails any in-flight 0.5-RTT streams
-                // and deliberately leaves the slot pre-handshake — a failed or
-                // cancelled handshake must never expose an identity.
+                // watchdog's timeout bounds the moment the accept loop
+                // observed the handshake outcome (success or failure), not
+                // quinn's completion itself: the loop drops `handshake_watchdog`
+                // when it observes the signal, and until then the watchdog
+                // closes the connection once the timeout elapses. Closing
+                // fails any in-flight 0.5-RTT streams and deliberately leaves
+                // the slot pre-handshake — a failed or cancelled handshake must
+                // never expose an identity.
                 if !handshake_timeout.is_zero() {
                     let (outcome_observed, watchdog_released) = tokio::sync::oneshot::channel();
                     handshake_watchdog = Some(outcome_observed);
@@ -2114,18 +2127,21 @@ async fn handle_h3_connection(
                 let state = Arc::clone(&state);
                 let frontend_sni_hostname = frontend_sni_hostname.clone();
                 let socket_ip = Arc::clone(&socket_ip);
-                // Issue #5761: classify this stream from the handshake state at
-                // the instant quinn accepted it. While the completion signal is
-                // still pending, one non-blocking re-poll here closes the window
-                // in which a 1-RTT stream arriving with the client's `Finished`
-                // is accepted before the select above observed completion; a
-                // signal still pending now proves the stream was opened in
-                // 0-RTT. Then take ONE lock-free identity snapshot — before
-                // spawning the task — so the early-data flag and the peer
-                // certificate this stream sees come from the same point in the
-                // connection lifecycle. A single `ArcSwap::load_full()`: no
-                // lock, no allocation beyond the refcount bumps the per-request
-                // cert handles already cost.
+                // Issue #5761: classify this stream from the handshake state
+                // observed right after quinn accepted it. While the completion
+                // signal is still pending, one non-blocking re-poll here closes
+                // the window in which a 1-RTT stream arriving with the client's
+                // `Finished` is accepted before the select above observed
+                // completion; a signal still pending now proves the stream was
+                // opened in 0-RTT. (A 0-RTT stream is classified 1-RTT if the
+                // handshake completed first; see `ZeroRttCompletion` for why
+                // RFC 8470 allows that.) Then take ONE lock-free identity
+                // snapshot — before spawning the task — so the early-data flag
+                // and the peer certificate this stream sees come from the same
+                // point in the connection lifecycle. A single
+                // `ArcSwap::load_full()`: no lock, no allocation beyond the
+                // refcount bumps the per-request cert handles already cost.
+                let completion_was_pending = handshake_completion.is_pending();
                 let identity = peer_identity
                     .accepted_stream_snapshot(
                         &mut handshake_completion,
@@ -2133,8 +2149,14 @@ async fn handle_h3_connection(
                         || quinn_peer_cert_chain(&quinn_conn),
                     )
                     .await;
-                if !handshake_completion.is_pending() {
+                if completion_was_pending && !handshake_completion.is_pending() {
                     drop(handshake_watchdog.take());
+                    // The re-poll observed the signal. A successful handshake
+                    // publishes a non-early snapshot, so a snapshot still
+                    // early here means the handshake did not complete.
+                    if identity.is_early_data {
+                        debug_h3_zero_rtt_handshake_failed(canonical_peer);
+                    }
                 }
                 let cert = identity.client_cert_der.clone();
                 let chain = identity.client_cert_chain_der.clone();

@@ -180,9 +180,15 @@ impl Future for FakeZeroRttAccepted {
     }
 }
 
-fn zero_rtt_connection() -> (oneshot::Sender<bool>, ZeroRttCompletion<FakeZeroRttAccepted>) {
+fn zero_rtt_connection() -> (
+    oneshot::Sender<bool>,
+    ZeroRttCompletion<FakeZeroRttAccepted>,
+) {
     let (driver, signal) = oneshot::channel();
-    (driver, ZeroRttCompletion::pending(FakeZeroRttAccepted(signal)))
+    (
+        driver,
+        ZeroRttCompletion::pending(FakeZeroRttAccepted(signal)),
+    )
 }
 
 #[tokio::test]
@@ -227,7 +233,10 @@ async fn stream_accepted_while_the_handshake_is_pending_stays_early_data() {
             || unreachable!("no identity may be read before the handshake completed"),
         )
         .await;
-    assert!(early.is_early_data, "a 0-RTT request must stay replay-gated");
+    assert!(
+        early.is_early_data,
+        "a 0-RTT request must stay replay-gated"
+    );
     assert!(early.client_cert_der.is_none());
     assert!(completion.is_pending());
 
@@ -235,7 +244,10 @@ async fn stream_accepted_while_the_handshake_is_pending_stays_early_data() {
     let later = slot
         .accepted_stream_snapshot(&mut completion, || true, || None)
         .await;
-    assert!(!later.is_early_data, "streams accepted after completion are 1-RTT");
+    assert!(
+        !later.is_early_data,
+        "streams accepted after completion are 1-RTT"
+    );
     assert!(
         early.is_early_data,
         "an early stream keeps its classification after the handshake completes"
@@ -261,8 +273,45 @@ async fn a_failed_handshake_keeps_every_stream_early_data() {
     let later = slot
         .accepted_stream_snapshot(&mut completion, || true, || Some(vec![leaf()]))
         .await;
-    assert!(later.is_early_data, "a failed handshake is never retried into success");
+    assert!(
+        later.is_early_data,
+        "a failed handshake is never retried into success"
+    );
     assert!(later.client_cert_der.is_none());
+}
+
+#[tokio::test]
+async fn a_fired_signal_is_observed_after_the_task_spent_its_coop_budget() {
+    // Quinn's signal is a tokio oneshot receiver, which reports `Pending` once
+    // the polling task has spent its cooperative budget even when the value is
+    // already there. A busy accept loop must still see an already-fired signal,
+    // or a 1-RTT stream would be answered 425 / forwarded with Early-Data: 1.
+    let slot = H3ConnectionIdentity::pre_handshake();
+    let (driver, mut completion) = zero_rtt_connection();
+    driver.send(false).expect("completion receiver is alive");
+
+    // Far more ready messages than tokio's per-poll budget.
+    let (budget_tx, mut budget_rx) = tokio::sync::mpsc::unbounded_channel();
+    for _ in 0..1024 {
+        budget_tx.send(()).expect("receiver is alive");
+    }
+
+    let stream = std::future::poll_fn(|cx| {
+        while let Poll::Ready(Some(())) = budget_rx.poll_recv(cx) {}
+        assert!(
+            !budget_rx.is_empty(),
+            "the receiver must have stopped on the exhausted coop budget"
+        );
+        let snapshot = slot.accepted_stream_snapshot(&mut completion, || true, || None);
+        let mut snapshot = std::pin::pin!(snapshot);
+        snapshot.as_mut().poll(cx)
+    })
+    .await;
+    assert!(
+        !stream.is_early_data,
+        "an exhausted coop budget must not hide a fired completion signal"
+    );
+    assert!(!completion.is_pending());
 }
 
 #[tokio::test]

@@ -2086,7 +2086,10 @@ async fn h3_full_handshake_exposes_peer_identity_before_any_stream_is_accepted()
 // false `Early-Data: 1`). These tests run the production classifier
 // (`H3ConnectionIdentity::accepted_stream_snapshot`) exactly where the gateway
 // does — right after `accept_bi`, without having awaited completion — and check
-// it against quinn's own per-stream `RecvStream::is_0rtt()`.
+// it against quinn's own per-stream `RecvStream::is_0rtt()`. Only one direction
+// of that comparison is an invariant: a signal still pending at the re-poll
+// implies `is_0rtt()`. A 0-RTT stream may be classified 1-RTT when the
+// handshake completed before the re-poll (RFC 8470 §6.2 / §6.4).
 
 /// Quinn server endpoint with the gateway's non-mTLS early-data posture: QUIC
 /// early data enabled at the only size quinn accepts, plus the bounded stateful
@@ -2135,8 +2138,27 @@ fn h3_early_data_client_endpoint(fixture: &H3MtlsFixture) -> quinn::Endpoint {
 struct AcceptedStreamClassification {
     /// The gateway classifier's verdict.
     is_early_data: bool,
+    /// Whether the completion signal was still pending when the classifier
+    /// re-polled it for this stream.
+    signal_pending_at_snapshot: bool,
     /// Quinn's own per-stream record: accepted while still handshaking.
     quinn_is_0rtt: bool,
+}
+
+impl AcceptedStreamClassification {
+    /// The invariants that hold on either side of the loopback race.
+    fn assert_consistent(&self, label: &str) {
+        assert!(
+            !self.signal_pending_at_snapshot || self.is_early_data,
+            "{label}: a stream whose completion signal was still pending at its re-poll \
+             must be early data: {self:?}"
+        );
+        assert!(
+            !self.signal_pending_at_snapshot || self.quinn_is_0rtt,
+            "{label}: a signal still pending after accept proves quinn accepted the stream \
+             mid-handshake: {self:?}"
+        );
+    }
 }
 
 /// Serve one connection the way the gateway's 0.5-RTT accept path does and
@@ -2163,6 +2185,7 @@ async fn classify_one_zero_rtt_connection(
         .await;
     let classification = AcceptedStreamClassification {
         is_early_data: snapshot.is_early_data,
+        signal_pending_at_snapshot: completion.is_pending(),
         quinn_is_0rtt: recv.is_0rtt(),
     };
 
@@ -2222,11 +2245,18 @@ async fn h3_zero_rtt_path_classifies_streams_by_handshake_state_at_accept() {
         let Ok((connection, zero_rtt_accepted)) = connecting.into_0rtt() else {
             panic!("the resumed client must hold 0-RTT keys from the earlier sessions");
         };
-        assert_eq!(h3_echo_request(&connection, b"PUT").await, b"PUT");
+        // Send the request in 0-RTT, then confirm the server accepted that
+        // data before reading the echo: a rejected 0-RTT stream would
+        // otherwise surface as an opaque read error.
+        let (mut send, mut recv) = connection.open_bi().await.expect("open 0-RTT stream");
+        send.write_all(b"PUT").await.expect("write 0-RTT request");
+        send.finish().expect("finish 0-RTT request");
         assert!(
             zero_rtt_accepted.await,
             "the server must accept the client's 0-RTT data for this test to exercise it"
         );
+        let echo = recv.read_to_end(1024).await.expect("read 0-RTT echo");
+        assert_eq!(echo, b"PUT");
         connection.close(0u32.into(), b"done");
     };
     tokio::time::timeout(timeout, client_flow)
@@ -2240,6 +2270,7 @@ async fn h3_zero_rtt_path_classifies_streams_by_handshake_state_at_accept() {
     let (one_rtt, zero_rtt) = classifications.split_at(ONE_RTT_CONNECTIONS);
 
     for (index, classification) in one_rtt.iter().enumerate() {
+        classification.assert_consistent(&format!("connection {index}"));
         assert!(
             !classification.quinn_is_0rtt,
             "connection {index}: a request sent after the client handshake completed is a \
@@ -2252,15 +2283,11 @@ async fn h3_zero_rtt_path_classifies_streams_by_handshake_state_at_accept() {
         );
     }
     // Whether the genuine 0-RTT stream is still mid-handshake when the server
-    // accepts it depends on the loopback round trip, so pin the invariant that
-    // holds on either side of that race: the classifier reports early data
-    // only for a stream quinn accepted before the handshake completed.
-    let zero_rtt = &zero_rtt[0];
-    assert!(
-        !zero_rtt.is_early_data || zero_rtt.quinn_is_0rtt,
-        "a stream classified as early data must be one quinn accepted mid-handshake: \
-         {zero_rtt:?}"
-    );
+    // re-polls the signal depends on the loopback round trip, so pin the
+    // invariants that hold on either side of that race: a signal still pending
+    // at the re-poll means early data, and only for a stream quinn accepted
+    // before the handshake completed.
+    zero_rtt[0].assert_consistent("0-RTT connection");
 
     client.wait_idle().await;
 }
