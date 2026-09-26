@@ -1,11 +1,23 @@
 //! Unit coverage for NodeWaypoint ADR observability counters (issue #3334).
 
+use async_trait::async_trait;
+use ferrum_edge::_test_support;
+use ferrum_edge::config::env_config::EnvConfig;
+use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::modes::mesh::node_waypoint_observability::{
     self, NodeWaypointAssertedIdentityRejectReason, NodeWaypointDestinationPolicyRejectReason,
     NodeWaypointHboneHandshakePhase,
 };
+use ferrum_edge::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache;
 use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
-use std::sync::{Mutex, MutexGuard};
+use ferrum_edge::plugins::{Plugin, RequestContext, TransactionSummary};
+use ferrum_edge::proxy::ProxyState;
+use http_body_util::BodyExt;
+use rcgen::string::Ia5String;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 static OBSERVABILITY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -390,4 +402,338 @@ fn handshake_phase_ownership_is_independent() {
     );
 
     node_waypoint_observability::set_enabled(false);
+}
+
+/// Captures every transaction line a refusal hands to the logging chain.
+struct CapturingLogPlugin {
+    captured: Arc<Mutex<Vec<TransactionSummary>>>,
+}
+
+#[async_trait]
+impl Plugin for CapturingLogPlugin {
+    fn name(&self) -> &str {
+        "capturing_log"
+    }
+
+    fn priority(&self) -> u16 {
+        9000
+    }
+
+    async fn log(&self, summary: &TransactionSummary) {
+        self.captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(summary.clone());
+    }
+}
+
+/// What the refused CONNECT's peer presented on its mTLS connection.
+#[derive(Clone, Copy)]
+enum Peer {
+    /// A client certificate carrying one valid SPIFFE URI SAN.
+    Authenticated,
+    /// A client certificate the listener accepted that carries no SPIFFE ID.
+    CertWithoutSpiffeId,
+    /// No client certificate at all.
+    Peerless,
+}
+
+const CLIENT_SPIFFE_ID: &str = "spiffe://cluster.local/ns/default/sa/client";
+
+/// A self-signed leaf with `spiffe_id` as its only URI SAN, or with a DNS SAN
+/// only when `None`. The listener's verifier is not under test here: synthesis
+/// runs after the handshake, so only the SAN content decides the peer class.
+fn client_leaf_der(spiffe_id: Option<&str>) -> Vec<u8> {
+    let names = vec!["client.local".to_string()];
+    let mut params = rcgen::CertificateParams::new(names).expect("leaf params");
+    if let Some(spiffe_id) = spiffe_id {
+        let uri = spiffe_id.to_string();
+        let uri = Ia5String::try_from(uri).expect("spiffe uri san");
+        params.subject_alt_names = vec![rcgen::SanType::URI(uri)];
+    }
+    let key = rcgen::KeyPair::generate().expect("leaf key");
+    params
+        .self_signed(&key)
+        .expect("self-signed leaf")
+        .der()
+        .to_vec()
+}
+
+struct SynthesisRefusal {
+    status: u16,
+    body: String,
+    summary: TransactionSummary,
+}
+
+async fn refuse_at_synthesis(
+    state: &ProxyState,
+    peer: Peer,
+    reason: &'static str,
+    destination: (&str, u16),
+    is_udp_connect: bool,
+) -> SynthesisRefusal {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let plugin = CapturingLogPlugin {
+        captured: Arc::clone(&captured),
+    };
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin)];
+    let mut ctx = RequestContext::new(
+        "10.0.0.2".to_string(),
+        "CONNECT".to_string(),
+        "/".to_string(),
+    );
+    ctx.mesh_inbound_terminator_ip = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
+    // Synthesis runs before `spiffe_identity`, so it classifies the peer from
+    // the presented certificate through the connection's extraction cache.
+    let leaf = match peer {
+        Peer::Authenticated => Some(client_leaf_der(Some(CLIENT_SPIFFE_ID))),
+        Peer::CertWithoutSpiffeId => Some(client_leaf_der(None)),
+        Peer::Peerless => None,
+    };
+    if let Some(leaf) = leaf {
+        ctx.tls_client_cert_der = Some(Arc::new(leaf));
+        ctx.peer_spiffe_extraction_cache = Some(Arc::new(SpiffeIdentityConnectionCache::new()));
+    }
+    let response = _test_support::reject_inbound_connect_relay_synthesis_for_test(
+        state,
+        &plugins,
+        &mut ctx,
+        reason,
+        Some(destination),
+        is_udp_connect,
+    )
+    .await;
+    let status = response.status().as_u16();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("refusal body")
+        .to_bytes();
+    let mut lines = captured
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .split_off(0);
+    assert_eq!(
+        lines.len(),
+        1,
+        "a refusal writes exactly one transaction line"
+    );
+    SynthesisRefusal {
+        status,
+        body: String::from_utf8_lossy(&body).into_owned(),
+        summary: lines.remove(0),
+    }
+}
+
+fn metadata<'a>(summary: &'a TransactionSummary, key: &str) -> Option<&'a str> {
+    summary.metadata.get(key).map(String::as_str)
+}
+
+/// Issue #5763: a relay-synthesis refusal answers one of three terminals and
+/// writes one transaction line each. Only a real destination denial carries the
+/// documented 403 body and counts as `relay_destination_denied`; `no_mesh_slice`
+/// is a 503 readiness answer, and a CONNECT with no verified SPIFFE identity —
+/// no certificate, or one without a usable SPIFFE ID — gets the handlers'
+/// unauthenticated-peer 403 with no `mesh.relay.*` audit metadata.
+#[test]
+fn inbound_connect_relay_synthesis_refusals_log_and_count_by_terminal() {
+    let _guard = observability_test_guard();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    node_waypoint_observability::set_enabled(true);
+    let before = node_waypoint_observability::snapshot();
+    let (denied, udp_denied, not_ready, peerless, no_spiffe, state) = runtime.block_on(async {
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let (state, _) = ProxyState::new(
+            GatewayConfig::default(),
+            dns_cache,
+            EnvConfig::default(),
+            None,
+            None,
+        )
+        .expect("proxy state");
+        let denied = refuse_at_synthesis(
+            &state,
+            Peer::Authenticated,
+            "address_not_terminated_here",
+            ("::1", 8080),
+            false,
+        )
+        .await;
+        let udp_denied = refuse_at_synthesis(
+            &state,
+            Peer::Authenticated,
+            "port_not_declared",
+            ("10.0.0.9", 5353),
+            true,
+        )
+        .await;
+        let not_ready = refuse_at_synthesis(
+            &state,
+            Peer::Authenticated,
+            "no_mesh_slice",
+            ("10.0.0.9", 5353),
+            true,
+        )
+        .await;
+        let peerless = refuse_at_synthesis(
+            &state,
+            Peer::Peerless,
+            "address_not_terminated_here",
+            ("10.0.0.9", 8080),
+            false,
+        )
+        .await;
+        let no_spiffe = refuse_at_synthesis(
+            &state,
+            Peer::CertWithoutSpiffeId,
+            "address_not_terminated_here",
+            ("10.0.0.9", 5353),
+            true,
+        )
+        .await;
+        (denied, udp_denied, not_ready, peerless, no_spiffe, state)
+    });
+    let after = node_waypoint_observability::snapshot();
+    node_waypoint_observability::set_enabled(false);
+
+    // A real destination denial: the documented 403, its body, and the
+    // `mesh.relay.*` audit trail on a transaction line with no `proxy_id`.
+    assert_eq!(denied.status, 403);
+    assert!(
+        denied.body.contains("HBONE relay destination not allowed"),
+        "body={}",
+        denied.body
+    );
+    assert_eq!(denied.summary.response_status_code, 403);
+    assert_eq!(denied.summary.proxy_id, None);
+    assert_eq!(
+        metadata(&denied.summary, "rejection_phase"),
+        Some("hbone_relay_destination_denied")
+    );
+    assert_eq!(
+        metadata(&denied.summary, "mesh_authz.deny_policy"),
+        Some("hbone_relay_destination_denied")
+    );
+    assert_eq!(
+        metadata(&denied.summary, "mesh.relay.denial_reason"),
+        Some("address_not_terminated_here")
+    );
+    assert_eq!(
+        metadata(&denied.summary, "mesh.relay.denied_destination"),
+        Some("[::1]:8080"),
+        "an IPv6 destination is bracketed so its port stays unambiguous"
+    );
+    assert_eq!(
+        metadata(&denied.summary, "mesh.relay.terminator_ip"),
+        Some("10.0.0.5")
+    );
+
+    // The datagram flavor of the same denial.
+    assert_eq!(udp_denied.status, 403);
+    assert!(
+        udp_denied
+            .body
+            .contains("HBONE UDP relay destination not allowed"),
+        "body={}",
+        udp_denied.body
+    );
+    assert_eq!(
+        metadata(&udp_denied.summary, "rejection_phase"),
+        Some("hbone_udp_relay_destination_denied")
+    );
+    assert_eq!(
+        metadata(&udp_denied.summary, "mesh.relay.denied_destination"),
+        Some("10.0.0.9:5353")
+    );
+
+    // No slice yet: a readiness answer, still audited, never a 403.
+    assert_eq!(not_ready.status, 503);
+    assert!(
+        not_ready.body.contains("HBONE UDP relay not ready"),
+        "body={}",
+        not_ready.body
+    );
+    assert_eq!(not_ready.summary.response_status_code, 503);
+    assert_eq!(
+        metadata(&not_ready.summary, "rejection_phase"),
+        Some("hbone_udp_relay_not_ready")
+    );
+    assert_eq!(
+        metadata(&not_ready.summary, "mesh.relay.denial_reason"),
+        Some("no_mesh_slice")
+    );
+
+    // A peerless CONNECT learns nothing about the destination.
+    assert_eq!(peerless.status, 403);
+    assert!(
+        peerless
+            .body
+            .contains("HBONE tunnel requires an authenticated mesh peer"),
+        "body={}",
+        peerless.body
+    );
+    assert_eq!(
+        metadata(&peerless.summary, "rejection_phase"),
+        Some("hbone_unauthenticated_peer")
+    );
+    assert_eq!(
+        metadata(&peerless.summary, "mesh_authz.deny_policy"),
+        Some("hbone_unauthenticated_peer")
+    );
+    assert!(
+        peerless
+            .summary
+            .metadata
+            .keys()
+            .all(|key| !key.starts_with("mesh.relay.")),
+        "a peerless refusal must carry no relay audit metadata: {:?}",
+        peerless.summary.metadata
+    );
+
+    // A certificate without a usable SPIFFE ID is no verified identity, so it
+    // is the same unauthenticated-peer answer, never a destination denial.
+    assert_eq!(no_spiffe.status, 403);
+    assert!(
+        no_spiffe
+            .body
+            .contains("HBONE UDP tunnel requires an authenticated mesh peer"),
+        "body={}",
+        no_spiffe.body
+    );
+    assert_eq!(
+        metadata(&no_spiffe.summary, "rejection_phase"),
+        Some("hbone_udp_unauthenticated_peer")
+    );
+    assert!(
+        no_spiffe
+            .summary
+            .metadata
+            .keys()
+            .all(|key| !key.starts_with("mesh.relay.")),
+        "a refusal without a verified identity must carry no relay audit metadata: {:?}",
+        no_spiffe.summary.metadata
+    );
+
+    // Only the two real destination denials count.
+    assert_eq!(
+        after.destination_policy_rejections.relay_destination_denied,
+        before
+            .destination_policy_rejections
+            .relay_destination_denied
+            + 2
+    );
+    // Every refusal is accounted as a request with its status.
+    assert_eq!(state.request_count.load(Ordering::Relaxed), 5);
+    let status_count = |status: u16| {
+        state
+            .status_counts
+            .get(&status)
+            .map(|count| count.load(Ordering::Relaxed))
+    };
+    assert_eq!(status_count(403), Some(4));
+    assert_eq!(status_count(503), Some(1));
 }
