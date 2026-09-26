@@ -238,7 +238,7 @@ its empty-bodied automatic `400`. The response uses the same JSON envelope
 handler-layer protocol rejects use: `Content-Type: application/json`, a fixed
 `{"error":"..."}` body matching `check_protocol_headers()`, and
 `Connection: close`. Like the handler-layer protocol `400`s, it carries **no**
-`X-Gateway-Error`: that header is the closed seven-token client-facing
+`X-Gateway-Error`: that header is the closed eight-token client-facing
 vocabulary below, which names why a *backend* attempt failed, and none of its
 tokens describes a client-caused `400` (issue #4543). The parse reject names
 itself only in its `warn`-level log line (`parse_reject_class`,
@@ -304,7 +304,7 @@ HTTP-family 5xx use **two** closed vocabularies across three surfaces:
 
 | Surface | Closed set | Cardinality |
 |---|---|---|
-| `X-Gateway-Error` (client header) | seven coarse tokens below | **7** |
+| `X-Gateway-Error` (client header) | eight coarse tokens below | **8** |
 | Access-log `error_class` | [`ErrorClass::as_str`](../src/retry.rs) | **19** (omitted when unset) |
 | `ferrum_requests_total{error_class}` | `ErrorClass::as_str` plus five non-class tokens | **24** (omitted on 2xx/3xx/4xx; an unclassified backend 5xx carries `backend_error`) |
 
@@ -314,19 +314,34 @@ Metrics and logs keep the granular class so PromQL and log alerts can split
 `port_exhaustion`. Values on every surface are compiled-in `&'static str` —
 never an error message, never a client- or backend-influenced string.
 
+`X-Gateway-Error` and `X-Gateway-Upstream-Status` are gateway-owned. Both
+names live in one shared list
+([`GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`](../src/proxy/headers.rs)).
+Every dispatch path strips a backend-supplied copy, in the response headers or
+the trailers, before the gateway writes its own value. That covers HTTP/1.1,
+HTTP/2, HTTP/3 (native and bridged), reqwest and direct hyper, native gRPC,
+gRPC-Web, and serverless functions, buffered or streamed. A backend therefore
+cannot make a response look gateway-attributed. The headers are not
+authenticated, though: a client should trust them only on a response it
+received from a gateway it authenticated.
+
 ### Header tokens (`X-Gateway-Error`)
 
 | Token | When |
 |---|---|
 | `connection_failure` | Pre-wire connect/DNS/TLS failure (502) |
-| `backend_timeout` | Backend accepted the connection but timed out (504) |
+| `backend_timeout` | A backend held the request (it accepted the connection and was sent the request) but did not answer in time (504) |
 | `backend_error` | Backend returned 5xx, or a post-wire 5xx without a more specific token |
 | `circuit_breaker_open` | Open-breaker 503; never reached a backend |
 | `overload` | Gateway resource refusal: overload/drain `reject_new_requests` 503, or response-transformer output above the configured response ceiling (502) |
 | `config_stale` | DP stale-config fence 503 |
 | `concurrency_limit` | `adaptive_concurrency` admission 503 |
+| `request_timeout` | A matched route rule's total request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway API `timeouts.request`) expired before any backend held the request: during the client upload, a gateway-local phase, admission, or retry backoff (504). The transaction log records `route_request_timeout` as `before_dispatch` or `retry_backoff` |
 
-Do not reuse `backend_error` for a response that never reached a backend.
+Do not reuse `backend_error` for a response that never reached a backend, and
+do not reuse `backend_timeout` for a timeout no backend held. A route-deadline
+`504` whose recorded phase is `dispatch` (the backend held the cancelled
+attempt) stays `backend_timeout`.
 
 ### Granular class → header token
 
@@ -349,7 +364,7 @@ Do not reuse `backend_error` for a response that never reached a backend.
 | `gateway_buffer_capacity` | `backend_error` |
 | `request_body_too_large` | `backend_error` |
 | `graceful_remote_close` | `backend_error` |
-| `dispatch_policy_rejected` | `overload` for a response-transformer output-ceiling refusal; existing dispatch paths retain their header mapping |
+| `dispatch_policy_rejected` | `overload` for a response-transformer output-ceiling refusal; `request_timeout` for a route-deadline `504` no backend held; existing dispatch paths retain their header mapping |
 | `request_error` | `backend_error` |
 | *(no `ErrorClass`; `rejection_phase=circuit_breaker_open`)* | `circuit_breaker_open` |
 | *(no `ErrorClass`; `rejection_phase=overload`)* | `overload` |

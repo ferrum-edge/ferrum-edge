@@ -258,10 +258,11 @@ A backend 5xx with neither a class nor a gateway phase carries
 joined. 2xx/3xx/4xx omit the label. Cardinality bound is **24** compiled-in
 tokens.
 
-`X-Gateway-Error` stays on the coarser seven-token header vocabulary
+`X-Gateway-Error` stays on the coarser eight-token header vocabulary
 (`connection_failure` / `backend_timeout` / `backend_error` plus the four
-gateway tokens). Access-log `error_class` stays granular `ErrorClass::as_str`
-on every status. Mapping: [error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
+gateway tokens and the header-only `request_timeout`; a route-deadline `504`
+that token covers is labelled `dispatch_policy_rejected` here). Access-log
+`error_class` stays granular `ErrorClass::as_str` on every status. Mapping: [error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
 
 `ferrum_stream_disconnects_total{error_class}` uses the same 19
 `ErrorClass::as_str` values as stream logs and omits the label when unset.

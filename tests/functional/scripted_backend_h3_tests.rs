@@ -256,8 +256,10 @@ async fn spawn_h3_route_timeout_harness(
         "enabled": true,
         "config": {"rules": [rule]}
     }]);
+    // `to_file_mode_yaml` tags struct-variant enums (a retry `backoff`) the
+    // way the file loader requires.
     let (harness, _, https_port) = spawn_h3_harness_with_explicit_https_port_config_and_env(
-        serde_yaml::to_string(&config).expect("yaml"),
+        to_file_mode_yaml(&config),
         true,
         None,
         &[("FERRUM_HTTP3_CONNECTIONS_PER_BACKEND", "1")],
@@ -320,6 +322,75 @@ async fn h3_native_pool_route_request_timeout_answers_504_before_the_response_he
         requests.len(),
         1,
         "the native HTTP/3 backend must have held the one attempt: {requests:?}"
+    );
+}
+
+/// A rule's total deadline that expires in the native retry loop's backoff
+/// (#5762): no backend holds the request then, so the `504` carries
+/// `X-Gateway-Error: request_timeout`, never the `backend_timeout` a backend
+/// that held the attempt earns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_pool_route_request_timeout_in_backoff_is_request_timeout() {
+    let ca = TestCa::new("h3-route-deadline-backoff").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+    let backend_port = tcp.port;
+    let _h2 = spawn_h2_bridge_backend(tcp.into_listener(), &cert, &key, b"fallback");
+    // The one attempt is answered at once with a retryable 503; the retry's
+    // backoff then outlives the route deadline.
+    let backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "503".into()),
+            ("content-type", "text/plain".into()),
+        ]))
+        .step(H3Step::RespondData(Bytes::from_static(b"busy")))
+        .step(H3Step::RespondTrailers(vec![]))
+        .step(H3Step::StallFor(Duration::from_secs(30)))
+        .spawn()
+        .expect("h3 backend");
+    let (_harness, https_port) = spawn_h3_route_timeout_harness(
+        backend_port,
+        json!({"request_timeout_ms": 800}),
+        Some(json!({
+            "max_retries": 1,
+            "retryable_status_codes": [503],
+            "retryable_methods": ["GET"],
+            "backoff": {"fixed": {"delay_ms": 10_000}}
+        })),
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let started = Instant::now();
+    let resp = client
+        .get(&format!("https://127.0.0.1:{https_port}/api/backoff"))
+        .await
+        .expect("h3 request");
+    let elapsed = started.elapsed();
+    assert_eq!(resp.status.as_u16(), 504, "{resp:?}");
+    assert!(
+        resp.body_text().contains("Request timeout"),
+        "a total deadline answers proxy core's route timeout body: {:?}",
+        resp.body_text()
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-gateway-error")
+            .and_then(|value| value.to_str().ok()),
+        Some("request_timeout"),
+        "no backend held the request when the deadline expired"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the 504 must arrive at the route deadline, not after the backoff: {elapsed:?}"
+    );
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "the deadline must end the retry loop inside its backoff: {requests:?}"
     );
 }
 
@@ -5756,7 +5827,10 @@ async fn h3_bridge_streams_default_sse_with_retries_configured() {
 }
 
 /// Ordinary responses report the backend hop, including a retained earlier
-/// Via value, on both buffered and streaming H3 frontend paths.
+/// Via value, on both buffered and streaming H3 frontend paths. Every backend
+/// also forges the gateway-owned `X-Gateway-Error` / `X-Gateway-Upstream-Status`
+/// (#5759): neither may reach the client on the native H3 relays or the H3
+/// bridge to HTTP/1.1 and HTTP/2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_response_via_matches_backend_protocol_for_stream_and_buffer() {
@@ -5778,7 +5852,7 @@ async fn h3_response_via_matches_backend_protocol_for_stream_and_buffer() {
                     )
                     .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
                     .step(TcpStep::Write(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nVia: 1.1 upstream\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nVia: 1.1 upstream\r\nX-Gateway-Error: backend_error\r\nX-Gateway-Upstream-Status: degraded\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
                     ))
                     .step(TcpStep::Drop)
                     .spawn()
@@ -5794,6 +5868,8 @@ async fn h3_response_via_matches_backend_protocol_for_stream_and_buffer() {
                             (":status", "200".into()),
                             ("content-type", "text/plain".into()),
                             ("via", "1.1 upstream".into()),
+                            ("x-gateway-error", "backend_error".into()),
+                            ("x-gateway-upstream-status", "degraded".into()),
                         ]))
                         .step(H2Step::RespondData {
                             data: Bytes::from_static(b"ok"),
@@ -5811,6 +5887,8 @@ async fn h3_response_via_matches_backend_protocol_for_stream_and_buffer() {
                             (":status", "200".into()),
                             ("content-type", "text/plain".into()),
                             ("via", "1.1 upstream".into()),
+                            ("x-gateway-error", "backend_error".into()),
+                            ("x-gateway-upstream-status", "degraded".into()),
                         ]))
                         .step(H3Step::RespondData(Bytes::from_static(b"ok")))
                         // FIN the response, then keep its QUIC connection alive
@@ -5858,7 +5936,13 @@ async fn h3_response_via_matches_backend_protocol_for_stream_and_buffer() {
                 format!("1.1 upstream, {protocol} routing-test"),
                 "{protocol}/{body_mode}"
             );
-            assert!(!response.headers.contains_key("x-gateway-upstream-status"));
+            for owned in ["x-gateway-error", "x-gateway-upstream-status"] {
+                assert!(
+                    !response.headers.contains_key(owned),
+                    "{protocol}/{body_mode}: backend-forged {owned} reached the client: {:?}",
+                    response.headers
+                );
+            }
             drop((harness, h1, h2, h3));
         }
     }

@@ -37,7 +37,7 @@
 //! The envelope carries the same shape as a handler-layer protocol reject
 //! (`Content-Type: application/json`, a fixed `{"error":"..."}` body,
 //! `Connection: close`) and, like them, carries **no** `X-Gateway-Error`.
-//! That header is a closed seven-token client-facing vocabulary
+//! That header is a closed eight-token client-facing vocabulary
 //! ([`crate::retry::HTTP_OBSERVABILITY_ERROR_CLASSES`]) describing why a
 //! *backend* attempt failed; none of its tokens describes a client-caused
 //! `400`, so a parse reject names itself only in the log field and in the
@@ -399,7 +399,7 @@ impl<T: AsyncWrite + Unpin> H1FramingGuardIo<T> {
         }
         // `parse_reject_class` is a *log* field, deliberately not the
         // client-facing `X-Gateway-Error` header token: that header is a closed
-        // seven-token vocabulary and the envelope carries none of them (#4543).
+        // eight-token vocabulary and the envelope carries none of them (#4543).
         tracing::warn!(
             parse_reject_class = "request_error",
             parse_reject_hint = hint,
@@ -1782,7 +1782,7 @@ mod tests {
             JSON_MALFORMED_HTTP_REQUEST.as_bytes()
         );
 
-        // Issue #4543: `X-Gateway-Error` is a closed seven-token client-facing
+        // Issue #4543: `X-Gateway-Error` is a closed eight-token client-facing
         // vocabulary for backend-attempt failures. The parse-layer `400` is
         // client-caused and carries none of them, exactly like the
         // handler-layer protocol `400`s built by `build_response`.

@@ -1807,7 +1807,7 @@ where
                 stream,
                 ctx,
                 StatusCode::BAD_GATEWAY,
-                r#"{"error":"Bad Gateway"}"#,
+                crate::proxy::CONNECTION_POOL_CLIENT_ERROR_BODY,
                 None,
                 backend_start,
                 0,
@@ -2527,9 +2527,10 @@ fn mark_plain_route_backoff_expiry(ctx: &mut RequestContext) {
 /// Proxy core's route timeout `504` (#5646) for a plain request whose matched
 /// rule's total deadline expired while only the gateway was waiting: buffering
 /// the client upload, acquiring the backend client, or in retry backoff. No
-/// backend held the request, so it is health-neutral, and the transaction log
-/// names the phase (`before_dispatch` unless backoff already recorded
-/// `retry_backoff`). A gRPC-Web client's terminal is decorated through
+/// backend held the request, so it is health-neutral, carries the
+/// `request_timeout` `X-Gateway-Error` token, and the transaction log names the
+/// phase (`before_dispatch` unless backoff already recorded `retry_backoff`).
+/// A gRPC-Web client's terminal is decorated through
 /// [`write_plain_gateway_error_terminal`] (#5747).
 #[inline(never)]
 async fn write_plain_route_timeout<S>(
@@ -10957,7 +10958,9 @@ fn classify_hyper_error(e: &hyper::Error) -> ErrorClass {
 // Header helpers
 // ---------------------------------------------------------------------------
 
-fn collect_reqwest_response_headers(response: &reqwest::Response) -> HashMap<String, String> {
+pub(crate) fn collect_reqwest_response_headers(
+    response: &reqwest::Response,
+) -> HashMap<String, String> {
     let mut headers: HashMap<String, String> =
         HashMap::with_capacity(response.headers().keys_len());
     // RFC 9110 §7.6.1 also requires removing every header NAMED in the
@@ -11384,8 +11387,11 @@ where
         }
     };
     let mut headers = HashMap::new();
-    crate::proxy::insert_x_gateway_error_for_backend_failure(
+    // Context-aware so a route-deadline `504` no backend held reads
+    // `request_timeout`, as proxy core's builder does.
+    crate::proxy::apply_authoritative_gateway_error_header_for_response(
         &mut headers,
+        ctx,
         attempt_result.connection_error,
         status.as_u16(),
     );

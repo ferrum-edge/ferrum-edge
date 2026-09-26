@@ -51,13 +51,13 @@ use crate::proxy::grpc_proxy::{
 use crate::proxy::headers::{
     ClientResponseFraming, GatewayOwnedResponseHeader, GatewayOwnedResponseHeaders,
     PrePolicyResponseHeaders, RejectBodyDisposition, ResponseTrailerGovernance,
-    ResponseTrailerPolicyWitness, TrailerSectionKind, apply_response_headers,
-    is_backend_request_strip_header, is_proxy_owned_forwarding_header, is_untrusted_real_ip_header,
-    parse_connection_listed_from_str_map, preserved_response_content_length,
-    reconcile_backend_trailers_with_response_policy, reconcile_streaming_backend_trailers,
-    remove_content_length_header, sanitize_backend_request_trailers,
-    sanitize_client_response_headers_for_wire, strip_client_response_hop_by_hop_headers,
-    strip_response_hop_by_hop_trailers,
+    ResponseTrailerPolicyWitness, TrailerSectionKind, X_GATEWAY_UPSTREAM_STATUS_HEADER,
+    apply_response_headers, is_backend_request_strip_header, is_proxy_owned_forwarding_header,
+    is_untrusted_real_ip_header, parse_connection_listed_from_str_map,
+    preserved_response_content_length, reconcile_backend_trailers_with_response_policy,
+    reconcile_streaming_backend_trailers, remove_content_length_header,
+    sanitize_backend_request_trailers, sanitize_client_response_headers_for_wire,
+    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
@@ -7093,6 +7093,7 @@ async fn handle_h3_request(
                 // reject write.
                 let _ = send_h3_backend_failure_response(
                     &mut stream,
+                    &ctx,
                     reject_status,
                     reject_body,
                     outcome_connection_error,
@@ -9777,21 +9778,14 @@ async fn handle_h3_request(
             state.via_header_http3.as_deref(),
             &mut response_headers,
         );
-        if crate::proxy::apply_authoritative_backend_gateway_error_header(
+        // Context-aware token: an output-ceiling refusal reads `overload` and a
+        // route-deadline `504` no backend held reads `request_timeout`.
+        if crate::proxy::apply_authoritative_gateway_error_header_for_response(
             &mut response_headers,
+            &ctx,
             !h3_request_on_wire,
             response_status,
         ) {
-            gateway_owned_headers.insert(GatewayOwnedResponseHeader::GatewayError);
-        }
-        if ctx.response_transform_size_refusal_selected()
-            && let Some(value) = crate::proxy::x_gateway_error_for_response(
-                &ctx,
-                !h3_request_on_wire,
-                response_status,
-            )
-        {
-            crate::proxy::restore_authoritative_gateway_error_header(&mut response_headers, value);
             gateway_owned_headers.insert(GatewayOwnedResponseHeader::GatewayError);
         }
 
@@ -10568,15 +10562,19 @@ fn build_h3_backend_headers(
 /// Seal the gateway's routing headers after response hooks, before commitment.
 /// Return ownership for trailer reconciliation, including idempotent writes.
 /// Existing Via hops are retained before the gateway's configured hop.
+///
+/// `X-Gateway-Upstream-Status` is gateway-owned: any copy a backend or hook
+/// left in the map is removed on every response, and only the gateway's own
+/// `degraded` value is written back when this response used fallback routing.
 pub(crate) fn finalize_h3_response_routing_headers(
     is_fallback: bool,
     via: Option<&str>,
     headers: &mut HashMap<String, String>,
 ) -> GatewayOwnedResponseHeaders {
     let mut owned = GatewayOwnedResponseHeaders::default();
+    headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_UPSTREAM_STATUS_HEADER));
     if is_fallback {
-        headers.retain(|name, _| !name.eq_ignore_ascii_case("x-gateway-upstream-status"));
-        headers.insert("x-gateway-upstream-status".into(), "degraded".into());
+        headers.insert(X_GATEWAY_UPSTREAM_STATUS_HEADER.into(), "degraded".into());
         owned.insert(GatewayOwnedResponseHeader::GatewayUpstreamStatus);
     }
     if let Some(via) = via {
@@ -11103,6 +11101,7 @@ async fn proxy_to_backend_h3_refined_response(
             // after_proxy reject paths in `stream_h3_open_response_to_client`.
             let reject_sent = send_h3_backend_failure_response(
                 h3_stream,
+                ctx,
                 reject_status,
                 reject_body,
                 !request_on_wire,
@@ -15804,6 +15803,7 @@ async fn proxy_to_backend_h3_streaming(
             // after_proxy reject paths below.
             let reject_sent = send_h3_backend_failure_response(
                 h3_stream,
+                ctx,
                 reject_status,
                 reject_body,
                 !request_on_wire,
@@ -16528,18 +16528,26 @@ struct H3BufferedDispatchResult {
 /// failed `proxy_to_backend_h3` returns: proxy core's route timeout `504` for
 /// the total deadline (its transaction-log phase recorded), the ordinary
 /// backend-timeout `504` for an attempt budget. Like proxy core's route
-/// terminal it is not a connection error, so it carries the `backend_timeout`
-/// `X-Gateway-Error` token and a retry policy never treats it as pre-wire.
+/// terminal it is not a connection error, so a retry policy never treats it as
+/// pre-wire; its `X-Gateway-Error` token is `request_timeout` when no backend
+/// held the attempt and `backend_timeout` otherwise.
 fn h3_route_deadline_buffered_result(
     ctx: &mut RequestContext,
     expiry: crate::proxy::RouteDeadlineExpiry,
 ) -> H3BufferedDispatchResult {
     crate::http3::route_deadline::mark_expiry_phase(ctx, expiry);
     let (status, body) = crate::http3::route_deadline::expiry_status_body(expiry);
+    let mut headers = HashMap::new();
+    crate::proxy::apply_authoritative_gateway_error_header_for_response(
+        &mut headers,
+        ctx,
+        false,
+        status,
+    );
     H3BufferedDispatchResult {
         status,
         body: Bytes::from_static(body.as_bytes()),
-        headers: h3_backend_failure_headers(false, status),
+        headers,
         trailers: None,
         error_class: Some(crate::http3::route_deadline::expiry_error_class(expiry)),
         request_on_wire: true,
@@ -16548,13 +16556,22 @@ fn h3_route_deadline_buffered_result(
 
 /// The buffered result for a matched route rule's total deadline (#5646) that
 /// expired in the native retry loop's backoff: proxy core's route timeout
-/// `504`, health-neutral because no backend held the request then.
+/// `504` with the `request_timeout` token, health-neutral because no backend
+/// held the request then.
 fn h3_route_backoff_timeout_result(ctx: &mut RequestContext) -> H3BufferedDispatchResult {
     crate::http3::route_deadline::mark_backoff_expiry(ctx);
+    let status = StatusCode::GATEWAY_TIMEOUT.as_u16();
+    let mut headers = HashMap::new();
+    crate::proxy::apply_authoritative_gateway_error_header_for_response(
+        &mut headers,
+        ctx,
+        false,
+        status,
+    );
     H3BufferedDispatchResult {
-        status: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+        status,
         body: Bytes::from_static(crate::proxy::ROUTE_REQUEST_TIMEOUT_BODY.as_bytes()),
-        headers: h3_backend_failure_headers(false, StatusCode::GATEWAY_TIMEOUT.as_u16()),
+        headers,
         trailers: None,
         error_class: Some(crate::retry::ErrorClass::DispatchPolicyRejected),
         request_on_wire: true,
@@ -16821,13 +16838,17 @@ async fn send_h3_protocol_method_not_allowed(
 /// `X-Gateway-Error` token the H1/H2 builder attaches.
 async fn send_h3_backend_failure_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    ctx: &RequestContext,
     status: StatusCode,
     body: &str,
     connection_error: bool,
 ) -> Result<(), anyhow::Error> {
     let mut headers = HashMap::new();
-    crate::proxy::insert_x_gateway_error_for_backend_failure(
+    // Context-aware so a route-deadline `504` no backend held reads
+    // `request_timeout`, as proxy core's builder does.
+    crate::proxy::apply_authoritative_gateway_error_header_for_response(
         &mut headers,
+        ctx,
         connection_error,
         status.as_u16(),
     );
@@ -17412,15 +17433,16 @@ async fn finalize_h3_upload_deadline_rejection(
 const H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE: &str = "route_request_timeout_h3_upload";
 
 /// Proxy core's route timeout `504` (#5646) as a canonical gateway rejection:
-/// the fixed body and the `backend_timeout` `X-Gateway-Error` token. It names no
-/// route, rule, backend, or configured duration.
+/// the fixed body and the `request_timeout` `X-Gateway-Error` token, because
+/// the deadline expired while the gateway was still buffering the client
+/// upload and no backend held the request. It names no route, rule, backend,
+/// or configured duration.
 fn h3_route_upload_timeout_plugin_result() -> PluginResult {
     let mut headers = HashMap::with_capacity(2);
     headers.insert("content-type".to_string(), "application/json".to_string());
-    crate::proxy::insert_x_gateway_error_for_backend_failure(
-        &mut headers,
-        false,
-        StatusCode::GATEWAY_TIMEOUT.as_u16(),
+    headers.insert(
+        crate::proxy::X_GATEWAY_ERROR_HEADER.to_string(),
+        crate::proxy::X_GATEWAY_ERROR_REQUEST_TIMEOUT.to_string(),
     );
     PluginResult::Reject {
         status_code: StatusCode::GATEWAY_TIMEOUT.as_u16(),

@@ -4206,6 +4206,15 @@ async fn gateway_route_request_timeout_spans_retry_attempts_and_backoff() {
         .expect("deadline response");
     let elapsed = started.elapsed();
     assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    // No backend held the request when the budget ran out (#5762): the token
+    // must not blame one with `backend_timeout`.
+    assert_eq!(
+        response
+            .headers()
+            .get("x-gateway-error")
+            .and_then(|value| value.to_str().ok()),
+        Some("request_timeout")
+    );
     let body = response.text().await.unwrap();
     assert_eq!(body, r#"{"error":"Request timeout"}"#);
     assert!(

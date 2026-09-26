@@ -729,7 +729,7 @@ fn connection_listed_headers_if_present(headers: &http::HeaderMap) -> Vec<http::
     }
 }
 
-fn collect_h3_response_headers(source: &http::HeaderMap) -> HashMap<String, String> {
+pub(crate) fn collect_h3_response_headers(source: &http::HeaderMap) -> HashMap<String, String> {
     let mut headers: HashMap<String, String> = HashMap::with_capacity(source.keys_len());
     // RFC 9110 §7.6.1: snapshot the Connection-listed names before
     // iterating so any header NAMED in `Connection` is also skipped during

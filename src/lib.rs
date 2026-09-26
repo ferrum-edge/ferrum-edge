@@ -1879,6 +1879,125 @@ pub mod _test_support {
         )
     }
 
+    /// The single gateway-owned diagnostic response-header list every
+    /// dispatch path strips from backend responses (#5759).
+    pub fn gateway_owned_diagnostic_response_headers_for_test() -> &'static [&'static str] {
+        &crate::proxy::headers::GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS
+    }
+
+    /// Backend response headers as the H1/H2 reqwest and direct-hyper
+    /// (H2 pool, native gRPC) dispatch paths collect them.
+    pub fn collect_backend_response_headers_for_test(
+        source: &http::HeaderMap,
+    ) -> HashMap<String, String> {
+        let mut target = HashMap::new();
+        crate::proxy::collect_hyper_response_headers(source, &mut target);
+        target
+    }
+
+    /// Backend response headers as the native HTTP/3 pool collects them.
+    pub fn collect_h3_backend_response_headers_for_test(
+        source: &http::HeaderMap,
+    ) -> HashMap<String, String> {
+        crate::http3::client::collect_h3_response_headers(source)
+    }
+
+    /// Backend response headers as the HTTP/3 -> HTTP/1.1/HTTP/2 bridge
+    /// collects them from its reqwest response.
+    pub fn collect_h3_bridge_backend_response_headers_for_test(
+        response: &reqwest::Response,
+    ) -> HashMap<String, String> {
+        crate::http3::cross_protocol::collect_reqwest_response_headers(response)
+    }
+
+    /// The HTTP/3 routing-header seal every native-H3 and H3-bridge relay runs
+    /// before committing response headers.
+    pub fn finalize_h3_response_routing_headers_for_test(
+        is_fallback: bool,
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::http3::server::finalize_h3_response_routing_headers(is_fallback, None, headers);
+    }
+
+    /// The final client-facing `X-Gateway-Error` token for a response whose
+    /// transaction recorded route-deadline `phase` (`None`: no route deadline
+    /// expired), through the same context-aware classifier every HTTP-family
+    /// builder uses: `(classifier token, value the header writer left on a
+    /// map pre-seeded with a stale backend_timeout)`.
+    pub fn x_gateway_error_after_route_timeout_for_test(
+        phase: Option<&str>,
+        connection_error: bool,
+        status: u16,
+    ) -> (Option<&'static str>, Option<String>) {
+        use crate::proxy::{
+            ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH, ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH,
+            ROUTE_REQUEST_TIMEOUT_PHASE_RETRY_BACKOFF,
+        };
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        if let Some(phase) = phase {
+            ctx.mark_route_request_timeout_exceeded(match phase {
+                "dispatch" => ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH,
+                "before_dispatch" => ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH,
+                _ => ROUTE_REQUEST_TIMEOUT_PHASE_RETRY_BACKOFF,
+            });
+        }
+        let mut headers = HashMap::from([(
+            "X-Gateway-Error".to_string(),
+            "backend_timeout".to_string(),
+        )]);
+        crate::proxy::apply_authoritative_gateway_error_header_for_response(
+            &mut headers,
+            &ctx,
+            connection_error,
+            status,
+        );
+        let token = crate::proxy::x_gateway_error_for_response(&ctx, connection_error, status);
+        (token, headers.remove(crate::proxy::X_GATEWAY_ERROR_HEADER))
+    }
+
+    /// The pre-wire response for a reqwest connection-pool client that could
+    /// not be built, shared by the first attempt and the retry path.
+    pub fn connection_pool_client_error_response_for_test(
+        resolved_ip: Option<String>,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::connection_pool_client_error_response(resolved_ip)
+    }
+
+    /// One reqwest retry attempt (`proxy_to_backend_retry`) for a plain `GET`
+    /// with no body, upstream target, or plugins.
+    pub async fn proxy_to_backend_retry_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        backend_url: &str,
+    ) -> crate::retry::BackendResponse {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        crate::proxy::proxy_to_backend_retry(
+            state,
+            proxy,
+            backend_url,
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            true,
+            &[],
+            &ctx,
+            "127.0.0.1",
+            "127.0.0.1",
+            false,
+            hyper::Version::HTTP_11,
+        )
+        .await
+    }
+
     pub fn request_method_is_allowed_for_test(allowed: &[String], method: &str) -> bool {
         crate::proxy::request_method_is_allowed(allowed, method)
     }

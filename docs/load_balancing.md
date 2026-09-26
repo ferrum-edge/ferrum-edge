@@ -690,7 +690,7 @@ When proxying to upstream targets, the gateway adds response headers that help c
 ### `X-Gateway-Error`
 
 Set on 5xx responses to categorize the failure. This is the **stable
-client-facing contract** — a closed set of seven `&'static str` tokens.
+client-facing contract** — a closed set of eight `&'static str` tokens.
 Access-log `error_class` and `ferrum_requests_total{error_class}` use the
 **granular** `ErrorClass::as_str` spelling when a class exists
 (`dns_lookup_error`, `connection_refused`, `tls_error`, …) plus the four
@@ -702,12 +702,16 @@ The header is omitted on 2xx/3xx/4xx.
 | Value | Meaning |
 |-------|---------|
 | `connection_failure` | TCP connection refused, DNS resolution failure, TLS handshake error, or connect timeout — the gateway could not reach the backend at all |
-| `backend_timeout` | The backend accepted the connection but did not respond in time (504 Gateway Timeout) |
+| `backend_timeout` | A backend held the request (it accepted the connection and was sent the request) but did not respond in time (504 Gateway Timeout) |
 | `backend_error` | The backend returned a 5xx error response (500, 502, 503, etc.) |
 | `circuit_breaker_open` | The circuit breaker is open; the gateway returned 503 without contacting a backend |
 | `overload` | Overload manager or drain `reject_new_requests`; the gateway returned 503 without contacting a backend |
 | `config_stale` | Data-plane stale-config fence; the gateway returned 503 without contacting a backend |
 | `concurrency_limit` | `adaptive_concurrency` admission shed; the gateway returned 503 without contacting a backend |
+| `request_timeout` | A matched route rule's total request deadline expired before any backend held the request (client upload, gateway-local phases, admission, or retry backoff); the gateway returned 504 |
+
+`request_timeout` is distinct from `backend_timeout`: no backend saw the
+request, so on-call should not look for it in backend logs.
 
 `circuit_breaker_open`, `overload`, `config_stale`, and `concurrency_limit` are
 distinct from `backend_error`. Those 503s never reached a backend, so reusing
@@ -722,6 +726,12 @@ stale-config fences are unchanged (they do not carry `X-Gateway-Error`).
 | Value | Meaning |
 |-------|---------|
 | `degraded` | All targets in the upstream were marked unhealthy. The request was routed via the all-unhealthy fallback path — the selected target may still be failing |
+
+Both headers are gateway-owned. On every protocol and dispatch path, the
+gateway strips a backend-supplied copy (header or trailer) before it writes its
+own value, so a backend cannot forge either one. They are not authenticated,
+so trust them only on a response from a gateway you authenticated. See
+[error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
 
 **Example: connection failure**
 ```
@@ -760,6 +770,12 @@ HTTP/1.1 503 Service Unavailable
 X-Gateway-Error: concurrency_limit
 ```
 
+**Example: route request deadline spent before any backend held the request**
+```
+HTTP/1.1 504 Gateway Timeout
+X-Gateway-Error: request_timeout
+```
+
 **Example: successful response (no error headers)**
 ```
 HTTP/1.1 200 OK
@@ -770,7 +786,7 @@ HTTP/1.1 200 OK
 - **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`). Alert on `circuit_breaker_open` to detect a tripped breaker rather than a live backend 5xx (`backend_error`). Alert on `overload`, `config_stale`, and `concurrency_limit` to distinguish gateway-authored sheds from backend 503s. PromQL on `ferrum_requests_total{error_class}` uses the granular spelling (`dns_lookup_error` vs `connection_refused` vs `read_write_timeout`) plus the five gateway-authored tokens; it does **not** emit `connection_failure` or `backend_timeout`, and it emits `backend_error` only for a backend 5xx the gateway never classified.
 - **Client-side retry**: Clients can decide whether to retry based on the error type — connection failures may resolve quickly, while backend errors suggest the service itself is unhealthy.
 - **Dashboards**: Track `X-Gateway-Upstream-Status: degraded` to monitor when upstreams are operating in fallback mode.
-- **Distinguishing gateway vs. backend issues**: A `backend_error` means the backend returned a 5xx — the issue is with the backend. A `connection_failure` means the gateway couldn't reach the backend — the issue may be network, DNS, or the backend process is down. A `circuit_breaker_open`, `overload`, `config_stale`, or `concurrency_limit` means the gateway short-circuited the request locally.
+- **Distinguishing gateway vs. backend issues**: A `backend_error` means the backend returned a 5xx — the issue is with the backend. A `connection_failure` means the gateway couldn't reach the backend — the issue may be network, DNS, or the backend process is down. A `circuit_breaker_open`, `overload`, `config_stale`, or `concurrency_limit` means the gateway short-circuited the request locally. A `request_timeout` means the route's total deadline ran out before any backend held the request.
 
 ## Retry Logic
 
