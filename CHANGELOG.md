@@ -577,6 +577,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status, as HTTP/1.1 and HTTP/2 do, so hooks can no longer see, replace,
   duplicate, or erase the token. A hook-set non-5xx status without a connection
   error carries no token, matching HTTP/1.1 and HTTP/2 (#5807).
+- Streamed pass-through gRPC-Web uploads now count request messages on their
+  decoded frames, as the buffered arms do. A `grpc-web-text` upload is decoded
+  from base64 across chunk boundaries, including concatenated padded segments,
+  instead of reporting 0 messages. A binary upload's trailer frame is no longer
+  counted as a message. This covers the native gRPC dispatch, the reqwest,
+  direct-H2, HBONE, Unix and mesh-mTLS upload adapters, and the native HTTP/3
+  backend upload paths (#5807).
 
 ### Security
 

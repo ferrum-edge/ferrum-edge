@@ -4583,16 +4583,18 @@ pub async fn proxy_grpc_request_streaming(
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
-    grpc_request_messages: Option<Arc<AtomicU64>>,
+    grpc_request_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
     request_bytes: Option<GrpcUploadByteAccounting>,
     auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
+    // The tap's scanner reads the upload's own framing (a pass-through
+    // gRPC-Web upload counts decoded message frames only).
     let (grpc_messages, grpc_scanner) = match grpc_request_messages {
-        Some(messages) => (
-            Some(messages),
-            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default()),
-        ),
+        Some(tap) => {
+            let (messages, scanner) = tap.into_parts();
+            (Some(messages), Some(scanner))
+        }
         None => (None, None),
     };
     // Authorization lifetime for the fully-streamed native-gRPC upload (issue

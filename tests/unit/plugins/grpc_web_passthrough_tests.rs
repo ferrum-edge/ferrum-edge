@@ -23,12 +23,14 @@ use ferrum_edge::_test_support::{
     record_backend_response_grpc_message_count_for_test,
     record_captured_request_grpc_message_count_for_test,
     record_grpc_web_passthrough_status_for_test, record_request_grpc_message_count_for_test,
-    request_stream_observes_native_grpc_messages_for_test,
+    request_stream_grpc_messages_for_test, request_upload_grpc_message_framing_for_test,
     request_uploads_passthrough_grpc_web_text_for_test,
     retain_grpc_web_client_content_type_for_test, set_request_grpc_web_upload_for_test,
 };
 use ferrum_edge::plugins::TransactionSummary;
-use ferrum_edge::plugins::mesh::prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA;
+use ferrum_edge::plugins::mesh::prometheus_helpers::{
+    GrpcMessageFraming, MESH_PROMETHEUS_METRICS_OBSERVED_METADATA,
+};
 use ferrum_edge::proxy::body::ProxyBodyError;
 use futures_util::stream;
 use http::{HeaderMap, HeaderValue};
@@ -542,14 +544,23 @@ fn passthrough_request_messages_follow_the_upload_framing() {
             2,
             "text_mode={text_mode}: the captured counter counts the same frames"
         );
-        // Streamed: the native scanner reads binary framing, never base64.
+        // Streamed: the tap scans the upload's own framing, fed one byte at a
+        // time, and likewise skips the trailer frame and the base64 armour.
+        let mut streamed = observing_request_context();
+        set_request_grpc_web_upload_for_test(&mut streamed, text_mode);
+        let chunks: Vec<&[u8]> = wire.chunks(1).collect();
         assert_eq!(
-            request_stream_observes_native_grpc_messages_for_test(&ctx),
-            !text_mode,
+            request_stream_grpc_messages_for_test(&streamed, &chunks),
+            Some(2),
             "text_mode={text_mode}"
         );
-        // The native dispatch's streamed arm withholds its counter from a
-        // base64 upload whether or not a metrics plugin observes it.
+        assert_eq!(
+            request_upload_grpc_message_framing_for_test(&streamed),
+            GrpcMessageFraming::grpc_web(text_mode),
+            "text_mode={text_mode}"
+        );
+        // Framing is decided by the upload alone, whether or not a metrics
+        // plugin observes it.
         let mut unobserved = create_test_context();
         set_request_grpc_web_upload_for_test(&mut unobserved, text_mode);
         for ctx in [&ctx, &unobserved] {
@@ -570,20 +581,30 @@ fn native_and_translated_request_messages_keep_the_native_scanner() {
     let ctx = observing_request_context();
     let counted = record_request_grpc_message_count_for_test(&ctx, &native);
     assert_eq!(counted, 2);
-    let scanned = request_stream_observes_native_grpc_messages_for_test(&ctx);
-    assert!(scanned);
+    let streamed = observing_request_context();
+    let scanned = request_stream_grpc_messages_for_test(&streamed, &[&native]);
+    assert_eq!(scanned, Some(2));
+    let framing = request_upload_grpc_message_framing_for_test(&streamed);
+    assert_eq!(framing, GrpcMessageFraming::Native);
 
     // A translated text upload reaches the backend decoded, so the native
     // scanner counts it on both paths.
-    let mut translated = observing_request_context();
-    set_request_grpc_web_upload_for_test(&mut translated, true);
-    translated
-        .metadata
-        .insert("grpc_web_mode".to_string(), "text".to_string());
+    let translated_context = || {
+        let mut translated = observing_request_context();
+        set_request_grpc_web_upload_for_test(&mut translated, true);
+        translated
+            .metadata
+            .insert("grpc_web_mode".to_string(), "text".to_string());
+        translated
+    };
+    let translated = translated_context();
     let counted = record_request_grpc_message_count_for_test(&translated, &native);
     assert_eq!(counted, 2);
-    let scanned = request_stream_observes_native_grpc_messages_for_test(&translated);
-    assert!(scanned);
+    let streamed = translated_context();
+    let scanned = request_stream_grpc_messages_for_test(&streamed, &[&native]);
+    assert_eq!(scanned, Some(2));
+    let framing = request_upload_grpc_message_framing_for_test(&streamed);
+    assert_eq!(framing, GrpcMessageFraming::Native);
     assert!(!request_uploads_passthrough_grpc_web_text_for_test(&ctx));
     assert!(!request_uploads_passthrough_grpc_web_text_for_test(
         &translated
@@ -594,8 +615,8 @@ fn native_and_translated_request_messages_keep_the_native_scanner() {
     set_request_grpc_web_upload_for_test(&mut unobserved, false);
     let counted = record_request_grpc_message_count_for_test(&unobserved, &grpc_web_upload());
     assert_eq!(counted, 0);
-    let scanned = request_stream_observes_native_grpc_messages_for_test(&unobserved);
-    assert!(!scanned);
+    let scanned = request_stream_grpc_messages_for_test(&unobserved, &[&grpc_web_upload()]);
+    assert_eq!(scanned, None);
 }
 
 /// The H1/H2 and H3 frontends stamp the upload's framing from the request's
