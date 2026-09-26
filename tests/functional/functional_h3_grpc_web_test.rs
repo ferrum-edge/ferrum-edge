@@ -1685,7 +1685,10 @@ async fn h3_grpc_web_passthrough_is_byte_identical_and_logs_the_backend_status()
         .into_iter()
         .filter(|(flag, _)| *flag == 0x80)
         .count();
-    assert_eq!(translated_trailers, 1, "translation emits one trailer frame");
+    assert_eq!(
+        translated_trailers, 1,
+        "translation emits one trailer frame"
+    );
 
     let expected = [
         ("h3-passthrough-binary", 7),

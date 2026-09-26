@@ -71,10 +71,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client byte for byte, binary and text, with no synthesized trailer frame;
   the gateway still frames its own deadline and authorization-expiry
   terminals as gRPC-Web. The transaction log's `grpc_status` for these calls
-  is now read from the backend's final trailer frame on HTTP/1.1, HTTP/2 and
-  HTTP/3, streamed or buffered, instead of defaulting to `UNKNOWN` (2), and a
-  non-OK status there feeds backend outcome accounting the way native gRPC
-  trailers do. Translated gRPC-Web keeps reading its status from the
+  is now read from the backend's final trailer frame instead of defaulting to
+  `UNKNOWN` (2): on HTTP/1.1 and HTTP/2, streamed or buffered, and on the
+  HTTP/3 cross-protocol and native HTTP/3 relays, streamed or buffered. The
+  HTTP/3 mesh-egress buffered bridge is not covered yet. A non-OK status there
+  feeds backend outcome accounting the way native gRPC trailers do, including
+  when the body is dropped after its final frame without a transaction
+  logger. A final frame that is present but unreadable (a compressed `0x81`
+  trailer frame, or a body under an HTTP `Content-Encoding`) leaves
+  `grpc_status` unset rather than `UNKNOWN`, and
+  `metadata.grpc_status_unreadable` names why (`compressed_trailer_frame` or
+  `content_encoded_body`); only a body with no final trailer frame at all is
+  still `UNKNOWN`. Translated gRPC-Web keeps reading its status from the
   backend's HTTP/2 trailers.
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,

@@ -8343,21 +8343,32 @@ impl TransactionSummary {
     /// HTTP transport status. Missing or malformed terminal status on a known
     /// gRPC transaction remains a failure: missing is UNKNOWN (2), while
     /// malformed input uses the existing `u32::MAX` invalid-status sentinel.
+    /// A status that is present on the wire but unreadable by the gateway
+    /// ([`crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY`]) is
+    /// not missing, so it stays `None` rather than UNKNOWN.
     /// Translated gRPC-Web requests are stamped as `request_protocol="grpc"`
     /// by the H1/H2 and H3 dispatchers; no runtime path currently produces
     /// `request_protocol="grpc-web"` (mesh uses `mesh.request_protocol`).
     pub fn grpc_status(&self) -> Option<u32> {
         match self.metadata.get("grpc_status") {
             Some(status) => Some(crate::proxy::grpc_proxy::parse_grpc_status_value(status)),
-            None if self
-                .metadata
-                .get("request_protocol")
-                .is_some_and(|protocol| protocol == "grpc") =>
-            {
+            None if self.grpc_status_missing() => {
                 Some(crate::proxy::grpc_proxy::grpc_status::UNKNOWN)
             }
             None => None,
         }
+    }
+
+    /// Whether this is a gRPC transaction whose terminal status never reached
+    /// the log. A status present on the wire but unreadable by the gateway is
+    /// not missing.
+    fn grpc_status_missing(&self) -> bool {
+        let is_grpc = self
+            .metadata
+            .get("request_protocol")
+            .is_some_and(|protocol| protocol == "grpc");
+        let unreadable = crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY;
+        is_grpc && !self.metadata.contains_key(unreadable)
     }
 
     /// Gateway-authored rejection phase (`circuit_breaker_open`,
@@ -8477,6 +8488,7 @@ impl TransactionSummary {
         for key in [
             "request_protocol",
             "grpc_status",
+            crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY,
             "grpc_message",
             "rejection_phase",
             "mirror_error",

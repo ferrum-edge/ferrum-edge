@@ -36275,13 +36275,14 @@ async fn handle_proxy_request_inner(
                 // Pass-through gRPC-Web: no translator rewrote the request, so
                 // the backend answers in gRPC-Web itself and its body, trailer
                 // frame included, reaches the client unchanged. The pristine
-                // content type names the framing that frame is read in.
-                let grpc_web_passthrough_text_mode = grpc_web_response_content_type
+                // headers name the framing that frame is read in.
+                let grpc_web_passthrough_framing = grpc_web_response_content_type
                     .filter(|_| !grpc_request_is_web_translated)
-                    .and_then(|_| {
-                        crate::plugins::grpc_web::passthrough_response_text_mode(
+                    .map(|content_type| {
+                        crate::plugins::grpc_web::passthrough_response_framing_or(
                             &ctx,
-                            response_headers.get("content-type").map(String::as_str),
+                            &response_headers,
+                            content_type,
                         )
                     });
                 let mut grpc_recorder_owns_ended_response = false;
@@ -36443,11 +36444,24 @@ async fn handle_proxy_request_inner(
                 // Seed deferred metadata from the final client-visible headers.
                 // The snapshot restore above protects a true Trailers-Only status;
                 // a later real trailer on an open stream remains authoritative.
-                grpc_proxy::refresh_grpc_status_metadata(
-                    &mut ctx.metadata,
-                    &EMPTY_HEADERS,
-                    &response_headers,
-                );
+                // A pass-through gRPC-Web status rides the body's own trailer
+                // frame, read when the body ends, so only a header-borne status
+                // is seeded for it: a provisional UNKNOWN would outlive a final
+                // frame that is present but unreadable.
+                if grpc_web_passthrough_framing.is_none() {
+                    grpc_proxy::refresh_grpc_status_metadata(
+                        &mut ctx.metadata,
+                        &EMPTY_HEADERS,
+                        &response_headers,
+                    );
+                } else if let Some(grpc_status) =
+                    grpc_proxy::grpc_status_from_maps(&EMPTY_HEADERS, &response_headers)
+                {
+                    ctx.metadata
+                        .insert("grpc_status".to_string(), grpc_status.to_string());
+                } else {
+                    ctx.metadata.remove("grpc_status");
+                }
 
                 // Gateway API session persistence on the FULLY-STREAMING native
                 // gRPC fast path. This arm commits its HEADERS frame and returns
@@ -36990,15 +37004,12 @@ async fn handle_proxy_request_inner(
                                 &ctx,
                             ),
                         )
-                    } else {
+                    } else if let Some(framing) = grpc_web_passthrough_framing {
                         // Pass-through: forward the backend's gRPC-Web body and
                         // its own trailer frame unchanged; never append one.
-                        body.into_grpc_web_passthrough_streaming(
-                            grpc_web_passthrough_text_mode.unwrap_or_else(|| {
-                                crate::plugins::grpc_web::is_grpc_web_text(content_type)
-                            }),
-                            grpc_streaming.status,
-                        )
+                        body.into_grpc_web_passthrough_streaming(framing, grpc_streaming.status)
+                    } else {
+                        body
                     };
                 }
                 if let Some(logger) = deferred_grpc_logger {
@@ -37565,21 +37576,24 @@ async fn handle_proxy_request_inner(
                 // Pass-through gRPC-Web carries its terminal status in the
                 // backend's own body trailer frame, which the client receives
                 // unchanged, so neither map names it. Read it from the body the
-                // client will see instead of reporting a synthesized UNKNOWN.
+                // client will see instead of reporting a synthesized UNKNOWN; a
+                // frame the gateway cannot read leaves the status unset. The
+                // body frame replaces any status the pristine maps named before
+                // the hooks ran.
                 if !terminal_metadata_is_body_framed
                     && grpc_web_response_content_type.is_some()
                     && !grpc_request_is_web_translated
                     && grpc_proxy::grpc_status_from_maps(&response_trailers, &response_headers)
                         .is_none()
-                    && let Some(grpc_status) =
+                    && let Some(passthrough) =
                         crate::plugins::grpc_web::passthrough_body_trailer_status(
                             &ctx,
-                            response_headers.get("content-type").map(String::as_str),
+                            &response_headers,
                             &response_body,
                         )
                 {
-                    ctx.metadata
-                        .insert("grpc_status".to_string(), grpc_status.to_string());
+                    ctx.metadata.remove("grpc_status");
+                    passthrough.record(&mut ctx.metadata);
                     terminal_metadata_is_body_framed = true;
                 }
                 // Health/circuit-breaker accounting intentionally retains the
@@ -40285,20 +40299,20 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH3(_)
     );
     // A buffered pass-through gRPC-Web response carries its terminal status in
-    // the backend's own body trailer frame, which reaches the client unchanged.
-    // A gateway-authored terminal has already recorded its own status.
+    // the backend's own body trailer frame, which reaches the client unchanged;
+    // a frame the gateway cannot read leaves the status unset rather than
+    // UNKNOWN. A gateway-authored terminal has already recorded its own status.
     if grpc_web_request
         && !grpc_request_is_web_translated
         && !ctx.metadata.contains_key("grpc_status")
-        && let ResponseBody::Buffered(body) = &response_body
-        && let Some(grpc_status) = crate::plugins::grpc_web::passthrough_body_trailer_status(
+        && let ResponseBody::Buffered(buffered) = &response_body
+        && let Some(passthrough) = crate::plugins::grpc_web::passthrough_body_trailer_status(
             &ctx,
-            response_headers.get("content-type").map(String::as_str),
-            body,
+            &response_headers,
+            buffered,
         )
     {
-        ctx.metadata
-            .insert("grpc_status".to_string(), grpc_status.to_string());
+        passthrough.record(&mut ctx.metadata);
     }
     // Native H3 needs the backend's declared length to distinguish a complete
     // body followed by a graceful QUIC close from truncation. Use the
@@ -40619,17 +40633,12 @@ async fn handle_proxy_request_inner(
     // Pass-through gRPC-Web: the backend answers in gRPC-Web itself, so its
     // body and its own trailer frame are relayed unchanged and only that frame's
     // status is read for logging and outcome classification.
-    let grpc_web_passthrough_text_mode = if body_will_stream
-        && grpc_web_request
-        && !grpc_request_is_web_translated
-    {
-        crate::plugins::grpc_web::passthrough_response_text_mode(
-            &ctx,
-            response_headers.get("content-type").map(String::as_str),
-        )
-    } else {
-        None
-    };
+    let grpc_web_passthrough_framing =
+        if body_will_stream && grpc_web_request && !grpc_request_is_web_translated {
+            crate::plugins::grpc_web::passthrough_response_framing(&ctx, &response_headers)
+        } else {
+            None
+        };
 
     // Build final response
     let mut resp_builder = Response::builder()
@@ -41439,10 +41448,10 @@ async fn handle_proxy_request_inner(
             Some(initial_terminal_metadata),
             crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
         )
-    } else if let Some(text_mode) = grpc_web_passthrough_text_mode {
+    } else if let Some(framing) = grpc_web_passthrough_framing {
         // Pass-through gRPC-Web: the backend's body and its own trailer frame
         // reach the client unchanged; the relay only reads that frame's status.
-        body.into_grpc_web_passthrough_streaming(text_mode, response_status)
+        body.into_grpc_web_passthrough_streaming(framing, response_status)
     } else {
         body
     };

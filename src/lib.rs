@@ -12266,7 +12266,38 @@ pub mod _test_support {
         text_mode: bool,
         http_status: u16,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_passthrough_streaming(text_mode, http_status)
+        let framing = crate::plugins::grpc_web::PassthroughFraming {
+            text_mode,
+            content_encoded: false,
+        };
+        body.into_grpc_web_passthrough_streaming(framing, http_status)
+    }
+
+    /// [`proxy_body_into_grpc_web_passthrough_streaming_for_test`] with the
+    /// framing read from the backend's response headers, as the H1/H2 funnels
+    /// derive it (a `content-encoding` header hides the trailer frame).
+    pub fn proxy_body_into_grpc_web_passthrough_streaming_with_headers_for_test(
+        body: crate::proxy::ProxyBody,
+        text_mode: bool,
+        response_headers: &HashMap<String, String>,
+        http_status: u16,
+    ) -> crate::proxy::ProxyBody {
+        let framing = crate::plugins::grpc_web::PassthroughFraming::from_response(
+            text_mode,
+            response_headers,
+        );
+        body.into_grpc_web_passthrough_streaming(framing, http_status)
+    }
+
+    /// Hold `permits` on `body` with gRPC trailer classification, exactly as
+    /// the native gRPC streaming funnel does before its gRPC-Web wrapper.
+    pub fn proxy_body_with_grpc_admission_outcome_for_test(
+        body: crate::proxy::ProxyBody,
+        permits: crate::plugins::BackendAdmissionPermitSet,
+        response_status: u16,
+    ) -> crate::proxy::ProxyBody {
+        body.with_deferred_backend_admission_outcome(permits, response_status, Duration::ZERO)
+            .with_grpc_trailer_admission_classification()
     }
 
     /// Feed `chunks`, in order, to the pass-through gRPC-Web trailer observer
@@ -12279,6 +12310,32 @@ pub mod _test_support {
         observer.status()
     }
 
+    /// Feed `chunks` to the pass-through gRPC-Web trailer observer and return
+    /// its full outcome: `Ok(status)` for a readable final trailer frame,
+    /// `Err(reason)` for one present but unreadable, `None` for no final
+    /// trailer frame naming a status.
+    pub fn grpc_web_trailer_outcome_for_test(
+        chunks: &[&[u8]],
+        text_mode: bool,
+    ) -> Option<Result<u32, &'static str>> {
+        let mut observer = crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::new(text_mode);
+        for chunk in chunks {
+            observer.push(chunk);
+        }
+        observer.outcome().map(grpc_web_passthrough_outcome_for_test)
+    }
+
+    fn grpc_web_passthrough_outcome_for_test(
+        outcome: crate::plugins::grpc_web::PassthroughGrpcStatus,
+    ) -> Result<u32, &'static str> {
+        match outcome {
+            crate::plugins::grpc_web::PassthroughGrpcStatus::Status(code) => Ok(code),
+            crate::plugins::grpc_web::PassthroughGrpcStatus::Unreadable(reason) => {
+                Err(reason.as_str())
+            }
+        }
+    }
+
     pub fn grpc_web_passthrough_response_text_mode_for_test(
         ctx: &crate::plugins::RequestContext,
         response_content_type: Option<&str>,
@@ -12286,12 +12343,31 @@ pub mod _test_support {
         crate::plugins::grpc_web::passthrough_response_text_mode(ctx, response_content_type)
     }
 
+    /// The terminal status a complete pass-through gRPC-Web body carries, as
+    /// the buffered response paths read it: `Ok(status)`, `Err(reason)` for a
+    /// status present but unreadable, `None` when not pass-through or absent.
     pub fn grpc_web_passthrough_body_trailer_status_for_test(
         ctx: &crate::plugins::RequestContext,
-        response_content_type: Option<&str>,
+        response_headers: &HashMap<String, String>,
         body: &[u8],
-    ) -> Option<u32> {
-        crate::plugins::grpc_web::passthrough_body_trailer_status(ctx, response_content_type, body)
+    ) -> Option<Result<u32, &'static str>> {
+        crate::plugins::grpc_web::passthrough_body_trailer_status(ctx, response_headers, body)
+            .map(grpc_web_passthrough_outcome_for_test)
+    }
+
+    /// Record a pass-through body's terminal status into `metadata` exactly as
+    /// the buffered response paths do.
+    pub fn record_grpc_web_passthrough_status_for_test(
+        ctx: &crate::plugins::RequestContext,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+        metadata: &mut HashMap<String, String>,
+    ) {
+        if let Some(passthrough) =
+            crate::plugins::grpc_web::passthrough_body_trailer_status(ctx, response_headers, body)
+        {
+            passthrough.record(metadata);
+        }
     }
 
     pub fn take_streaming_initial_terminal_metadata_for_test(

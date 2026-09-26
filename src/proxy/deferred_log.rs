@@ -58,6 +58,11 @@ pub struct BodyOutcome {
     /// separate from the HTTP response status because gRPC application
     /// failures normally complete under HTTP 200.
     pub grpc_status: Option<u32>,
+    /// Bounded, fixed-cardinality reason a terminal gRPC status is present on
+    /// the wire but unreadable by the gateway (a pass-through gRPC-Web body
+    /// ending on a compressed trailer frame, or a content-encoded one). The
+    /// logged status then stays unset instead of defaulting to UNKNOWN.
+    pub grpc_status_unreadable: Option<&'static str>,
     /// Bounded authorization-lifetime termination class when the body ended
     /// because the accepted credential's deadline (or the finite
     /// authenticated-stream maximum) elapsed. A compiled-in literal from
@@ -75,6 +80,7 @@ impl BodyOutcome {
             bytes_streamed,
             client_disconnected: false,
             grpc_status: None,
+            grpc_status_unreadable: None,
             authorization_termination: None,
         }
     }
@@ -88,6 +94,7 @@ impl BodyOutcome {
             bytes_streamed,
             client_disconnected,
             grpc_status: None,
+            grpc_status_unreadable: None,
             authorization_termination: None,
         }
     }
@@ -101,12 +108,23 @@ impl BodyOutcome {
             bytes_streamed,
             client_disconnected: true,
             grpc_status: None,
+            grpc_status_unreadable: None,
             authorization_termination: None,
         }
     }
 
     pub fn with_grpc_status(mut self, grpc_status: Option<u32>) -> Self {
         self.grpc_status = grpc_status;
+        self
+    }
+
+    /// Record why a terminal gRPC status present on the wire could not be read
+    /// (see [`Self::grpc_status_unreadable`]).
+    pub(crate) fn with_grpc_status_unreadable(
+        mut self,
+        reason: Option<crate::plugins::grpc_web::GrpcWebTrailerUnreadable>,
+    ) -> Self {
+        self.grpc_status_unreadable = reason.map(|reason| reason.as_str());
         self
     }
 
@@ -192,7 +210,9 @@ impl CompactTerminal {
     fn record(&self, outcome: &BodyOutcome) {
         crate::runtime_metrics::global_ref().record_terminal_outcome(TerminalOutcome {
             proxy_id: Some(self.proxy_id.as_str()),
-            grpc: self.grpc || outcome.grpc_status.is_some(),
+            grpc: self.grpc
+                || outcome.grpc_status.is_some()
+                || outcome.grpc_status_unreadable.is_some(),
             error_class: self.error_class,
             body_error_class: outcome.body_error_class,
             client_disconnected: outcome.client_disconnected,
@@ -486,6 +506,14 @@ impl DeferredTransactionLogger {
         if let Some(grpc_status) = outcome.grpc_status {
             ctx.metadata
                 .insert("grpc_status".to_string(), grpc_status.to_string());
+        } else if let Some(reason) = outcome.grpc_status_unreadable {
+            // The body carried a terminal status the gateway cannot read, so
+            // it is not missing: leave `grpc_status` unset (a Trailers-Only
+            // header status already captured still stands) and name why.
+            ctx.metadata.insert(
+                crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY.to_string(),
+                reason.to_string(),
+            );
         } else if request_protocol_is_grpc {
             // A gRPC stream that ends without terminal status is UNKNOWN, not
             // an unqualified successful HTTP 200. Preserve a Trailers-Only

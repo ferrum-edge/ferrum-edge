@@ -5877,11 +5877,15 @@ where
         let bytes_streamed = response_body.len() as u64;
         // Read before the body moves into the write: a pass-through gRPC-Web
         // response carries its status in the backend's own trailer frame.
-        let passthrough_grpc_status = crate::plugins::grpc_web::passthrough_body_trailer_status(
-            ctx,
-            response_headers.get("content-type").map(String::as_str),
-            &response_body,
-        );
+        let passthrough_grpc_status = if ctx.request_is_grpc_web() {
+            crate::plugins::grpc_web::passthrough_body_trailer_status(
+                ctx,
+                &response_headers,
+                &response_body,
+            )
+        } else {
+            None
+        };
         let buffered_write = async {
             if !response_body.is_empty() {
                 stream.send_data(response_body).await?;
@@ -5954,12 +5958,9 @@ where
             }
         };
 
-        if body_completed
-            && !ctx.metadata.contains_key("grpc_status")
-            && let Some(grpc_status) = passthrough_grpc_status
-        {
-            ctx.metadata
-                .insert("grpc_status".to_string(), grpc_status.to_string());
+        // A gateway-authored terminal keeps the status it recorded.
+        if body_completed && let Some(passthrough) = passthrough_grpc_status {
+            passthrough.record(&mut ctx.metadata);
         }
         return Ok(CrossProtocolOutcome {
             response_status,
@@ -6228,10 +6229,11 @@ where
     // Pass-through gRPC-Web: the backend's body, trailer frame included, is
     // relayed unchanged. The relay reads that frame so the transaction log
     // records the status the client received instead of a synthesized UNKNOWN.
-    let mut grpc_web_passthrough = crate::plugins::grpc_web::passthrough_trailer_status_observer(
-        ctx,
-        response_headers.get("content-type").map(String::as_str),
-    );
+    let mut grpc_web_passthrough = if ctx.request_is_grpc_web() {
+        crate::plugins::grpc_web::passthrough_trailer_status_observer(ctx, &response_headers)
+    } else {
+        None
+    };
     let stream_response = async {
         if let Some(inspector) = response_inspector {
             stream_inspected_reqwest_response(
@@ -6309,12 +6311,12 @@ where
     if let Some(termination) = auth_termination {
         ctx.latch_authorization_termination(termination);
     }
+    // A gateway-authored terminal keeps the status it recorded.
     let grpc_web_passthrough_status = grpc_web_passthrough
         .as_deref()
-        .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::status);
-    if body_completed && let Some(grpc_status) = grpc_web_passthrough_status {
-        ctx.metadata
-            .insert("grpc_status".to_string(), grpc_status.to_string());
+        .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::outcome);
+    if body_completed && let Some(passthrough) = grpc_web_passthrough_status {
+        passthrough.record(&mut ctx.metadata);
     }
 
     // A route deadline cut is the route's own total-duration policy, not

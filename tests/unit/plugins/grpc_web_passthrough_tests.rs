@@ -5,16 +5,21 @@
 //! the client receives, so the relay must not append a synthesized one, and the
 //! logged `grpc_status` must come from that frame.
 
+use std::collections::HashMap;
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     GRPC_FRAME_TRAILER, grpc_web_passthrough_body_trailer_status_for_test,
-    grpc_web_passthrough_response_text_mode_for_test, grpc_web_trailer_status_for_test,
-    parse_grpc_frames, proxy_body_into_grpc_web_passthrough_streaming_for_test,
+    grpc_web_passthrough_response_text_mode_for_test, grpc_web_trailer_outcome_for_test,
+    grpc_web_trailer_status_for_test, parse_grpc_frames,
+    proxy_body_into_grpc_web_passthrough_streaming_for_test,
     proxy_body_into_grpc_web_streaming_for_test, proxy_body_streaming_for_test,
-    proxy_body_with_client_grpc_deadline_for_test, retain_grpc_web_client_content_type_for_test,
+    proxy_body_with_client_grpc_deadline_for_test, record_grpc_web_passthrough_status_for_test,
+    retain_grpc_web_client_content_type_for_test,
 };
+use ferrum_edge::plugins::TransactionSummary;
 use ferrum_edge::proxy::body::ProxyBodyError;
 use futures_util::stream;
 use http::{HeaderMap, HeaderValue};
@@ -57,6 +62,10 @@ async fn collect(mut body: ferrum_edge::proxy::ProxyBody) -> (Vec<u8>, Option<He
         }
     }
     (data, trailers)
+}
+
+fn response_headers(content_type: &str) -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), content_type.to_string())])
 }
 
 fn source(frames: Vec<Frame<Bytes>>) -> ferrum_edge::proxy::ProxyBody {
@@ -192,7 +201,7 @@ fn passthrough_classification_excludes_translated_and_non_grpc_web_requests() {
     assert_eq!(
         grpc_web_passthrough_body_trailer_status_for_test(
             &ctx,
-            Some("application/grpc-web+proto"),
+            &response_headers("application/grpc-web+proto"),
             &backend_body(b"grpc-status: 7\r\n"),
         ),
         None
@@ -206,19 +215,194 @@ fn passthrough_buffered_body_status_uses_the_response_framing() {
     assert_eq!(
         grpc_web_passthrough_body_trailer_status_for_test(
             &ctx,
-            Some("application/grpc-web-text+proto"),
+            &response_headers("application/grpc-web-text+proto"),
             &text_body(b"grpc-status: 12\r\n"),
         ),
-        Some(12)
+        Some(Ok(12))
     );
     assert_eq!(
         grpc_web_passthrough_body_trailer_status_for_test(
             &ctx,
-            Some("application/grpc-web+proto"),
+            &response_headers("application/grpc-web+proto"),
             &backend_body(b"grpc-status: 12\r\n"),
         ),
-        Some(12)
+        Some(Ok(12))
     );
+}
+
+#[test]
+fn observer_reports_a_final_compressed_trailer_frame_as_unreadable() {
+    // The status is present, but compressed: it is neither a status nor absent.
+    let mut body = frame(0x00, b"hello");
+    body.extend_from_slice(&frame(0x81, b"compressed-trailer-bytes"));
+    assert_eq!(
+        grpc_web_trailer_outcome_for_test(&[&body], false),
+        Some(Err("compressed_trailer_frame"))
+    );
+    let chunks: Vec<&[u8]> = body.chunks(2).collect();
+    assert_eq!(
+        grpc_web_trailer_outcome_for_test(&chunks, false),
+        Some(Err("compressed_trailer_frame"))
+    );
+    let text = BASE64.encode(&body).into_bytes();
+    assert_eq!(
+        grpc_web_trailer_outcome_for_test(&[&text], true),
+        Some(Err("compressed_trailer_frame"))
+    );
+
+    // Only the FINAL frame counts: a later frame makes the body end without a
+    // terminal, and a readable trailer frame after it wins.
+    let mut not_final = body.clone();
+    not_final.extend_from_slice(&frame(0x00, b"late"));
+    assert_eq!(
+        grpc_web_trailer_outcome_for_test(&[&not_final], false),
+        None
+    );
+    let mut readable_last = body.clone();
+    readable_last.extend_from_slice(&frame(GRPC_FRAME_TRAILER, b"grpc-status: 6\r\n"));
+    assert_eq!(
+        grpc_web_trailer_outcome_for_test(&[&readable_last], false),
+        Some(Ok(6))
+    );
+    // Truncated inside the compressed frame: nothing is terminal yet.
+    assert_eq!(
+        grpc_web_trailer_outcome_for_test(&[&body[..body.len() - 1]], false),
+        None
+    );
+}
+
+#[test]
+fn observer_skips_a_max_length_prefix_without_allocating_or_panicking() {
+    // A hostile 0xFFFFFFFF length prefix must only be counted down: the
+    // observer holds fixed-size state, so feeding megabytes of the declared
+    // payload neither allocates the declared 4 GiB nor overflows.
+    let filler = vec![0x41u8; 64 * 1024];
+    for flag in [0x00u8, 0x01, GRPC_FRAME_TRAILER, 0x81] {
+        let mut header = vec![flag];
+        header.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut chunks: Vec<&[u8]> = vec![header.as_slice()];
+        chunks.extend(std::iter::repeat_n(filler.as_slice(), 64));
+        assert_eq!(
+            grpc_web_trailer_outcome_for_test(&chunks, false),
+            None,
+            "flag {flag:#04x}: an unfinished frame has no terminal status"
+        );
+
+        // A complete earlier trailer frame is no longer final once the
+        // oversized frame starts.
+        let mut body = backend_body(b"grpc-status: 0\r\n");
+        body.extend_from_slice(&header);
+        body.extend_from_slice(&filler);
+        assert_eq!(grpc_web_trailer_status_for_test(&[&body], false), None);
+
+        // Text framing decodes group by group into the same bounded reader.
+        let text = BASE64.encode(&body).into_bytes();
+        assert_eq!(grpc_web_trailer_outcome_for_test(&[&text], true), None);
+    }
+
+    let mut ctx = create_test_context();
+    retain_grpc_web_client_content_type_for_test(&mut ctx, "application/grpc-web+proto");
+    let mut body = vec![GRPC_FRAME_TRAILER];
+    body.extend_from_slice(&u32::MAX.to_be_bytes());
+    body.extend_from_slice(b"grpc-status: 0\r\n");
+    assert_eq!(
+        grpc_web_passthrough_body_trailer_status_for_test(
+            &ctx,
+            &response_headers("application/grpc-web+proto"),
+            &body,
+        ),
+        None
+    );
+}
+
+#[tokio::test]
+async fn passthrough_relay_forwards_a_max_length_prefix_unchanged() {
+    let mut wire = frame(0x00, b"hello");
+    wire.push(0x00);
+    wire.extend_from_slice(&u32::MAX.to_be_bytes());
+    wire.extend_from_slice(&[0x42; 1024]);
+    let body = source(vec![Frame::data(Bytes::from(wire.clone()))]);
+    let body = proxy_body_into_grpc_web_passthrough_streaming_for_test(body, false, 200);
+    let (data, trailers) = collect(body).await;
+    assert_eq!(data, wire, "the relay never reframes the body");
+    assert!(trailers.is_none());
+}
+
+#[test]
+fn passthrough_body_under_a_content_coding_is_unreadable() {
+    let mut ctx = create_test_context();
+    retain_grpc_web_client_content_type_for_test(&mut ctx, "application/grpc-web+proto");
+    let body = backend_body(b"grpc-status: 7\r\n");
+
+    let mut encoded = response_headers("application/grpc-web+proto");
+    encoded.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_eq!(
+        grpc_web_passthrough_body_trailer_status_for_test(&ctx, &encoded, &body),
+        Some(Err("content_encoded_body")),
+        "a content-coded body's frames cannot be parsed, even when they look readable"
+    );
+
+    let mut identity = response_headers("application/grpc-web+proto");
+    identity.insert("content-encoding".to_string(), "identity".to_string());
+    assert_eq!(
+        grpc_web_passthrough_body_trailer_status_for_test(&ctx, &identity, &body),
+        Some(Ok(7))
+    );
+}
+
+#[test]
+fn an_unreadable_status_stays_unset_instead_of_unknown() {
+    let mut ctx = create_test_context();
+    retain_grpc_web_client_content_type_for_test(&mut ctx, "application/grpc-web+proto");
+    let mut compressed = frame(0x00, b"hello");
+    compressed.extend_from_slice(&frame(0x81, b"compressed-trailer-bytes"));
+
+    let mut metadata = HashMap::from([("request_protocol".to_string(), "grpc".to_string())]);
+    record_grpc_web_passthrough_status_for_test(
+        &ctx,
+        &response_headers("application/grpc-web+proto"),
+        &compressed,
+        &mut metadata,
+    );
+    assert!(!metadata.contains_key("grpc_status"));
+    assert_eq!(
+        metadata.get("grpc_status_unreadable").map(String::as_str),
+        Some("compressed_trailer_frame")
+    );
+    let summary = TransactionSummary {
+        metadata: metadata.clone(),
+        ..Default::default()
+    };
+    assert_eq!(
+        summary.grpc_status(),
+        None,
+        "a status present but unreadable is not reported as UNKNOWN"
+    );
+
+    // A truly missing final frame is still UNKNOWN.
+    let mut missing = HashMap::from([("request_protocol".to_string(), "grpc".to_string())]);
+    record_grpc_web_passthrough_status_for_test(
+        &ctx,
+        &response_headers("application/grpc-web+proto"),
+        &frame(0x00, b"hello"),
+        &mut missing,
+    );
+    assert!(!missing.contains_key("grpc_status_unreadable"));
+    let summary = TransactionSummary {
+        metadata: missing,
+        ..Default::default()
+    };
+    assert_eq!(summary.grpc_status(), Some(2));
+
+    // A gateway-authored terminal keeps the status it already recorded.
+    let mut gateway = HashMap::from([("grpc_status".to_string(), "4".to_string())]);
+    record_grpc_web_passthrough_status_for_test(
+        &ctx,
+        &response_headers("application/grpc-web+proto"),
+        &backend_body(b"grpc-status: 0\r\n"),
+        &mut gateway,
+    );
+    assert_eq!(gateway.get("grpc_status").map(String::as_str), Some("4"));
 }
 
 #[tokio::test]

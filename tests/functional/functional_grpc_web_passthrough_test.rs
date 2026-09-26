@@ -50,7 +50,10 @@ fn trailer_frames(body: &[u8]) -> Vec<Vec<u8>> {
     let mut rest = body;
     while rest.len() >= 5 {
         let len = u32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
-        assert!(rest.len() >= 5 + len, "truncated gRPC-Web frame in {body:?}");
+        assert!(
+            rest.len() >= 5 + len,
+            "truncated gRPC-Web frame in {body:?}"
+        );
         if rest[0] == 0x80 {
             frames.push(rest[5..5 + len].to_vec());
         }
@@ -77,6 +80,43 @@ async fn spawn_h2c_backend(content_type: &'static str, body: Vec<u8>) -> (Script
         })
         .spawn()
         .expect("spawn h2c backend");
+    (backend, port)
+}
+
+/// A pass-through backend that writes `body` as several DATA frames split at
+/// `cuts`, pausing between them so the gateway reads each one separately.
+async fn spawn_split_h2c_backend(
+    content_type: &'static str,
+    body: &[u8],
+    cuts: &[usize],
+) -> (ScriptedH2Backend, u16) {
+    let mut data_steps = Vec::new();
+    let mut start = 0;
+    for &cut in cuts {
+        data_steps.push(H2Step::RespondData {
+            data: Bytes::copy_from_slice(&body[start..cut]),
+            end_stream: false,
+        });
+        data_steps.push(H2Step::Sleep(Duration::from_millis(20)));
+        start = cut;
+    }
+    data_steps.push(H2Step::RespondData {
+        data: Bytes::copy_from_slice(&body[start..]),
+        end_stream: true,
+    });
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let port = reservation.port;
+    let backend = ScriptedH2Backend::builder_plain(reservation.into_listener())
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", content_type.into()),
+        ]))
+        .steps(data_steps)
+        .spawn()
+        .expect("spawn split h2c backend");
     (backend, port)
 }
 
@@ -119,6 +159,22 @@ fn route(id: &str, backend_port: u16, plugins: Value) -> Value {
     })
 }
 
+/// The same route with `response_body_mode: buffer`, which sends pass-through
+/// gRPC-Web through the native gRPC BUFFERED branch.
+fn buffered_route(id: &str, backend_port: u16) -> Value {
+    let mut buffered = route(id, backend_port, json!([]));
+    buffered["response_body_mode"] = json!("buffer");
+    buffered
+}
+
+fn logged_metadata(logs: &str, proxy_id: &str, key: &str) -> Vec<Value> {
+    logs.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["proxy_id"] == proxy_id)
+        .map(|entry| entry["metadata"][key].clone())
+        .collect()
+}
+
 fn logged_grpc_status(logs: &str, proxy_id: &str) -> Vec<Value> {
     logs.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -133,14 +189,24 @@ async fn post_grpc_web(
     content_type: &str,
     body: Vec<u8>,
 ) -> (reqwest::Version, reqwest::header::HeaderMap, Vec<u8>) {
-    let response = client
+    post_grpc_web_with_headers(client, url, content_type, body, &[]).await
+}
+
+async fn post_grpc_web_with_headers(
+    client: &reqwest::Client,
+    url: &str,
+    content_type: &str,
+    body: Vec<u8>,
+    extra_headers: &[(&str, &str)],
+) -> (reqwest::Version, reqwest::header::HeaderMap, Vec<u8>) {
+    let mut request = client
         .post(url)
         .header("content-type", content_type)
-        .header("x-grpc-web", "1")
-        .body(body)
-        .send()
-        .await
-        .expect("gRPC-Web request");
+        .header("x-grpc-web", "1");
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+    let response = request.body(body).send().await.expect("gRPC-Web request");
     assert_eq!(response.status(), reqwest::StatusCode::OK, "url={url}");
     let version = response.version();
     let headers = response.headers().clone();
@@ -308,5 +374,193 @@ async fn grpc_web_passthrough_and_translation_on_h1_and_h2_frontends() {
             "{proxy_id}: the logged grpc_status must come from the delivered trailer frame; \
              logs:\n{logs}"
         );
+    }
+}
+
+/// A backend whose final frame is a COMPRESSED trailer frame (flag `0x81`):
+/// its status is on the wire, but the gateway cannot read it.
+fn compressed_trailer_body() -> Vec<u8> {
+    let mut body = frame(0x00, b"pong");
+    body.extend_from_slice(&frame(0x81, b"deflated-trailer"));
+    body
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_web_passthrough_buffered_deadline_split_and_unreadable_status() {
+    let binary = passthrough_binary_body();
+    let (_binary_backend, binary_port) =
+        spawn_h2c_backend("application/grpc-web+proto", binary.clone()).await;
+    let (_text_backend, text_port) =
+        spawn_h2c_backend("application/grpc-web-text+proto", passthrough_text_body()).await;
+    // Cuts inside the message frame header, the trailer frame header, and the
+    // trailer's `grpc-status` line.
+    let (_split_backend, split_port) =
+        spawn_split_h2c_backend("application/grpc-web+proto", &binary, &[3, 11, 20]).await;
+    let (_compressed_backend, compressed_port) =
+        spawn_h2c_backend("application/grpc-web+proto", compressed_trailer_body()).await;
+
+    let mut proxies = Vec::new();
+    for suffix in ["h1", "h2"] {
+        let id = |route_id: &str| format!("{route_id}-{suffix}");
+        proxies.push(buffered_route(&id("buf-bin"), binary_port));
+        proxies.push(buffered_route(&id("buf-text"), text_port));
+        proxies.push(route(&id("deadline"), binary_port, json!([])));
+        proxies.push(route(&id("split"), split_port, json!([])));
+        proxies.push(buffered_route(&id("split-buf"), split_port));
+        proxies.push(route(&id("zip"), compressed_port, json!([])));
+        proxies.push(buffered_route(&id("zip-buf"), compressed_port));
+    }
+    let config = json!({
+        "version": "1",
+        "proxies": proxies,
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "access-log",
+            "plugin_name": "stdout_logging",
+            "config": {},
+            "scope": "global",
+            "enabled": true,
+        }],
+    });
+    let harness = GatewayHarness::builder()
+        .file_config(to_file_mode_yaml(&config))
+        .log_level("info")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let base = harness.proxy_base_url().to_string();
+
+    let h1 = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h1 client");
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h2c client");
+    let request = frame(0x00, b"ping");
+    let binary_type = "application/grpc-web+proto";
+
+    for (client, suffix) in [(&h1, "h1"), (&h2, "h2")] {
+        // Native BUFFERED branch: the collected body is still the backend's own.
+        let (_, _, body) = post_grpc_web(
+            client,
+            &format!("{base}/buf-bin-{suffix}/echo.Echo/Unary"),
+            binary_type,
+            request.clone(),
+        )
+        .await;
+        assert_eq!(body, binary, "{suffix}: buffered is byte-identical");
+        assert_eq!(trailer_frames(&body).len(), 1, "{suffix}: one trailer");
+
+        let (_, _, body) = post_grpc_web(
+            client,
+            &format!("{base}/buf-text-{suffix}/echo.Echo/Unary"),
+            "application/grpc-web-text+proto",
+            BASE64.encode(&request).into_bytes(),
+        )
+        .await;
+        assert_eq!(
+            body,
+            passthrough_text_body(),
+            "{suffix}: buffered text pass-through is not encoded again"
+        );
+
+        // A client deadline stacks its wrapper under the relay; a deadline that
+        // does not fire leaves the backend's bytes untouched.
+        let (_, _, body) = post_grpc_web_with_headers(
+            client,
+            &format!("{base}/deadline-{suffix}/echo.Echo/Unary"),
+            binary_type,
+            request.clone(),
+            &[("grpc-timeout", "30S")],
+        )
+        .await;
+        assert_eq!(body, binary, "{suffix}: deadline is byte-identical");
+
+        // The backend's body arrives in several DATA frames, split inside both
+        // frame headers and the status line; streamed and buffered alike.
+        for route_id in ["split", "split-buf"] {
+            let (_, _, body) = post_grpc_web(
+                client,
+                &format!("{base}/{route_id}-{suffix}/echo.Echo/Unary"),
+                binary_type,
+                request.clone(),
+            )
+            .await;
+            assert_eq!(body, binary, "{route_id}-{suffix}: split body");
+        }
+
+        // A compressed final trailer frame is relayed unchanged, too.
+        for route_id in ["zip", "zip-buf"] {
+            let (_, _, body) = post_grpc_web(
+                client,
+                &format!("{base}/{route_id}-{suffix}/echo.Echo/Unary"),
+                binary_type,
+                request.clone(),
+            )
+            .await;
+            assert_eq!(body, compressed_trailer_body(), "{route_id}-{suffix}");
+        }
+    }
+
+    let readable = [
+        ("buf-bin", 7),
+        ("buf-text", 12),
+        ("deadline", 7),
+        ("split", 7),
+        ("split-buf", 7),
+    ];
+    let unreadable = ["zip", "zip-buf"];
+    let mut proxy_ids = Vec::new();
+    for suffix in ["h1", "h2"] {
+        for (route_id, _) in readable {
+            proxy_ids.push(format!("{route_id}-{suffix}"));
+        }
+        for route_id in unreadable {
+            proxy_ids.push(format!("{route_id}-{suffix}"));
+        }
+    }
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| {
+                proxy_ids
+                    .iter()
+                    .all(|proxy_id| !logged_grpc_status(logs, proxy_id).is_empty())
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+    for suffix in ["h1", "h2"] {
+        for (route_id, status) in readable {
+            let proxy_id = format!("{route_id}-{suffix}");
+            assert_eq!(
+                logged_grpc_status(&logs, &proxy_id),
+                vec![json!(status)],
+                "{proxy_id}: the logged grpc_status must come from the delivered trailer \
+                 frame; logs:\n{logs}"
+            );
+        }
+        // Present but unreadable: no status at all rather than a synthesized
+        // UNKNOWN (2), and the log names why.
+        for route_id in unreadable {
+            let proxy_id = format!("{route_id}-{suffix}");
+            assert_eq!(
+                logged_grpc_status(&logs, &proxy_id),
+                vec![Value::Null],
+                "{proxy_id}: an unreadable status stays unset; logs:\n{logs}"
+            );
+            assert_eq!(
+                logged_metadata(&logs, &proxy_id, "grpc_status_unreadable"),
+                vec![json!("compressed_trailer_frame")],
+                "{proxy_id}: logs:\n{logs}"
+            );
+        }
     }
 }

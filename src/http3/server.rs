@@ -6778,6 +6778,7 @@ async fn handle_h3_request(
                 bytes_streamed: outcome.bytes_streamed,
                 client_disconnected: outcome.client_disconnected,
                 grpc_status: None,
+                grpc_status_unreadable: None,
                 // Latched by the relay that terminated this stream at the
                 // accepted credential's authorization deadline (#3815).
                 authorization_termination: ctx
@@ -7592,11 +7593,11 @@ async fn handle_h3_request(
         let mut body_completed = false;
         // Pass-through gRPC-Web: the backend's body, trailer frame included, is
         // relayed unchanged; the relay reads that frame's status for the log.
-        let mut grpc_web_passthrough =
-            crate::plugins::grpc_web::passthrough_trailer_status_observer(
-                &ctx,
-                response_headers.get("content-type").map(String::as_str),
-            );
+        let mut grpc_web_passthrough = if ctx.request_is_grpc_web() {
+            crate::plugins::grpc_web::passthrough_trailer_status_observer(&ctx, &response_headers)
+        } else {
+            None
+        };
 
         // Set when the recv_data arm consumed a backend frame; the loop head
         // re-arms `read_deadline` on the NEXT iteration so the deadline only
@@ -8156,12 +8157,12 @@ async fn handle_h3_request(
                 true,
             );
 
+        // A gateway-authored terminal keeps the status it recorded.
         let grpc_web_passthrough_status = grpc_web_passthrough
             .as_deref()
-            .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::status);
-        if body_completed && let Some(grpc_status) = grpc_web_passthrough_status {
-            ctx.metadata
-                .insert("grpc_status".to_string(), grpc_status.to_string());
+            .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::outcome);
+        if body_completed && let Some(passthrough) = grpc_web_passthrough_status {
+            passthrough.record(&mut ctx.metadata);
         }
 
         // Native H3 drives the inspector in this task rather than a detached
@@ -8174,6 +8175,7 @@ async fn handle_h3_request(
             bytes_streamed,
             client_disconnected,
             grpc_status: None,
+            grpc_status_unreadable: None,
             authorization_termination: ctx
                 .authorization_termination()
                 .map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str),
@@ -8782,6 +8784,7 @@ async fn handle_h3_request(
             bytes_streamed: h3_stream_result.bytes_streamed,
             client_disconnected: h3_stream_result.client_disconnected,
             grpc_status: None,
+            grpc_status_unreadable: None,
             authorization_termination: ctx
                 .authorization_termination()
                 .map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str),
@@ -9880,11 +9883,15 @@ async fn handle_h3_request(
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
         // A pass-through gRPC-Web response carries its status in the backend's
         // own trailer frame, relayed unchanged; read it before the write.
-        let passthrough_grpc_status = crate::plugins::grpc_web::passthrough_body_trailer_status(
-            &ctx,
-            response_headers.get("content-type").map(String::as_str),
-            &response_body,
-        );
+        let passthrough_grpc_status = if ctx.request_is_grpc_web() {
+            crate::plugins::grpc_web::passthrough_body_trailer_status(
+                &ctx,
+                &response_headers,
+                &response_body,
+            )
+        } else {
+            None
+        };
         let response_body_bytes = response_body.len() as u64;
         let mut bytes_received = 0;
         let mut body_completed = true;
@@ -10074,12 +10081,9 @@ async fn handle_h3_request(
             }
         }
 
-        if body_completed
-            && !ctx.metadata.contains_key("grpc_status")
-            && let Some(grpc_status) = passthrough_grpc_status
-        {
-            ctx.metadata
-                .insert("grpc_status".to_string(), grpc_status.to_string());
+        // A gateway-authored terminal keeps the status it recorded.
+        if body_completed && let Some(passthrough) = passthrough_grpc_status {
+            passthrough.record(&mut ctx.metadata);
         }
         // Transaction logging follows downstream response completion so a
         // deadline-triggered reset cannot be reported as a full successful
@@ -11777,10 +11781,11 @@ async fn stream_h3_open_response_to_client(
     let mut coalesce_buf = BytesMut::with_capacity(coalesce_max_bytes);
     // Pass-through gRPC-Web: the backend's body, trailer frame included, is
     // relayed unchanged; the relay reads that frame's status for the log.
-    let mut grpc_web_passthrough = crate::plugins::grpc_web::passthrough_trailer_status_observer(
-        ctx,
-        response_headers.get("content-type").map(String::as_str),
-    );
+    let mut grpc_web_passthrough = if ctx.request_is_grpc_web() {
+        crate::plugins::grpc_web::passthrough_trailer_status_observer(ctx, &response_headers)
+    } else {
+        None
+    };
     let mut total_streamed: usize = 0;
     let flush_timer = tokio::time::sleep(flush_interval);
     tokio::pin!(flush_timer);
@@ -12151,12 +12156,12 @@ async fn stream_h3_open_response_to_client(
     // covers a task that never reaches this statement at all.
     h3_stream.settle_committed_terminal();
 
+    // A gateway-authored terminal keeps the status it recorded.
     let grpc_web_passthrough_status = grpc_web_passthrough
         .as_deref()
-        .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::status);
-    if body_completed && let Some(grpc_status) = grpc_web_passthrough_status {
-        ctx.metadata
-            .insert("grpc_status".to_string(), grpc_status.to_string());
+        .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::outcome);
+    if body_completed && let Some(passthrough) = grpc_web_passthrough_status {
+        passthrough.record(&mut ctx.metadata);
     }
     Ok(H3StreamResult {
         status: response_status,
@@ -16153,10 +16158,11 @@ async fn proxy_to_backend_h3_streaming(
     let mut coalesce_buf = BytesMut::with_capacity(coalesce_max_bytes);
     // Pass-through gRPC-Web: the backend's body, trailer frame included, is
     // relayed unchanged; the relay reads that frame's status for the log.
-    let mut grpc_web_passthrough = crate::plugins::grpc_web::passthrough_trailer_status_observer(
-        ctx,
-        response_headers.get("content-type").map(String::as_str),
-    );
+    let mut grpc_web_passthrough = if ctx.request_is_grpc_web() {
+        crate::plugins::grpc_web::passthrough_trailer_status_observer(ctx, &response_headers)
+    } else {
+        None
+    };
     let mut total_streamed: usize = 0;
     let flush_timer = tokio::time::sleep(flush_interval);
     tokio::pin!(flush_timer);
@@ -16542,12 +16548,12 @@ async fn proxy_to_backend_h3_streaming(
     // covers a task that never reaches this statement at all.
     h3_stream.settle_committed_terminal();
 
+    // A gateway-authored terminal keeps the status it recorded.
     let grpc_web_passthrough_status = grpc_web_passthrough
         .as_deref()
-        .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::status);
-    if body_completed && let Some(grpc_status) = grpc_web_passthrough_status {
-        ctx.metadata
-            .insert("grpc_status".to_string(), grpc_status.to_string());
+        .and_then(crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::outcome);
+    if body_completed && let Some(passthrough) = grpc_web_passthrough_status {
+        passthrough.record(&mut ctx.metadata);
     }
     Ok(H3StreamResult {
         status: response_status,
