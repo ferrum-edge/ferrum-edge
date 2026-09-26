@@ -90,6 +90,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An inbound HBONE CONNECT refused at relay synthesis now returns the
+  documented `403` instead of a route-miss `404` (#5763). This covers a
+  destination the terminator does not own, an unresolvable authority, and a
+  declared Sidecar `ingress[]` block that does not map the port. The response
+  body is `{"error":"HBONE relay destination not allowed"}` (the `UDP` variant
+  for a datagram CONNECT), the same as the later re-checks. The refusal now
+  writes a transaction line whose `rejection_phase` is
+  `hbone_relay_destination_denied` (or `hbone_udp_relay_destination_denied`),
+  with `mesh_authz.deny_policy`, `mesh.relay.denial_reason`,
+  `mesh.relay.denied_destination`, and `mesh.relay.terminator_ip`. Before, the
+  reason was only in a debug log. Nothing is dialed, as before.
+- A terminator that has not applied its first mesh slice now answers an
+  inbound CONNECT with `503` and `{"error":"HBONE relay not ready"}` (the `UDP`
+  variant for a datagram CONNECT), deny policy `hbone_relay_not_ready` (or
+  `hbone_udp_relay_not_ready`) (#5763). Before, that case was a `404` at relay
+  synthesis and a `403` destination denial at the later re-checks. It is no
+  longer counted as a `relay_destination_denied` rejection, so a `403` always
+  means a real authorization denial.
+- A CONNECT with no verified SPIFFE identity that is refused at relay
+  synthesis now gets the same unauthenticated-peer `403` the HBONE handlers
+  return (`hbone_unauthenticated_peer`), not a destination denial (#5763). That
+  covers a CONNECT with no client certificate and one whose certificate carries
+  no single, currently valid SPIFFE ID. It carries no `mesh.relay.*` metadata
+  and is not counted as a `relay_destination_denied` rejection.
+- A datagram CONNECT refused at the post-plugin re-check or the post-DNS
+  screen is now counted as a `relay_destination_denied` rejection, like the
+  byte-stream relay (#5763). The post-DNS screens also answer `503
+  hbone_relay_not_ready` before the first mesh slice, and both now bracket an
+  IPv6 `mesh.relay.denied_destination`.
+- `mesh.relay.denied_destination` now brackets an IPv6 literal as
+  `[host]:port` (#5763).
+- A datagram-over-HBONE relay that ends on a socket error is now recorded as an
+  error, not as a completed tunnel (#5765). The CONNECT stream still ends with a
+  clean HTTP/2 `END_STREAM`, because hyper's upgraded stream cannot reset. The
+  transaction line now carries `hbone.udp.termination_reason`, and every ending
+  other than a peer close or an idle expiry records `body_completed: false`
+  with a `body_error_class`. For example, a relay whose workload port has no
+  listener records `connection_refused`. Socket-error endings also log a
+  warning, sampled to at most one per 10 seconds.
 - An Ambient mesh proxy whose node-agent registry directory is missing now
   says so, repeatedly (#5766). `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`
   defaults to `/run/ferrum/node-waypoint-pods` and is authoritative for the
@@ -379,6 +418,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shrinking the limit until that window rolls out; backend failures, the
   recovery-cohort barrier, and in-flight accounting are unchanged, and
   compatible reloads keep the learned windows.
+- `request_deduplication` and `ai_semantic_cache` no longer store or replay
+  the IETF-draft rate-limit headers: the combined `RateLimit` field and every
+  `RateLimit-*` field (`-Limit`, `-Remaining`, `-Reset`, `-Policy`) are now
+  stripped case-insensitively alongside the `X-RateLimit-*` family, both before
+  storage and when an existing entry is replayed, so a cache hit no longer
+  reports the original response's stale quota or reset (#5788).
 - HTTP/3 responses now carry the gateway's own `X-Gateway-Error` on every
   path, as HTTP/1.1 and HTTP/2 do (#5783). A backend 5xx relayed on an HTTP/3
   streaming relay (native or bridged, plain or gRPC) or on the HTTP/3

@@ -179,6 +179,40 @@ pub mod _test_support {
         crate::proxy::publish_websocket_handshake_body_digests(plugins, ctx);
     }
 
+    /// Answer an inbound CONNECT relay-synthesis refusal exactly as the
+    /// dispatcher's route-miss arm does (issue #5763), delivering the
+    /// transaction line to `plugins` in place of the epoch's global chain.
+    /// `reason` is the `mesh.relay.denial_reason` label synthesis produced and
+    /// `destination` the CONNECT authority, when it carried a host and port.
+    pub async fn reject_inbound_connect_relay_synthesis_for_test(
+        state: &crate::proxy::ProxyState,
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        reason: &'static str,
+        destination: Option<(&str, u16)>,
+        is_udp_connect: bool,
+    ) -> hyper::Response<crate::proxy::body::ProxyBody> {
+        use crate::proxy::InboundConnectRelayRefusal;
+        let refusal = match destination {
+            Some((host, port)) => InboundConnectRelayRefusal::new(reason, host, port),
+            None => InboundConnectRelayRefusal {
+                reason,
+                destination: None,
+            },
+        };
+        crate::proxy::reject_inbound_connect_relay_synthesis_with_plugins(
+            state,
+            plugins,
+            ctx,
+            &refusal,
+            is_udp_connect,
+            std::time::Instant::now(),
+            false,
+            None,
+        )
+        .await
+    }
+
     pub fn websocket_backend_path_for_test(
         proxy: &crate::config::types::Proxy,
         path: &str,
@@ -3373,6 +3407,16 @@ pub mod _test_support {
         plugin.redis_payload_for_tests(status_code, headers, body, presentation_digest)
     }
 
+    pub fn request_deduplication_replay_stored_response_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: u16,
+        headers: HashMap<String, String>,
+        body: &[u8],
+    ) -> crate::plugins::PluginResult {
+        plugin.replay_stored_response_for_tests(ctx, status_code, headers, body)
+    }
+
     // ── plugins/kafka_logging ───────────────────────────────────────────────
     /// Pure producer-configuration / CRL admission boundary. External unit
     /// tests use this so TLS-policy coverage does not require constructing a
@@ -5047,6 +5091,16 @@ pub mod _test_support {
         hook: Option<std::sync::Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
         plugin.set_store_post_admit_hook_for_tests(hook);
+    }
+
+    pub fn ai_semantic_cache_admit_sealed_redis_hit_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        redis_key: &str,
+        status_code: u16,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<(u16, HashMap<String, String>)> {
+        plugin.admit_sealed_redis_hit_for_tests(redis_key, status_code, headers, body)
     }
 
     pub fn ai_semantic_cache_instance_id_for_test(
@@ -15585,16 +15639,19 @@ pub mod _test_support {
     }
 
     /// Production HBONE CONNECT circuit-breaker settlement after
-    /// `connect_backend`. External tests use this so a DNS-screen 403 cannot
-    /// drift from the served HALF_OPEN accounting.
+    /// `connect_backend`. External tests use this so a DNS-screen policy
+    /// refusal (403 denial or 503 not-ready) cannot drift from the served
+    /// HALF_OPEN accounting.
     pub fn settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
         cb: &crate::circuit_breaker::CircuitBreaker,
         status: hyper::StatusCode,
+        policy_refusal: bool,
         is_half_open_probe: bool,
     ) {
         crate::proxy::settle_hbone_backend_connect_circuit_breaker_outcome(
             cb,
             status,
+            policy_refusal,
             is_half_open_probe,
         )
     }

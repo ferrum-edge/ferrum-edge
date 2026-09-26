@@ -1153,7 +1153,8 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
 }
 
 /// Issue #4252: these functional cases exercise production synthesis-time
-/// refusal (`build_inbound_hbone_relay_proxy` → 404, zero dials). Mesh-mode
+/// refusal (`build_inbound_hbone_relay_proxy` → the documented 403, zero
+/// dials; issue #5763). Mesh-mode
 /// has no deployed source that puts `mesh_route_dispatch` on a synthesized
 /// inbound relay; do not invent a `MeshSlice` plugin/config bypass. The
 /// post-plugin handler re-check is proved in-process by
@@ -1189,8 +1190,8 @@ fn third_workload_refusal_exercises_synthesis_time_guard() {
          the synthesized inbound relay; do not invent a slice/plugin bypass"
     );
     // Without an in-fixture positive control, a terminator that refuses EVERY
-    // destination (slice never applied, SVID mismatch, wrong topology) 404s for
-    // C and passes as a security proof. These pin the control in place.
+    // destination (slice never applied, SVID mismatch, wrong topology) refuses
+    // C too and passes as a security proof. These pin the control in place.
     assert!(
         drive.contains("start_own_dest_echo_for("),
         "the driver must stand up B's OWN declared destination as a live echo \
@@ -1199,7 +1200,7 @@ fn third_workload_refusal_exercises_synthesis_time_guard() {
     assert!(
         drive.contains("control_failure"),
         "the driver must require a positive control CONNECT that IS relayed; \
-         otherwise C's 404 is not attributable to C being a third workload"
+         otherwise C's refusal is not attributable to C being a third workload"
     );
     assert!(
         drive.contains("observe_third_workload_backend_hits("),
@@ -1263,13 +1264,14 @@ fn third_workload_refusal_exercises_synthesis_time_guard() {
         .expect("no top-level closing brace for assert_third_workload_connect_refused");
     let assertion = &assert_rest[..assert_end];
     assert!(
-        assertion.contains("outcome.status, 404"),
-        "both flavors must require synthesis-time 404; this functional setup \
-         never reaches the post-plugin handler re-check"
+        assertion.contains("outcome.status, 403"),
+        "both flavors must require the documented synthesis-time 403 (issue \
+         #5763); this functional setup never reaches the post-plugin handler \
+         re-check"
     );
     assert!(
         !assertion.contains("403 | 404"),
-        "do not treat a handler-path status as equivalent to synthesis refusal"
+        "a route-miss 404 is not a relay refusal"
     );
 }
 
@@ -4604,7 +4606,7 @@ async fn functional_mesh_ambient_egress_routes_a_to_b_over_hbone() {
 // The #4150 / #4252 negative of this keystone — an authenticated peer CONNECTs
 // to B naming a third slice-declared workload B does not terminate for — is
 // `functional_mesh_ambient_hbone_refuses_third_workload_{byte_stream,datagram}`
-// (synthesis-time 404, zero dials). The post-plugin handler re-check is
+// (synthesis-time 403, zero dials). The post-plugin handler re-check is
 // `inbound_hbone_relay_refuses_post_plugin_third_workload_*` in
 // `tests/integration/mesh_hbone_tests.rs`.
 
@@ -10259,8 +10261,9 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
 // path that places operator `mesh_route_dispatch` on the synthesized inbound
 // HBONE relay. These functional cases therefore prove the production-shaped
 // synthesis refusal: an authenticated peer CONNECTs to terminator B naming
-// slice-declared workload C, `build_inbound_hbone_relay_proxy` returns None,
-// the dispatcher 404s, and C's backend records zero hits.
+// slice-declared workload C, `build_inbound_hbone_relay_proxy` refuses it,
+// the dispatcher answers the documented 403 (issue #5763), and C's backend
+// records zero hits.
 //
 // That is not the post-plugin handler re-check. The independently placed
 // re-checks in `handle_hbone_request` / `handle_hbone_udp_request` are proved
@@ -10277,10 +10280,10 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
 // CONNECT, the same peer SVID and the same CONNECT flavor name B's OWN
 // declared non-loopback destination and must be relayed (200 + byte-exact echo).
 // Ambient refuses the loopback namespace (#4315), so the control cannot name
-// `127.0.0.1`. A 404 is only evidence of an ownership refusal once the same
+// `127.0.0.1`. A 403 is only evidence of an ownership refusal once the same
 // terminator has been shown to relay something. Without the control, a
 // fixture whose slice never applied, whose SVID did not chain, or whose
-// topology was wrong would 404 for C and pass as a security proof.
+// topology was wrong would refuse C too and pass as a security proof.
 
 /// After a CONNECT result, wait this long for C's backend task to report a
 /// TCP accept or UDP datagram that was already queued while that task had not
@@ -10776,7 +10779,7 @@ async fn drive_inbound_relay_third_workload_refusal(
         // a byte-exact echo proves the slice loaded, the peer is trusted, and
         // synthesis still builds a relay on this child. Without it, a fixture
         // that refuses EVERY destination (slice never applied, SVID mismatch,
-        // wrong topology) would 404 for C and pass as a security proof.
+        // wrong topology) would refuse C too and pass as a security proof.
         let control_authority = SocketAddr::new(b_ip, b_local_port).to_string();
         let control = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => {
@@ -10817,7 +10820,7 @@ async fn drive_inbound_relay_third_workload_refusal(
             Ok((status, _)) => Some(format!(
                 "own-destination control CONNECT to {control_authority} returned {status}, \
                  expected 200: this terminator refuses even the destination it owns, so a \
-                 404 for C would not be attributable to C being a third workload"
+                 refusal of C would not be attributable to C being a third workload"
             )),
             Err(e) => Some(format!(
                 "own-destination control CONNECT to {control_authority} failed: {e}"
@@ -10832,13 +10835,14 @@ async fn drive_inbound_relay_third_workload_refusal(
             return Err(format!("{failure}\n--- gateway B ---\n{logs}"));
         }
 
-        // CONNECT names C, a dest B does not terminate for. Synthesis 404s
-        // before either HBONE handler runs. When this host has only one
-        // non-loopback IPv4, B and C share that address and the own-address
-        // arm refuses C as PortNotDeclared (C's port lives only on C's
-        // SPIFFE); distinct addresses miss the own-address arm and inventory
-        // refuses as AddressNotTerminated. Both are synthesis 404, and C is
-        // not loopback so the 404 is not the #4315 namespace refusal.
+        // CONNECT names C, a dest B does not terminate for. Synthesis refuses
+        // it with the documented 403 before either HBONE handler runs. When
+        // this host has only one non-loopback IPv4, B and C share that address
+        // and the own-address arm refuses C as PortNotDeclared (C's port lives
+        // only on C's SPIFFE); distinct addresses miss the own-address arm and
+        // inventory refuses as AddressNotTerminated. Both are synthesis
+        // refusals, and C is not loopback so the refusal is not the #4315
+        // namespace refusal.
         let authority = SocketAddr::new(c_ip, c_port).to_string();
         let connect = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
@@ -10910,10 +10914,10 @@ async fn drive_inbound_relay_third_workload_refusal(
 
 fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, flavor: &str) {
     assert_eq!(
-        outcome.status, 404,
+        outcome.status, 403,
         "{flavor}: authenticated CONNECT naming C must be refused at \
-         synthesis time; 200/502 means the terminator relayed a dest it \
-         does not own\n{}",
+         synthesis time with the documented 403 (issue #5763); 200/502 means \
+         the terminator relayed a dest it does not own\n{}",
         outcome.logs
     );
     assert_eq!(
@@ -10926,11 +10930,11 @@ fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, f
 }
 
 /// Issue #4252 (byte-stream, synthesis): an authenticated HBONE CONNECT to
-/// terminator B naming slice-declared workload C is refused with 404, and C's
+/// terminator B naming slice-declared workload C is refused with 403, and C's
 /// TCP echo records zero accepts — proving `build_inbound_hbone_relay_proxy`
 /// still withholds the relay before `handle_hbone_request`. The same
 /// terminator relays B's own declared destination in the same attempt, so the
-/// 404 is attributable to C being a third workload.
+/// 403 is attributable to C being a third workload.
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
@@ -10942,7 +10946,7 @@ async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
 }
 
 /// Issue #4252 (datagram-over-CONNECT, synthesis): the same C-named CONNECT
-/// over the UDP-marked flavor, asserting synthesis 404 and C's UDP echo
+/// over the UDP-marked flavor, asserting synthesis 403 and C's UDP echo
 /// records zero datagrams — proving the UDP branch of
 /// `build_inbound_hbone_relay_proxy` still withholds the relay before
 /// `handle_hbone_udp_request`. The same terminator round-trips a datagram to
@@ -11027,7 +11031,23 @@ struct IngressConnectOutcome {
     /// The tagged line the relayed loopback backend wrote back, when the tunnel
     /// opened. `None` for every refused CONNECT.
     relayed: Option<String>,
+    /// The response body of a refused CONNECT. `None` when the tunnel opened.
+    ///
+    /// A relay-destination refusal and a `mesh_authz` DENY are both `403`
+    /// (issue #5763) and neither carries a reason header, so the body is the
+    /// only on-the-wire evidence of WHICH layer refused the CONNECT.
+    refusal_body: Option<String>,
 }
+
+/// The body every inbound byte-stream relay-destination refusal answers with
+/// (`hbone_relay_destination_denied`, issue #5763) — including a declared
+/// Sidecar `ingress[]` block that does not map the CONNECT's port.
+const HBONE_RELAY_DESTINATION_DENIED_BODY: &str =
+    r#"{"error":"HBONE relay destination not allowed"}"#;
+
+/// The prefix every `mesh_authz` refusal body carries. A relay-destination
+/// refusal never carries it.
+const MESH_AUTHZ_DENIED_BODY_PREFIX: &str = r#"{"error":"Mesh authorization denied"#;
 
 /// mTLS client config presenting the peer SVID and verifying the sidecar's
 /// server SVID against the shared mesh CA. ALPN `h2` — the mesh-mTLS transport.
@@ -11088,6 +11108,28 @@ async fn read_tagged_relay_reply(
     })
     .await
     .map_err(|_| "timed out reading the relayed reply".to_string())?
+}
+
+/// Drain a refused CONNECT's response body, bounded in size and time.
+///
+/// A stream error ends the read with whatever already arrived: the server may
+/// reset the still-open request half (`RST_STREAM(NO_ERROR)`) right after the
+/// complete refusal. Callers assert on the exact body text, so a truncated,
+/// empty, or wedged body still fails loudly.
+async fn read_connect_refusal_body(body: &mut h2::RecvStream, timeout: Duration) -> String {
+    const MAX_REFUSAL_BODY: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = tokio::time::timeout(timeout, async {
+        while let Some(Ok(chunk)) = body.data().await {
+            let _ = body.flow_control().release_capacity(chunk.len());
+            buf.extend_from_slice(&chunk);
+            if buf.len() > MAX_REFUSAL_BODY {
+                break;
+            }
+        }
+    })
+    .await;
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Open a real mesh-mTLS HTTP/2 tunnel to a Sidecar's inbound listener and
@@ -11162,18 +11204,24 @@ async fn sidecar_ingress_connect(
 
     // Only an accepted CONNECT has a tunnel to write into; a refusal must never
     // be probed for relayed bytes (that would mask a fail-open regression).
-    let relayed = if status == 200 {
+    let mut body = response.into_body();
+    let (relayed, refusal_body) = if status == 200 {
         send_body
             .send_data(Bytes::from(payload.to_string()), false)
             .map_err(|e| format!("write relay payload: {e}"))?;
-        let mut body = response.into_body();
-        Some(read_tagged_relay_reply(&mut body, Duration::from_secs(10)).await?)
+        let relayed = read_tagged_relay_reply(&mut body, Duration::from_secs(10)).await?;
+        (Some(relayed), None)
     } else {
-        None
+        let refusal = read_connect_refusal_body(&mut body, Duration::from_secs(5)).await;
+        (None, Some(refusal))
     };
 
     conn_task.abort();
-    Ok(IngressConnectOutcome { status, relayed })
+    Ok(IngressConnectOutcome {
+        status,
+        relayed,
+        refusal_body,
+    })
 }
 
 /// The local `echo` workload plus its Service.
@@ -11555,8 +11603,9 @@ async fn functional_mesh_sidecar_ingress_stream_connect_relays_declared_listener
 ///   LISTENER port rejects the CONNECT (403). Authorizing on the
 ///   `defaultEndpoint` backend port instead would let that DENY fail OPEN.
 /// * Phase 3 — a reload that declares a DIFFERENT listener withdraws the first:
-///   the old port fails closed (neither relayed nor still 403 from phase 2) and
-///   the new one relays to the same endpoint.
+///   the old port fails closed as an undeclared destination (the documented
+///   `403` relay-destination refusal, told apart from phase 2's `mesh_authz`
+///   403 by its body; issue #5763) and the new one relays to the same endpoint.
 #[cfg(unix)]
 #[ignore]
 #[tokio::test]
@@ -11779,6 +11828,14 @@ async fn run_sidecar_ingress_reload_phases(
             denied.relayed
         ));
     }
+    // The 403 must be the listener-port DENY itself (`mesh_authz`), not a
+    // relay-destination refusal, which is also a 403 (issue #5763).
+    let denied_body = denied.refusal_body.as_deref().unwrap_or_default();
+    if !denied_body.starts_with(MESH_AUTHZ_DENIED_BODY_PREFIX) {
+        return Err(format!(
+            "the phase-2 403 must be mesh_authz's listener-port DENY, got body {denied_body:?}"
+        ));
+    }
 
     // ── Phase 3: withdraw that listener, declare a different one ──────────
     std::fs::write(
@@ -11792,14 +11849,23 @@ async fn run_sidecar_ingress_reload_phases(
     )
     .map_err(|e| format!("rewrite mesh document withdrawing the first listener: {e}"))?;
     sighup_mesh_gateway(child)?;
-    // Neither 200 (relayed) nor 403 (phase 2's now-withdrawn DENY): under the
-    // NEW document the withdrawn listener port must fail closed.
+    // Under the NEW document the withdrawn listener port must fail closed as
+    // an undeclared destination: the declared `ingress[]` block no longer maps
+    // it, so relay synthesis refuses it (`ingress_endpoint_mapping_mismatch`)
+    // with the documented `403 hbone_relay_destination_denied` (issue #5763)
+    // before `mesh_authz` runs. Phase 2's now-withdrawn DENY is ALSO a 403, so
+    // the status alone cannot tell the reload landed; the refusal body names
+    // the refusing layer: requiring the relay-destination body excludes both a
+    // relayed 200 and phase 2's stale `mesh_authz` DENY.
     let withdrawn = wait_for_ingress_connect(
         inbound_port,
         &first_authority,
         peers,
         reload_deadline,
-        |outcome| outcome.status != 200 && outcome.status != 403,
+        |outcome| {
+            outcome.status == 403
+                && outcome.refusal_body.as_deref() == Some(HBONE_RELAY_DESTINATION_DENIED_BODY)
+        },
     )
     .await
     .map_err(|e| format!("the withdrawn ingress listener never failed closed: {e}"))?;
@@ -11858,8 +11924,8 @@ async fn wait_for_ingress_connect(
         let last = match sidecar_ingress_connect(inbound_port, authority, peers, "ping").await {
             Ok(outcome) if accept(&outcome) => return Ok(outcome),
             Ok(outcome) => format!(
-                "last CONNECT to {authority}: status {} relayed {:?}",
-                outcome.status, outcome.relayed
+                "last CONNECT to {authority}: status {} relayed {:?} refusal body {:?}",
+                outcome.status, outcome.relayed, outcome.refusal_body
             ),
             Err(e) => format!("last CONNECT to {authority} failed: {e}"),
         };
@@ -12091,6 +12157,31 @@ async fn drive_one_waypoint_byte_connect(
     client_svid: &GeneratedGatewaySvid,
     payload: &[u8],
 ) -> Result<(u16, Option<Vec<u8>>), String> {
+    observe_waypoint_byte_connect(hbone_ip, hbone_port, authority, client_svid, payload)
+        .await
+        .map(|outcome| (outcome.status, outcome.echoed))
+}
+
+/// One byte-stream HBONE CONNECT observation.
+struct WaypointByteConnect {
+    status: u16,
+    /// Bytes echoed back through an accepted tunnel. `None` when refused.
+    echoed: Option<Vec<u8>>,
+    /// Response body of a refused CONNECT. `None` when accepted. A
+    /// relay-destination refusal and a `mesh_authz` DENY are both `403`
+    /// (issue #5763), so this is what tells them apart on the wire.
+    refusal_body: Option<String>,
+}
+
+/// [`drive_one_waypoint_byte_connect`], also keeping a refused CONNECT's
+/// response body.
+async fn observe_waypoint_byte_connect(
+    hbone_ip: Ipv4Addr,
+    hbone_port: u16,
+    authority: &str,
+    client_svid: &GeneratedGatewaySvid,
+    payload: &[u8],
+) -> Result<WaypointByteConnect, String> {
     let tcp = tokio::net::TcpStream::connect((hbone_ip, hbone_port))
         .await
         .map_err(|e| format!("connect waypoint: {e}"))?;
@@ -12126,19 +12217,23 @@ async fn drive_one_waypoint_byte_connect(
         .map_err(|e| format!("CONNECT response: {e}"))?;
     let status = resp.status().as_u16();
 
-    let echoed = if status == 200 {
-        let mut response_body = resp.into_body();
-        Some(
-            read_relayed_bytes(&mut response_body, payload.len(), Duration::from_secs(5))
-                .await
-                .map_err(|e| format!("read relayed bytes: {e}"))?,
-        )
+    let mut response_body = resp.into_body();
+    let (echoed, refusal_body) = if status == 200 {
+        let echoed = read_relayed_bytes(&mut response_body, payload.len(), Duration::from_secs(5))
+            .await
+            .map_err(|e| format!("read relayed bytes: {e}"))?;
+        (Some(echoed), None)
     } else {
-        None
+        let refusal = read_connect_refusal_body(&mut response_body, Duration::from_secs(5)).await;
+        (None, Some(refusal))
     };
 
     conn_task.abort();
-    Ok((status, echoed))
+    Ok(WaypointByteConnect {
+        status,
+        echoed,
+        refusal_body,
+    })
 }
 
 /// The outcome of probing BOTH destinations behind one waypoint under one
@@ -12147,6 +12242,7 @@ async fn drive_one_waypoint_byte_connect(
 struct WaypointDestinationOutcome {
     status: u16,
     echoed: Option<Vec<u8>>,
+    refusal_body: Option<String>,
     backend_connections: usize,
 }
 
@@ -12233,7 +12329,7 @@ async fn drive_waypoint_target_refs(
             continue;
         }
 
-        let reviews = drive_one_waypoint_byte_connect(
+        let reviews = observe_waypoint_byte_connect(
             Ipv4Addr::LOCALHOST,
             hbone_port,
             &format!("{workload_address}:{reviews_port}"),
@@ -12241,7 +12337,7 @@ async fn drive_waypoint_target_refs(
             b"reviews-payload",
         )
         .await;
-        let ratings = drive_one_waypoint_byte_connect(
+        let ratings = observe_waypoint_byte_connect(
             Ipv4Addr::LOCALHOST,
             hbone_port,
             &format!("{workload_address}:{ratings_port}"),
@@ -12268,20 +12364,20 @@ async fn drive_waypoint_target_refs(
         }
 
         return match (reviews, ratings) {
-            (Ok((reviews_status, reviews_echoed)), Ok((ratings_status, ratings_echoed))) => {
-                Ok(WaypointTargetRefsOutcome {
-                    reviews: WaypointDestinationOutcome {
-                        status: reviews_status,
-                        echoed: reviews_echoed,
-                        backend_connections: reviews_hits.load(Ordering::SeqCst),
-                    },
-                    ratings: WaypointDestinationOutcome {
-                        status: ratings_status,
-                        echoed: ratings_echoed,
-                        backend_connections: ratings_hits.load(Ordering::SeqCst),
-                    },
-                })
-            }
+            (Ok(reviews), Ok(ratings)) => Ok(WaypointTargetRefsOutcome {
+                reviews: WaypointDestinationOutcome {
+                    status: reviews.status,
+                    echoed: reviews.echoed,
+                    refusal_body: reviews.refusal_body,
+                    backend_connections: reviews_hits.load(Ordering::SeqCst),
+                },
+                ratings: WaypointDestinationOutcome {
+                    status: ratings.status,
+                    echoed: ratings.echoed,
+                    refusal_body: ratings.refusal_body,
+                    backend_connections: ratings_hits.load(Ordering::SeqCst),
+                },
+            }),
             (Err(e), _) | (_, Err(e)) => Err(format!(
                 "waypoint CONNECT failed against a healthy gateway: {e}\n--- waypoint ---\n{logs}"
             )),
@@ -12310,6 +12406,13 @@ fn assert_denied(outcome: &WaypointDestinationOutcome, what: &str) {
     assert_eq!(
         outcome.status, 403,
         "{what} must be denied by mesh_authz (403)"
+    );
+    // A relay-destination refusal is also a 403 (issue #5763); only the body
+    // proves the targetRefs DENY itself refused the CONNECT.
+    let body = outcome.refusal_body.as_deref().unwrap_or_default();
+    assert!(
+        body.starts_with(MESH_AUTHZ_DENIED_BODY_PREFIX),
+        "{what} must be refused by mesh_authz, not another 403 layer; body {body:?}"
     );
     assert_eq!(
         outcome.backend_connections, 0,
