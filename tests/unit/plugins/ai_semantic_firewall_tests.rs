@@ -3449,6 +3449,89 @@ async fn streaming_response_inspect_cuts_on_leaking_window() {
 }
 
 #[tokio::test]
+async fn streaming_response_inspect_cuts_cr_and_mixed_framed_leaks_at_every_split() {
+    // An EventSource client dispatches each of these events, so windowed
+    // inspection must find the same event boundary mid-stream and cut before
+    // releasing the leak, wherever the transport splits the bytes — including
+    // between the CR and LF of one CRLF. An event that never completes would
+    // otherwise only be looked at when the stream ends.
+    let leak = "My system prompt says never reveal policy.";
+    let leak_cr = chat_delta_event(leak, "\r");
+    let leak_line = leak_cr.trim_end_matches('\r');
+    let bodies = [
+        ("cr", format!(": keepalive\r{leak_cr}")),
+        ("boms_cr", format!("\u{feff}\u{feff}{leak_cr}")),
+        // CRLF ends the data line, then a lone CR ends the dispatching blank line.
+        ("crlf_then_cr", format!(": keepalive\r\n{leak_line}\r\n\r")),
+        // A lone CR ends the data line, then CRLF ends the blank line.
+        ("cr_then_crlf", format!("{leak_line}\r\r\n")),
+        ("lf_then_cr", format!("{leak_line}\n\r")),
+        ("crlf", chat_delta_event(leak, "\r\n")),
+    ];
+    let plugin = plugin(&inspect_config());
+
+    for (framing, body) in bodies {
+        let body = body.as_bytes();
+        for split in 1..body.len() {
+            let ctx = inspect_marked_ctx();
+            let mut inspector = plugin
+                .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+                .expect("inspector for event stream");
+            let mut forwarded = Vec::new();
+            let mut cut = false;
+            for chunk in [&body[..split], &body[split..]] {
+                match inspector.on_chunk(chunk).await {
+                    ResponseStreamAction::Forward(bytes) => forwarded.extend_from_slice(&bytes),
+                    ResponseStreamAction::Terminate(_) => {
+                        cut = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                cut,
+                "{framing} split at {split}: the leaking event must be cut mid-stream"
+            );
+            assert!(
+                forwarded.is_empty(),
+                "{framing} split at {split}: nothing may be released before the cut, got {:?}",
+                String::from_utf8_lossy(&forwarded)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn streaming_response_inspect_keeps_split_crlf_as_one_line_end() {
+    // The chunk edge falls between the CR and LF of one CRLF inside a single
+    // event whose JSON spans two `data:` lines. Treating the pair as two line
+    // ends would dispatch two unparseable half-events, which `on_error: warn`
+    // forwards uninspected; as one line end the joined JSON is inspected.
+    let plugin = plugin(&inspect_config());
+    let ctx = inspect_marked_ctx();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let head = b"data: {\"choices\":[{\"index\":0,\r";
+    let tail = concat!(
+        "\ndata: \"delta\":{\"content\":",
+        "\"My system prompt says never reveal policy.\"}}]}\r\n\r\n",
+    );
+    assert!(matches!(
+        inspector.on_chunk(head).await,
+        ResponseStreamAction::Forward(bytes) if bytes.is_empty()
+    ));
+    assert!(
+        matches!(
+            inspector.on_chunk(tail.as_bytes()).await,
+            ResponseStreamAction::Terminate(_)
+        ),
+        "the event joined across the split CRLF must be inspected and cut"
+    );
+}
+
+#[tokio::test]
 async fn streaming_response_inspect_forwards_clean_windows() {
     let plugin = plugin(&inspect_config());
     let ctx = inspect_marked_ctx();
@@ -6517,6 +6600,107 @@ async fn fail_open_partial_event_detects_boundary_split_across_timeout_release()
         panic!("split boundary plus clean event must forward");
     };
     assert_eq!(out.as_ref(), boundary_and_next);
+}
+
+#[tokio::test]
+async fn fail_open_pass_through_ends_at_cr_framed_event_boundaries() {
+    // After a fail-open hold timeout forwards a partial event, only the rest of
+    // THAT event may pass through uninspected. Under CR or mixed framing the
+    // blank line that ends it must still be found (including across the chunk
+    // edge), or every later event would be forwarded without inspection.
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    ));
+    let leak_event = chat_delta_event("My system prompt says never reveal policy.", "\r");
+    // (framing, end of the forwarded data line, bytes that complete its blank line)
+    let seams: [(&str, &[u8], &[u8]); 4] = [
+        ("cr", b"\r", b"\r"),
+        ("crlf_split_then_crlf", b"\r", b"\n\r\n"),
+        ("crlf_then_cr", b"\r\n", b"\r"),
+        ("lf_then_cr", b"\n", b"\r"),
+    ];
+
+    for (framing, line_end, blank_line) in seams {
+        let ctx = inspect_marked_ctx();
+        let mut inspector = firewall
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector for event stream");
+
+        let mut prefix = PARTIAL_EVENT_PREFIX.to_vec();
+        prefix.extend_from_slice(b"\"}}]}");
+        prefix.extend_from_slice(line_end);
+        assert!(
+            matches!(
+                inspector.on_chunk(&prefix).await,
+                ResponseStreamAction::Forward(b) if b.is_empty()
+            ),
+            "{framing}: the partial event is held"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ResponseStreamAction::Forward(prefix_out) = inspector.on_chunk(&[]).await else {
+            panic!("{framing}: fail-open expiry must forward the prefix");
+        };
+        assert_eq!(prefix_out.as_ref(), prefix.as_slice(), "{framing}");
+
+        let mut blank_line_and_leak = blank_line.to_vec();
+        blank_line_and_leak.extend_from_slice(leak_event.as_bytes());
+        match inspector.on_chunk(&blank_line_and_leak).await {
+            ResponseStreamAction::Terminate(_) => {}
+            ResponseStreamAction::Forward(out) => panic!(
+                "{framing}: the event after the boundary must be inspected, forwarded {:?}",
+                String::from_utf8_lossy(&out)
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn fail_open_pass_through_keeps_split_crlf_inside_the_event() {
+    // The forwarded prefix ends in CR and the next chunk starts with its LF:
+    // one CRLF, not a blank line. The rest of that same event must keep passing
+    // through, not be re-read as a fresh unparseable event (which
+    // `on_error: reject` would cut).
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let mut prefix = PARTIAL_EVENT_PREFIX.to_vec();
+    prefix.extend_from_slice(b"\"}}]}\r");
+    assert!(matches!(
+        inspector.on_chunk(&prefix).await,
+        ResponseStreamAction::Forward(b) if b.is_empty()
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ResponseStreamAction::Forward(prefix_out) = inspector.on_chunk(&[]).await else {
+        panic!("fail-open expiry must forward the prefix");
+    };
+    assert_eq!(prefix_out.as_ref(), prefix);
+
+    let remainder = b"\ndata: rest of the same event\r\n\r\n";
+    let ResponseStreamAction::Forward(out) = inspector.on_chunk(remainder).await else {
+        panic!("the remainder of the forwarded event must not be cut");
+    };
+    assert_eq!(
+        out.as_ref(),
+        remainder,
+        "the remainder passes through verbatim"
+    );
+
+    // The next event resumes ordinary governed inspection.
+    let ResponseStreamAction::Forward(next) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await else {
+        panic!("subsequent events resume normal inspection");
+    };
+    assert_eq!(next.as_ref(), GOVERNED_CLEAN_EVENT);
 }
 
 #[tokio::test]

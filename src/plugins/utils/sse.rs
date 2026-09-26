@@ -173,9 +173,7 @@ pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
         }
     }
 
-    // Strip leading U+FEFF characters so decoding stages that each consume a
-    // BOM cannot leave a second one hiding the first event from inspection.
-    let body_str = body_str.trim_start_matches('\u{feff}');
+    let body_str = strip_sse_boms(body_str);
 
     for line in sse_lines(body_str) {
         if line.is_empty() {
@@ -221,15 +219,33 @@ pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
     }
 }
 
+/// Drop every leading U+FEFF from an event-stream body.
+///
+/// The WHATWG decoder consumes one BOM, but stacked decoding stages may each
+/// consume one, so all leading BOMs are stripped: a second BOM left in place
+/// would hide the first event from inspection while a client still decodes it.
+/// Every SSE inspection and rewrite path applies this same policy.
+pub fn strip_sse_boms(body: &str) -> &str {
+    body.trim_start_matches('\u{feff}')
+}
+
 /// Split an event-stream body into lines on every WHATWG end-of-line form:
 /// CRLF, a lone LF, or a lone CR (mixed freely within one stream). Unlike
 /// [`str::lines`], a lone CR terminates a line instead of staying inside it. A
 /// final unterminated line is still yielded; no trailing empty line follows a
 /// final terminator. Borrows from `body`, so splitting allocates nothing.
-fn sse_lines(body: &str) -> impl Iterator<Item = &str> {
-    fn is_eol(b: &u8) -> bool {
-        matches!(*b, b'\n' | b'\r')
-    }
+///
+/// This does not strip a BOM; callers splitting a whole body apply
+/// [`strip_sse_boms`] first.
+pub fn sse_lines(body: &str) -> impl Iterator<Item = &str> {
+    sse_lines_inclusive(body).map(|line| split_sse_line_terminator(line).0)
+}
+
+/// Like [`sse_lines`], but each yielded line keeps its own terminator (`"\r\n"`,
+/// `"\n"`, or `"\r"`), so concatenating the lines reproduces `body` exactly.
+/// Rewriters use this to preserve the original framing byte-for-byte; use
+/// [`split_sse_line_terminator`] to separate a line from its terminator.
+pub fn sse_lines_inclusive(body: &str) -> impl Iterator<Item = &str> {
     let bytes = body.as_bytes();
     let mut pos = 0;
     std::iter::from_fn(move || {
@@ -237,22 +253,89 @@ fn sse_lines(body: &str) -> impl Iterator<Item = &str> {
             return None;
         }
         let start = pos;
-        match bytes[start..].iter().position(is_eol) {
-            Some(offset) => {
-                let end = start + offset;
-                pos = end + 1;
-                if bytes[end] == b'\r' && bytes.get(pos) == Some(&b'\n') {
-                    pos += 1;
-                }
-                // CR and LF are ASCII, so `start..end` lies on char boundaries.
-                Some(&body[start..end])
-            }
-            None => {
-                pos = bytes.len();
-                Some(&body[start..])
-            }
-        }
+        pos = match bytes[start..].iter().position(is_sse_eol) {
+            Some(offset) => sse_eol_end(bytes, start + offset),
+            None => bytes.len(),
+        };
+        // CR and LF are ASCII, so `start..pos` lies on char boundaries.
+        Some(&body[start..pos])
     })
+}
+
+/// Split one line from [`sse_lines_inclusive`] into its content and its
+/// terminator: `"\r\n"`, `"\n"`, `"\r"`, or `""` for a final unterminated line.
+pub fn split_sse_line_terminator(line: &str) -> (&str, &str) {
+    let terminator_len = if line.ends_with("\r\n") {
+        2
+    } else if line.ends_with(['\n', '\r']) {
+        1
+    } else {
+        0
+    };
+    line.split_at(line.len() - terminator_len)
+}
+
+/// Byte index just past the first complete SSE event in `buf` (the end of its
+/// first blank line), or `None` while no event has fully arrived.
+///
+/// Line terminators are CRLF, LF, or a lone CR, mixed freely, so a blank line is
+/// any terminator immediately followed by another one (`\n\n`, `\r\r`,
+/// `\r\n\r\n`, `\n\r\n`, `\r\n\r`, ...). A CR followed by LF is always one
+/// terminator. `buf` is scanned as if it starts inside a line, so a terminator
+/// at index 0 ends that line rather than forming a blank line by itself.
+///
+/// A CR as the final byte of `buf` is decided as early as possible: as the
+/// FIRST terminator it cannot complete an event until the next byte shows
+/// whether it is half of a CRLF, but as the SECOND terminator it already ends
+/// the event. An LF that then follows it belongs to the same CRLF, and treating
+/// it as an empty line at the start of the next event dispatches nothing — the
+/// same result a client reaches. Allocation-free.
+pub fn sse_event_end(buf: &[u8]) -> Option<usize> {
+    let mut pos = 0;
+    while let Some(offset) = buf[pos..].iter().position(is_sse_eol) {
+        let after = sse_eol_end(buf, pos + offset);
+        match buf.get(after) {
+            Some(b'\n' | b'\r') => return Some(sse_eol_end(buf, after)),
+            _ => pos = after,
+        }
+    }
+    None
+}
+
+/// How many bytes of `chunk` complete the next SSE event, given the partial
+/// `carry` already accumulated, with the same framing rules as
+/// [`sse_event_end`] applied to `carry` followed by `chunk`.
+///
+/// `carry` must hold no complete event (`sse_event_end(carry)` is `None`).
+/// Allocation-free: a blank line can only straddle the seam through a
+/// terminator that ends `carry`, including a CR at the end of `carry` whose LF
+/// starts `chunk` (one CRLF terminator), so those cases are checked directly and
+/// everything else is found by scanning `chunk` alone.
+pub fn sse_event_end_after(carry: &[u8], chunk: &[u8]) -> Option<usize> {
+    // Index in `chunk` at which the terminator that ends `carry` is complete.
+    let after_seam = match carry.last() {
+        Some(b'\r') if chunk.first() == Some(&b'\n') => 1,
+        Some(b'\n' | b'\r') => 0,
+        _ => return sse_event_end(chunk),
+    };
+    match chunk.get(after_seam) {
+        Some(b'\n' | b'\r') => Some(sse_eol_end(chunk, after_seam)),
+        _ => sse_event_end(chunk),
+    }
+}
+
+fn is_sse_eol(byte: &u8) -> bool {
+    matches!(*byte, b'\n' | b'\r')
+}
+
+/// Index just past the line terminator that starts at `eol`: CRLF is one
+/// terminator; a lone CR or LF is one byte.
+fn sse_eol_end(bytes: &[u8], eol: usize) -> usize {
+    if bytes.get(eol) == Some(&b'\r') && bytes.get(eol + 1) == Some(&b'\n') {
+        eol + 2
+    } else {
+        eol + 1
+    }
 }
 
 impl SseParse {

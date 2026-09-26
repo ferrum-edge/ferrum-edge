@@ -3554,6 +3554,88 @@ async fn test_multiline_sse_event_redaction_uses_complete_event() {
 }
 
 #[tokio::test]
+async fn test_sse_redaction_follows_cr_and_mixed_framing_and_leading_boms() {
+    // Every body below is a legal event stream that an EventSource client
+    // decodes to the same events. Redact mode must rewrite the email in each,
+    // splitting lines exactly as the inspection parser does, instead of
+    // refusing the stream as unredactable.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+    // (framing, leading BOMs, line ends of: comment, event, data 1, data 2,
+    // blank, done, blank). A lone CR is never followed by an LF-terminated
+    // blank line, which would merge the two into one CRLF.
+    let variants: [(&str, &str, [&str; 7]); 5] = [
+        ("cr", "", ["\r"; 7]),
+        ("boms_cr", "\u{feff}\u{feff}", ["\r"; 7]),
+        (
+            "mixed",
+            "",
+            ["\r\n", "\r", "\n", "\r\n", "\r", "\n", "\r\n"],
+        ),
+        (
+            "bom_mixed",
+            "\u{feff}",
+            ["\r", "\n", "\r\n", "\n", "\r", "\r", "\r\n"],
+        ),
+        // Dropping the second data line leaves the first line's lone CR right
+        // before the LF blank line; the rewrite must keep them two line ends.
+        (
+            "cr_data_then_lf",
+            "",
+            ["\n", "\n", "\r", "\n", "\n", "\n", "\n"],
+        ),
+    ];
+
+    for (framing, boms, [comment, event, data_1, data_2, blank, done, done_blank]) in variants {
+        let body = format!(
+            "{boms}: keep-alive{comment}event: message{event}\
+             data: {{\"choices\":[{data_1}\
+             data: {{\"index\":0,\"delta\":{{\"content\":\"multi@example.com\"}}}}]}}{data_2}\
+             {blank}data: [DONE]{done}{done_blank}"
+        );
+        let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+            .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{framing}: a redactable stream must not be refused"
+        );
+        assert!(
+            ctx.metadata.contains_key("ai_response_guard_redacted"),
+            "{framing}: the stream must be recorded as redacted"
+        );
+
+        let transformed = plugin
+            .transform_response_body(body.as_bytes(), Some("text/event-stream"), &sse_headers())
+            .await
+            .expect("the SSE event should be rewritten");
+        let transformed = String::from_utf8(transformed).unwrap();
+        assert!(!transformed.contains("multi@example.com"), "{framing}");
+        assert!(transformed.contains("[REDACTED:pii:email]"), "{framing}");
+        // Leading BOMs, the comment, and every other line keep their bytes and
+        // line ends; only the rewritten data line changes.
+        let expected_head = format!("{boms}: keep-alive{comment}event: message{event}data: ");
+        assert!(
+            transformed.starts_with(&expected_head),
+            "{framing}: {transformed:?}"
+        );
+        let rewritten_end = if data_1 == "\r" && blank.starts_with('\n') {
+            format!("{data_1}\r{blank}")
+        } else {
+            format!("{data_1}{blank}")
+        };
+        let expected_tail = format!("}}]}}{rewritten_end}data: [DONE]{done}{done_blank}");
+        assert!(
+            transformed.ends_with(&expected_tail),
+            "{framing}: {transformed:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_common_buffered_output_shapes_are_detected_and_redacted() {
     let secret = "shape@example.com";
     let shapes = [
