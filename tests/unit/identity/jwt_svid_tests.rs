@@ -14,11 +14,14 @@ use ferrum_edge::identity::ca::{
     SignedSvid,
 };
 use ferrum_edge::identity::jwt_svid::{
-    JwtSvidSigner, LocalJwtAuthority, LocalJwtAuthorityConfig, SharedJwtSvidSigner, jwks_document,
-    validate_jwt_svid,
+    JwtSvidSigner, LocalJwtAuthority, LocalJwtAuthorityConfig, MAX_JWT_CLAIMS_NESTING_DEPTH,
+    SharedJwtSvidSigner, claims_to_struct, jwks_document, validate_jwt_svid,
 };
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::identity::workload_api::server::WorkloadApiService;
+use prost::Message as _;
+use prost_types::value::Kind;
+use prost_types::{ListValue, NullValue, Struct};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tonic::Request;
@@ -304,8 +307,29 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn claims_of(validated_json: &[u8]) -> serde_json::Value {
-    serde_json::from_slice(validated_json).expect("claims are JSON")
+/// Project a returned `google.protobuf.Struct` back to JSON so claim
+/// assertions read naturally. Numbers come back as doubles.
+fn claims_of(claims: &Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        claims
+            .fields
+            .iter()
+            .map(|(key, value)| (key.clone(), proto_value_to_json(value)))
+            .collect(),
+    )
+}
+
+fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    match value.kind.as_ref().expect("a Value has a kind") {
+        Kind::NullValue(_) => serde_json::Value::Null,
+        Kind::NumberValue(number) => serde_json::json!(*number),
+        Kind::StringValue(text) => serde_json::Value::String(text.clone()),
+        Kind::BoolValue(flag) => serde_json::Value::Bool(*flag),
+        Kind::StructValue(object) => claims_of(object),
+        Kind::ListValue(list) => {
+            serde_json::Value::Array(list.values.iter().map(proto_value_to_json).collect())
+        }
+    }
 }
 
 // ── mint ─────────────────────────────────────────────────────────────────
@@ -321,7 +345,7 @@ fn mint_and_validate_round_trip() {
         .expect("round trip validates");
 
     assert_eq!(validated.spiffe_id, workload_id());
-    let claims = claims_of(&validated.claims_json);
+    let claims = claims_of(&validated.claims);
     assert_eq!(claims["sub"], workload_id().as_str());
     assert_eq!(claims["aud"][0], "spiffe://td.test/api");
     assert!(claims["exp"].is_number(), "exp must be present");
@@ -402,7 +426,7 @@ fn mint_collapses_duplicate_audiences_preserving_order() {
         )
         .expect("mint succeeds");
     let validated = validate_jwt_svid(&minted.token, "a", &bundles_of(&signer)).expect("validates");
-    let claims = claims_of(&validated.claims_json);
+    let claims = claims_of(&validated.claims);
     assert_eq!(claims["aud"], serde_json::json!(["b", "a"]));
 }
 
@@ -834,6 +858,245 @@ fn validation_errors_never_echo_token_bytes() {
         !err.to_string().contains(marker),
         "rejection reasons must not reflect hostile token bytes (got: {err})"
     );
+}
+
+// ── claims as google.protobuf.Struct ─────────────────────────────────────
+
+/// `ValidateJWTSVIDResponse` exactly as upstream SPIFFE `workload.proto`
+/// declares it (`google.protobuf.Struct claims = 2`), written independently of
+/// Ferrum's vendored proto so wire drift in either direction fails here.
+#[derive(Clone, PartialEq, prost::Message)]
+struct UpstreamValidateJwtsvidResponse {
+    #[prost(string, tag = "1")]
+    spiffe_id: String,
+    #[prost(message, optional, tag = "2")]
+    claims: Option<Struct>,
+}
+
+fn proto_struct(fields: Vec<(&str, prost_types::Value)>) -> Struct {
+    Struct {
+        fields: fields
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+    }
+}
+
+fn proto_object(fields: Vec<(&str, prost_types::Value)>) -> prost_types::Value {
+    Kind::StructValue(proto_struct(fields)).into()
+}
+
+fn proto_list(values: Vec<prost_types::Value>) -> prost_types::Value {
+    Kind::ListValue(ListValue { values }).into()
+}
+
+fn proto_null() -> prost_types::Value {
+    Kind::NullValue(NullValue::NullValue as i32).into()
+}
+
+fn num(value: f64) -> prost_types::Value {
+    value.into()
+}
+
+/// A claims object whose nesting depth is exactly `depth`: the object itself
+/// is depth 1 and every `wrap` adds one container level.
+fn nested_claims(
+    depth: usize,
+    wrap: fn(serde_json::Value) -> serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut inner = serde_json::Value::Null;
+    for _ in 1..depth {
+        inner = wrap(inner);
+    }
+    let mut claims = serde_json::Map::new();
+    claims.insert("n".to_string(), inner);
+    claims
+}
+
+fn wrap_in_object(value: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "n": value })
+}
+
+fn wrap_in_array(value: serde_json::Value) -> serde_json::Value {
+    serde_json::json!([value])
+}
+
+#[test]
+fn claims_to_struct_maps_every_json_kind_faithfully() {
+    let claims = serde_json::json!({
+        "sub": "spiffe://td.test/ns/test/sa/foo",
+        "aud": ["a", "b"],
+        "exp": 1_700_000_000u64,
+        "neg": -7,
+        "ratio": 0.25,
+        "big": 9_007_199_254_740_993u64,
+        "active": false,
+        "admin": true,
+        "owner": null,
+        "name": "caf\u{e9}",
+        "empty_object": {},
+        "empty_list": [],
+        "realm_access": {
+            "roles": ["reader", { "scoped": true, "tags": [1, null, [2.5]] }],
+            "level": { "depth": { "leaf": "x" } }
+        }
+    });
+    let claims = claims.as_object().expect("claims are a JSON object");
+
+    let tags = proto_list(vec![num(1.0), proto_null(), proto_list(vec![num(2.5)])]);
+    let scoped = proto_object(vec![("scoped", true.into()), ("tags", tags)]);
+    let level = proto_object(vec![("depth", proto_object(vec![("leaf", "x".into())]))]);
+    let realm_access = proto_object(vec![
+        ("roles", proto_list(vec!["reader".into(), scoped])),
+        ("level", level),
+    ]);
+    let expected = proto_struct(vec![
+        ("sub", "spiffe://td.test/ns/test/sa/foo".into()),
+        ("aud", proto_list(vec!["a".into(), "b".into()])),
+        ("exp", num(1_700_000_000.0)),
+        ("neg", num(-7.0)),
+        ("ratio", num(0.25)),
+        // Doubles, as SPIRE returns them: 2^53 + 1 is not representable.
+        ("big", num(9_007_199_254_740_992.0)),
+        ("active", false.into()),
+        ("admin", true.into()),
+        ("owner", proto_null()),
+        ("name", "caf\u{e9}".into()),
+        ("empty_object", proto_object(Vec::new())),
+        ("empty_list", proto_list(Vec::new())),
+        ("realm_access", realm_access),
+    ]);
+
+    let converted = claims_to_struct(claims).expect("claims convert");
+    assert_eq!(converted, expected);
+}
+
+#[test]
+fn claims_to_struct_bounds_nesting_depth() {
+    let wraps: [fn(serde_json::Value) -> serde_json::Value; 2] = [wrap_in_object, wrap_in_array];
+    for wrap in wraps {
+        let at_limit = nested_claims(MAX_JWT_CLAIMS_NESTING_DEPTH, wrap);
+        assert!(
+            claims_to_struct(&at_limit).is_ok(),
+            "claims at the nesting limit must convert"
+        );
+
+        let over_limit = nested_claims(MAX_JWT_CLAIMS_NESTING_DEPTH + 1, wrap);
+        let err = claims_to_struct(&over_limit).expect_err("claims past the limit must fail");
+        assert!(err.to_string().contains("nested too deeply"));
+    }
+}
+
+#[test]
+fn validate_returns_nested_claims_that_decode_with_the_upstream_proto() {
+    use ferrum_edge::identity::workload_api::proto::ValidateJwtsvidResponse;
+
+    let key = forge_key();
+    let exp = now() + 300;
+    let claims = serde_json::json!({
+        "sub": "spiffe://td.test/ns/test/sa/foo",
+        "aud": ["aud"],
+        "exp": exp,
+        "groups": ["admin", { "scoped": true, "tags": [1, null, [2.5]] }],
+        "realm": { "level": { "leaf": "x" }, "owner": null, "ratio": -0.5 }
+    });
+    let token = sign_compact(
+        &key,
+        r#"{"alg":"ES256","kid":"k1","typ":"JWT"}"#,
+        &claims.to_string(),
+    );
+    let validated = validate_jwt_svid(&token, "aud", &forged_bundles(&key, "k1"))
+        .expect("nested claims validate");
+
+    let tags = proto_list(vec![num(1.0), proto_null(), proto_list(vec![num(2.5)])]);
+    let scoped = proto_object(vec![("scoped", true.into()), ("tags", tags)]);
+    let realm = proto_object(vec![
+        ("level", proto_object(vec![("leaf", "x".into())])),
+        ("owner", proto_null()),
+        ("ratio", num(-0.5)),
+    ]);
+    let expected = proto_struct(vec![
+        ("sub", "spiffe://td.test/ns/test/sa/foo".into()),
+        ("aud", proto_list(vec!["aud".into()])),
+        ("exp", num(exp as f64)),
+        ("groups", proto_list(vec!["admin".into(), scoped])),
+        ("realm", realm),
+    ]);
+    assert_eq!(validated.claims, expected);
+
+    // Encode exactly what the RPC returns and decode it with the upstream
+    // message shape: a spec-conformant client must see the same claims.
+    let response = ValidateJwtsvidResponse {
+        spiffe_id: validated.spiffe_id.to_string(),
+        claims: Some(validated.claims),
+    };
+    let upstream = UpstreamValidateJwtsvidResponse::decode(response.encode_to_vec().as_slice())
+        .expect("the response decodes with the upstream workload.proto shape");
+    assert_eq!(
+        upstream,
+        UpstreamValidateJwtsvidResponse {
+            spiffe_id: "spiffe://td.test/ns/test/sa/foo".to_string(),
+            claims: Some(expected),
+        }
+    );
+}
+
+#[test]
+fn validate_returns_max_depth_claims_that_decode_with_the_upstream_proto() {
+    use ferrum_edge::identity::workload_api::proto::ValidateJwtsvidResponse;
+
+    // Every object level costs about three nested protobuf messages (`Struct`,
+    // map entry, `Value`), so the deepest allowed claims must still fit under
+    // prost's default decode recursion limit of 100.
+    let key = forge_key();
+    let mut claims = nested_claims(MAX_JWT_CLAIMS_NESTING_DEPTH, wrap_in_object);
+    claims.insert("sub".into(), workload_id().as_str().into());
+    claims.insert("aud".into(), serde_json::json!(["aud"]));
+    claims.insert("exp".into(), serde_json::json!(now() + 300));
+    let token = sign_compact(
+        &key,
+        r#"{"alg":"ES256","kid":"k1","typ":"JWT"}"#,
+        &serde_json::Value::Object(claims.clone()).to_string(),
+    );
+    let validated = validate_jwt_svid(&token, "aud", &forged_bundles(&key, "k1"))
+        .expect("claims at the nesting limit validate");
+    let expected = claims_to_struct(&claims).expect("claims at the nesting limit convert");
+    assert_eq!(validated.claims, expected);
+
+    let response = ValidateJwtsvidResponse {
+        spiffe_id: validated.spiffe_id.to_string(),
+        claims: Some(validated.claims),
+    };
+    let upstream = UpstreamValidateJwtsvidResponse::decode(response.encode_to_vec().as_slice())
+        .expect("max-depth claims decode within the protobuf recursion limit");
+    assert_eq!(upstream.spiffe_id, workload_id().as_str());
+    let decoded = upstream.claims.expect("claims are returned");
+    assert_eq!(decoded, expected);
+
+    let mut depth = 1;
+    let mut level = &decoded;
+    while let Some(Kind::StructValue(inner)) = level.fields["n"].kind.as_ref() {
+        depth += 1;
+        level = inner;
+    }
+    assert_eq!(depth, MAX_JWT_CLAIMS_NESTING_DEPTH);
+}
+
+#[test]
+fn validate_refuses_claims_nested_beyond_the_struct_depth_limit() {
+    let key = forge_key();
+    let mut claims = nested_claims(MAX_JWT_CLAIMS_NESTING_DEPTH + 1, wrap_in_object);
+    claims.insert("sub".into(), workload_id().as_str().into());
+    claims.insert("aud".into(), serde_json::json!(["aud"]));
+    claims.insert("exp".into(), serde_json::json!(now() + 300));
+    let token = sign_compact(
+        &key,
+        r#"{"alg":"ES256","kid":"k1","typ":"JWT"}"#,
+        &serde_json::Value::Object(claims).to_string(),
+    );
+    let err = validate_jwt_svid(&token, "aud", &forged_bundles(&key, "k1"))
+        .expect_err("claims deeper than the Struct limit must fail closed");
+    assert!(err.to_string().contains("nested too deeply"));
 }
 
 // ── JWKS bundles ─────────────────────────────────────────────────────────
@@ -1347,8 +1610,14 @@ async fn validate_jwtsvid_round_trips_through_the_service() {
         .into_inner();
 
     assert_eq!(validated.spiffe_id, workload_id().as_str());
-    let claims = claims_of(&validated.claims_json);
+    let claims = claims_of(validated.claims.as_ref().expect("claims are returned"));
     assert_eq!(claims["sub"], workload_id().as_str());
+
+    // A client generated from upstream `workload.proto` decodes the same bytes.
+    let upstream = UpstreamValidateJwtsvidResponse::decode(validated.encode_to_vec().as_slice())
+        .expect("the response decodes with the upstream workload.proto shape");
+    assert_eq!(upstream.spiffe_id, workload_id().as_str());
+    assert_eq!(upstream.claims, validated.claims);
 }
 
 #[tokio::test]

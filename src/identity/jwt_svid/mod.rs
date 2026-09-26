@@ -47,6 +47,7 @@
 //!   drive an unbounded scan.
 
 pub mod authority;
+pub mod claims;
 pub mod jwks;
 mod strict_json;
 pub mod validate;
@@ -59,6 +60,8 @@ pub mod validate;
 pub use authority::{
     JwtSvidSigner, LocalJwtAuthority, LocalJwtAuthorityConfig, MintedJwtSvid, SharedJwtSvidSigner,
 };
+#[allow(unused_imports)]
+pub use claims::claims_to_struct;
 #[allow(unused_imports)]
 pub use jwks::{
     authorities_from_jwks, decoding_key_for_authority, jwks_document, published_authority_key_id,
@@ -88,9 +91,14 @@ pub const MAX_JWT_PUBLIC_KEY_PEM_BYTES: usize = 8 * 1024;
 pub const MAX_JWKS_DOCUMENT_BYTES: usize = 64 * 1024;
 /// Maximum number of trust domains in one `FetchJWTBundles` response.
 pub const MAX_JWT_BUNDLE_TRUST_DOMAINS: usize = 64;
-/// Maximum serialized size of the claims document returned by
+/// Maximum JSON-serialized size of the claims document returned by
 /// `ValidateJWTSVID`.
 pub const MAX_JWT_CLAIMS_JSON_BYTES: usize = 8 * 1024;
+/// Maximum nesting depth of the claims returned by `ValidateJWTSVID` as a
+/// `google.protobuf.Struct`. The claims object is depth 1; each nested object
+/// or array adds one. Bounded so the response stays within common protobuf
+/// decoder recursion limits (see [`claims`]).
+pub const MAX_JWT_CLAIMS_NESTING_DEPTH: usize = 32;
 /// Default JWT-SVID lifetime. Deliberately short — a JWT-SVID is a bearer
 /// credential with no revocation channel.
 pub const DEFAULT_JWT_SVID_TTL_SECS: u64 = 300;
