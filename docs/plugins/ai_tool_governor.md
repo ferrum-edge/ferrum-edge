@@ -58,6 +58,12 @@ Each is toggled independently under `inspect`; at least one must be enabled.
   (`n > 1`) streams, a batch is finalized only once **every** choice holding
   tool calls has reported a `finish_reason` (or the stream ends); later
   tool-call deltas form a new, independently governed batch.
+- **Deferred cuts.** When an earlier inspector defers a cut, the chain passes its cleared bytes
+  through the governor and calls `flush_before_cut` instead of `on_end`. The default hook calls
+  `on_end`; the governor overrides it to drop a pending tool-call batch, partial event, or fully
+  held body without governing it. This applies in both `enforce` and `dry_run`: the truncated
+  call triggers no approval webhook or decision metadata, and none of its held frames are
+  released. Only frames the governor already cleared reach the client before the earlier cut.
 - **Call identity.** Duplicate `tool_calls[].index` values in one frame, or
   conflicting / changing `tool_calls[].id` values for the same
   `(choice, index)` slot, are **ungovernable** and fail closed in enforce mode
@@ -143,10 +149,12 @@ be delivered buffered rather than streamed.
 | `mode` | Rejects? | What it does |
 | --- | --- | --- |
 | `enforce` (default) | yes | Blocks denied calls, cuts blocked streams, and **fails closed** on every body it cannot policy-check. |
-| `dry_run` | never | Evaluates policy, records the decision `enforce` **would** have reached plus the observation labels below, and forwards. The safe rollout / observe posture. Never calls the approval webhook. |
+| `dry_run` | never by governor policy | Evaluates policy, records the decision `enforce` **would** have reached plus the observation labels below, and forwards. The safe rollout / observe posture. Never calls the approval webhook. An earlier inspector's deferred cut can still end the chain and drop a pending, ungoverned unit. |
 
 `dry_run` still **counts and logs** everything `enforce` would have refused,
-including bodies it could not read — it just does not disrupt traffic.
+including bodies it could not read — it does not disrupt traffic by governor
+policy. An earlier inspector's deferred cut still ends the chain and can drop a
+pending unit that the governor has not finished governing.
 
 **Global dry-run does not relabel the decision.** `ai_tool_governor.mode` is
 what records the posture; `ai_tool_governor.decision` keeps the would-be policy
@@ -264,7 +272,10 @@ forwarded ungoverned:
   byte of the governed body.
 
 In `mode: dry_run` these bodies are forwarded uninspected (and a stream past
-the hold cap is released uninspected) — dry-run never disrupts traffic. That
+the hold cap is released uninspected). An earlier inspector's deferred cut can
+still end the chain in either mode: the governor drops a pending unit at that
+cut, including in dry-run. This is a consequence of the earlier cut, not a
+governor policy decision. Apart from that case, dry-run never disrupts traffic.
 includes ambiguous JSON: dry-run forwards the original bytes unchanged and
 records a sanitized fixed-cardinality observation —
 `ai_tool_governor.decision=dry_run` plus

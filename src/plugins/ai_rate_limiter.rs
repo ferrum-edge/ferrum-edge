@@ -3330,10 +3330,11 @@ impl ResponseStreamInspector for UsageStreamInspector {
 
     /// A later inspector cut the stream: the bytes this one already parsed are
     /// still the bytes the provider generated and billed, so the accumulated
-    /// usage stays. Publish it now because `on_end` will not run. `finish`
-    /// first, so a terminal usage event that arrived without its trailing blank
-    /// line is still dispatched by the SSE event assembler; it is idempotent
-    /// and only ever applies bytes already received.
+    /// usage stays. At a deferred cut, `flush_before_cut` may already have
+    /// published it; publishing again is idempotent. `finish` first, so a
+    /// terminal usage event that arrived without its trailing blank line is
+    /// still dispatched by the SSE event assembler; it only applies bytes
+    /// already received.
     fn on_downstream_terminated(&mut self) {
         self.extractor.finish();
         self.publish();

@@ -831,10 +831,11 @@ The proxy drives inspectors on reqwest, direct HTTP/2, and native HTTP/3 respons
 The `ResponseStreamInspector` action contract is:
 
 - `on_chunk(&mut self, chunk)` receives each decoded body chunk. `Forward(bytes)` releases those bytes now; `Forward(Bytes::new())` emits nothing and means the inspector is holding data in its own accumulator. `Terminate(None)` ends the body, while `Terminate(Some(bytes))` emits the final bytes and then ends it.
-- `on_end(&mut self)` is the clean end-of-stream flush for a trailing partial window. Its default returns an empty `Forward`.
+- `on_end(&mut self)` is the clean end-of-stream flush for a trailing partial window. Its default returns an empty `Forward`. A later inspector is also flushed at an earlier inspector's deferred cut through `flush_before_cut(&mut self)`, whose default calls `on_end`; override it when a cut must discard an unfinished unit instead of governing or releasing it.
+- `on_downstream_terminated()` is also called on inspectors after the owner of a deferred cut, after they have been flushed, so they can record that the stream ended with a cut or discard state that is no longer client-visible.
 - Response headers are already committed before either hook runs. `Terminate` can only truncate the in-flight response; it cannot change the HTTP status, replace headers, or retract previously forwarded bytes.
 
-Inspectors must remain portable across the detached H1/H2 driver and the native H3 event loop. They cannot borrow request context, must keep accumulators bounded, and must treat `on_downstream_terminated()` as the signal that a later inspector cut bytes they had already observed.
+Inspectors must remain portable across the detached H1/H2 driver and the native H3 event loop. They cannot borrow request context and must keep accumulators bounded. `on_downstream_terminated()` signals that a later inspector cut bytes they had already observed, and is also called after a deferred cut's owner has flushed them.
 
 ### `Content-Type` relabeling trap
 

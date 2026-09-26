@@ -605,6 +605,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the stream ends. In a chain of stream inspectors the LF follows what the
   client actually received, and a last inspector's cut at the end of the
   stream keeps the bytes it released just before (#5820).
+- The HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends now counts pass-through
+  gRPC-Web request messages on their decoded frames on its streamed upload,
+  its mesh-egress drain, and its unprepared buffered body, which fed no count
+  before (#5819). Its `502` for a backend client the connection pool could not
+  build is now a gateway error terminal: a gRPC-Web client's is decorated by
+  the `after_proxy` hooks, and `X-Gateway-Error: connection_failure` is written
+  after them. A test-only fault on the pooled-client acquire covers that
+  terminal over a real HTTP/3 stream (#5824).
 - A cut by an `ai_semantic_firewall` or `ai_tool_governor` stream inspector
   that is not the last one in the chain no longer drops the bytes it cleared
   in the same call (clean windows, a fail-open pass-through rest, or content
@@ -618,18 +626,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that is not the last and cuts in its flush drops what it released there,
   since the inspectors after it never passed it. At that flush a later
   `ai_tool_governor` drops a tool-call batch still pending without governing
-  it, so the truncated call calls no approval webhook, records no decision
-  metadata, and releases none of its held frames. `ai_tool_governor` no
+  it, so the truncated call triggers no approval webhook, even in `dry_run`,
+  records no decision metadata, and releases none of its held frames.
+  `ai_tool_governor` no
   longer puts bytes it cleared into its terminal payload when a later
   inspector follows, so they no longer skip that inspector (#5826).
-- The HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends now counts pass-through
-  gRPC-Web request messages on their decoded frames on its streamed upload,
-  its mesh-egress drain, and its unprepared buffered body, which fed no count
-  before (#5819). Its `502` for a backend client the connection pool could not
-  build is now a gateway error terminal: a gRPC-Web client's is decorated by
-  the `after_proxy` hooks, and `X-Gateway-Error: connection_failure` is written
-  after them. A test-only fault on the pooled-client acquire covers that
-  terminal over a real HTTP/3 stream (#5824).
 
 ### Security
 
