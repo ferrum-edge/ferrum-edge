@@ -405,6 +405,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `content_encoded_body`); only a body with no final trailer frame at all is
   still `UNKNOWN`. Translated gRPC-Web keeps reading its status from the
   backend's HTTP/2 trailers.
+- `response_caching` no longer stores or replays rate-limit fields: the
+  combined IETF `RateLimit` field and every `RateLimit-*`, `X-RateLimit-*`,
+  `X-AI-RateLimit-*`, and `Anthropic-RateLimit-*` field are stripped
+  case-insensitively from the retained entry, so a cache hit no longer reports
+  the original client's stale quota (for example `r=0`) until the entry
+  expires. The response that produced the miss is unchanged. `ai_federation`
+  now relays a provider's combined `RateLimit` field alongside the
+  `RateLimit-*` fields it already relayed (#5790).
 - `adaptive_concurrency` now relearns an obsolete minimum-latency baseline
   (#5737). The baseline was an all-time minimum, so one unusually fast success
   (a tiny `200`, a `304`, a cache hit) tightened the latency target forever:

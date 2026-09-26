@@ -329,10 +329,55 @@ fn is_supported_cacheable_status(status: u16) -> bool {
     status >= 200 && !UNSUPPORTED_CACHEABLE_STATUS_CODES.contains(&status)
 }
 
+/// Exact (case-insensitive) rate-limit field names a shared cache never
+/// retains: the combined IETF `RateLimit` structured field
+/// (draft-ietf-httpapi-ratelimit-headers, e.g. `RateLimit: "api";r=0;t=60`).
+const RATE_LIMIT_EXACT_HEADERS: [&str; 1] = ["ratelimit"];
+
+/// Case-insensitive prefixes for rate-limit field families a shared cache
+/// never retains: the split IETF `RateLimit-*` fields (`-Limit`, `-Remaining`,
+/// `-Reset`, `-Policy`), the de-facto `X-RateLimit-*` family (including
+/// provider suffix variants such as `X-RateLimit-Remaining-Tokens`), Ferrum
+/// Edge's own `X-AI-RateLimit-*`, and Anthropic's `Anthropic-RateLimit-*`.
+const RATE_LIMIT_HEADER_PREFIXES: [&str; 4] = [
+    "ratelimit-",
+    "x-ratelimit-",
+    "x-ai-ratelimit-",
+    "anthropic-ratelimit-",
+];
+
+/// Whether `name` is a rate-limit field that describes the quota state of the
+/// client whose request produced the response, at the moment it was produced.
+///
+/// RFC 9111 lets a shared cache store any field that is not connection-scoped
+/// or origin-qualified, but these fields are neither representation metadata
+/// nor valid for anyone else: a HIT consumes no origin quota, belongs to a
+/// different client (and possibly a different quota partition or policy
+/// tier), and arrives after the relative reset (`t=` / `-Reset`) has already
+/// elapsed. Replaying them would tell every later client the original
+/// caller's `r=0`. `RateLimit-Policy` is dropped with the family because a
+/// policy may be selected per client and can carry a partition key. Matching
+/// is allocation-free: byte-slice `eq_ignore_ascii_case` on ASCII names.
+fn is_rate_limit_response_header(name: &str) -> bool {
+    if RATE_LIMIT_EXACT_HEADERS
+        .iter()
+        .any(|exact| name.eq_ignore_ascii_case(exact))
+    {
+        return true;
+    }
+    let name = name.as_bytes();
+    RATE_LIMIT_HEADER_PREFIXES.iter().any(|prefix| {
+        let prefix = prefix.as_bytes();
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
 /// Strip everything that must not be retained from the representation about to
 /// be stored: connection-scoped and proxy-authentication fields, every field
-/// nominated by this response's own `Connection` header, and every field the
-/// origin qualified with `private="…"` / `no-cache="…"`.
+/// nominated by this response's own `Connection` header, every field the
+/// origin qualified with `private="…"` / `no-cache="…"`, and every per-client
+/// rate-limit field ([`is_rate_limit_response_header`]).
 ///
 /// The client-visible response for the miss that produced these bytes is
 /// untouched — only the retained copy is narrowed, which is exactly the
@@ -365,6 +410,7 @@ fn sanitize_cached_response_headers(
             && !directives
                 .qualified_protected_fields()
                 .any(|protected| name.eq_ignore_ascii_case(protected))
+            && !is_rate_limit_response_header(name)
     });
 }
 
@@ -3732,10 +3778,10 @@ impl Plugin for ResponseCaching {
         // this store acquires `accounting_lock`.
         let mut cached_response_headers = response_headers.clone();
         // Narrow the retained copy only: hop-by-hop / proxy-authentication
-        // fields and every field the origin qualified as `private` or
-        // `no-cache` are dropped before the entry exists, so no later replay
-        // path can emit them. The client that produced this miss still receives
-        // the untouched `response_headers`.
+        // fields, every field the origin qualified as `private` or `no-cache`,
+        // and per-client rate-limit fields are dropped before the entry exists,
+        // so no later replay path can emit them. The client that produced this
+        // miss still receives the untouched `response_headers`.
         sanitize_cached_response_headers(&mut cached_response_headers, &directives);
         // The entry body is a DISTINCT allocation from the one the collector
         // charged: the collected body is released when this response finishes,
