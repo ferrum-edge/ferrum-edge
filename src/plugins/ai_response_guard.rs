@@ -44,6 +44,7 @@ use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
     AnthropicEvent, SseEventName, SseReassembler, SseTextKind, is_text_event_stream_media_type,
     is_tgi_stream_frame, original_response_is_event_stream, parse_sse_data_frames_checked,
+    split_sse_line_terminator, sse_lines_inclusive, strip_sse_boms,
 };
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -1861,11 +1862,14 @@ impl AiResponseGuard {
     /// preserving the overall SSE framing. Returns `None` when no frame was
     /// modified (zero-copy happy path).
     ///
-    /// Rewritten `data:` lines preserve their original CR/LF terminator so
-    /// CRLF-encoded streams round-trip without mixing line endings. Frame JSON
-    /// is reserialized compactly by `serde_json::to_writer` into the bounded
-    /// sink, which may alter whitespace within a frame — clients consuming SSE
-    /// byte-for-byte should not depend on inner-frame formatting.
+    /// Events and lines are split exactly as the shared SSE parser splits them
+    /// (leading BOMs set aside, then CRLF, LF, or a lone CR), so CR-framed and
+    /// mixed-framing streams are redacted rather than refused. Rewritten `data:`
+    /// lines keep their original terminator, so streams round-trip without
+    /// changing their line endings. Frame JSON is reserialized compactly by
+    /// `serde_json::to_writer` into the bounded sink, which may alter
+    /// whitespace within a frame — clients consuming SSE byte-for-byte should
+    /// not depend on inner-frame formatting.
     fn redact_sse_body(&self, body: &[u8], ceiling: usize) -> Option<Vec<u8>> {
         let body_str = std::str::from_utf8(body).ok()?;
 
@@ -4320,10 +4324,7 @@ fn blank_top_level_structural_scalars(value: &mut Value) {
 fn sse_event_name_of(lines: &[&str]) -> Option<SseEventName> {
     let mut name = None;
     for line in lines {
-        let content = line
-            .strip_suffix("\r\n")
-            .or_else(|| line.strip_suffix('\n'))
-            .unwrap_or(line);
+        let content = split_sse_line_terminator(line).0;
         if let Some(rest) = content.strip_prefix("event:") {
             name = Some(SseEventName::from_name(rest.trim()));
         }
@@ -4351,10 +4352,7 @@ fn rewrite_sse_json_event_into(
     let mut data_lines = Vec::new();
     let mut payloads = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
-        let content = line
-            .strip_suffix("\r\n")
-            .or_else(|| line.strip_suffix('\n'))
-            .unwrap_or(line);
+        let content = split_sse_line_terminator(line).0;
         if let Some(data) = content
             .strip_prefix("data: ")
             .or_else(|| content.strip_prefix("data:"))
@@ -4384,15 +4382,14 @@ fn rewrite_sse_json_event_into(
     }
 
     let first_data_line = data_lines[0];
+    // Whether the last line written ended in a lone CR. Dropping the later data
+    // lines can place such a line directly before a blank line terminated by LF;
+    // written as-is, the pair would merge into one CRLF and the blank line that
+    // dispatches this event would disappear.
+    let mut wrote_lone_cr = false;
     for (idx, line) in lines.iter().enumerate() {
         if idx == first_data_line {
-            let ending: &[u8] = if line.ends_with("\r\n") {
-                b"\r\n"
-            } else if line.ends_with('\n') {
-                b"\n"
-            } else {
-                b""
-            };
+            let ending = split_sse_line_terminator(line).1;
             if !output.push(b"data: ") {
                 return None;
             }
@@ -4402,30 +4399,41 @@ fn rewrite_sse_json_event_into(
             if serde_json::to_writer(&mut *output, &json).is_err() {
                 return None;
             }
-            if !ending.is_empty() && !output.push(ending) {
+            if !ending.is_empty() && !output.push(ending.as_bytes()) {
                 return None;
             }
-        } else if data_lines.binary_search(&idx).is_err() && !output.push(line.as_bytes()) {
-            return None;
+            wrote_lone_cr = ending == "\r";
+        } else if data_lines.binary_search(&idx).is_err() {
+            // Write that LF blank line as CRLF so it stays its own line.
+            if wrote_lone_cr && line.starts_with('\n') && !output.push(b"\r") {
+                return None;
+            }
+            if !output.push(line.as_bytes()) {
+                return None;
+            }
+            wrote_lone_cr = split_sse_line_terminator(line).1 == "\r";
         }
     }
     Some(true)
 }
 
 /// Apply an event-level rewrite across a buffered SSE body while preserving
-/// event order, non-data fields, separators, and LF/CRLF framing.
+/// event order, non-data fields, separators, and CR/LF/CRLF framing.
+///
+/// Lines are split exactly as the shared SSE parser splits them (leading BOMs
+/// set aside, then CRLF, LF, or a lone CR), so an event the parser inspected is
+/// the event rewritten here. Leading BOMs are copied through unchanged.
 fn rewrite_sse_events<'a>(
     body: &'a str,
     mut rewrite_event: impl FnMut(&[&'a str]) -> Option<String>,
 ) -> (String, bool) {
     let mut output = String::with_capacity(body.len());
+    let events = strip_sse_boms(body);
+    output.push_str(&body[..body.len() - events.len()]);
     let mut event_lines: Vec<&'a str> = Vec::new();
-    for line in body.split_inclusive('\n') {
+    for line in sse_lines_inclusive(events) {
         event_lines.push(line);
-        let content = line
-            .strip_suffix("\r\n")
-            .or_else(|| line.strip_suffix('\n'))
-            .unwrap_or(line);
+        let content = split_sse_line_terminator(line).0;
         if content.is_empty() {
             if let Some(rewritten) = rewrite_event(&event_lines) {
                 output.push_str(&rewritten);
@@ -4504,13 +4512,16 @@ fn rewrite_sse_events_bounded<'a>(
 
     let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
     let mut modified = false;
+    // Same BOM policy and line splitting as `rewrite_sse_events`; leading BOMs
+    // are copied through unchanged.
+    let events = strip_sse_boms(body);
+    if !output.push(&body.as_bytes()[..body.len() - events.len()]) {
+        return None;
+    }
     let mut event_lines: Vec<&'a str> = Vec::new();
-    for line in body.split_inclusive('\n') {
+    for line in sse_lines_inclusive(events) {
         event_lines.push(line);
-        let content = line
-            .strip_suffix("\r\n")
-            .or_else(|| line.strip_suffix('\n'))
-            .unwrap_or(line);
+        let content = split_sse_line_terminator(line).0;
         if content.is_empty() {
             let rewritten = rewrite_event(&mut output, &event_lines);
             if !flush_event(&mut output, &mut modified, &event_lines, rewritten) {
@@ -4677,10 +4688,7 @@ fn mask_sse_event_structural_scalars(lines: &[&str]) -> Result<Option<String>, (
     let mut joined_len = 0usize;
 
     for (line_index, line) in lines.iter().enumerate() {
-        let content = line
-            .strip_suffix("\r\n")
-            .or_else(|| line.strip_suffix('\n'))
-            .unwrap_or(line);
+        let content = split_sse_line_terminator(line).0;
         let payload_start = if content.starts_with("data: ") {
             6
         } else if content.starts_with("data:") {
