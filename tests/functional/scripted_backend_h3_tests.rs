@@ -6316,8 +6316,7 @@ async fn h3_bridge_buffered_collected_oversize_response_carries_backend_error() 
             h1 = Some(
                 ScriptedTlsBackend::builder(
                     tcp.into_listener(),
-                    TlsConfig::new(cert.clone(), key.clone())
-                        .with_alpn(vec![b"http/1.1".to_vec()]),
+                    TlsConfig::new(cert.clone(), key.clone()).with_alpn(vec![b"http/1.1".to_vec()]),
                 )
                 .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
                 .step(TcpStep::Write(response))
