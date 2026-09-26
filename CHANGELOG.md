@@ -77,34 +77,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A cold backend TLS configuration build no longer runs on the Tokio worker
-  that is serving requests (#5754). The first request to a new backend TLS
-  identity, and the first one after a cache clear or SVID rotation, used to
-  read CA bundles and client certificates and keys (and wait on remote
-  `vault://`/`aws://`/`azure://`/`gcp://` sources) inline on the reqwest,
-  direct HTTP/2, gRPC, and HTTP/3 backend paths, stalling every other request
-  and timer on that worker until the load finished. These builds now run on
-  the shared bounded TLS source executor
-  (`FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY`,
-  `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`). Concurrent misses for one TLS
-  identity on the direct HTTP/2, gRPC, and HTTP/3 pools share a single build
-  instead of each building its own; the reqwest pool already coalesces misses
-  per pool key, and its rustls config is now cached per TLS identity as well.
-  Cache hits are unchanged. Each request waiting on a cold build has a total
-  budget of `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS` (at most 5s), including
-  executor queue time, and fails closed when it runs out. The build keeps
-  running under its own larger but still bounded budget: each remote source
-  wait inside it keeps the full `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`
-  budget, and the whole build is capped at three times that value, measured
-  from when it starts executing. A backend whose CA, client certificate and
-  client key each come from a slow remote provider therefore still builds. A
-  late success is cached, so a slow but working source serves the next request
-  instead of timing out on every one. There is still at most one build in
-  flight per TLS identity. Failures keep their existing error classes and are
-  not cached. A build still in flight when backend TLS or CRL reload clears
-  the cache answers its callers without being cached, and a build still
-  queued for the executor at that point is skipped and fails its callers
-  closed.
 - An Ambient mesh proxy whose node-agent registry directory is missing now
   says so, repeatedly (#5766). `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`
   defaults to `/run/ferrum/node-waypoint-pods` and is authoritative for the
@@ -239,6 +211,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanup bound. The HTTP/3 bridge's mesh backends no longer run response-body
   inspection or final-body validation plugins over a charged
   `Backend deadline exceeded` terminal, as HTTP/1.1 and HTTP/2 already did not.
+- A cold backend TLS configuration build no longer runs on the Tokio worker
+  that is serving requests (#5754). The first request to a new backend TLS
+  identity, and the first one after a cache clear or SVID rotation, used to
+  read CA bundles and client certificates and keys (and wait on remote
+  `vault://`/`aws://`/`azure://`/`gcp://` sources) inline on the reqwest,
+  direct HTTP/2, gRPC, and HTTP/3 backend paths, stalling every other request
+  and timer on that worker until the load finished. These builds now run on
+  the shared bounded TLS source executor
+  (`FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY`,
+  `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`). Concurrent misses for one TLS
+  identity on the direct HTTP/2, gRPC, and HTTP/3 pools share a single build
+  instead of each building its own; the reqwest pool already coalesces misses
+  per pool key, and its rustls config is now cached per TLS identity as well.
+  Cache hits are unchanged. Each request waiting on a cold build has a total
+  budget of `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS` (at most 5s), including
+  executor queue time, and fails closed when it runs out. The build keeps
+  running under its own larger but still bounded budget: each remote source
+  wait inside it keeps the full `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`
+  budget, and the whole build is capped at three times that value, measured
+  from when it starts executing. A backend whose CA, client certificate and
+  client key each come from a slow remote provider therefore still builds. A
+  late success is cached, so a slow but working source serves the next request
+  instead of timing out on every one. There is still at most one build in
+  flight per TLS identity. Failures keep their existing error classes and are
+  not cached. A build still in flight when backend TLS or CRL reload clears
+  the cache answers its callers without being cached, and a build still
+  queued for the executor at that point is skipped and fails its callers
+  closed.
 - An expired credential no longer gets one more response-plugin poll over a
   charged `Backend deadline exceeded` terminal when an earlier RPC deadline
   fired first (PR #5746, PR #5748). The reject-path hooks over that terminal
