@@ -618,6 +618,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `after_proxy` hooks, and `X-Gateway-Error: connection_failure` is written
   after them. A test-only fault on the pooled-client acquire covers that
   terminal over a real HTTP/3 stream (#5824).
+- The HTTP/3 bridge pool-failure unit tests build their QUIC endpoints
+  explicitly so the FIPS profile compiles its test targets again.
 
 ### Security
 
