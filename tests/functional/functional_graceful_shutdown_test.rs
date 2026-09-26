@@ -26,9 +26,7 @@
 
 #![cfg(unix)]
 
-use crate::common::{
-    GatewayChildGuard, SpawnedGatewayIdentity, pin_gateway_command_rust_log,
-};
+use crate::common::{GatewayChildGuard, SpawnedGatewayIdentity, pin_gateway_command_rust_log};
 use crate::scaffolding::port_registry::TestSocket;
 use crate::scaffolding::ports::{
     REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY, reserve_refused_tcp_port,
@@ -1428,9 +1426,7 @@ async fn spawn_fake_peer(kind: FakePeer) -> (SocketAddr, JoinHandle<()>) {
 /// that shows the listener closing without the drain flags set cannot pass it.
 #[test]
 fn harness_drain_begun_wait_requires_the_gateway_log_line() {
-    assert!(
-        !SHUTDOWN_DRAIN_BEGUN_LOG.contains(['"', '\\'])
-    );
+    assert!(!SHUTDOWN_DRAIN_BEGUN_LOG.contains(['"', '\\']));
     let logged = format!(
         concat!(
             r#"{{"timestamp":"...","level":"INFO","fields":{{"message":""#,
