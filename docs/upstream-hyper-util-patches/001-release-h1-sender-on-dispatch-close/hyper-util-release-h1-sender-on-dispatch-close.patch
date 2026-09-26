@@ -33,7 +33,24 @@
          };
  
          // If the Connector included 'extra' info, add to Response...
-@@ -879,9 +871,177 @@
+@@ -816,10 +808,15 @@
+ }
+ 
+ impl<B: Body + 'static> PoolClient<B> {
++    // Ferrum Edge patch (hyper-util-001): `use<B>` keeps the returned future
++    // from capturing the `&mut self` borrow under edition 2024's capture
++    // rules. hyper's send future owns everything it needs, and
++    // `Client::try_send_request` moves the pooled connection into
++    // `await_pooled_response` while this future is still pending.
+     fn try_send_request(
+         &mut self,
+         req: Request<B>,
+-    ) -> impl Future<Output = Result<Response<hyper::body::Incoming>, ConnTrySendError<Request<B>>>>
++    ) -> impl Future<Output = Result<Response<hyper::body::Incoming>, ConnTrySendError<Request<B>>>> + use<B>
+     where
+         B: Send,
+     {
+@@ -879,7 +876,175 @@
  
      fn can_share(&self) -> bool {
          self.is_http2()
@@ -110,8 +127,8 @@
 +            Ok((res, None))
 +        }
      }
- }
- 
++}
++
 +/// The readiness watch `await_pooled_response` runs on a pooled connection.
 +///
 +/// An HTTP/2 sender is a clone shared with the pool, so releasing this one
@@ -206,12 +223,10 @@
 +    })
 +    .await;
 +    (output, slot)
-+}
-+
+ }
+ 
  enum ClientConnectError {
-     Normal(Error),
-     CheckoutIsClosed(pool::Error),
-@@ -1668,3 +1828,548 @@
+@@ -1710,3 +1875,547 @@
          e!(ChannelClosed, src)
      }
  }
@@ -223,8 +238,7 @@
 +// connection whose dispatcher has stopped reading.
 +#[cfg(test)]
 +mod ferrum_release_on_close_tests {
-+    use super::{await_response_or_release, ConnSlot};
-+    use std::future::Future;
++    use super::{ConnSlot, await_response_or_release};
 +    use std::sync::atomic::{AtomicUsize, Ordering};
 +    use std::sync::{Arc, Mutex};
 +    use std::task::{Context, Poll, Waker};
@@ -539,16 +553,16 @@
 +    #[cfg(all(feature = "http1", feature = "tokio"))]
 +    mod pooled_http1 {
 +        use super::super::{
-+            await_pooled_response, pool, poll_h1_dispatch_open, release_pool_conn,
-+            ConnTrySendError, Connected, ErrorKind, PoolClient, PoolConn, PoolKey, PoolTx,
-+            Request, Response, TrySendError, Ver,
++            ConnTrySendError, Connected, ErrorKind, PoolClient, PoolConn, PoolKey, PoolTx, Request,
++            Response, TrySendError, Ver, await_pooled_response, poll_h1_dispatch_open, pool,
++            release_pool_conn,
 +        };
 +        use crate::common::timer;
 +        use crate::rt::{TokioExecutor, TokioIo};
 +        use http_body_util::Empty;
 +        use hyper::body::Bytes;
 +        use hyper::client::conn::http1;
-+        use std::future::{poll_fn, Future};
++        use std::future::poll_fn;
 +        use std::pin::Pin;
 +        use std::task::Poll;
 +        use std::time::Duration;
