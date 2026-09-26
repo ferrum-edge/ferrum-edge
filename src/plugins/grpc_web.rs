@@ -3464,7 +3464,10 @@ pub(crate) fn passthrough_response_framing(
 ) -> Option<PassthroughFraming> {
     let content_type = response_headers.get("content-type").map(String::as_str);
     let text_mode = passthrough_response_text_mode(ctx, content_type)?;
-    Some(PassthroughFraming::from_response(text_mode, response_headers))
+    Some(PassthroughFraming::from_response(
+        text_mode,
+        response_headers,
+    ))
 }
 
 /// [`passthrough_response_framing`] for a caller that already knows the

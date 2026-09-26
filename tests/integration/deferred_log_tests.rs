@@ -2051,10 +2051,7 @@ async fn grpc_web_passthrough_content_encoded_body_leaves_grpc_status_unset() {
     headers.insert("content-encoding".to_string(), "gzip".to_string());
     let inner = ProxyBody::full(Bytes::from(wire.clone()));
     let body = proxy_body_into_grpc_web_passthrough_streaming_with_headers_for_test(
-        inner,
-        false,
-        &headers,
-        200,
+        inner, false, &headers, 200,
     );
     let mut body = body.with_logger(logger);
     let data = body

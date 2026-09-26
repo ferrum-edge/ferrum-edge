@@ -12322,7 +12322,9 @@ pub mod _test_support {
         for chunk in chunks {
             observer.push(chunk);
         }
-        observer.outcome().map(grpc_web_passthrough_outcome_for_test)
+        observer
+            .outcome()
+            .map(grpc_web_passthrough_outcome_for_test)
     }
 
     fn grpc_web_passthrough_outcome_for_test(
