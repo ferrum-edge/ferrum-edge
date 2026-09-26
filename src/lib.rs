@@ -15764,6 +15764,25 @@ pub mod _test_support {
         crate::proxy::body::COALESCE_TARGET
     }
 
+    /// The HTTP/1.1 / HTTP/2-via-reqwest size-limited streaming response body
+    /// (an unknown-length backend body under a response size limit), fed from
+    /// `chunks` that are all ready at once, as when a small backend response
+    /// arrives in a single read. The idle read timeout is off.
+    pub fn size_limited_streaming_body_from_ready_chunks(
+        chunks: Vec<bytes::Bytes>,
+        max_bytes: usize,
+    ) -> crate::proxy::body::ProxyBody {
+        let frames = chunks
+            .into_iter()
+            .map(|chunk| Ok::<_, CoalesceFrameError>(http_body::Frame::data(chunk)));
+        crate::proxy::body::size_limited_frame_stream_body(
+            futures_util::stream::iter(frames),
+            max_bytes,
+            None,
+            0,
+        )
+    }
+
     /// One scripted backend event for [`CoalesceProbe`].
     #[derive(Clone, Debug)]
     pub enum CoalesceStep {
