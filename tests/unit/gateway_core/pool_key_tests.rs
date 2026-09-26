@@ -2272,7 +2272,7 @@ async fn reqwest_tls_config_cache_key_ignores_host_when_direct_backend() {
     assert_eq!(
         pool.tls_config_cache_key_for_warmup(&host_a),
         pool.tls_config_cache_key_for_warmup(&host_b),
-        "H3/reqwest TLS cache key must not partition on backend_host"
+        "the shared H3 TLS cache key must not partition on backend_host"
     );
     assert_ne!(
         pool.pool_key_for_warmup(&host_a),
@@ -2475,11 +2475,11 @@ async fn reqwest_cold_client_with_missing_ca_fails_closed() {
     assert_eq!(cache.pending_builds(), 0);
 }
 
-/// The reqwest pool caches its rustls config per TLS identity (plus ALPN
-/// variant), so reqwest clients for two endpoints with the same trust material
-/// share one cold build, and a backend TLS / CRL reload clears it.
+/// Reqwest rustls configs are partitioned by the complete client pool key so a
+/// client created after an in-place trust rotation cannot inherit material
+/// loaded for a different backend client.
 #[tokio::test]
-async fn reqwest_cold_clients_share_one_cached_rustls_build() {
+async fn reqwest_cold_clients_do_not_share_cached_rustls_builds() {
     ensure_crypto_provider();
     let pool = pool_with_defaults();
     let first = proxy_at("10.0.0.1", 8080);
@@ -2488,13 +2488,11 @@ async fn reqwest_cold_clients_share_one_cached_rustls_build() {
     pool.get_client(&first).await.expect("first client");
     pool.get_client(&second).await.expect("second client");
 
-    let tls_key = pool.tls_config_cache_key_for_warmup(&first);
     let cache = pool.backend_reqwest_tls_config_cache();
-    assert_eq!(cache.len(), 1, "one rustls build per TLS identity");
-    assert!(
-        cache.contains_key(&format!("alpn=h2|{tls_key}"))
-            || cache.contains_key(&format!("alpn=h1|{tls_key}")),
-        "reqwest TLS cache key must be the TLS identity plus its ALPN variant"
+    assert_eq!(
+        cache.len(),
+        2,
+        "one rustls build per reqwest client identity"
     );
     assert_eq!(cache.pending_builds(), 0);
 
@@ -2510,7 +2508,7 @@ fn https_proxy_at(host: &str, port: u16) -> Proxy {
 }
 
 /// Config load / reload prebuilds the reqwest TLS config of every HTTPS proxy
-/// (one build per TLS identity, in the ALPN variant its pool settings select),
+/// (one build per reqwest pool identity, in the ALPN variant its pool settings select),
 /// so the first request is a cache hit rather than a cold build.
 #[tokio::test]
 async fn config_prebuild_warms_reqwest_tls_configs_per_identity() {
@@ -2526,24 +2524,19 @@ async fn config_prebuild_warms_reqwest_tls_configs_per_identity() {
 
     pool.prebuild_tls_configs_from_config(&config).await;
 
-    let tls_key = pool.tls_config_cache_key_for_warmup(&first);
     let cache = pool.backend_reqwest_tls_config_cache();
-    assert_eq!(cache.len(), 1, "one prebuild per TLS identity");
-    assert!(
-        cache.contains_key(&format!("alpn=h2|{tls_key}")),
-        "the prebuild must use the ALPN variant the pool settings select"
-    );
+    assert_eq!(cache.len(), 2, "one prebuild per reqwest pool identity");
     assert_eq!(cache.pending_builds(), 0);
 
     // The first request reuses the prebuilt config instead of building.
     pool.get_client(&first)
         .await
         .expect("client from prebuilt TLS");
-    assert_eq!(pool.backend_reqwest_tls_config_cache().len(), 1);
+    assert_eq!(pool.backend_reqwest_tls_config_cache().len(), 2);
 
     // A republication with nothing new is a no-op.
     pool.prebuild_tls_configs_from_config(&config).await;
-    assert_eq!(pool.backend_reqwest_tls_config_cache().len(), 1);
+    assert_eq!(pool.backend_reqwest_tls_config_cache().len(), 2);
 }
 
 /// Plaintext-only configs have no backend TLS to warm.
@@ -2614,10 +2607,8 @@ async fn superseded_config_prebuild_pass_starts_no_builds() {
     stale.await;
     current.await;
 
-    let removed_tls = pool.tls_config_cache_key_for_warmup(&removed);
-    let removed_key = format!("alpn=h2|{removed_tls}");
-    let kept_tls = pool.tls_config_cache_key_for_warmup(&kept);
-    let kept_key = format!("alpn=h2|{kept_tls}");
+    let removed_key = pool.reqwest_tls_config_cache_key_for_warmup(&removed);
+    let kept_key = pool.reqwest_tls_config_cache_key_for_warmup(&kept);
     assert_ne!(removed_key, kept_key);
     let cache = pool.backend_reqwest_tls_config_cache();
     assert!(
@@ -2644,10 +2635,8 @@ async fn spawned_config_prebuild_keeps_only_the_newest_pass() {
     pool.spawn_tls_prebuild(Arc::clone(&stale_config));
     pool.spawn_tls_prebuild(Arc::new(single_proxy_config(&kept)));
 
-    let removed_tls = pool.tls_config_cache_key_for_warmup(&removed);
-    let removed_key = format!("alpn=h2|{removed_tls}");
-    let kept_tls = pool.tls_config_cache_key_for_warmup(&kept);
-    let kept_key = format!("alpn=h2|{kept_tls}");
+    let removed_key = pool.reqwest_tls_config_cache_key_for_warmup(&removed);
+    let kept_key = pool.reqwest_tls_config_cache_key_for_warmup(&kept);
     let cache = pool.backend_reqwest_tls_config_cache();
     tokio::time::timeout(Duration::from_secs(10), async {
         while !cache.contains_key(&kept_key) {

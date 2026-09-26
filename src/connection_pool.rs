@@ -44,8 +44,9 @@ struct ReqwestPoolManager {
     tls_policy: Option<Arc<TlsPolicy>>,
     crls: crate::tls::SharedCrlList,
     backend_h3_tls_configs: BackendTlsConfigCache,
-    /// rustls configs for reqwest clients, keyed by TLS identity plus the
-    /// baked-in ALPN variant (see `reqwest_tls_config_cache_key_owned`).
+    /// rustls configs for reqwest clients, keyed by the complete reqwest pool
+    /// identity plus the baked-in ALPN variant (see
+    /// `reqwest_tls_config_cache_key_owned`).
     /// Caching them is what lets a cold build that outlives the requests
     /// waiting on it serve the next pool miss instead of being discarded.
     backend_reqwest_tls_configs: BackendTlsConfigCache,
@@ -109,18 +110,24 @@ impl ReqwestPoolManager {
         )
     }
 
-    /// TLS identity key plus the ALPN variant `build_rustls_for_reqwest` bakes
-    /// into the config (HTTP/1.1-only vs h2-capable). The variant is a prefix
-    /// so the `|svidg=` field stays last for SVID drain and retirement.
+    /// Reqwest pool identity plus the ALPN variant
+    /// `build_rustls_for_reqwest` bakes into the config (HTTP/1.1-only vs
+    /// h2-capable). Keeping the pool identity prevents a newly created client
+    /// from reusing TLS material read for a different client before an
+    /// in-place source rotation. The TLS identity is appended so the
+    /// `|svidg=` field stays last for SVID drain and retirement.
     fn reqwest_tls_config_cache_key_owned(&self, proxy: &Proxy, enable_http2: bool) -> String {
         let alpn = if proxy.forces_backend_http1_only() || !enable_http2 {
             "alpn=h1|"
         } else {
             "alpn=h2|"
         };
+        let pool_key = self.pool_key_owned(proxy);
         let tls_key = self.tls_config_cache_key_owned(proxy);
-        let mut key = String::with_capacity(alpn.len() + tls_key.len());
+        let mut key = String::with_capacity(alpn.len() + pool_key.len() + 1 + tls_key.len());
         key.push_str(alpn);
+        key.push_str(&pool_key);
+        key.push('|');
         key.push_str(&tls_key);
         key
     }
@@ -190,7 +197,7 @@ impl ReqwestPoolManager {
 
         // Material loading and rustls construction run on the bounded TLS
         // source executor, never on this Tokio worker, single-flight per TLS
-        // identity and ALPN variant; a build that outlives its waiters is
+        // reqwest pool identity and ALPN variant; a build that outlives its waiters is
         // still cached for the next miss. `GenericPool` additionally coalesces
         // concurrent misses for this pool key onto one `create`.
         let tls_inputs = Arc::new(self.backend_tls_inputs(proxy));
@@ -492,6 +499,16 @@ impl ConnectionPool {
     #[allow(dead_code)] // exercised from unit tests
     pub fn tls_config_cache_key_for_warmup(&self, proxy: &Proxy) -> String {
         self.pool.manager().tls_config_cache_key_owned(proxy)
+    }
+
+    /// Reqwest TLS-config cache key for the effective pool settings.
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn reqwest_tls_config_cache_key_for_warmup(&self, proxy: &Proxy) -> String {
+        let manager = self.pool.manager();
+        manager.reqwest_tls_config_cache_key_owned(
+            proxy,
+            manager.global_config.effective_enable_http2(proxy),
+        )
     }
 
     /// Drop H3, reqwest, and WebSocket TLS configs whose identity is no longer

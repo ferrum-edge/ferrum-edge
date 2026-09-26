@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reqwest backend TLS-config caching is now partitioned by the complete client
+  pool identity. When backend TLS live reload is disabled, a new client for a
+  different backend or effective pool configuration no longer reuses a
+  verifier built before an in-place CA rotation; it rebuilds from the current
+  TLS sources instead.
 - A route-deadline `504` that no backend received now carries the new
   `X-Gateway-Error: request_timeout` token instead of `backend_timeout`
   (#5762). This covers a Gateway API `HTTPRoute` `timeouts.request`, or a
