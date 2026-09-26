@@ -14766,7 +14766,9 @@ mod tests {
             // features, so build the endpoints explicitly (as the listener does).
             let runtime = quinn::default_runtime().expect("tokio runtime");
             let server_socket = std::net::UdpSocket::bind(loopback).expect("bind server");
-            server_socket.set_nonblocking(true).expect("nonblocking server socket");
+            server_socket
+                .set_nonblocking(true)
+                .expect("nonblocking server socket");
             let server = quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),
                 Some(server_config),
@@ -14786,7 +14788,9 @@ mod tests {
             let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
                 .expect("QUIC client config");
             let client_socket = std::net::UdpSocket::bind(loopback).expect("bind client");
-            client_socket.set_nonblocking(true).expect("nonblocking client socket");
+            client_socket
+                .set_nonblocking(true)
+                .expect("nonblocking client socket");
             let mut client = quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),
                 None,
