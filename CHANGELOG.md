@@ -432,21 +432,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stripped case-insensitively alongside the `X-RateLimit-*` family, both before
   storage and when an existing entry is replayed, so a cache hit no longer
   reports the original response's stale quota or reset (#5788).
+- HTTP/3 responses now carry the gateway's own `X-Gateway-Error` on every
+  path, as HTTP/1.1 and HTTP/2 do (#5783). A backend 5xx relayed on an HTTP/3
+  streaming relay (native or bridged, plain or gRPC) or on the HTTP/3
+  bridge's buffered path now reads `backend_error`, and a copy a plugin or
+  hook wrote is replaced instead of forwarded. An HTTP/3 bridge attempt whose
+  connection-pool client could not be built now answers its `502` with
+  `connection_failure`. A plugin that writes the `route_request_timeout`
+  transaction metadata key can no longer suppress the route-deadline phase an
+  HTTP/3 relay records (and with it the `request_timeout` token), end the
+  HTTP/3 retry loop, or withhold an affinity cookie: those decisions now read
+  a typed marker only trusted proxy code sets.
+- Pass-through gRPC-Web follow-ups (#5784). The mesh gRPC response message
+  counter now counts a pass-through body's decoded message frames on HTTP/1.1
+  and HTTP/2, streamed or buffered: it no longer counts the backend's `0x80`
+  trailer frame as a message or scans `grpc-web-text` base64 as frames. An
+  empty or never-polled content-coded body is logged `UNKNOWN` (no status was
+  relayed) rather than `grpc_status_unreadable: content_encoded_body`, and
+  only the exact compressed trailer flag `0x81` is labelled
+  `compressed_trailer_frame`; a final trailer frame with other reserved flag
+  bits (e.g. `0x82`, `0xC0`) names no status and is logged `UNKNOWN`.
+  `ai_transcript_audit` no longer reads an unreadable status as `UNKNOWN`, so
+  it no longer fires `always_capture_on_error` for it. The HTTP/3
+  mesh-egress buffered bridge already reads the pass-through status through
+  the bridge's shared buffered path; the docs no longer say it is not covered.
 
 - The circuit-breaker cache's at-capacity warning is now rate-limited to at
   most one line per second (with a suppressed count) instead of one line per
   request to an uncached overflow target, and it is emitted after the cache
   shard lock is released. `ferrum_circuit_breaker_cache_admission_refused_total`
   still counts every refused admission (#5787).
-- A streaming response with no `Content-Length` that exceeds
-  `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` now reliably shows the client the
-  committed status and the bytes within the limit before it is aborted.
-  Previously, when a small over-limit body arrived in a single read, the limit
-  tripped in the same HTTP/1.1 write pass that queued the response head, and
-  the client saw the connection close before any status line
-  (`IncompleteMessage`). The reqwest, direct-H2/gRPC, and native-H3
-  size-limited adapters now hold the error for one scheduler turn so the
-  frontend flushes first.
 - HTTP/2 response trailers from a backend now reach an HTTP/2 client on every
   dispatch path and body mode (#5760). The reqwest relay (used for a backend
   the capability registry has not yet classified, and for routes with retries
@@ -462,6 +477,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trailer section, and a reqwest response whose backend framing cannot carry
   one (HTTP/1.x `Content-Length` or close-delimited) skips the trailer policy
   capture entirely.
+- A streaming response with no `Content-Length` that exceeds
+  `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` now reliably shows the client the
+  committed status and the bytes within the limit before it is aborted.
+  Previously, when a small over-limit body arrived in a single read, the limit
+  tripped in the same HTTP/1.1 write pass that queued the response head, and
+  the client saw the connection close before any status line
+  (`IncompleteMessage`). The reqwest, direct-H2/gRPC, and native-H3
+  size-limited adapters now hold the error for one scheduler turn so the
+  frontend flushes first.
+- The shared buffered SSE inspection parser used by `ai_semantic_firewall` and
+  `ai_response_guard` now follows the WHATWG event-stream framing: it consumes
+  leading UTF-8 BOMs and splits lines on CRLF, LF, or a lone CR (mixed
+  freely). Previously a leading BOM or CR-only framing hid events from
+  inspection while the body was still reported as fully parsed (#5795).
 
 ### Security
 
@@ -505,6 +534,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `security_headers` removes matching response headers in place without allocating or cloning keys
   (#5755).
+
+- Backend TLS follow-ups to the off-worker cold builds (#5782). `wss://` WebSocket
+  backends reuse one cached rustls config per TLS identity, built on the bounded TLS
+  source executor, instead of building a connector on the Tokio worker for every
+  upgrade; WebSocket dials now also follow CRL reloads. A cold build that fails only
+  after holding its executor slot for the full `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`
+  budget backs that TLS identity off for one more budget, so requests fail closed at
+  once instead of tying up another slot; a backend TLS / CRL reload clears it. A
+  quarter of `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY` (at least one slot when it
+  is 2 or more) is reserved for request-path builds, so refreshes, reconcile work, and
+  prebuilds cannot starve them. Every config load or reload prebuilds, in the
+  background, the reqwest backend TLS config of each HTTPS proxy whose TLS identity
+  is not cached yet. Prebuilds are the lowest executor class: at most two run at a
+  time, only in idle capacity that leaves a slot for refreshes and reconcile work, and
+  an identity is claimed only once its prebuild runs, so a request never waits behind
+  a queued prebuild and a prebuild never waits in line ahead of refreshes. An
+  admitted prebuild holds its slot until its build ends (up to 3×
+  `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`), so with a small
+  `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY` two running prebuilds reduce refresh
+  capacity for that long. Only the newest config load's prebuild pass stays alive; a
+  newer load cancels the older pass's unstarted prebuilds. An identity whose prebuild
+  failed is not prebuilt again until it builds or a reload.
 
 ## [0.9.7] - 2026-09-25
 

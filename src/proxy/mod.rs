@@ -8232,6 +8232,8 @@ impl ProxyState {
         self.grpc_pool.retain_live_from_config(&published.config);
         self.connection_pool
             .retain_live_tls_configs_from_config(&published.config);
+        self.connection_pool
+            .spawn_tls_prebuild(Arc::clone(&published.config));
     }
 
     /// Terminal drain of transport pools that own kernel objects the graceful
@@ -15519,8 +15521,7 @@ async fn handle_websocket_request_authenticated(
                         ws_dial_proxy,
                         &env_config,
                         &client_headers,
-                        state.tls_policy.as_deref(),
-                        &state.crls,
+                        &state.connection_pool,
                         ws_size_limits.max_frame_bytes,
                         ws_size_limits.max_message_bytes,
                         state.websocket_write_buffer_size,
@@ -17162,47 +17163,6 @@ pub(crate) fn websocket_backend_tls_sni_unsupported(proxy: &Proxy) -> bool {
     matches!(proxy.backend_scheme, Some(BackendScheme::Https)) && proxy.resolved_tls.sni.is_some()
 }
 
-/// Build a rustls TLS connector for WebSocket backends that respects
-/// proxy-level and global TLS settings (CA bundles, client certs, cert verification).
-/// When `tls_policy` is provided, outbound connections use the same cipher suites,
-/// protocol versions, and key exchange groups as inbound listeners.
-fn build_websocket_tls_connector(
-    proxy: &Proxy,
-    env_config: &crate::config::EnvConfig,
-    tls_policy: Option<&TlsPolicy>,
-    crls: &crate::tls::CrlList,
-) -> Result<Option<tokio_tungstenite::Connector>, anyhow::Error> {
-    // Only build a TLS connector when the backend scheme is TLS — a plaintext
-    // `ws://` upgrade needs no TLS. WebSocket is a runtime flavor, so the
-    // caller has already filtered to WebSocket requests; here we only decide
-    // encrypted vs plaintext.
-    if !matches!(proxy.backend_scheme, Some(BackendScheme::Https)) {
-        return Ok(None);
-    }
-
-    let client_config = BackendTlsConfigBuilder {
-        proxy,
-        policy: tls_policy,
-        global_ca: env_config.tls_ca_bundle_path.as_deref().map(Path::new),
-        global_no_verify: env_config.tls_no_verify,
-        global_client_cert: env_config
-            .backend_tls_client_cert_path
-            .as_deref()
-            .map(Path::new),
-        global_client_key: env_config
-            .backend_tls_client_key_path
-            .as_deref()
-            .map(Path::new),
-        crls,
-    }
-    .build_rustls()
-    .map_err(|e| anyhow::anyhow!("Failed to build WebSocket backend TLS config: {}", e))?;
-
-    Ok(Some(tokio_tungstenite::Connector::Rustls(Arc::new(
-        client_config,
-    ))))
-}
-
 /// Outcome of a successful backend WebSocket handshake. The stream carries
 /// frames; `negotiated_subprotocol` preserves the backend's chosen value
 /// (RFC 6455 §11.3.4, also applicable to RFC 8441 / RFC 9220 Extended CONNECT)
@@ -17290,8 +17250,11 @@ pub(crate) async fn connect_websocket_backend(
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
     client_headers: &[(String, String)],
-    tls_policy: Option<&TlsPolicy>,
-    crls: &crate::tls::CrlList,
+    // Source of the cached `wss://` rustls config (proxy-level and global CA
+    // bundles, client certs, verification, the gateway TLS policy, and the
+    // live CRL generation). A miss builds on the bounded TLS source executor,
+    // never on this Tokio worker.
+    tls_configs: &ConnectionPool,
     max_websocket_frame_size_bytes: usize,
     max_websocket_message_size_bytes: usize,
     websocket_write_buffer_size: usize,
@@ -17362,7 +17325,18 @@ pub(crate) async fn connect_websocket_backend(
         return Err(retry::WS_BACKEND_TLS_SNI_UNSUPPORTED.into());
     }
 
-    let connector = build_websocket_tls_connector(proxy, env_config, tls_policy, crls)?;
+    // Only a TLS backend scheme needs a connector; a plaintext `ws://` upgrade
+    // needs no TLS. WebSocket is a runtime flavor, so the caller has already
+    // filtered to WebSocket requests; here we only decide encrypted vs
+    // plaintext.
+    let connector = if matches!(proxy.backend_scheme, Some(BackendScheme::Https)) {
+        let client_config = tls_configs
+            .get_websocket_tls_config_for_backend(proxy)
+            .await?;
+        Some(tokio_tungstenite::Connector::Rustls(client_config))
+    } else {
+        None
+    };
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
     // Dial the TCP stream ourselves (instead of `connect_async_tls_with_config`)
     // so the byte-level `WsActivityIo` idle adapter can be installed UNDER the
@@ -37167,9 +37141,11 @@ async fn handle_proxy_request_inner(
                 // the backend's native length-prefixed DATA frames. The adapter
                 // wraps this body and re-frames the client-visible bytes
                 // (terminal trailer frame, and base64 in text mode), which are
-                // not native gRPC messages. Attached independently of whether a
-                // deferred logger is present so message metrics are not silently
-                // zero when plugins are absent.
+                // not native gRPC messages. A pass-through gRPC-Web body is not
+                // native framing at all: its relay takes this counter over and
+                // counts decoded message frames. Attached independently of
+                // whether a deferred logger is present so message metrics are
+                // not silently zero when plugins are absent.
                 if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                     &ctx.metadata,
                 ) {
@@ -37268,11 +37244,13 @@ async fn handle_proxy_request_inner(
                 // Count the backend's native length-prefixed frames here, before
                 // the response-body pipeline runs. A gRPC-Web transform appends a
                 // terminal trailer frame and, in text mode, base64-armours the
-                // whole body — neither is a native gRPC message. Recording
-                // in place avoids cloning the buffered body on the hot path.
-                crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-                    &ctx.metadata,
-                    &ctx.grpc_response_messages_observed,
+                // whole body — neither is a native gRPC message. A pass-through
+                // gRPC-Web body already carries both, so it is counted on its
+                // decoded frame stream instead. Recording in place avoids cloning
+                // the buffered body on the hot path.
+                crate::plugins::grpc_web::record_backend_response_grpc_message_count(
+                    &ctx,
+                    &response_headers,
                     &response_body,
                 );
                 if let Some(grpc_status) =
@@ -39624,14 +39602,16 @@ async fn handle_proxy_request_inner(
     // Authoritative gRPC response messages for a buffered backend body are
     // counted here, from the backend's native length-prefixed representation and
     // before the response-body pipeline can re-frame it (a gRPC-Web transform
-    // appends a terminal trailer frame and base64-armours text mode). Streaming
-    // bodies are counted frame-by-frame by the scanner attached below, also
-    // ahead of the gRPC-Web adapter.
-    if let ResponseBody::Buffered(backend_native_body) = &response_body {
-        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-            &ctx.metadata,
-            &ctx.grpc_response_messages_observed,
-            backend_native_body,
+    // appends a terminal trailer frame and base64-armours text mode). A
+    // pass-through gRPC-Web body is counted on its decoded frame stream, so its
+    // own trailer frame and text-mode base64 are not messages. Streaming bodies
+    // are counted frame-by-frame by the scanner attached below, ahead of the
+    // gRPC-Web adapter; the pass-through relay takes that counter over.
+    if let ResponseBody::Buffered(backend_body) = &response_body {
+        crate::plugins::grpc_web::record_backend_response_grpc_message_count(
+            &ctx,
+            &response_headers,
+            backend_body,
         );
     }
     // Record original backend response invariants before any `after_proxy` hook
@@ -41685,7 +41665,9 @@ async fn handle_proxy_request_inner(
     // Attach native gRPC message scanning before the optional gRPC-Web adapter.
     // Text-mode gRPC-Web base64 and its body-framed terminal metadata are not
     // native length-prefixed messages; the inner body still sees the original
-    // DATA/trailer split and updates the shared RequestContext counter.
+    // DATA/trailer split and updates the shared RequestContext counter. The
+    // pass-through gRPC-Web relay takes the counter over instead and counts the
+    // backend's decoded message frames, never its trailer frame or base64.
     //
     // Gated on `body_will_stream` rather than `is_streaming_response`: a plugin
     // reject can replace a streaming backend body with a gateway-authored

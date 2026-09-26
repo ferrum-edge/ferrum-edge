@@ -12701,6 +12701,43 @@ async fn grpc_ok_status_stays_subject_to_ordinary_sampling() {
     );
 }
 
+/// Issue #5784: a pass-through gRPC-Web status the client received but the
+/// gateway could not read (a compressed trailer frame) is neither a failure
+/// nor missing. It must not be read as `UNKNOWN` and fire the error override.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_unreadable_status_does_not_fire_the_error_override() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_error_override_plugin(&endpoint);
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let headers = grpc_headers();
+    let request = grpc_frame(&hello_request_bytes("ada"));
+    let response = grpc_frame(&hello_response_bytes("hello ada"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    // What the proxy core records for such a body: no `grpc_status`, and the
+    // reason it could not be read.
+    ctx.metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    ctx.metadata.insert(
+        "grpc_status_unreadable".to_string(),
+        "compressed_trailer_frame".to_string(),
+    );
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    assert_eq!(audit_meta(&ctx, SINK_KEY).as_deref(), Some("skipped"));
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "an unreadable status is not a failed RPC and must not fire the error override"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn grpc_trailers_only_error_is_retained_from_the_initial_headers() {
     let server = mock_sink().await;

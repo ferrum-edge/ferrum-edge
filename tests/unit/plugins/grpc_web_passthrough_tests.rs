@@ -6,20 +6,25 @@
 //! logged `grpc_status` must come from that frame.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     GRPC_FRAME_TRAILER, grpc_web_passthrough_body_trailer_status_for_test,
-    grpc_web_passthrough_response_text_mode_for_test, grpc_web_trailer_outcome_for_test,
-    grpc_web_trailer_status_for_test, parse_grpc_frames,
+    grpc_web_passthrough_messages_for_test, grpc_web_passthrough_response_text_mode_for_test,
+    grpc_web_trailer_outcome_for_test, grpc_web_trailer_status_for_test, parse_grpc_frames,
     proxy_body_into_grpc_web_passthrough_streaming_for_test,
+    proxy_body_into_grpc_web_passthrough_streaming_with_counter_for_test,
     proxy_body_into_grpc_web_streaming_for_test, proxy_body_streaming_for_test,
-    proxy_body_with_client_grpc_deadline_for_test, record_grpc_web_passthrough_status_for_test,
-    retain_grpc_web_client_content_type_for_test,
+    proxy_body_with_client_grpc_deadline_for_test,
+    record_backend_response_grpc_message_count_for_test,
+    record_grpc_web_passthrough_status_for_test, retain_grpc_web_client_content_type_for_test,
 };
 use ferrum_edge::plugins::TransactionSummary;
+use ferrum_edge::plugins::mesh::prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA;
 use ferrum_edge::proxy::body::ProxyBodyError;
 use futures_util::stream;
 use http::{HeaderMap, HeaderValue};
@@ -348,6 +353,147 @@ fn passthrough_body_under_a_content_coding_is_unreadable() {
         grpc_web_passthrough_body_trailer_status_for_test(&ctx, &identity, &body),
         Some(Ok(7))
     );
+}
+
+/// Issue #5784: an empty (or never-polled) content-coded body relayed no
+/// trailer frame at all, so its status is missing (`UNKNOWN`), not present but
+/// unreadable.
+#[test]
+fn an_empty_content_coded_body_has_no_unreadable_status() {
+    let mut ctx = create_test_context();
+    retain_grpc_web_client_content_type_for_test(&mut ctx, "application/grpc-web+proto");
+    let mut encoded = response_headers("application/grpc-web+proto");
+    encoded.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_eq!(
+        grpc_web_passthrough_body_trailer_status_for_test(&ctx, &encoded, b""),
+        None,
+        "no body byte was relayed, so there is no status to call unreadable"
+    );
+    let mut metadata = HashMap::from([("request_protocol".to_string(), "grpc".to_string())]);
+    record_grpc_web_passthrough_status_for_test(&ctx, &encoded, b"", &mut metadata);
+    assert!(!metadata.contains_key("grpc_status_unreadable"));
+    let summary = TransactionSummary {
+        metadata,
+        ..Default::default()
+    };
+    assert_eq!(summary.grpc_status(), Some(2));
+
+    // One relayed byte of a coded body is enough to hide its status.
+    assert_eq!(
+        grpc_web_passthrough_body_trailer_status_for_test(&ctx, &encoded, b"\x1f"),
+        Some(Err("content_encoded_body"))
+    );
+}
+
+/// Issue #5784: only the exact compressed trailer flag (`0x81`) is a
+/// compressed trailer frame. A trailer-flagged frame with reserved bits set is
+/// not a status frame the gateway can name, so the body has no terminal status.
+#[test]
+fn only_a_0x81_trailer_frame_is_reported_as_compressed() {
+    for flag in [0x82u8, 0x83, 0xA0, 0xC0, 0xFF] {
+        let mut body = frame(0x00, b"hello");
+        body.extend_from_slice(&frame(flag, b"grpc-status: 0\r\n"));
+        assert_eq!(
+            grpc_web_trailer_outcome_for_test(&[&body], false),
+            None,
+            "flag {flag:#04x}: reserved trailer flag bits are not a compressed trailer"
+        );
+        let text = BASE64.encode(&body).into_bytes();
+        assert_eq!(
+            grpc_web_trailer_outcome_for_test(&[&text], true),
+            None,
+            "flag {flag:#04x}"
+        );
+    }
+    let mut compressed = frame(0x00, b"hello");
+    compressed.extend_from_slice(&frame(0x81, b"deflated"));
+    assert_eq!(
+        grpc_web_trailer_outcome_for_test(&[&compressed], false),
+        Some(Err("compressed_trailer_frame"))
+    );
+}
+
+/// Issue #5784: the authoritative message counter reads the DECODED frame
+/// stream of a pass-through body: the backend's own trailer frame is metadata
+/// and `grpc-web-text` is base64, so neither is a message.
+#[test]
+fn observer_counts_decoded_message_frames_but_never_the_trailer_frame() {
+    let mut body = frame(0x00, b"one");
+    body.extend_from_slice(&frame(0x01, b"two"));
+    body.extend_from_slice(&frame(GRPC_FRAME_TRAILER, b"grpc-status: 0\r\n"));
+    assert_eq!(grpc_web_passthrough_messages_for_test(&[&body], false), 2);
+    let chunks: Vec<&[u8]> = body.chunks(1).collect();
+    assert_eq!(grpc_web_passthrough_messages_for_test(&chunks, false), 2);
+    // An empty message is still a message.
+    let mut empty = frame(0x00, b"");
+    empty.extend_from_slice(&frame(GRPC_FRAME_TRAILER, b"grpc-status: 0\r\n"));
+    assert_eq!(grpc_web_passthrough_messages_for_test(&[&empty], false), 1);
+    // A message still in flight is not counted yet.
+    assert_eq!(
+        grpc_web_passthrough_messages_for_test(&[&body[..6]], false),
+        0
+    );
+
+    // Text framing, each segment independently padded.
+    let trailer = frame(GRPC_FRAME_TRAILER, b"grpc-status: 0\r\n");
+    let mut text = BASE64.encode(frame(0x00, b"one")).into_bytes();
+    text.extend_from_slice(BASE64.encode(frame(0x00, b"two")).as_bytes());
+    text.extend_from_slice(BASE64.encode(trailer).as_bytes());
+    assert_eq!(grpc_web_passthrough_messages_for_test(&[&text], true), 2);
+}
+
+#[tokio::test]
+async fn passthrough_relay_counts_backend_messages_not_its_trailer_frame_or_base64() {
+    for text_mode in [false, true] {
+        let wire = if text_mode {
+            text_body(b"grpc-status: 0\r\n")
+        } else {
+            backend_body(b"grpc-status: 0\r\n")
+        };
+        let messages = Arc::new(AtomicU64::new(0));
+        let body = source(vec![Frame::data(Bytes::from(wire.clone()))]);
+        let body = proxy_body_into_grpc_web_passthrough_streaming_with_counter_for_test(
+            body,
+            text_mode,
+            Arc::clone(&messages),
+        );
+        let (data, _) = collect(body).await;
+        assert_eq!(data, wire, "the relay still forwards the body unchanged");
+        assert_eq!(
+            messages.load(Ordering::Acquire),
+            1,
+            "text_mode={text_mode}: one backend message, and its trailer frame is not one"
+        );
+    }
+}
+
+#[test]
+fn buffered_passthrough_response_messages_are_counted_on_decoded_frames() {
+    for (content_type, wire) in [
+        (
+            "application/grpc-web+proto",
+            backend_body(b"grpc-status: 0\r\n"),
+        ),
+        (
+            "application/grpc-web-text+proto",
+            text_body(b"grpc-status: 0\r\n"),
+        ),
+    ] {
+        let mut ctx = create_test_context();
+        ctx.metadata.insert(
+            MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
+            "true".to_string(),
+        );
+        ctx.metadata
+            .insert("request_protocol".to_string(), "grpc".to_string());
+        retain_grpc_web_client_content_type_for_test(&mut ctx, content_type);
+        let counted = record_backend_response_grpc_message_count_for_test(
+            &ctx,
+            &response_headers(content_type),
+            &wire,
+        );
+        assert_eq!(counted, 1, "{content_type}");
+    }
 }
 
 #[test]

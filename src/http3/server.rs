@@ -7493,10 +7493,16 @@ async fn handle_h3_request(
         // wire contradicting a header the gateway itself synthesized. The
         // lookup stays case-sensitive on the already-lowercased H3 header map,
         // exactly as the previous builder-side check was.
-        let gateway_owned_headers = finalize_h3_response_routing_headers(
-            ctx.h3_response_upstream_is_fallback,
+        //
+        // The backend answered this head, so the token's dispatch signal is
+        // not a connection failure: a backend 5xx reads `backend_error`, as on
+        // the H1/H2 builder.
+        let gateway_owned_headers = finalize_h3_response_gateway_headers(
+            &ctx,
             state.via_header_http3.as_deref(),
             &mut response_headers,
+            false,
+            response_status,
         );
         response_headers
             .entry("content-type".to_string())
@@ -9833,21 +9839,15 @@ async fn handle_h3_request(
         // boundary as H1/H2's response builder. Classification is the original
         // typed `h3_request_on_wire` signal; status is the client-visible one
         // after after_proxy, body, final-client-visible, and committed hooks.
-        let mut gateway_owned_headers = finalize_h3_response_routing_headers(
-            ctx.h3_response_upstream_is_fallback,
-            state.via_header_http3.as_deref(),
-            &mut response_headers,
-        );
         // Context-aware token: an output-ceiling refusal reads `overload` and a
         // route-deadline `504` no backend held reads `request_timeout`.
-        if crate::proxy::apply_authoritative_gateway_error_header_for_response(
-            &mut response_headers,
+        let gateway_owned_headers = finalize_h3_response_gateway_headers(
             &ctx,
+            state.via_header_http3.as_deref(),
+            &mut response_headers,
             !h3_request_on_wire,
             response_status,
-        ) {
-            gateway_owned_headers.insert(GatewayOwnedResponseHeader::GatewayError);
-        }
+        );
 
         // Reconcile surviving backend trailers with the response-header policy
         // this path already applied. Every response-header phase — `after_proxy`,
@@ -10681,6 +10681,37 @@ pub(crate) fn finalize_h3_response_routing_headers(
         value.push_str(via);
         headers.insert("via".into(), value);
         owned.insert(GatewayOwnedResponseHeader::Via);
+    }
+    owned
+}
+
+/// [`finalize_h3_response_routing_headers`] plus the gateway-owned
+/// `X-Gateway-Error` token, for every HTTP/3 response that carries a backend
+/// outcome (native and bridged, buffered and streamed).
+///
+/// This is the same post-hook / pre-wire boundary the H1/H2 response builder
+/// uses. Every case variant a backend, plugin, or hook left in the map is
+/// stripped, and the token is derived from
+/// [`crate::proxy::apply_authoritative_gateway_error_header_for_response`]:
+/// `connection_error` is the original typed dispatch signal and `status` is
+/// the client-visible status after every hook. A backend 5xx therefore reads
+/// `backend_error`, and a response that warrants no token carries none.
+pub(crate) fn finalize_h3_response_gateway_headers(
+    ctx: &RequestContext,
+    via: Option<&str>,
+    headers: &mut HashMap<String, String>,
+    connection_error: bool,
+    status: u16,
+) -> GatewayOwnedResponseHeaders {
+    let mut owned =
+        finalize_h3_response_routing_headers(ctx.h3_response_upstream_is_fallback, via, headers);
+    if crate::proxy::apply_authoritative_gateway_error_header_for_response(
+        headers,
+        ctx,
+        connection_error,
+        status,
+    ) {
+        owned.insert(GatewayOwnedResponseHeader::GatewayError);
     }
     owned
 }
@@ -11709,10 +11740,12 @@ async fn stream_h3_open_response_to_client(
     // Default `content-type` goes into the header MAP, not just the builder, so
     // the map handed to the trailer boundary below is the field set the client
     // actually received. See the matching note in the inline native-H3 relay.
-    let gateway_owned_headers = finalize_h3_response_routing_headers(
-        ctx.h3_response_upstream_is_fallback,
+    let gateway_owned_headers = finalize_h3_response_gateway_headers(
+        ctx,
         state.via_header_http3.as_deref(),
         &mut response_headers,
+        false,
+        response_status,
     );
     response_headers
         .entry("content-type".to_string())
@@ -14332,10 +14365,12 @@ async fn dispatch_grpc_native_h3(
         h3_grpc_authorization_precommit_terminal!(termination, true);
     }
 
-    let gateway_owned_headers = finalize_h3_response_routing_headers(
-        ctx.h3_response_upstream_is_fallback,
+    let gateway_owned_headers = finalize_h3_response_gateway_headers(
+        ctx,
         state.via_header_http3.as_deref(),
         &mut response_headers,
+        false,
+        response_status,
     );
 
     // Send response headers. gRPC carries its own `content-type`
@@ -16083,10 +16118,12 @@ async fn proxy_to_backend_h3_streaming(
     // the header MAP, not just the builder, so the map handed to the trailer
     // boundary below is the field set the client actually received. See the
     // matching note in the inline native-H3 relay.
-    let gateway_owned_headers = finalize_h3_response_routing_headers(
-        ctx.h3_response_upstream_is_fallback,
+    let gateway_owned_headers = finalize_h3_response_gateway_headers(
+        ctx,
         state.via_header_http3.as_deref(),
         &mut response_headers,
+        false,
+        response_status,
     );
     response_headers
         .entry("content-type".to_string())

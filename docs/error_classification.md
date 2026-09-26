@@ -329,13 +329,19 @@ classifies the response:
 - Gateway-synthesized failures (pre-wire connect/DNS/TLS `502`, backend
   timeout and route-deadline `504`, reject-path `503`s, response-transformer
   output-ceiling refusals) carry their token on every protocol.
-- A backend-returned 5xx carries `backend_error` on the HTTP/1.1 and HTTP/2
-  response builder and on the native HTTP/3 buffered writer.
-- A backend-returned 5xx relayed on an HTTP/3 streaming path (native or
-  bridged), or on the HTTP/3 bridge's buffered path, currently carries **no**
-  `X-Gateway-Error`: the backend's copy is stripped and nothing is written in
-  its place. An absent header there does not mean the backend succeeded; use
-  the status code and the access-log `error_class`.
+- A backend-returned 5xx carries `backend_error` on every path that relays
+  it: the HTTP/1.1 and HTTP/2 response builder, and every HTTP/3 response,
+  native or bridged, buffered or streamed, plain or gRPC
+  ([`finalize_h3_response_gateway_headers`](../src/http3/server.rs)). A copy a
+  plugin or hook wrote is replaced by the gateway's own value, never forwarded
+  or duplicated — except on the HTTP/1.1 / HTTP/2 native gRPC branch, which
+  reports the RPC outcome in `grpc-status` trailers, forwards a plugin- or
+  hook-written copy unchanged, and writes no `backend_error` token for a gRPC
+  backend's HTTP 5xx (the HTTP/3 native gRPC response now writes one). Giving
+  that branch the HTTP/3 seal is follow-up #5798.
+- An HTTP/3 bridge attempt whose reqwest connection-pool client could not be
+  built answers its `502` with `connection_failure`, exactly as the HTTP/1.1
+  and HTTP/2 builder does for the same shared pool-failure response.
 
 The headers are not authenticated, though: a client should trust them only on
 a response it received from a gateway it authenticated.

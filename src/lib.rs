@@ -1953,6 +1953,83 @@ pub mod _test_support {
         crate::http3::server::finalize_h3_response_routing_headers(is_fallback, None, headers);
     }
 
+    /// The HTTP/3 response-header seal every native-H3 and H3-bridge response
+    /// that carries a backend outcome runs: routing headers plus the
+    /// gateway-owned `X-Gateway-Error` token for `(connection_error, status)`.
+    /// Returns whether the seal claimed `X-Gateway-Error` as gateway-owned for
+    /// trailer reconciliation.
+    pub fn finalize_h3_response_gateway_headers_for_test(
+        connection_error: bool,
+        status: u16,
+        headers: &mut HashMap<String, String>,
+    ) -> bool {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        let owned = crate::http3::server::finalize_h3_response_gateway_headers(
+            &ctx,
+            None,
+            headers,
+            connection_error,
+            status,
+        );
+        owned.owns(crate::proxy::X_GATEWAY_ERROR_HEADER)
+    }
+
+    /// Headers of the `502` the HTTP/3 plain bridge answers when its reqwest
+    /// client could not be built.
+    pub fn h3_bridge_pool_client_failure_headers_for_test() -> HashMap<String, String> {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        crate::http3::cross_protocol::plain_pool_client_failure_headers(&ctx)
+    }
+
+    /// A plugin pre-writes `route_request_timeout` metadata (`plugin_value`),
+    /// then the HTTP/3 route-deadline code records `phase` ("dispatch",
+    /// "before_dispatch", or "retry_backoff") only if none was recorded yet.
+    /// Returns `(total deadline already recorded before the mark, logged phase,
+    /// X-Gateway-Error for a 504)`.
+    pub fn h3_route_deadline_mark_after_plugin_metadata_for_test(
+        plugin_value: &str,
+        phase: &str,
+    ) -> (bool, Option<String>, Option<&'static str>) {
+        use crate::proxy::{
+            ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH, ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH,
+            ROUTE_REQUEST_TIMEOUT_PHASE_RETRY_BACKOFF,
+        };
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        ctx.metadata.insert(
+            crate::plugins::ROUTE_REQUEST_TIMEOUT_METADATA_KEY.to_string(),
+            plugin_value.to_string(),
+        );
+        let route = crate::http3::route_deadline::H3RouteDeadlines::new(
+            Some(tokio::time::Instant::now()),
+            None,
+        );
+        let recorded_before = crate::http3::route_deadline::total_expiry_recorded(route, &ctx);
+        let phase = match phase {
+            "dispatch" => ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH,
+            "before_dispatch" => ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH,
+            _ => ROUTE_REQUEST_TIMEOUT_PHASE_RETRY_BACKOFF,
+        };
+        crate::http3::route_deadline::mark_phase_once(&mut ctx, phase);
+        let logged = ctx
+            .metadata
+            .get(crate::plugins::ROUTE_REQUEST_TIMEOUT_METADATA_KEY)
+            .cloned();
+        let token = crate::proxy::x_gateway_error_for_response(&ctx, false, 504);
+        (recorded_before, logged, token)
+    }
+
     /// The final client-facing `X-Gateway-Error` token for a response whose
     /// transaction recorded route-deadline `phase` (`None`: no route deadline
     /// expired), through the same context-aware classifier every HTTP-family
@@ -4495,6 +4572,20 @@ pub mod _test_support {
         crate::proxy::forward_ws_tunnel_residual(writer, residual, offset).await
     }
 
+    /// Backend TLS config source for the WebSocket test dialers: a default
+    /// pool with no TLS policy and no CRLs, like the dialers' own defaults.
+    fn websocket_backend_tls_configs_for_test(
+        env_config: &crate::config::EnvConfig,
+    ) -> crate::connection_pool::ConnectionPool {
+        crate::connection_pool::ConnectionPool::new(
+            crate::config::PoolConfig::default(),
+            env_config.clone(),
+            crate::dns::DnsCache::new(crate::dns::DnsConfig::default()),
+            None,
+            Arc::new(Vec::new()),
+        )
+    }
+
     /// Connect to a WebSocket backend using production dialer settings that
     /// are relevant to unit tests.
     pub async fn connect_websocket_backend_for_test(
@@ -4507,14 +4598,13 @@ pub mod _test_support {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let env_config = crate::config::EnvConfig::default();
-        let crls: crate::tls::CrlList = Arc::new(Vec::new());
+        let tls_configs = websocket_backend_tls_configs_for_test(&env_config);
         let handshake = crate::proxy::connect_websocket_backend(
             backend_url,
             proxy,
             &env_config,
             &[],
-            None,
-            &crls,
+            &tls_configs,
             65_536,
             262_144,
             4_096,
@@ -4808,7 +4898,7 @@ pub mod _test_support {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let env_config = crate::config::EnvConfig::default();
-        let crls: crate::tls::CrlList = Arc::new(Vec::new());
+        let tls_configs = websocket_backend_tls_configs_for_test(&env_config);
         let client_headers: Vec<(String, String)> = if client_subprotocols.is_empty() {
             Vec::new()
         } else {
@@ -4822,8 +4912,7 @@ pub mod _test_support {
             proxy,
             &env_config,
             &client_headers,
-            None,
-            &crls,
+            &tls_configs,
             65_536,
             262_144,
             4_096,
@@ -12638,6 +12727,48 @@ pub mod _test_support {
     ) -> crate::proxy::ProxyBody {
         body.with_deferred_backend_admission_outcome(permits, response_status, Duration::ZERO)
             .with_grpc_trailer_admission_classification()
+    }
+
+    /// [`proxy_body_into_grpc_web_passthrough_streaming_for_test`] after
+    /// attaching the authoritative gRPC message counter to the inner body,
+    /// exactly as the H1/H2 response funnels attach it ahead of the adapter.
+    pub fn proxy_body_into_grpc_web_passthrough_streaming_with_counter_for_test(
+        body: crate::proxy::ProxyBody,
+        text_mode: bool,
+        messages: Arc<std::sync::atomic::AtomicU64>,
+    ) -> crate::proxy::ProxyBody {
+        let framing = crate::plugins::grpc_web::PassthroughFraming {
+            text_mode,
+            content_encoded: false,
+        };
+        body.with_grpc_message_counter(messages)
+            .into_grpc_web_passthrough_streaming(framing, 200)
+    }
+
+    /// Complete gRPC-Web message frames the pass-through trailer observer
+    /// counts over `chunks`, on the decoded frame stream.
+    pub fn grpc_web_passthrough_messages_for_test(chunks: &[&[u8]], text_mode: bool) -> u64 {
+        let mut observer = crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::new(text_mode);
+        for chunk in chunks {
+            observer.push(chunk);
+        }
+        observer.messages()
+    }
+
+    /// The authoritative response message count a complete buffered backend
+    /// body records, for a transaction that observes gRPC messages.
+    pub fn record_backend_response_grpc_message_count_for_test(
+        ctx: &crate::plugins::RequestContext,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> u64 {
+        crate::plugins::grpc_web::record_backend_response_grpc_message_count(
+            ctx,
+            response_headers,
+            body,
+        );
+        ctx.grpc_response_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Feed `chunks`, in order, to the pass-through gRPC-Web trailer observer

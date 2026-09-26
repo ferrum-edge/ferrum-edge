@@ -108,7 +108,8 @@ pub struct SseParse {
 
 /// Parse SSE `data:` frames from a buffered SSE response body into JSON values.
 ///
-/// Iterates lines, strips the `data: ` (or `data:`) prefix, skips empty data,
+/// Consumes leading UTF-8 BOMs, splits lines on CRLF, LF, or CR, skips
+/// comments, strips the `data: ` (or `data:`) prefix, skips empty data,
 /// the `[DONE]` sentinel, and frames that are not valid JSON. Returns the
 /// parsed frames in order. Returns an empty `Vec` if the body is not valid
 /// UTF-8 — callers receive no JSON frames but no error either. Use
@@ -172,8 +173,11 @@ pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
         }
     }
 
-    for raw_line in body_str.lines() {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+    // Strip leading U+FEFF characters so decoding stages that each consume a
+    // BOM cannot leave a second one hiding the first event from inspection.
+    let body_str = body_str.trim_start_matches('\u{feff}');
+
+    for line in sse_lines(body_str) {
         if line.is_empty() {
             flush_event(
                 &mut event_name,
@@ -185,20 +189,22 @@ pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
             continue;
         }
 
-        // Per the WHATWG spec the last `event:` field of an event wins.
-        if let Some(rest) = line.strip_prefix("event:") {
-            event_name = Some(SseEventName::from_name(rest.trim()));
+        // A line starting with `:` is a comment.
+        if line.starts_with(':') {
             continue;
         }
-
-        let data = if let Some(rest) = line.strip_prefix("data: ") {
-            rest
-        } else if let Some(rest) = line.strip_prefix("data:") {
-            rest
-        } else {
-            continue;
+        // Field name up to the first `:`, value after it minus one optional
+        // leading space. A line with no `:` is a field with an empty value.
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
         };
-        event_data.push(data);
+        match field {
+            // Per the WHATWG spec the last `event:` field of an event wins.
+            "event" => event_name = Some(SseEventName::from_name(value.trim())),
+            "data" => event_data.push(value),
+            _ => {}
+        }
     }
     flush_event(
         &mut event_name,
@@ -213,6 +219,40 @@ pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
         events,
         fully_parsed,
     }
+}
+
+/// Split an event-stream body into lines on every WHATWG end-of-line form:
+/// CRLF, a lone LF, or a lone CR (mixed freely within one stream). Unlike
+/// [`str::lines`], a lone CR terminates a line instead of staying inside it. A
+/// final unterminated line is still yielded; no trailing empty line follows a
+/// final terminator. Borrows from `body`, so splitting allocates nothing.
+fn sse_lines(body: &str) -> impl Iterator<Item = &str> {
+    fn is_eol(b: &u8) -> bool {
+        matches!(*b, b'\n' | b'\r')
+    }
+    let bytes = body.as_bytes();
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        if pos >= bytes.len() {
+            return None;
+        }
+        let start = pos;
+        match bytes[start..].iter().position(is_eol) {
+            Some(offset) => {
+                let end = start + offset;
+                pos = end + 1;
+                if bytes[end] == b'\r' && bytes.get(pos) == Some(&b'\n') {
+                    pos += 1;
+                }
+                // CR and LF are ASCII, so `start..end` lies on char boundaries.
+                Some(&body[start..end])
+            }
+            None => {
+                pos = bytes.len();
+                Some(&body[start..])
+            }
+        }
+    })
 }
 
 impl SseParse {
