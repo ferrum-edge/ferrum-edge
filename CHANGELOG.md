@@ -78,13 +78,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cache hits are unchanged. Each request waiting on a cold build has a total
   budget of `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS` (at most 5s), including
   executor queue time, and fails closed when it runs out. The build keeps
-  running (remote source waits inside it share one budget of the same length,
-  measured from when it starts executing), and a late success is cached, so a
-  slow but working source serves the next request instead of timing out on
-  every one. There is still at most one build in flight per TLS identity.
-  Failures keep their existing error classes and are not cached, and a build
-  still in flight when backend TLS or CRL reload clears the cache answers its
-  callers without being cached.
+  running under its own larger but still bounded budget: each remote source
+  wait inside it keeps the full `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`
+  budget, and the whole build is capped at three times that value, measured
+  from when it starts executing. A backend whose CA, client certificate and
+  client key each come from a slow remote provider therefore still builds. A
+  late success is cached, so a slow but working source serves the next request
+  instead of timing out on every one. There is still at most one build in
+  flight per TLS identity. Failures keep their existing error classes and are
+  not cached. A build still in flight when backend TLS or CRL reload clears
+  the cache answers its callers without being cached, and a build still
+  queued for the executor at that point is skipped and fails its callers
+  closed.
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,
   PR #5741). A client that withholds QUIC flow control parks the gateway's

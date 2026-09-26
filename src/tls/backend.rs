@@ -96,7 +96,7 @@ impl TlsError {
     pub fn duplicate(&self) -> Self {
         match self {
             Self::Io { kind, path, source } => Self::Io {
-                kind: *kind,
+                kind,
                 path: path.clone(),
                 source: match source.raw_os_error() {
                     Some(code) => std::io::Error::from_raw_os_error(code),
@@ -108,7 +108,7 @@ impl TlsError {
                 path,
                 details,
             } => Self::Pem {
-                kind: *kind,
+                kind,
                 path: path.clone(),
                 details: details.clone(),
             },
@@ -213,12 +213,21 @@ impl OwnedBackendTlsConfigInputs {
 /// on the bounded TLS source executor, and every concurrent caller for the
 /// same key awaits that one build instead of starting its own. No Tokio worker
 /// performs material I/O, and failures are not negatively cached. Each caller
-/// waits at most the executor deadline (including executor queue time) and
-/// then fails closed, but the build itself runs to completion: a late success
-/// is cached, so a slow yet working source serves the next request from the
-/// cache instead of timing out forever. The pending entry stays registered
-/// until the build publishes, so there is never more than one build in flight
-/// per key.
+/// waits at most the executor deadline `D` (including executor queue time)
+/// and then fails closed, but the build itself runs to completion under its
+/// own larger, still bounded budget: every remote source wait keeps the
+/// per-source budget `D`, and the whole build is capped at
+/// [`TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER`] × `D`, so a CA, client
+/// certificate, and client key each resolved from a slow remote provider can
+/// still finish. A late success is cached, so a slow yet working source serves
+/// the next request from the cache instead of timing out forever. The pending
+/// entry stays registered until the build publishes, so there is never more
+/// than one build in flight per key. Only remote waits are bounded: a truly
+/// hung local syscall (for example a file read on a wedged mount) wedges that
+/// key until a backend TLS / CRL reload or a restart.
+///
+/// [`TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER`]:
+/// crate::tls::source::TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER
 #[derive(Clone, Default)]
 pub struct BackendTlsConfigCache {
     configs: Arc<DashMap<String, Arc<ClientConfig>>>,
@@ -231,6 +240,11 @@ pub struct BackendTlsConfigCache {
     /// reload in the cache.
     clear_epoch: Arc<AtomicU64>,
 }
+
+/// Failure published to the waiters of a queued build that a backend TLS /
+/// CRL reload orphaned before it was admitted to run.
+const RELOAD_CANCELLED_BUILD_DETAILS: &str =
+    "backend TLS configuration build was cancelled by a reload before it started";
 
 /// Outcome a single-flight leader publishes to every coalesced waiter.
 type BackendTlsBuildOutcome = Result<Arc<ClientConfig>, Arc<TlsError>>;
@@ -472,7 +486,10 @@ impl BackendTlsConfigCache {
     ///
     /// Every caller waits at most the executor deadline, measured from its
     /// own arrival and including executor queue time, then fails closed. The
-    /// build keeps running past that point and caches a late success.
+    /// build keeps running past that point under the larger background build
+    /// budget (see [`TlsSourceExecutor::run_blocking_result_to_completion`])
+    /// and caches a late success. A queued build that a [`Self::clear`]
+    /// orphaned before admission is skipped and its waiters fail closed.
     pub async fn get_or_build<P, F>(
         &self,
         key: String,
@@ -564,8 +581,22 @@ impl BackendTlsConfigCache {
                 // after `started_epoch`; a reload that lands later bumps the
                 // epoch and keeps this result out of the cache.
                 let build = prepare();
+                let clear_epoch = Arc::clone(&self.clear_epoch);
                 tokio::spawn(async move {
-                    let outcome = executor.run_blocking_result_to_completion(build).await;
+                    let outcome = executor
+                        .run_blocking_result_to_completion(move || {
+                            // Admission can queue behind other builds. If a
+                            // reload landed meanwhile, this build's result can
+                            // no longer be cached, so give the slot back to
+                            // fresh builds instead of running it.
+                            if clear_epoch.load(Ordering::Acquire) != started_epoch {
+                                return Err(TlsError::Rustls(
+                                    RELOAD_CANCELLED_BUILD_DETAILS.to_string(),
+                                ));
+                            }
+                            build()
+                        })
+                        .await;
                     publisher.publish(outcome);
                 });
             }

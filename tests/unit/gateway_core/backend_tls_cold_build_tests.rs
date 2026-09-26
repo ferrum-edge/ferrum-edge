@@ -6,15 +6,17 @@
 //! polling the request, concurrent misses for one key coalesce onto a single
 //! build, and failures stay fail-closed without being cached — including a
 //! build that straddles a cache clear (CRL / backend TLS reload). Waiters are
-//! bounded by the executor deadline, but the build is not: a late success is
-//! cached for the next request.
+//! bounded by the executor deadline; the build runs under a larger but still
+//! bounded background budget, and a late success is cached for the next
+//! request.
 
 use ferrum_edge::tls::backend::{BackendTlsConfigCache, TlsError};
 use ferrum_edge::tls::source::{
-    MaterialError, TlsSourceExecutor, remaining_tls_source_operation_budget,
+    MaterialError, TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER, TlsSourceExecutor,
+    remaining_tls_source_operation_budget, resolve_on_tls_source_runtime_for_test,
 };
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -52,6 +54,31 @@ fn await_release(release: &mpsc::Receiver<()>) -> Result<(), TlsError> {
     release
         .recv_timeout(RELEASE_TIMEOUT)
         .map_err(|_| TlsError::Rustls("test build was never released".to_string()))
+}
+
+/// Simulated remote provider wait inside a build: the source needs `latency`
+/// and is allowed its per-source budget, capped by what remains of the
+/// enclosing executor operation (the same rule real provider resolution uses).
+fn slow_remote_source(per_source_budget: Duration, latency: Duration) -> Result<(), TlsError> {
+    let allowed = remaining_tls_source_operation_budget(per_source_budget);
+    if allowed < latency {
+        std::thread::sleep(allowed);
+        return Err(TlsError::Rustls("remote source deadline exceeded".to_string()));
+    }
+    std::thread::sleep(latency);
+    Ok(())
+}
+
+/// Wait until a background build has cached `key` and retired its pending
+/// entry, bounded by [`RELEASE_TIMEOUT`].
+async fn wait_until_cached(cache: &BackendTlsConfigCache, key: &str) {
+    tokio::time::timeout(RELEASE_TIMEOUT, async {
+        while !cache.contains_key(key) || cache.pending_builds() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the background build must cache its late success");
 }
 
 /// Build that reports it started, then parks inside blocking work until the
@@ -497,9 +524,11 @@ async fn dropped_build_task_answers_waiters_with_a_closed_failure() {
 }
 
 /// Every executor operation carries one absolute deadline measured from
-/// admission, and remote source waits inside it spend only what remains of
-/// it. The deadline is scoped to the operation, and a run-to-completion
-/// operation returns its result even after that deadline has passed.
+/// admission, and remote source waits inside it are capped by what remains of
+/// it. A bounded operation's deadline is the per-source budget; a
+/// run-to-completion (background build) operation gets the larger
+/// `TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER` cap and returns its result
+/// even after that cap has passed. The deadline is scoped to the operation.
 #[tokio::test(flavor = "current_thread")]
 async fn executor_operations_carry_one_absolute_source_budget() {
     let budget = Duration::from_secs(5);
@@ -519,20 +548,241 @@ async fn executor_operations_carry_one_absolute_source_budget() {
     assert!(spent < fresh, "{spent:?} must be less than {fresh:?}");
     assert!(spent <= Duration::from_millis(300), "{spent:?}");
 
-    let late = executor
+    let per_source = Duration::from_millis(200);
+    let background = test_executor(1, per_source);
+    let cap = background.background_build_deadline();
+    assert_eq!(
+        cap,
+        per_source * TLS_SOURCE_BACKGROUND_BUILD_BUDGET_MULTIPLIER
+    );
+    let (fresh, late) = background
         .run_blocking_result_to_completion(move || {
-            std::thread::sleep(Duration::from_millis(500));
-            Ok::<_, ()>(remaining_tls_source_operation_budget(budget))
+            let fresh = remaining_tls_source_operation_budget(budget);
+            std::thread::sleep(cap + Duration::from_millis(100));
+            Ok::<_, ()>((fresh, remaining_tls_source_operation_budget(budget)))
         })
         .await
         .expect("run-to-completion operation")
         .expect("late result");
+    assert!(fresh <= cap, "{fresh:?}");
+    assert!(
+        fresh > per_source,
+        "the background cap must exceed the per-source budget: {fresh:?}"
+    );
     assert_eq!(late, Duration::ZERO, "the operation deadline has passed");
 
     let after = tokio::task::spawn_blocking(move || remaining_tls_source_operation_budget(budget))
         .await
         .expect("plain blocking task");
     assert_eq!(after, budget, "the deadline is scoped to its operation");
+}
+
+/// A backend whose CA, client certificate, and client key each come from a
+/// slow remote provider: every source fits the per-source budget `D`, but the
+/// three together exceed it. The first request fails closed at `D`, the
+/// background build keeps going under its larger cap, and a later request is
+/// served from the cache.
+#[tokio::test(flavor = "current_thread")]
+async fn multi_source_build_past_the_request_budget_is_cached_for_a_later_request() {
+    let per_source_budget = Duration::from_millis(400);
+    let source_latency = Duration::from_millis(250);
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(1, per_source_budget);
+    assert!(source_latency * 3 > per_source_budget);
+    assert!(source_latency * 3 < executor.background_build_deadline());
+    let prepares = Arc::new(AtomicUsize::new(0));
+
+    let leader_prepares = Arc::clone(&prepares);
+    let first = cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+            leader_prepares.fetch_add(1, Ordering::SeqCst);
+            let build: TestBuild = Box::new(move || -> BuildResult {
+                // CA, client certificate, client key: resolved one after
+                // another, like the backend TLS builder does.
+                for _ in 0..3 {
+                    slow_remote_source(per_source_budget, source_latency)?;
+                }
+                Ok(test_client_config())
+            });
+            build
+        })
+        .await;
+    let details = match first {
+        Err(TlsError::Rustls(details)) => details,
+        Err(other) => panic!("the first request must fail closed at its budget, got {other}"),
+        Ok(_) => panic!("three sequential sources cannot finish inside one request budget"),
+    };
+    assert!(
+        details.contains("did not complete"),
+        "unexpected deadline diagnostic: {details}"
+    );
+
+    wait_until_cached(&cache, STATIC_KEY).await;
+    let later_prepares = Arc::clone(&prepares);
+    cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+            later_prepares.fetch_add(1, Ordering::SeqCst);
+            ok_build()
+        })
+        .await
+        .expect("a later request hits the cached build");
+    assert_eq!(
+        prepares.load(Ordering::SeqCst),
+        1,
+        "the later request is a cache hit, not a rebuild"
+    );
+}
+
+/// A late success is cached even when every waiter has already given up, so
+/// nobody is listening when the build publishes.
+#[tokio::test(flavor = "current_thread")]
+async fn late_success_is_cached_with_no_waiter_left() {
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(1, Duration::from_millis(200));
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let timed_out = cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+            parked_build(started_tx, release_rx)
+        })
+        .await;
+    started_rx.await.expect("cold build started");
+    assert!(
+        timed_out.is_err(),
+        "the only waiter gives up while the build is parked"
+    );
+    assert!(cache.is_empty());
+    assert_eq!(cache.pending_builds(), 1);
+
+    // No caller is waiting on the build any more.
+    release_tx.send(()).expect("release the parked build");
+    wait_until_cached(&cache, STATIC_KEY).await;
+
+    let rebuilds = Arc::new(AtomicUsize::new(0));
+    let hit_rebuilds = Arc::clone(&rebuilds);
+    cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+            hit_rebuilds.fetch_add(1, Ordering::SeqCst);
+            ok_build()
+        })
+        .await
+        .expect("cache hit");
+    assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
+}
+
+/// A build still queued for an executor slot when a reload clears the cache
+/// is skipped once admitted: its result could not be cached, so it must not
+/// hold a slot ahead of fresh builds. Its waiters fail closed.
+#[tokio::test(flavor = "current_thread")]
+async fn queued_build_orphaned_by_a_clear_is_skipped_once_admitted() {
+    const OTHER_KEY: &str = "ca=|cert=|key=|sni=other|san=|verify=1|svidg=static";
+
+    let cache = BackendTlsConfigCache::new();
+    let executor = test_executor(1, Duration::from_secs(5));
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    // Occupy the only executor slot.
+    let occupant = tokio::spawn({
+        let cache = cache.clone();
+        let executor = executor.clone();
+        async move {
+            cache
+                .get_or_build_with_executor(&executor, OTHER_KEY.to_string(), move || {
+                    parked_build(started_tx, release_rx)
+                })
+                .await
+        }
+    });
+    started_rx.await.expect("occupying build started");
+
+    let queued_builds = Arc::new(AtomicUsize::new(0));
+    let queued = tokio::spawn({
+        let cache = cache.clone();
+        let executor = executor.clone();
+        let queued_builds = Arc::clone(&queued_builds);
+        async move {
+            cache
+                .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), move || {
+                    let build: TestBuild = Box::new(move || -> BuildResult {
+                        queued_builds.fetch_add(1, Ordering::SeqCst);
+                        Ok(test_client_config())
+                    });
+                    build
+                })
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(
+        cache.pending_builds(),
+        2,
+        "the second build is queued behind the first"
+    );
+
+    cache.clear();
+    release_tx.send(()).expect("release the occupying build");
+    occupant
+        .await
+        .expect("occupant task")
+        .expect("the admitted build still answers its callers");
+
+    let result = queued.await.expect("queued task");
+    let details = match result {
+        Err(TlsError::Rustls(details)) => details,
+        Err(other) => panic!("an orphaned build must fail closed, got {other}"),
+        Ok(_) => panic!("an orphaned build must not produce a config"),
+    };
+    assert!(
+        details.contains("cancelled by a reload"),
+        "unexpected cancellation diagnostic: {details}"
+    );
+    assert_eq!(
+        queued_builds.load(Ordering::SeqCst),
+        0,
+        "the orphaned build must not run"
+    );
+    assert!(cache.is_empty());
+    assert_eq!(cache.pending_builds(), 0);
+
+    cache
+        .get_or_build_with_executor(&executor, STATIC_KEY.to_string(), ok_build)
+        .await
+        .expect("a fresh build after the reload");
+    assert!(cache.contains_key(STATIC_KEY));
+}
+
+/// Once the enclosing operation's deadline has passed, source resolution
+/// fails fast without spawning (or polling) the provider future.
+#[tokio::test(flavor = "current_thread")]
+async fn exhausted_operation_budget_fails_source_resolution_without_polling() {
+    let executor = test_executor(1, Duration::from_millis(50));
+    let cap = executor.background_build_deadline();
+    let polled = Arc::new(AtomicBool::new(false));
+    let provider_polled = Arc::clone(&polled);
+
+    let (result, elapsed) = executor
+        .run_blocking_result_to_completion(move || {
+            std::thread::sleep(cap + Duration::from_millis(50));
+            let started = std::time::Instant::now();
+            let result = resolve_on_tls_source_runtime_for_test(async move {
+                provider_polled.store(true, Ordering::SeqCst);
+                Ok::<_, String>(())
+            });
+            Ok::<_, ()>((result, started.elapsed()))
+        })
+        .await
+        .expect("run-to-completion operation")
+        .expect("operation result");
+
+    let error = result.expect_err("an exhausted budget must fail closed");
+    assert!(error.contains("deadline exceeded"), "{error}");
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "the provider future must not run"
+    );
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
 }
 
 /// The direct HTTP/2, gRPC, and reqwest/H3 pool managers must reach the
@@ -555,8 +805,9 @@ fn backend_pool_managers_never_build_tls_synchronously() {
         ),
     ];
     for (path, source) in sources {
+        // No `(`: a turbofish or function-value use must also trip the guard.
         assert!(
-            !source.contains("get_or_try_build("),
+            !source.contains("get_or_try_build"),
             "{path} must not build backend TLS configs synchronously on the Tokio worker"
         );
         assert!(
