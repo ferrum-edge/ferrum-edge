@@ -12,11 +12,12 @@
 //! * Each backend attempt runs under the total deadline and a fresh attempt
 //!   budget, started when the attempt is handed to the backend.
 //! * Before the response head, an expired total deadline is the
-//!   gateway-authored `504` (`{"error":"Request timeout"}`, `backend_timeout`
-//!   `X-Gateway-Error`) and is never retried. It is charged to the backend
-//!   only when the backend held the attempt; expiry while the gateway is still
-//!   buffering a client upload, taking admission, or in retry backoff is
-//!   health-neutral and names its phase under
+//!   gateway-authored `504` (`{"error":"Request timeout"}`) and is never
+//!   retried. It is charged to the backend, with the `backend_timeout`
+//!   `X-Gateway-Error` token, only when the backend held the attempt; expiry
+//!   while the gateway is still buffering a client upload, taking admission,
+//!   or in retry backoff is health-neutral, carries the `request_timeout`
+//!   token, and names its phase under
 //!   [`crate::plugins::ROUTE_REQUEST_TIMEOUT_METADATA_KEY`].
 //! * An expired attempt budget is the ordinary backend-timeout `504`, charged
 //!   to the backend and retryable by the rule's retry policy, which replays
@@ -218,8 +219,9 @@ pub(crate) fn total_expiry_recorded(route: H3RouteDeadlines, ctx: &RequestContex
 
 /// The backend response for an attempt a route deadline cancelled, exactly as
 /// proxy core's retry loop sees it (`route_deadline_expiry_response`), with a
-/// total-deadline expiry's phase recorded and the `backend_timeout`
-/// `X-Gateway-Error` token proxy core's response builder attaches to a `504`.
+/// total-deadline expiry's phase recorded and the `X-Gateway-Error` token proxy
+/// core's response builder attaches to that `504`: `request_timeout` when no
+/// backend held the attempt, `backend_timeout` otherwise.
 pub(crate) fn expiry_backend_response(
     ctx: &mut RequestContext,
     expiry: RouteDeadlineExpiry,
@@ -229,8 +231,9 @@ pub(crate) fn expiry_backend_response(
     if let Some(phase) = phase {
         ctx.mark_route_request_timeout_exceeded(phase);
     }
-    crate::proxy::insert_x_gateway_error_for_backend_failure(
+    crate::proxy::apply_authoritative_gateway_error_header_for_response(
         &mut response.headers,
+        ctx,
         response.connection_error,
         response.status_code,
     );

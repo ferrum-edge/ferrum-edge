@@ -2402,3 +2402,90 @@ async fn a2a_card_public_origin_admission_and_signed_jsonrpc_batch_on_the_wire()
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Backend-forged gateway-owned diagnostics (#5759).
+// ────────────────────────────────────────────────────────────────────────────
+//
+// `X-Gateway-Error` and `X-Gateway-Upstream-Status` are authored only by the
+// gateway. A backend that sends its own copies must not reach the client on a
+// streaming 200 (no gateway token at all) or a buffered 503 (exactly the
+// gateway's own `backend_error`, never a duplicate or the forged value).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn backend_forged_gateway_diagnostic_headers_never_reach_the_client() {
+    for (status, body_mode, expected_token) in [
+        (200u16, "stream", None),
+        (503u16, "buffer", Some("backend_error")),
+    ] {
+        let reason = if status == 200 {
+            "OK"
+        } else {
+            "Service Unavailable"
+        };
+        let reservation = reserve_port().await.expect("reserve port");
+        let backend_port = reservation.port;
+        let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+            .step(HttpStep::RespondStatus {
+                status,
+                reason: reason.into(),
+            })
+            .step(HttpStep::RespondHeader {
+                name: "X-Gateway-Error".into(),
+                value: "circuit_breaker_open".into(),
+            })
+            .step(HttpStep::RespondHeader {
+                name: "X-Gateway-Upstream-Status".into(),
+                value: "degraded".into(),
+            })
+            .step(HttpStep::RespondHeader {
+                name: "Connection".into(),
+                value: "close".into(),
+            })
+            .step(HttpStep::RespondHeader {
+                name: "Content-Length".into(),
+                value: "2".into(),
+            })
+            .step(HttpStep::RespondBodyChunk(b"ok".to_vec()))
+            .step(HttpStep::RespondBodyEnd)
+            .spawn()
+            .expect("spawn");
+
+        let yaml = file_mode_yaml_for_backend_with(
+            backend_port,
+            json!({ "response_body_mode": body_mode }),
+        );
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(yaml)
+            .log_level("info")
+            .spawn()
+            .await
+            .expect("spawn gateway");
+
+        let client = harness.http_client().expect("client");
+        let resp = client
+            .get(&harness.proxy_url("/api/forged"))
+            .await
+            .expect("response");
+        assert_eq!(resp.status.as_u16(), status, "{body_mode}");
+        let gateway_errors: Vec<_> = resp
+            .headers
+            .get_all("x-gateway-error")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert_eq!(
+            gateway_errors,
+            expected_token.into_iter().collect::<Vec<_>>(),
+            "{status}/{body_mode}: only the gateway may author X-Gateway-Error"
+        );
+        assert!(
+            !resp.headers.contains_key("x-gateway-upstream-status"),
+            "{status}/{body_mode}: a backend-forged X-Gateway-Upstream-Status reached the \
+             client: {:?}",
+            resp.headers
+        );
+    }
+}

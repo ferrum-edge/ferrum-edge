@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A route-deadline `504` that no backend received now carries the new
+  `X-Gateway-Error: request_timeout` token instead of `backend_timeout`
+  (#5762). This covers a Gateway API `HTTPRoute` `timeouts.request`, or a
+  `mesh_route_dispatch` `request_timeout_ms`, that expires during the client
+  upload, a gateway-local phase, admission, or retry backoff. The transaction
+  log records the phase as `before_dispatch` or `retry_backoff`. Before, the
+  `504` could not be told apart from a real backend read timeout, so on-call
+  and client tooling blamed a backend that never saw the request.
+  `backend_timeout` now always means a backend held the request, including a
+  route-deadline `504` logged as `dispatch`. HTTP/1.1, HTTP/2, and HTTP/3
+  (native and bridged) all emit it. The closed `X-Gateway-Error` vocabulary
+  grows from seven tokens to eight. The metrics `error_class` label is
+  unchanged (`dispatch_policy_rejected`).
 - **BREAKING (wire) — `ValidateJWTSVID` returns claims as
   `google.protobuf.Struct`** (issue #5764). The in-process SPIFFE Workload API
   (`FERRUM_MESH_WORKLOAD_API_ENABLED`) now returns
@@ -30,9 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`attempt_timeout_ms`) bound HTTP/3 exactly as they bound HTTP/1.1 and
   HTTP/2, on the bridge to HTTP/1.1 and HTTP/2 backends and on the native
   HTTP/3 backend pool, buffered or streaming, with or without retries. Before
-  the response head the client gets the same `504`, `X-Gateway-Error:
-  backend_timeout` and transaction-log phase as on HTTP/1.1 and HTTP/2, and
-  an expiry is charged to a backend only when that backend held the attempt.
+  the response head the client gets the same `504`, `X-Gateway-Error` token
+  and transaction-log phase as on HTTP/1.1 and HTTP/2, and an expiry is
+  charged to a backend only when that backend held the attempt.
   An attempt budget expiry is retried when the rule's `retry` lists `504`, and
   the retry replays the retained request body. The HTTP/3 bridge to HTTP/1.1
   and HTTP/2 backends collects a buffered response body (a response-body
@@ -252,6 +265,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over the request context and response. They now check the credential's own
   deadline before polling: no plugin is polled, the expiry is recorded, and
   proxy core answers with the fixed authorization terminal.
+- A reqwest retry attempt whose backend client cannot be built now answers the
+  same fixed `502` `{"error":"Bad Gateway"}` body as the first attempt. Before,
+  the retry body embedded the client-construction error text verbatim. That
+  text could include backend TLS material locations and was not always valid
+  JSON. The detail now goes only to the operator log, and the status, error
+  class, and `X-Gateway-Error` token are unchanged. The first attempt, the
+  retry, and the HTTP/3 bridge now share one fixed body.
 - A peer that resets an HTTP/3 stream in the middle of a DATA frame no longer
   tears down the whole QUIC connection (PR #5741). The vendored `h3` frame-drain
   patch held a QUIC error back so it could decode buffered bytes first. Quinn
@@ -343,6 +363,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A backend can no longer forge the gateway-owned `X-Gateway-Error` or
+  `X-Gateway-Upstream-Status` response headers (#5759). Before, a backend's
+  `X-Gateway-Upstream-Status` reached the client on the generic HTTP/1.1 and
+  HTTP/2 path, and was duplicated beside the gateway's own on fallback
+  routing. A backend's `X-Gateway-Error` reached the client on native gRPC,
+  gRPC-Web pass-through, and the HTTP/3 streaming and bridge paths. Both names
+  now live in one shared list. Every backend response boundary strips a
+  backend-supplied copy, in the headers or the trailers: reqwest, direct
+  HTTP/2, native gRPC, native HTTP/3, the HTTP/3 bridge, and serverless
+  functions, buffered or streamed. The gateway then writes its own value
+  where it classifies the response: on every gateway-synthesized failure, and
+  on a backend 5xx through the HTTP/1.1 / HTTP/2 builder and the native HTTP/3
+  buffered writer. A backend 5xx relayed on an HTTP/3 streaming path or the
+  HTTP/3 bridge's buffered path currently gets no `X-Gateway-Error` (the
+  forged copy is still stripped). The headers are still unauthenticated, so
+  trust them only on a response from a gateway the client authenticated.
 - The vendored `h3` frame-drain patch (001) now defers only QUIC connection
   errors behind buffered bytes, matching the updated upstream fix
   (hyperium/h3#339). PR #5741 exempted a peer stream reset, but every other

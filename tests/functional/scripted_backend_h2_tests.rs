@@ -1473,6 +1473,80 @@ async fn grpc_deadline_exceeded_propagates_as_deadline_exceeded_not_unavailable(
     );
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Backend-forged gateway-owned diagnostics on native gRPC (#5759).
+// ────────────────────────────────────────────────────────────────────────────
+//
+// `X-Gateway-Error` / `X-Gateway-Upstream-Status` are gateway-owned. A native
+// gRPC backend that forges them in its response HEADERS or its trailers must
+// not reach the client on a successful RPC; ordinary trailing metadata still
+// passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_backend_forged_gateway_diagnostics_are_stripped_from_headers_and_trailers() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeadersOverride(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+            ("x-gateway-error", "backend_error".into()),
+            ("x-gateway-upstream-status", "degraded".into()),
+        ]))
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
+        .step(GrpcStep::RespondStatusWithTrailers {
+            code: 0,
+            message: "",
+            trailers: vec![
+                ("x-gateway-error", "backend_timeout".into()),
+                ("x-gateway-upstream-status", "degraded".into()),
+                ("x-keep", "yes".into()),
+            ],
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = grpc_file_config(backend_port, Value::Null);
+    let harness = spawn_grpc_harness(yaml).await;
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let response = client
+        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
+        .await
+        .expect("response surfaced");
+
+    assert_eq!(response.http_status, 200);
+    assert_eq!(
+        response.grpc_status(),
+        Some(0),
+        "trailers={:?} stream_error={:?}",
+        response.trailers,
+        response.stream_error
+    );
+    let trailers = response.trailers.clone().unwrap_or_default();
+    for owned in ["x-gateway-error", "x-gateway-upstream-status"] {
+        assert!(
+            !response.headers.contains_key(owned),
+            "backend-forged {owned} reached the client headers: {:?}",
+            response.headers
+        );
+        assert!(
+            !trailers.contains_key(owned),
+            "backend-forged {owned} reached the client trailers: {trailers:?}"
+        );
+    }
+    assert_eq!(
+        trailers.get("x-keep").and_then(|value| value.to_str().ok()),
+        Some("yes"),
+        "ordinary trailing metadata must still pass: {trailers:?}"
+    );
+}
+
 async fn assert_errors_only_grpc_output(overrides: Value, case: &str) {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;

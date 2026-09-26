@@ -24127,8 +24127,10 @@ components:
                   attempt, retry backoff, and the streaming response body, and
                   is never re-armed by a retry. Request-scoped: it never changes
                   the selected proxy or upstream. Expiry before a non-gRPC
-                  response head answers `504`; expiry mid-body resets the
-                  HTTP/2 stream, closes the HTTP/1.1 connection, or resets the
+                  response head answers `504` (with `X-Gateway-Error:
+                  request_timeout` when no backend held the request, otherwise
+                  `backend_timeout`); expiry mid-body resets the HTTP/2
+                  stream, closes the HTTP/1.1 connection, or resets the
                   HTTP/3 stream with `H3_REQUEST_CANCELLED`; a gRPC request
                   folds it into its RPC deadline and ends with
                   `DEADLINE_EXCEEDED`. HTTP/1.1, HTTP/2 and native HTTP/3

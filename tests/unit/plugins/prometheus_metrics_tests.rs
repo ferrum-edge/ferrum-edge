@@ -2910,7 +2910,7 @@ async fn http_error_class_label_is_granular_error_class() {
 
 #[test]
 fn http_observability_error_class_set_is_closed() {
-    assert_eq!(HTTP_OBSERVABILITY_ERROR_CLASSES.len(), 7);
+    assert_eq!(HTTP_OBSERVABILITY_ERROR_CLASSES.len(), 8);
     let mut seen = std::collections::HashSet::new();
     for token in HTTP_OBSERVABILITY_ERROR_CLASSES {
         assert!(

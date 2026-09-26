@@ -288,12 +288,14 @@ fn native_h3_dispatch_failures_send_typed_gateway_error() {
         .find("sanitize_client_response_headers_for_wire(")
         .map(|idx| committed + idx)
         .expect("buffered native H3 pre-wire sanitize");
+    // The context-aware writer, so an output-ceiling refusal reads `overload`
+    // and a route-deadline 504 no backend held reads `request_timeout`.
     let restore = buffered[sanitize..]
-        .find("apply_authoritative_backend_gateway_error_header(")
+        .find("apply_authoritative_gateway_error_header_for_response(")
         .map(|idx| sanitize + idx)
         .expect("buffered native H3 must restore X-Gateway-Error after committed hooks");
     assert!(
-        !buffered[..sanitize].contains("apply_authoritative_backend_gateway_error_header("),
+        !buffered[..sanitize].contains("apply_authoritative_gateway_error_header_for_response("),
         "buffered native H3 must not restore X-Gateway-Error before the final pre-wire boundary"
     );
     assert!(

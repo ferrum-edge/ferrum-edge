@@ -740,9 +740,27 @@ pub fn merge_proxy_headers_preserving_repeated(
 ///   - `proxy::body::StripHopByHopTrailers` wrapper interposed before
 ///     `Coalescing<Incoming>` on the streaming path.
 ///
+/// **Gateway-owned diagnostics**: the client-facing diagnostic fields in
+/// `GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS` are stripped here too, so
+/// every dispatch path (reqwest, direct hyper / H2 pool, native gRPC and
+/// gRPC-Web, native H3, the H3 bridge, serverless functions) drops a
+/// backend-supplied copy — header or trailer — before the gateway writes its
+/// own. Unlike the hop-by-hop set they are NOT stripped at the final client
+/// wire boundary ([`strip_client_response_hop_by_hop_headers`]), because the
+/// gateway's own reject builders carry them in the same header map.
+///
 /// `name` is expected to be lowercase.
 #[inline]
 pub fn is_backend_response_strip_header(name: &str) -> bool {
+    is_response_hop_by_hop_or_internal_control_header(name)
+        || is_gateway_owned_diagnostic_response_header(name)
+}
+
+/// Response-direction hop-by-hop set plus Ferrum-owned internal control
+/// fields: the part of [`is_backend_response_strip_header`] that is also
+/// stripped at the final client wire boundary.
+#[inline]
+fn is_response_hop_by_hop_or_internal_control_header(name: &str) -> bool {
     matches!(
         name,
         "connection"
@@ -754,6 +772,46 @@ pub fn is_backend_response_strip_header(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     ) || is_internal_response_control_header(name)
+}
+
+/// Wire name of the gateway-owned HTTP-family failure-class header
+/// (`X-Gateway-Error`).
+pub(crate) const X_GATEWAY_ERROR_HEADER: &str = "x-gateway-error";
+/// Wire name of the gateway-owned degraded-routing header
+/// (`X-Gateway-Upstream-Status`).
+pub(crate) const X_GATEWAY_UPSTREAM_STATUS_HEADER: &str = "x-gateway-upstream-status";
+
+/// The single list of client-facing diagnostic response fields only the
+/// gateway may author. A backend (or serverless function) copy is removed at
+/// every backend response boundary through
+/// [`is_backend_response_strip_header`], and each response builder removes any
+/// leftover copy with [`strip_gateway_owned_diagnostic_response_headers`]
+/// before writing its own value. Add a new gateway-authored diagnostic field
+/// here, never at an individual dispatch path.
+pub(crate) const GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS: [&str; 2] =
+    [X_GATEWAY_ERROR_HEADER, X_GATEWAY_UPSTREAM_STATUS_HEADER];
+
+/// Whether `name` is one of [`GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`],
+/// compared ASCII-case-insensitively.
+#[inline]
+pub(crate) fn is_gateway_owned_diagnostic_response_header(name: &str) -> bool {
+    GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS
+        .iter()
+        .any(|owned| name.eq_ignore_ascii_case(owned))
+}
+
+/// Remove every case variant of the gateway-owned diagnostic fields from a
+/// response map, so the builder that runs next is their only author. No-op
+/// (and no rehash) when none is present, the common case.
+pub(crate) fn strip_gateway_owned_diagnostic_response_headers(
+    headers: &mut std::collections::HashMap<String, String>,
+) {
+    if headers
+        .keys()
+        .any(|name| is_gateway_owned_diagnostic_response_header(name))
+    {
+        headers.retain(|name, _| !is_gateway_owned_diagnostic_response_header(name));
+    }
 }
 
 /// Ferrum-owned response fields used only between trusted proxy phases.
@@ -773,7 +831,7 @@ fn is_internal_response_control_header(name: &str) -> bool {
 /// backend decoding already normalizes names while plugins may not.
 #[inline]
 fn is_client_response_hop_by_hop_header(name: &str) -> bool {
-    if is_backend_response_strip_header(name) {
+    if is_response_hop_by_hop_or_internal_control_header(name) {
         return true;
     }
     if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
@@ -1542,8 +1600,10 @@ impl GatewayOwnedResponseHeaders {
         let bit = match field {
             "via" => GatewayOwnedResponseHeader::Via as u8,
             "alt-svc" => GatewayOwnedResponseHeader::AltSvc as u8,
-            "x-gateway-error" => GatewayOwnedResponseHeader::GatewayError as u8,
-            "x-gateway-upstream-status" => GatewayOwnedResponseHeader::GatewayUpstreamStatus as u8,
+            X_GATEWAY_ERROR_HEADER => GatewayOwnedResponseHeader::GatewayError as u8,
+            X_GATEWAY_UPSTREAM_STATUS_HEADER => {
+                GatewayOwnedResponseHeader::GatewayUpstreamStatus as u8
+            }
             _ => return false,
         };
         self.0 & bit != 0
@@ -1561,9 +1621,9 @@ impl GatewayOwnedResponseHeaders {
                 Some(GatewayOwnedResponseHeader::Via)
             } else if name.eq_ignore_ascii_case("alt-svc") {
                 Some(GatewayOwnedResponseHeader::AltSvc)
-            } else if name.eq_ignore_ascii_case("x-gateway-error") {
+            } else if name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER) {
                 Some(GatewayOwnedResponseHeader::GatewayError)
-            } else if name.eq_ignore_ascii_case("x-gateway-upstream-status") {
+            } else if name.eq_ignore_ascii_case(X_GATEWAY_UPSTREAM_STATUS_HEADER) {
                 Some(GatewayOwnedResponseHeader::GatewayUpstreamStatus)
             } else {
                 None

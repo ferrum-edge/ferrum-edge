@@ -25495,8 +25495,9 @@ pub(crate) fn restore_authoritative_allow_header(
 /// Wire name for the HTTP-family failure-class header. HashMap reject paths
 /// use this lowercase spelling; the H1/H2 response builder keeps the
 /// historical `X-Gateway-Error` casing. HTTP header names are
-/// case-insensitive either way.
-pub(crate) const X_GATEWAY_ERROR_HEADER: &str = "x-gateway-error";
+/// case-insensitive either way. The gateway-owned diagnostic set lives in
+/// [`headers_mod::GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`].
+pub(crate) const X_GATEWAY_ERROR_HEADER: &str = headers_mod::X_GATEWAY_ERROR_HEADER;
 // The backend-path tokens (`connection_failure` / `backend_timeout` /
 // `backend_error`) have no alias here: those paths now take them straight from
 // `crate::retry::OBS_*` through `http_observability_error_class`, so a second
@@ -25508,6 +25509,11 @@ pub(crate) const X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN: &str =
     crate::retry::OBS_CIRCUIT_BREAKER_OPEN;
 pub(crate) const X_GATEWAY_ERROR_OVERLOAD: &str = crate::retry::OBS_OVERLOAD;
 pub(crate) const X_GATEWAY_ERROR_CONFIG_STALE: &str = crate::retry::OBS_CONFIG_STALE;
+/// Distinct from `backend_timeout`: a matched route rule's total request
+/// deadline expired before any backend held the request (client upload,
+/// gateway-local phases, admission, or retry backoff), so no backend is to
+/// blame for the `504`.
+pub(crate) const X_GATEWAY_ERROR_REQUEST_TIMEOUT: &str = crate::retry::OBS_REQUEST_TIMEOUT;
 
 /// RFC 9110 `Allow` for protocol-level 405s (TRACE and non-WebSocket CONNECT)
 /// that run before a proxy is matched, so no per-route `allowed_methods`
@@ -25527,13 +25533,22 @@ pub(crate) fn x_gateway_error_for_backend_failure(
 }
 
 /// A gateway output-ceiling decision overrides the original backend outcome.
+/// A route-deadline `504` that no backend held (the transaction's recorded
+/// route-timeout phase is not `dispatch`) is `request_timeout`, never
+/// `backend_timeout`, so the token does not blame a backend that was never
+/// asked.
 pub(crate) fn x_gateway_error_for_response(
     ctx: &RequestContext,
     connection_error: bool,
     status: u16,
 ) -> Option<&'static str> {
     if ctx.response_transform_size_refusal_selected() && status >= 500 {
-        Some("overload")
+        Some(X_GATEWAY_ERROR_OVERLOAD)
+    } else if !connection_error
+        && status == StatusCode::GATEWAY_TIMEOUT.as_u16()
+        && ctx.route_request_timeout_before_backend()
+    {
+        Some(X_GATEWAY_ERROR_REQUEST_TIMEOUT)
     } else {
         x_gateway_error_for_backend_failure(connection_error, status)
     }
@@ -25583,6 +25598,26 @@ pub(crate) fn insert_x_gateway_error_for_backend_failure(
         connection_error,
         status,
     );
+}
+
+/// [`apply_authoritative_backend_gateway_error_header`] for a request whose
+/// context is in hand: the token is [`x_gateway_error_for_response`], so a
+/// gateway output-ceiling refusal reads `overload` and a route-deadline `504`
+/// no backend held reads `request_timeout`. Every case variant is stripped
+/// first. Returns whether the authoritative token was written.
+pub(crate) fn apply_authoritative_gateway_error_header_for_response(
+    response_headers: &mut HashMap<String, String>,
+    ctx: &RequestContext,
+    connection_error: bool,
+    status: u16,
+) -> bool {
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    if let Some(value) = x_gateway_error_for_response(ctx, connection_error, status) {
+        response_headers.insert(X_GATEWAY_ERROR_HEADER.to_string(), value.to_string());
+        true
+    } else {
+        false
+    }
 }
 
 /// Snapshot of the open-breaker 503 header map. Callers clone it into the
@@ -40697,20 +40732,23 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH3(_) => headers_mod::ClientResponseFraming::Streaming,
         }
     };
-    // Gateway-owned: strip every hook/backend case variant before sanitizing
-    // so a late phase cannot spoof or duplicate the token beside the builder
-    // write. Classification is the original dispatch signal; status is final.
+    // Gateway-owned: strip every hook/backend case variant of BOTH diagnostic
+    // fields before sanitizing so a late phase cannot spoof or duplicate them
+    // beside the builder writes below. Classification is the original dispatch
+    // signal; status is final.
     let gateway_error_token =
         x_gateway_error_for_response(&ctx, backend_resp.connection_error, response_status);
-    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    headers_mod::strip_gateway_owned_diagnostic_response_headers(&mut response_headers);
     resp_builder =
         headers_mod::apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);
 
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
-    //   X-Gateway-Error: connection_failure | backend_timeout | backend_error
-    //     | circuit_breaker_open | overload | config_stale | concurrency_limit
-    //     (open-breaker / overload / stale / concurrency 503s use reject paths)
+    //   X-Gateway-Error: connection_failure | backend_timeout | request_timeout
+    //     | backend_error | circuit_breaker_open | overload | config_stale
+    //     | concurrency_limit (request_timeout = route timeout fired before any
+    //     backend held the request; open-breaker / overload / stale /
+    //     concurrency 503s use reject paths)
     //   X-Gateway-Upstream-Status: degraded (when routing via all-unhealthy fallback)
     if let Some(value) = gateway_error_token {
         resp_builder = resp_builder.header("X-Gateway-Error", value);
@@ -40812,14 +40850,10 @@ async fn handle_proxy_request_inner(
     if let Some((pre_policy, section, unbounded)) = streaming_trailer_policy {
         let mut final_headers = response_headers.clone();
         let mut gateway_owned_headers = headers_mod::GatewayOwnedResponseHeaders::default();
-        if backend_resp.connection_error {
-            final_headers.insert("x-gateway-error".into(), "connection_failure".into());
-            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
-        } else if response_status == 504 {
-            final_headers.insert("x-gateway-error".into(), "backend_timeout".into());
-            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
-        } else if response_status >= 500 {
-            final_headers.insert("x-gateway-error".into(), "backend_error".into());
+        // The exact token the builder wrote above, so the view cannot drift
+        // from the wire.
+        if let Some(value) = gateway_error_token {
+            final_headers.insert("x-gateway-error".into(), value.into());
             gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
         }
         if upstream_is_fallback {
@@ -42446,17 +42480,16 @@ pub(crate) async fn proxy_to_backend_retry(
         }
         Ok(Ok(client)) => client,
         Ok(Err(e)) => {
-            error!("Failed to get client from pool for retry: {}", e);
-            return retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::buffered(
-                    format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
-                ),
-                headers: HashMap::new(),
-                connection_error: true,
-                backend_resolved_ip: resolved_ip.clone(),
-                error_class: Some(retry::ErrorClass::ConnectionPoolError),
-            };
+            // The client-construction error can name backend TLS material
+            // sources and carry raw parser/provider text: it stays in this
+            // operator log and never reaches the client body.
+            error!(
+                proxy_id = %proxy.id,
+                listen_path = ?proxy.listen_path,
+                "Connection pool client creation failed on retry — refusing to proxy without proper TLS configuration: {}",
+                e
+            );
+            return connection_pool_client_error_response(resolved_ip);
         }
     };
 
@@ -44123,6 +44156,29 @@ pub(crate) fn http_backend_failure_status_and_body(
         (504, r#"{"error":"Backend timeout"}"#)
     } else {
         (502, r#"{"error":"Backend unavailable"}"#)
+    }
+}
+
+/// Fixed client-visible body for a reqwest connection-pool client that could
+/// not be built (backend TLS material unreadable or invalid, egress refusal,
+/// builder failure). Shared by the first attempt, the retry path, and the H3
+/// bridge so no dispatch path interpolates the construction error, which can
+/// name local TLS material sources and carry raw parser/provider text.
+pub(crate) const CONNECTION_POOL_CLIENT_ERROR_BODY: &str = r#"{"error":"Bad Gateway"}"#;
+
+/// The pre-wire `502` for a reqwest connection-pool client that could not be
+/// built: [`CONNECTION_POOL_CLIENT_ERROR_BODY`], `ConnectionPoolError`. Takes
+/// no error value by design; the caller logs the detail for operators.
+pub(crate) fn connection_pool_client_error_response(
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code: StatusCode::BAD_GATEWAY.as_u16(),
+        body: ResponseBody::buffered(CONNECTION_POOL_CLIENT_ERROR_BODY.as_bytes().to_vec()),
+        headers: HashMap::new(),
+        connection_error: true,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ConnectionPoolError),
     }
 }
 
@@ -45819,14 +45875,7 @@ async fn proxy_to_backend(
                 e
             );
             return backend_dispatch_response(
-                retry::BackendResponse {
-                    status_code: 502,
-                    body: ResponseBody::buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
-                    headers: HashMap::new(),
-                    connection_error: true,
-                    backend_resolved_ip: resolved_ip.clone(),
-                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
-                },
+                connection_pool_client_error_response(resolved_ip),
                 None,
                 None,
             );
@@ -47743,7 +47792,10 @@ fn collect_response_headers(
 /// Same semantics as `collect_response_headers` (Set-Cookie newline separation,
 /// comma folding for other headers) but for `hyper::HeaderMap` instead of
 /// `reqwest::header::HeaderMap`. Used by the HTTP/2 multiplexing pool path.
-fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMap<String, String>) {
+pub(crate) fn collect_hyper_response_headers(
+    source: &hyper::HeaderMap,
+    target: &mut HashMap<String, String>,
+) {
     let listed = headers_mod::parse_connection_listed_headers(source);
     collect_response_headers_generic(source.keys_len(), source.iter(), target, &listed);
 }

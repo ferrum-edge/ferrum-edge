@@ -1063,6 +1063,9 @@ async fn h3_grpc_web_preserves_ascii_custom_trailers_binary_and_text() {
         ("request-id", "abc-456".into()),
         ("trace-proto-bin", "AQID".into()),
         ("proxy-authenticate", "Basic realm=backend".into()),
+        // Gateway-owned diagnostics a backend must never author (#5759).
+        ("x-gateway-error", "backend_error".into()),
+        ("x-gateway-upstream-status", "degraded".into()),
     ];
     let backend = ScriptedGrpcBackend::builder_tls(backend_listener, &backend_cert, &backend_key)
         .expect("backend TLS")
@@ -1131,6 +1134,10 @@ async fn h3_grpc_web_preserves_ascii_custom_trailers_binary_and_text() {
         assert!(
             !payload.contains("proxy-authenticate"),
             "hop-by-hop trailer leaked: {payload}"
+        );
+        assert!(
+            !payload.contains("x-gateway-"),
+            "backend-forged gateway-owned trailer leaked: {payload}"
         );
     };
 
