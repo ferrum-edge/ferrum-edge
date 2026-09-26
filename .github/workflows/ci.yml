@@ -1827,6 +1827,7 @@ jobs:
               functional_grpc_message_metrics_test
               functional_grpc_test
               functional_grpc_web_passthrough_test
+              functional_h2_response_trailers_test
               functional_h3_soap_utf16_test
               functional_http3_connect_udp_test
               functional_key_auth_query_test

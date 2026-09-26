@@ -2536,6 +2536,7 @@ pub fn grpc_request_body_too_large_backend_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(crate::retry::ErrorClass::RequestBodyTooLarge),
+        buffered_trailers: None,
     }
 }
 

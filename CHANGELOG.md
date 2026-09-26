@@ -462,6 +462,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request to an uncached overflow target, and it is emitted after the cache
   shard lock is released. `ferrum_circuit_breaker_cache_admission_refused_total`
   still counts every refused admission (#5787).
+- HTTP/2 response trailers from a backend now reach an HTTP/2 client on every
+  dispatch path and body mode (#5760). The reqwest relay (used for a backend
+  the capability registry has not yet classified, and for routes with retries
+  or request-body buffering) read only DATA and dropped the trailer section, as
+  did every buffered collection (`response_body_mode: buffer`, body-buffering
+  plugins, and the small-response eager buffer) on the reqwest, direct-HTTP/2,
+  sidecar-mTLS, HBONE, and Unix-socket paths. The same configuration could
+  therefore relay trailers on one run and drop them on the next. These paths
+  now read real frames and forward the trailer section after hop-by-hop
+  stripping and the same response-header policy reconciliation the
+  direct-HTTP/2 streaming relay applies; a section left empty by that ends the
+  body without an empty trailer frame. HTTP/1.1 clients still receive no
+  trailer section, and a reqwest response whose backend framing cannot carry
+  one (HTTP/1.x `Content-Length` or close-delimited) skips the trailer policy
+  capture entirely.
 - A streaming response with no `Content-Length` that exceeds
   `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` now reliably shows the client the
   committed status and the bytes within the limit before it is aborted.

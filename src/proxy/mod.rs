@@ -3662,6 +3662,7 @@ fn backend_tls_sni_requires_direct_h2_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+        buffered_trailers: None,
     }
 }
 
@@ -4193,6 +4194,7 @@ async fn prepare_mesh_request_body(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip.clone(),
                 error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                buffered_trailers: None,
             },
             RequestBodyBufferError::ClientDisconnected(message) => {
                 debug!(error = %message, "Client disconnected while buffering mesh request body");
@@ -4203,6 +4205,7 @@ async fn prepare_mesh_request_body(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::ClientDisconnect),
+                    buffered_trailers: None,
                 }
             }
             RequestBodyBufferError::TimedOut => {
@@ -4263,6 +4266,7 @@ async fn prepare_mesh_request_body(
             connection_error: false,
             backend_resolved_ip: resolved_ip,
             error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+            buffered_trailers: None,
         });
     }
 
@@ -6661,6 +6665,7 @@ fn reject_result_to_backend_response(
         } else {
             retry::ErrorClass::DispatchPolicyRejected
         }),
+        buffered_trailers: None,
     }
 }
 
@@ -38988,6 +38993,7 @@ async fn handle_proxy_request_inner(
                         connection_error: false,
                         backend_resolved_ip: None,
                         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        buffered_trailers: None,
                     }
                 };
                 final_upstream_target = current_target.clone();
@@ -39058,6 +39064,7 @@ async fn handle_proxy_request_inner(
                         connection_error: false,
                         backend_resolved_ip: None,
                         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        buffered_trailers: None,
                     }
                 };
                 final_upstream_target = current_target.clone();
@@ -39108,6 +39115,7 @@ async fn handle_proxy_request_inner(
                         connection_error: false,
                         backend_resolved_ip: None,
                         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        buffered_trailers: None,
                     }
                 };
                 final_upstream_target = current_target.clone();
@@ -39531,6 +39539,28 @@ async fn handle_proxy_request_inner(
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
+    // HTTP/1.x responses built here never carry a trailer section: hyper writes
+    // one only for names the response declares in a `Trailer` field, and the
+    // response-header sanitizer strips that field. Only HTTP/2+ clients (and a
+    // translated gRPC-Web stream, whose terminal metadata the adapter re-encodes
+    // as DATA) can receive backend trailers from this handler.
+    let inbound_carries_response_trailers = matches!(
+        inbound_version,
+        hyper::Version::HTTP_2 | hyper::Version::HTTP_3
+    );
+    // Backend trailer section collected alongside a buffered body (issue #5760).
+    // Native gRPC and translated gRPC-Web own their buffered terminal metadata
+    // elsewhere. Cleared below whenever a gateway-authored body replaces the
+    // backend's, so a gateway response never carries backend trailers.
+    let buffered_trailers_relayable = buffered_backend_trailers_relayable(
+        inbound_carries_response_trailers,
+        request_uses_grpc_content_type,
+        grpc_request_is_web_translated,
+    );
+    let mut buffered_response_trailers = backend_resp
+        .buffered_trailers
+        .take()
+        .filter(|_| buffered_trailers_relayable);
     // Pre-commitment authorization terminal (#3815). The H1/H2 request-upload
     // seam bounds a streaming/bidirectional upload by the accepted credential's
     // absolute deadline; when it fires it errors the upload, which resets the
@@ -39567,6 +39597,7 @@ async fn handle_proxy_request_inner(
     if precommit_authorization_terminal.is_some() {
         backend_resp.connection_error = false;
         backend_resp.error_class = Some(retry::ErrorClass::ClientDisconnect);
+        buffered_response_trailers = None;
     }
     // Authoritative gRPC response messages for a buffered backend body are
     // counted here, from the backend's native length-prefixed representation and
@@ -39725,6 +39756,23 @@ async fn handle_proxy_request_inner(
     let streaming_h3_native_grpc =
         request_uses_grpc_content_type && matches!(&response_body, ResponseBody::StreamingH3(_));
 
+    // The reqwest relay reads real frames (issue #5760), so its trailer section
+    // crosses the same boundary as the direct-H2 relay's whenever the client
+    // can receive it AND the backend response can carry one. Otherwise the
+    // relay drops it at the source and captures no evidence, so a
+    // Content-Length HTTP/1.x backend response never pays the pre-policy
+    // snapshot or the final-header clone. Same structural gRPC test as the two
+    // terms above.
+    let reqwest_trailers_relayed = match &response_body {
+        ResponseBody::Streaming { response, .. } => {
+            (inbound_carries_response_trailers || grpc_request_is_web_translated)
+                && reqwest_response_can_carry_trailers(response)
+        }
+        _ => false,
+    };
+    let streaming_reqwest_native_grpc =
+        request_uses_grpc_content_type && matches!(&response_body, ResponseBody::Streaming { .. });
+
     // Response-trailer policy boundary for the PLAIN streaming HTTP/2 relay,
     // the direct-H2 counterpart of the native-H3 streaming relays (issue
     // #2941 follow-up), and for the H1/H2 frontend → native-H3 BACKEND relay
@@ -39760,16 +39808,26 @@ async fn handle_proxy_request_inner(
     //
     // Capture is here, on the PRISTINE backend header map: the gRPC-Web bridge
     // promotion and every response-header phase below run after this point.
-    let streaming_trailer_policy = if matches!(
+    //
+    // A BUFFERED backend body that arrived with a trailer section (direct-H2 or
+    // reqwest collection, issue #5760) crosses the same boundary: the builder
+    // reconciles that section through the same governor before the buffered
+    // body emits it.
+    let hyper_or_h3_streaming_relay = matches!(
         &response_body,
         ResponseBody::StreamingH2(_) | ResponseBody::StreamingH3(_)
-    ) {
+    );
+    let streaming_trailer_policy = if hyper_or_h3_streaming_relay
+        || reqwest_trailers_relayed
+        || buffered_response_trailers.is_some()
+    {
         // A translated gRPC-Web response's trailer block IS a native gRPC
         // terminal section — chosen structurally from the dispatch the gateway
         // committed to, never from a trailer's own name — so its three reserved
         // status fields survive and still drive `build_streaming_trailer_data`.
         let section = if streaming_h2_native_grpc
             || streaming_h3_native_grpc
+            || streaming_reqwest_native_grpc
             || grpc_request_is_web_translated
         {
             headers_mod::TrailerSectionKind::NativeGrpcTerminal
@@ -39993,6 +40051,7 @@ async fn handle_proxy_request_inner(
                 .entry("content-type".to_string())
                 .or_insert_with(|| "application/json".to_string());
             response_body = ResponseBody::buffered(reject.body);
+            buffered_response_trailers = None;
             after_proxy_rejected = true;
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -40150,6 +40209,7 @@ async fn handle_proxy_request_inner(
             )
             .await;
             response_body = ResponseBody::buffered(body);
+            buffered_response_trailers = None;
             let _ = ctx.take_buffered_initial_response_header_policy();
             mesh_grpc_web_trailer_reconcile = None;
             response_body_rejected = true;
@@ -40184,6 +40244,7 @@ async fn handle_proxy_request_inner(
         if response_replaced {
             let _ = ctx.take_buffered_initial_response_header_policy();
             mesh_grpc_web_trailer_reconcile = None;
+            buffered_response_trailers = None;
         }
         response_body_rejected |= response_replaced;
         // Mesh translated gRPC-Web: reconcile bridged trailers with policy state
@@ -40298,6 +40359,7 @@ async fn handle_proxy_request_inner(
             )
             .await;
             response_body = ResponseBody::buffered(body);
+            buffered_response_trailers = None;
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
@@ -41040,6 +41102,22 @@ async fn handle_proxy_request_inner(
             // The backend guards move into the task so connection accounting tracks
             // the real streaming lifetime; a policy cut ends the body cleanly (EOF,
             // not an error).
+            // The reqwest relay reads real frames, so the backend's trailer
+            // section survives it exactly as on the direct-H2 relay (issue
+            // #5760). The governor moves into whichever body reads the frames.
+            // A gRPC terminal section keeps its trailer frame even when empty;
+            // a plain section left empty ends the body on its last DATA frame.
+            let reqwest_trailers = if !reqwest_trailers_relayed {
+                crate::proxy::body::ReqwestResponseTrailers::drop_all()
+            } else if streaming_reqwest_native_grpc || grpc_request_is_web_translated {
+                crate::proxy::body::ReqwestResponseTrailers::relay_grpc_terminal(
+                    streaming_trailer_governor.take(),
+                )
+            } else {
+                crate::proxy::body::ReqwestResponseTrailers::relay(
+                    streaming_trailer_governor.take(),
+                )
+            };
             if let Some(inspector) = response_inspector {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
                 tokio::spawn(crate::proxy::body::run_response_inspection(
@@ -41050,6 +41128,7 @@ async fn handle_proxy_request_inner(
                     proxy.backend_read_timeout_ms,
                     reqwest_backend_guard,
                     lb_connection_guard,
+                    reqwest_trailers,
                 ));
                 // Carry the adaptive-concurrency permits on the inspected body, just
                 // like the non-inspect streaming path below: the in-flight slot then
@@ -41107,6 +41186,7 @@ async fn handle_proxy_request_inner(
                         response,
                         advertised_cl,
                         proxy.backend_read_timeout_ms,
+                        reqwest_trailers,
                     )
                 } else if streaming_response_requires_size_limit(
                     effective_max_response_body_size_bytes,
@@ -41121,6 +41201,7 @@ async fn handle_proxy_request_inner(
                         effective_max_response_body_size_bytes,
                         advertised_cl,
                         proxy.backend_read_timeout_ms,
+                        reqwest_trailers,
                     )
                 } else {
                     crate::proxy::body::coalescing_body(
@@ -41128,6 +41209,7 @@ async fn handle_proxy_request_inner(
                         advertised_cl,
                         proxy.backend_read_timeout_ms,
                         coalesce_flush,
+                        reqwest_trailers,
                     )
                 };
                 let base = if let Some(guard) = reqwest_backend_guard {
@@ -41563,7 +41645,21 @@ async fn handle_proxy_request_inner(
             // Buffered response: body is fully consumed, drop the guard
             // immediately so the connection count is released now.
             drop(lb_connection_guard);
-            ProxyBody::full(data)
+            // The backend's trailer section rides after the buffered DATA
+            // (issue #5760), sanitized and governed exactly like the direct-H2
+            // relay's. A response with no content, or one the gateway authored
+            // late, carries none.
+            let trailers_allowed =
+                buffered_response_carries_backend_trailers(&ctx, is_head, response_status);
+            let backend_trailers = buffered_response_trailers
+                .take()
+                .filter(|_| trailers_allowed);
+            buffered_response_body(
+                data,
+                backend_trailers,
+                streaming_trailer_governor.take(),
+                &proxy.id,
+            )
         }
     };
     // Attach native gRPC message scanning before the optional gRPC-Web adapter.
@@ -42650,6 +42746,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip.clone(),
                 error_class: None,
+                buffered_trailers: None,
             };
         }
     };
@@ -42884,6 +42981,7 @@ pub(crate) async fn proxy_to_backend_retry(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    buffered_trailers: None,
                 };
             }
         }
@@ -43050,6 +43148,7 @@ pub(crate) async fn proxy_to_backend_retry(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                    buffered_trailers: None,
                 };
             }
 
@@ -43131,6 +43230,7 @@ pub(crate) async fn proxy_to_backend_retry(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: None,
+                        buffered_trailers: None,
                     }
                 }
             } else {
@@ -43167,13 +43267,14 @@ pub(crate) async fn proxy_to_backend_retry(
                         }
                     };
                     match collected {
-                        Ok((resp_body, _)) => retry::BackendResponse {
+                        Ok((resp_body, trailers)) => retry::BackendResponse {
                             status_code: status,
                             body: ResponseBody::buffered(resp_body),
                             headers: resp_headers,
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: None,
+                            buffered_trailers: trailers,
                         },
                         Err(failure) => retry::BackendResponse {
                             status_code: failure.status_code,
@@ -43182,6 +43283,7 @@ pub(crate) async fn proxy_to_backend_retry(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: Some(failure.error_class),
+                            buffered_trailers: None,
                         },
                     }
                 }
@@ -43209,6 +43311,7 @@ pub(crate) async fn proxy_to_backend_retry(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    buffered_trailers: None,
                 };
             }
             let error_class = retry::classify_reqwest_error(&e);
@@ -43348,6 +43451,7 @@ async fn proxy_to_backend_mesh_retry(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                buffered_trailers: None,
             },
             None,
             proxy.backend_read_timeout_ms,
@@ -43827,6 +43931,7 @@ pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
             connection_error: false,
             backend_resolved_ip: None,
             error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+            buffered_trailers: None,
         };
     }
 
@@ -43958,6 +44063,7 @@ fn h3_mesh_buffered_retry_response(
             connection_error: false,
             backend_resolved_ip: response.backend_resolved_ip,
             error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+            buffered_trailers: None,
         };
     }
     let mut response = response;
@@ -44159,35 +44265,46 @@ async fn eager_collect_charged_backend_body(
     ceiling: usize,
     preallocation_hint: usize,
     read_timeout_ms: u64,
-) -> Result<Bytes, EagerRetainFailure> {
+) -> Result<EagerCollectedBody, EagerRetainFailure> {
     let mut collector = response_buffer_budget::ChargedBodyCollector::with_preallocation(
         response_buffer_budget::BudgetRef::global(),
         ceiling,
         preallocation_hint,
     )
     .map_err(EagerRetainFailure::Retain)?;
-    let mut stream = response.bytes_stream();
+    let mut frames = reqwest_body_frames(response);
+    let mut trailers = None;
     loop {
-        let chunk = match next_reqwest_chunk_idle(&mut stream, read_timeout_ms).await {
-            Ok(Some(chunk)) => chunk,
+        let frame = match next_reqwest_chunk_idle(&mut frames, read_timeout_ms).await {
+            Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(()) => return Err(EagerRetainFailure::ReadTimeout),
         };
-        match chunk {
-            Ok(chunk) => {
-                if let Err(rejection) = collector.append(&chunk) {
-                    return Err(EagerRetainFailure::Retain(rejection));
+        match frame {
+            Ok(frame) => match frame.into_data() {
+                Ok(chunk) => {
+                    if let Err(rejection) = collector.append(&chunk) {
+                        return Err(EagerRetainFailure::Retain(rejection));
+                    }
                 }
-            }
+                Err(frame) => trailers = buffered_trailer_section(frame),
+            },
             Err(e) => return Err(EagerRetainFailure::Read(e)),
         }
     }
     match collector.into_charged_bytes() {
-        Some(charged) => Ok(charged),
+        Some(body) => Ok(EagerCollectedBody { body, trailers }),
         None => Err(EagerRetainFailure::Retain(
             response_buffer_budget::RetainRejection::BudgetExhausted,
         )),
     }
+}
+
+/// A small backend body collected eagerly, with the trailer section the backend
+/// sent after it (issue #5760).
+struct EagerCollectedBody {
+    body: Bytes,
+    trailers: Option<Box<http::HeaderMap>>,
 }
 
 /// Build a buffered `BackendResponse` from an eager charged collection. A read
@@ -44201,7 +44318,7 @@ async fn eager_collect_charged_backend_body(
 /// success and can grow the limit. Mirrors the size-limited buffered read paths
 /// that already classify this.
 fn buffered_backend_response_from_eager_collect(
-    result: Result<Bytes, EagerRetainFailure>,
+    result: Result<EagerCollectedBody, EagerRetainFailure>,
     status: u16,
     resp_headers: HashMap<String, String>,
     resolved_ip: Option<String>,
@@ -44211,13 +44328,17 @@ fn buffered_backend_response_from_eager_collect(
 ) -> retry::BackendResponse {
     use response_buffer_budget::RetainRejection;
     match result {
-        Ok(charged) => retry::BackendResponse {
+        Ok(EagerCollectedBody {
+            body: charged,
+            trailers,
+        }) => retry::BackendResponse {
             status_code: status,
             body: ResponseBody::buffered(charged),
             headers: resp_headers,
             connection_error: false,
             backend_resolved_ip: resolved_ip,
             error_class: None,
+            buffered_trailers: trailers,
         },
         Err(EagerRetainFailure::Retain(RetainRejection::BudgetExhausted)) => {
             response_buffer_capacity_response(proxy, resolved_ip, transport)
@@ -44243,6 +44364,7 @@ fn buffered_backend_response_from_eager_collect(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                buffered_trailers: None,
             }
         }
         Err(EagerRetainFailure::Read(e)) => {
@@ -44260,6 +44382,7 @@ fn buffered_backend_response_from_eager_collect(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(error_class),
+                buffered_trailers: None,
             }
         }
         Err(EagerRetainFailure::ReadTimeout) => {
@@ -44276,6 +44399,7 @@ fn buffered_backend_response_from_eager_collect(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                buffered_trailers: None,
             }
         }
     }
@@ -44323,6 +44447,7 @@ pub(crate) fn connection_pool_client_error_response(
         connection_error: true,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ConnectionPoolError),
+        buffered_trailers: None,
     }
 }
 
@@ -44343,6 +44468,7 @@ pub(crate) fn http_backend_dispatch_error_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        buffered_trailers: None,
     }
 }
 
@@ -44546,6 +44672,7 @@ fn backend_egress_denied_response(host: &str) -> retry::BackendResponse {
         connection_error: false,
         backend_resolved_ip: Some(host.to_string()),
         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+        buffered_trailers: None,
     }
 }
 
@@ -44570,6 +44697,7 @@ fn backend_dns_override_literal_conflict_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+        buffered_trailers: None,
     }
 }
 
@@ -44604,6 +44732,7 @@ fn backend_dns_resolution_failed_response(
         } else {
             retry::ErrorClass::DnsLookupError
         }),
+        buffered_trailers: None,
     }
 }
 
@@ -44716,6 +44845,7 @@ fn oversized_request_body_dispatch_reject(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                buffered_trailers: None,
             },
             None,
             None,
@@ -45844,6 +45974,7 @@ async fn proxy_to_backend(
                                 connection_error: false,
                                 backend_resolved_ip: resolved_ip,
                                 error_class: None,
+                                buffered_trailers: None,
                             },
                             None,
                             None,
@@ -46040,6 +46171,7 @@ async fn proxy_to_backend(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: None,
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -46221,6 +46353,7 @@ async fn proxy_to_backend(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -46481,6 +46614,7 @@ async fn proxy_to_backend(
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip.clone(),
                                     error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                                    buffered_trailers: None,
                                 },
                                 None,
                                 None,
@@ -46503,6 +46637,7 @@ async fn proxy_to_backend(
                                 connection_error: false,
                                 backend_resolved_ip: resolved_ip.clone(),
                                 error_class: Some(retry::ErrorClass::ClientDisconnect),
+                                buffered_trailers: None,
                             },
                             None,
                             None,
@@ -46708,6 +46843,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        buffered_trailers: None,
                     },
                     None,
                     None,
@@ -46920,6 +47056,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                        buffered_trailers: None,
                     },
                     retained_body,
                     backend_admission_permits,
@@ -46981,6 +47118,7 @@ async fn proxy_to_backend(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                            buffered_trailers: None,
                         },
                         retained_body,
                         backend_admission_permits,
@@ -47068,6 +47206,7 @@ async fn proxy_to_backend(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: None,
+                            buffered_trailers: None,
                         },
                         retained_body,
                         backend_admission_permits,
@@ -47091,6 +47230,7 @@ async fn proxy_to_backend(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: None,
+                            buffered_trailers: None,
                         },
                         retained_body,
                         backend_admission_permits,
@@ -47130,13 +47270,14 @@ async fn proxy_to_backend(
                     }
                 };
                 match collected {
-                    Ok((resp_body, _)) => retry::BackendResponse {
+                    Ok((resp_body, trailers)) => retry::BackendResponse {
                         status_code: status,
                         body: ResponseBody::buffered(resp_body),
                         headers: resp_headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: None,
+                        buffered_trailers: trailers,
                     },
                     Err(failure) => retry::BackendResponse {
                         status_code: failure.status_code,
@@ -47145,6 +47286,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(failure.error_class),
+                        buffered_trailers: None,
                     },
                 }
             } else if stream_response {
@@ -47220,6 +47362,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: None,
+                        buffered_trailers: None,
                     }
                 }
             } else {
@@ -47259,13 +47402,14 @@ async fn proxy_to_backend(
                     }
                 };
                 match collected {
-                    Ok((resp_body, _)) => retry::BackendResponse {
+                    Ok((resp_body, trailers)) => retry::BackendResponse {
                         status_code: status,
                         body: ResponseBody::buffered(resp_body),
                         headers: resp_headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: None,
+                        buffered_trailers: trailers,
                     },
                     Err(failure) => retry::BackendResponse {
                         status_code: failure.status_code,
@@ -47274,6 +47418,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(failure.error_class),
+                        buffered_trailers: None,
                     },
                 }
             }
@@ -47298,6 +47443,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                        buffered_trailers: None,
                     },
                     retained_body,
                     backend_admission_permits,
@@ -47329,6 +47475,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        buffered_trailers: None,
                     },
                     retained_body,
                     backend_admission_permits,
@@ -47460,41 +47607,216 @@ async fn collect_response_with_limit(
     response: reqwest::Response,
     max_size: usize,
     read_timeout_ms: u64,
-) -> Result<(Bytes, usize), BufferedCollectFailure> {
+) -> Result<(Bytes, Option<Box<http::HeaderMap>>), BufferedCollectFailure> {
     let mut body = response_buffer_budget::ChargedBodyCollector::new(
         response_buffer_budget::BudgetRef::global(),
         max_size,
     );
-    let mut stream = response.bytes_stream();
+    let mut frames = reqwest_body_frames(response);
+    let mut trailers = None;
     loop {
-        let chunk_result = match next_reqwest_chunk_idle(&mut stream, read_timeout_ms).await {
-            Ok(Some(chunk)) => chunk,
+        let frame_result = match next_reqwest_chunk_idle(&mut frames, read_timeout_ms).await {
+            Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(()) => return Err(BufferedCollectFailure::read_timeout()),
         };
-        match chunk_result {
-            Ok(chunk) => {
-                // The collector owns BOTH bounds. It charges the growth target
-                // it is about to allocate, not the post-append length, so a
-                // reallocation cannot publish capacity the budget never saw.
-                if let Err(rejection) = body.append(&chunk) {
-                    return Err(buffered_collect_retain_failure(rejection, max_size));
+        match frame_result {
+            Ok(frame) => match frame.into_data() {
+                Ok(chunk) => {
+                    // The collector owns BOTH bounds. It charges the growth
+                    // target it is about to allocate, not the post-append
+                    // length, so a reallocation cannot publish capacity the
+                    // budget never saw.
+                    if let Err(rejection) = body.append(&chunk) {
+                        return Err(buffered_collect_retain_failure(rejection, max_size));
+                    }
                 }
-            }
+                Err(frame) => trailers = buffered_trailer_section(frame),
+            },
             Err(e) => {
                 error!("Error reading backend response: {}", e);
                 return Err(BufferedCollectFailure::read_error());
             }
         }
     }
-    let len = body.len();
     match body.into_charged_bytes() {
-        Some(charged) => Ok((charged, len)),
+        Some(charged) => Ok((charged, trailers)),
         None => Err(buffered_collect_retain_failure(
             response_buffer_budget::RetainRejection::BudgetExhausted,
             max_size,
         )),
     }
+}
+
+/// Frame-level view of a reqwest response body. `Response::bytes_stream()`
+/// yields DATA only and silently discards the backend's trailer section, so
+/// every buffered reqwest collector reads frames instead (issue #5760).
+fn reqwest_body_frames(response: reqwest::Response) -> http_body_util::BodyStream<reqwest::Body> {
+    let body = http::Response::<reqwest::Body>::from(response).into_body();
+    http_body_util::BodyStream::new(body)
+}
+
+/// Whether a reqwest backend response can end with a trailer section: an
+/// HTTP/2+ response, or an HTTP/1.1 response framed with chunked
+/// transfer-coding. Read from the reqwest response's own header map, which
+/// still holds the `transfer-encoding` field the gateway strips from the
+/// client-facing copy. Any other HTTP/1.x framing (Content-Length or
+/// close-delimited) has no place for a trailer section (issue #5760).
+fn reqwest_response_can_carry_trailers(response: &reqwest::Response) -> bool {
+    match response.version() {
+        http::Version::HTTP_2 | http::Version::HTTP_3 => true,
+        http::Version::HTTP_11 => response
+            .headers()
+            .get_all(http::header::TRANSFER_ENCODING)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|coding| coding.trim().eq_ignore_ascii_case("chunked")),
+        _ => false,
+    }
+}
+
+/// Test seam (issue #5760): whether the reqwest relay would treat `response`
+/// as able to carry a trailer section, and therefore capture response-policy
+/// evidence for it. Reached only through `crate::_test_support`.
+#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
+pub(crate) fn reqwest_response_can_carry_trailers_for_test(response: &reqwest::Response) -> bool {
+    reqwest_response_can_carry_trailers(response)
+}
+
+/// Whether a backend trailer section collected with a buffered body may be
+/// relayed at all (issue #5760): the client must be able to receive one, and
+/// the request must not be gRPC-flavored. Native gRPC and translated gRPC-Web
+/// own their buffered terminal metadata elsewhere (folded into the response
+/// headers or re-encoded as a body frame), so the plain-HTTP section is
+/// dropped for them.
+fn buffered_backend_trailers_relayable(
+    inbound_carries_response_trailers: bool,
+    request_uses_grpc_content_type: bool,
+    grpc_request_is_web_translated: bool,
+) -> bool {
+    inbound_carries_response_trailers
+        && !request_uses_grpc_content_type
+        && !grpc_request_is_web_translated
+}
+
+/// Body for a buffered backend response (issue #5760). A relayable backend
+/// trailer section rides after the DATA once hop-by-hop names are stripped
+/// and the response-header policy boundary has run. When those leave nothing
+/// to send, the body ends on its DATA instead of an empty trailer frame.
+fn buffered_response_body(
+    data: Bytes,
+    trailers: Option<Box<http::HeaderMap>>,
+    governor: Option<headers_mod::StreamingResponseTrailerGovernor>,
+    proxy_id: &str,
+) -> ProxyBody {
+    let Some(mut trailers) = trailers else {
+        return ProxyBody::full(data);
+    };
+    headers_mod::strip_response_hop_by_hop_trailers(&mut trailers);
+    if let Some(governor) = governor {
+        let removed = governor.reconcile(&mut trailers);
+        if removed > 0 {
+            debug!(
+                proxy_id = %proxy_id,
+                removed,
+                "buffered response: dropped governed backend trailer fields"
+            );
+        }
+    }
+    if trailers.is_empty() {
+        return ProxyBody::full(data);
+    }
+    ProxyBody::buffered_with_trailers(data, *trailers)
+}
+
+/// Test seam (issue #5760) over the handler's buffered-trailer decisions:
+/// whether the request may relay a buffered backend trailer section, whether
+/// the final response still carries the backend's body (`gateway_selected`
+/// names a late gateway terminal: `"deadline"`, `"capacity"`, or
+/// `"representation"`), and the body the builder then emits. Reached only
+/// through `crate::_test_support`.
+#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn buffered_response_body_for_test(
+    inbound_carries_response_trailers: bool,
+    request_uses_grpc_content_type: bool,
+    grpc_request_is_web_translated: bool,
+    gateway_selected: Option<&str>,
+    is_head: bool,
+    status: u16,
+    data: Bytes,
+    trailers: http::HeaderMap,
+    governor: Option<headers_mod::StreamingResponseTrailerGovernor>,
+) -> ProxyBody {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    match gateway_selected {
+        Some("deadline") => ctx.mark_gateway_deadline_response_selected(),
+        Some("capacity") => ctx.mark_gateway_capacity_response_selected(),
+        Some("representation") => ctx.mark_gateway_representation_response_selected(),
+        _ => {}
+    }
+    let relayable = buffered_backend_trailers_relayable(
+        inbound_carries_response_trailers,
+        request_uses_grpc_content_type,
+        grpc_request_is_web_translated,
+    );
+    let allowed = buffered_response_carries_backend_trailers(&ctx, is_head, status);
+    let trailers = (relayable && allowed).then_some(Box::new(trailers));
+    buffered_response_body(data, trailers, governor, "test")
+}
+
+/// Whether a buffered response may carry the backend's trailer section: it
+/// must have content, and its body must still be the backend's rather than a
+/// terminal the gateway selected in a late phase.
+fn buffered_response_carries_backend_trailers(
+    ctx: &RequestContext,
+    is_head: bool,
+    status: u16,
+) -> bool {
+    !is_head
+        && !crate::plugins::utils::synthetic_response::status_forbids_response_body(status)
+        && !ctx.gateway_deadline_response_selected()
+        && !ctx.gateway_capacity_response_selected()
+        && !ctx.gateway_representation_response_selected()
+        && !ctx.charged_backend_deadline_terminal()
+}
+
+/// Test seam (issue #5760): drive the production buffered reqwest collector
+/// (`eager = false`) or the eager small-body collector (`eager = true`) over
+/// `response` and report the retained body and trailer section. Reached only
+/// through `crate::_test_support`.
+#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
+pub(crate) async fn collect_reqwest_buffered_response_for_test(
+    response: reqwest::Response,
+    eager: bool,
+) -> Result<(Bytes, Option<http::HeaderMap>), &'static str> {
+    const CEILING: usize = 1024 * 1024;
+    if eager {
+        match eager_collect_charged_backend_body(response, CEILING, 0, 0).await {
+            Ok(collected) => {
+                let trailers = collected.trailers.map(|trailers| *trailers);
+                Ok((collected.body, trailers))
+            }
+            Err(_) => Err("eager collection failed"),
+        }
+    } else {
+        match collect_response_with_limit(response, CEILING, 0).await {
+            Ok((body, trailers)) => Ok((body, trailers.map(|trailers| *trailers))),
+            Err(_) => Err("buffered collection failed"),
+        }
+    }
+}
+
+/// Keep a non-empty backend trailer section read by a buffered collector.
+/// Sanitization and response-policy governance happen in the response builder,
+/// once every response-header phase has run.
+fn buffered_trailer_section(frame: http_body::Frame<Bytes>) -> Option<Box<http::HeaderMap>> {
+    frame
+        .into_trailers()
+        .ok()
+        .filter(|trailers| !trailers.is_empty())
+        .map(Box::new)
 }
 
 /// Wait for the next reqwest body chunk, bounded by an idle
@@ -48875,6 +49197,7 @@ fn request_buffer_capacity_backend_response(resolved_ip: Option<String>) -> retr
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(response_buffer_budget::REQUEST_BUFFER_OVERLOAD_ERROR_CLASS),
+        buffered_trailers: None,
     }
 }
 
@@ -48890,6 +49213,7 @@ fn request_body_timeout_backend_response(resolved_ip: Option<String>) -> retry::
         // Buffered client-upload timeouts carry no backend health signal.
         // ClientDisconnect is the existing centrally neutral client-side class.
         error_class: Some(retry::ErrorClass::ClientDisconnect),
+        buffered_trailers: None,
     }
 }
 
@@ -48944,6 +49268,7 @@ fn mesh_transport_pool_error_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        buffered_trailers: None,
     }
 }
 
@@ -49012,6 +49337,7 @@ fn mesh_transport_hyper_error_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        buffered_trailers: None,
     }
 }
 
@@ -49066,22 +49392,12 @@ enum HyperBodyCollectError {
     },
 }
 
-async fn collect_hyper_body_with_limit(
-    body: Incoming,
-    max_size: usize,
-    backend_read_timeout_ms: u64,
-) -> Result<Bytes, HyperBodyCollectError> {
-    collect_hyper_body_and_trailers_with_limit(body, max_size, backend_read_timeout_ms)
-        .await
-        .map(|(body_bytes, _trailers)| body_bytes)
-}
-
-/// Collect a hyper H2 response body up to `max_size`, also capturing the
-/// terminal TRAILERS frame when present. Data-frame limits and read-timeout
-/// behavior are identical to [`collect_hyper_body_with_limit`] (which
-/// delegates here). The mesh-mTLS buffered arm needs the trailers to preserve
-/// gRPC terminal metadata for gRPC-Web translation (codex r1-4); callers that
-/// don't can use the body-only wrapper.
+/// Collect a hyper response body up to `max_size`, also capturing the
+/// terminal trailer section when present (an HTTP/2 TRAILERS frame, or the
+/// trailer fields of an HTTP/1.1 chunked body). The mesh-mTLS buffered arm
+/// needs the trailers to preserve gRPC terminal metadata for gRPC-Web
+/// translation (codex r1-4); every buffered arm also hands them to the
+/// response builder, which relays them after the buffered DATA (issue #5760).
 async fn collect_hyper_body_and_trailers_with_limit(
     mut body: Incoming,
     max_size: usize,
@@ -49201,6 +49517,7 @@ fn response_buffer_capacity_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+        buffered_trailers: None,
     }
 }
 
@@ -49236,6 +49553,7 @@ fn mesh_grpc_response_buffer_capacity_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+        buffered_trailers: None,
     }
 }
 
@@ -49392,6 +49710,7 @@ fn mesh_transport_response_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+        buffered_trailers: None,
     }
 }
 
@@ -49429,6 +49748,7 @@ fn mesh_transport_request_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+        buffered_trailers: None,
     }
 }
 
@@ -49534,6 +49854,7 @@ fn mesh_grpc_unavailable_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        buffered_trailers: None,
     }
 }
 
@@ -49564,6 +49885,7 @@ fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::B
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+        buffered_trailers: None,
     }
 }
 
@@ -49913,6 +50235,7 @@ pub(crate) fn route_request_timeout_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        buffered_trailers: None,
     }
 }
 
@@ -50023,6 +50346,7 @@ fn grpc_deadline_exceeded_response_for_request(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        buffered_trailers: None,
     }
 }
 
@@ -50673,6 +50997,7 @@ pub(crate) fn authorization_expired_dispatch_placeholder(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ClientDisconnect),
+        buffered_trailers: None,
     }
 }
 
@@ -51008,6 +51333,7 @@ fn mesh_grpc_response_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+        buffered_trailers: None,
     }
 }
 
@@ -51046,6 +51372,7 @@ fn mesh_grpc_response_buffering_refusal_response(
         } else {
             Some(retry::ErrorClass::DispatchPolicyRejected)
         },
+        buffered_trailers: None,
     }
 }
 
@@ -51342,6 +51669,7 @@ async fn proxy_to_backend_hbone(
                 connection_error: true,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                buffered_trailers: None,
             },
             None,
             None,
@@ -51460,6 +51788,7 @@ async fn proxy_to_backend_hbone(
                     connection_error: true,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -51484,6 +51813,7 @@ async fn proxy_to_backend_hbone(
                     connection_error: true,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -51791,6 +52121,7 @@ async fn proxy_to_backend_hbone_after_ready(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -51895,6 +52226,7 @@ async fn proxy_to_backend_hbone_after_ready(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -52319,6 +52651,7 @@ async fn proxy_to_backend_hbone_after_ready(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                buffered_trailers: None,
             },
             None,
             Some(body_size_exceeded),
@@ -52330,7 +52663,7 @@ async fn proxy_to_backend_hbone_after_ready(
         let collected = match collect_response_under_authorization(
             ctx.and_then(RequestContext::grpc_deadline_at),
             send_auth_deadline.as_ref(),
-            collect_hyper_body_with_limit(
+            collect_hyper_body_and_trailers_with_limit(
                 response.into_body(),
                 effective_max_response_body_size_bytes,
                 proxy.backend_read_timeout_ms,
@@ -52360,8 +52693,8 @@ async fn proxy_to_backend_hbone_after_ready(
                 );
             }
         };
-        let body_bytes = match collected {
-            Ok(body_bytes) => body_bytes,
+        let (body_bytes, trailers) = match collected {
+            Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
                 return (
                     hbone_response_body_too_large_response(
@@ -52429,6 +52762,11 @@ async fn proxy_to_backend_hbone_after_ready(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                // The inner HTTP/1.1 exchange's chunked trailer section, for
+                // the response builder to govern and relay (issue #5760).
+                buffered_trailers: trailers
+                    .filter(|trailers| !trailers.is_empty())
+                    .map(Box::new),
             },
             None,
             None,
@@ -52464,6 +52802,7 @@ fn unix_backend_dispatch_unavailable_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: None,
         error_class: Some(error_class),
+        buffered_trailers: None,
     }
 }
 
@@ -52510,6 +52849,7 @@ fn unix_backend_error_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        buffered_trailers: None,
     }
 }
 
@@ -52783,6 +53123,7 @@ async fn proxy_to_backend_unix(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -52889,6 +53230,7 @@ async fn proxy_to_backend_unix(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -53291,6 +53633,7 @@ async fn proxy_to_backend_unix(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                buffered_trailers: None,
             },
             None,
             Some(body_size_exceeded),
@@ -53302,7 +53645,7 @@ async fn proxy_to_backend_unix(
         let collected = match collect_response_under_authorization(
             ctx.and_then(RequestContext::grpc_deadline_at),
             send_auth_deadline.as_ref(),
-            collect_hyper_body_with_limit(
+            collect_hyper_body_and_trailers_with_limit(
                 response.into_body(),
                 effective_max_response_body_size_bytes,
                 proxy.backend_read_timeout_ms,
@@ -53332,8 +53675,8 @@ async fn proxy_to_backend_unix(
                 );
             }
         };
-        let body_bytes = match collected {
-            Ok(body_bytes) => body_bytes,
+        let (body_bytes, trailers) = match collected {
+            Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
                 return (
                     unix_response_body_too_large_response(
@@ -53402,6 +53745,11 @@ async fn proxy_to_backend_unix(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                // The inner HTTP/1.1 exchange's chunked trailer section, for
+                // the response builder to govern and relay (issue #5760).
+                buffered_trailers: trailers
+                    .filter(|trailers| !trailers.is_empty())
+                    .map(Box::new),
             },
             None,
             None,
@@ -53474,6 +53822,7 @@ fn unix_hyper_error_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        buffered_trailers: None,
     }
 }
 
@@ -53497,6 +53846,7 @@ fn unix_request_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+        buffered_trailers: None,
     }
 }
 
@@ -53531,6 +53881,7 @@ fn unix_response_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+        buffered_trailers: None,
     }
 }
 
@@ -53605,6 +53956,7 @@ async fn proxy_to_backend_mesh_mtls(
                 connection_error: true,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                buffered_trailers: None,
             },
             None,
             None,
@@ -53696,6 +54048,7 @@ async fn proxy_to_backend_mesh_mtls(
                     connection_error: true,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -53720,6 +54073,7 @@ async fn proxy_to_backend_mesh_mtls(
                     connection_error: true,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -54119,6 +54473,7 @@ async fn proxy_to_backend_mesh_mtls(
                     connection_error: true,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ConnectionTimeout),
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -54301,6 +54656,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -54357,6 +54713,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -54462,6 +54819,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    buffered_trailers: None,
                 },
                 None,
                 None,
@@ -54836,6 +55194,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                buffered_trailers: None,
             },
             None,
             // Post-header client-upload overflow flag for the caller's
@@ -55012,9 +55371,9 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
         // into metadata and strips before the client sees the response.
         if is_grpc_web_translated {
             let mut backend_trailer_headers = HashMap::new();
-            if let Some(trailer_map) = backend_trailers {
+            if let Some(trailer_map) = backend_trailers.as_ref() {
                 grpc_proxy::collect_buffered_grpc_trailers(
-                    &trailer_map,
+                    trailer_map,
                     &mut backend_trailer_headers,
                 );
             }
@@ -55039,6 +55398,12 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                // Plain-HTTP trailer section for the response builder (issue
+                // #5760); it drops the section for gRPC-flavored requests,
+                // whose terminal metadata was folded into the headers above.
+                buffered_trailers: backend_trailers
+                    .filter(|trailers| !trailers.is_empty())
+                    .map(Box::new),
             },
             None,
             None,
@@ -55200,6 +55565,7 @@ async fn proxy_to_backend_http2(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    buffered_trailers: None,
                 },
                 None,
             );
@@ -55377,6 +55743,7 @@ async fn proxy_to_backend_http2(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    buffered_trailers: None,
                 },
                 None,
             );
@@ -55533,6 +55900,7 @@ async fn proxy_to_backend_http2(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip.clone(),
                 error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                buffered_trailers: None,
             },
             None,
         )
@@ -55559,6 +55927,7 @@ async fn proxy_to_backend_http2(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                        buffered_trailers: None,
                     },
                     None,
                 );
@@ -55936,6 +56305,7 @@ async fn proxy_to_backend_http2(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::ProtocolError),
+                        buffered_trailers: None,
                     },
                     None,
                 );
@@ -55975,6 +56345,7 @@ async fn proxy_to_backend_http2(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                buffered_trailers: None,
             },
             None,
         );
@@ -55999,12 +56370,15 @@ async fn proxy_to_backend_http2(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                buffered_trailers: None,
             },
             Some(body_size_exceeded),
         )
     } else {
-        // Buffer the full response body, enforcing the operator size cap.
-        let collect = collect_hyper_body_with_limit(
+        // Buffer the full response body, enforcing the operator size cap. The
+        // backend's trailer section is kept for the response builder, which
+        // governs it once every header phase has run (issue #5760).
+        let collect = collect_hyper_body_and_trailers_with_limit(
             response.into_body(),
             effective_max_response_body_size_bytes,
             proxy.backend_read_timeout_ms,
@@ -56039,7 +56413,7 @@ async fn proxy_to_backend_http2(
                 );
             }
         };
-        let body_bytes = match collect_result {
+        let (body_bytes, trailers) = match collect_result {
             Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
                 warn_sampled!(
@@ -56059,6 +56433,7 @@ async fn proxy_to_backend_http2(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                        buffered_trailers: None,
                     },
                     None,
                 );
@@ -56081,6 +56456,7 @@ async fn proxy_to_backend_http2(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::ProtocolError),
+                        buffered_trailers: None,
                     },
                     None,
                 );
@@ -56108,6 +56484,9 @@ async fn proxy_to_backend_http2(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                buffered_trailers: trailers
+                    .filter(|trailers| !trailers.is_empty())
+                    .map(Box::new),
             },
             None,
         )
@@ -56334,6 +56713,7 @@ async fn proxy_to_backend_http3(
                 connection_error: false,
                 backend_resolved_ip: Some(effective_host.to_string()),
                 error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                buffered_trailers: None,
             },
             None,
         );
@@ -56373,6 +56753,7 @@ async fn proxy_to_backend_http3(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip,
                             error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                            buffered_trailers: None,
                         },
                         None,
                     );
@@ -56518,6 +56899,7 @@ async fn proxy_to_backend_http3(
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip,
                                     error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                                    buffered_trailers: None,
                                 },
                                 None,
                             )
@@ -56541,6 +56923,7 @@ async fn proxy_to_backend_http3(
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip,
                                     error_class: Some(retry::ErrorClass::ClientDisconnect),
+                                    buffered_trailers: None,
                                 },
                                 None,
                             )
@@ -56601,6 +56984,7 @@ async fn proxy_to_backend_http3(
                                     connection_error: is_conn_error,
                                     backend_resolved_ip: resolved_ip,
                                     error_class: Some(error_class),
+                                    buffered_trailers: None,
                                 },
                                 None,
                             )
@@ -56650,6 +57034,7 @@ async fn proxy_to_backend_http3(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                        buffered_trailers: None,
                     },
                     None,
                 );
@@ -56695,6 +57080,7 @@ async fn proxy_to_backend_http3(
                                 connection_error: false,
                                 backend_resolved_ip: resolved_ip,
                                 error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                                buffered_trailers: None,
                             },
                             None,
                         );
@@ -56716,6 +57102,7 @@ async fn proxy_to_backend_http3(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip,
                             error_class: Some(retry::ErrorClass::ClientDisconnect),
+                            buffered_trailers: None,
                         },
                         None,
                     );
@@ -56929,6 +57316,7 @@ async fn proxy_to_backend_http3(
                         connection_error: is_conn_error,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(error_class),
+                        buffered_trailers: None,
                     },
                     retained_body,
                 )
@@ -57066,6 +57454,7 @@ async fn proxy_to_backend_http3(
                         connection_error: is_conn_error,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(error_class),
+                        buffered_trailers: None,
                     },
                     retained_body,
                 )
@@ -57129,6 +57518,7 @@ fn h3_streaming_backend_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: None,
+        buffered_trailers: None,
     }
 }
 
@@ -57184,6 +57574,7 @@ async fn drain_h3_streaming_response_to_buffered(
             connection_error: false,
             backend_resolved_ip: resolved_ip,
             error_class: None,
+            buffered_trailers: None,
         },
         Err(crate::http3::client::H3BodyDrainError::ResponseTooLarge { .. }) => {
             error!(
@@ -57203,6 +57594,7 @@ async fn drain_h3_streaming_response_to_buffered(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                buffered_trailers: None,
             }
         }
         Err(crate::http3::client::H3BodyDrainError::BufferBudgetExhausted) => {
@@ -57246,6 +57638,7 @@ async fn drain_h3_streaming_response_to_buffered(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(error_class),
+                buffered_trailers: None,
             }
         }
         Err(crate::http3::client::H3BodyDrainError::Truncated { received, declared }) => {
@@ -57271,6 +57664,7 @@ async fn drain_h3_streaming_response_to_buffered(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ConnectionClosed),
+                buffered_trailers: None,
             }
         }
     }
@@ -57410,6 +57804,7 @@ fn h3_response_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+        buffered_trailers: None,
     }
 }
 
@@ -57634,6 +58029,7 @@ async fn proxy_to_backend_http3_retry(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: None,
+                        buffered_trailers: None,
                     }
                 } else {
                     drain_h3_streaming_response_to_buffered(
@@ -57688,6 +58084,7 @@ async fn proxy_to_backend_http3_retry(
                     connection_error: is_conn_error,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(error_class),
+                    buffered_trailers: None,
                 }
             }
         };
@@ -57760,6 +58157,7 @@ async fn proxy_to_backend_http3_retry(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                    buffered_trailers: None,
                 };
             }
             // Backend trailers (`response.trailers`) are dropped here for the
@@ -57773,6 +58171,7 @@ async fn proxy_to_backend_http3_retry(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                buffered_trailers: None,
             }
         }
         Err(e) => {
@@ -57815,6 +58214,7 @@ async fn proxy_to_backend_http3_retry(
                 connection_error: is_conn_error,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(error_class),
+                buffered_trailers: None,
             }
         }
     }
@@ -64683,6 +65083,7 @@ mod tests {
                 connection_error,
                 backend_resolved_ip: None,
                 error_class,
+                buffered_trailers: None,
             }
         };
 

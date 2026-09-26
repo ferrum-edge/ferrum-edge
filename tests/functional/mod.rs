@@ -58,6 +58,7 @@ mod functional_grpc_test;
 mod functional_grpc_web_passthrough_test;
 mod functional_grpcroute_pathless_dispatch_test;
 mod functional_h1_h2_auth_lifetime_test;
+mod functional_h2_response_trailers_test;
 mod functional_h3_auth_lifetime_test;
 mod functional_h3_authority_validation_test;
 mod functional_h3_early_data_classification_test;

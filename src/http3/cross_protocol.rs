@@ -1340,6 +1340,7 @@ fn reqwest_error_response_for_cross_protocol(
         connection_error: !crate::retry::request_reached_wire(error_class),
         backend_resolved_ip,
         error_class: Some(error_class),
+        buffered_trailers: None,
     }
 }
 
@@ -1563,6 +1564,7 @@ fn plain_attempt_head_result(status: u16) -> crate::retry::BackendResponse {
         connection_error: false,
         backend_resolved_ip: None,
         error_class: None,
+        buffered_trailers: None,
     }
 }
 
@@ -3604,6 +3606,7 @@ where
                             connection_error: mesh_connection_error,
                             backend_resolved_ip: mesh_resolved_ip,
                             error_class: mesh_error_class,
+                            buffered_trailers: _,
                         } = attempt_result;
                         let crate::retry::ResponseBody::Buffered(mesh_body) = mesh_response_body
                         else {

@@ -829,10 +829,10 @@ fn every_eager_reqwest_buffer_collects_through_the_charged_collector() {
 
     // Three eager small-response paths: the retry loop, the limited
     // first-attempt arm, and the unlimited first-attempt arm — plus the
-    // definition.
+    // definition and the trailer-collection test seam (issue #5760).
     assert_eq!(
         proxy.matches("eager_collect_charged_backend_body(").count(),
-        4,
+        5,
         "every eager small-response path must collect through the shared \
          charged collector, which charges each growth before allocating it"
     );

@@ -7325,6 +7325,175 @@ pub mod _test_support {
         surviving
     }
 
+    /// A reqwest backend response carrying `chunks` as DATA frames followed by
+    /// `trailers` as its trailer section (none when empty).
+    fn reqwest_response_with_trailers_for_test(
+        chunks: &[&'static [u8]],
+        trailers: &[(&str, &str)],
+    ) -> reqwest::Response {
+        type TestFrame = Result<http_body::Frame<bytes::Bytes>, std::io::Error>;
+        let mut frames: Vec<TestFrame> = Vec::with_capacity(chunks.len() + 1);
+        for chunk in chunks.iter().copied() {
+            let data = bytes::Bytes::from_static(chunk);
+            frames.push(Ok(http_body::Frame::data(data)));
+        }
+        if !trailers.is_empty() {
+            let map = backend_trailer_map_for_test(trailers);
+            frames.push(Ok(http_body::Frame::trailers(map)));
+        }
+        let stream = futures_util::stream::iter(frames);
+        let body = reqwest::Body::wrap(http_body_util::StreamBody::new(stream));
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    /// Relay a reqwest backend response through the production streaming
+    /// adapter named by `adapter` (`"direct"`, `"coalescing"`, or
+    /// `"size_limited"`) and collect what the client receives (issue #5760).
+    ///
+    /// `relay_trailers = false` is the shape used when the client cannot
+    /// receive a trailer section. A non-empty `policy_names` installs the
+    /// response-trailer governor the handler builds for a chain declaring
+    /// those names.
+    pub async fn relay_reqwest_streaming_response_for_test(
+        adapter: &str,
+        chunks: &[&'static [u8]],
+        trailers: &[(&str, &str)],
+        relay_trailers: bool,
+        policy_names: &[String],
+    ) -> (Vec<u8>, Option<Vec<(String, String)>>) {
+        use crate::proxy::body::{
+            ReqwestResponseTrailers, coalescing_body, direct_streaming_body,
+            size_limited_streaming_body,
+        };
+        use http_body_util::BodyExt;
+
+        let response = reqwest_response_with_trailers_for_test(chunks, trailers);
+        let trailer_mode = if relay_trailers {
+            let governor = (!policy_names.is_empty()).then(|| {
+                crate::proxy::headers::StreamingResponseTrailerGovernor::new(
+                    HashMap::new(),
+                    crate::proxy::headers::PrePolicyResponseHeaders::NoHeaderPolicyPhase,
+                    std::sync::Arc::new(policy_names.to_vec()),
+                    std::sync::Arc::new(Vec::new()),
+                    crate::proxy::headers::GatewayOwnedResponseHeaders::default(),
+                    crate::proxy::headers::TrailerSectionKind::PlainResponse,
+                    false,
+                )
+            });
+            ReqwestResponseTrailers::relay(governor)
+        } else {
+            ReqwestResponseTrailers::drop_all()
+        };
+        let body = match adapter {
+            "direct" => direct_streaming_body(response, None, 0, trailer_mode),
+            "coalescing" => coalescing_body(response, None, 0, None, trailer_mode),
+            "size_limited" => size_limited_streaming_body(response, 1 << 20, None, 0, trailer_mode),
+            other => panic!("unknown reqwest streaming adapter {other:?}"),
+        };
+        let collected = body.collect().await.expect("relayed body");
+        let trailers = collected.trailers().map(surviving_trailer_lines_for_test);
+        (collected.to_bytes().to_vec(), trailers)
+    }
+
+    /// Whether the reqwest relay treats a backend response with `version` and
+    /// `headers` as able to carry a trailer section (issue #5760). When it
+    /// cannot, the handler captures no response-policy evidence and builds no
+    /// trailer governor for it.
+    pub fn reqwest_response_can_carry_trailers_for_test(
+        version: http::Version,
+        headers: &[(&str, &str)],
+    ) -> bool {
+        let mut response = http::Response::new(reqwest::Body::from(Vec::<u8>::new()));
+        *response.version_mut() = version;
+        *response.headers_mut() = backend_trailer_map_for_test(headers);
+        let response = reqwest::Response::from(response);
+        crate::proxy::reqwest_response_can_carry_trailers_for_test(&response)
+    }
+
+    /// Collect a reqwest backend response through the production buffered
+    /// collector (`eager = false`, used by `response_body_mode: buffer`) or
+    /// the eager small-body collector (`eager = true`) and report the
+    /// retained body and trailer section (issue #5760).
+    pub async fn collect_reqwest_buffered_response_for_test(
+        chunks: &[&'static [u8]],
+        trailers: &[(&str, &str)],
+        eager: bool,
+    ) -> (Vec<u8>, Option<Vec<(String, String)>>) {
+        use crate::proxy::collect_reqwest_buffered_response_for_test as collect;
+
+        let response = reqwest_response_with_trailers_for_test(chunks, trailers);
+        let (body, trailers) = collect(response, eager).await.expect("collect");
+        let trailers = trailers.as_ref().map(surviving_trailer_lines_for_test);
+        (body.to_vec(), trailers)
+    }
+
+    /// Frames of the body the H1/H2 handler builds for a buffered backend
+    /// response that arrived with a trailer section (issue #5760), through the
+    /// handler's own relay decisions: the client can receive trailers
+    /// (`client_http2`), the request is native gRPC (`grpc`) or translated
+    /// gRPC-Web (`grpc_web`), a late gateway terminal replaced the body
+    /// (`gateway_selected`: `"deadline"`, `"capacity"`, `"representation"`),
+    /// and the response is `HEAD` or has a status that forbids content. A
+    /// non-empty `policy_names` installs the response-trailer governor the
+    /// handler builds for a chain declaring those names.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handler_buffered_body_frames_for_test(
+        client_http2: bool,
+        grpc: bool,
+        grpc_web: bool,
+        gateway_selected: Option<&str>,
+        is_head: bool,
+        status: u16,
+        trailers: &[(&str, &str)],
+        policy_names: &[String],
+    ) -> (Vec<u8>, Option<Vec<(String, String)>>) {
+        use http_body_util::BodyExt;
+
+        let governor = (!policy_names.is_empty()).then(|| {
+            crate::proxy::headers::StreamingResponseTrailerGovernor::new(
+                HashMap::new(),
+                crate::proxy::headers::PrePolicyResponseHeaders::NoHeaderPolicyPhase,
+                std::sync::Arc::new(policy_names.to_vec()),
+                std::sync::Arc::new(Vec::new()),
+                crate::proxy::headers::GatewayOwnedResponseHeaders::default(),
+                crate::proxy::headers::TrailerSectionKind::PlainResponse,
+                false,
+            )
+        });
+        let body = crate::proxy::buffered_response_body_for_test(
+            client_http2,
+            grpc,
+            grpc_web,
+            gateway_selected,
+            is_head,
+            status,
+            bytes::Bytes::from_static(b"buffered body"),
+            backend_trailer_map_for_test(trailers),
+            governor,
+        );
+        let collected = body.collect().await.expect("buffered body");
+        let trailers = collected.trailers().map(surviving_trailer_lines_for_test);
+        (collected.to_bytes().to_vec(), trailers)
+    }
+
+    /// Frames of the buffered body the response builder emits for a buffered
+    /// backend response that carried a trailer section (issue #5760).
+    pub async fn buffered_body_with_trailers_frames_for_test(
+        data: &'static [u8],
+        trailers: &[(&str, &str)],
+    ) -> (Vec<u8>, Option<Vec<(String, String)>>) {
+        use http_body_util::BodyExt;
+
+        let map = backend_trailer_map_for_test(trailers);
+        let body = crate::proxy::body::ProxyBody::buffered_with_trailers(
+            bytes::Bytes::from_static(data),
+            map,
+        );
+        let collected = body.collect().await.expect("buffered body");
+        let trailers = collected.trailers().map(surviving_trailer_lines_for_test);
+        (collected.to_bytes().to_vec(), trailers)
+    }
+
     pub fn record_buffered_initial_response_header_plugin_for_test(
         ctx: &mut crate::plugins::RequestContext,
         plugin: &dyn crate::plugins::Plugin,

@@ -1801,6 +1801,12 @@ pub struct BackendResponse {
     /// failed to communicate with the backend. `None` for successful requests
     /// and normal HTTP error responses from the backend.
     pub error_class: Option<ErrorClass>,
+    /// Backend response trailers collected with a [`ResponseBody::Buffered`]
+    /// body, still unsanitized and ungoverned. The response builder strips
+    /// hop-by-hop names and applies the response-header policy before any of
+    /// them reach the wire. `None` for streaming bodies, whose trailers stay in
+    /// the body, and for every gateway-authored response.
+    pub buffered_trailers: Option<Box<http::HeaderMap>>,
 }
 
 impl BackendResponse {

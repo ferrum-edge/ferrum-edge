@@ -22,6 +22,7 @@ fn http_response(status_code: u16) -> BackendResponse {
         connection_error: false,
         backend_resolved_ip: None,
         error_class: None,
+        buffered_trailers: None,
     }
 }
 
@@ -33,6 +34,7 @@ fn connection_failure() -> BackendResponse {
         connection_error: true,
         backend_resolved_ip: None,
         error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionRefused),
+        buffered_trailers: None,
     }
 }
 
@@ -44,6 +46,7 @@ fn post_header_body_read_failure() -> BackendResponse {
         connection_error: false,
         backend_resolved_ip: None,
         error_class: Some(ErrorClass::ConnectionReset),
+        buffered_trailers: None,
     }
 }
 
@@ -55,6 +58,7 @@ fn dispatch_policy_rejection() -> BackendResponse {
         connection_error: false,
         backend_resolved_ip: None,
         error_class: Some(ErrorClass::DispatchPolicyRejected),
+        buffered_trailers: None,
     }
 }
 
@@ -66,6 +70,7 @@ fn terminal_gateway_error(status_code: u16, error_class: ErrorClass) -> BackendR
         connection_error: false,
         backend_resolved_ip: None,
         error_class: Some(error_class),
+        buffered_trailers: None,
     }
 }
 
@@ -1544,6 +1549,7 @@ fn post_handshake_rustls_alerts_are_post_wire_and_do_not_replay_a_post() {
             connection_error: !ferrum_edge::retry::request_reached_wire(class),
             backend_resolved_ip: None,
             error_class: Some(class),
+            buffered_trailers: None,
         };
         assert!(
             !should_retry(&config, "POST", &response, 0),
@@ -1568,6 +1574,7 @@ fn post_handshake_rustls_alerts_are_post_wire_and_do_not_replay_a_post() {
             connection_error: true,
             backend_resolved_ip: None,
             error_class: Some(setup_class),
+            buffered_trailers: None,
         };
         assert!(
             should_retry(&config, "POST", &setup_response, 0),
