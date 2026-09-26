@@ -1840,3 +1840,156 @@ async fn h3_grpc_web_passthrough_unreadable_status_stays_unset() {
         "logs:\n{logs}"
     );
 }
+
+/// Three request messages and a trailer frame, as a gRPC-Web client may
+/// upload them.
+fn passthrough_upload_frames() -> [Vec<u8>; 4] {
+    let trailer = b"x-app-id: 42\r\n";
+    let mut trailer_frame = vec![0x80];
+    trailer_frame.extend_from_slice(&(trailer.len() as u32).to_be_bytes());
+    trailer_frame.extend_from_slice(trailer);
+    [
+        grpc_frame(b"one"),
+        grpc_frame(b"two"),
+        grpc_frame(b"three"),
+        trailer_frame,
+    ]
+}
+
+fn logged_request_messages(logs: &str, proxy_id: &str) -> Vec<Value> {
+    logs.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["proxy_id"] == proxy_id)
+        .map(|entry| entry["grpc_request_messages"].clone())
+        .collect()
+}
+
+/// Issue #5819: a pass-through gRPC-Web upload that the HTTP/3 cross-protocol
+/// plain bridge sends to an HTTP/1.1 backend counts its request messages on
+/// the decoded frames, whether the bridge streams it or buffers it unprepared
+/// (a client `grpc-timeout` buffers a pass-through upload, and no body plugin
+/// prepares it). A binary upload's trailer frame is not a message, and a
+/// `grpc-web-text` upload, here as independently padded base64 segments, is
+/// decoded before its frames are counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_grpc_web_passthrough_uploads_count_decoded_request_messages() {
+    // (proxy id, text encoding, client `grpc-timeout`)
+    let cases = [
+        ("h3-count-binary", false, None),
+        ("h3-count-text", true, None),
+        ("h3-count-buffered-binary", false, Some("5S")),
+        ("h3-count-buffered-text", true, Some("5S")),
+    ];
+    let mut backends = Vec::new();
+    let mut routes = Vec::new();
+    for (proxy_id, text, _) in cases {
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind pass-through backend");
+        let port = listener.local_addr().expect("backend addr").port();
+        let content_type = if text {
+            "application/grpc-web-text+proto"
+        } else {
+            "application/grpc-web+proto"
+        };
+        backends.push(spawn_passthrough_grpc_web_backend(
+            listener,
+            proxy_id,
+            content_type,
+            &passthrough_grpc_web_body(text, b"grpc-status: 0\r\n"),
+        ));
+        // No body plugin and no retry: only a `grpc-timeout` buffers the upload.
+        routes.push(json!({
+            "id": proxy_id,
+            "listen_path": format!("/{proxy_id}"),
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [],
+        }));
+    }
+    let config = json!({
+        "version": "1",
+        "proxies": routes,
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "h3-count-access-log",
+                "plugin_name": "stdout_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": {},
+            },
+            // Marks the transaction as observing gRPC messages.
+            {
+                "id": "h3-count-prometheus",
+                "plugin_name": "prometheus_metrics",
+                "scope": "global",
+                "enabled": true,
+                "config": { "render_cache_ttl_seconds": 0 },
+            },
+        ],
+    });
+    let (gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
+    let client = Http3Client::insecure().expect("H3 client");
+
+    let binary = passthrough_upload_frames().concat();
+    let text: Vec<u8> = passthrough_upload_frames()
+        .iter()
+        .flat_map(|frame| BASE64.encode(frame).into_bytes())
+        .collect();
+    assert_ne!(
+        text,
+        BASE64.encode(&binary).into_bytes(),
+        "the text upload carries padding inside the body"
+    );
+    for (proxy_id, is_text, grpc_timeout) in cases {
+        let (content_type, upload) = if is_text {
+            ("application/grpc-web-text+proto", text.clone())
+        } else {
+            ("application/grpc-web+proto", binary.clone())
+        };
+        let mut options = GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", content_type)
+            .header("x-grpc-web", "1")
+            .body(Bytes::from(upload));
+        if let Some(grpc_timeout) = grpc_timeout {
+            options = options.header("grpc-timeout", grpc_timeout);
+        }
+        let response = request_with_retry(
+            &client,
+            &format!("https://127.0.0.1:{https_port}/{proxy_id}/echo.Echo/ClientStream"),
+            options,
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{proxy_id}");
+    }
+
+    let logs = gateway
+        .wait_for_log_contains(
+            |logs| {
+                cases
+                    .iter()
+                    .all(|(proxy_id, _, _)| !logged_request_messages(logs, proxy_id).is_empty())
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+    for (proxy_id, _, _) in cases {
+        assert_eq!(
+            logged_request_messages(&logs, proxy_id),
+            vec![json!(3)],
+            "{proxy_id}: three decoded messages, never the base64 armour or the trailer \
+             frame; logs:\n{logs}"
+        );
+    }
+    drop(backends);
+}

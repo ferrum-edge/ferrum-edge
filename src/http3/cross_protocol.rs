@@ -1061,6 +1061,13 @@ where
 
     match flavor {
         HttpFlavor::Plain => {
+            // gRPC request messages of the backend-visible body, counted in the
+            // upload's own framing: a pass-through gRPC-Web body counts its
+            // decoded message frames only (#5819). A body the frontend prepared
+            // was already counted there, on these same bytes.
+            if !request_body_prepared && let Some(body) = prebuffered_body.as_deref() {
+                crate::plugins::grpc_web::record_request_grpc_message_count(ctx, body);
+            }
             boxed_dispatch_plain(
                 state,
                 epoch,
@@ -1759,6 +1766,10 @@ fn plain_collect_failure_headers(ctx: &RequestContext, status: u16) -> HashMap<S
 /// pre-wire connection failure: the token is the `connection_failure` proxy
 /// core's builder writes for the same shared pool-failure response
 /// ([`crate::proxy::connection_pool_client_error_response`]).
+///
+/// [`get_cross_protocol_client`] writes this token through
+/// [`write_plain_gateway_error_terminal`], after the `after_proxy` hooks, from
+/// the same `connection_error` signal and status.
 pub(crate) fn plain_pool_client_failure_headers(ctx: &RequestContext) -> HashMap<String, String> {
     let mut headers = HashMap::new();
     crate::proxy::apply_authoritative_gateway_error_header_for_response(
@@ -1778,6 +1789,10 @@ pub(crate) fn plain_pool_client_failure_headers(ctx: &RequestContext) -> HashMap
 /// port gets that port's TLS/ALPN/idle client). Returns `Ok(Ok(client))` on
 /// success, `Ok(Err(outcome))` when the caller should return the written
 /// error, or `Err(_)` only on a stream-write failure.
+///
+/// The `502` is a gateway error terminal: a gRPC-Web client's is decorated by
+/// the `after_proxy` hooks, and `X-Gateway-Error` is written after them, as on
+/// every other gateway error terminal of this bridge (#5747, #5824).
 ///
 /// Both callers run backend admission AND
 /// `record_cross_protocol_connection_start` for the selected target BEFORE this
@@ -1799,6 +1814,7 @@ async fn get_cross_protocol_client<S>(
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
     stream: &mut RequestStream<S, Bytes>,
+    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     pending_slot_to_release_before_error: Option<
         &mut Option<crate::backend_pending_limit::BackendPendingGuard>,
@@ -1807,7 +1823,7 @@ async fn get_cross_protocol_client<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    match state.connection_pool.get_client(dispatch_proxy).await {
+    match acquire_cross_protocol_pool_client(state, dispatch_proxy).await {
         Ok(c) => Ok(Ok(c)),
         Err(e) => {
             error!(
@@ -1829,13 +1845,16 @@ where
             if let Some(slot) = pending_slot_to_release_before_error {
                 drop(slot.take());
             }
-            let headers = plain_pool_client_failure_headers(ctx);
-            let mut outcome = write_plain_gateway_reject(
+            // The client never existed: a pre-wire connection failure, tokened
+            // `connection_failure` after the hooks (see
+            // `plain_pool_client_failure_headers`).
+            let mut outcome = write_plain_gateway_error_terminal(
                 stream,
+                plugins,
                 ctx,
                 StatusCode::BAD_GATEWAY,
                 Bytes::from_static(crate::proxy::CONNECTION_POOL_CLIENT_ERROR_BODY.as_bytes()),
-                &headers,
+                true,
                 backend_start,
                 0,
             )
@@ -1844,6 +1863,17 @@ where
             Ok(Err(outcome))
         }
     }
+}
+
+/// The plain bridge's pooled-client acquire. The crate's own test build swaps
+/// in a variant that honors `pool_client_fault` (defined with the test-only
+/// items below).
+#[cfg(not(test))]
+async fn acquire_cross_protocol_pool_client(
+    state: &ProxyState,
+    proxy: &Proxy,
+) -> anyhow::Result<reqwest::Client> {
+    state.connection_pool.get_client(proxy).await
 }
 
 /// Record the observability accounting for an H3→HTTP plain-bridge client-acquire
@@ -3200,6 +3230,9 @@ where
         {
             Ok(Some(body)) => {
                 let len = body.len() as u64;
+                // No request body hook runs on this drain, so the client's
+                // bytes are the backend-visible body (#5819).
+                crate::plugins::grpc_web::record_request_grpc_message_count(ctx, &body);
                 (Some(body), len)
             }
             Ok(None) => {
@@ -3688,6 +3721,7 @@ where
                             &mut backend_admission_permits,
                             backend_admission_start.elapsed(),
                             stream,
+                            plugins,
                             ctx,
                             Some(&mut pending_slot),
                         ),
@@ -4526,6 +4560,7 @@ where
                         &mut backend_admission_permits,
                         backend_admission_start.elapsed(),
                         stream,
+                        plugins,
                         ctx,
                         Some(&mut pending_slot),
                     ),
@@ -4733,6 +4768,12 @@ where
                 let stream_cancelled = crate::http3::stream_util::peer_response_cancelled(stream);
                 let reader_peer_reset = Arc::new(AtomicBool::new(false));
                 let reader_reset_flag = Arc::clone(&reader_peer_reset);
+                // gRPC request-message accounting for the streamed upload, read
+                // in its own framing: a pass-through gRPC-Web upload counts its
+                // decoded message frames, never its trailer frame or its
+                // `grpc-web-text` base64 (#5819).
+                let mut reader_grpc_tap =
+                    crate::plugins::grpc_web::request_stream_grpc_message_tap(ctx);
                 let reader_future = async {
                     let finish_reader = || {
                         reader_finished_for_reader.store(true, Ordering::Release);
@@ -4783,6 +4824,11 @@ where
                                         // pattern used by the native H3 backend pool
                                         // in `src/http3/client.rs`.
                                         let body_bytes = chunk.copy_to_bytes(len);
+                                        // A refcount bump, only when the metric is
+                                        // observed: the send moves the buffer, and a
+                                        // message counts only once it is handed on.
+                                        let metric_data =
+                                            reader_grpc_tap.as_ref().map(|_| body_bytes.clone());
                                         let write_timeout_active = write_timeout_configured
                                             && reader_transport_consuming.load(Ordering::Acquire);
                                         if write_timeout_active
@@ -4819,6 +4865,11 @@ where
                                         if send_outcome.is_err() {
                                             finish_reader();
                                             return;
+                                        }
+                                        if let (Some(tap), Some(metric_data)) =
+                                            (reader_grpc_tap.as_mut(), metric_data.as_ref())
+                                        {
+                                            tap.push(metric_data);
                                         }
                                     }
                                     Ok(None) => {
@@ -12309,6 +12360,61 @@ where
     }
 }
 
+/// Test build of the plain bridge's pooled-client acquire: an armed
+/// `pool_client_fault` fails it, otherwise it defers to the pool.
+#[cfg(test)]
+async fn acquire_cross_protocol_pool_client(
+    state: &ProxyState,
+    proxy: &Proxy,
+) -> anyhow::Result<reqwest::Client> {
+    if let Some(error) = pool_client_fault::injected(&proxy.id) {
+        return Err(error);
+    }
+    state.connection_pool.get_client(proxy).await
+}
+
+/// Test-only fault injection for the plain bridge's pooled-client acquire
+/// (#5824). It exists only in this crate's own test build, so release builds
+/// carry no check and no configuration can reach it.
+#[cfg(test)]
+mod pool_client_fault {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    /// Proxy ids whose pooled-client acquire fails. Keyed by proxy so tests
+    /// running in parallel never see another test's fault.
+    static FAILING_PROXY_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn failing_proxy_ids() -> MutexGuard<'static, Vec<String>> {
+        FAILING_PROXY_IDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Fails every pooled-client acquire for one proxy id until dropped.
+    pub(super) struct Armed(String);
+
+    impl Armed {
+        pub(super) fn new(proxy_id: &str) -> Self {
+            failing_proxy_ids().push(proxy_id.to_string());
+            Self(proxy_id.to_string())
+        }
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            failing_proxy_ids().retain(|id| id != &self.0);
+        }
+    }
+
+    /// The injected acquire error for `proxy_id`, when a test armed one.
+    pub(super) fn injected(proxy_id: &str) -> Option<anyhow::Error> {
+        failing_proxy_ids()
+            .iter()
+            .any(|id| id == proxy_id)
+            .then(|| anyhow::anyhow!("injected pool client failure"))
+    }
+}
+
 /// Extract a plugin reject body into a gRPC-safe header value for the H3
 /// test path. Reuses the shared H1/H2 JSON/body extraction logic, then
 /// strips bytes `HeaderValue::from_str` rejects on this response path.
@@ -14583,6 +14689,347 @@ mod tests {
                 body.contains(required),
                 "missing deadline guard: {required}"
             );
+        }
+    }
+
+    /// #5824: the plain bridge's pooled-client failure terminal, driven over a
+    /// real loopback HTTP/3 request stream through the test-only acquire fault.
+    mod pool_client_failure_terminal {
+        use std::collections::HashMap;
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        use async_trait::async_trait;
+        use bytes::{Buf, Bytes};
+        use http::StatusCode;
+        use rustls::pki_types::pem::PemObject;
+
+        use super::{minimal_proxy, minimal_proxy_state};
+        use crate::config::types::Proxy;
+        use crate::http3::cross_protocol::{
+            CrossProtocolOutcome, get_cross_protocol_client, pool_client_fault,
+        };
+        use crate::plugins::{Plugin, PluginResult, RequestContext};
+        use crate::proxy::ProxyState;
+
+        type ServerStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+        type ClientStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+
+        /// One HTTP/3 request on loopback: the gateway-side stream the bridge
+        /// answers on, and the client stream that reads the answer.
+        struct H3Exchange {
+            server_stream: ServerStream,
+            client_stream: ClientStream,
+            // Held so both connections stay open for the exchange.
+            _server_connection: h3::server::Connection<h3_quinn::Connection, Bytes>,
+            _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+            _endpoints: (quinn::Endpoint, quinn::Endpoint),
+            client_driver: tokio::task::JoinHandle<()>,
+        }
+
+        impl Drop for H3Exchange {
+            fn drop(&mut self) {
+                self.client_driver.abort();
+            }
+        }
+
+        /// Open a loopback HTTP/3 connection and send one bodyless POST.
+        async fn h3_exchange(content_type: &str) -> H3Exchange {
+            let _ = crate::fips::base_crypto_provider().install_default();
+            let key_pair =
+                rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
+            let params =
+                rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+            let cert = params.self_signed(&key_pair).expect("self-sign cert");
+            let cert_pem = cert.pem();
+            let cert_der = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+                .next()
+                .expect("one certificate")
+                .expect("read certificate");
+            let key_pem = key_pair.serialize_pem();
+            let key_der = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+                .expect("read private key");
+
+            let mut server_crypto =
+                rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                    .with_no_client_auth()
+                    .with_single_cert(vec![cert_der.clone()], key_der)
+                    .expect("server TLS config");
+            server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+            let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+                .expect("QUIC server config");
+            let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+            let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+            let server = quinn::Endpoint::server(server_config, loopback).expect("bind server");
+            let server_addr = server.local_addr().expect("server address");
+
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert_der).expect("trust the certificate");
+            let mut client_crypto =
+                rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+            client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+            let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+                .expect("QUIC client config");
+            let mut client = quinn::Endpoint::client(loopback).expect("bind client");
+            client.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_client)));
+
+            let accept_endpoint = server.clone();
+            let accept = tokio::spawn(async move {
+                let connection = accept_endpoint
+                    .accept()
+                    .await
+                    .expect("incoming connection")
+                    .await
+                    .expect("server handshake");
+                let mut server_connection: h3::server::Connection<h3_quinn::Connection, Bytes> =
+                    h3::server::builder()
+                        .build(h3_quinn::Connection::new(connection))
+                        .await
+                        .expect("h3 server");
+                let resolver = server_connection
+                    .accept()
+                    .await
+                    .expect("accept request")
+                    .expect("one request");
+                let (_request, stream) = resolver.resolve_request().await.expect("request head");
+                (server_connection, stream)
+            });
+
+            let connection = client
+                .connect(server_addr, "localhost")
+                .expect("client connect")
+                .await
+                .expect("client handshake");
+            let (mut driver, mut send_request) =
+                h3::client::new(h3_quinn::Connection::new(connection))
+                    .await
+                    .expect("h3 client");
+            let client_driver = tokio::spawn(async move {
+                let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            });
+            let request = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("https://localhost/echo.Echo/Unary")
+                .header("content-type", content_type)
+                .body(())
+                .expect("request head");
+            let mut client_stream = send_request
+                .send_request(request)
+                .await
+                .expect("send request");
+            client_stream.finish().await.expect("finish request");
+            let (server_connection, server_stream) = accept.await.expect("server task");
+
+            H3Exchange {
+                server_stream,
+                client_stream,
+                _server_connection: server_connection,
+                _send_request: send_request,
+                _endpoints: (server, client),
+                client_driver,
+            }
+        }
+
+        /// The response head and body the client reads.
+        async fn read_response(stream: &mut ClientStream) -> (http::Response<()>, Vec<u8>) {
+            let response = stream.recv_response().await.expect("response head");
+            let mut body = Vec::new();
+            while let Some(mut chunk) = stream.recv_data().await.expect("response body") {
+                let len = chunk.remaining();
+                body.extend_from_slice(&chunk.copy_to_bytes(len));
+            }
+            (response, body)
+        }
+
+        fn gateway_tokens(response: &http::Response<()>) -> Vec<&str> {
+            response
+                .headers()
+                .get_all("x-gateway-error")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect()
+        }
+
+        /// Acquire `proxy`'s pooled client with the fault armed, and return
+        /// the outcome of the terminal written on `stream`.
+        async fn fail_pool_client_acquire(
+            state: &ProxyState,
+            proxy: &Proxy,
+            stream: &mut ServerStream,
+            plugins: &[Arc<dyn Plugin>],
+            ctx: &mut RequestContext,
+        ) -> CrossProtocolOutcome {
+            let _fault = pool_client_fault::Armed::new(&proxy.id);
+            let epoch = state.request_epoch.load();
+            let mut permits = None;
+            let result = get_cross_protocol_client(
+                state,
+                proxy,
+                &epoch,
+                None,
+                None,
+                None,
+                &crate::proxy::HalfOpenProbeGuard::none(),
+                Instant::now(),
+                &mut permits,
+                Duration::ZERO,
+                stream,
+                plugins,
+                ctx,
+                None,
+            )
+            .await
+            .expect("the terminal is written");
+            let Err(outcome) = result else {
+                panic!("the injected fault must fail the pooled-client acquire");
+            };
+            outcome
+        }
+
+        /// An `after_proxy` hook that records whether the gateway token was
+        /// already on the terminal it decorates, then authors its own.
+        struct GatewayTokenProbe {
+            ran: Arc<AtomicBool>,
+            saw_token: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Plugin for GatewayTokenProbe {
+            fn name(&self) -> &str {
+                "gateway_token_probe"
+            }
+
+            fn applies_after_proxy_on_reject(&self) -> bool {
+                true
+            }
+
+            async fn after_proxy(
+                &self,
+                _ctx: &mut RequestContext,
+                _response_status: u16,
+                response_headers: &mut HashMap<String, String>,
+            ) -> PluginResult {
+                self.ran.store(true, Ordering::Release);
+                let saw_token = response_headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("x-gateway-error"));
+                self.saw_token.store(saw_token, Ordering::Release);
+                response_headers.insert("x-gateway-error".to_string(), "spoofed".to_string());
+                PluginResult::Continue
+            }
+        }
+
+        fn probe() -> (Vec<Arc<dyn Plugin>>, Arc<AtomicBool>, Arc<AtomicBool>) {
+            let ran = Arc::new(AtomicBool::new(false));
+            let saw_token = Arc::new(AtomicBool::new(false));
+            let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(GatewayTokenProbe {
+                ran: Arc::clone(&ran),
+                saw_token: Arc::clone(&saw_token),
+            })];
+            (plugins, ran, saw_token)
+        }
+
+        /// A gRPC-Web client's pool-failure `502` is a gateway error terminal:
+        /// the hooks decorate it without seeing the token, and the terminal
+        /// then carries exactly the `connection_failure` token, whatever a hook
+        /// wrote, with the `502` as gRPC `UNAVAILABLE` in its trailer frame.
+        #[tokio::test]
+        async fn grpc_web_pool_client_failure_writes_the_token_after_the_hooks() {
+            let state = minimal_proxy_state();
+            let mut proxy = minimal_proxy();
+            proxy.id = "h3-pool-client-fault-grpc-web".to_string();
+            let (plugins, ran, saw_token) = probe();
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/echo.Echo/Unary".to_string(),
+            );
+            crate::plugins::grpc_web::retain_negotiated_response_content_type(
+                &mut ctx,
+                "application/grpc-web+proto",
+            );
+            let mut exchange = h3_exchange("application/grpc-web+proto").await;
+
+            let outcome = fail_pool_client_acquire(
+                &state,
+                &proxy,
+                &mut exchange.server_stream,
+                &plugins,
+                &mut ctx,
+            )
+            .await;
+            let (response, body) = read_response(&mut exchange.client_stream).await;
+
+            assert!(outcome.connection_error);
+            assert!(
+                ran.load(Ordering::Acquire),
+                "a gRPC-Web terminal runs the after_proxy hooks"
+            );
+            assert!(
+                !saw_token.load(Ordering::Acquire),
+                "the hooks must run before the gateway token is written"
+            );
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                gateway_tokens(&response),
+                ["connection_failure"],
+                "a hook must not see, replace, duplicate, or erase the gateway token"
+            );
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                body.contains("grpc-status: 14"),
+                "the 502 is gRPC UNAVAILABLE in the trailer frame: {body:?}"
+            );
+        }
+
+        /// A plain client's pool-failure terminal is the fixed `502` with the
+        /// `connection_failure` token; only a gRPC-Web terminal runs the hooks.
+        #[tokio::test]
+        async fn plain_pool_client_failure_writes_the_connection_failure_502() {
+            let state = minimal_proxy_state();
+            let mut proxy = minimal_proxy();
+            proxy.id = "h3-pool-client-fault-plain".to_string();
+            let (plugins, ran, _) = probe();
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/echo.Echo/Unary".to_string(),
+            );
+            let mut exchange = h3_exchange("application/json").await;
+
+            let outcome = fail_pool_client_acquire(
+                &state,
+                &proxy,
+                &mut exchange.server_stream,
+                &plugins,
+                &mut ctx,
+            )
+            .await;
+            let (response, body) = read_response(&mut exchange.client_stream).await;
+
+            assert!(outcome.connection_error);
+            assert_eq!(outcome.response_status, 502);
+            assert!(!ran.load(Ordering::Acquire));
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(gateway_tokens(&response), ["connection_failure"]);
+            assert_eq!(
+                body,
+                crate::proxy::CONNECTION_POOL_CLIENT_ERROR_BODY.as_bytes()
+            );
+        }
+
+        /// The seam is keyed by proxy and disarmed on drop.
+        #[test]
+        fn pool_client_fault_is_scoped_to_its_proxy_and_its_guard() {
+            let armed = pool_client_fault::Armed::new("h3-fault-scoped");
+            assert!(pool_client_fault::injected("h3-fault-scoped").is_some());
+            assert!(pool_client_fault::injected("h3-fault-other").is_none());
+            drop(armed);
+            assert!(pool_client_fault::injected("h3-fault-scoped").is_none());
         }
     }
 }
