@@ -424,6 +424,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stripped case-insensitively alongside the `X-RateLimit-*` family, both before
   storage and when an existing entry is replayed, so a cache hit no longer
   reports the original response's stale quota or reset (#5788).
+
+- The circuit-breaker cache's at-capacity warning is now rate-limited to at
+  most one line per second (with a suppressed count) instead of one line per
+  request to an uncached overflow target, and it is emitted after the cache
+  shard lock is released. `ferrum_circuit_breaker_cache_admission_refused_total`
+  still counts every refused admission (#5787).
 - HTTP/2 response trailers from a backend now reach an HTTP/2 client on every
   dispatch path and body mode (#5760). The reqwest relay (used for a backend
   the capability registry has not yet classified, and for routes with retries
@@ -439,12 +445,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trailer section, and a reqwest response whose backend framing cannot carry
   one (HTTP/1.x `Content-Length` or close-delimited) skips the trailer policy
   capture entirely.
-
-- The circuit-breaker cache's at-capacity warning is now rate-limited to at
-  most one line per second (with a suppressed count) instead of one line per
-  request to an uncached overflow target, and it is emitted after the cache
-  shard lock is released. `ferrum_circuit_breaker_cache_admission_refused_total`
-  still counts every refused admission (#5787).
 
 ### Security
 
