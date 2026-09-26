@@ -64,15 +64,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - An inbound HBONE CONNECT refused at relay synthesis now returns the
   documented `403` instead of a route-miss `404` (#5763). This covers a
-  destination the terminator does not own, a missing slice, an unresolvable
-  authority, and a declared Sidecar `ingress[]` block that does not map the
-  port. The response body is `{"error":"HBONE relay destination not allowed"}`
-  (the `UDP` variant for a datagram CONNECT), the same as the later re-checks.
-  The refusal now writes a transaction line whose `rejection_phase` is
+  destination the terminator does not own, an unresolvable authority, and a
+  declared Sidecar `ingress[]` block that does not map the port. The response
+  body is `{"error":"HBONE relay destination not allowed"}` (the `UDP` variant
+  for a datagram CONNECT), the same as the later re-checks. The refusal now
+  writes a transaction line whose `rejection_phase` is
   `hbone_relay_destination_denied` (or `hbone_udp_relay_destination_denied`),
   with `mesh_authz.deny_policy`, `mesh.relay.denial_reason`,
   `mesh.relay.denied_destination`, and `mesh.relay.terminator_ip`. Before, the
   reason was only in a debug log. Nothing is dialed, as before.
+- A terminator that has not applied its first mesh slice now answers an
+  inbound CONNECT with `503` and `{"error":"HBONE relay not ready"}` (the `UDP`
+  variant for a datagram CONNECT), deny policy `hbone_relay_not_ready` (or
+  `hbone_udp_relay_not_ready`) (#5763). Before, that case was a `404` at relay
+  synthesis and a `403` destination denial at the later re-checks. It is no
+  longer counted as a `relay_destination_denied` rejection, so a `403` always
+  means a real authorization denial.
+- A CONNECT with no client certificate and no verified peer identity that is
+  refused at relay synthesis now gets the same unauthenticated-peer `403` the
+  HBONE handlers return (`hbone_unauthenticated_peer`), not a destination
+  denial (#5763). It carries no `mesh.relay.*` metadata and is not counted as a
+  `relay_destination_denied` rejection.
+- `mesh.relay.denied_destination` now brackets an IPv6 literal as
+  `[host]:port` (#5763).
 - A datagram-over-HBONE relay that ends on a socket error is now recorded as an
   error, not as a completed tunnel (#5765). The CONNECT stream still ends with a
   clean HTTP/2 `END_STREAM`, because hyper's upgraded stream cannot reset. The

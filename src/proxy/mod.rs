@@ -2654,10 +2654,10 @@ pub(crate) struct InboundConnectRelayRefusal {
 }
 
 impl InboundConnectRelayRefusal {
-    fn new(reason: &'static str, host: &str, port: u16) -> Self {
+    pub(crate) fn new(reason: &'static str, host: &str, port: u16) -> Self {
         Self {
             reason,
-            destination: Some(format!("{host}:{port}")),
+            destination: Some(hbone_proxy::relay_denied_destination(host, port)),
         }
     }
 }
@@ -2784,13 +2784,10 @@ fn build_inbound_hbone_relay_proxy(
 
 /// Answer a synthesis-time inbound CONNECT relay refusal (issue #5763).
 ///
-/// The documented contract (`docs/mesh.md`, "Fail closed") is a `403` carrying
-/// `mesh_authz.deny_policy=hbone_relay_destination_denied` (or
-/// `hbone_udp_relay_destination_denied` for the datagram flavor) plus the
-/// `mesh.relay.*` audit metadata — the same terminal the post-plugin re-check
-/// in `handle_hbone_request` / `handle_hbone_udp_request` produces. No plugin
-/// chain has run yet, so the transaction line goes to the logging plugins the
-/// synthesized relay would have carried. Nothing is dialed.
+/// No plugin chain has run yet, so the transaction line goes to the logging
+/// plugins the synthesized relay would have carried (the global chain).
+/// Nothing is dialed. See [`reject_inbound_connect_relay_synthesis_with_plugins`]
+/// for the terminal it answers with.
 #[allow(clippy::too_many_arguments)]
 async fn reject_inbound_connect_relay_synthesis(
     state: &ProxyState,
@@ -2798,65 +2795,103 @@ async fn reject_inbound_connect_relay_synthesis(
     ctx: &mut RequestContext,
     refusal: &InboundConnectRelayRefusal,
     is_udp_connect: bool,
-    accepted_local_ip: Option<std::net::IpAddr>,
     start_time: Instant,
     request_uses_grpc_content_type: bool,
     grpc_web_response_content_type: Option<&str>,
 ) -> Response<ProxyBody> {
-    let (deny_policy, body): (&'static str, &'static [u8]) = if is_udp_connect {
-        (
-            "hbone_udp_relay_destination_denied",
-            br#"{"error":"HBONE UDP relay destination not allowed"}"#,
-        )
-    } else {
-        (
-            "hbone_relay_destination_denied",
-            br#"{"error":"HBONE relay destination not allowed"}"#,
-        )
-    };
-    ctx.metadata.insert(
-        "mesh_authz.deny_policy".to_string(),
-        deny_policy.to_string(),
-    );
-    ctx.metadata.insert(
-        hbone_proxy::MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
-        refusal.reason.to_string(),
-    );
-    if let Some(destination) = refusal.destination.as_deref() {
-        ctx.metadata.insert(
-            hbone_proxy::MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
-            destination.to_string(),
-        );
-    }
-    if let Some(terminator_ip) = accepted_local_ip {
-        ctx.metadata.insert(
-            hbone_proxy::MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
-            terminator_ip.to_string(),
-        );
-    }
-    crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
-        crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
-        false,
-    );
-    crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
-        crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
-    );
-    state.request_count.fetch_add(1, Ordering::Relaxed);
-    let response = build_pre_plugin_reject_response(
-        StatusCode::FORBIDDEN,
-        body,
-        &EMPTY_HEADERS,
-        request_uses_grpc_content_type,
-        grpc_web_response_content_type,
-    );
-    let status = response.status().as_u16();
     let plugins = epoch.plugin_cache.plugins_for_protocol(
         "",
         crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID,
         ProxyProtocol::Http,
     );
-    log_pre_backend_rejected_request(&plugins, ctx, status, start_time, deny_policy, 0).await;
-    record_status(state, status);
+    reject_inbound_connect_relay_synthesis_with_plugins(
+        state,
+        &plugins,
+        ctx,
+        refusal,
+        is_udp_connect,
+        start_time,
+        request_uses_grpc_content_type,
+        grpc_web_response_content_type,
+    )
+    .await
+}
+
+/// The terminal a synthesis-time inbound CONNECT relay refusal answers with,
+/// logged to `plugins` (issue #5763). Three cases, in order:
+///
+/// 1. A peerless CONNECT (no client certificate and no verified SPIFFE
+///    identity) gets the same unauthenticated-peer `403` the HBONE handlers
+///    answer (`hbone_unauthenticated_peer` / `hbone_udp_unauthenticated_peer`).
+///    It carries no `mesh.relay.*` metadata and is not counted as a
+///    destination denial: an unauthenticated peer learns nothing about
+///    destination ownership or readiness.
+/// 2. `no_mesh_slice` is a readiness condition: `503 hbone_relay_not_ready`
+///    (`hbone_udp_relay_not_ready`), not counted as a destination denial.
+/// 3. Every other reason is the documented `403 hbone_relay_destination_denied`
+///    (`hbone_udp_relay_destination_denied`), the same terminal the
+///    post-plugin re-check produces.
+///
+/// Cases 2 and 3 carry the `mesh.relay.*` audit metadata.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reject_inbound_connect_relay_synthesis_with_plugins(
+    state: &ProxyState,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    refusal: &InboundConnectRelayRefusal,
+    is_udp_connect: bool,
+    start_time: Instant,
+    request_uses_grpc_content_type: bool,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    let peerless = ctx.tls_client_cert_der.is_none() && ctx.peer_spiffe_id.is_none();
+    let terminal = if peerless {
+        hbone_proxy::unauthenticated_peer_connect_terminal(is_udp_connect)
+    } else {
+        hbone_proxy::inbound_relay_refusal_terminal(refusal.reason, is_udp_connect)
+    };
+    ctx.metadata.insert(
+        "mesh_authz.deny_policy".to_string(),
+        terminal.deny_policy.to_string(),
+    );
+    if !peerless {
+        ctx.metadata.insert(
+            hbone_proxy::MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
+            refusal.reason.to_string(),
+        );
+        if let Some(destination) = refusal.destination.as_deref() {
+            ctx.metadata.insert(
+                hbone_proxy::MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
+                destination.to_string(),
+            );
+        }
+        if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {
+            ctx.metadata.insert(
+                hbone_proxy::MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
+                terminator_ip.to_string(),
+            );
+        }
+    }
+    crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+        crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+        false,
+    );
+    if terminal.is_destination_denial {
+        crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
+        );
+    }
+    let response = build_pre_plugin_reject_response(
+        terminal.status,
+        terminal.body,
+        &EMPTY_HEADERS,
+        request_uses_grpc_content_type,
+        grpc_web_response_content_type,
+    );
+    let status = response.status().as_u16();
+    let deny_policy = terminal.deny_policy;
+    log_pre_backend_rejected_request(plugins, ctx, status, start_time, deny_policy, 0).await;
+    record_request(state, status);
     response
 }
 
@@ -31876,18 +31911,18 @@ async fn handle_proxy_request_inner(
             };
             match hbone_relay {
                 Some(Err(refusal)) => {
-                    // Synthesis-time refusal (issue #5763): the same
-                    // authorization decision the post-plugin re-check makes, so
-                    // it answers the same documented 403 + `mesh.relay.*` audit
-                    // metadata and writes a transaction line, instead of
-                    // masquerading as a route miss.
+                    // Synthesis-time refusal (issue #5763): the same decision
+                    // the post-plugin re-check makes, so it answers the same
+                    // terminal (the documented 403, `503 hbone_relay_not_ready`
+                    // before the first slice, or the unauthenticated-peer 403
+                    // for a peerless CONNECT) and writes a transaction line,
+                    // instead of masquerading as a route miss.
                     let response = reject_inbound_connect_relay_synthesis(
                         &state,
                         &epoch,
                         &mut ctx,
                         &refusal,
                         is_udp_hbone_connect,
-                        accepted_local_ip,
                         start_time,
                         request_uses_grpc_content_type,
                         grpc_web_response_content_type,

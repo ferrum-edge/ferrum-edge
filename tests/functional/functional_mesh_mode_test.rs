@@ -10836,12 +10836,13 @@ async fn drive_inbound_relay_third_workload_refusal(
         }
 
         // CONNECT names C, a dest B does not terminate for. Synthesis refuses
-        // it with the documented 403 before either HBONE handler runs. When this host has only one
-        // non-loopback IPv4, B and C share that address and the own-address
-        // arm refuses C as PortNotDeclared (C's port lives only on C's
-        // SPIFFE); distinct addresses miss the own-address arm and inventory
-        // refuses as AddressNotTerminated. Both are synthesis refusals, and C
-        // is not loopback so the refusal is not the #4315 namespace refusal.
+        // it with the documented 403 before either HBONE handler runs. When
+        // this host has only one non-loopback IPv4, B and C share that address
+        // and the own-address arm refuses C as PortNotDeclared (C's port lives
+        // only on C's SPIFFE); distinct addresses miss the own-address arm and
+        // inventory refuses as AddressNotTerminated. Both are synthesis
+        // refusals, and C is not loopback so the refusal is not the #4315
+        // namespace refusal.
         let authority = SocketAddr::new(c_ip, c_port).to_string();
         let connect = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
