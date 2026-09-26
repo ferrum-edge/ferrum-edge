@@ -2561,13 +2561,15 @@ pub struct RequestContext {
     /// charged wording. Set only by trusted proxy code; cleared when the attempt
     /// ends for retry backoff or a new attempt starts.
     charged_backend_deadline_terminal: bool,
-    /// Whether a matched route rule's total request deadline produced this
-    /// request's gateway-authored `504` while no backend held the request
-    /// (recorded phase other than `dispatch`). Selects the `request_timeout`
-    /// `X-Gateway-Error` token instead of `backend_timeout`. Set only by
+    /// Phase of the matched route rule's total request deadline that produced
+    /// this request's gateway-authored `504`, or `None` when none did. Any
+    /// phase other than `dispatch` means no backend held the request, which
+    /// selects the `request_timeout` `X-Gateway-Error` token instead of
+    /// `backend_timeout`. Set only by
     /// [`Self::mark_route_request_timeout_exceeded`]; typed so a plugin-written
-    /// metadata value cannot select it.
-    route_request_timeout_before_backend: bool,
+    /// `route_request_timeout` metadata value can neither select the token nor
+    /// make the gateway believe a phase is already recorded.
+    route_request_timeout_phase: Option<&'static str>,
     /// Latest dispatch outcome, retaining possible execution across retries.
     /// Only trusted transport code may set this; it is not serialized.
     backend_dispatch_state: BackendDispatchState,
@@ -3870,7 +3872,7 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             charged_backend_deadline_terminal: false,
-            route_request_timeout_before_backend: false,
+            route_request_timeout_phase: None,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
             gateway_capacity_response_selected: false,
             gateway_representation_response_selected: false,
@@ -4526,19 +4528,28 @@ impl RequestContext {
     /// Any phase other than `dispatch` means no backend held the request, so
     /// the `504` carries the `request_timeout` `X-Gateway-Error` token.
     pub(crate) fn mark_route_request_timeout_exceeded(&mut self, phase: &'static str) {
-        self.route_request_timeout_before_backend =
-            phase != crate::proxy::ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH;
+        self.route_request_timeout_phase = Some(phase);
         self.metadata.insert(
             ROUTE_REQUEST_TIMEOUT_METADATA_KEY.to_string(),
             phase.to_string(),
         );
     }
 
+    /// Whether trusted proxy code has recorded a route-deadline phase for this
+    /// request; see [`Self::mark_route_request_timeout_exceeded`]. Never read
+    /// from the plugin-writable transaction metadata.
+    #[inline]
+    pub(crate) fn route_request_timeout_recorded(&self) -> bool {
+        self.route_request_timeout_phase.is_some()
+    }
+
     /// Whether a route-deadline `504` was recorded for this request before any
     /// backend held it; see [`Self::mark_route_request_timeout_exceeded`].
     #[inline]
     pub(crate) fn route_request_timeout_before_backend(&self) -> bool {
-        self.route_request_timeout_before_backend
+        let dispatch = crate::proxy::ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH;
+        self.route_request_timeout_phase
+            .is_some_and(|phase| phase != dispatch)
     }
 
     /// Correlation id for the concrete response-stream inspector chain, when
@@ -5349,7 +5360,7 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             charged_backend_deadline_terminal: self.charged_backend_deadline_terminal,
-            route_request_timeout_before_backend: self.route_request_timeout_before_backend,
+            route_request_timeout_phase: self.route_request_timeout_phase,
             backend_dispatch_state: self.backend_dispatch_state,
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,

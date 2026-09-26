@@ -16,11 +16,14 @@ use std::collections::HashMap;
 use ferrum_edge::_test_support::{
     collect_backend_response_headers_for_test, collect_h3_backend_response_headers_for_test,
     collect_h3_bridge_backend_response_headers_for_test,
-    connection_pool_client_error_response_for_test, finalize_h3_response_routing_headers_for_test,
+    connection_pool_client_error_response_for_test, finalize_h3_response_gateway_headers_for_test,
+    finalize_h3_response_routing_headers_for_test,
     gateway_owned_diagnostic_response_headers_for_test,
     govern_streaming_grpc_web_terminal_frame_for_test,
     govern_streaming_h2_backend_trailers_for_test,
-    govern_streaming_h2_native_grpc_trailers_for_test, proxy_to_backend_retry_for_test,
+    govern_streaming_h2_native_grpc_trailers_for_test,
+    h3_bridge_pool_client_failure_headers_for_test,
+    h3_route_deadline_mark_after_plugin_metadata_for_test, proxy_to_backend_retry_for_test,
     x_gateway_error_after_route_timeout_for_test,
 };
 use ferrum_edge::config::types::{GatewayConfig, Proxy};
@@ -240,6 +243,84 @@ fn h3_routing_seal_is_the_only_author_of_upstream_status() {
     assert_eq!(values, ["degraded"]);
 }
 
+/// Every `X-Gateway-Error` value on `headers`, whatever its name case.
+fn gateway_error_values(headers: &HashMap<String, String>) -> Vec<&str> {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-gateway-error"))
+        .map(|(_, value)| value.as_str())
+        .collect()
+}
+
+// ── #5783: every HTTP/3 response path writes the gateway's own token ────────
+
+#[test]
+fn h3_response_seal_writes_backend_error_for_a_relayed_backend_5xx() {
+    // A plugin- or hook-set copy in any case is replaced by exactly one
+    // gateway value, and the seal claims it for trailer reconciliation.
+    let mut headers = map(&[
+        ("X-Gateway-Error", "connection_failure"),
+        ("x-gateway-error", "overload"),
+        ("content-type", "text/plain"),
+    ]);
+    assert!(finalize_h3_response_gateway_headers_for_test(false, 503, &mut headers));
+    assert_eq!(gateway_error_values(&headers), ["backend_error"]);
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("text/plain")
+    );
+
+    let mut headers = HashMap::new();
+    assert!(finalize_h3_response_gateway_headers_for_test(true, 502, &mut headers));
+    assert_eq!(gateway_error_values(&headers), ["connection_failure"]);
+}
+
+#[test]
+fn h3_response_seal_removes_a_forged_token_from_a_success() {
+    let mut headers = map(&[("X-Gateway-Error", "backend_error"), ("x-app", "kept")]);
+    assert!(!finalize_h3_response_gateway_headers_for_test(false, 200, &mut headers));
+    assert!(gateway_error_values(&headers).is_empty(), "{headers:?}");
+    assert_eq!(headers.get("x-app").map(String::as_str), Some("kept"));
+}
+
+#[test]
+fn every_h3_response_finalize_site_writes_the_gateway_token() {
+    // The bare routing seal writes no `X-Gateway-Error`; a relay that called
+    // it directly would forward a backend 5xx without the gateway's token and
+    // keep a plugin-written copy.
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    assert!(
+        !cross.contains("finalize_h3_response_routing_headers("),
+        "every HTTP/3 bridge response must use the gateway-token seal"
+    );
+    let server = include_str!("../../../src/http3/server.rs");
+    let production = server
+        .split("#[cfg(test)]")
+        .next()
+        .expect("server.rs production code");
+    assert_eq!(
+        production
+            .matches("finalize_h3_response_routing_headers(")
+            .count(),
+        2,
+        "only the routing seal's definition and the gateway-token seal may call it"
+    );
+    assert_eq!(
+        production
+            .matches("finalize_h3_response_gateway_headers(")
+            .count(),
+        6,
+        "the definition plus the native buffered writer and the four streaming relays"
+    );
+    assert_eq!(
+        cross
+            .matches("finalize_h3_response_gateway_headers(")
+            .count(),
+        4,
+        "the plain bridge's buffered and streaming paths and both gRPC bridge paths"
+    );
+}
+
 #[test]
 fn h1_h2_builder_strips_both_diagnostics_through_the_shared_helper() {
     let proxy = include_str!("../../../src/proxy/mod.rs");
@@ -300,6 +381,30 @@ fn request_timeout_token_is_scoped_to_the_route_deadline_504() {
     assert_eq!(token(before, false, 502), Some("backend_error"));
     assert_eq!(token(before, true, 504), Some("connection_failure"));
     assert_eq!(token(before, false, 200), None);
+}
+
+#[test]
+fn a_plugin_written_route_timeout_marker_cannot_suppress_the_phase() {
+    // A plugin pre-writes the transaction-log key with a `dispatch` value.
+    // The typed context marker, not the metadata, decides whether a phase is
+    // already recorded, so the real before-dispatch phase is still recorded
+    // and the 504 reads `request_timeout`.
+    let (recorded_before, logged, token) =
+        h3_route_deadline_mark_after_plugin_metadata_for_test("dispatch", "before_dispatch");
+    assert!(
+        !recorded_before,
+        "plugin metadata must not read as a recorded total-deadline expiry"
+    );
+    assert_eq!(logged.as_deref(), Some("before_dispatch"));
+    assert_eq!(token, Some("request_timeout"));
+
+    // A plugin value naming a no-backend phase cannot select the token when
+    // the backend held the attempt.
+    let (recorded_before, logged, token) =
+        h3_route_deadline_mark_after_plugin_metadata_for_test("retry_backoff", "dispatch");
+    assert!(!recorded_before);
+    assert_eq!(logged.as_deref(), Some("dispatch"));
+    assert_eq!(token, Some("backend_timeout"));
 }
 
 #[test]
@@ -396,6 +501,21 @@ async fn retry_client_construction_failure_never_reaches_the_client_body() {
             "the retry body must not carry `{leaked}`: {body}"
         );
     }
+}
+
+/// The HTTP/3 bridge's pool-failure `502` carries the same
+/// `connection_failure` token proxy core's builder writes for the shared
+/// pool-failure response (#5783).
+#[test]
+fn h3_bridge_pool_client_failure_carries_the_connection_failure_token() {
+    let headers = h3_bridge_pool_client_failure_headers_for_test();
+    assert_eq!(gateway_error_values(&headers), ["connection_failure"]);
+    let (h1_h2_token, _) = x_gateway_error_after_route_timeout_for_test(
+        None,
+        connection_pool_client_error_response_for_test(None).connection_error,
+        502,
+    );
+    assert_eq!(h1_h2_token, Some("connection_failure"));
 }
 
 #[test]

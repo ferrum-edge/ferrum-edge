@@ -379,6 +379,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shrinking the limit until that window rolls out; backend failures, the
   recovery-cohort barrier, and in-flight accounting are unchanged, and
   compatible reloads keep the learned windows.
+- HTTP/3 responses now carry the gateway's own `X-Gateway-Error` on every
+  path, as HTTP/1.1 and HTTP/2 do (#5783). A backend 5xx relayed on an HTTP/3
+  streaming relay (native or bridged, plain or gRPC) or on the HTTP/3
+  bridge's buffered path now reads `backend_error`, and a copy a plugin or
+  hook wrote is replaced instead of forwarded. An HTTP/3 bridge attempt whose
+  connection-pool client could not be built now answers its `502` with
+  `connection_failure`. A plugin that writes the `route_request_timeout`
+  transaction metadata key can no longer suppress the route-deadline phase an
+  HTTP/3 relay records (and with it the `request_timeout` token), end the
+  HTTP/3 retry loop, or withhold an affinity cookie: those decisions now read
+  a typed marker only trusted proxy code sets.
+- Pass-through gRPC-Web follow-ups (#5784). The mesh gRPC response message
+  counter now counts a pass-through body's decoded message frames on HTTP/1.1
+  and HTTP/2, streamed or buffered: it no longer counts the backend's `0x80`
+  trailer frame as a message or scans `grpc-web-text` base64 as frames. An
+  empty or never-polled content-coded body is logged `UNKNOWN` (no status was
+  relayed) rather than `grpc_status_unreadable: content_encoded_body`, and
+  only the exact compressed trailer flag `0x81` is labelled
+  `compressed_trailer_frame`; a final trailer frame with other reserved flag
+  bits (e.g. `0x82`, `0xC0`) names no status and is logged `UNKNOWN`.
+  `ai_transcript_audit` no longer reads an unreadable status as `UNKNOWN`, so
+  it no longer fires `always_capture_on_error` for it. The HTTP/3
+  mesh-egress buffered bridge already reads the pass-through status through
+  the bridge's shared buffered path; the docs no longer say it is not covered.
 
 ### Security
 

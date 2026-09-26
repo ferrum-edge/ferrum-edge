@@ -1721,3 +1721,98 @@ async fn h3_grpc_web_passthrough_is_byte_identical_and_logs_the_backend_status()
         );
     }
 }
+
+fn logged_metadata(logs: &str, proxy_id: &str, key: &str) -> Vec<Value> {
+    logs.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["proxy_id"] == proxy_id)
+        .map(|entry| entry["metadata"][key].clone())
+        .collect()
+}
+
+/// Issue #5784 on the HTTP/3 frontend: a pass-through backend whose final
+/// frame is a COMPRESSED trailer frame (flag `0x81`) delivers a status the
+/// gateway cannot read. The body is still relayed byte for byte, and the log
+/// leaves `grpc_status` unset and names why, instead of reporting `UNKNOWN`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_grpc_web_passthrough_unreadable_status_stays_unset() {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind compressed-trailer backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let mut body = grpc_frame(b"pong");
+    let deflated = b"deflated-trailer";
+    body.push(0x81);
+    body.extend_from_slice(&(deflated.len() as u32).to_be_bytes());
+    body.extend_from_slice(deflated);
+    let _backend = spawn_passthrough_grpc_web_backend(
+        listener,
+        "h3-grpc-web-passthrough-unreadable",
+        "application/grpc-web+proto",
+        &body,
+    );
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "h3-passthrough-zip",
+            "listen_path": "/h3-passthrough-zip",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "h3-passthrough-unreadable-access-log",
+            "plugin_name": "stdout_logging",
+            "scope": "global",
+            "enabled": true,
+            "config": {},
+        }],
+    });
+    let (gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
+    let client = Http3Client::insecure().expect("H3 client");
+    let response = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/h3-passthrough-zip/echo.Echo/Unary"),
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "application/grpc-web+proto")
+            .header("x-grpc-web", "1")
+            .body(Bytes::from(grpc_frame(b"ping"))),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert!(response.body_error.is_none(), "{:?}", response.body_error);
+    assert_eq!(
+        response.body_bytes.as_ref(),
+        body.as_slice(),
+        "a compressed final trailer frame is relayed unchanged"
+    );
+
+    let proxy_id = "h3-passthrough-zip";
+    let logs = gateway
+        .wait_for_log_contains(
+            |logs| !logged_grpc_statuses(logs, proxy_id).is_empty(),
+            Duration::from_secs(10),
+        )
+        .await;
+    assert_eq!(
+        logged_grpc_statuses(&logs, proxy_id),
+        vec![Value::Null],
+        "a status present but unreadable is not UNKNOWN; logs:\n{logs}"
+    );
+    assert_eq!(
+        logged_metadata(&logs, proxy_id, "grpc_status_unreadable"),
+        vec![json!("compressed_trailer_frame")],
+        "logs:\n{logs}"
+    );
+}
