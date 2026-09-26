@@ -3166,3 +3166,173 @@ async fn mesh_route_dispatch_publishes_retry_for_the_matched_rule_only() {
     assert_eq!(plain.route_override_upstream_id.as_deref(), Some("plain"));
     assert_eq!(plain.route_override_retry, None);
 }
+
+// ── response policy on route-owned terminals (#5753) ──────────────────────
+
+fn response_transform_keys(ctx: &RequestContext) -> Vec<String> {
+    ctx.route_override_response_transform
+        .as_deref()
+        .map(|rules| rules.iter().map(|rule| rule.key.clone()).collect())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn redirect_publishes_the_matched_rule_response_transform() {
+    // Gateway API `ResponseHeaderModifier` applies to responses the route
+    // generates. The redirect answers the request itself, so the rule's
+    // response list must be published before the 3xx is returned — otherwise
+    // proxy core's rejection path has nothing to apply.
+    let plugin = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "response_transform": [
+            {"operation": "update", "target": "header", "key": "X-Route", "value": "redirected"}
+        ],
+        "redirect": {"uri": "/new", "redirect_code": 302}
+    }]}))
+    .expect("redirect + response_transform is admitted");
+    let mut request = ctx();
+    match plugin.before_proxy(&mut request, &mut HashMap::new()).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 302);
+            assert_eq!(headers.get("location").map(String::as_str), Some("/new"));
+        }
+        other => panic!("expected redirect Reject, got {other:?}"),
+    }
+    assert_eq!(response_transform_keys(&request), ["x-route"]);
+    assert!(request.route_override_response_transform_published);
+    // A redirect never dispatches, so it must not publish a destination.
+    assert!(request.route_override_upstream_id.is_none());
+    assert!(request.route_override_backend_host.is_none());
+    assert!(request.route_override_request_transform.is_none());
+}
+
+#[tokio::test]
+async fn fault_abort_publishes_the_matched_rule_response_transform() {
+    let plugin = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"upstream_id": "x"},
+        "response_transform": [
+            {"operation": "update", "target": "header", "key": "X-Route", "value": "faulted"}
+        ],
+        "fault": {"abort": {"status_code": 503, "percentage": 100.0}}
+    }]}))
+    .expect("fault + response_transform is admitted");
+    let mut request = ctx();
+    match plugin.before_proxy(&mut request, &mut HashMap::new()).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 503),
+        other => panic!("expected fault Reject, got {other:?}"),
+    }
+    assert_eq!(response_transform_keys(&request), ["x-route"]);
+    assert!(request.route_override_response_transform_published);
+    // An aborted request never reaches backend dispatch.
+    assert!(request.route_override_upstream_id.is_none());
+}
+
+#[tokio::test]
+async fn later_redirect_instance_replaces_an_earlier_response_transform() {
+    // Multiple effective dispatch instances run in order on one request. A
+    // later matching instance owns the answer, so its redirect must carry its
+    // OWN response list — or none — never the earlier instance's.
+    let earlier = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"upstream_id": "x"},
+        "response_transform": [
+            {"operation": "update", "target": "header", "key": "X-Earlier", "value": "1"}
+        ]
+    }]}))
+    .expect("earlier instance");
+    let replacing = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "response_transform": [
+            {"operation": "update", "target": "header", "key": "X-Later", "value": "1"}
+        ],
+        "redirect": {"uri": "/new", "redirect_code": 302}
+    }]}))
+    .expect("replacing instance");
+    let clearing = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "redirect": {"uri": "/new", "redirect_code": 302}
+    }]}))
+    .expect("clearing instance");
+
+    let mut replaced = ctx();
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        earlier.before_proxy(&mut replaced, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(response_transform_keys(&replaced), ["x-earlier"]);
+    assert!(matches!(
+        replacing.before_proxy(&mut replaced, &mut headers).await,
+        PluginResult::Reject {
+            status_code: 302,
+            ..
+        }
+    ));
+    assert_eq!(response_transform_keys(&replaced), ["x-later"]);
+    assert!(replaced.route_override_response_transform_published);
+
+    let mut cleared = ctx();
+    let mut headers = HashMap::new();
+    let _ = earlier.before_proxy(&mut cleared, &mut headers).await;
+    assert!(matches!(
+        clearing.before_proxy(&mut cleared, &mut headers).await,
+        PluginResult::Reject {
+            status_code: 302,
+            ..
+        }
+    ));
+    assert!(
+        cleared.route_override_response_transform.is_none(),
+        "a redirect rule without a response list must clear the earlier one"
+    );
+    assert!(!cleared.route_override_response_transform_published);
+}
+
+#[tokio::test]
+async fn node_waypoint_authz_denial_carries_no_route_response_transform() {
+    // A NodeWaypoint authorization 403 is a security denial, not a response
+    // the matched rule generates: tenant route response policy must never
+    // decorate it, including a list an earlier instance published.
+    let earlier = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"upstream_id": "stable"},
+        "response_transform": [
+            {"operation": "update", "target": "header", "key": "X-Earlier", "value": "1"}
+        ]
+    }]}))
+    .expect("earlier instance");
+    let denied = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"upstream_id": "canary"},
+        "response_transform": [
+            {"operation": "update", "target": "header", "key": "X-Route", "value": "1"}
+        ]
+    }]}))
+    .expect("denied instance");
+    let mut request = ctx();
+    request.metadata.insert(
+        "mesh_authz.node_waypoint_authorized_upstream_id".to_string(),
+        "stable".to_string(),
+    );
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        earlier.before_proxy(&mut request, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(response_transform_keys(&request), ["x-earlier"]);
+
+    match denied.before_proxy(&mut request, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("unauthorized NodeWaypoint override must reject, got {other:?}"),
+    }
+    assert!(
+        request.route_override_response_transform.is_none(),
+        "a security denial must not carry route response headers"
+    );
+    assert!(!request.route_override_response_transform_published);
+}
