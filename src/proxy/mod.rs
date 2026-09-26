@@ -4316,12 +4316,10 @@ async fn prepare_mesh_request_body(
     // text base64 is decoded and the terminal trailer frame is split off. A
     // prepared buffer already went through that phase upstream, so counting it
     // here is the same representation; `fetch_max` keeps replays idempotent.
+    // An untranslated pass-through gRPC-Web upload is counted on its decoded
+    // frames.
     if let Some(request_ctx) = ctx.as_deref() {
-        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-            &request_ctx.metadata,
-            &request_ctx.grpc_request_messages_observed,
-            &body,
-        );
+        crate::plugins::grpc_web::record_request_grpc_message_count(request_ctx, &body);
     }
     let retained = (retain_request_body && !body.is_empty()).then(|| body.clone());
     let trailers = ctx
@@ -25731,7 +25729,14 @@ pub(crate) fn apply_authoritative_gateway_error_header_for_response(
     connection_error: bool,
     status: u16,
 ) -> bool {
-    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    // Read-only probe first, as the routing seal does: the common response
+    // carries no copy, so it pays no `retain` pass over the map.
+    if response_headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER))
+    {
+        response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    }
     if let Some(value) = x_gateway_error_for_response(ctx, connection_error, status) {
         response_headers.insert(X_GATEWAY_ERROR_HEADER.to_string(), value.to_string());
         true
@@ -31310,6 +31315,15 @@ async fn handle_proxy_request_inner(
     // client's own representation and never a rewritten one.
     if let Some(content_type) = grpc_web_response_content_type {
         crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);
+        // The upload's own framing, from the same immutable inbound field. The
+        // negotiated response type above can name the other mode, so it cannot
+        // say how the request body is encoded.
+        ctx.set_request_grpc_web_text(
+            req.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(crate::plugins::grpc_web::is_grpc_web_text),
+        );
     }
 
     // Canonical policy path (advisory GHSA-69xf-42xm-4w4f). Runs after the
@@ -35172,12 +35186,9 @@ async fn handle_proxy_request_inner(
             // NOT the client wire bytes recorded into `bytes_sent_observed`
             // above. A translated gRPC-Web request only becomes native
             // length-prefixed framing after the transform decodes text-mode
-            // base64 and strips the terminal trailer frame.
-            crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-                &ctx.metadata,
-                &ctx.grpc_request_messages_observed,
-                &grpc_req_body,
-            );
+            // base64 and strips the terminal trailer frame; an untranslated
+            // pass-through upload counts its decoded frames.
+            crate::plugins::grpc_web::record_request_grpc_message_count(&ctx, &grpc_req_body);
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
             let mut body_hook_ctx = deferred_body_hook_ctx.take();
@@ -35525,7 +35536,10 @@ async fn handle_proxy_request_inner(
                     upload_observer,
                     ctx.grpc_deadline_at(),
                     &mut held_frontend_grpc_upload,
-                    Some(Arc::clone(&ctx.grpc_request_messages_observed)),
+                    // The native length-prefix scanner cannot read a
+                    // pass-through `grpc-web-text` upload's base64.
+                    (!crate::plugins::grpc_web::request_uploads_passthrough_grpc_web_text(&ctx))
+                        .then(|| Arc::clone(&ctx.grpc_request_messages_observed)),
                     // The buffered arms `fetch_max` the collected length into
                     // this counter; the streamed arm has no collected length,
                     // so the body publishes its forwarded DATA tally at upload
@@ -35588,10 +35602,11 @@ async fn handle_proxy_request_inner(
                         // gRPC-Web translation is configured) or when an earlier
                         // terminal preparation already ran the transforms
                         // (`request_body_prepared`). Either way `grpc_req_body`
-                        // is already the backend-visible native representation.
-                        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-                            &ctx.metadata,
-                            &ctx.grpc_request_messages_observed,
+                        // is already the backend-visible representation; an
+                        // untranslated pass-through gRPC-Web upload counts its
+                        // decoded frames rather than its base64 / trailer bytes.
+                        crate::plugins::grpc_web::record_request_grpc_message_count(
+                            &ctx,
                             &grpc_req_body,
                         );
                         backend_admission_permits =
@@ -36384,9 +36399,13 @@ async fn handle_proxy_request_inner(
                 let grpc_streaming_unbounded_trailer_policy =
                     plugin_cache_view.unbounded_response_trailer_policy_applies(&ctx);
                 // `content-length` is in this gate because the gRPC deadline
-                // strip and the gRPC-Web translation both remove it below.
-                let grpc_streaming_header_phases_can_mutate =
-                    !plugins.is_empty() || response_headers.contains_key("content-length");
+                // strip and the gRPC-Web translation both remove it below. A
+                // backend HTTP 5xx is too, because the gateway writes its
+                // `X-Gateway-Error` token below (hooks cannot change the status
+                // this arm relays).
+                let grpc_streaming_header_phases_can_mutate = !plugins.is_empty()
+                    || response_headers.contains_key("content-length")
+                    || grpc_streaming.status >= 500;
                 // No evidence, no declaration, and no fail-closed arm means the
                 // reconciliation is provably a no-op, so the boundary is skipped
                 // entirely and the response pays no header-map clone. This can
@@ -36937,6 +36956,20 @@ async fn handle_proxy_request_inner(
                 // the strip.
                 let advertised_content_length: Option<u64> = None;
 
+                // Gateway-owned `X-Gateway-Error` at the same post-hook /
+                // pre-wire boundary the H1/H2 response builder and every HTTP/3
+                // response use: every case variant a plugin or hook left is
+                // stripped, and a gRPC backend's HTTP 5xx reads
+                // `backend_error`. The backend answered this head, so the
+                // dispatch signal is not a connection failure.
+                let grpc_streaming_wrote_gateway_error =
+                    apply_authoritative_gateway_error_header_for_response(
+                        &mut response_headers,
+                        &ctx,
+                        false,
+                        grpc_streaming.status,
+                    );
+
                 // Final protocol-aware boundary before the H2 gRPC streaming
                 // builder. Trailer frames are filtered separately by
                 // StripHopByHopTrailers.
@@ -36990,7 +37023,9 @@ async fn handle_proxy_request_inner(
                 // Seal the native-gRPC trailer boundary captured before
                 // `after_proxy` ran. `response_headers` above is exactly the map
                 // that went on the wire (this arm writes nothing straight onto the
-                // builder, so `GatewayOwnedResponseHeaders` stays empty). The
+                // builder), and the gateway's own `X-Gateway-Error` token is
+                // recorded as gateway-owned so a trailer of that name stays
+                // governed even when its value matches. The
                 // governor is owned because the body outlives this handler: the
                 // backend TRAILERS frame is read later, on a different task. It is
                 // consulted only on that single frame — never per DATA frame — and
@@ -36999,13 +37034,19 @@ async fn handle_proxy_request_inner(
                 // classification, and gRPC-Web translation below are unaffected.
                 let mut grpc_streaming_trailer_governor = None;
                 if grpc_streaming_trailer_policy_can_act {
+                    let mut grpc_streaming_gateway_owned_headers =
+                        headers_mod::GatewayOwnedResponseHeaders::default();
+                    if grpc_streaming_wrote_gateway_error {
+                        grpc_streaming_gateway_owned_headers
+                            .insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
+                    }
                     grpc_streaming_trailer_governor =
                         Some(headers_mod::StreamingResponseTrailerGovernor::new(
                             response_headers.clone(),
                             grpc_streaming_pre_policy_headers,
                             plugin_cache_view.response_trailer_policy_names_shared(),
                             plugin_cache_view.response_trailer_policy_prefixes_shared(),
-                            headers_mod::GatewayOwnedResponseHeaders::default(),
+                            grpc_streaming_gateway_owned_headers,
                             headers_mod::TrailerSectionKind::NativeGrpcTerminal,
                             grpc_streaming_unbounded_trailer_policy,
                         ));
@@ -37984,6 +38025,17 @@ async fn handle_proxy_request_inner(
                 let grpc_framing = headers_mod::ClientResponseFraming::for_buffered_grpc(
                     response_status,
                     response_body.len(),
+                );
+                // Gateway-owned `X-Gateway-Error` at the post-hook / pre-wire
+                // boundary, as on the streaming arm: a plugin- or hook-written
+                // copy is replaced, and a gRPC backend's HTTP 5xx reads
+                // `backend_error`. `response_status` is the client-visible
+                // status after every hook.
+                let _ = apply_authoritative_gateway_error_header_for_response(
+                    &mut response_headers,
+                    &ctx,
+                    false,
+                    response_status,
                 );
                 headers_mod::sanitize_client_response_headers_for_wire(
                     &mut response_headers,
@@ -46420,10 +46472,10 @@ async fn proxy_to_backend(
                 // decoded and any terminal trailer frame stripped by the
                 // transform above (or by the terminal preparation that set
                 // `request_body_prepared`). `fetch_max` keeps a replayed buffer
-                // from inflating the count across retries.
-                crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-                    &request_ctx.metadata,
-                    &request_ctx.grpc_request_messages_observed,
+                // from inflating the count across retries. An untranslated
+                // pass-through gRPC-Web upload is counted on its decoded frames.
+                crate::plugins::grpc_web::record_request_grpc_message_count(
+                    request_ctx,
                     &body_bytes,
                 );
                 // Publish a pre-auth permit onto the bytes that stay resident
@@ -46501,8 +46553,8 @@ async fn proxy_to_backend(
                     );
                     upload_pump = pump;
                     let limited =
-                        if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                            &request_ctx.metadata,
+                        if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
+                            request_ctx,
                         ) {
                             limited.with_grpc_message_counter(Arc::clone(
                                 &request_ctx.grpc_request_messages_observed,
@@ -46531,8 +46583,8 @@ async fn proxy_to_backend(
                     );
                     upload_pump = pump;
                     let counting =
-                        if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                            &request_ctx.metadata,
+                        if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
+                            request_ctx,
                         ) {
                             counting.with_grpc_message_counter(Arc::clone(
                                 &request_ctx.grpc_request_messages_observed,
@@ -46689,9 +46741,8 @@ async fn proxy_to_backend(
                 .await;
                 // gRPC message accounting uses the transformed, backend-visible
                 // body; `bytes_sent` above stays the raw client-wire length.
-                crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-                    &request_ctx.metadata,
-                    &request_ctx.grpc_request_messages_observed,
+                crate::plugins::grpc_web::record_request_grpc_message_count(
+                    request_ctx,
                     &body_bytes,
                 );
                 match run_final_request_body_hooks(
@@ -52174,13 +52225,11 @@ async fn proxy_to_backend_hbone_after_ready(
             );
             let body = match ctx {
                 Some(c)
-                    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                        &c.metadata,
+                    if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
+                        c,
                     ) =>
                 {
-                    body.with_grpc_message_counter(Arc::clone(
-                        &c.grpc_request_messages_observed,
-                    ))
+                    body.with_grpc_message_counter(Arc::clone(&c.grpc_request_messages_observed))
                 }
                 _ => body,
             };
@@ -53177,13 +53226,11 @@ async fn proxy_to_backend_unix(
             );
             let body = match ctx {
                 Some(c)
-                    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                        &c.metadata,
+                    if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
+                        c,
                     ) =>
                 {
-                    body.with_grpc_message_counter(Arc::clone(
-                        &c.grpc_request_messages_observed,
-                    ))
+                    body.with_grpc_message_counter(Arc::clone(&c.grpc_request_messages_observed))
                 }
                 _ => body,
             };
@@ -54760,8 +54807,8 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                 .as_ref(),
                 proxy.backend_write_timeout_ms,
             );
-            let body = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                &request_ctx.metadata,
+            let body = if crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
+                request_ctx,
             ) {
                 body.with_grpc_message_counter(Arc::clone(
                     &request_ctx.grpc_request_messages_observed,
@@ -55594,7 +55641,7 @@ async fn proxy_to_backend_http2(
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let mut body_cancel_tx = Some(cancel_tx);
     let observe_grpc = ctx.and_then(|c| {
-        crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&c.metadata)
+        crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(c)
             .then(|| Arc::clone(&c.grpc_request_messages_observed))
     });
     // Authorization lifetime for the UPLOAD direction (#3815); see
@@ -56789,8 +56836,8 @@ async fn proxy_to_backend_http3(
                     let proxy_clone = proxy.clone();
                     let grpc_messages = response_decision_ctx
                         .filter(|c| {
-                            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                                &c.metadata,
+                            crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
+                                c,
                             )
                         })
                         .map(|c| Arc::clone(&c.grpc_request_messages_observed));
@@ -56816,8 +56863,8 @@ async fn proxy_to_backend_http3(
                     let proxy_clone = proxy.clone();
                     let grpc_messages = response_decision_ctx
                         .filter(|c| {
-                            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                                &c.metadata,
+                            crate::plugins::grpc_web::request_stream_observes_native_grpc_messages(
+                                c,
                             )
                         })
                         .map(|c| Arc::clone(&c.grpc_request_messages_observed));
@@ -57144,15 +57191,11 @@ async fn proxy_to_backend_http3(
     // Captured before the transform because `ctx` is consumed by the final-body
     // hooks below; the counter is recorded against the transformed,
     // backend-visible body so a translated gRPC-Web request counts native
-    // length-prefixed frames rather than base64 or a terminal trailer frame.
+    // length-prefixed frames rather than base64 or a terminal trailer frame,
+    // and an untranslated pass-through upload counts its decoded frames.
     let grpc_request_messages = response_decision_ctx
         .or(ctx.as_deref())
-        .filter(|request_ctx| {
-            crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                &request_ctx.metadata,
-            )
-        })
-        .map(|request_ctx| Arc::clone(&request_ctx.grpc_request_messages_observed));
+        .and_then(crate::plugins::grpc_web::RequestGrpcMessageCounter::for_request);
 
     let request_body = if request_body_prepared {
         request_body
@@ -57179,10 +57222,7 @@ async fn proxy_to_backend_http3(
         request_body
     };
     if let Some(counter) = grpc_request_messages.as_ref() {
-        crate::plugins::mesh::prometheus_helpers::record_complete_grpc_message_count(
-            counter,
-            &request_body,
-        );
+        counter.record(&request_body);
     }
 
     let request_content_length = if !request_body.is_empty() {
