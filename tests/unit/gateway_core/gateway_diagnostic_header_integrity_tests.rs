@@ -263,7 +263,11 @@ fn h3_response_seal_writes_backend_error_for_a_relayed_backend_5xx() {
         ("x-gateway-error", "overload"),
         ("content-type", "text/plain"),
     ]);
-    assert!(finalize_h3_response_gateway_headers_for_test(false, 503, &mut headers));
+    assert!(finalize_h3_response_gateway_headers_for_test(
+        false,
+        503,
+        &mut headers
+    ));
     assert_eq!(gateway_error_values(&headers), ["backend_error"]);
     assert_eq!(
         headers.get("content-type").map(String::as_str),
@@ -271,14 +275,22 @@ fn h3_response_seal_writes_backend_error_for_a_relayed_backend_5xx() {
     );
 
     let mut headers = HashMap::new();
-    assert!(finalize_h3_response_gateway_headers_for_test(true, 502, &mut headers));
+    assert!(finalize_h3_response_gateway_headers_for_test(
+        true,
+        502,
+        &mut headers
+    ));
     assert_eq!(gateway_error_values(&headers), ["connection_failure"]);
 }
 
 #[test]
 fn h3_response_seal_removes_a_forged_token_from_a_success() {
     let mut headers = map(&[("X-Gateway-Error", "backend_error"), ("x-app", "kept")]);
-    assert!(!finalize_h3_response_gateway_headers_for_test(false, 200, &mut headers));
+    assert!(!finalize_h3_response_gateway_headers_for_test(
+        false,
+        200,
+        &mut headers
+    ));
     assert!(gateway_error_values(&headers).is_empty(), "{headers:?}");
     assert_eq!(headers.get("x-app").map(String::as_str), Some("kept"));
 }

@@ -809,8 +809,7 @@ plugin_configs:
         )
         .await;
         assert_eq!(
-            body,
-            backend_body,
+            body, backend_body,
             "the generic relay forwards the backend body byte for byte"
         );
         assert_eq!(
@@ -829,8 +828,7 @@ plugin_configs:
         };
         assert_eq!(logged.len(), 1, "one transaction summary: {logged:?}");
         assert_eq!(
-            logged[0]["grpc_status"],
-            7,
+            logged[0]["grpc_status"], 7,
             "the logged status comes from the backend's trailer frame: {logged:?}"
         );
         gateway.shutdown().await;

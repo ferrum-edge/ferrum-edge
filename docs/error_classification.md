@@ -334,9 +334,11 @@ classifies the response:
   native or bridged, buffered or streamed, plain or gRPC
   ([`finalize_h3_response_gateway_headers`](../src/http3/server.rs)). A copy a
   plugin or hook wrote is replaced by the gateway's own value, never forwarded
-  or duplicated. The one exception is the HTTP/1.1 / HTTP/2 native gRPC
-  branch, which reports the RPC outcome in `grpc-status` trailers and writes no
-  `X-Gateway-Error` for a backend's HTTP 5xx.
+  or duplicated — except on the HTTP/1.1 / HTTP/2 native gRPC branch, which
+  reports the RPC outcome in `grpc-status` trailers, forwards a plugin- or
+  hook-written copy unchanged, and writes no `backend_error` token for a gRPC
+  backend's HTTP 5xx (the HTTP/3 native gRPC response now writes one). Giving
+  that branch the HTTP/3 seal is follow-up #5798.
 - An HTTP/3 bridge attempt whose reqwest connection-pool client could not be
   built answers its `502` with `connection_failure`, exactly as the HTTP/1.1
   and HTTP/2 builder does for the same shared pool-failure response.
