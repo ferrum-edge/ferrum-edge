@@ -681,16 +681,23 @@ async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() 
 
     // The hooks arm uploads `+json` gRPC-Web so the body rule buffers it.
     let arms = [
-        ("buf", "application/grpc-web+proto", "application/grpc-web-text+proto"),
-        ("hooks", "application/grpc-web+json", "application/grpc-web-text+json"),
+        (
+            "buf",
+            "application/grpc-web+proto",
+            "application/grpc-web-text+proto",
+        ),
+        (
+            "hooks",
+            "application/grpc-web+json",
+            "application/grpc-web-text+json",
+        ),
     ];
     let mut proxy_ids = Vec::new();
     for (client, suffix) in [(&h1, "h1"), (&h2, "h2")] {
         for (arm, binary_type, text_type) in arms {
-            for (mode, content_type, upload) in [
-                ("bin", binary_type, &binary),
-                ("text", text_type, &text),
-            ] {
+            for (mode, content_type, upload) in
+                [("bin", binary_type, &binary), ("text", text_type, &text)]
+            {
                 let proxy_id = format!("count-{arm}-{mode}-{suffix}");
                 post_grpc_web(
                     client,
