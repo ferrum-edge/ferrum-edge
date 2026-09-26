@@ -674,12 +674,18 @@ impl http_body::Body for GrpcWebStreamingBody {
 /// authorization-lifetime wrapper below it ends the stream with native
 /// trailers, those become one gRPC-Web trailer frame, because a gRPC-Web client
 /// cannot read HTTP trailers.
+///
+/// The authoritative gRPC message counter, when one is attached, is fed from
+/// the same observer: it counts decoded message frames, never the backend's
+/// trailer frame or the base64 text of `grpc-web-text`.
 struct GrpcWebPassthroughBody {
     inner: ProxyBody,
     text_mode: bool,
     http_status: u16,
     observer: crate::plugins::grpc_web::GrpcWebTrailerStatusObserver,
     observed_status: Arc<AtomicU64>,
+    grpc_messages: Option<Arc<AtomicU64>>,
+    messages_published: u64,
     terminal_status: Arc<AtomicU64>,
     terminal_emitted: bool,
     failed: bool,
@@ -739,6 +745,13 @@ impl http_body::Body for GrpcWebPassthroughBody {
                 this.observer.push(data);
                 let observed = encode_passthrough_grpc_status(this.observer.outcome());
                 this.observed_status.store(observed, Ordering::Release);
+                if let Some(messages) = this.grpc_messages.as_ref() {
+                    let counted = this.observer.messages();
+                    if counted > this.messages_published {
+                        messages.fetch_add(counted - this.messages_published, Ordering::Relaxed);
+                        this.messages_published = counted;
+                    }
+                }
             }
             return Poll::Ready(Some(Ok(frame)));
         }
@@ -948,12 +961,19 @@ impl ProxyBody {
     /// stay on the inner body, while outcome classifiers and the deferred
     /// logger move to the returned outer body so the backend's terminal status
     /// is logged and classified once, at the end of the client-visible body.
+    ///
+    /// A gRPC message counter attached below moves into the relay: the inner
+    /// body's native length-prefix scanner would count the backend's `0x80`
+    /// trailer frame as a message and would scan `grpc-web-text` base64 as if
+    /// it were frames, so the relay counts decoded message frames instead.
     pub(crate) fn into_grpc_web_passthrough_streaming(
         self,
         framing: PassthroughFraming,
         http_status: u16,
     ) -> Self {
         let mut inner = self;
+        let grpc_messages = inner.grpc_messages.take();
+        inner.grpc_scanner = None;
         let client_grpc_deadline_fired = inner.client_grpc_deadline_fired.clone();
         let stream_auth_deadline = inner.stream_auth_deadline.clone();
         let logger = inner.logger.take();
@@ -970,6 +990,8 @@ impl ProxyBody {
             http_status,
             observer,
             observed_status: Arc::clone(&observed_status),
+            grpc_messages,
+            messages_published: 0,
             terminal_status: Arc::clone(&terminal_status),
             terminal_emitted: false,
             failed: false,
@@ -2190,13 +2212,11 @@ impl Drop for ProxyBody {
             && self.backend_admission_outcome.is_some()
             || self.backend_dispatch_outcome.is_some())
             && self.polled.load(Ordering::Relaxed)
-            && self
-                .success_on_drop_after_bytes
-                .is_none_or(|expected| self.bytes_streamed.load(Ordering::Relaxed) != expected)
-            // Same proof as the logger branch above: a body whose wrapper
-            // already reported end-of-stream completed, so backend admission
-            // and dispatch accounting must not record a client disconnect.
-            && (client_deadline_fired || !self.proved_end_of_stream_on_drop())
+            // Same proof as the logger branch above: a body that reached its
+            // declared byte count, or whose wrapper already reported
+            // end-of-stream, completed, so backend admission and dispatch
+            // accounting must not record a client disconnect.
+            && !self.proved_complete_on_drop(client_deadline_fired)
         {
             deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
             deferred_admission_client_disconnected = true;

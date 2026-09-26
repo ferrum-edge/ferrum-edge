@@ -47,7 +47,7 @@ use h3::error::Code;
 use h3::quic::SendStream;
 use h3::server::RequestStream;
 
-use crate::plugins::{ROUTE_REQUEST_TIMEOUT_METADATA_KEY, RequestContext};
+use crate::plugins::RequestContext;
 use crate::proxy::RouteDeadlineExpiry;
 use crate::retry::ErrorClass;
 
@@ -184,13 +184,13 @@ pub(crate) fn mark_expiry_phase(ctx: &mut RequestContext, expiry: RouteDeadlineE
 }
 
 /// Record a total-deadline expiry's phase unless an earlier, more specific
-/// site already recorded one.
+/// site already recorded one. Reads the typed context marker, never the
+/// plugin-writable transaction metadata: a plugin that pre-wrote the
+/// `route_request_timeout` key must not suppress the phase (and with it the
+/// `request_timeout` token).
 #[inline]
 pub(crate) fn mark_phase_once(ctx: &mut RequestContext, phase: &'static str) {
-    if !ctx
-        .metadata
-        .contains_key(ROUTE_REQUEST_TIMEOUT_METADATA_KEY)
-    {
+    if !ctx.route_request_timeout_recorded() {
         ctx.mark_route_request_timeout_exceeded(phase);
     }
 }
@@ -208,13 +208,12 @@ pub(crate) fn mark_backoff_expiry(ctx: &mut RequestContext) {
 /// request's route timeout `504` (its phase is recorded in the transaction
 /// log). A retry loop stops on it: the whole budget is spent and the `504`
 /// stands, exactly as proxy core's retry planner stops on its typed expiry.
-/// Free when the rule carries no total deadline.
+/// Free when the rule carries no total deadline. Reads the typed context
+/// marker, so a plugin-written `route_request_timeout` metadata value cannot
+/// end a retry loop or withhold an affinity cookie.
 #[inline]
 pub(crate) fn total_expiry_recorded(route: H3RouteDeadlines, ctx: &RequestContext) -> bool {
-    route.total.is_some()
-        && ctx
-            .metadata
-            .contains_key(ROUTE_REQUEST_TIMEOUT_METADATA_KEY)
+    route.total.is_some() && ctx.route_request_timeout_recorded()
 }
 
 /// The backend response for an attempt a route deadline cancelled, exactly as

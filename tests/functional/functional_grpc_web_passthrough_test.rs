@@ -564,3 +564,273 @@ async fn grpc_web_passthrough_buffered_deadline_split_and_unreadable_status() {
         }
     }
 }
+
+/// Issue #5784: pass-through gRPC-Web over the GENERIC relay path. A
+/// `mesh.unix_socket` HTTP/1.1 target makes the native gRPC branch fall through
+/// (`grpc_mesh_dispatch_falls_through`), so the H1/H2 response funnel's generic
+/// relay carries the backend body, with the client `grpc-timeout` deadline
+/// wrapper stacked beneath the pass-through relay.
+#[cfg(unix)]
+mod generic_relay_mesh_fall_through {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use ferrum_edge::config::EnvConfig;
+    use serde_json::Value;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, UnixListener};
+
+    use crate::common::{TrustedProjectedGateway, TrustedProjectedGatewayOptions};
+    use crate::scaffolding::port_registry::TestSocket;
+
+    use super::{frame, passthrough_binary_body, post_grpc_web_with_headers, trailer_frames};
+
+    const PROXY_ID: &str = "grpc-web-unix";
+    const SINK_OK: &[u8] = b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n";
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    /// Read one HTTP/1.1 request, head and body (`Content-Length` or chunked).
+    async fn read_http1_request<S>(stream: &mut S) -> Option<Vec<u8>>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(head_end) = find(&request, b"\r\n\r\n") {
+                let request_head = String::from_utf8_lossy(&request[..head_end]);
+                let request_head = request_head.to_ascii_lowercase();
+                let body = &request[head_end + 4..];
+                let complete = if request_head.contains("transfer-encoding: chunked") {
+                    find(body, b"0\r\n\r\n").is_some()
+                } else {
+                    let length = request_head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    body.len() >= length
+                };
+                if complete {
+                    return Some(request);
+                }
+            }
+            let read = stream.read(&mut buf);
+            match tokio::time::timeout_at(deadline, read).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return None,
+                Ok(Ok(n)) => request.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    /// An HTTP/1.1 gRPC-Web backend on a Unix-domain socket that answers every
+    /// complete request with `body`.
+    fn spawn_unix_grpc_web_backend(listener: UnixListener, body: Vec<u8>) {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    if read_http1_request(&mut stream).await.is_none() {
+                        return;
+                    }
+                    let mut response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/grpc-web+proto\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(&body);
+                    let _ = stream.write_all(&response).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+    }
+
+    /// Minimal HTTP/1.1 sink recording the JSON transaction summaries the
+    /// `http_logging` plugin posts (the in-process gateway's stdout is not
+    /// captured).
+    async fn start_http_logging_sink() -> (u16, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind http_logging sink");
+        let port = listener.local_addr().expect("sink addr").port();
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&entries);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let captured = Arc::clone(&captured);
+                tokio::spawn(async move {
+                    let Some(request) = read_http1_request(&mut stream).await else {
+                        return;
+                    };
+                    if let Some(head_end) = find(&request, b"\r\n\r\n") {
+                        let posted = &request[head_end + 4..];
+                        if let Ok(posted) = serde_json::from_slice::<Value>(posted)
+                            && let Ok(mut guard) = captured.lock()
+                        {
+                            match posted {
+                                Value::Array(batch) => guard.extend(batch),
+                                entry => guard.push(entry),
+                            }
+                        }
+                    }
+                    let _ = stream.write_all(SINK_OK).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (port, entries)
+    }
+
+    fn logged_entries(entries: &Mutex<Vec<Value>>) -> Vec<Value> {
+        let Ok(guard) = entries.lock() else {
+            return Vec::new();
+        };
+        guard
+            .iter()
+            .filter(|entry| entry["proxy_id"] == PROXY_ID)
+            .cloned()
+            .collect()
+    }
+
+    /// Trusted-projected fixture: one route whose only target carries the
+    /// reserved `mesh.unix_socket` tag, plus an `http_logging` sink.
+    fn fixture_yaml(socket_path: &str, placeholder_port: u16, sink_port: u16) -> String {
+        format!(
+            r#"version: "1"
+proxies:
+  - id: "{PROXY_ID}"
+    listen_path: "/{PROXY_ID}"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {placeholder_port}
+    upstream_id: "{PROXY_ID}-upstream"
+    strip_listen_path: true
+    pool_enable_http2: false
+    updated_at: "2026-09-26T00:00:00Z"
+upstreams:
+  - id: "{PROXY_ID}-upstream"
+    name: "{PROXY_ID}-upstream"
+    algorithm: round_robin
+    updated_at: "2026-09-26T00:00:00Z"
+    targets:
+      - host: "127.0.0.1"
+        port: {placeholder_port}
+        weight: 1
+        tags:
+          mesh.unix_socket: "{socket_path}"
+          mesh.unix_socket_h2c: "false"
+consumers: []
+plugin_configs:
+  - id: "{PROXY_ID}-http-log"
+    plugin_name: http_logging
+    scope: global
+    enabled: true
+    config:
+      endpoint_url: "http://127.0.0.1:{sink_port}/logs"
+      batch_size: 1
+      flush_interval_ms: 100
+"#
+        )
+    }
+
+    #[ignore]
+    #[test]
+    fn grpc_web_passthrough_generic_relay_with_grpc_timeout_over_mesh_fall_through() {
+        crate::common::run_trusted_projected_gateway_test(generic_relay_inner);
+    }
+
+    async fn generic_relay_inner() {
+        let temp = TempDir::new().expect("temp dir");
+        // The dial-time containment gate compares the symlink-resolved path.
+        let root = temp
+            .path()
+            .canonicalize()
+            .expect("canonicalize the unix-socket containment root");
+        let socket_path = root.join("grpc-web.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind unix socket");
+        let backend_body = passthrough_binary_body();
+        spawn_unix_grpc_web_backend(listener, backend_body.clone());
+        let (sink_port, entries) = start_http_logging_sink().await;
+        // Never dialed: a TCP fallback would hit this idle listener instead.
+        let placeholder = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind placeholder port");
+        let placeholder_port = placeholder.local_addr().expect("placeholder addr").port();
+
+        let socket = socket_path.to_str().expect("utf-8 socket path");
+        let config = fixture_yaml(socket, placeholder_port, sink_port);
+        let root = root.to_str().expect("utf-8 containment root").to_string();
+        let mut gateway = TrustedProjectedGateway::spawn_from_yaml(
+            &config,
+            TrustedProjectedGatewayOptions {
+                env: EnvConfig {
+                    pool_warmup_enabled: false,
+                    log_level: "warn".into(),
+                    ..Default::default()
+                },
+                mesh_unix_socket_allowed_roots: vec![root],
+                ..TrustedProjectedGatewayOptions::default()
+            },
+        )
+        .await
+        .expect("start trusted projected gateway");
+        gateway
+            .wait_for_proxy_port(Duration::from_secs(10))
+            .await
+            .expect("proxy port ready");
+
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("h1 client");
+        let url = gateway.proxy_url(&format!("/{PROXY_ID}/echo.Echo/Unary"));
+        let (_, _, body) = post_grpc_web_with_headers(
+            &client,
+            &url,
+            "application/grpc-web+proto",
+            frame(0x00, b"ping"),
+            &[("grpc-timeout", "30S")],
+        )
+        .await;
+        assert_eq!(
+            body, backend_body,
+            "the generic relay forwards the backend body byte for byte"
+        );
+        assert_eq!(
+            trailer_frames(&body).len(),
+            1,
+            "only the backend's own trailer frame; the relay appends none"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let logged = loop {
+            let logged = logged_entries(&entries);
+            if !logged.is_empty() || tokio::time::Instant::now() >= deadline {
+                break logged;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(logged.len(), 1, "one transaction summary: {logged:?}");
+        assert_eq!(
+            logged[0]["grpc_status"], 7,
+            "the logged status comes from the backend's trailer frame: {logged:?}"
+        );
+        gateway.shutdown().await;
+    }
+}

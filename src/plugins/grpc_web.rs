@@ -3096,10 +3096,11 @@ const TRAILER_STATUS_LINE_CAP: usize = 64;
 /// stays reserved for a body that has no final trailer frame at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GrpcWebTrailerUnreadable {
-    /// The body ends on a compressed trailer frame (flag `0x81`).
+    /// The body ends on a compressed trailer frame (flag `0x81`, exactly).
     CompressedTrailerFrame,
     /// The response carries an HTTP content-coding, so the relayed bytes are
-    /// not gRPC-Web frames the gateway can parse.
+    /// not gRPC-Web frames the gateway can parse. Reported only once at least
+    /// one body byte was relayed: an empty body carries no status at all.
     ContentEncodedBody,
 }
 
@@ -3210,8 +3211,13 @@ enum ObservedGrpcWebFrame {
     Message,
     /// Reading an uncompressed trailer payload line by line.
     Trailer,
-    /// Skipping a trailer payload the observer cannot read (compressed).
+    /// Skipping a compressed trailer payload (flag `0x81`) the observer cannot
+    /// read.
     OpaqueTrailer,
+    /// Skipping a trailer-flagged frame whose reserved flag bits are set (e.g.
+    /// `0x82`, `0xC0`). It is not a status frame the gateway can name, so a
+    /// body ending on one has no terminal status.
+    ReservedTrailer,
 }
 
 /// Incremental reader of the terminal `grpc-status` in a PASS-THROUGH gRPC-Web
@@ -3226,13 +3232,21 @@ enum ObservedGrpcWebFrame {
 /// base64 group at a time, and at most one bounded trailer line is buffered.
 ///
 /// A trailer frame counts only while it is the final frame: any later frame, a
-/// truncated frame, or malformed base64 leaves no observed status. A final
-/// compressed trailer frame, or a content-encoded body, is reported as present
+/// truncated frame, malformed base64, or a final trailer-flagged frame with
+/// reserved flag bits leaves no observed status. A final compressed (`0x81`)
+/// trailer frame, or a non-empty content-encoded body, is reported as present
 /// but unreadable (see [`PassthroughGrpcStatus`]). A declared frame length is
 /// only ever counted down, never allocated.
+///
+/// The observer also counts the complete MESSAGE frames it walked (every frame
+/// without the trailer flag), on the decoded frame stream: a pass-through body's
+/// trailer frame is metadata, and text framing is base64, so neither may be
+/// counted by a native length-prefix scanner over the relayed bytes.
 pub(crate) struct GrpcWebTrailerStatusObserver {
     text_mode: bool,
     content_encoded: bool,
+    observed_bytes: bool,
+    messages: u64,
     text_group: [u8; 4],
     text_group_len: u8,
     header: [u8; GRPC_FRAME_HEADER_BYTES],
@@ -3253,6 +3267,8 @@ impl GrpcWebTrailerStatusObserver {
         Self {
             text_mode,
             content_encoded: false,
+            observed_bytes: false,
+            messages: 0,
             text_group: [0u8; 4],
             text_group_len: 0,
             header: [0u8; GRPC_FRAME_HEADER_BYTES],
@@ -3271,6 +3287,10 @@ impl GrpcWebTrailerStatusObserver {
 
     /// Observe the next client-visible body bytes, in wire order.
     pub(crate) fn push(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.observed_bytes = true;
         if self.malformed || self.content_encoded {
             return;
         }
@@ -3300,10 +3320,16 @@ impl GrpcWebTrailerStatusObserver {
 
     /// Terminal status carried by the bytes observed so far, when they end
     /// exactly on a final trailer frame that names one or that the gateway
-    /// cannot read. `None` for no trailer frame, a later frame, truncation,
-    /// malformed base64, or a readable trailer frame without `grpc-status`.
+    /// cannot read. `None` for no body bytes at all, no trailer frame, a later
+    /// frame, truncation, malformed base64, a final trailer frame with reserved
+    /// flag bits, or a readable trailer frame without `grpc-status`.
     pub(crate) fn outcome(&self) -> Option<PassthroughGrpcStatus> {
         if self.content_encoded {
+            // An empty or never-polled content-coded body carries no status;
+            // it is missing (`UNKNOWN`), not present but unreadable.
+            if !self.observed_bytes {
+                return None;
+            }
             let reason = GrpcWebTrailerUnreadable::ContentEncodedBody;
             return Some(PassthroughGrpcStatus::Unreadable(reason));
         }
@@ -3325,6 +3351,14 @@ impl GrpcWebTrailerStatusObserver {
     /// so far end exactly on that frame and it names a readable status.
     pub(crate) fn status(&self) -> Option<u32> {
         self.outcome().and_then(PassthroughGrpcStatus::status)
+    }
+
+    /// Complete gRPC-Web message frames (no trailer flag) observed so far,
+    /// counted on the decoded frame stream. Trailer frames, a truncated final
+    /// frame, and bytes the observer cannot parse (malformed base64, a
+    /// content-coded body) are not counted.
+    pub(crate) fn messages(&self) -> u64 {
+        self.messages
     }
 
     fn push_binary(&mut self, mut data: &[u8]) {
@@ -3372,8 +3406,10 @@ impl GrpcWebTrailerStatusObserver {
             ObservedGrpcWebFrame::Message
         } else if flag == GRPC_FRAME_TRAILER {
             ObservedGrpcWebFrame::Trailer
-        } else {
+        } else if flag == GRPC_FRAME_TRAILER_COMPRESSED {
             ObservedGrpcWebFrame::OpaqueTrailer
+        } else {
+            ObservedGrpcWebFrame::ReservedTrailer
         };
         if self.payload_remaining == 0 {
             self.end_frame();
@@ -3388,7 +3424,8 @@ impl GrpcWebTrailerStatusObserver {
                 self.terminal_status = self.frame_status;
             }
             ObservedGrpcWebFrame::OpaqueTrailer => self.terminal_unreadable = true,
-            ObservedGrpcWebFrame::Header | ObservedGrpcWebFrame::Message => {}
+            ObservedGrpcWebFrame::Message => self.messages = self.messages.saturating_add(1),
+            ObservedGrpcWebFrame::Header | ObservedGrpcWebFrame::ReservedTrailer => {}
         }
         self.frame = ObservedGrpcWebFrame::Header;
     }
@@ -3509,6 +3546,33 @@ pub(crate) fn passthrough_body_trailer_status(
     let mut observer = framing.observer();
     observer.push(body);
     observer.outcome()
+}
+
+/// Record the authoritative response message count for a complete, buffered
+/// backend body, when the transaction observes gRPC messages.
+///
+/// A PASS-THROUGH gRPC-Web body is counted on its decoded frame stream (see
+/// [`GrpcWebTrailerStatusObserver::messages`]): its own trailer frame is
+/// metadata and `grpc-web-text` is base64, so neither is a native message.
+/// Every other body is already the backend's native length-prefixed framing.
+/// `fetch_max` keeps a retried or replayed buffer from inflating the count.
+pub(crate) fn record_backend_response_grpc_message_count(
+    ctx: &RequestContext,
+    response_headers: &HashMap<String, String>,
+    body: &[u8],
+) {
+    use crate::plugins::mesh::prometheus_helpers as helpers;
+    if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+        return;
+    }
+    let Some(framing) = passthrough_response_framing(ctx, response_headers) else {
+        helpers::record_complete_grpc_message_count(&ctx.grpc_response_messages_observed, body);
+        return;
+    };
+    let mut observer = framing.observer();
+    observer.push(body);
+    ctx.grpc_response_messages_observed
+        .fetch_max(observer.messages(), Ordering::Release);
 }
 
 /// Compare an existing trailer-frame suffix against the reconciled trailers

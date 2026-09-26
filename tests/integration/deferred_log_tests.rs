@@ -2079,6 +2079,42 @@ async fn grpc_web_passthrough_content_encoded_body_leaves_grpc_status_unset() {
     assert_eq!(got.grpc_status(), None);
 }
 
+/// Issue #5784: a content-coded pass-through body that hyper never polls (so no
+/// body byte reached the client) relayed no status at all. The Drop safety net
+/// must log it as missing (`UNKNOWN`), not as present but unreadable.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_passthrough_never_polled_content_encoded_body_is_unknown() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let logger = grpc_terminal_logger(plugins);
+
+    let wire = grpc_web_passthrough_wire(b"grpc-status: 0\r\n");
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+proto".to_string(),
+    );
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let body = proxy_body_into_grpc_web_passthrough_streaming_with_headers_for_test(
+        single_frame_source(&wire),
+        false,
+        &headers,
+        200,
+    )
+    .with_logger(logger);
+    drop(body);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    let got = &captures[0];
+    assert_eq!(
+        got.metadata.get("grpc_status_unreadable"),
+        None,
+        "no body byte was relayed, so no status is present to call unreadable"
+    );
+    assert_eq!(got.grpc_status(), Some(2));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_web_passthrough_without_a_trailer_frame_is_unknown() {
     let (plugin, captured) = CapturingPlugin::new();

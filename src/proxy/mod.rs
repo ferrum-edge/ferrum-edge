@@ -37136,9 +37136,11 @@ async fn handle_proxy_request_inner(
                 // the backend's native length-prefixed DATA frames. The adapter
                 // wraps this body and re-frames the client-visible bytes
                 // (terminal trailer frame, and base64 in text mode), which are
-                // not native gRPC messages. Attached independently of whether a
-                // deferred logger is present so message metrics are not silently
-                // zero when plugins are absent.
+                // not native gRPC messages. A pass-through gRPC-Web body is not
+                // native framing at all: its relay takes this counter over and
+                // counts decoded message frames. Attached independently of
+                // whether a deferred logger is present so message metrics are
+                // not silently zero when plugins are absent.
                 if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                     &ctx.metadata,
                 ) {
@@ -37237,11 +37239,13 @@ async fn handle_proxy_request_inner(
                 // Count the backend's native length-prefixed frames here, before
                 // the response-body pipeline runs. A gRPC-Web transform appends a
                 // terminal trailer frame and, in text mode, base64-armours the
-                // whole body — neither is a native gRPC message. Recording
-                // in place avoids cloning the buffered body on the hot path.
-                crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-                    &ctx.metadata,
-                    &ctx.grpc_response_messages_observed,
+                // whole body — neither is a native gRPC message. A pass-through
+                // gRPC-Web body already carries both, so it is counted on its
+                // decoded frame stream instead. Recording in place avoids cloning
+                // the buffered body on the hot path.
+                crate::plugins::grpc_web::record_backend_response_grpc_message_count(
+                    &ctx,
+                    &response_headers,
                     &response_body,
                 );
                 if let Some(grpc_status) =
@@ -39567,14 +39571,16 @@ async fn handle_proxy_request_inner(
     // Authoritative gRPC response messages for a buffered backend body are
     // counted here, from the backend's native length-prefixed representation and
     // before the response-body pipeline can re-frame it (a gRPC-Web transform
-    // appends a terminal trailer frame and base64-armours text mode). Streaming
-    // bodies are counted frame-by-frame by the scanner attached below, also
-    // ahead of the gRPC-Web adapter.
-    if let ResponseBody::Buffered(backend_native_body) = &response_body {
-        crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-            &ctx.metadata,
-            &ctx.grpc_response_messages_observed,
-            backend_native_body,
+    // appends a terminal trailer frame and base64-armours text mode). A
+    // pass-through gRPC-Web body is counted on its decoded frame stream, so its
+    // own trailer frame and text-mode base64 are not messages. Streaming bodies
+    // are counted frame-by-frame by the scanner attached below, ahead of the
+    // gRPC-Web adapter; the pass-through relay takes that counter over.
+    if let ResponseBody::Buffered(backend_body) = &response_body {
+        crate::plugins::grpc_web::record_backend_response_grpc_message_count(
+            &ctx,
+            &response_headers,
+            backend_body,
         );
     }
     // Record original backend response invariants before any `after_proxy` hook
@@ -41563,7 +41569,9 @@ async fn handle_proxy_request_inner(
     // Attach native gRPC message scanning before the optional gRPC-Web adapter.
     // Text-mode gRPC-Web base64 and its body-framed terminal metadata are not
     // native length-prefixed messages; the inner body still sees the original
-    // DATA/trailer split and updates the shared RequestContext counter.
+    // DATA/trailer split and updates the shared RequestContext counter. The
+    // pass-through gRPC-Web relay takes the counter over instead and counts the
+    // backend's decoded message frames, never its trailer frame or base64.
     //
     // Gated on `body_will_stream` rather than `is_streaming_response`: a plugin
     // reject can replace a streaming backend body with a gateway-authored

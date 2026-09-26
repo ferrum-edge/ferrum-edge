@@ -1744,6 +1744,22 @@ fn plain_collect_failure_headers(status: u16) -> HashMap<String, String> {
     headers
 }
 
+/// Headers for the `502` a plain-bridge attempt answers when its reqwest
+/// client could not be built. The client never existed, so the attempt is a
+/// pre-wire connection failure: the token is the `connection_failure` proxy
+/// core's builder writes for the same shared pool-failure response
+/// ([`crate::proxy::connection_pool_client_error_response`]).
+pub(crate) fn plain_pool_client_failure_headers(ctx: &RequestContext) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    crate::proxy::apply_authoritative_gateway_error_header_for_response(
+        &mut headers,
+        ctx,
+        true,
+        StatusCode::BAD_GATEWAY.as_u16(),
+    );
+    headers
+}
+
 /// Acquire the shared reqwest client for one H3→HTTP plain-bridge attempt,
 /// resolved from this attempt's effective (per-port) proxy. On pool failure it
 /// records the 502 backend outcome and writes the Bad-Gateway response, then
@@ -1803,12 +1819,13 @@ where
             if let Some(slot) = pending_slot_to_release_before_error {
                 drop(slot.take());
             }
-            let mut outcome = write_plain_gateway_error(
+            let headers = plain_pool_client_failure_headers(ctx);
+            let mut outcome = write_plain_gateway_reject(
                 stream,
                 ctx,
                 StatusCode::BAD_GATEWAY,
-                crate::proxy::CONNECTION_POOL_CLIENT_ERROR_BODY,
-                None,
+                Bytes::from_static(crate::proxy::CONNECTION_POOL_CLIENT_ERROR_BODY.as_bytes()),
+                &headers,
                 backend_start,
                 0,
             )
@@ -5748,16 +5765,16 @@ where
             response_body.len(),
         );
         sanitize_client_response_headers_for_wire(&mut response_headers, buffered_framing);
-        if ctx.response_transform_size_refusal_selected()
-            && let Some(value) =
-                crate::proxy::x_gateway_error_for_response(ctx, false, response_status)
-        {
-            crate::proxy::restore_authoritative_gateway_error_header(&mut response_headers, value);
-        }
-        super::server::finalize_h3_response_routing_headers(
-            ctx.h3_response_upstream_is_fallback,
+        // Same post-hook / pre-wire token as the native H3 buffered writer and
+        // the H1/H2 builder: a backend 5xx reads `backend_error`, an
+        // output-ceiling refusal `overload`, and any copy a plugin or hook left
+        // is replaced.
+        super::server::finalize_h3_response_gateway_headers(
+            ctx,
             response_via,
             &mut response_headers,
+            terminal_connection_error,
+            response_status,
         );
         // The backend exchange is settled: its whole body is in hand. Record
         // its outcome and release the admission permit and least-connections
@@ -6068,10 +6085,12 @@ where
         &mut response_headers,
         ClientResponseFraming::for_streaming_response(&ctx.method, status),
     );
-    super::server::finalize_h3_response_routing_headers(
-        ctx.h3_response_upstream_is_fallback,
+    super::server::finalize_h3_response_gateway_headers(
+        ctx,
         response_via,
         &mut response_headers,
+        terminal_connection_error,
+        status,
     );
 
     // The matched route rule's body deadline (#5646): the earlier of its total
@@ -6985,10 +7004,12 @@ where
         &mut streaming.headers,
         ClientResponseFraming::Streaming,
     );
-    let gateway_owned_headers = super::server::finalize_h3_response_routing_headers(
-        ctx.h3_response_upstream_is_fallback,
+    let gateway_owned_headers = super::server::finalize_h3_response_gateway_headers(
+        ctx,
         state.via_header_http2.as_deref(),
         &mut streaming.headers,
+        false,
+        streaming.status,
     );
 
     if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
@@ -8736,10 +8757,12 @@ where
             let grpc_framing =
                 ClientResponseFraming::for_buffered_grpc(response_status, response_body.len());
             sanitize_client_response_headers_for_wire(&mut response_headers, grpc_framing);
-            let gateway_owned_headers = super::server::finalize_h3_response_routing_headers(
-                ctx.h3_response_upstream_is_fallback,
+            let gateway_owned_headers = super::server::finalize_h3_response_gateway_headers(
+                ctx,
                 state.via_header_http2.as_deref(),
                 &mut response_headers,
+                false,
+                response_status,
             );
             response_trailers
                 .retain(|name, _| !gateway_owned_headers.owns(&name.to_ascii_lowercase()));

@@ -6810,13 +6810,24 @@ fn redact_headers(headers: &HashMap<String, String>) -> BTreeMap<String, String>
 /// `response_headers` is the Trailers-Only fallback for a hook that holds the
 /// initial header block and whose status never reached metadata. A gRPC
 /// transaction that ends with no terminal status at all is `UNKNOWN` for the
-/// client, matching [`TransactionSummary::grpc_status`].
+/// client, and one whose status is present but unreadable
+/// (`metadata.grpc_status_unreadable`) is `None`, both matching
+/// [`TransactionSummary::grpc_status`], so an unreadable status never triggers
+/// `always_capture_on_error`.
 fn final_grpc_status(
     metadata: &HashMap<String, String>,
     response_headers: Option<&HashMap<String, String>>,
 ) -> Option<u32> {
     if let Some(status) = metadata.get("grpc_status") {
         return Some(crate::proxy::grpc_proxy::parse_grpc_status_value(status));
+    }
+    // A terminal status the client received but the gateway could not read (a
+    // pass-through gRPC-Web compressed trailer frame or content-coded body) is
+    // neither a failure nor missing; like `TransactionSummary::grpc_status`, it
+    // stays unset rather than `UNKNOWN`.
+    let unreadable = crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY;
+    if metadata.contains_key(unreadable) {
+        return None;
     }
     if let Some(status) =
         response_headers.and_then(crate::proxy::grpc_proxy::grpc_status_from_headers)
