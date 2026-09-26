@@ -9,8 +9,9 @@
 //! body — never a connection close before any status line.
 //!
 //! The same contract holds for a backend error that arrives with the first
-//! bytes on the unlimited reqwest streaming bodies, and for the size-limit
-//! error of the plugin-inspected streaming body.
+//! bytes on the unlimited streaming bodies (reqwest, direct HTTP/2 and gRPC,
+//! native HTTP/3), and for the size-limit error of the plugin-inspected
+//! streaming body.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -32,6 +33,7 @@ use ferrum_edge::_test_support::{
     inspected_streaming_body_from_ready_chunks_then_limit_error,
     size_limited_streaming_body_from_ready_chunks,
     unlimited_streaming_body_from_ready_chunks_then_error,
+    unlimited_streaming_body_pending_once_then_error,
 };
 use ferrum_edge::proxy::body::ProxyBody;
 
@@ -39,6 +41,18 @@ const LIMIT: usize = 8;
 const BACKEND_RESET: &str = "backend reset";
 /// A non-zero idle read timeout, far longer than any test runs.
 const IDLE_READ_TIMEOUT_MS: u64 = 30_000;
+/// Every unlimited streaming body builder the test seam can name.
+const UNLIMITED_ADAPTERS: [&str; 6] = [
+    "direct",
+    "coalescing",
+    "h2_direct",
+    "h2_coalescing",
+    "h3_direct",
+    "h3_coalescing",
+];
+
+/// An adapter name paired with the body builder that fails with a backend reset.
+type BodyCase = (&'static str, fn() -> ProxyBody);
 
 /// Two ready chunks: the first fits the limit exactly, the second overruns it.
 fn over_limit_body() -> ProxyBody {
@@ -51,8 +65,9 @@ fn over_limit_body() -> ProxyBody {
     )
 }
 
-/// One ready chunk followed at once by a backend reset, on the unlimited
-/// reqwest streaming body named by `adapter`, with the idle read timeout off.
+/// One ready chunk followed at once by a backend reset on the unlimited
+/// streaming body named by `adapter` (reqwest, direct H2/gRPC, or native H3),
+/// with the idle read timeout off.
 fn backend_reset_body(adapter: &str) -> ProxyBody {
     let chunks = vec![Bytes::from_static(b"abcdefgh")];
     unlimited_streaming_body_from_ready_chunks_then_error(adapter, chunks, 0)
@@ -64,6 +79,22 @@ fn direct_backend_reset_body() -> ProxyBody {
 
 fn coalescing_backend_reset_body() -> ProxyBody {
     backend_reset_body("coalescing")
+}
+
+fn h2_direct_backend_reset_body() -> ProxyBody {
+    backend_reset_body("h2_direct")
+}
+
+fn h2_coalescing_backend_reset_body() -> ProxyBody {
+    backend_reset_body("h2_coalescing")
+}
+
+fn h3_direct_backend_reset_body() -> ProxyBody {
+    backend_reset_body("h3_direct")
+}
+
+fn h3_coalescing_backend_reset_body() -> ProxyBody {
+    backend_reset_body("h3_coalescing")
 }
 
 /// The plugin-inspected streaming body after its task queued the released
@@ -153,22 +184,110 @@ fn coalescing_body_backend_reset_yields_once_after_the_accepted_bytes() {
     );
 }
 
+#[test]
+fn h2_direct_body_backend_reset_yields_once_after_the_accepted_bytes() {
+    assert_error_yields_once_after_the_accepted_bytes(
+        h2_direct_backend_reset_body(),
+        BACKEND_RESET,
+    );
+}
+
+#[test]
+fn h2_coalescing_body_backend_reset_yields_once_after_the_accepted_bytes() {
+    assert_error_yields_once_after_the_accepted_bytes(
+        h2_coalescing_backend_reset_body(),
+        BACKEND_RESET,
+    );
+}
+
 #[tokio::test]
-async fn direct_body_backend_reset_yields_once_through_the_idle_read_timeout() {
-    // The idle read timeout wraps the held error. The held turn's `Pending`
-    // arms its deadline and passes through, and the next poll must hand out
-    // the backend error, not a timeout.
-    let chunks = vec![Bytes::from_static(b"abcdefgh")];
-    let body = unlimited_streaming_body_from_ready_chunks_then_error(
-        "direct",
-        chunks,
-        IDLE_READ_TIMEOUT_MS,
+async fn h3_direct_body_backend_reset_yields_once_after_the_accepted_bytes() {
+    assert_error_yields_once_after_the_accepted_bytes(
+        h3_direct_backend_reset_body(),
+        BACKEND_RESET,
     );
-    let message = assert_error_yields_once_after_the_accepted_bytes(body, BACKEND_RESET);
-    assert!(
-        !message.contains("read timeout"),
-        "the held backend error must not turn into a timeout: {message}"
+}
+
+#[tokio::test]
+async fn h3_coalescing_body_backend_reset_yields_once_after_the_accepted_bytes() {
+    // The H3 coalescer arms its flush timer on the first buffered chunk, so
+    // this body needs a runtime.
+    assert_error_yields_once_after_the_accepted_bytes(
+        h3_coalescing_backend_reset_body(),
+        BACKEND_RESET,
     );
+}
+
+#[tokio::test]
+async fn h2_body_backend_reset_yields_once_under_a_client_grpc_deadline() {
+    // The absolute gRPC deadline replaces the idle read timeout. The hold
+    // wraps it, so a backend error inside the deadline is still held once.
+    for adapter in ["h2_direct_grpc_deadline", "h2_coalescing_grpc_deadline"] {
+        let chunks = vec![Bytes::from_static(b"abcdefgh")];
+        let body = unlimited_streaming_body_from_ready_chunks_then_error(
+            adapter,
+            chunks,
+            IDLE_READ_TIMEOUT_MS,
+        );
+        let message = assert_error_yields_once_after_the_accepted_bytes(body, BACKEND_RESET);
+        assert!(
+            !message.contains("deadline"),
+            "{adapter}: the held backend error must not turn into a deadline: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn backend_reset_yields_once_through_the_idle_read_timeout() {
+    // The hold wraps the idle read timeout, so the backend error passes
+    // through the timeout before it is held, and the next poll hands it out.
+    for adapter in UNLIMITED_ADAPTERS {
+        let chunks = vec![Bytes::from_static(b"abcdefgh")];
+        let body = unlimited_streaming_body_from_ready_chunks_then_error(
+            adapter,
+            chunks,
+            IDLE_READ_TIMEOUT_MS,
+        );
+        let message = assert_error_yields_once_after_the_accepted_bytes(body, BACKEND_RESET);
+        assert!(
+            !message.contains("read timeout"),
+            "{adapter}: the held backend error must not turn into a timeout: {message}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_backend_error_survives_an_idle_deadline_that_expires_on_the_held_turn() {
+    // The backend stalls for the whole idle read timeout, then fails. The
+    // error reaches the body on the same poll on which the idle deadline has
+    // expired. The error was read first, so it must win: the failure is the
+    // backend's, not a timeout.
+    for adapter in UNLIMITED_ADAPTERS {
+        let mut body =
+            unlimited_streaming_body_pending_once_then_error(adapter, IDLE_READ_TIMEOUT_MS);
+        let wakes = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(
+            Pin::new(&mut body).poll_frame(&mut cx).is_pending(),
+            "{adapter}: the stalled backend read must be pending"
+        );
+        tokio::time::advance(Duration::from_millis(IDLE_READ_TIMEOUT_MS + 1)).await;
+
+        assert!(
+            Pin::new(&mut body).poll_frame(&mut cx).is_pending(),
+            "{adapter}: the backend error must be held for one turn"
+        );
+        let Poll::Ready(Some(Err(error))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            panic!("{adapter}: expected the held backend error");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains(BACKEND_RESET) && !message.contains("read timeout"),
+            "{adapter}: the held backend error must not turn into a timeout: {message}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -251,6 +370,30 @@ async fn http1_client_sees_the_committed_status_before_a_coalescing_body_backend
 }
 
 #[tokio::test]
+async fn http1_client_sees_the_committed_status_before_an_h2_direct_body_backend_reset() {
+    let response = serve_once_over_http1(h2_direct_backend_reset_body).await;
+    assert_committed_head_then_truncated_body(&response);
+}
+
+#[tokio::test]
+async fn http1_client_sees_the_committed_status_before_an_h2_coalescing_body_backend_reset() {
+    let response = serve_once_over_http1(h2_coalescing_backend_reset_body).await;
+    assert_committed_head_then_truncated_body(&response);
+}
+
+#[tokio::test]
+async fn http1_client_sees_the_committed_status_before_an_h3_direct_body_backend_reset() {
+    let response = serve_once_over_http1(h3_direct_backend_reset_body).await;
+    assert_committed_head_then_truncated_body(&response);
+}
+
+#[tokio::test]
+async fn http1_client_sees_the_committed_status_before_an_h3_coalescing_body_backend_reset() {
+    let response = serve_once_over_http1(h3_coalescing_backend_reset_body).await;
+    assert_committed_head_then_truncated_body(&response);
+}
+
+#[tokio::test]
 async fn http1_client_sees_the_committed_status_before_the_inspected_body_over_limit_abort() {
     let response = serve_once_over_http1(inspected_over_limit_body).await;
     assert_committed_head_then_truncated_body(&response);
@@ -317,4 +460,22 @@ async fn http2_client_sees_the_committed_status_before_the_over_limit_reset() {
         body.is_err(),
         "the over-limit body must end with the stream reset: {body:?}"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn http2_client_sees_the_committed_status_before_an_h2_or_h3_backend_reset() {
+    let bodies: [BodyCase; 4] = [
+        ("h2_direct", h2_direct_backend_reset_body),
+        ("h2_coalescing", h2_coalescing_backend_reset_body),
+        ("h3_direct", h3_direct_backend_reset_body),
+        ("h3_coalescing", h3_coalescing_backend_reset_body),
+    ];
+    for (adapter, make_body) in bodies {
+        let (status, body) = serve_once_over_http2(make_body).await;
+        assert_eq!(status, 200, "{adapter}: committed status lost");
+        assert!(
+            body.is_err(),
+            "{adapter}: the failed body must end with the stream reset: {body:?}"
+        );
+    }
 }
