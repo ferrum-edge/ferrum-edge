@@ -619,3 +619,110 @@ fn configured_provider_cannot_suppress_an_unambiguous_root_usage_signal() {
     extractor.finish();
     assert_eq!(extractor.usage().total_for_mode("total_tokens"), Some(13));
 }
+
+// ─── SSE line endings ───────────────────────────────────────────────────
+
+/// Like `sse`, but every line, including each dispatching blank line, ends
+/// with `eol`.
+fn sse_with_eol(events: &[&str], eol: &str) -> Vec<u8> {
+    let mut out = String::new();
+    for event in events {
+        out.push_str("data: ");
+        out.push_str(event);
+        out.push_str(eol);
+        out.push_str(eol);
+    }
+    out.into_bytes()
+}
+
+fn openai_usage_stream(eol: &str) -> Vec<u8> {
+    let chunk = json!({"object": "chat.completion.chunk", "choices": []}).to_string();
+    let usage = json!({
+        "object": "chat.completion.chunk",
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    })
+    .to_string();
+    sse_with_eol(&[&chunk, &usage, "[DONE]"], eol)
+}
+
+#[test]
+fn sse_usage_is_extracted_under_every_line_ending_at_every_chunk_split() {
+    for eol in ["\r", "\r\n", "\n"] {
+        let body = openai_usage_stream(eol);
+        assert_eq!(
+            extract(UsageStreamFormat::Sse, &[&body], "total_tokens"),
+            Some(18),
+            "{eol:?}"
+        );
+        for split in 0..=body.len() {
+            let (head, tail) = body.split_at(split);
+            assert_eq!(
+                extract(UsageStreamFormat::Sse, &[head, tail], "total_tokens"),
+                Some(18),
+                "{eol:?} split at {split}"
+            );
+        }
+        let bytes: Vec<&[u8]> = body.chunks(1).collect();
+        assert_eq!(
+            extract(UsageStreamFormat::Sse, &bytes, "total_tokens"),
+            Some(18),
+            "{eol:?} one byte at a time"
+        );
+    }
+}
+
+#[test]
+fn mixed_line_endings_in_one_sse_stream_are_all_split() {
+    let start =
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 25}}}).to_string();
+    let delta = json!({"type": "message_delta", "usage": {"output_tokens": 40}}).to_string();
+    // A lone CR ends the first data line and a CRLF its blank line; an LF ends
+    // the second data line and a lone CR its blank line.
+    let body = format!(
+        "event: message_start\rdata: {start}\r\r\nevent: message_delta\r\ndata: {delta}\n\r"
+    );
+    let body = body.as_bytes();
+    for split in 0..=body.len() {
+        let (head, tail) = body.split_at(split);
+        assert_eq!(
+            extract(UsageStreamFormat::Sse, &[head, tail], "total_tokens"),
+            Some(65),
+            "split at {split}"
+        );
+    }
+}
+
+#[test]
+fn crlf_split_across_chunks_does_not_dispatch_an_event_early() {
+    // One usage document legally split across two `data` lines. If the LF that
+    // completes the chunk-ending CR were read as a blank line, the event would
+    // dispatch after its first half and neither half would parse.
+    let first = b"data: {\"usage\": {\"prompt_tokens\": 2,\r" as &[u8];
+    let second = b"\ndata: \"completion_tokens\": 3, \"total_tokens\": 5}}\r\n\r\n" as &[u8];
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[first, second], "total_tokens"),
+        Some(5)
+    );
+}
+
+#[test]
+fn stacked_leading_boms_are_stripped_before_the_first_sse_line() {
+    // The usage event is the first event, so a BOM left on its field name
+    // would hide it.
+    let usage = json!({
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    })
+    .to_string();
+    for eol in ["\r", "\r\n", "\n"] {
+        let mut body = "\u{feff}\u{feff}".as_bytes().to_vec();
+        body.extend_from_slice(&sse_with_eol(&[&usage], eol));
+        for split in 0..=body.len() {
+            let (head, tail) = body.split_at(split);
+            assert_eq!(
+                extract(UsageStreamFormat::Sse, &[head, tail], "total_tokens"),
+                Some(18),
+                "{eol:?} split at {split}"
+            );
+        }
+    }
+}
