@@ -3247,6 +3247,19 @@ async fn http_probe(
     timeout: Duration,
     healthy_status_codes: &[u16],
 ) -> ProbeOutcome {
+    let (outcome, drain_task) =
+        http_probe_inner(client, url, host_header, timeout, healthy_status_codes).await;
+    drop(drain_task);
+    outcome
+}
+
+async fn http_probe_inner(
+    client: &reqwest::Client,
+    url: &str,
+    host_header: Option<&str>,
+    timeout: Duration,
+    healthy_status_codes: &[u16],
+) -> (ProbeOutcome, Option<tokio::task::JoinHandle<()>>) {
     let mut request = client.get(url).timeout(timeout);
     if let Some(host_header) = host_header {
         request = request.header(reqwest::header::HOST, host_header);
@@ -3267,19 +3280,20 @@ async fn http_probe(
             let drain_budget = timeout
                 .saturating_sub(started.elapsed())
                 .min(HTTP_PROBE_BODY_DRAIN_TIMEOUT);
-            drop(tokio::spawn(async move {
+            let drain_task = tokio::spawn(async move {
                 let mut resp = resp;
                 match tokio::time::timeout(drain_budget, drain_probe_body(&mut resp)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(reason)) => debug!(reason, "HTTP health probe body not drained"),
                     Err(_) => debug!("HTTP health probe body drain timed out"),
                 }
-            }));
-            if healthy {
+            });
+            let outcome = if healthy {
                 ProbeOutcome::success()
             } else {
                 ProbeOutcome::failure(format!("http status {status}"))
-            }
+            };
+            (outcome, Some(drain_task))
         }
         Err(e) => {
             let failure = sanitized_http_probe_failure(&e);
@@ -3288,7 +3302,7 @@ async fn http_probe(
             } else {
                 debug!(failure = failure, "HTTP health probe failed");
             }
-            ProbeOutcome::failure(failure)
+            (ProbeOutcome::failure(failure), None)
         }
     }
 }
@@ -4820,7 +4834,26 @@ pub async fn http_probe_for_test(
     timeout: Duration,
     healthy_status_codes: &[u16],
 ) -> (bool, Option<String>) {
-    let outcome = http_probe(client, url, None, timeout, healthy_status_codes).await;
+    let (outcome, drain_task) =
+        http_probe_inner(client, url, None, timeout, healthy_status_codes).await;
+    if let Some(drain_task) = drain_task {
+        drop(drain_task.await);
+    }
+    (outcome.success, outcome.failure)
+}
+
+/// Test wrapper that returns at the header-time verdict without waiting for the body drain.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn http_probe_verdict_for_test(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    healthy_status_codes: &[u16],
+) -> (bool, Option<String>) {
+    let (outcome, drain_task) =
+        http_probe_inner(client, url, None, timeout, healthy_status_codes).await;
+    drop(drain_task);
     (outcome.success, outcome.failure)
 }
 

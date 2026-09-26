@@ -3315,14 +3315,14 @@ async fn http_probe_reuses_connection_for_empty_body() {
 
 #[tokio::test]
 async fn http_probe_stalled_body_keeps_status_verdict_and_is_time_bounded() {
-    use ferrum_edge::health_check::http_probe_for_test;
+    use ferrum_edge::health_check::http_probe_verdict_for_test;
 
     let (addr, _accepted) = keep_alive_health_server("200 OK", ProbeBodyMode::Stalled).await;
     let client = plain_probe_client();
     let url = format!("http://{addr}/health");
     let started = Instant::now();
     let (healthy, failure) =
-        http_probe_for_test(&client, &url, Duration::from_secs(10), &[200]).await;
+        http_probe_verdict_for_test(&client, &url, Duration::from_secs(10), &[200]).await;
     let elapsed = started.elapsed();
 
     assert!(
