@@ -26,7 +26,7 @@ bash run_payload_test.sh all-protocols --duration 10
 # Skip rebuild for iteration
 bash run_payload_test.sh grpc --skip-build --duration 15
 
-# Compare Ferrum Edge vs Envoy (requires: brew install envoy)
+# Compare Ferrum Edge vs Envoy (requires `envoy` in PATH, e.g. brew install envoy)
 bash run_payload_test.sh json --envoy --duration 15
 bash run_payload_test.sh all-protocols --envoy
 ```
@@ -56,6 +56,9 @@ bash run_payload_test.sh all-protocols --envoy
 | `xml` | HTTP/1.1 | `application/xml` — legacy APIs |
 | `soap-xml` | HTTP/1.1 | `application/soap+xml` — SOAP web services |
 | `graphql` | HTTP/1.1 | `application/graphql` — GraphQL mutations with large variables |
+
+`sse` (`text/event-stream`) is also accepted as a content type but belongs to no
+tier or protocol group; run it explicitly with `bash run_payload_test.sh sse`.
 
 ## Payload Sizes
 
@@ -95,9 +98,9 @@ bash run_payload_test.sh all-protocols --envoy
 
 ## Port conflicts and cleanup
 
-`run_payload_test.sh` refuses to start if any of its fixed ports (8000, 8443,
-5010, 5003, the backend/admin ports, and the Envoy admin port) is already
-bound, printing the port and an `lsof` command to inspect the listener. Cleanup
+`run_payload_test.sh` requires `lsof` and refuses to start if any of its fixed
+ports (8000, 8443, 5010, 5003, the backend/admin ports, and the Envoy admin port)
+is already bound, printing the port and an `lsof` command to inspect the listener. Cleanup
 stops only the gateway/backend/Envoy PIDs this run started (graceful `SIGTERM`,
 bounded wait, then `SIGKILL`), never whatever else happens to be listening on
 those ports.

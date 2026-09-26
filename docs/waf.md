@@ -149,28 +149,22 @@ escape decoders are content-type-agnostic (an attacker controls the declared
 `Content-Type`) and bounded to a small number of variants.
 
 UTF-16 / UTF-32 transcoding does **not** decide whether a body is
-scanned. The existing `body_content_types`, `inspect_multipart`, and
-`inspect_binary_body` gates run first and remain authoritative; an excluded
-body is not admitted merely because it declares a UTF-16 or UTF-32 charset or
-carries a BOM. For an admitted body, UTF-8 continues to borrow the buffered
-bytes without allocating, while a valid UTF-16 or UTF-32 view is allocated
-only within the already-applied `max_scan_bytes` bound. UTF-32 BOMs
-(`FF FE 00 00` little-endian, `00 00 FE FF` big-endian) are recognized
-**before** the 2-byte UTF-16 BOMs, because a UTF-32LE BOM also starts with
-the UTF-16LE mark `FF FE`. That prefix is genuinely ambiguous — it is a
-UTF-32LE BOM, and equally a UTF-16LE BOM followed by `U+0000` — so unless the
-charset names the UTF-32 family, **both** readings are scanned along with the
-raw/lossy view. Unicode makes UTF-32LE the correct decode, but a backend
-without UTF-32 support reads the same bytes as UTF-16LE, and committing to
-one reading would leave the other unscanned. A charset that does name UTF-32
-(`utf-32`, `utf-32le`, `utf-32be`) settles the width, and only the UTF-32
-reading is used. `00 00 FE FF` is not a UTF-16 BOM prefix and is
-unambiguous. Bare `charset=utf-16` / `charset=utf-32` with no
-BOM does not invent an endianness (IANA leaves both unspecified without a
-BOM). Both little-endian and big-endian decodes are scanned by the
-direction's body rules, and the existing raw/lossy view is still scanned. Bare
-`utf-16` / `utf-32` stays endianness-unspecified rather than defaulting to
-little-endian as WHATWG does, which is the more conservative choice.
+scanned. The `body_content_types`, `inspect_multipart`, and
+`inspect_binary_body` gates run first and remain authoritative; a charset or
+BOM never admits an otherwise excluded body. UTF-8 bodies are scanned in place;
+a UTF-16 or UTF-32 view is allocated only within the `max_scan_bytes` bound.
+
+- UTF-32 BOMs (`FF FE 00 00` little-endian, `00 00 FE FF` big-endian) are
+  checked **before** the 2-byte UTF-16 BOMs. `FF FE 00 00` is ambiguous (it is
+  also a UTF-16LE BOM followed by `U+0000`, which is how a backend without
+  UTF-32 support reads it), so unless the charset names the UTF-32 family,
+  **both** readings are scanned along with the raw/lossy view. A UTF-32
+  charset (`utf-32`, `utf-32le`, `utf-32be`) settles the width. `00 00 FE FF`
+  is unambiguous.
+- Bare `charset=utf-16` / `charset=utf-32` with no BOM does not assume an
+  endianness (IANA leaves it unspecified; unlike WHATWG, Ferrum does not
+  default to little-endian): both little- and big-endian decodes are scanned,
+  plus the raw/lossy view.
 
 Without a charset or BOM, inference requires a four-byte prefix containing
 one non-NUL ASCII UTF-32 unit or two non-NUL ASCII UTF-16 units in the
@@ -207,7 +201,7 @@ readings are scanned: the declaration-honouring reading decodes the whole
 body including the BOM bytes — which is what a backend trusting
 `Content-Type` sees, reading `FE FF` as the noncharacter `U+FFFE` — and the
 BOM-honouring reading decodes the body after the mark. The raw/lossy view is
-kept as well. Dropping every view on a disagreement was a one-shot bypass.
+kept as well, so a mismatched declaration cannot hide the payload.
 
 The full WHATWG UTF-16LE label set is recognized, not just `utf-16le` /
 `utf16le`: `unicode`, `unicodefeff`, `ucs-2`, `iso-10646-ucs-2`, and
@@ -308,11 +302,11 @@ and `rule_overrides`. Categories:
 | `ldap_injection` | FE-LDAP-001..002 | |
 | `xpath_injection` | FE-XPATH-001, FE-XPATH-002 (L3, low value) | |
 | `ssti` | FE-SSTI-001 (broad, L2), FE-SSTI-002 (arithmetic probe, L1), FE-SSTI-003 (Java/Spring EL, L2) | |
-| `xss` | FE-XSS-001..005 plus `-B`/`-Q` body/query mirrors | script-tag and js-URL now cover both query and body |
+| `xss` | FE-XSS-001..005 plus `-B`/`-Q` body/query mirrors | script-tag and js-URL cover both query and body |
 | `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-B | FE-PATHTRAV-001..003 (FullUrl) also scan percent-decoded query values (including `%2f`); 001-B covers request bodies. Category labels do not select scan targets. |
 | `lfi` / `rfi` | FE-LFI-001(+ -B), FE-RFI-001 (L2) | FE-LFI-001 (FullUrl) also inspects canonical query values; 001-B covers bodies. The `lfi` label itself does not. |
 | `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q) | metadata/private-IP and dangerous schemes; **level 1** across body and decoded query values (not the raw whole URI). Same dotted-IPv4 / `metadata.google.internal` / `file|gopher|dict|jar|ldap://` claims as the body rules; IPv6 and alternate textual IP forms are out of scope |
-| `xxe` | FE-XXE-001 | external-entity markers; no longer trips on `<!DOCTYPE html>` |
+| `xxe` | FE-XXE-001 | external-entity markers; does not trip on `<!DOCTYPE html>` |
 | `deserialization` | FE-DESER-001..003 | Java / .NET / PHP markers |
 | `header_anomaly` | FE-HEADER-001..003 | control chars, method-override, header-borne injection (L2) |
 | `cookie_attack` | FE-COOKIE-001, FE-COOKIE-002 (Info, L3) | |
@@ -561,11 +555,9 @@ means no admitted body is ever oversize, and `fail_closed` never fires.
 every surface — request metadata, headers, query, path, request and response
 bodies, and WebSocket messages alike. The scan always runs to completion and its
 hits always decide first, so an enforcing rule that matched still rejects even
-when the scan finished over budget. A body scan is never skipped: it used to be,
-when the scheduler alone had burned the budget across the plugin's pre-scan
-yield, which let a cheap request flood retire an enforcing body rule on demand.
-On the body path the clock starts *after* that fairness yield, so scheduler
-re-poll delay — which a request flood can inflate — is never charged to the
+when the scan finished over budget, and a body scan is never skipped. On the
+body path the clock starts *after* the plugin's pre-scan fairness yield, so
+scheduler delay — which a request flood can inflate — is never charged to the
 budget.
 
 Because the scan always completes, an over-budget result names a body the WAF
@@ -780,7 +772,7 @@ attaches to stream proxies. Two capabilities, both governed by the global
 
 ```json
 {
-  "name": "waf",
+  "plugin_name": "waf",
   "config": {
     "mode": "enforce",
     "stream": {

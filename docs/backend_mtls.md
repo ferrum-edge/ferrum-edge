@@ -1,10 +1,10 @@
 # Backend mTLS Configuration
 
-This document explains how to configure backend mutual TLS (mTLS) authentication in Ferrum Edge.
+This document explains how to configure backend TLS verification and backend mutual TLS (mTLS) in Ferrum Edge.
 
 ## Overview
 
-Backend mTLS allows the gateway to authenticate itself to backend services using client certificates. This is commonly used when backend services require certificate-based authentication.
+Backend mTLS lets the gateway authenticate itself to backend services with a client certificate, for backends that require certificate-based authentication.
 
 ## Configuration
 
@@ -26,7 +26,7 @@ export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/path/to/client-cert.pem"
 # Optional source override for the client certificate
 export FERRUM_BACKEND_TLS_CLIENT_CERT_SOURCE="file:///path/to/client-cert.pem"
 
-# Path to client private key file (PEM format)  
+# Path to client private key file (PEM format)
 export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/path/to/client-key.pem"
 
 # Optional source override for the client private key. With the pkcs11 Cargo
@@ -192,7 +192,7 @@ when verification is disabled.
 > The proxy backend path (HTTP/1.1, H2, HTTP/3, gRPC, WebSocket, TCP/TLS) builds its trust store in-house from `webpki-roots`'s `TLS_SERVER_ROOTS` and hands the resulting `rustls::ClientConfig` to reqwest via `use_preconfigured_tls(...)`. That means the "no custom CA" fallback always uses bundled webpki on every platform — Linux, macOS, and Windows — regardless of OS keychain contents. Only the `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-proxy CA paths can change which roots the gateway trusts for backend traffic.
 
 > **Trust roots — internal helper clients.**
-> A few internal-helper reqwest clients (plugin outbound HTTP via `PluginHttpClient`, the `spec_expose` plugin, and skip-verify health-check probes) do not preconfigure TLS the way the proxy backend path does. As of reqwest 0.13 those clients use `rustls-platform-verifier`, which resolves trust roots from the **OS keychain on macOS/Windows** and from the host CA bundle on Linux (`rustls-native-certs`, typically `/etc/ssl/certs` via `ca-certificates`). Linux does **not** fall through to bundled webpki when that host bundle is missing or empty: verifier construction fails instead. `PluginHttpClient` then constructs a fail-closed client — native/built-in roots disabled, empty trust store, certificate verification still enabled — so the gateway stays up and plugin HTTPS calls fail at handshake rather than aborting the process. If even that bounded empty-trust construction fails, the shared client stays inert and outbound plugin HTTP fails closed without hanging, panicking, or restoring ambient proxy, redirects, or an unapproved crypto provider. Ambient proxy environment and redirect following stay disabled on that fallback. When the gateway DNS resolver is present, every fallback retains it so hostname resolution cannot bypass `FERRUM_BACKEND_ALLOW_IPS`; the HTTP/2 companion likewise retains prior-knowledge mode instead of downgrading h2c. Operators running the gateway locally on macOS/Windows will see helper-client TLS verified against their OS keychain unless a `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-plugin CA is configured (in which case the custom CA replaces the trust store wholesale, per the exclusivity rule above). Production images should still ship CA certificates so ordinary plugin HTTPS can authenticate public peers.
+> A few internal-helper reqwest clients (plugin outbound HTTP via `PluginHttpClient`, the `spec_expose` plugin, and skip-verify health-check probes) do not preconfigure TLS the way the proxy backend path does. Those clients use `rustls-platform-verifier`, which resolves trust roots from the **OS keychain on macOS/Windows** and from the host CA bundle on Linux (`rustls-native-certs`, typically `/etc/ssl/certs` via `ca-certificates`). Linux does **not** fall through to bundled webpki when that host bundle is missing or empty: verifier construction fails instead. `PluginHttpClient` then constructs a fail-closed client — native/built-in roots disabled, empty trust store, certificate verification still enabled — so the gateway stays up and plugin HTTPS calls fail at handshake rather than aborting the process. If even that bounded empty-trust construction fails, the shared client stays inert and outbound plugin HTTP fails closed without hanging, panicking, or restoring ambient proxy, redirects, or an unapproved crypto provider. Ambient proxy environment and redirect following stay disabled on that fallback. When the gateway DNS resolver is present, every fallback retains it so hostname resolution cannot bypass `FERRUM_BACKEND_ALLOW_IPS`; the HTTP/2 companion likewise retains prior-knowledge mode instead of downgrading h2c. Operators running the gateway locally on macOS/Windows will see helper-client TLS verified against their OS keychain unless a `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-plugin CA is configured (in which case the custom CA replaces the trust store wholesale, per the exclusivity rule above). Production images should still ship CA certificates so ordinary plugin HTTPS can authenticate public peers.
 >
 > Verified HTTPS and gRPC health-check probes are not in that helper-client group: they preconfigure rustls with the same server verifier and shared CRL snapshot as proxy backend traffic.
 
@@ -210,7 +210,7 @@ cat > ca-bundle.pem << EOF
 -----END CERTIFICATE-----
 
 -----BEGIN CERTIFICATE-----
-# Second CA certificate  
+# Second CA certificate
 -----END CERTIFICATE-----
 EOF
 ```
@@ -298,12 +298,15 @@ EOF
 The gateway includes comprehensive tests for mTLS functionality:
 
 ```bash
-# Run mTLS tests
-cargo test --test backend_mtls_tests
+# Run the backend mTLS integration tests
+cargo test --test integration_tests backend_mtls
 
-# Run specific test
-cargo test test_backend_mtls_global_config -- --nocapture
+# Run a specific test
+cargo test --test integration_tests test_backend_mtls_global_config -- --nocapture
 ```
+
+Functional coverage (a real gateway presenting a client certificate) lives in
+`tests/functional/functional_mtls_test.rs`.
 
 ## Troubleshooting
 
@@ -452,12 +455,11 @@ Admin-managed backend certificate resources can be referenced with `managed://` 
 
 ## Implementation Details
 
-The mTLS implementation uses:
-
-- **reqwest**: HTTP client with TLS support
-- **rustls**: TLS library for secure connections
-- **Connection Pooling**: mTLS clients are pooled and reused efficiently
-- **Override Logic**: Proxy-specific settings override global environment variables
+Backend TLS is built on rustls. HTTP/1.1 (and reqwest-negotiated HTTP/2) uses
+reqwest with a preconfigured rustls `ClientConfig`; the direct HTTP/2, gRPC,
+HTTP/3, TCP/TLS, and WebSocket paths use rustls directly. Clients are pooled per
+TLS identity, and proxy-specific settings override the global environment
+variables.
 
 ### Connection Pool Behavior
 
@@ -473,7 +475,13 @@ The mTLS implementation uses:
 
   Two proxies pointing at the same backend host but with different cert sources will **not** share connections. This is required because `reqwest::Client` and `rustls::ClientConfig` bake TLS identity and root certificates in at build time. Changing a proxy's cert sources in a config reload creates a new pool entry on the next request; the old pool entry is eventually evicted by idle timeout.
 - File-backed sources are read at validation time (startup/config load) and when the connection pool entry is first created. Inline PEM sources are materialized directly from the configured value. Subsequent requests reuse the cached client.
-- The first-request build of a backend TLS config (a new TLS identity, or the first request after a cache clear or SVID rotation) never runs on the Tokio worker serving the request. On the reqwest, direct HTTP/2, gRPC, and HTTP/3 backend paths, source reads, provider resolution, and rustls construction run on the bounded TLS source executor (`FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY`, `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`), so a slow file system or secret provider cannot stall unrelated requests or timers on that worker. Concurrent first requests for the same TLS identity share one build on the direct HTTP/2, gRPC, and HTTP/3 pools, and on the reqwest pool concurrent first requests for one pool key share one client build. A request waits at most `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS` for a cold build, executor queue time included, and fails closed when that runs out; the build itself keeps running under a larger but still bounded budget (each remote source wait inside it keeps the full `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS` budget, and the whole build is capped at three times that value, measured from when it starts executing), and a late success is cached so the next request hits it. Fast failures (a missing file, a malformed PEM) are never cached, so the next request retries the build. A build that fails only after holding its executor slot for the full `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS` budget (typically a remote secret provider that is down) backs that TLS identity off for one more budget: requests in that window fail closed at once with the same error instead of tying up another executor slot, and a backend TLS / CRL reload drops the backoff. `wss://` WebSocket backends use the same cached, executor-backed build (one config per TLS identity, no ALPN), so a WebSocket burst no longer reads CA and client material on the worker for every upgrade, and WebSocket dials now follow CRL reloads like the other backend paths. After every config load or reload, the gateway prebuilds in the background the reqwest backend TLS config of every HTTPS proxy whose TLS identity is not cached yet, so the first request after a load normally hits the cache; direct HTTP/2, gRPC, HTTP/3, and WebSocket configs still build on first use (or during pool warmup). A quarter of `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY` (at least one slot when it is 2 or more) is reserved for these request-path builds: runtime TLS refreshes, reconcile work, and prebuilds cannot occupy those slots. Prebuilds are the lowest class below refreshes and reconcile work: at most two run at a time, each only in executor capacity that is idle and that still leaves a background slot free, so a prebuild never waits in line ahead of a refresh, reconcile pass, or request (with `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY` of `2` or less there is no such spare slot and prebuilds are skipped). Once admitted, a prebuild keeps its slot until its build ends, up to 3× `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`, so when `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY` is small, two running prebuilds can leave refreshes and reconcile work with less capacity for that long. Only the newest config load's prebuild pass stays alive: a newer load cancels the older pass's prebuilds that have not started, so a stale config never warms identities it no longer has. A prebuild claims a TLS identity only once it starts running, so a request for an identity whose prebuild is still waiting builds it on the request path instead of waiting behind it. An identity whose prebuild failed is not prebuilt again by later config loads until a request builds it successfully or a backend TLS / CRL reload.
+- **Cold builds run off the request worker.** The first build of a backend TLS config (a new TLS identity, or the first request after a cache clear or SVID rotation) never runs on the Tokio worker serving the request. On the reqwest, direct HTTP/2, gRPC, HTTP/3, and `wss://` WebSocket paths, source reads, provider resolution, and rustls construction run on the bounded TLS source executor (`FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY`, `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`), so a slow file system or secret provider cannot stall unrelated requests or timers on that worker. `wss://` configs are cached one per TLS identity (no ALPN) and follow CRL reloads like the other backend paths.
+  - **Single flight.** Concurrent first requests for the same TLS identity share one build on the direct HTTP/2, gRPC, and HTTP/3 pools; on the reqwest pool, concurrent first requests for one pool key share one client build.
+  - **Timeouts.** A request waits at most `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS` for a cold build, executor queue time included, and fails closed when that runs out. The build itself keeps running under a larger but still bounded budget: each remote source wait inside it keeps the full `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`, and the whole build is capped at three times that value from when it starts executing. A late success is cached so the next request hits it.
+  - **Failures.** Fast failures (a missing file, a malformed PEM) are never cached, so the next request retries the build. A build that fails only after holding its executor slot for the full `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS` (typically a remote secret provider that is down) backs that TLS identity off for one more budget: requests in that window fail closed at once with the same error instead of tying up another executor slot. A backend TLS / CRL reload drops the backoff.
+  - **Prebuild after config load.** After every config load or reload, the gateway prebuilds in the background the reqwest backend TLS config of every HTTPS proxy whose TLS identity is not cached yet, so the first request after a load normally hits the cache. Direct HTTP/2, gRPC, HTTP/3, and WebSocket configs still build on first use (or during pool warmup).
+  - **Executor slot reservation.** A quarter of `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY` (at least one slot when it is 2 or more) is reserved for request-path builds; runtime TLS refreshes, reconcile work, and prebuilds cannot occupy those slots. Prebuilds are the lowest class: at most two run at a time, each only in idle executor capacity that still leaves a background slot free, so a prebuild never waits in line ahead of a refresh, reconcile pass, or request. With `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY` of `2` or less there is no spare slot and prebuilds are skipped. Once admitted, a prebuild keeps its slot until its build ends (up to 3× `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`), so with a small concurrency limit two running prebuilds can leave refreshes and reconcile work with less capacity for that long.
+  - **Prebuild scheduling.** Only the newest config load's prebuild pass stays alive: a newer load cancels the older pass's prebuilds that have not started, so a stale config never warms identities it no longer has. A prebuild claims a TLS identity only once it starts running, so a request for an identity whose prebuild is still waiting builds it on the request path instead of waiting behind it. An identity whose prebuild failed is not prebuilt again by later config loads until a request builds it successfully or a backend TLS / CRL reload runs.
 - Replacing the contents of a watched cert/key/CA/CRL file at the **same path** refreshes already-built HTTP-family backend TLS configs (reqwest, direct HTTP/2, gRPC, and HTTP/3) and cached `wss://` WebSocket backend TLS configs when backend TLS live reload is enabled; a gateway SVID rotation likewise drains the WebSocket configs built from the rotated SVID, so the next upgrade uses the new material. If you disable it, use a process restart, Kubernetes rolling redeploy, or an effective config change that produces a new pool key to pick up in-place rotations.
 - If certificate source loading or parsing fails at request time (e.g., file deleted after startup), the request fails with an error. This behavior is consistent across all backend protocols (HTTP/1.1, H2, and HTTP/3). The gateway continues running and serves other proxies normally.
 - Connection reuse respects the original mTLS configuration
@@ -496,9 +504,10 @@ export FERRUM_TLS_NO_VERIFY="true"
 - **Internal Networks**: Isolated environments where verification is not needed
 
 **Gateway Behavior:**
-- Logs warning: "Backend TLS certificate verification DISABLED (testing mode)"
+- Logs a startup warning: `WARNING: FERRUM_TLS_NO_VERIFY=true — outbound TLS certificate verification is DISABLED. Do not use in production.`
 - Accepts any certificate (including self-signed and expired)
 - Still uses TLS encryption, just skips verification
+- Refused at startup under `FERRUM_MESH_PRODUCTION_MODE=true` or FIPS enforce
 
 For development and testing, you can generate self-signed certificates:
 
@@ -515,15 +524,6 @@ openssl x509 -req -days 365 -in client.csr -signkey client-key.pem -out client-c
 # Clean up CSR
 rm client.csr
 ```
-
-## Migration from Previous Versions
-
-If upgrading from a version without mTLS support:
-
-1. No breaking changes - existing configurations continue to work
-2. Add environment variables or proxy configuration as needed
-3. Test with non-production backends first
-4. Monitor logs for certificate-related errors
 
 ## Performance Impact
 

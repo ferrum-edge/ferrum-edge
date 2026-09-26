@@ -74,17 +74,13 @@ through the Admin API in database mode).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `listen_port` | `u16` | (required) | Dedicated port for this stream proxy (1024-65535) |
+| `listen_port` | `u16` | (required) | Dedicated port for this stream proxy (1-65535; must not collide with gateway reserved ports) |
 | `backend_scheme` | `string` | (required) | One of: `tcp`, `tcps`, `udp`, `dtls` |
 | `frontend_tls` | `bool` | `false` | Terminate TLS (TCP) or DTLS (UDP) on incoming connections |
 | `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
-| `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol: the v1/v2 connection header on `tcp`/`tcp_tls` (see [Inbound PROXY Protocol](#inbound-proxy-protocol)), or the per-datagram v2 DGRAM envelope on `udp`/`dtls` (see [Datagram Client-Address Metadata](#datagram-client-address-metadata-udp--dtls)). |
+| `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol: the v1/v2 connection header on `tcp`/`tcps` (see [Inbound PROXY Protocol](#inbound-proxy-protocol)), or the per-datagram v2 DGRAM envelope on `udp`/`dtls` (see [Datagram Client-Address Metadata](#datagram-client-address-metadata-udp--dtls)). |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
 | `udp_max_response_amplification_factor` | `f32` | `8.0` (every configuration source) | Backend→client payload-byte budget of `request_payload_size × factor` per admitted client request, **accrued** (not reset) across requests and capped at 16× a single request's budget, so a reply in flight for request *N* is charged against *N*'s budget rather than a later, smaller request's while a session's total outbound bytes stay bounded by `factor ×` its total inbound bytes. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. Every backend response datagram consumes at least one unit of remaining budget, so a zero-length reply cannot bypass a finite factor. Finite values must be `> 0` and `≤ 1024`. **Omitting the field is not unlimited**: every `udp`/`dtls` proxy that leaves it unset is normalized to `8.0`. `0` is the explicit unlimited opt-out and logs a warning on the affected listener at startup. |
-
-### Synthetic `listen_path`
-
-Stream proxies use synthetic `listen_path` values (`__tcp:PORT` or `__udp:PORT`) to maintain the UNIQUE constraint on `listen_path` without conflicting with HTTP path-based routing. These are auto-generated during config normalization if `listen_path` is empty.
 
 ## Encryption Support
 
@@ -294,7 +290,7 @@ Set `frontend_tls: true` to accept TLS connections from clients. The gateway use
 
 For TLS-terminating TCP proxies, Ferrum completes the client-to-gateway TLS handshake before opening the backend connection. Stream lifecycle plugins then run with frontend TLS context, including client certificate material when mTLS is enabled, before any backend socket is consumed. Clients that fail the frontend TLS handshake, or are rejected by `on_stream_connect` plugins, are closed on the frontend side without dialing the backend. Frontend TLS failures remain frontend setup failures and are not recorded as backend circuit-breaker failures. Negotiated ClientHello/handshake SNI is available on `StreamConnectionContext.sni_hostname` and preserved on `StreamTransactionSummary.sni_hostname` for disconnect logging.
 
-Latency trade-off: backend connect now starts after frontend TLS instead of overlapping with it, so legitimate TCP+TLS sessions may add roughly one backend RTT to first-byte latency compared with backend-first setup. The benefit is that failed frontend handshakes, plugin rejects, and already-open backend circuit breakers do not spend backend sockets or handshakes on unadmitted clients. If a backend circuit breaker is already open, Ferrum still completes frontend TLS before refusing the stream, so the cost shifts to bounded frontend TLS CPU instead of backend capacity.
+Latency trade-off: backend connect starts after frontend TLS instead of overlapping with it, so legitimate TCP+TLS sessions may add roughly one backend RTT to first-byte latency compared with backend-first setup. The benefit is that failed frontend handshakes, plugin rejects, and already-open backend circuit breakers do not spend backend sockets or handshakes on unadmitted clients. If a backend circuit breaker is already open, Ferrum still completes frontend TLS before refusing the stream, so the cost shifts to bounded frontend TLS CPU instead of backend capacity.
 
 `passthrough: true` is different: Ferrum does not terminate TLS, so it peeks at ClientHello SNI and forwards the encrypted stream to the backend.
 
@@ -306,6 +302,8 @@ Backend TLS settings are controlled by the proxy's `backend_tls_*` fields:
 - `backend_tls_verify_server_cert` (default `true`) — verify backend certificate
 - `backend_tls_server_ca_cert_path` — custom CA certificate for verification
 - `backend_tls_client_cert_path` + `backend_tls_client_key_path` — client certificate for mutual TLS
+
+TCP+TLS origination uses the upstream's `backend_tls_sni`, when set, as both the ClientHello SNI and the certificate verification name; the selected target host/IP still controls the socket destination. With no override, the selected host is the TLS name. Configured mesh identity verification is still enforced.
 
 ### Frontend DTLS Termination (UDP)
 
@@ -401,7 +399,7 @@ This provides full encryption: DTLS client → gateway (DTLS termination) → ga
 
 `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`, `FERRUM_TLS_CIPHER_SUITES` and
 `FERRUM_TLS_KEY_EXCHANGE_GROUPS` (alias `FERRUM_TLS_CURVES`) are documented as applying
-"inbound + outbound". Since issue #4507 that includes every DTLS surface: the frontend
+"inbound + outbound", and that includes every DTLS surface (issue #4507): the frontend
 DTLS listener, the DTLS live-reload rebuild, the generated NodeWaypoint DTLS listeners,
 and the backend DTLS client. The policy is resolved once at startup (and again on each
 reload) and applied to the DTLS configuration before any listener can serve.
@@ -437,7 +435,7 @@ The gateway uses separate trust stores for TCP and UDP encryption:
 | Backend client cert (TCP + UDP) | `backend_tls_client_cert_path` + `backend_tls_client_key_path` | Per-proxy | Gateway presents this cert to the backend (mTLS). |
 | Frontend TLS client CA (TCP) | `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` | Gateway-wide | Verify TCP client certificates (frontend mTLS). |
 | Frontend DTLS client CA (UDP) | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | Gateway-wide | Verify DTLS client certificates (frontend mTLS). |
-| Frontend TLS server cert (TCP) | `FERRUM_TLS_CERT_PATH` + `FERRUM_TLS_KEY_PATH` | Gateway-wide | Gateway's TLS certificate for TCP frontend termination. |
+| Frontend TLS server cert (TCP) | `FERRUM_FRONTEND_TLS_CERT_PATH` + `FERRUM_FRONTEND_TLS_KEY_PATH` | Gateway-wide | Gateway's TLS certificate for TCP frontend termination. |
 | Frontend DTLS server cert (UDP) | `FERRUM_DTLS_CERT_PATH` + `FERRUM_DTLS_KEY_PATH` | Gateway-wide | Gateway's DTLS certificate for UDP frontend termination. |
 
 The separation of TCP and UDP trust stores allows independent certificate rotation and different CA hierarchies for each protocol.
@@ -570,7 +568,7 @@ proxies:
 
 **When the write watermark disarms is not the same on every path** (issue #5588). The splice, io_uring and kTLS loops disarm it the moment the queued bytes are handed to the destination file descriptor: there is no userspace write buffer between the relay and the socket, so "accepted" is "delivered". The **userspace direction-tracking relay** disarms it when the writer's **flush completes** — not when the relay's own buffer drains — and, while a flush is still owed, keeps it armed across the half-close (`poll_shutdown`) until that resolves. A direction that reaches EOF owing nothing is inert from that moment. `tokio-rustls` accepts plaintext and returns `Ok(n)` for ciphertext it could not push to the transport, so on a TLS backend "the relay has nothing queued" does not mean "the backend can see it".
 
-Operator-visible consequence, TLS backends only: with a non-zero `backend_write_timeout_ms`, a backend whose socket has stopped draining while rustls holds accepted ciphertext now trips this timer and reports `backend write inactivity timeout` with `error_class=read_write_timeout` on the client→backend direction. Before, the watermark had already gone inert at the moment the writer said `Ok`, and that connection fell through to `tcp_idle_timeout_seconds` — or, with the idle timeout and `tcp_half_close_max_wait_seconds` both disabled, to no bound at all. Plain-TCP backends are unchanged: `TcpStream`'s flush is a no-op, so both disarm points coincide. Raise `backend_write_timeout_ms` (or set it to `0`) if a TLS backend is legitimately slower than the configured window at accepting a large write. Note that this also bounds the half-close: a direction that reaches EOF with a flush still outstanding is now cut by `backend_write_timeout_ms` — at the shipped defaults 30,000 ms, ten times tighter than the 300 s `tcp_half_close_max_wait_seconds` — so a deliberately raised half-close cap no longer describes that case on its own.
+Operator-visible consequence, TLS backends only: with a non-zero `backend_write_timeout_ms`, a backend whose socket has stopped draining while rustls holds accepted ciphertext trips this timer and reports `backend write inactivity timeout` with `error_class=read_write_timeout` on the client→backend direction, rather than falling through to `tcp_idle_timeout_seconds` (or to no bound at all when that and `tcp_half_close_max_wait_seconds` are both disabled). Plain-TCP backends are unaffected: `TcpStream`'s flush is a no-op, so both disarm points coincide. Raise `backend_write_timeout_ms` (or set it to `0`) if a TLS backend is legitimately slower than the configured window at accepting a large write. This also bounds the half-close: a direction that reaches EOF with a flush still outstanding is cut by `backend_write_timeout_ms` (30,000 ms by default, ten times tighter than the 300 s `tcp_half_close_max_wait_seconds`), so a raised half-close cap does not cover that case on its own.
 
 The same reasoning applies to the half-close itself. `poll_shutdown` performs the writer's implied flush, so when it *fails* while the writer is still holding bytes it accepted, the relay reports that direction as a write-side failure instead of a clean completion — the tail it already counted never reached the peer. A half-close with nothing outstanding, and the benign peer-already-gone failures, remain graceful and produce no `error_class`. Benign means the errnos `EPIPE`, `ECONNRESET`, `WriteZero` and `ENOTCONN` — and, on the HBONE HTTP/2 CONNECT byte tunnel, whose writer is hyper's `H2Upgraded` and can raise none of them, an h2 close reason of `NO_ERROR` or `CANCEL`. Every other h2 reason stays a write-side failure.
 
@@ -599,7 +597,7 @@ and is never dropped for it.
 | Cipher | `ECDHE_{RSA,ECDSA}_WITH_CHACHA20_POLY1305_SHA256` (Linux 5.11+), gated on its own startup probe. TLS 1.2 AES-GCM suites stay on the userspace rustls relay — Linux cannot establish a race-free receive-record bound after accept (`FIONREAD` omits out-of-order skbs) | userspace relay |
 | Backend | plain `tcp` backend | userspace relay |
 | Plugins | no plugin requesting decrypted first bytes | userspace relay |
-| Frontend mode | terminating `tcp_tls` (not `passthrough`) | unchanged |
+| Frontend mode | `tcp` with `frontend_tls: true` (not `passthrough`) | unchanged |
 
 TLS 1.3 is **refused, not approximated**. The kernel holds a static copy of the
 application traffic secret and this gateway does not implement KeyUpdate
@@ -877,7 +875,7 @@ Both stream listeners bound how much of a listener one source IP may hold, indep
 
 `0` means unlimited for either variable.
 
-**TCP ordering.** The bound is applied as soon as the connection's effective client IP is known and **before** `handle_tcp_connection` runs, so a refused connection reaches no frontend TLS handshake, no `on_stream_connect` plugin chain, and no backend dial — the socket is closed at accept. This is the gap the opt-in `tcp_connection_throttle` plugin cannot close: its `on_stream_connect` hook runs *after* the handshake on `tcp_tls` proxies, so it can never bound concurrent pre-handshake state from one source. The plugin remains available and unchanged for policy-level throttling on top of this bound.
+**TCP ordering.** The bound is applied as soon as the connection's effective client IP is known and **before** `handle_tcp_connection` runs, so a refused connection reaches no frontend TLS handshake, no `on_stream_connect` plugin chain, and no backend dial — the socket is closed at accept. This is the gap the opt-in `tcp_connection_throttle` plugin cannot close: its `on_stream_connect` hook runs *after* the handshake on TLS-terminating proxies, so it can never bound concurrent pre-handshake state from one source. The plugin remains available and unchanged for policy-level throttling on top of this bound.
 
 **UDP/DTLS ordering.** The per-source bound shares one admission point and one release path with the listener-wide `FERRUM_UDP_MAX_SESSIONS` bound, so neither slot can be taken without the other and neither can leak. The session's slot is released exactly once with its other per-session guards on idle expiry, authorization-lifetime expiry, backend teardown, and listener shutdown.
 
@@ -1024,9 +1022,8 @@ listeners (different ports), that parent reports the conservative aggregate:
 `ExplicitUnlimited` if any listener is unlimited, `FinitePolicy` only when every
 listener uses a finite policy, and `FiniteDefault` when at least one uses the
 controller default. A missing exact parent does not inherit another parentRef's
-posture. Runtime accounting is cumulative per admitted request (accrued and
-capped, not reset); a zero-length response consumes one unit of remaining budget. See
-[`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md).
+posture. Runtime accounting is the same accrued, capped budget described under
+[UDP Session Management](#udp-session-management).
 
 For a `UDPRoute` the rule's `backendRefs` is a weighted **set**. A single
 serviceable leg becomes a direct backend
@@ -1137,7 +1134,7 @@ Ferrum supports inbound [PROXY protocol](https://www.haproxy.org/download/1.8/do
 
 ### Enabling PROXY Protocol
 
-Add `stream_proxy_protocol: true` to any `tcp` or `tcp_tls` proxy:
+Add `stream_proxy_protocol: true` to any `tcp` or `tcps` proxy (with or without `frontend_tls`):
 
 ```yaml
 proxies:
@@ -1145,9 +1142,8 @@ proxies:
     name: Postgres
     backend_scheme: tcp
     listen_port: 5432
-    targets:
-      - host: db.internal
-        port: 5432
+    backend_host: db.internal
+    backend_port: 5432
     stream_proxy_protocol: true   # expect PROXY header on every accepted connection
 ```
 
@@ -1202,9 +1198,8 @@ proxies:
     name: DNS
     backend_scheme: udp
     listen_port: 5353
-    targets:
-      - host: resolver.internal
-        port: 53
+    backend_host: resolver.internal
+    backend_port: 53
     stream_proxy_protocol: true   # expect the DGRAM envelope on every datagram
 ```
 
@@ -1365,9 +1360,8 @@ proxies:
     name: Postgres
     backend_scheme: tcp
     listen_port: 5432
-    targets:
-      - host: db.internal
-        port: 5432
+    backend_host: db.internal
+    backend_port: 5432
     backend_proxy_protocol: v2   # prepend PROXY v2 on every backend connect
 ```
 
@@ -1392,12 +1386,12 @@ Outbound PROXY can be combined with inbound `stream_proxy_protocol: true`: Ferru
 
 ## Validation Rules
 
-- `listen_port` is required for stream proxies (1024-65535)
+- `listen_port` is required for stream proxies (1-65535)
 - `listen_port` must be unique across stream proxies unless every sharer forms one opaque-TLS SNI listener (homogeneous passthrough or ordinary opaque TCP) or one L4 `stream_match` group
 - `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
 - `listen_port` is optional for HTTP-family proxies; when present it scopes the route to that frontend port and does not join stream-port sharing
 - A TCP/TLS stream `listen_port` still collides with an HTTP-family Gateway listener on that port (whole-listener refusal). A UDP/DTLS stream may share the numeric port with an HTTP-family listener: plaintext is unaffected, and a TLS-class listener with HTTP/3 enabled keeps TCP/H1/H2 while refusing only QUIC/H3 for that port (see [gateway_api_conformance.md](gateway_api_conformance.md) and [http3.md](http3.md))
-- `stream_proxy_protocol` may only be set on stream proxies (`tcp` / `tcp_tls` use the connection header, `udp` / `dtls` use the per-datagram envelope); setting it on an HTTP-family proxy is a validation error
+- `stream_proxy_protocol` may only be set on stream proxies (`tcp` / `tcps` use the connection header, `udp` / `dtls` use the per-datagram envelope); setting it on an HTTP-family proxy is a validation error
 - `backend_proxy_protocol` may only be set on `tcp` / `tcps` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - Stream proxies are excluded from the HTTP router (routed by port, not path)
 
@@ -1450,11 +1444,6 @@ Authenticated `/overload` retains the existing stream bind-failure diagnostics;
 unauthenticated health responses still contain only `status` and `ready`. `/live`
 is unaffected. Initial hard bind failures remain fatal in file/database mode and
 non-fatal in DP mode.
-
-TCP+TLS origination honors the upstream's `backend_tls_sni` as both the ClientHello
-SNI and the certificate verification name. The selected target host/IP still controls
-the socket destination. With no override, the selected host remains the TLS name;
-configured mesh identity verification remains enforced by the existing verifier.
 
 ## TCP Accept-Loop Supervision
 

@@ -40,15 +40,15 @@ prompt, including continuation prompts and any permitted nested delegation.
 ## Preflight
 
 1. Read `AGENTS.md`, the relevant `.claude/rules/*.md`, and the issue or PR before dispatching.
-2. Confirm the standalone claude CLI is resolvable, then run `claude --version`, `claude auth status`,
-   and `claude --help` against it. The launcher resolves the binary in this order and refuses
-   any candidate under `com.conductor.app`, because Conductor's bundled copy lags the standalone
-   release:
+2. Confirm the standalone claude CLI is resolvable, then run `claude --version`,
+   `claude auth status`, and `claude --help` against it. The launcher resolves the binary in this
+   order and refuses any candidate under `com.conductor.app`, because Conductor's bundled copy
+   lags the standalone release:
    - `CLAUDE_BIN` if it points at an executable absolute path,
    - `~/.local/bin/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude`,
    - `claude` on `PATH`.
-3. Confirm that the installed CLI accepts `claude-fable-5-1` and exposes `--effort` with `low`, `medium`,
-   `high`, `xhigh`, and `max`.
+3. Confirm that the installed CLI accepts `claude-fable-5-1` and exposes `--effort` with `low`,
+   `medium`, `high`, `xhigh`, and `max`.
 4. Use only the pinned model `claude-fable-5-1`. Do not expose a model override in the launcher.
 5. Stop and report the problem if authentication or Fable access is unavailable. Do not silently
    substitute another model or effort.
@@ -75,12 +75,11 @@ sandbox Claude from the rest of the host.
   failure mode, and other routine work where latency and cost matter.
 - `high`: default. Use for unfamiliar or multi-module work, concurrency and lifecycle bugs, protocol
   correctness, security boundaries, greenfield features, and difficult root-cause analysis.
-
 - `xhigh`: use for especially difficult reasoning and capability-sensitive coding.
 - `max`: use for the hardest long-running tasks when the additional reasoning cost is justified.
 
-Honor an explicit user choice. Use only `low`, `medium`, `high`, `xhigh`, or `max`; do not translate another requested
-level into one of them. Record the selected level beside each worker and preserve it across
+Honor an explicit user choice. Use only `low`, `medium`, `high`, `xhigh`, or `max`; do not
+translate another requested level into one of them. Record the selected level beside each worker and preserve it across
 continuation rounds unless verified evidence justifies changing it.
 
 ## Dispatch with the exact model contract
@@ -123,8 +122,10 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents, grok-agents, or any
-.agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
+skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents,
+grok-agents, composer-agents, qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
+opencode-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested
+workers.
 ```
 
 This prevents a worker from replacing the selected model or effort through nested delegation.

@@ -22,9 +22,9 @@ This guide describes how to upgrade Ferrum Edge with zero configuration loss and
 a clear rollback path. The approach varies by operating mode, but the core
 principle is the same: **export logical configuration, validate the new binary
 against a fresh datastore (or config copy) on non-production ports, then cut
-over production traffic.** File-mode config version bumps still use in-memory or
-`FERRUM_MODE=migrate` config migration; that is separate from the database
-baseline contract above.
+over production traffic.** File mode has no database; its config format is
+`version: "1"` with no shipped config transforms, so breaking field changes are
+applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release
 
@@ -214,6 +214,14 @@ for limits, PUT semantics, and `X-Ferrum-Provisioned-By` behavior.
 
 ## Breaking changes in 0.9.0
 
+Every `BREAKING` changelog entry in the `[0.9.0]` release is listed here exactly
+once, with its issue number and operator action. A few later breaking changes
+that need the same kind of operator action are also kept here (issues #4768,
+#4816, #4817, #5693, #5699 / #5700). Several entries fail **silently** at
+cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded
+spellings, backends stop seeing client-supplied XFF hops) rather than refusing
+config load. Read this section before the per-mode procedures below.
+
 ### ConfigSync subscription identity binding
 
 `ConfigSync.Subscribe` now requires the request's trimmed `node_id` to equal
@@ -223,13 +231,12 @@ Before upgrading, update external DP token issuers and custom subscribers to
 use the same node identity for both fields. Built-in DP token minting already
 does this. Enforcement is immediate; there is no compatibility mode.
 
-Every `BREAKING` changelog entry in the `[0.9.0]` release is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
-
 ### Backend mTLS handshake without a client certificate is pre-wire (issue [#4406](https://github.com/ferrum-edge/ferrum-edge/issues/4406))
 
 An HTTPS origin that requires a client certificate previously logged `error_class=connection_reset` (or the `request_error` catch-all) and `X-Gateway-Error: backend_error` when the gateway presented none. That failure never reached HTTP. Typed rustls handshake errors still log `error_class=tls_error`. On the reqwest HTTP/1 path the rustls error is not in the request chain (hyper `is_canceled`), so the class is `connection_pool_error`. Both are pre-wire; `X-Gateway-Error` is `connection_failure`. `retry_on_connect_failure` replays regardless of method. The circuit breaker uses the connect-error path (`trip_on_connection_errors`) instead of a 502-status / post-wire reset charge. Plugin outbound HTTP (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) also retries `connection_pool_error` on GET/HEAD/OPTIONS; that list is not identical to `request_reached_wire`.
 
 **Operator action:** retarget alerts keyed on `connection_reset` / `backend_error` for this misconfig onto `tls_error` / `connection_pool_error` / `connection_failure`. If you set `trip_on_connection_errors: false` to ignore connect failures, this handshake will no longer trip the breaker via 502 in `failure_status_codes`. Configure `backend_tls_client_cert_path` / `backend_tls_client_key_path` (or stop requiring client certs on the origin).
+
 ### TLS event source IDs are opaque digests (issue [#4435](https://github.com/ferrum-edge/ferrum-edge/issues/4435))
 
 `GET /admin/tls/events` no longer returns configured source paths or URIs in
@@ -244,21 +251,25 @@ identifiers and error strings do not remain in snapshots.
 `sources[].source_id` as an opaque returned digest and use that value, rather
 than a configured URI/path, in the `source_id` query filter; accept the new
 `recovered` outcome.
+
 ### Native ConfigSync and MeshSubscribe share xDS stream admission (issue [#4432](https://github.com/ferrum-edge/ferrum-edge/issues/4432))
 
 Authenticated `ConfigSync.Subscribe` and `MeshConfigSync.MeshSubscribe` streams previously had no process, namespace, principal, or node ceiling. They now draw from the existing ADS admission controller (`FERRUM_XDS_MAX_TOTAL_STREAMS` and the per-namespace / per-principal / per-node / distinct-node ceilings). Excess streams are refused with gRPC `RESOURCE_EXHAUSTED` before a snapshot or response channel is allocated. Under `FERRUM_MESH_PRODUCTION_MODE=true`, a previously valid unbounded (`0`) configuration is refused at validate and CP startup unless `FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true`, including when ADS is disabled.
 
-**Operator action:** size the `FERRUM_XDS_MAX_*` budgets for native DP and mesh subscribers as well as ADS, and replace any production `0` (unbounded) values with finite ceilings or the explicit unsafe override before upgrading. Check the concrete defaults against your fleet first: `FERRUM_XDS_MAX_TOTAL_STREAMS` is **1024**, `FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE` **512**, `FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL` **256**, and `FERRUM_XDS_MAX_STREAMS_PER_NODE` **4**. A CP that serves more DP and mesh subscribers than the total ceiling — or a fleet that shares one credential across more than 256 subscribers — starts refusing streams with `RESOURCE_EXHAUSTED` at that boundary, where before the upgrade every native stream was admitted. Raise the ceilings to match the fleet before cutover, not after the first refusal.
+**Operator action:** size the `FERRUM_XDS_MAX_*` budgets for native DP and mesh subscribers as well as ADS, and replace any production `0` (unbounded) values with finite ceilings or the explicit unsafe override before upgrading. Check the current defaults against your fleet first: `FERRUM_XDS_MAX_TOTAL_STREAMS` is **8192**, `FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE` **4096**, `FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL` **2048**, and `FERRUM_XDS_MAX_STREAMS_PER_NODE` **4** (0.9.0 shipped with 1024 / 512 / 256 / 4). A CP that serves more DP and mesh subscribers than the total ceiling — or a fleet that shares one credential across more than 2048 subscribers — starts refusing streams with `RESOURCE_EXHAUSTED` at that boundary, where before the upgrade every native stream was admitted. Raise the ceilings to match the fleet before cutover, not after the first refusal.
+
 ### AI gateway authentication `401` bodies use the OpenAI nested envelope (issue [#4408](https://github.com/ferrum-edge/ferrum-edge/issues/4408))
 
 Proxies with an effective `ai_federation` or `ai_stream_router` plugin now return OpenAI-shaped `{"error":{"message","type","param","code"}}` bodies for gateway-authored authentication `401`s (missing or invalid credentials from `key_auth`, JWT/JWKS/Basic/HMAC/LDAP/mTLS/OIDC/introspection plugins). Status codes and `WWW-Authenticate` are unchanged. Authorization-phase rejects (`acl`, `rate_limiting`, and other `authorize` plugins) and non-`401` authentication outcomes keep their existing bodies.
 
 **Operator action:** on AI gateway routes, read `error.message` / `error.code` (or use an OpenAI-compatible client) instead of parsing the flat `{"error":"<string>"}` shape for authentication failures.
+
 ### Opaque-TLS SNI admission refusals classify as `dispatch_policy_rejected` / `gateway_policy` (issue [#4407](https://github.com/ferrum-edge/ferrum-edge/issues/4407))
 
 Fail-closed opaque-TLS SNI admission (plaintext on an SNI port, ClientHello timeout / incomplete / malformed hello, unmatched SNI with no catch-all) still RSTs the client and still does not dial or charge a backend. The `StreamTransactionSummary` taxonomy is what changed: those refusals previously logged `error_class=connection_refused` with `disconnect_cause=backend_error` / `disconnect_direction=backend_to_client` (or unmatched SNI as `request_error` / `recv_error`) even though `backend_target` was empty. They now log `error_class=dispatch_policy_rejected`, `disconnect_cause=gateway_policy`, and `disconnect_direction=unknown`. Real backend connect refusals remain `connection_refused`.
 
 **Operator action:** retarget alerts and dashboards that keyed opaque-TLS SNI scanner/plaintext/slow-hello noise on `connection_refused` or `backend_error` to `dispatch_policy_rejected` / `gateway_policy`.
+
 ### Malformed or out-of-range `FERRUM_POOL_*` settings refuse to start (issue [#4428](https://github.com/ferrum-edge/ferrum-edge/issues/4428))
 
 Connection-pool environment settings previously ignored failed numeric parses, treated two boolean parse failures as `true`, and silently clamped several out-of-range values. `ferrum-edge validate` and `run` now fail closed with the variable name and the offending value. These are process environment / `ferrum.conf` settings, not CP-pushed gateway config, so a DP does not newly reject a snapshot it previously accepted.
@@ -396,6 +407,7 @@ never changes `failurePolicy` to `Ignore` to make a broken webhook render.
 **Operator action:** set `injector.caBundle` or
 `injector.certManager.injectCaFrom` before enabling the injector. `helm
 template` / `helm upgrade` fail until one trust source is set.
+
 ### `preserve_host_header` now sets `:authority` on direct-H2 and gRPC backends (issue [#4410](https://github.com/ferrum-edge/ferrum-edge/issues/4410))
 
 Ferrum's outbound direct-H2 and native-gRPC dispatch previously sent a hostname-only `Host` while Hyper derived `:authority` from the full backend URI including a non-default port. RFC 9113 §8.3.1 forbids that disagreement, so RFC-compliant HTTP/2 origins reset the stream and the client saw `502 backend_error` or gRPC `UNAVAILABLE`. Both fields now carry the same authority.
@@ -632,7 +644,6 @@ The public `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and 
 
 `LoadBalancer::record_connection_start` and `LoadBalancer::record_connection_end` remain, but they must now be strictly paired: every start needs exactly one end, on the same balancer, on every exit path. A rebuild no longer resets a leaked count, so a missed end keeps the target looking busier than it is to least-connections, and to the per-target connection metrics, until the target leaves the upstream.
 
-## Database Mode (`FERRUM_MODE=database`)
 ## Build-Out Database Upgrade (PostgreSQL, MySQL, SQLite, MongoDB)
 
 Use this procedure whenever the target binary's `V001` baseline may differ from
@@ -1053,15 +1064,10 @@ one fail-closed replay-partition contract
   even when no `Content-Length` is present. Expect those requests to reach the
   origin instead of receiving or populating a cached response.
 - **Tracing and correlation request headers are now retained-cache key
-  dimensions.** An earlier revision excluded `traceparent`, `tracestate`, `b3`,
-  `X-B3-*`, `X-Request-Id`, `X-Correlation-Id` and friends from the shared
-  request-header partition by reusing the *response*-cache sanitation classifier
-  and arguing they are fresh "by construction". That proof does not hold on the
-  request side: `correlation_id` preserves a valid client-supplied ID, the plugin
-  may not be configured at all, and the value reaches the origin either way.
-  Wherever that partition is used they are bound like any other backend-visible
-  header, so a client that varies its trace header per request will now miss per
-  request; `response_caching` now binds the same origin-visible fields directly
+  dimensions.** `traceparent`, `tracestate`, `b3`, `X-B3-*`, `X-Request-Id`,
+  `X-Correlation-Id` and similar headers reach the origin, so they are bound
+  like any other backend-visible header (they were previously excluded). A
+  client that varies its trace header per request will now miss per request; `response_caching` now binds the same origin-visible fields directly
   in its base partition even when the origin does not nominate them in `Vary`.
   **Plan for this before enabling either retained cache alongside request
   tracing.** `otel_tracing` injects a `traceparent` carrying a freshly generated
@@ -1144,7 +1150,11 @@ CP/DP upgrades use the same
 [build-out database rebuild](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
 for the CP datastore, with the added consideration of rolling out DP nodes. The
 key property that makes this safe: **DPs cache their config in memory and
-continue serving traffic even if the CP is temporarily unavailable.**
+continue serving traffic while the CP is temporarily unavailable** — up to
+`FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default `3600`), after which the default
+`fail_closed` action refuses new traffic (see
+[bounded last-known-good age](cp_dp_mode.md#bounded-last-known-good-configuration-age)).
+Keep each CP outage well inside that window.
 
 ### Helm Chart Runtime Defaults
 
@@ -1226,7 +1236,7 @@ Starting in v0.9.0, CP and DP nodes exchange their Ferrum Edge binary version du
 What happens on rejection:
 - The **CP** returns a gRPC `FAILED_PRECONDITION` status with a message identifying both versions and the required DP version.
 - The **DP** logs the error, disconnects, and enters the standard exponential-backoff/failover loop. It will keep failing until upgraded to a compatible version.
-- **No config is exchanged** — the DP continues serving traffic with whatever config it had cached before the connection attempt.
+- **No config is exchanged** — the DP continues serving traffic with whatever config it had cached before the connection attempt, subject to the `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` bound.
 
 This prevents a scenario where a newer CP pushes config containing fields or structures that an older DP cannot deserialize, which could cause silent data loss or deserialization failures.
 
@@ -1413,16 +1423,18 @@ FERRUM_MODE=file \
   FERRUM_PROXY_HTTP_PORT=8100 \
   FERRUM_PROXY_HTTPS_PORT=8543 \
   FERRUM_ADMIN_HTTP_PORT=9100 \
+  FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   FERRUM_LOG_LEVEL=info \
   ./ferrum-edge-new
 ```
 
-Validate:
+Without `FERRUM_ADMIN_JWT_SECRET`, file mode generates a random admin secret and
+externally minted tokens cannot read the Admin API. Validate:
 
 - **Health check**: `curl http://localhost:9100/health`
-- **Config loaded**: `curl http://localhost:9100/proxies` — verify all routes are present
+- **Config loaded**: `curl -H "Authorization: Bearer $TOKEN" http://localhost:9100/proxies` — verify all routes are present
 - **Proxy traffic**: send test requests through port 8100
-- **Logs**: look for deprecation warnings or config parsing errors
+- **Logs**: look for config parsing errors or warnings
 
 #### 4. Cut Over
 
@@ -1446,7 +1458,7 @@ FERRUM_MODE=file \
 
 ### Pre-Upgrade Checklist
 
-- [ ] Read [Breaking changes in 0.9.0](#breaking-changes-in-090) and the release notes for breaking changes, deprecated fields, and new required fields
+- [ ] Read the section for your target release above (for example [Upgrading to 0.9.7](#upgrading-to-097)), [Breaking changes in 0.9.0](#breaking-changes-in-090), and the release notes for breaking changes, deprecated fields, and new required fields
 - [ ] For database/CP modes during build-out: plan a
       [fresh-database rebuild](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
       (`GET /backup` → fresh `V001` baseline → `POST /restore`); keep the old

@@ -36,26 +36,25 @@ same names live in `charts/ferrum-mesh/templates/alerts-prometheusrule.yaml`.
 ## Installing via the Helm chart
 
 The bundled `ferrum-mesh` Helm chart ships these dashboards as a templated
-`ConfigMap` carrying the `grafana_dashboard: "1"` label, which the upstream
-Grafana sidecar (`kiwigrid/k8s-sidecar`) and the Grafana Operator both pick
-up automatically. The ConfigMap is opt-in for safety — operators with an
-existing dashboard pipeline see no change unless they enable observability.
+`ConfigMap` (default name `ferrum-mesh-dashboards`) carrying the
+`grafana_dashboard: "1"` label, which the upstream Grafana sidecar
+(`kiwigrid/k8s-sidecar`) and the Grafana Operator both pick up automatically.
+The ConfigMap renders only when `observability.enabled=true`
+(`observability.dashboards.enabled` then defaults to `true`; set it to `false`
+if you manage dashboards out of band). Enabling observability also renders
+monitors and alerts, which require a scrape credential
+(`observability.metrics.allowedCidrs` or `observability.metrics.bearerToken`),
+so render fails without one:
 
 ```bash
 helm install ferrum-mesh ./charts/ferrum-mesh \
   --set observability.enabled=true \
-  --set observability.dashboards.enabled=true
+  --set observability.metrics.allowedCidrs=<prometheus-pod-cidr>
 ```
 
-If Grafana looks for a non-default label, override it:
-
-```bash
-helm install ferrum-mesh ./charts/ferrum-mesh \
-  --set observability.enabled=true \
-  --set observability.dashboards.enabled=true \
-  --set observability.dashboards.sidecarLabel=grafana_dashboard \
-  --set observability.dashboards.sidecarLabelValue=my-folder
-```
+If Grafana looks for a non-default label, override it with
+`observability.dashboards.sidecarLabel` / `observability.dashboards.sidecarLabelValue`
+(for example `--set observability.dashboards.sidecarLabelValue=my-folder`).
 
 ## Installing without Helm
 
@@ -71,10 +70,11 @@ either:
 
 ## Notes on what is and isn't covered
 
-- **Active-connections / pool-utilization gauges** are not exposed in
-  Prometheus format. The gateway surfaces them only in authenticated detail
-  from `GET /overload` and the JWT-authenticated `GET /metrics/runtime` JSON
-  endpoint, so they are intentionally absent from `gateway-overview.json`.
+- **Concurrency and pool detail** is not charted. The live gauges
+  `ferrum_overload_active_connections` / `ferrum_overload_active_requests` are
+  exported on `/metrics` but not on `gateway-overview.json`; fuller pool and
+  overload detail is available from authenticated `GET /overload` and the
+  JWT-authenticated `GET /metrics/runtime` JSON endpoint.
 - **Per-rule mesh authz denies** are surfaced in transaction logs only
   (`mesh_authz.deny_policy` metadata), not as Prometheus labels. The
   `policy-deny.json` dashboard groups denies by source / destination

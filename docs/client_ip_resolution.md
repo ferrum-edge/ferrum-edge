@@ -21,7 +21,7 @@ The gateway uses a three-step process to resolve the real client IP:
 
 2. **Walk `X-Forwarded-For` right-to-left**: If the configured real-IP header is absent, parse the XFF header into a list of IPs. Every field-line is read as raw bytes and repeated field-lines are one chain in wire order. Starting from the rightmost entry, skip any IP that matches a trusted proxy CIDR. The first non-trusted IP is the real client.
 
-3. **Fall back to socket IP**: If the configured real-IP header is present but empty, duplicated across field-lines, not valid UTF-8, malformed, comma-separated, or sent by an untrusted peer, the TCP socket address is used — and `X-Forwarded-For` is **not** consulted as a fallback, because it is the weaker source the operator chose to override. The socket address is also used when no XFF header is present, all XFF entries are trusted proxies, or no trusted proxies are configured.
+3. **Fall back to socket IP**: If the configured real-IP header is present but empty, duplicated across field-lines, not valid UTF-8, malformed, comma-separated, or sent by an untrusted peer, the TCP socket address is used — and `X-Forwarded-For` is **not** consulted as a fallback, because it is the weaker source the operator chose to override. The socket address is also used when no XFF header is present, all XFF entries are trusted proxies, the first non-trusted entry (walking right-to-left) is unparseable, or no trusted proxies are configured.
 
 ### The authoritative header must be overwritten, not appended
 
@@ -190,7 +190,7 @@ The client IP resolution follows these security principles:
 | Proxy preserves the client's real-IP header and appends its own (two field-lines) | Both lines rejected in either order; socket IP used; XFF not consulted |
 | Typo in `FERRUM_TRUSTED_PROXIES` (e.g. `/33`, junk, stray comma) | Configuration rejected; `validate` and startup fail before listeners bind |
 | All XFF entries are trusted proxy IPs | Falls back to socket IP |
-| XFF contains unparseable garbage entries | Stops at the first unparseable entry (conservative) |
+| XFF contains unparseable garbage entries | Walk stops at the first unparseable entry left of the trusted suffix; socket IP used |
 | XFF field-line carries `obs-text` alongside the address the proxy appended | Field-line preserved byte for byte; the appended address is resolved |
 | Repeated XFF field-lines, one of them not representable as text | All lines walked as one chain in wire order; only the rightmost hop decides |
 | Trusted proxy overwrites XFP with one `http` or `https` value | Value becomes the original request scheme |
@@ -280,8 +280,7 @@ The resolved client IP (`ctx.client_ip`) is used throughout the gateway. It is a
 
 | Feature | How IP Is Used |
 |---|---|
-| **IP Whitelisting / Blacklisting** | `ip_restriction` plugin checks `client_ip` against allow/deny lists |
-| **IP Restriction** | `ip_restriction` plugin enforces allow-first or deny-first IP policies |
+| **IP Restriction** | `ip_restriction` plugin checks `client_ip` against its allow/deny lists (allow-first or deny-first) |
 | **Rate Limiting** | When `limit_by="ip"` (default), rate limit key is `ip:{client_ip}`. `consumer` and `spiffe_identity` modes fall back to this IP key when their identity is absent |
 | **Load Balancer Hashing** | `client_ip` used as hash key for consistent upstream selection |
 | **Transaction Logging** | `client_ip` included in all log entries and transaction summaries |

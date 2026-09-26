@@ -574,14 +574,15 @@ window matters because a `/mutate` call landing on a terminating replica is
 connection-refused and fails pod CREATE cluster-wide. The **node-agent** renders
 `terminationGracePeriodSeconds` (30) only: `node_agent` mode never reads
 `FERRUM_SHUTDOWN_DRAIN_SECONDS` and the DaemonSet sits behind no Service, so a
-preStop sleep would only delay node drains. Restricted-compatible `securityContext` / non-empty
-`resources` apply to control plane, CA, and east-west; ambient keeps
-host-network datapath capabilities after dropping ALL, and its
-`securityContext` is a constrained explicit surface
-(`allowPrivilegeEscalation`, `readOnlyRootFilesystem`, `capabilities.drop`,
-`capabilities.add`) so an unsupported key is rejected rather than ignored.
+preStop sleep would only delay node drains.
+
+Restricted-compatible `securityContext` and non-empty `resources` defaults
+apply to control plane, CA, and east-west. Ambient keeps its host-network
+datapath capabilities after dropping ALL; its `securityContext` accepts only
+`allowPrivilegeEscalation`, `readOnlyRootFilesystem`, `capabilities.drop`, and
+`capabilities.add`, so an unsupported key is rejected rather than ignored.
 `allowPrivilegeEscalation` defaults to `false` on the steady-state proxy
-(Restricted); it is not a UDP-preflight-only field.
+container, not only on the UDP preflight.
 
 Each workload's `admin.bindAddress` must be an IP literal and its
 `admin.allowedCidrs` (and `observability.metrics.allowedCidrs`) is validated
@@ -678,12 +679,13 @@ injector:
 
 ## Liveness and Readiness Probes
 
-Ferrum Edge serves unauthenticated `/health` and `/status` on the admin listener. That coarse response includes only `status` and `ready`. Authenticated detail (admin JWT, metrics bearer token, or an allowed metrics CIDR) additionally includes fields such as `mode`, `database`, `cached_config`, and `admin_writes_enabled`.
+Ferrum Edge serves unauthenticated `/live`, `/health`, and `/status` on the admin listener. The unauthenticated `/health` response includes only `status` and `ready`. Authenticated detail (admin JWT, metrics bearer token, or an allowed metrics CIDR) additionally includes fields such as `mode`, `database`, `cached_config`, and `admin_writes_enabled`.
 
 Important behavior:
 
-- The endpoint returns HTTP `200` when the admin listener is healthy.
-- The JSON `status` field changes to `"degraded"` when the process is alive but running with a degraded dependency state, such as a disconnected database while serving from cached config.
+- `/live` returns HTTP `200` whenever the process and admin listener are up.
+- `/health` returns HTTP `200` once the gateway is ready, and HTTP `503` while it is `"starting"`, `"unavailable"` (a lost dependency such as a stale DP config), or `"draining"` after SIGTERM.
+- A ready gateway with a degraded dependency (for example a disconnected database while serving cached config) still returns `200`, with JSON `status: "degraded"`.
 
 ### Startup Timing
 
@@ -717,11 +719,11 @@ startupProbe:
 
 ### Strict Readiness
 
-An `httpGet` probe returns success for any 2xx status from `/health` (the gateway returns 200 with `{"status":"ok"}` when healthy). However, `httpGet` probes connect to the **pod IP**, so they only work when admin is bound non-loopback (`FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0`) — which in `database`/`cp` modes also requires an allowlist, admin TLS, or the explicit insecure opt-in (see "Admin bind address" above). With the loopback default, use the **exec** `ferrum-edge health` probe shown above instead.
+An `httpGet` probe returns success for any 2xx status from `/health`. However, `httpGet` probes connect to the **pod IP**, so they only work when admin is bound non-loopback (`FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0`) — which in `database`/`cp` modes also requires an allowlist, admin TLS, or the explicit insecure opt-in (see "Admin bind address" above). With the loopback default, use the **exec** `ferrum-edge health` probe shown above instead.
 
-> **Note**: The distroless image has no shell or curl. Exec probes using `/bin/sh` and `curl` are not available. Use `httpGet` probes (shown above) or the built-in `ferrum-edge health` subcommand.
+> **Note**: The distroless image has no shell or curl, so exec probes using `/bin/sh` or `curl` are not available. Use `httpGet` probes or the built-in `ferrum-edge health` subcommand.
 
-If you need to inspect the response body (e.g., verify `"status":"ok"` or check DP config sync), use the `ferrum-edge health` exec probe:
+`ferrum-edge health` passes only on HTTP `200`; it does not parse the response body. Without `-p`/`--host` it reads `FERRUM_ADMIN_HTTP_PORT` (default `9000`) and `FERRUM_ADMIN_BIND_ADDRESS` from the container environment (or `ferrum.conf`), connecting to `127.0.0.1` (or `::1`) when the bind address is a wildcard, so a bare command also works:
 
 ```yaml
 readinessProbe:
@@ -733,25 +735,13 @@ readinessProbe:
 
 ### Data Plane Readiness After Config Sync
 
-In DP mode, the pod can start before the Control Plane pushes config. The `httpGet` probe on `/health` will succeed once the admin API is listening, even before config is received. For most deployments this is acceptable — the DP returns 404 for unrouted paths until config arrives.
+In DP mode, `/health` stays `503` (`"starting"`) until the first Control Plane snapshot has been applied, so a new DP pod does not receive Service traffic before it has config.
 
 #### Bounded stale config while every CP is lost
 
 A data plane keeps serving its last **applied** CP snapshot during control-plane outages, but that window is bounded. When **every** CP is unreachable and the applied snapshot reaches `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default **3600**), `/health` reports `ready: false` with `status: "unavailable"` so Kubernetes stops steering new traffic to the pod. Under the default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`, new HTTP/1.1, HTTP/2, HTTP/3, TCP, UDP-session, and DTLS-session admissions are refused at the proxy boundary while already-accepted connections and in-flight requests drain normally. Partial CP loss (another CP remains authoritative) and successful multi-CP failover do **not** trigger the fence — only total CP authority loss combined with an aged applied snapshot does. Setting the bound to `0` restores unbounded serving as an explicit, deliberately unsafe opt-in.
 
 The `ferrum-gateway` chart exposes these as `dp.configMaxStaleSeconds` and `dp.configStaleAction` (omitted values keep the binary defaults above). Authenticated `/health` includes a fixed-cardinality `dp_config` object for operators who need the live reason and counters. See [cp_dp_mode.md](cp_dp_mode.md#bounded-last-known-good-configuration-age) for the full semantics, recovery requirements, and metrics.
-
-If your deployment requires at least one proxy before the pod becomes ready, use a sidecar or init container with curl to inspect the health response body:
-
-```yaml
-# Example with an ephemeral debug container or sidecar
-readinessProbe:
-  httpGet:
-    path: /health
-    port: admin-http
-  initialDelaySeconds: 10
-  periodSeconds: 10
-```
 
 In authenticated `/health` detail, `proxy_count` is reported inside `cached_config`, not as a top-level field. It is not exposed to unauthenticated probes.
 
@@ -1011,8 +1001,10 @@ For CP/DP mode, keep the Control Plane private and expose only the Data Plane pr
 
 With the Helm chart, set `networkPolicy.enabled=true` and configure
 `networkPolicy.allowedNamespaceSelectors` / `networkPolicy.allowedPodSelectors`
-to restrict admin and CP gRPC ingress while leaving proxy ports open. Example
-manifest (adjust selectors to your scrape/admin clients):
+to restrict admin and CP gRPC ingress while leaving proxy ports open (`cp` mode
+has no proxy listeners, so a CP policy only has the restricted rule). Example
+manifest for the Control Plane (adjust selectors to your DP, scrape, and admin
+clients):
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -1025,12 +1017,6 @@ spec:
       app: ferrum-edge-cp
   policyTypes: ["Ingress"]
   ingress:
-    # Data-plane proxy ports (omit in cp-only installs with no proxy listeners).
-    - ports:
-        - protocol: TCP
-          port: 8000
-        - protocol: TCP
-          port: 8443
     # Admin + CP gRPC: only from trusted namespaces/pods.
     - from:
         - namespaceSelector:
@@ -1138,6 +1124,14 @@ behaviour is:
   immediately on the next cluster change. Lower that interval if you want a
   tighter bound. **Alert on `quarantine_active`**, not on individual
   quarantines.
+- **A replica holding back its own mesh recovers on its own.** Because the
+  sequence is a minimum over scopes, a change in one busy scope while the rest
+  are quiet cannot advance it; the control plane keeps serving the last accepted
+  mesh rather than stamping new content with the old sequence. Instead of
+  waiting out the relist window, it immediately asks every watch scope for a
+  fresh authoritative boundary (at most once per 5 s per scope), so the withheld
+  mesh is released after one relist round trip. A scope that cannot relist still
+  blocks the sequence from advancing.
 - **After an etcd restore-from-backup**, Kubernetes `resourceVersion` can rewind.
   That is never auto-adopted inside one authority (it is indistinguishable from a
   rollback attack). Set `FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID` to a new value and
@@ -1147,16 +1141,6 @@ behaviour is:
 - **`FERRUM_MESH_CONFIG_AUTHORITY_ID=`** (empty) disables revision publication
   entirely, on either shape. Data planes then apply no cross-CP ordering — only
   do this deliberately.
-
-- **A replica holding back its own mesh recovers on its own.** The sequence is
-  a minimum over scopes, so a change in one busy scope while the rest are quiet
-  cannot advance it, and the control plane keeps serving the last accepted mesh
-  rather than stamping new content with the old sequence. It does not wait out
-  the relist window to get unstuck: it asks every watch scope for a fresh
-  authoritative boundary immediately (spaced by a 5 s per-scope floor), so the
-  withheld mesh is released after one relist round trip. Nothing is assumed —
-  a scope that cannot relist still contributes no evidence and the sequence
-  still refuses to advance.
 
 The Kubernetes control plane costs one extra one-item list request per watch
 scope per relist window for this (the authoritative boundary read), plus a

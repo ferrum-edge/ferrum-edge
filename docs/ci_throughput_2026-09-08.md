@@ -90,7 +90,7 @@ another optimization-profile guess. The prior dev-profile experiments lost
 iterations or failed to show repeatable benefit. The GHCR transfer foundation
 from #4750/#4815 proves transport, not compiler reuse or a production migration.
 Keep AddressSanitizer, target inventory, input limits, runtime bounds and useful
-stack traces intact. Root must verify both actual compiler hits and subsequent
+stack traces intact. Maintainers must verify both actual compiler hits and subsequent
 main cache retention before adopting a storage change.
 
 ## Cancellation and release follow-through
@@ -126,7 +126,7 @@ affected-platform runtime/ABI/install/image results are still required.
 
 Local validation is static review and `git diff --check` only. The existing
 hosted required-policy path invokes `verify_ci_runtime_cache.py` and its
-self-tests; their result on the new PR head is pending. Root owns fresh hosted
+self-tests; their result on the new PR head is pending. Maintainers own fresh hosted
 CI, exact-head review and merge. Subsequent snapshots must retain the same
 cache IDs across completed main writes and PR readers before asserting durable
 retention. None of the four issue acceptance sets is closed by configuration

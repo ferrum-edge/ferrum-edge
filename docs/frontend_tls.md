@@ -20,7 +20,7 @@ Required for HTTPS mode:
 # Server certificate (PEM format)
 export FERRUM_FRONTEND_TLS_CERT_PATH="/path/to/server.crt"
 
-# Server private key (PEM format)  
+# Server private key (PEM format)
 export FERRUM_FRONTEND_TLS_KEY_PATH="/path/to/server.key"
 
 # Optional source overrides. These accept a path, file:// URI, or inline PEM.
@@ -161,19 +161,13 @@ export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/client-ca-bundl
 
 ### Separate Listeners vs Single Port
 
-**Before (Single Port Approach):**
-- Single listener trying to handle both HTTP and HTTPS
-- TLS handshake failures for HTTP clients
-- Port confusion and protocol mismatches
-- Complex protocol detection logic
+HTTP and HTTPS are served on separate listeners (defaults: HTTP `8000`, HTTPS
+`8443`, both configurable) rather than one port with protocol detection:
 
-**After (Separate Listeners):**
-- **Clear protocol separation** - HTTP on dedicated port, HTTPS on dedicated port
-- **No handshake conflicts** - Each listener handles its protocol exclusively
-- **Standard port conventions** - HTTP: 8000, HTTPS: 8443 (both configurable)
-- **Better security posture** - Can block HTTP port in production
-- **Easier load balancing** - Separate endpoints for different protocols
-- **Simplified client configuration** - Clear URLs for each protocol
+- Each listener handles one protocol, so plaintext clients never hit a TLS
+  handshake failure.
+- The plaintext port can be disabled (`0`) or firewalled in production.
+- Load balancers and clients get a distinct endpoint per protocol.
 
 ### Listener Management
 
@@ -317,7 +311,7 @@ export FERRUM_ADMIN_TLS_NO_VERIFY="true"
 # Backend TLS no-verify (testing only)
 export FERRUM_TLS_NO_VERIFY="true"
 
-# JWT authentication (required)
+# JWT verification secret (required in database and CP modes, at least 32 characters)
 export FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret"
 ```
 
@@ -371,12 +365,12 @@ export FERRUM_ADMIN_TLS_NO_VERIFY="true"
 
 ### Admin API Security Notes
 
-- **mTLS Support**: Admin API now supports client certificate verification
+- **mTLS Support**: The admin HTTPS listener can require and verify client certificates
 - **Custom CA Bundle**: Can use internal/private CAs for admin client verification
 - **No-Verify Mode**: Available for testing (NEVER use in production)
 - **JWT Required**: All admin endpoints require JWT authentication
 - **Same Security**: HTTP and HTTPS endpoints have identical security requirements
-- **Operating Modes**: Admin API available in Database and Control Plane modes only
+- **Operating Modes**: The Admin API is read-write in database and CP modes and read-only in file and DP modes
 
 ### No-Verify Mode (Testing Only)
 
@@ -402,10 +396,10 @@ export FERRUM_ADMIN_TLS_NO_VERIFY="true"
 ```
 
 #### **Warnings**
-Gateway will log warnings when no-verify is enabled:
+The gateway logs warnings at startup when no-verify is enabled, for example:
 ```
-WARNING: Admin TLS configuration loaded with certificate verification DISABLED (testing mode)
-WARNING: Backend TLS certificate verification DISABLED (testing mode)
+WARNING: FERRUM_ADMIN_TLS_NO_VERIFY=true — the admin listener does not require or verify client certificates. Do not use in production.
+WARNING: FERRUM_TLS_NO_VERIFY=true — outbound TLS certificate verification is DISABLED. Do not use in production.
 ```
 
 ## Example Certificate Setup
@@ -501,13 +495,12 @@ are listed at the end of this section.
   single-pod incident. This is deliberate (see
   [PRODUCTION_READINESS.md](../PRODUCTION_READINESS.md) → "Deliberate
   decisions"): booting with an expired CRL would serve without revocation
-  enforcement for that issuer, which is fail-open. Two things are required of
-  an operator: refresh the CRL before `nextUpdate`, and/or set
-  `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` (and
-  `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` for backend surfaces) so a
-  refreshed copy is adopted without a restart. Live reload is **off by
-  default**, so without it the only way to pick up a new CRL is a restart —
-  which the expired one blocks.
+  enforcement for that issuer, which is fail-open. Refresh the CRL before
+  `nextUpdate`, and set `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` (backend
+  surfaces use `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED`, which defaults to
+  `true`) so a refreshed copy is adopted without a restart. Frontend live
+  reload is **off by default**, so without it the only way to pick up a new CRL
+  on frontend surfaces is a restart — which the expired one blocks.
 - **A lead-time warning is the advance signal.** Every accepted CRL source
   whose soonest `nextUpdate` falls within `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS`
   (default `30`, `0` disables) logs a `warn!` naming the redacted source id and
@@ -1114,7 +1107,7 @@ listener family that does no client-certificate authentication (see
 
 ### Gateway API Multi-Certificate Serving (SNI)
 
-A data plane that receives its frontend TLS material from a Kubernetes Gateway (`spec.listeners[].tls.certificateRefs`) can serve **many** certificates at once. This covers two shapes that used to be refused:
+A data plane that receives its frontend TLS material from a Kubernetes Gateway (`spec.listeners[].tls.certificateRefs`) can serve **many** certificates at once, including:
 
 - one listener naming several `certificateRefs` (for example an RSA and an ECDSA leaf, or several hostnames);
 - several Gateways in the **same namespace**, each owning its own Secret.
@@ -1154,7 +1147,12 @@ The snapshot is produced off the request path by a bounded, single-flight backgr
 
 ### Backend Connection Pool and TLS Paths
 
-For reqwest-based backend paths (HTTP/1.1, HTTP/2 via reqwest, HTTP/3 frontend-to-backend), each unique combination of `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` produces a **separate `reqwest::Client` pool entry**. Two proxies with different cert paths targeting the same backend host will not share connections. For rustls-based paths (gRPC pool, HTTP/2 direct pool), the TLS config is built per-connection rather than per-pool-entry, but the same isolation principle applies — different cert paths produce different TLS configurations.
+Each unique combination of `backend_tls_client_cert_path`,
+`backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` gets its
+own backend pool entry / TLS config, so two proxies with different TLS sources
+targeting the same backend host never share connections. See
+[backend_mtls.md → Connection Pool Behavior](backend_mtls.md#connection-pool-behavior)
+for the per-protocol details.
 
 ## Security Best Practices
 
@@ -1179,7 +1177,7 @@ That is necessary but not sufficient for the gateway's authorization contract:
 HTTP/2 and HTTP/3 multiplex new request streams over one transport connection
 for a long time without repeating the handshake, HTTP/1.1 reuses a connection
 for keep-alive requests, and a TCP+TLS stream session can stay open
-continuously. Issue #3816 tracks that gap.
+continuously.
 
 `mtls_auth` therefore enforces the leaf certificate's validity interval itself:
 
@@ -1392,9 +1390,9 @@ export RUST_LOG=debug
 ```
 
 Look for messages like:
-- "TLS configuration loaded with client certificate verification"
-- "TLS connection established with client certificate verification"
-- "TLS handshake failed"
+- "TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
+- "TLS not configured - HTTPS listener disabled"
+- "TLS policy: ..." (the startup policy summary described in [Verifying TLS Policy](#verifying-tls-policy))
 
 ## TLS Policy Hardening
 
@@ -1405,7 +1403,7 @@ The gateway supports fine-grained control over TLS protocol versions, cipher sui
 | **Inbound** | Proxy HTTPS, Admin HTTPS, HTTP/3 (QUIC) listeners |
 | **Outbound** | HTTP/1.1 and HTTP/2 backends (reqwest), hyper HTTP/2 pool, gRPC (grpcs://) backends, WebSocket (wss://) backends, TCP-TLS stream backends, HTTP/3 QUIC backends |
 
-> **Note:** DTLS (UDP-TLS) uses `dimpl`, which has its own cipher negotiation independent of rustls. Since issue #4507 the version, cipher-suite and key-exchange-group settings are translated into that vocabulary and applied to every DTLS surface (frontend listener, live-reload rebuild, generated NodeWaypoint listeners, backend client) — see [DTLS and the TLS policy](tcp_udp_proxy.md#dtls-and-the-tls-policy) for the mapping and for the one dimension that does not carry over (`ECDHE-RSA-*` suites, which DTLS cannot authenticate). `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` and `FERRUM_TLS_SESSION_CACHE_SIZE` remain rustls-only: they apply to inbound TCP/QUIC listeners and have no DTLS equivalent.
+> **Note:** DTLS (UDP-TLS) uses `dimpl`, which has its own cipher negotiation independent of rustls. The version, cipher-suite and key-exchange-group settings are translated into that vocabulary and applied to every DTLS surface (frontend listener, live-reload rebuild, generated NodeWaypoint listeners, backend client) — see [DTLS and the TLS policy](tcp_udp_proxy.md#dtls-and-the-tls-policy) for the mapping and for the one dimension that does not carry over (`ECDHE-RSA-*` suites, which DTLS cannot authenticate). `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` and `FERRUM_TLS_SESSION_CACHE_SIZE` remain rustls-only: they apply to inbound TCP/QUIC listeners and have no DTLS equivalent.
 
 ### Environment Variables
 
@@ -1478,7 +1476,9 @@ When `FERRUM_TLS_KEY_EXCHANGE_GROUPS` is not set, the gateway uses `X25519` and 
 
 Curve names are case-insensitive.
 
-Hybrid post-quantum groups such as Kyber/X25519 are not exposed by the current rustls/ring provider used by Ferrum. `FERRUM_TLS_KEY_EXCHANGE_GROUPS` is the stable operator-facing control point; supported hybrid names can be added there when the upstream provider exposes them.
+Only the three groups above are accepted; hybrid post-quantum groups are not currently configurable. `FERRUM_TLS_KEY_EXCHANGE_GROUPS` is where such names would be added.
+
+With `FERRUM_FIPS_MODE=enforce`, the default cipher suites and groups narrow to the FIPS-approved set (no ChaCha20-Poly1305, no X25519); see [fips.md](fips.md).
 
 **Example — X25519 only:**
 ```bash
@@ -1553,7 +1553,7 @@ When using load balancers:
 2. Set `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`
 3. Issue client certificates to authorized clients
 4. Update client applications to present certificates
-5. Gradually enforce mTLS (start with optional, then required)
+5. Enable mTLS once clients are ready: with a client CA bundle configured, every HTTPS client must present a valid certificate (there is no optional-certificate mode), so roll it out on a separate listener or gateway first if some clients are not yet ready
 
 ## ACME Auto-Renewal Requires Frontend TLS Live Reload
 
@@ -1725,7 +1725,7 @@ order with the CA while the original remains active:
   certificate record is not completion evidence.
 - **The order's own challenge type is used**, inferred from the challenge
   records it actually carries — not from whatever
-  `FERRUM_ACME_RENEWAL_CHALLENGE_TYPE` is set to now. Exactly one non-empty
+  `FERRUM_ACME_RENEW_CHALLENGE_TYPE` is set to now. Exactly one non-empty
   challenge family is required; no families or more than one is an explicit
   failure and the order is left untouched. Diagnostics name the order id only,
   never a token, key authorization, or account credential.
@@ -1791,14 +1791,13 @@ the whole recovery authority.
   the store rather than being silently folded onto another identity. Permitted
   characters are `A-Z a-z 0-9 - _ . :`. Leave the setting unset for a generated
   per-process identity, which is always valid and always distinct.
-- `FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS` no longer has to cover a whole ACME
+- `FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS` does not have to cover a whole ACME
   cycle, because the heartbeat extends the claim while the renewal runs; it has
   to cover one heartbeat interval (a third of the TTL) plus scheduling slack,
-  and it is how long a *crashed* holder's certificate stays unrenewable. Note
-  that the TTL by itself guarantees nothing: ACME does not fence side effects
-  for Ferrum, so a renewal that outran a static TTL would previously have
-  overlapped with its successor. Continuous maintenance plus
-  cancel-on-loss — not the TTL value — is what bounds overlap.
+  and it is how long a *crashed* holder's certificate stays unrenewable. The
+  TTL alone guarantees nothing, because ACME does not fence side effects for
+  Ferrum; the heartbeat plus cancel-on-loss is what bounds overlap between
+  renewers.
 - **DNS-01 hook cancellation stops the process Ferrum started, not its
   descendants.** A DNS-01 hook is a child process, and cancelling the renewal
   cancels it: the hook is spawned with kill-on-drop, so losing the claim

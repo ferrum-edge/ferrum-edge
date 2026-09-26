@@ -55,10 +55,9 @@ both endpoints having to be up before either can poll. After exchange, each
 server holds the peer's federated bundle. EVERY workload entry — `svc`,
 `ew-gateway`, `client`, AND `rogue` — is registered with `-federatesWith
 spiffe://<peer-td>` so its SPIRE-issued SVID carries the peer trust bundle and the
-proxy can verify cross-cluster peers. `rogue` is federated on purpose: the negative
-proves a DESTINATION-SIDE rejection, not an incidental client-side TLS failure.
-Because both `client` and `rogue` present a valid peer SVID once the trust domain is
-federated, STRICT PeerAuthentication alone cannot tell them apart; the destination's
+proxy can verify cross-cluster peers. Because both `client` and `rogue` present a
+valid peer SVID once the trust domain is federated, STRICT PeerAuthentication
+alone cannot tell them apart; the destination's
 `deny-peer-rogue` MeshPolicy (an identity-scoped DENY on the peer trust domain's
 `sa/rogue` principal) is what rejects exactly `rogue` — `mesh_authz` returns `403`
 with body `{"error":"Mesh authorization denied"}`, while the federated `sa/client`
@@ -103,8 +102,8 @@ east-west endpoint and the local `svc` pod IP are not known until both clusters
 are up). Cross-cluster remote classification rides `MultiClusterConfig.local_cluster`
 plus the remote workload's `cluster` field (the `workload_is_remote` cluster-name
 fallback), so no live remote-discovery poll is required. The mesh document shape
-is `{version?, mesh}` (`MeshConfig`); these documents were validated against the
-real `load_mesh_slice_from_file` deserializer + `validate_mesh_fields`.
+is `{version?, mesh}` (`MeshConfig`), as parsed by `load_mesh_slice_from_file`
+and checked by `validate_mesh_fields`.
 
 ## Live assertions
 

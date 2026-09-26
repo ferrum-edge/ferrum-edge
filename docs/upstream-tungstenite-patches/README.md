@@ -128,18 +128,20 @@ equivalent opt-out for automatic Ping replies (`auto_pong` or successor),
 incomplete-message count/duration bounds. The stray-continuation extension may
 retire only when the consumed parser rejects invalid continuation state before
 applying caller frame-size policy, or when Ferrum no longer needs distinct
-protocol-vs-capacity attribution. If
-an extension has not shipped upstream, carry forward only that documented
+protocol-vs-capacity attribution. If an extension has not shipped upstream, carry forward only that documented
 minimal extension until its own retirement condition is met.
 
 At retirement:
 
 1. Bump `tokio-tungstenite` / `tungstenite` dependency versions and update
    `Cargo.lock` through Cargo.
-2. Remove these root `[patch.crates-io]` entries:
+2. Remove these root `[patch.crates-io]` entries and their mirrors in
+   `tests/performance/mesh/Cargo.toml`:
    - `tungstenite = { path = "vendor/tungstenite-0.29.0-ferrum-patched" }`
    - `tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }`
-3. Delete both vendor directories.
+3. Delete both vendor directories, regenerate the drift manifest
+   (`scripts/update_vendor_integrity.sh`), and remove the matching inventory
+   rows and `docs/vendored-patch-lifecycle.json` entries.
 4. Keep the gateway call-site logic using
    `WebSocketStream::into_inner_with_read_buffer()` and
    `WebSocketStream::set_fragment_accounting()`.

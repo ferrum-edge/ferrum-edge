@@ -9,6 +9,7 @@ Ferrum Edge provides configurable retry logic for failed backend requests. Retri
 - [Configuration](#configuration)
 - [Retry Behavior](#retry-behavior)
   - [Connection Failures](#connection-failures)
+  - [Reqwest Protocol NACKs (HTTP/2, buffered uploads)](#reqwest-protocol-nacks-http2-buffered-uploads)
   - [Native gRPC Protocol NACKs](#native-grpc-protocol-nacks)
   - [HTTP Status Code Failures](#http-status-code-failures)
   - [Method Filtering](#method-filtering)
@@ -105,7 +106,7 @@ Note that `is_canceled` is a statement about hyper's own wire boundary, not abou
 
 Independently of the Ferrum retry policy above, reqwest replays a request **once per protocol NACK** (up to two replays) when the backend proves it did not process it: a remote `GOAWAY` with `NO_ERROR` (RFC 9113 §6.8) or a remote `RST_STREAM` with `REFUSED_STREAM` (RFC 9113 §8.7). Reqwest can only do this for a body it holds in full.
 
-A live `backend_write_timeout_ms` (default `30000`) makes Ferrum hand reqwest a *streaming* carrier for buffered uploads, which would silently disable that replay. Ferrum therefore reproduces it at its own dispatch layer — same two shapes, same budget of two replays, a fresh upload pump per attempt, and one absolute response-header bound across all attempts. This is typed (`h2::Reason`), never substring-matched: a mis-detected NACK would replay a non-idempotent request the backend may already have processed. It requires no `retry` configuration and is independent of `retryable_methods`, exactly as reqwest's own behavior was.
+A live `backend_write_timeout_ms` (default `30000`) makes Ferrum hand reqwest a *streaming* carrier for buffered uploads, which would silently disable that replay. Ferrum therefore reproduces it at its own dispatch layer — same two shapes, same budget of two replays, a fresh upload pump per attempt, and one absolute response-header bound across all attempts. This is typed (`h2::Reason`), never substring-matched: a mis-detected NACK would replay a non-idempotent request the backend may already have processed. Like reqwest's own replay, it requires no `retry` configuration and is independent of `retryable_methods`.
 
 ### Native gRPC Protocol NACKs
 
@@ -182,7 +183,7 @@ backoff: !exponential
 | `base_ms` | integer | — | Base delay in milliseconds |
 | `max_ms` | integer | — | Maximum delay cap in milliseconds |
 
-The delay formula is: `base_ms * 2^attempt`, capped at `max_ms`, with jitter applied in the range `[delay/2, delay*3/2)`.
+The delay formula is: `base_ms * 2^attempt`, capped at `max_ms`, with jitter applied in the range `[delay/2, delay*3/2)`. The jittered value is capped at `max_ms` again.
 
 **Example progression** (base_ms=100, max_ms=5000):
 
@@ -349,9 +350,9 @@ This is equivalent to the minimal configuration since `retryable_status_codes` d
 
 - `max_retries` must be between 0 and 100
 - `retryable_status_codes` must contain valid HTTP status codes (100–599)
-- `retryable_methods` must contain valid HTTP methods (GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, TRACE)
+- `retryable_methods` must contain valid HTTP methods (GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, TRACE, CONNECT), at most 9 entries
 - For exponential backoff, `base_ms` must not exceed `max_ms`
-- `delay_ms` (fixed) and `max_ms` (exponential) must not exceed 300,000ms (5 minutes)
+- `delay_ms` (fixed) and `base_ms`/`max_ms` (exponential) must not exceed 300,000ms (5 minutes)
 
 ### TCP passthrough connection retries
 

@@ -17,13 +17,15 @@ Each signal produces a 0.0-1.0 pressure ratio. When a ratio exceeds a threshold,
 
 ## Progressive Actions
 
-Actions escalate with pressure. Each action is additive — higher pressure activates additional actions on top of lower ones.
+Actions escalate with pressure. Each action is additive — higher pressure activates additional actions on top of lower ones. Thresholds are per signal (see [Configuration](#configuration)); the defaults are FD 0.80, connections 0.85, requests 0.85 for the pressure tier and 0.95 for every critical tier. Event-loop latency at or above `FERRUM_OVERLOAD_LOOP_CRITICAL_US` also triggers connection rejection.
 
-| Pressure Level | Action | Effect | Hot Path Cost |
+Between a signal's pressure and critical thresholds the monitor also computes a RED-style probability that ramps linearly from 0% to 100% (reported as `red_drop_probability_pct`). HTTP/1.1 and HTTP/2 responses add `Connection: close` when the binary `disable_keepalive` flag is set **or** a per-response RED sample fires.
+
+| Tier | Action | Effect | Hot Path Cost |
 |----------------|--------|--------|---------------|
-| **0.80** (pressure) | Disable keepalive | HTTP/1.1 and HTTP/2 responses include `Connection: close`, causing clients to disconnect after each request. HTTP/3 expresses the same tier as a one-shot GOAWAY per connection (see below). This naturally frees connection slots | 1 `AtomicBool::load` per response (~1ns); HTTP/3 pays nothing per request |
-| **0.95** (critical) | Reject new connections | TCP connections are accepted and immediately dropped (HTTP/H2). H3 connections are refused via QUIC. Existing connections continue serving | 1 `AtomicBool::load` per accept loop iteration (~1ns) |
-| **0.95** (critical) | Reject new requests | New requests are rejected with `503` (gRPC `UNAVAILABLE`) once active requests reach `FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD` of `FERRUM_MAX_REQUESTS`. Only active when a request cap is configured (`FERRUM_MAX_REQUESTS` > 0) | 1 `AtomicBool::load` per request (~1ns) |
+| **pressure** | Disable keepalive | HTTP/1.1 and HTTP/2 responses include `Connection: close`, causing clients to disconnect after each request. HTTP/3 expresses the same tier as a one-shot GOAWAY per connection (see below). This naturally frees connection slots | 1 `AtomicBool::load` per response (~1ns); HTTP/3 pays nothing per request |
+| **critical** | Reject new connections | TCP connections are accepted and immediately dropped (HTTP/H2). H3 connections are refused via QUIC. Existing connections continue serving | 1 `AtomicBool::load` per accept loop iteration (~1ns) |
+| **critical** (requests) | Reject new requests | New requests are rejected with `503` (gRPC `UNAVAILABLE`) once active requests reach `FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD` of `FERRUM_MAX_REQUESTS`. Only active when a request cap is configured (`FERRUM_MAX_REQUESTS` > 0) | 1 `AtomicBool::load` per request (~1ns) |
 
 State transitions are logged at `warn` (entering overload) and `info` (recovering).
 
@@ -155,7 +157,9 @@ Authenticated example (full snapshot):
 }
 ```
 
-Returns HTTP 503 when `level` is `critical` (both tiers).
+The authenticated snapshot also includes `node_waypoint_drops` (per-reason fail-closed drop counters for mesh node-waypoint accepts) and `request_buffer` (aggregate buffered-request budget), omitted above for brevity.
+
+`level` is `normal`, `pressure`, or `critical`. Both tiers return HTTP 503 when `level` is `critical`, and 200 otherwise.
 
 ## Port Exhaustion Monitoring
 
@@ -183,6 +187,7 @@ so treat it as operational telemetry rather than an admission-control source.
 Mitigation knobs:
 - `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` bounds how long a peer can hold DTLS demux state before completing the handshake.
 - `FERRUM_UDP_MAX_SESSIONS` caps total UDP/DTLS sessions per proxy, including DTLS peers still in handshake.
+- Overload critical mode rejects new DTLS demux state before per-peer channels/tasks are allocated.
 - `FERRUM_UDP_MAX_SESSIONS_PER_IP` caps how much of that table any one effective source IP may hold. The bound is taken on the ClientHello admission path, before any per-peer allocation, so a single spoofed-source or many-source-port client cannot fill the pre-handshake table and deny DTLS service to everyone else. It is the same gateway-wide counter the plain-UDP and TCP listeners use, and the demuxer releases its slot at accept handoff, so an established DTLS session is charged once rather than twice.
 
 Refused ClientHellos and abandoned handshakes are both reported through rate-limited, fixed-cardinality warnings that carry the count they withheld, so a spray shows up as a bounded number of records rather than one line per peer.
@@ -237,12 +242,10 @@ In **data-plane (DP) mode** these binds are intentionally **non-fatal**: the DP
 does not own its config (it comes from the control plane), so a single
 unbindable CP-pushed stream proxy must not prevent the DP from starting or brick
 the other listeners. Only the affected listener is skipped; it is retried on the
-next reconcile. Before, a skip was only warn-logged; this structured surface lets
-operators alert on `bind_failures_total > 0` and see exactly which proxy/port is
-not serving (and why, via `kind`) without scraping logs. The list reflects the
-latest reconcile plus any subsequent asynchronous listener-task failure, so a
-resource that starts serving on a later reconcile clears its entry.
-- Overload critical mode rejects new DTLS demux state before per-peer channels/tasks are allocated.
+next reconcile. Alert on `bind_failures_total > 0` to see exactly which
+proxy/port is not serving (and why, via `kind`) without scraping logs. The list
+reflects the latest reconcile plus any subsequent asynchronous listener-task
+failure, so a resource that starts serving on a later reconcile clears its entry.
 
 ## Platform Support
 
@@ -267,11 +270,10 @@ whenever no enforceable per-process ceiling can be determined:
   against that, so the tier keeps working; macOS publishes no equivalent, so
   the tier is disabled there.
 
-`raise_fd_limit()` raises the soft cap to the hard cap at startup, so an
-unlimited hard cap previously produced `max: 9223372036854775807` and a ratio
-that could never reach the 0.80 pressure or 0.95 critical threshold — a tier
-that looked healthy while doing nothing. It is now explicitly disabled instead,
-with a one-shot startup `warn!` naming the reason. Connection-based and
+`raise_fd_limit()` raises the soft cap to the hard cap at startup. Measuring
+against an unlimited cap would give a ratio that can never reach a threshold, so
+the tier is disabled instead, with a one-shot startup `warn!` naming the reason.
+Connection-based and
 request-based shedding are unaffected either way; set a finite `LimitNOFILE=`
 (systemd), `--ulimit nofile=` (Docker), or `/etc/security/limits.conf` value to
 re-enable the FD tier.

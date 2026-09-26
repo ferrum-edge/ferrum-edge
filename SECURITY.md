@@ -83,12 +83,10 @@ Include the following information:
 
 ### Security Features
 
-Ferrum Edge includes several security-focused features:
-
 - **mTLS support**: Frontend and backend mutual TLS authentication
 - **JWT-based authentication**: Secure admin API with configurable secrets
-- **Rate limiting**: Token-bucket and Redis-backed distributed rate limiting
-- **IP restrictions**: Whitelist/blacklist client IP addresses
+- **Rate limiting**: Local token-bucket / sliding-window limits and Redis-backed centralized limits
+- **IP restrictions**: Allow and deny lists for client IP addresses
 - **Request size limiting**: Prevent large payload attacks
 - **Bot detection**: Identify and block automated threats
 - **CORS handling**: Configure cross-origin request policies

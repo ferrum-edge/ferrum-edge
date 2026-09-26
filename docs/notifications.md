@@ -1,6 +1,6 @@
 # Notifications
 
-Reusable, plugin-agnostic notification infrastructure. Lives at `src/notifications/`. Today the only consumer is the [`proxy_alerts` plugin](proxy_alerts.md); future subsystems (overload manager, mesh policy enforcement, custom plugins) can dispatch notifications to the same channels without re-implementing the transports.
+Reusable, plugin-agnostic notification infrastructure in `src/notifications/`. The only current consumer is the [`proxy_alerts` plugin](proxy_alerts.md); other subsystems (overload manager, mesh policy enforcement, custom plugins) can dispatch to the same channels without re-implementing the transports.
 
 ## What's in the module
 
@@ -24,7 +24,7 @@ Reusable, plugin-agnostic notification infrastructure. Lives at `src/notificatio
 - OpenAPI `ProxyAlertsConfig` encodes those nonempty / HTTP(S) / no-userinfo constraints with `minLength` and a URL pattern. `format: uri` / `format: email` are Draft 2020-12 annotations and are not by themselves the constructor grammar.
 - Dispatch slow-call/error logs redact endpoint paths, query strings, and userinfo because incoming webhook credentials commonly live inside the URL.
 - Response bodies are discarded after successful dispatches with a 1 MiB cap: responses advertising `Content-Length > 1 MiB` are rejected before any bytes are read, and otherwise the body is streamed and aborted once the running total crosses 1 MiB. Either path fails the send without buffering the whole body.
-- Non-success responses are reported by status only, without surfacing or draining their bodies. Any drain bail-out (non-success status, advertised `Content-Length` over 1 MiB, streaming abort at 1 MiB, or transport error) drops the response without consuming the body; reqwest handles the protocol cleanup (HTTP/1.x closes the connection, HTTP/2 can reset the stream while keeping the connection reusable). This is acceptable for the typical alert cadence (up to a few notifications per second per channel) and avoids spending work on misbehaving endpoints.
+- Non-success responses are reported by status only; their bodies are neither surfaced nor drained. Whenever the body is not fully drained (non-success status, oversize body, transport error) the response is simply dropped: HTTP/1.x closes the connection and HTTP/2 resets the stream. That cost is acceptable at alert cadence (a few notifications per second per channel at most).
 
 ### Slack (Incoming Webhook)
 
@@ -78,7 +78,7 @@ Posts an `embeds` payload. `Notification.fields` become `embeds[0].fields` (`{na
 }
 ```
 
-Renders `body_template` after `${var}` substitution and POSTs the result. `method` is case-insensitive (`post`, `POST`, and `pAtCh` all work); the constructor normalizes to POST, PUT, or PATCH. `body_template` is required and may be empty; unbalanced `${` is rejected at construction (JSON Schema cannot express balanced-placeholder syntax). The default `Content-Type: application/json` is added if the operator does not supply their own. For JSON content types (`application/json` or `*+json`), substituted values are escaped as JSON string content so quotes, backslashes, and control characters inside alert fields cannot break the body; place variables inside JSON strings unless the value is intentionally numeric/boolean text. Non-JSON content types keep raw substitution.
+Renders `body_template` after `${var}` substitution and sends it with the configured `method`. `method` is case-insensitive (`post`, `POST`, and `pAtCh` all work); the constructor normalizes to POST, PUT, or PATCH. `body_template` is required and may be empty; unbalanced `${` is rejected at construction (JSON Schema cannot express balanced-placeholder syntax). The default `Content-Type: application/json` is added if the operator does not supply their own. For JSON content types (`application/json` or `*+json`), substituted values are escaped as JSON string content so quotes, backslashes, and control characters inside alert fields cannot break the body; place variables inside JSON strings unless the value is intentionally numeric/boolean text. Non-JSON content types keep raw substitution.
 
 ### Email (SMTP)
 
@@ -180,7 +180,7 @@ dispatch(
 
 Transient transport/HTTP failures (408/429/5xx, connect/timeout) retry inside the same task with a bounded, jittered backoff while holding the permit. Permanent failures (other 4xx, egress denials) fail immediately. Process shutdown drains in-flight sends under the shared observability budget; sends still outstanding when that deadline expires are hard-aborted and increment `ferrum_notification_delivery_abandoned_at_deadline_total{channel_type=…}`.
 
-Retiring a generation (reload / `Drop`) cancels its sends promptly: the in-flight transport call and the backoff between attempts are both raced against the cancel signal, with cancellation deliberately given priority, so an endpoint that accepts a connection and then stalls cannot pin a retired generation until the 60s HTTP client timeout. Cancellation is a **commit boundary, not an undo** — bytes already written may still reach and be acted on by the endpoint, and Ferrum reports that send as abandoned regardless. What it does guarantee is that a retired generation cannot commit `Succeeded`, `FailedTransient`, or `FailedPermanent`; cannot schedule another retry or invoke a success/failure completion outcome; and settles exactly once as `Abandoned`, with the exactly-once settlement edge invoking the producer callback once with `Abandoned` to roll back reserved/pending producer state.
+Retiring a generation (reload / `Drop`) cancels its sends promptly: both the in-flight transport call and the backoff between attempts yield to the cancel signal, so an endpoint that accepts a connection and then stalls cannot pin a retired generation until the 60s HTTP client timeout. Cancellation is a **commit boundary, not an undo** — bytes already written may still reach and be acted on by the endpoint. It does guarantee that a retired send never commits `Succeeded`, `FailedTransient`, or `FailedPermanent`, never retries, and settles exactly once as `Abandoned`, invoking the producer callback once so reserved/pending producer state is rolled back.
 
 ### Delivery metrics (bounded cardinality)
 
@@ -208,7 +208,7 @@ Two families carry a second label, `reason`. Its values are compiled-in discrimi
 | `abandoned_total` | `shutdown_deadline` | Hard-aborted when the global observability drain deadline expired. |
 | `abandoned_total` | `task_dropped` | The dispatch task was dropped without settling for any other reason. |
 
-`abandoned_at_deadline_total` is exactly the `shutdown_deadline` slice of `abandoned_total`, kept as its own family because it is the signal operators page on. Nothing else increments it: an earlier revision charged reload retirement, registry rejection and dropped tasks to it as well, which made the metric operationally false.
+`abandoned_at_deadline_total` is exactly the `shutdown_deadline` slice of `abandoned_total`, kept as its own family because it is the signal operators page on. Nothing else increments it.
 
 The accounting identity, per `channel_type`, is:
 
@@ -219,7 +219,7 @@ attempted == succeeded + failed_transient + failed_permanent
 
 `backpressure_dropped_total` and `rejected_total` sit deliberately outside it: the delivery body never started, so counting them as attempts would understate the delivery success ratio. Every one of those paths still invokes the producer's settle callback exactly once, so reserved cooldown / pending incident state is always rolled back.
 
-`attempted` is deliberately a **body-start** counter, not a transport-start counter. Moving the marker to the first channel call would open a window where a hard shutdown abort could drop a running task before `attempted` advanced and misclassify it as `registry_rejected`. The body-start boundary keeps hard-deadline classification, the accounting identity, and pre-body rejection visibility coherent.
+`attempted` is deliberately a **body-start** counter, not a transport-start counter: counting at the first channel call would let a hard shutdown abort drop a running task before `attempted` advanced, misclassifying it as `registry_rejected` and breaking the identity above.
 
 ### Best-effort delivery can produce zero, one, or multiple copies
 

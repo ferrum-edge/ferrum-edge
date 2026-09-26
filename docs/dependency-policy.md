@@ -81,33 +81,25 @@ surface drifts.
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/vendored-patch-lifecycle.json`,
 > `docs/upstream-*-patches/`, and the vendored-patch scripts are owned via
 > [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`). Upstream `h3`
-> work is staged from the `jeremyjpj0916/h3` fork. Patches **h3-002** through
-> **h3-005** are deliberate forks, unfiled upstream, with `fork_ref: null` in
-> `docs/vendored-patch-lifecycle.json` pending maintainer handoff. Patch **h3-001**
-> records a published `fork_ref` for its filed upstream PR. Patches carried
-> without an upstream PR, including the tungstenite frame
-> error-origin and stray-continuation ordering extensions, the tungstenite `auto_pong` opt-out, the tungstenite /
-> tokio-tungstenite fragment-accounting extension, the dimpl
-> credential-security patch, and the hyper-util HTTP/1 sender release, are
-> governed by the
+> work is staged from the `jeremyjpj0916/h3` fork: **h3-001** records a published
+> `fork_ref` for its filed upstream PR, while **h3-002** through **h3-005** have
+> `fork_ref: null` in `docs/vendored-patch-lifecycle.json` pending maintainer
+> handoff. Every patch without an upstream PR is governed by the
 > [Deliberate fork policy and SLA](#deliberate-fork-policy-and-sla) below.
 
 ### Deliberate fork policy and SLA
 
-Most vendored patches ride an **open upstream PR** (reqwest #3017, h3 #339,
+Four patches ride an **open upstream PR** (reqwest #3017, h3 #339,
 tungstenite #556 / tokio-tungstenite #380); the weekly
 `scripts/check_vendored_patch_status.sh` (backed by
 `docs/vendored-patch-lifecycle.json`) polls those and goes red when one
-merges. Fork-only patches currently include **h3 002** (Extended CONNECT
-`:protocol=websocket`), **h3 003** (`peek_recv_trailers`), **h3 004**
-(`SendStreamStopped`), and **h3 005** (max buffered frame len) — all four
-unfiled with `fork_ref: null` pending maintainer handoff — plus the tungstenite
-frame-limit origin and stray-continuation ordering extensions, **tungstenite `auto_pong`** (transparent Ping
-relay), **tungstenite / tokio-tungstenite 004** (fragment accounting and
-incomplete-message bounds), **dimpl 001** (DTLS certificate chains and private-key
-zeroization), and **hyper-util 001** (release a closed HTTP/1 sender; upstream
-issue [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202), no
-upstream PR yet). They are not untracked TODOs; they are carried as
+merges. Every other row in the inventory table is marked **Deliberate fork**
+(`upstream.filing: deliberate_fork_unfiled` in the lifecycle JSON), including
+sqlx-core, reqwest 002–004, h3 002–005, both h3-quinn patches, the tungstenite /
+tokio-tungstenite extensions other than lossless takeover, dimpl, and
+hyper-util (which has upstream issue
+[hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) but no
+upstream PR). These are not untracked TODOs; they are carried as
 **deliberate, time-boxed forks** and are governed as follows:
 
 - **Owner.** The dependency-governance owner in
@@ -232,12 +224,12 @@ their upstream licenses (MIT, Apache-2.0, and similar permissive terms for the
 current patches) must fall within the allowlist or carry an explicit exception.
 
 Every `[licenses.exceptions]` entry must document an **owner**, a **rationale**,
-and an `[expires:YYYY-MM-DD]` token, and that is now **enforced** — not merely
-documented. `scripts/check_advisory_expiry.sh` walks the `exceptions` array in
+and an `[expires:YYYY-MM-DD]` token, and this is **enforced**:
+`scripts/check_advisory_expiry.sh` walks the `exceptions` array in
 `deny.toml` and fails on a missing token or a passed date, on the per-PR
 `dependency-audit` job in `.github/workflows/ci.yml` **and** on the weekly
-`.github/workflows/dependency-audit.yml`. A first license exception therefore
-cannot become permanent by default, the same guarantee advisories already had.
+`.github/workflows/dependency-audit.yml`, so a license exception cannot become
+permanent by default.
 
 The token lives in a **comment**, not in the entry value, because cargo-deny's
 two schemas differ: an `[advisories.ignore]` table accepts a free-text `reason`
@@ -437,8 +429,9 @@ adding, retiring, or changing a vendored patch.
 
 ### Retiring a vendored patch
 
-Trigger: the upstream PR merges **and** ships in a release we consume (for `h3`
-and tungstenite, *both* co-vendored patches must be ready — see the table).
+Trigger: the upstream PR merges **and** ships in a release we consume (for
+co-vendored patches such as `h3`, `h3-quinn`, and tungstenite, *every* patch in
+the group must be ready — see the `Removal trigger` column).
 
 1. Bump the registry version in `Cargo.toml` `[dependencies]` to the release
    containing the fix; update `Cargo.lock`.
@@ -708,26 +701,29 @@ reachable on *either* revision stays in scope, so a pull request cannot drop the
 reachability edge and edit the file in the same commit. Newly reaching an
 already-Cross-sensitive script from a protected job is still rejected.
 
-#### Retired `fips-build.yml` generation transition (issue #3888 / PR #3889)
+#### Temporary generation transitions (`fips-build.yml`, CI jobs, `setup-rust-ci`)
 
-PR #3889 landed on `main`. The temporary whole-file SHA-256 admission that let
-that rewrite pass the Cross surface scan is **retired and non-operational**.
-Ordinary `.github/workflows/fips-build.yml` edits are compared by the normal
-fail-closed Cross surface scan with no special case. The generic SHA-256
-generation digest helper remains because CI-job and local-action finite
-transitions still use it. Full description: `docs/ci_cd.md` → "Retired
-`fips-build.yml` generation transition".
+The verifier can admit an exact whole-file SHA-256 source→destination pair for
+a frozen surface, so one reviewed rewrite can pass the Cross surface scan. Each
+pair is path- or job-bound, one-way, fail-closed, and decided entirely by the
+trusted base; anything else is scanned as an ordinary Cross surface change.
+Current admissions:
 
-The same verifier still carries temporary SHA-256 generation pairs for
-Cross-sensitive `ci.yml` jobs and for `setup-rust-ci/action.yml`
-(`CI_JOB_GENERATION_TRANSITIONS`, `LOCAL_ACTION_GENERATION_TRANSITIONS`). Both
-ends are exact, path- or job-bound, one-way, and decided entirely by the trusted
-base. `setup-rust-ci` now has exactly one pair: current-main
-`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to the
-combined #3911 destination
-`57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`. See
-`docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions" and
-"Admitted `setup-rust-ci` generation transition".
+- `fips-build.yml`: one transition for the issue #4018 memory mitigation on the
+  `fips-test-build` job (`FIPS_BUILD_ADMITTED_GENERATION_TRANSITION`). The
+  earlier #3889 admission was retired by #3943.
+- Cross-sensitive `ci.yml` jobs: `CI_JOB_GENERATION_TRANSITIONS`.
+- `setup-rust-ci/action.yml`: a two-step chain in
+  `LOCAL_ACTION_GENERATION_TRANSITIONS`, from
+  `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` to the
+  cache-budget generation
+  `b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924`, then to
+  the combined #3911 destination
+  `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`.
+
+Details and digests: `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
+transition", "Admitted CI job SHA-256 generation transitions", and "Admitted
+`setup-rust-ci` generation transitions".
 
 ### Refreshing kind / kubectl / Helm versions and checksums
 
@@ -883,7 +879,8 @@ covers, so it must not be replaced with a prebuilt artifact.
   inventory enforced by `scripts/check_vendored_patch_lifecycle.py`.
 - `deny.toml` — the gate configuration and current exceptions.
 - `SECURITY.md` — vulnerability reporting and severity timelines.
-- `docs/upstream-reqwest-patches/`, `docs/upstream-h3-patches/`,
+- `docs/upstream-sqlx-patches/`, `docs/upstream-reqwest-patches/`,
+  `docs/upstream-h3-patches/`, `docs/upstream-h3-quinn-patches/`,
   `docs/upstream-tungstenite-patches/`, `docs/upstream-dimpl-patches/`,
   `docs/upstream-hyper-util-patches/` —
   per-patch detail and retirement plans.

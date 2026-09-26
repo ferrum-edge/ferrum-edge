@@ -31,7 +31,7 @@ Fixes # (issue number)
 
 - [ ] Unit tests pass (`cargo test --test unit_tests`, `--test unit_plugins_a_tests`, `--test unit_plugins_b_tests`, `--test unit_gateway_core_tests` as touched)
 - [ ] Integration tests pass (`cargo test --test integration_tests`)
-- [ ] E2E tests pass (`cargo test --test functional_tests -- --ignored`)
+- [ ] E2E tests pass (`cargo build --bin ferrum-edge && cargo test --test functional_tests -- --ignored`)
 - [ ] Clippy passes with zero warnings (`cargo clippy --all-targets -- -D warnings`)
 - [ ] Code is formatted (`cargo fmt --check`)
 
@@ -48,9 +48,8 @@ Fixes # (issue number)
 - [ ] I have read the [CONTRIBUTING.md](../CONTRIBUTING.md) guide
 - [ ] I have added tests that prove my fix is effective or that my feature works
 - [ ] I have updated the documentation accordingly (if applicable)
-- [ ] My changes don't introduce new clippy warnings
 - [ ] My code follows the project's style guidelines
-- [ ] I have checked that my changes don't break backward compatibility
+- [ ] Breaking changes (config shapes, env vars, schema, defaults) have an entry in `CHANGELOG.md` under `Unreleased`
 
 ## Performance Impact
 

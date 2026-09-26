@@ -5,20 +5,20 @@ Ferrum Edge. This lane tracks throughput, error rate, and latency percentiles
 across the supported protocol matrix, plus connection churn, long-lived soak /
 resource plateaus, and reload-under-load coverage.
 
-It is **not** a required pull-request check for the scheduled multi-protocol
-benchmark itself. Required PR CI does run lightweight static contracts for this
-lane inside the `Performance Regression Check` job in `.github/workflows/ci.yml`
-(workflow verifier self-test + repository contract, evaluator self-test, and a
-`python3 -m py_compile` check of the scenario harness) before optional
-benchmark/build gating. That PR job has read-only contents permission and does
-not persist checkout credentials while running PR-controlled code. The
-lightweight HTTP/1 overhead gate in `ci.yml`
-remains the PR path for measured overhead. That same job caches both the root
+Neither this lane nor its static contracts run in `ci.yml` or on pull
+requests, and noisy shared-runner microbenchmarks stay out of branch
+protection. The lightweight static contracts for this lane (workflow verifier
+self-test + repository contract, evaluator self-test, and a
+`python3 -m py_compile` check of the scenario harness) run first in the
+`Performance Regression Check` job of `.github/workflows/performance-regression.yml`,
+which runs daily against the tip of `main` and on manual dispatch. That job
+also runs the measured HTTP/1 overhead check
+(`tests/performance/ci_overhead_bench.py`). It has read-only contents
+permission, does not persist checkout credentials, and caches both the root
 workspace (`. -> target`) and the standalone `tests/performance/mesh`
 Criterion workspace through `setup-rust-ci`'s optional rust-cache `workspaces`
-pass-through (`shared-key: ci-perf`). Omitting `workspaces` on other
-`setup-rust-ci` callers keeps rust-cache's root-only default. Noisy
-shared-runner microbenchmarks stay out of branch protection.
+pass-through (`shared-key: ci-perf`). Other `setup-rust-ci` callers omit
+`workspaces` and keep rust-cache's root-only default.
 
 ## Documented runner and build profile
 
@@ -112,7 +112,7 @@ python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --sel
 python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py
 ```
 
-Full-mode PR CI runs the same static set in `Performance Regression Check`
+The daily `Performance Regression Check` job runs the same static set
 immediately after checkout.
 
 ## Historical-baseline H1 TLS POST check
@@ -394,7 +394,8 @@ instead of rewriting that protected README.
   `.github/scripts/mesh_baseline_step_summary.py` (the workflow itself keeps a
   literal command surface; see `verify_mesh_performance_baselines_workflow.py`)
 - Manual exploratory matrix: `.github/workflows/perf-benchmark.yml`
-- PR overhead gate: `tests/performance/ci_overhead_bench.py` via `ci.yml`
+- Daily overhead check: `tests/performance/ci_overhead_bench.py` via
+  `performance-regression.yml`
 - Connection saturation headlines: `docs/connection_saturation_benchmark.md`
 - Request-upload hand-off contracts (the section above):
   `tests/unit/gateway_core/stream_auth_lifetime_tests.rs`

@@ -106,12 +106,8 @@ store.
 Retire when a compatible upstream SQLx release supports both name-error
 variants (or verifies chains separately from names), treats a configured root
 CA as exclusive, and passes the same handshake controls. Remove both
-`[patch.crates-io]` entries, the vendor copy, and lifecycle inventory row;
-update both lockfiles and the drift manifest. Keep all Ferrum unit and
-service-integration regressions. No upstream review or issue was requested as
-part of this dispatch.
-
-Validation is GitHub-hosted CI on the pushed head. No project code, build,
-test, formatter, or script was executed locally. The vendor manifest entries
-were prepared from static file hashes (`shasum -a 256` over LF-normalized
-contents); the hosted drift guard must verify them.
+`[patch.crates-io]` entries (root `Cargo.toml` and
+`tests/performance/mesh/Cargo.toml`), the vendor copy, the inventory row in
+`docs/dependency-policy.md`, and the entry in
+`docs/vendored-patch-lifecycle.json`; update both lockfiles and the drift
+manifest. Keep all Ferrum unit and service-integration regressions.

@@ -119,8 +119,10 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including grok-agents, astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents, or any
-.agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
+skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents,
+grok-agents, composer-agents, qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
+opencode-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested
+workers.
 ```
 
 This prevents a worker from replacing the selected model through nested delegation.

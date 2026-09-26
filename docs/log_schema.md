@@ -290,6 +290,10 @@ The full canonical list (`DEFAULT_SENSITIVE_METADATA_KEYS` in
 | `bearer`      | `bearer`, `auth.bearer.value`                            |
 | `password`    | `password`, `user_password`                              |
 | `secret`      | `secret`, `api_secret`, `secret_count` *(also matched — see below)* |
+| `cache_request_headers_snapshot` | `cache_request_headers_snapshot` |
+| `grpc_web_shadowed_trailers` | `grpc_web_shadowed_trailers` |
+| `claim_header.` | `jwks_auth.claim_header.sub`, `oidc_rp.claim_header.email` |
+| `last_event_id` / `last-event-id` | `sse:last_event_id`, `last-event-id` |
 
 Matching is **case-insensitive substring**, not exact match. That means
 operator-chosen rename targets / `static_fields` keys / `derived_fields`
@@ -371,7 +375,35 @@ list and serializes as `[REDACTED]`.
 | `ws_logging` | Full | HTTP / WebSocket entries use `summary_type: http`; TCP / UDP / DTLS entries use `summary_type: stream`. WebSocket disconnect fields and derived-value behavior are documented above. |
 | `kafka_logging` | Full | One JSON message per summary. Partition key (`client_ip` / `proxy_id`) still reads typed fields, so partition keys are NOT affected by `rename:`. |
 | `loki_logging` | Full | Schema-customized JSON appears inside the Loki log line. Loki **labels** (`build_http_labels` / `build_stream_labels`) keep reading typed fields, so labels are NOT affected by `rename:`. |
-| `statsd_logging` | Tag rename / omit only | Static / derived / flatten / timestamp parts of a schema are no-ops here (statsd is line protocol, not JSON). When an inline `schema:` carries any of those keys, the plugin emits a `warn!` at construction time so operators don't ship a schema that silently throws fields away (per-referrer warnings would be noisy, so `schema_ref:` is not inspected — verify the shared schema's intent at the `transaction_log_schema` definition). The schema's `rename` and `omit` operate on the native field names backing the statsd tags. The supported mappings are: HTTP — `http_method`↔`method`, `response_status_code`↔`status`, `proxy_id`↔`proxy`. Stream — `protocol`↔`protocol`, `proxy_id`↔`proxy`, `disconnect_cause`↔`cause`, `disconnect_direction`↔`direction`. Computed statsd tags without native-field backing (`status_class`, `grpc_status`, `error`, `body_outcome`, `body_error`, `result`, `io_side`, `error_class`, and the authoritative `namespace`) are always emitted with their default names — `omit` and `rename` have no effect on them since they are derived at format time, not read from a summary field. `grpc_status` is emitted only for gRPC transactions and is bounded to `0`–`16` plus `OTHER`. Rename targets are fail-closed against a portable StatsD tag-key grammar (`[A-Za-z_][A-Za-z0-9_.-]*`) and cannot collide with reserved runtime tags; a schema that is valid for JSON loggers may still be rejected when attached to `statsd_logging` / `schema_ref`. |
+| `statsd_logging` | Tag rename / omit only | See [statsd_logging schema support](#statsd_logging-schema-support). |
+
+### statsd_logging schema support
+
+StatsD is a line protocol, not JSON, so only `summary_type`, `rename`, and
+`omit` affect its output. `static_fields`, `derived_fields`, `metadata`,
+`timestamp_format`, and `order` are no-ops; when an inline `schema:` carries
+any of them the plugin logs a `warn!` at construction. `schema_ref:` is not
+inspected (per-referrer warnings would be noisy), so check a shared schema's
+intent at its `transaction_log_schema` definition.
+
+`rename` and `omit` operate on the native fields backing the statsd tags:
+
+| Family | Native field ↔ tag |
+|---|---|
+| HTTP | `http_method`↔`method`, `response_status_code`↔`status`, `proxy_id`↔`proxy` |
+| Stream | `protocol`↔`protocol`, `proxy_id`↔`proxy`, `disconnect_cause`↔`cause`, `disconnect_direction`↔`direction` |
+| WebSocket | `proxy_id`↔`proxy` |
+
+Computed tags with no native field (`status_class`, `grpc_status`, `error`,
+`body_outcome`, `body_error`, `result`, `io_side`, `error_class`, and the
+authoritative `namespace`) are always emitted under their default names;
+`omit` and `rename` do not affect them. `grpc_status` is emitted only for gRPC
+transactions and is bounded to `0`–`16` plus `OTHER`.
+
+Rename targets must match a portable StatsD tag-key grammar
+(`[A-Za-z_][A-Za-z0-9_.-]*`) and cannot collide with reserved runtime tags, so
+a schema that is valid for JSON loggers may still be rejected when attached to
+`statsd_logging` (inline or via `schema_ref`).
 
 `prometheus_metrics` rejects `schema:` and `schema_ref:` at construction
 time: it exposes metrics with label names baked into the time-series store,
@@ -515,11 +547,8 @@ For named schemas:
 - `metadata: { mode: flatten }` needs a set of already-claimed output keys to
   detect collisions. The invariant part of that set — every `static_fields`
   key, plus every native output key — is compiled once into
-  `SummarySchema::flatten_reserved` and borrowed per record instead of being
-  rebuilt, so a flattened record no longer clones one owned `String` per
-  native field and allocates a hash table before it emits anything. Only the
-  genuinely record-dependent claims are collected per record, as borrowed
-  `&str`: a derived field claims its key only when the value was actually
+  `SummarySchema::flatten_reserved` and borrowed per record. Only the
+  record-dependent claims are collected per record, as borrowed `&str`: a derived field claims its key only when the value was actually
   emitted (`backend_host` yields nothing when the target carries no host), and
   under a `ws_logging` capability schema a native field claims its key only for
   the entry kind that owns it. A record with neither — the common case — makes
@@ -531,10 +560,7 @@ For named schemas:
   of retaining them in global, per-proxy, capability, or HTTP/gRPC/WebSocket/
   TCP/UDP protocol lists. A schema-only configuration therefore leaves every
   runtime list empty and preserves the existing no-plugin transaction-summary
-  fast path. Full- and delta-reload cache tests cover this invariant, including
-  multiple schema instances; the schema-only test also pins repeated request
-  views to the same precomputed `Arc` lists so a per-request list allocation
-  regression fails deterministically without a wall-clock benchmark.
+  fast path.
 
 ## Operator Cookbook
 
@@ -669,14 +695,17 @@ behavior by importing:
 
 ```rust
 use ferrum_edge::plugins::utils::log_schema::{
-    SchemaCapabilities, SchemaView, SummaryLogEntryView, SummarySchema, resolve_schema,
+    SchemaCapabilities, SchemaView, SummarySchema, resolve_schema,
 };
 ```
 
-Store `Option<Arc<SummarySchema>>` on the plugin struct; call
-`resolve_schema(config, "my_plugin", SchemaCapabilities::BASE)` in `new()`;
-wrap each `serde_json::to_string(summary)` call site in a
-`match self.schema { ... }` branch identical to the built-in plugins.
+Store `Option<Arc<SummarySchema>>` on the plugin struct and call
+`resolve_schema(config, "my_plugin", SchemaCapabilities::BASE)` in `new()`.
+At each serialization site, serialize
+`SchemaView { summary, schema: schema.as_ref() }` when the schema
+`applies_to_http()` (or `applies_to_stream()` for stream summaries), and the
+plain summary otherwise — the same `match` the built-in loggers use (see
+`src/plugins/kafka_logging.rs`).
 
 `resolve_schema` takes a `SchemaCapabilities` argument that gates optional
 field families. Pass `SchemaCapabilities::BASE` unless your plugin serializes

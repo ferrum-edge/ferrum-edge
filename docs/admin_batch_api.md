@@ -2,9 +2,9 @@
 
 ## Overview
 
-The `POST /batch` endpoint enables bulk creation of gateway resources in a single request. The whole submitted graph is inserted in **one** database transaction, eliminating per-row transaction overhead and dramatically improving write throughput at scale.
+`POST /batch` creates many gateway resources in one request. The whole submitted graph is inserted in **one** database transaction, which removes per-row transaction overhead and greatly improves write throughput at scale.
 
-**Performance**: ~3,400-5,500 resources/s with batch API vs ~5-116 resources/s with individual API calls (47x-687x improvement).
+**Performance** (measured): ~3,400-5,500 resources/s with the batch API vs ~5-116 resources/s with individual API calls (47x-687x faster).
 
 ## Atomicity Guarantee
 
@@ -327,7 +327,7 @@ curl -X POST http://localhost:9000/batch \
   }'
 ```
 
-Once the DB poller picks up the new config (default 30s, or set `FERRUM_DB_POLL_INTERVAL=5` for faster feedback), the route is live:
+In `database` mode the `201` is returned only after the new config is live on the gateway that handled the request (see [Database-mode live apply](admin_api.md#database-mode-live-apply)); other gateways pick it up on their next poll (`FERRUM_DB_POLL_INTERVAL`, default 30s). The route is then live:
 
 ```bash
 curl http://localhost:8000/api/payments/checkout \
@@ -354,7 +354,7 @@ curl -X POST http://localhost:9000/batch \
         "health_checks": {
           "active": {
             "http_path": "/health",
-            "interval": 10,
+            "interval_seconds": 10,
             "healthy_threshold": 2,
             "unhealthy_threshold": 3
           }
@@ -490,7 +490,7 @@ once the reported cause is addressed:
 
 ### Validation
 
-Each resource in the batch is validated before any database writes. If validation fails, the entire batch for that resource type is skipped and errors are returned. Validation includes:
+Every resource in the batch is validated before any database write. If any resource fails validation, the whole batch is rejected with `400` and `validation_errors`, and nothing is written. Validation includes:
 
 - **All resources**: ID format (alphanumeric + `.`, `_`, `-`, max 254 chars), no duplicate IDs within the batch
 - **Consumers**: Non-empty username, no duplicate usernames or custom_ids within the batch, custom_id normalization (empty string → null)
@@ -498,22 +498,24 @@ Each resource in the batch is validated before any database writes. If validatio
 - **Upstreams**: At least one target or service_discovery config, no duplicate names within the batch
 - **Plugin configs**: Known plugin name (`plugin_name`, same field as `POST /plugins/config`), scope/proxy_id consistency (proxy scope requires proxy_id, global and proxy_group scopes reject proxy_id), no duplicate plugin config IDs within the batch
 
-**Note**: Within-batch uniqueness is checked, but cross-batch uniqueness (against existing DB records) is enforced by database constraints. Database constraint violations are returned as errors in the response.
+Conflicts with resources that already exist in the namespace (duplicate ID, name, listen path, or consumer identity) are detected at persistence and return `409`; nothing from the batch is written.
 
 ### Error Responses
 
 | Status | Condition | Applied? |
 |--------|-----------|----------|
-| 201 | Whole graph committed | Yes, in full |
+| 201 | Whole graph committed (in `database` mode, and live on this gateway) | Yes, in full |
+| 202 | `?apply=async`: whole graph committed; live apply deferred (see [Deferred apply](admin_api.md#deferred-apply-for-bulk-provisioning-applyasync)) | Yes, in full |
 | 400 | Invalid JSON body, unknown top-level envelope key, or graph validation failed — payload problems only, never a database failure | No |
 | 403 | Admin API is in read-only mode | No |
 | 409 | A resource conflicts with an existing resource or with another resource in the same request (duplicate ID, name, listen path, or consumer identity) | No |
 | 500 | Server-side resource preparation failed, including a missing or weak `FERRUM_BASIC_AUTH_HMAC_SECRET` for plaintext Basic credentials | No |
 | 501 | The configured database deployment cannot provide the all-or-nothing guarantee (standalone MongoDB) — refused before any mutation | No |
 | 503 | No database available, a reference-check lookup or candidate-validation load failed, the datastore write failed, or the namespace config-admission lease lapsed before commit | No |
+| 503 with `"applied": false` | `database` mode only: the graph committed but the live reload rejected it, timed out, or could not verify the config cursor | Yes (durable, not yet live) |
 
-Every non-`201` status leaves the namespace as it was, so retrying the same
-payload is safe. `409`, `501`, and the datastore/lease `503`s are raised by the
+Except for the `"applied": false` case, every non-2xx status leaves the
+namespace as it was, so retrying the same payload is safe. `409`, `501`, and the datastore/lease `503`s are raised by the
 persistence attempt and carry `"rollback": "not_needed"`. Statuses raised
 before persistence keep their shared shapes: `400` returns `error` +
 `validation_errors`; a namespace-admission `503` returns the shared
@@ -522,14 +524,11 @@ returns `503` with the redacted `db_error_response` body. No failure body
 ever carries `created` counts.
 
 A database failure anywhere in the validation phase is a retryable `503`, never
-a `400`. This covers the reference lookups and, since issue #4527, the four
-candidate-validation loads that run before them — transaction-log schema,
-consumer credentials, mTLS compatibility, and the plugin graph. The plugin-graph
-load is the first database call for any batch carrying `plugin_configs`, so a
-Terraform/GitOps caller that previously read `400 "Batch validation failed"`
-during a pool exhaustion and abandoned the work now sees the retryable status.
-`400` is reserved for payload problems, which are the only failures a retry of
-the identical body cannot fix.
+a `400`. This covers the reference lookups and the four candidate-validation
+loads that run before them: transaction-log schema, consumer credentials, mTLS
+compatibility, and the plugin graph (the first database call for any batch
+carrying `plugin_configs`). `400` is reserved for payload problems, the only
+failures that retrying the identical body cannot fix.
 
 **One residual case the server cannot decide.** If the database acknowledges the
 commit but the acknowledgement is lost in transit, the transaction is durable
@@ -546,7 +545,7 @@ request that already committed stays committed if a later one fails. Keep
 resources that must be installed together (a proxy, its upstream, and its
 plugins) in the same request.
 
-For large-scale provisioning, send resources in chunks rather than one massive request. A chunk size of 100 resources per request provides a good balance between throughput and memory usage:
+For large-scale provisioning, send resources in chunks rather than one massive request (the request body limit is 1 MiB). About 100 resources per request balances throughput and memory use. In `database` mode, add `?apply=async` to each chunk and wait once on the last returned cursor with `GET /config/apply-status` to avoid one live reload per request (see [Deferred apply](admin_api.md#deferred-apply-for-bulk-provisioning-applyasync)):
 
 ```bash
 # Example: create 3,000 consumers in 30 batch requests
@@ -567,11 +566,12 @@ All list endpoints (`GET /proxies`, `GET /consumers`, `GET /plugins/config`, `GE
 | `limit`   | 100     | Maximum number of items to return (max: 1000; `0` means the default) |
 | `offset`  | 0       | Number of items to skip (max: 2^63 - 1) |
 
-An omitted `limit` applies the default of 100 — list endpoints never return an
-unbounded collection. Use `GET /backup` when you need a full export. Malformed,
-negative, or out-of-range `limit`/`offset` values are rejected with `400` rather
-than coerced to a default, and validation runs after authentication, so an
-unauthenticated caller still receives `401`.
+An omitted `limit` applies the default of 100, and a `limit` above 1000 is
+capped at 1000, so list endpoints never return an unbounded collection. Use
+`GET /backup` for a full export. Malformed or negative `limit`/`offset` values,
+and offsets above 2^63 - 1, are rejected with `400`. Validation runs after
+authentication, so an unauthenticated caller still receives `401`. See
+[Pagination](admin_api.md#pagination) for the full contract.
 
 ### Paginated Request
 

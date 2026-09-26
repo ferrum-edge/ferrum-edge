@@ -9,7 +9,7 @@ Routing is the first half of the request path; protocol dispatch is the second. 
 - **`proxy.backend_scheme`** (`http`, `https`, `tcp`, `tcps`, `udp`, `dtls`) — the wire transport. HTTP family proxies (`http`, `https`) default to `https` when omitted. Stream family proxies must set a scheme explicitly.
 - **Runtime `HttpFlavor`** — `Plain`, `Grpc`, or `WebSocket`, classified per-request by `detect_http_flavor()` from the request's content-type and upgrade headers.
 
-The gateway does **not** pin gRPC or WebSocket in config — a single `https` proxy transparently serves a mix of REST, gRPC, and WebSocket traffic on the same backend pool. This is the decoupling introduced alongside the `BackendScheme` refactor; older `BackendProtocol::{Grpcs, Wss, H3}` config values no longer exist.
+The gateway does **not** pin gRPC or WebSocket in config — a single `https` proxy transparently serves a mix of REST, gRPC, and WebSocket traffic on the same backend pool. There are no gRPC-, WebSocket-, or HTTP/3-specific scheme values.
 
 HTTP/3 clients work against any `backend_scheme` — see [docs/http3.md](http3.md) for the dispatch model, the cross-protocol bridge, and why WebSocket upgrades on the H3 listener return 501.
 
@@ -23,7 +23,7 @@ The request path used for routing is the **canonical policy path**, derived once
 
 ### Step 1: Cache Lookup (O(1))
 
-Before any route table scanning, the router checks two bounded caches keyed by `(host, path)`:
+Before any route table scanning, the router checks two bounded caches keyed by `(host, path)` plus the frontend port and TLS flag:
 
 1. **Prefix cache** — stores prefix route matches and negative (no-match) entries
 2. **Regex/exact cache** — stores regex, exact-path, and path-param route matches (separate partition)
@@ -59,8 +59,8 @@ Within **each** host tier, four path matching strategies are tried in order:
 
 After scanning, the result is cached for future O(1) lookups:
 
-- **Prefix match** is stored in the prefix cache
-- **Regex match** is stored in the regex cache (separate partition)
+- **Prefix or host-only match** is stored in the prefix cache
+- **Regex or exact-path match** is stored in the regex/exact cache (separate partition)
 - **No match** is stored as a negative entry in the prefix cache (prevents repeated O(n) scans from scanner/bot traffic)
 
 ## Priority Rules (Most to Least Specific)
@@ -70,7 +70,7 @@ After scanning, the result is cached for future O(1) lookups:
    exact host  >  wildcard host (*.domain)  >  catch-all (no hosts)
 
 2. Path match type (within the same host tier)
-   exact path  >  prefix route  >  regex route
+   exact path  >  prefix route  >  regex route  >  host-only fallback
 
 3. Prefix tiebreaker
    longest prefix wins (pre-sorted at config load time)
@@ -109,11 +109,11 @@ and `deep.other.example.com`, but not `example.com` itself.
 | `api.example.com` | `/api/health` | `wildcard-api` | No exact-host prefix match for `/api/health`, wildcard `*.example.com` + prefix `/api` |
 | `other.example.com` | `/api/data` | `wildcard-api` | Wildcard host match + prefix `/api` |
 | `other.org` | `/anything` | `catchall` | No exact/wildcard match, catch-all `/` |
-| `other.org` | `/users/42/orders` | `user-orders-regex` | No prefix match, catch-all regex matches exact path |
-| `other.org` | `/users/42/orders/pending` | `catchall` | Regex pattern has auto-appended `$`, so `/orders/pending` doesn't match — falls through to catch-all `/` |
-| `api.example.com` | `/users/42/orders` | `catchall` | Catch-all prefix `/` beats catch-all regex |
+| `other.org` | `/users/42/orders` | `catchall` | Catch-all prefix `/` beats catch-all regex |
+| `other.org` | `/users/42/orders/pending` | `catchall` | Catch-all prefix `/` (the regex would not match anyway: it is anchored with `$`) |
+| `api.example.com` | `/users/42/orders` | `catchall` | No exact-host or wildcard match; catch-all prefix `/` beats catch-all regex |
 
-Note the last row: the catch-all prefix route `/` matches `/users/42/orders` before the regex route is checked, because **prefix always beats regex within the same host tier**. To use the regex route for this path, either remove the catch-all or assign the regex route to a more specific host tier.
+In this example `user-orders-regex` never wins: the catch-all prefix route `/` matches every path before the regex route is checked, because **prefix always beats regex within the same host tier**. To use the regex route, either remove the catch-all `/` or give the regex route a more specific host tier.
 
 ## Host-only Routing
 

@@ -114,8 +114,8 @@ exits.
 Start each worker in its own long-lived execution session and retain its exact session handle or
 PID. Prefer one tool call per worker so completions and failures remain attributable. Never wrap
 the fleet in a single shell command, use `killall opencode`, or use `pkill opencode`; the user may
-have unrelated opencode sessions. Cap this workflow at 7 concurrent workers unless the user
-sets a lower limit.
+have unrelated opencode sessions. Cap this workflow at seven concurrent workers unless
+the user sets a lower limit.
 
 ## Pin the worker role
 
@@ -127,9 +127,10 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
-opencode-agents, grok-agents, astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents, composer-agents, or any
-.agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
+skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents,
+grok-agents, composer-agents, qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
+opencode-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested
+workers.
 ```
 
 This prevents a worker from replacing the selected model through nested delegation.

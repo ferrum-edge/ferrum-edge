@@ -54,17 +54,18 @@ rejects crash artifacts larger than 64 KiB before upload.
 ## Hosted CI
 
 - **PR gate** (`ci.yml` → `Fuzz Smoke`): the locked `proptest` smoke tests
-  (`cargo test --locked` in `fuzz/`). This is the required full-mode
-  pull-request gate and runs on every full-mode pull request.
+  (`cargo test --locked` in `fuzz/`). This is a required gate for full-mode
+  pull requests and merge-queue runs whose changes match the `run_fuzz_smoke`
+  path gate (see [ci_cd.md](ci_cd.md)); every other event runs it
+  unconditionally.
 - **Bounded libFuzzer budget** (same `Fuzz Smoke` job, `if: github.event_name ==
   'push' || github.event_name == 'workflow_dispatch'`): six targets at ~8 s each
   (`-runs=512`, `-max_total_time=8`, `-max_len=4096`, `-timeout=2`,
   `-rss_limit_mb=1024`), then `datagram_client_address` at the same bounds with
   `-max_len=65536` (issue #4442). It runs on the push to `main` and on manual
-  `workflow_dispatch` of `ci.yml` only. The bounds are byte-identical to what
-  pull requests used to run; only *where* the budget executes changed (#3902
-  took it off `pull_request` for cost, #4238 off `merge_group` for blast
-  radius). Every merged change still reaches the budget seconds later through
+  `workflow_dispatch` of `ci.yml` only (#3902 moved it off `pull_request` for
+  cost, #4238 off `merge_group` for blast radius; the bounds did not change).
+  Every merged change still reaches the budget seconds later through
   the push to `main`, which is also the only event permitted to populate this
   lane's cache.
 - **Scheduled sanitizer lane** (`.github/workflows/fuzz.yml`): AddressSanitizer

@@ -14,7 +14,7 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 | Admin listener | `FERRUM_NODE_AGENT_ADMIN_ENABLED=false` | Opts in to the read-only admin listeners for node-agent metrics/health. When enabled, `FERRUM_ADMIN_HTTP_PORT` and `FERRUM_ADMIN_HTTPS_PORT` control plaintext and TLS listeners independently (port `0` disables that transport only). HTTPS uses the shared `FERRUM_ADMIN_TLS_*` contract and fails closed on explicit TLS intent without server cert/key. The listener defaults to loopback unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set. `/live` is always unauthenticated/minimal; unauthenticated `/health` returns only `status`/`ready`; `/metrics` requires admin JWT, metrics bearer token, or metrics CIDR. |
 | Outbound capture port | `15001` | The port written into the BPF capture config map and used by cgroup connect hooks when rewriting outbound sockets. |
 | HBONE redirect port | `FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT=15008` | The HBONE listener/redirect port carried in the same BPF config map for sidecarless topologies. Must match the mesh proxy HBONE listener (`15008` today). Node-agent startup automatically adds this port to outbound capture exclusions. |
-| Unix socket | `/run/ferrum/node-agent.sock` | Reserved IPC path for future node-agent/proxy coordination. Phase 1 treats this as inert contract metadata; no socket is created yet. |
+| Unix socket | `/run/ferrum/node-agent.sock` | Reserved path for future node-agent/proxy coordination. It is contract metadata only; nothing listens here. (The optional CNI plugin uses its own socket, `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` — see [CNI plugin install](#cni-plugin-install-optional).) |
 | BPF config map | `FERRUM_CAPTURE_CONFIG` | Singleton map keyed by `0`, containing outbound capture and HBONE redirect ports plus the NodeWaypoint inbound relay socket mark trusted by the pod-veth tc guard. |
 | BPF pod maps | `FERRUM_POD_IPS`, `FERRUM_POD_IPS6` | IPv4/IPv6 pod IP to proxy-port and capture-lifecycle metadata for enrolled workloads. The tc guard treats these maps as the enrolled destination set and keeps pod-originated Ambient UDP closed until the producer-ready flag is set. |
 | BPF node/probe maps | `FERRUM_NODE_IPS`, `FERRUM_NODE_IPS6`, `FERRUM_NODE_PROBE_PORTS`, `FERRUM_NODE_PROBE_PORTS6` | Explicit trusted kubelet probe source IPs plus enrolled pod probe ports allowed through the NodeWaypoint direct-inbound guard. Helm does not infer host-interface addresses; set `nodeAgent.trustedKubeletProbeSourceIps` only to known kubelet probe source IPs, such as a CNI bridge gateway address. The node-agent derives probe ports from Kubernetes HTTP/TCP/gRPC liveness, readiness, and startup probes. |
@@ -111,7 +111,7 @@ When node-agent mode starts its admin listener, `/metrics` includes:
 | `ferrum_node_agent_ingress_interface_topology{state,reason}` | Gauge for the optional NodeWaypoint ingress-interface proof. `state` and `reason` are closed sets; configured interface names, route destinations, node addresses, and other host/Kubernetes values are never labels. Notable bounded reasons include `no_remote_topology_evidence`, `node_set_too_large`, `requirement_set_too_large`, and `datapath_update_failed`. |
 | `ferrum_node_agent_ingress_interface_configured_interfaces`, `ferrum_node_agent_ingress_interface_expected_interfaces` | Bounded counts for the explicit operator set and the complete route-derived set. Names are deliberately omitted. |
 | `ferrum_node_agent_ingress_interface_family_required{family}`, `ferrum_node_agent_ingress_interface_family_covered{family}` | Closed `ipv4`/`ipv6` gauges showing which families the observed remote PodCIDRs require and whether the current topology proof covers them. |
-| `ferrum_mesh_node_topology_degraded{reason}` | Gauge. `1` with `reason` ∈ {`kernel_too_old`,`cgroup_v1`,`bpffs_missing`,`ebpf_feature_disabled`,`capture_mode_not_ebpf`,`capture_unavailable`,`node_waypoint_sock_ops_unavailable`} when startup cannot provide the requested eBPF topology. `0` with `reason="none"` when the eBPF capture path is nominal. Cardinality is bounded per node (a single series at a time). |
+| `ferrum_mesh_node_topology_degraded{reason}` | Gauge. `1` with `reason` ∈ {`kernel_too_old`,`cgroup_v1`,`bpffs_missing`,`ebpf_feature_disabled`,`capture_mode_not_ebpf`,`capture_unavailable`,`node_waypoint_sock_ops_unavailable`,`node_waypoint_ingress_redirect_unavailable`} when startup cannot provide the requested eBPF topology. `0` with `reason="none"` when the eBPF capture path is nominal. Cardinality is bounded per node (a single series at a time). |
 
 `ferrum_node_agent_ingress_interface_topology` emits only the current active
 `state`/`reason` series with value `1`; it does not emit every possible state as
@@ -181,19 +181,16 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   backend is only ever selected by a build *without* `--features ebpf`, e.g. the
 >   default image, never by the `-ebpf` image on a bad kernel.) **Release
 >   gating:** the default `:<tag>` image and the per-platform binary assets
->   publish **independently** of the `-ebpf` variant — a variant build failure
->   never blocks them (they flow through the `docker` / `docker-manifest` jobs).
->   The **GitHub Release page**, however, is now gated on the `-ebpf` manifest:
->   `create-release` `needs: docker-ebpf-manifest`, because the release notes
->   advertise the `-ebpf` tags and must not publish until those manifests exist.
->   So if the default image + binaries push but the `-ebpf` build/manifest fails,
->   you will see the core artifacts in the registry with **no GitHub Release**;
->   re-run the failed `docker-ebpf` / `docker-ebpf-manifest` jobs (and then
+>   publish **independently** of the `-ebpf` variant (they flow through the
+>   `docker` / `docker-manifest` jobs), but the **GitHub Release page** is gated
+>   on it: `create-release` `needs: docker-ebpf-manifest`, because the release
+>   notes advertise the `-ebpf` tags. If the core artifacts push but the `-ebpf`
+>   build/manifest fails, you get registry artifacts with **no GitHub Release**;
+>   re-run the failed `docker-ebpf` / `docker-ebpf-manifest` jobs (then
 >   `create-release`) from
->   [`.github/workflows/release.yml`](../.github/workflows/release.yml) to finish
->   the release. Conversely, `docker-ebpf-manifest` itself `needs:` the core
->   release path, so the `-ebpf` tags are never published for a release whose
->   core artifacts failed.
+>   [`.github/workflows/release.yml`](../.github/workflows/release.yml).
+>   `docker-ebpf-manifest` itself `needs:` the core release path, so `-ebpf`
+>   tags are never published for a release whose core artifacts failed.
 > - **`-ebpf-tools` (tools-capable capture runtime, Linux-only).**
 >   `ferrumedge/ferrum-edge:<tag>-ebpf-tools` /
 >   `ghcr.io/ferrum-edge/ferrum-edge:<tag>-ebpf-tools` are built by the SAME
@@ -1028,7 +1025,7 @@ In a cluster with heterogeneous kernels, the recommended pattern is:
 
 1. Deploy the node-agent DaemonSet to every node with the default `FERRUM_NODE_AGENT_FALLBACK_MODE=fail`; degraded nodes stay NotReady and the startup error identifies the remediation reason.
 2. If you intentionally want degraded nodes to keep routing while kernels are upgraded, run a node-agent image that includes `/bin/sh`, `iptables`, and `ip6tables` — the published `:<tag>-ebpf-tools` variant, or your own equivalent — then set `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` for those nodes.
-3. Configure the admission webhook (`FERRUM_MODE=injector`) to inject iptables init containers for pods scheduled on degraded nodes. The injector decides this from a Helm-templated `NodeSelector` driven by your node labels (e.g., `ferrum.io/capture-mode=iptables`).
+3. The admission webhook (`FERRUM_MODE=injector`) applies one cluster-wide `FERRUM_MESH_CAPTURE_MODE`; it has no per-node selector, so it cannot give only pods on degraded nodes iptables init containers. Keep workloads that require capture off degraded nodes (for example with node affinity) until those nodes are upgraded.
 
 The mesh control plane is not changed by node-level degradation: slice apply, `mesh_authz`, `mesh_workload_metrics`, and HBONE all continue to function as ambient. Only the per-pod capture mechanism on the affected node changes.
 
@@ -1317,7 +1314,7 @@ Symptom: pods on a node stick in `ContainerCreating` with a CNI error mentioning
    rm /etc/cni/net.d/00-ferrum.conflist
    ```
    The primary CNI configuration it chained behind was never modified, so nothing else needs repairing; kubelet picks the primary config up again on the next ADD.
-3. Fix the node-agent (see the diagnostics table above and `ferrum_node_agent_cni_socket_lifecycle_total`), then recreate the node-agent pod to reinstall the chain.
+3. Fix the node-agent (check its logs, `ferrum_node_agent_capture_state`, and `ferrum_node_agent_cni_socket_lifecycle_total`), then recreate the node-agent pod to reinstall the chain.
 
 The listener holds a sibling `<socket>.lock` advisory lock for its complete
 lifetime. A second live node-agent generation refuses to replace the active
@@ -1359,7 +1356,7 @@ $ cat /etc/cni/net.d/00-ferrum.conflist
 }
 ```
 
-The `managedBy` / `owner` / `generation` keys are the ownership markers described below; the plugin itself ignores them on the request path.
+The `managedBy` / `owner` / `generation` keys are the ownership markers described in [Ownership markers](#ownership-markers); the plugin itself ignores them on the request path.
 
 The generated `name` is preserved from the matched primary CNI config, so it will usually be the primary network name rather than a Ferrum-specific constant.
 
@@ -1387,7 +1384,7 @@ Delivered (issue #3609):
 - **In-place upgrade.** See below.
 - **Hosted evidence.** External Rust integration coverage in `tests/integration/cni_tests.rs` (`install_lifecycle`, including crash-loop ADD fail-closed, ownership mismatch, repeated cleanup, and upgrade ordering) plus the existing CI Helm render/static contract assertions, plus the privileged live suite `tests/k8s/cni_lifecycle_live/run.sh` (workflow `.github/workflows/cni-lifecycle-live.yml`): live kind install → fail-closed pod creation → rollback recovery → idempotent uninstall → chart cleanup graph failure/retry → full-chart `helm install` / `helm uninstall` under the cluster's real primary CNI.
 
-**In-place upgrade.** A re-run of the installer is an upgrade, and the semantics are now explicit rather than incidental:
+**In-place upgrade.** A re-run of the installer is an upgrade:
 
 - The new binary is staged in the destination directory and published by an atomic same-directory `rename`. The installed file is never truncated or written through, so an already-exec'd `ferrum-cni` keeps a valid inode and finishes its RPC forward against the binary it started with — there is no torn-binary or `ETXTBSY` window.
 - When the staged bytes are byte-identical to what is already installed — the routine `helm upgrade` with an unchanged image — the rename is **skipped entirely**. The common upgrade therefore performs no binary swap at all, so no in-flight plugin can straddle one.

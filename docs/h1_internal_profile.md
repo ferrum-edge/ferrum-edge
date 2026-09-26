@@ -4,11 +4,9 @@
 hosted regression fixtures. It does not change coalescing, Content-Length, body limits,
 timeouts, retries, offered load, TLS verification, release optimization settings,
 or forwarding policy. #5600's client frame/chunk/TLS observations and `/proc/io`
-remain distinct sources. Historically this branch started at #5602 development
-head `5e32b808af5631978cedc525d0dff7a29aedbb4c`. #5602 landed at reviewed head
-`3ba46fcd73d22304dca4ddd20b14c8ecadd6c814`, merge
-`61c68cb0e73504f389a2fdf065bf5297d6baf3ba`; it is no longer an outstanding
-dependency. Preserve its error campaign. There are no new performance results here. The prior
+remain distinct sources. #5602 (merged as
+`61c68cb0e73504f389a2fdf065bf5297d6baf3ba`) is not a dependency; preserve its
+error campaign. There are no new performance results here. The prior
 cutoff campaign demonstrated no gain; its failed 5 MiB observations remain valid
 failure evidence and are not replaced by this foundation.
 
@@ -49,8 +47,8 @@ failure, exhausted registration and publication version exhaustion increment
 `lost_events` on the exceptional path. Saturation is sticky; counter overflow is
 exported and invalidates completeness. Internal array indices are constants or
 bounded enum/registration results. This contract depends on the backing
-allocator's `GlobalAlloc` contract and Rust's const TLS implementation; root
-should review these unsafe/concurrency seams explicitly.
+allocator's `GlobalAlloc` contract and Rust's const TLS implementation; review
+these unsafe/concurrency seams explicitly when changing them.
 
 There are 128 cache-aligned, never-reused thread slots, each with 206 fixed
 counters. Registration uses bounded atomic compare-exchange over static storage.
@@ -129,11 +127,8 @@ connections are outside the frontend write wrappers but their allocations remain
 in process totals. This build should run an isolated H1 workload; shared body,
 coalescer and mixed-wire counters must not be relabeled H1 under mixed traffic.
 
-## Hosted checks and exact root dispatch
+## Hosted checks and manual dispatch
 
-No repository code, build, formatter, lint, test, benchmark, container or server
-was executed locally for this implementation. Static inspection and
-`git diff --check` are the only local validation. The new
 `.github/workflows/h1-internal-profile.yml` registers a hosted lane (PRs that
 edit the H1 profiler itself, a daily run on the `main` tip, and
 manual dispatch; see `docs/ci_cd.md` -> "Optional PR lanes and post-merge
@@ -143,26 +138,25 @@ private publication-seam tests located under `tests/unit/gateway_core/`, existin
 coalescer contracts with observers on/off, existing live functional streaming
 contracts, the explicit H1 cadence/safety matrix below, supported-protocol
 trailer gates, and H1 schema/completeness tests. The independent Benchmark Harness
-Tests discovery also runs the new Python tests. These are registrations, not
-claims of passing execution.
+Tests discovery also runs the H1 Python tests.
 
-Root dispatches after reviewing this branch (#5602 is already landed; worker
-does not dispatch). Once the workflow is available to GitHub Actions:
+The measurement campaign runs only on manual dispatch:
 
 ```sh
 gh workflow run h1-internal-profile.yml \
-  --ref codex/20260919-5588-h1-kernel-profile -f payloads=all -f diagnostic_only=true
+  --ref <branch> -f payloads=all -f diagnostic_only=true
 ```
 
 `diagnostic_only=true` is the default: it runs the bounded slice below, then
-stops. Root must pin and verify the dispatched head against the pushed branch
-before interpreting artifacts; the command selects a ref, not an immutable SHA.
-For full profiles after reviewing the slice, root uses the same command with
-`-f diagnostic_only=false`. That dispatch includes its own diagnostic slice;
-there is no automatic rerun. `payloads` is `all` (default), `10240`, `71680`,
-`512000`, `1048576`, or `5242880` and applies only to full profiles. Root can
-budget separate size dispatches; all five remain required. Each comparison's two arms and repeated direct controls share one VM.
-No worker dispatch, PR, review, merge or issue write is part of this task.
+stops. Pin and verify the dispatched head SHA before interpreting artifacts;
+the command selects a ref, not an immutable SHA. For full profiles after
+reviewing the slice, rerun with `-f diagnostic_only=false`. That dispatch
+includes its own diagnostic slice; there is no automatic rerun. `payloads` is
+`all` (default), `10240`, `71680`, `512000`, `1048576`, or `5242880` and
+applies only to full profiles. Separate size dispatches can spread the budget,
+but all five sizes remain required. Each comparison's two arms and repeated
+direct controls share one VM. The `trace_mode` input (`none`, `syscalls`,
+`cpu`) is covered in [Hosted syscall and CPU follow-up](#hosted-syscall-and-cpu-follow-up-issue-5588).
 
 The manual job builds observer-off/on binaries at the **same checked-out SHA**,
 default `crypto-ring` features, Linux Jemalloc, release opt-level 3, fat LTO,
@@ -180,8 +174,7 @@ identical observers. Both use four counterbalanced pairs, repeated direct
 controls, 15-second measurement, five sizes and 200/200/200/100/50 offered workers.
 Existing warmup, drain, error, timeout, retry and TLS policy are preserved. The
 new H1 selector bypasses but never edits `experiment.json` or `experiment_arms.py`.
-Shared runner/sampler edits are isolated behind `--h1-profile`; root should
-coordinate those two file overlaps with #5602. The frozen benchmark job and its
+Shared runner/sampler edits are isolated behind `--h1-profile`. The frozen benchmark job and its
 policy verifier are untouched.
 
 `h1_internal_profile.py` requires schema-2 traffic samples bound to the expected
@@ -332,8 +325,8 @@ clock domain and client PID explicitly. This is **not host CLOCK_MONOTONIC** and
 cannot be directly compared with backend, BPF, perf or another process's times.
 Measurement/drain classification follows the existing fixed deadline. Session
 origin is diagnostic creation, not the generic harness monotonic origin; existing
-wall timestamps remain approximate cross-process context only. Generic clocks
-are left for root and the separate H3 repair.
+wall timestamps remain approximate cross-process context only. Generic harness
+clocks are out of scope here (see the separate H3 work).
 
 At warmup +10 seconds, if workers have not reached the barrier, the coordinator
 captures one `delayed_warmup` snapshot without extending its existing preflight
@@ -411,7 +404,7 @@ exit/reap codes, survivors, cleanup/report outcome and elapsed time. Missing
 permissions, an unavailable Docker daemon, an unkillable process or unsuccessful
 reaping cannot become successful cleanup. This is a hosted userspace deadline,
 not a guarantee against kernel uninterruptible I/O, host suspension or loss of
-the runner/filesystem. Such failures remain incomplete and need root attention;
+the runner/filesystem. Such failures remain incomplete and need manual review;
 no successful termination is inferred from missing evidence.
 
 Before starting the child, the supervisor atomically retains a failed report
@@ -448,7 +441,7 @@ and complete driver retirement accounting. No missing field is supplied a
 successful default. These joins validate retained evidence, not cryptographic
 provenance. All three rows and available partial evidence survive rejection.
 
-The review repairs add producer-to-consumer hosted regressions: real Rust plain
+Producer-to-consumer hosted regressions cover this path: real Rust plain
 and TLS H1 reports cross the Python typed validator (clean and failed responses),
 the actual runtime capture and sample-stamping paths feed diagnostic reports,
 and the real supervisor terminates TERM-resistant child sessions with nested
@@ -458,12 +451,12 @@ cleanup or the 5 MiB workload. The existing discovery gates select these tests
 without workflow dispatch or command-policy changes. All new Python process
 calls use literal executable/script argument lists; variable paths, deadlines
 and owned identities are data in the environment. The immutable-base CI policy
-checker remains the hosted authority and was not executed or weakened locally.
+checker remains the hosted authority.
 
 Manual run **35419342312** is pinned to old head
 `ac7ff645f766597b9e4f38aa9e18272c0b3c249d`. It remains raw prior-revision evidence
-and does not validate these repairs. New hosted formatting, lint, compilation,
-regressions and any root-owned manual slice must use the repair revision. No
+and does not validate the later diagnostic repairs; new hosted checks and any
+manual slice must run on a revision that contains them. No
 passing result, 5 MiB stall repair, performance gain or issue closure is asserted.
 
 Hosted registration: `metrics_tests::h1_diagnostic_tests` exercises actual plain
@@ -474,8 +467,7 @@ loss and separately timed driver cancellation. It is selected explicitly in the
 existing H1 checks job and included by the existing Benchmark Harness Tests
 `metrics_tests` target. Python selection/report/registration regressions run in
 both existing Python discovery gates. All cadence and supported-trailer gates
-remain registered unchanged. These are registrations only: no repository code,
-formatter, linter, test, build or benchmark was executed locally.
+remain registered unchanged.
 
 ## Live cadence and safety gate
 
@@ -488,8 +480,7 @@ test output and failures in `h1-cadence-{off,on}-<sha>` artifacts. No implicit
 harness rebuild is allowed. Measurement now depends on both cadence jobs as
 well as the existing checks. PR events run these gates without measurements;
 manual dispatch uses the inputs and command above. Full calibration/measurement
-requires `diagnostic_only=false` and a successful diagnostic slice. These are hosted registrations;
-no passing execution is claimed by this implementation.
+requires `diagnostic_only=false` and a successful diagnostic slice.
 
 Each of five tests runs cutoffs **0 and 1**, with cleartext H1 on both hops and
 with **verified TLS on both hops**. The TLS backend uses the existing `TestCa`
@@ -541,8 +532,8 @@ items to `Frame::data`; they cannot forward trailer frames. No H1 trailer pass
 is claimed. The lane explicitly retains the existing H2/gRPC hop-by-hop trailer
 filter, H2-frontend/H3-backend streaming trailer policy, and delayed-FIN trailer
 forwarding cases with both builds. These supported-protocol gates remain
-necessary for future shared-coalescer work; root must disposition the H1
-adapter limitation separately.
+necessary for future shared-coalescer work; the H1 adapter limitation needs a
+separate decision.
 
 ## Open obligations before any optimization
 
@@ -612,9 +603,8 @@ not a signed attestation or a performance result.
 `diagnostic_only=true` still stops after the existing drain slice even if a trace
 mode was supplied. An intrusive campaign requires `diagnostic_only=false`, a
 successful slice and explicit `syscalls` or `cpu`, plus **one payload selection**.
-Run separate root-selected shards for 10240, 71680, 512000, 1048576 and 5242880;
-all five are still required, with 200/200/200/100/50 workers. No worker dispatch is
-authorized by this implementation. The workflow keeps internal observer off/on
+Run separate shards for 10240, 71680, 512000, 1048576 and 5242880;
+all five are still required, with 200/200/200/100/50 workers. The workflow keeps internal observer off/on
 calibration and cutoff comparisons, then runs external off/on calibration with
 exactly the same observer-on image/config/cutoff, then a separate externally
 observed cutoff 0/1 matrix. Each matrix has four counterbalanced pairs, repeated
@@ -626,9 +616,9 @@ The `trace-fixtures` job compiles the shared C/BPF observer with warnings as
 errors, compiles the optimized omitted-frame-pointer/unwind-table fixture,
 checks shell/Python syntax and consumer regressions, and actually runs the
 fixtures on GitHub-hosted Ubuntu. The same preflight runs again on the measurement
-VM. `H3 Proof Preflight` also runs on changes to the shared observer. These are
-registered gates, **not locally executed or passing results**. No trusted policy
-verifier/exemption or frozen gateway benchmark workflow was edited. All commands
+VM. `H3 Proof Preflight` also runs on changes to the shared observer. The trusted
+policy verifier/exemptions and the frozen gateway benchmark workflow are
+unaffected. All commands
 used by the supervisor have literal execution sites in `h1_trace_commands.sh`.
 Ubuntu package versions/origins and actual tool hashes are retained; no unpinned
 downloads are introduced. The installed distro perf ELF is retained separately
@@ -717,7 +707,7 @@ capacity, stale-generation binding, missing BTF/symbol and unprivileged attachme
 cases are separate. Actual PID-number recycling, compat/IPv6, shared-file-table
 and nondeterministic close-in-flight fixtures remain explicitly unexercised.
 A passing fixture cannot imply all gateway APIs were observed. If attachment is
-unavailable, this implementation retains an unavailable syscall capture; a stock
+unavailable, the lane retains an unavailable syscall capture; a stock
 perf syscall fallback is not enabled or spliced onto a different repetition.
 
 ### CPU capture and bounds
@@ -866,9 +856,8 @@ exiting. The supervisor observes real perf autoexit without first signaling it,
 under a bounded fixture deadline. This proves only synthetic fixture behavior,
 not gateway drain or RPS. Mocked consumer regressions exercise the real runner
 request and supervisor acknowledgement, stale/missing/partial evidence, bad event
-ordering, and the target-exit/resource-read race. These new checks have not been
-executed locally; hosted results must be inspected before calling the repair
-verified.
+ordering, and the target-exit/resource-read race. Inspect hosted results before
+treating this path as verified.
 
 H1 teardown and trace event placement admit explicit `clock_receipt` records
 from readiness, the runner and the supervisor. Each carries the producer's boot
@@ -893,5 +882,6 @@ snapshots/lifetimes or raw perf/decoded stacks, build mapping inventory and
 remain alongside it. The report separates useful-work, internal-profile, syscall,
 socket/lifetime, CPU-sample and unwind validity. `internal_comparison_eligible`
 requires valid traffic, complete internal profiles and complete runtime pairing;
-`fully_measured_comparison_eligible` remains false with missing dimensions. Root must review actual hosted compiler,
-fixture and capture evidence before any interpretation; #5588 remains open.
+`fully_measured_comparison_eligible` remains false with missing dimensions. Review
+the actual hosted compiler, fixture and capture evidence before any
+interpretation; #5588 remains open.

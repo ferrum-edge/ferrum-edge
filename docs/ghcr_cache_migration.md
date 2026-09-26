@@ -4,13 +4,13 @@ The Actions cache allowance remains 10 GB and the organization keeps its $0 budg
 
 ## Original Ambient policy transition
 
-The first change adds an exact second generation to the trusted Cross policy and leaves the active workflows unchanged. Its hosted candidate-policy self-test validates both generations and rejects partial adoption. Once that policy is reviewed and merged, a workflow change can adopt the registry generation through the ordinary PR gates.
+The transition happened in two steps. First, a policy change added an exact second generation to the trusted Cross policy without touching the active workflows; its hosted candidate-policy self-test validated both generations and rejected partial adoption. Then an ordinary PR adopted the registry generation through the normal gates.
 
 The registry generation splits the Ambient image recipe into two mutually exclusive jobs:
 
 - `ambient-host-udp-image-read` runs for relevant PRs, merge groups, and non-main dispatches. It has only `contents: read`, no registry login, and imports cache anonymously.
 - `ambient-host-udp-image-write` runs only for relevant `push` or `workflow_dispatch` events on `ferrum-edge/ferrum-edge` main. It uses job-scoped `packages: write` and the existing pinned GHCR login action.
-- The existing `ambient-host-udp-image` job becomes an aggregate. It requires successful planning, the selected recipe to pass, and the other recipe to be skipped. The outer required `Ambient Host UDP Live` gate and the kernel job remain unchanged.
+- The `ambient-host-udp-image` job is an aggregate. It requires successful planning, the selected recipe to pass, and the other recipe to be skipped. The outer required `Ambient Host UDP Live` gate and the kernel job remain unchanged.
 
 Both recipes keep all three image builds, the `pr-build` profile, the tools runtime checks, and the distroless checks. Checkout does not persist credentials. The recipes use distinct references in `ghcr.io/ferrum-edge/ferrum-edge-buildcache` for `capture-tools-base`, `runtime-ebpf-tools`, and `runtime-ebpf`, with `ambient-v1-linux-amd64-` tag prefixes. They do not publish shipping images or alter release tags. A missing import performs a cold build; an export failure fails the writer.
 

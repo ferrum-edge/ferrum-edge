@@ -84,10 +84,9 @@ edit the UDP profiler itself, and a daily run on the `main` tip; see
 `docs/ci_cd.md` -> "Optional PR lanes and post-merge validation") for
 formatting, clippy, build, attribution/publication/batch tests, and existing
 setup/FIFO/auth/source/amplification/generation regressions. It also checks the
-observer-off path, combined H1 build and parent collector contracts. All
-execution is hosted. No workflow was dispatched by this implementation.
+observer-off path, combined H1 build and parent collector contracts.
 
-Manual dispatch builds symbolized observer off/on twins from the same checked
+Manual dispatch additionally runs the measurement job, which builds symbolized observer off/on twins from the same checked
 out revision, retaining release optimization, fat LTO, one codegen unit,
 crypto-ring and Jemalloc. It archives source/lockfiles, flags, binary hashes,
 build IDs/debug files, image identities, runner CPU/kernel/boot ID, effective
@@ -176,7 +175,7 @@ After the existing UDP readiness probe succeeds, `start_kong` runs
 bound to the pinned image ID. This runs before measurement in each of the four
 profile pairs, with no per-packet observation or workload/config change. It
 requires GitHub-hosted Linux and creates no replacement gateway. The existing
-OCI metadata remains retained; the new container inspection selects identity
+OCI metadata remains retained; the container inspection selects identity
 and state fields without dumping environment variables.
 
 Each `pairs/pair_NNN/diagnostics/kong-readback/` contains an initial manifest,
@@ -208,9 +207,10 @@ There is no `nginx -T`, directory recursion, arbitrary include following,
 `.kong_env`/secret/certificate-content read, or package-inventory path execution.
 The fixed config set retains the known stream includes; the summary indexes
 include candidates and marks references outside the successfully captured set
-as unresolved. This index is deliberately not an NGINX/Lua parser. Root must
-review the raw main/stream/server config and every relevant include, resolving
-unexpected includes in a subsequent bounded change if necessary. Optional
+as unresolved. This index is deliberately not an NGINX/Lua parser, so reviewers
+must read the raw main/stream/server config and every relevant include before
+drawing conclusions; resolving unexpected includes needs a separate bounded
+change. Optional
 absent generated files remain failed queries, never invented empty configs.
 
 The existing hosted `Registered collector, Kong readback and parent measurement
@@ -218,8 +218,7 @@ contracts` step checks shell syntax and discovers `test_kong_udp_readback.py`.
 Contracts exercise the actual reader's byte budgets, failures/interruption,
 identity binding, source-hash mismatch, stream-include gaps and fixed runner
 registration. They do not substitute for the manual campaign's actual image
-readback. Neither tests nor campaign were executed locally or dispatched by
-this implementation.
+readback.
 
 ### Interpretation remains incomplete
 
@@ -242,5 +241,5 @@ traffic/profile validity, with `kong_session_comparability.complete=false`,
 Kong campaign. No inherited effective value, session reuse, native source
 correspondence, or causal performance finding is fabricated.
 
-Root owns final provenance, syscall/CPU tracing, hosted dispatch, parent
-integration, and any subsequent decision about optimization or tracker closure.
+Final provenance, syscall/CPU tracing, and any decision about optimization or
+closing #5588 remain open.

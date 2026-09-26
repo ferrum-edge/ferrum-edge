@@ -3,8 +3,8 @@
 Live single-cluster validation of the **Stable Sidecar traffic surface** on a
 real kind cluster with real SPIRE-issued SVIDs — the datapath the in-process
 functional tests collapse (no iptables capture, loopback dials). One kind
-cluster runs SPIRE plus the hand-crafted sidecar workloads (and, since issue
-#2002, a Ferrum control plane):
+cluster runs SPIRE, the hand-crafted sidecar workloads, and a Ferrum control
+plane:
 
 - **svc** — the destination: an inbound iptables init container REDIRECTs app
   port `8080 -> :15006`, a Ferrum sidecar (`FERRUM_MESH_TOPOLOGY=sidecar`,
@@ -19,10 +19,9 @@ cluster runs SPIRE plus the hand-crafted sidecar workloads (and, since issue
   same-trust-domain mTLS and is then denied by the destination's
   identity-scoped AuthorizationPolicy (`mesh_authz` 403) — a
   destination-sourced negative, not an incidental client-side TLS failure.
-- **wssvc** — a second destination pod (`sa/wssvc`, **its own identity**: a
-  distinct WebSocket echo app on a distinct pod UID, so it is not folded into
-  `sa/svc`'s inbound Host table) running a
-  minimal RFC 6455 echo that answers upgrades with a correct
+- **wssvc** — a second destination pod with **its own identity** (`sa/wssvc`,
+  distinct pod UID, so it is not folded into `sa/svc`'s inbound Host table)
+  running a minimal RFC 6455 echo that answers upgrades with a correct
   `Sec-WebSocket-Accept` and **holds** the session — the target of the DR
   `maxConnections=1` probe.
 - **ferrum-cp** — a Ferrum **control plane** (`FERRUM_MODE=cp`, sqlite on an
@@ -69,7 +68,7 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 
 | Assertion | Proof |
 |---|---|
-| `sidecar.spire.workload_entries` | svc/wssvc/client/rogue/capp SPIRE entries registered |
+| `sidecar.spire.workload_entries` | svc/wssvc/client/rogue/capp/native-mtls-probe/drsvc-a/drsvc-b SPIRE entries registered |
 | `sidecar.peer_auth.strict_mtls_authenticated` | captured client request → mesh-mTLS → STRICT inbound → 200 with the app marker |
 | `sidecar.peer_auth.strict_mtls_plaintext_rejected` | plaintext dial at the **captured** app port never reaches the app (REDIRECT → STRICT rejects) |
 | `sidecar.authz.denied_principal_rejected` | rogue → 403 with `Mesh authorization denied` (dest-side `mesh_authz`) |
@@ -110,16 +109,15 @@ transport (`mesh.config_transport.native_subscribe`, backed by
 `sidecar.config.native_subscribe_delivered` plus the mTLS/JWT/SAN negatives
 and projected-Secret rotation assertions); the artifact is validated
 against the contract by `tests/conformance/live_contract.rs` (the live
-workflow runs it right after the fixture). No contract row remains
-`live_deferred`: VS CORS closed with issue #1973 (the mesh slice's
-`virtual_service_cors_policies` carriage) and the config-transport row closed
-with issue #2002 (the in-fixture Ferrum CP above).
+workflow runs it right after the fixture). No contract row for this suite is
+`live_deferred`.
 
 This contract is **PR- and release-blocking**: the dedicated workflow's
 `Mesh E2E Sidecar Live` gate job is a branch-protection required check
 directly (there is no mirror job in `ci.yml`), the suite force-runs on
-every main push, and `release.yml`'s `validate-release-sha` requires a green
-push run for the tag target before anything ships.
+every main push, and `release.yml`'s `validate-release-sha` requires it (via
+`.github/required-publication-checks.json`) to be green for the tag target
+before anything ships.
 
 ## JWT material
 

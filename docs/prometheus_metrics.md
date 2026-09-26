@@ -134,21 +134,27 @@ from a listener being rebound across a config change; and
 sustained.
 
 **Runbook.** Read authenticated `/health` for the affected port and reason.
-`bind_failed` on `:80`/`:443` is usually a missing `CAP_NET_BIND_SERVICE` or a
-port already owned by another process; `port_reserved`,
-`stream_port_collision`, `udp_stream_collision`, `class_conflict`, and
-`process_global_class_mismatch` are configuration conflicts inside Ferrum's own
-port map; `dedicated_bind_conflict` and `dedicated_bind_tls_unsupported` identify
-Sidecar ingress bind declarations that cannot be realized without widening or
-misclassifying the listener; `listener_task_ended` means an accept loop died
-after a successful bind and is being rebound — a same-pass rebind increments
-the cumulative failure and recovery counters once while the active gauge stays
-`0` once the half is live again. On the `quic` half only the HTTP/3 listener is
-reaped and retried, so HTTP/1.1 and HTTP/2 keep serving that port and its routes
-stay admitted; `class_flip_deferred` means a frontend TLS-class change is waiting for the previous accept sockets to close;
-`retirement_pending` is the same fail-closed wait for another bind-identity
-change. No action clears these manually — the supervisor retries on its own,
-and the metrics clear when it succeeds.
+
+- `bind_failed` on `:80`/`:443` is usually a missing `CAP_NET_BIND_SERVICE` or a
+  port already owned by another process.
+- `port_reserved`, `stream_port_collision`, `udp_stream_collision`,
+  `class_conflict`, and `process_global_class_mismatch` are configuration
+  conflicts inside Ferrum's own port map.
+- `dedicated_bind_conflict` and `dedicated_bind_tls_unsupported` identify
+  Sidecar ingress bind declarations that cannot be realized without widening or
+  misclassifying the listener.
+- `listener_task_ended` means an accept loop died after a successful bind and
+  is being rebound. A rebind in the same pass increments the failure and
+  recovery counters once each, and the active gauge returns to `0` once the
+  half is live again. On the `quic` half only the HTTP/3 listener is reaped and
+  retried, so HTTP/1.1 and HTTP/2 keep serving that port and its routes stay
+  admitted.
+- `class_flip_deferred` means a frontend TLS-class change is waiting for the
+  previous accept sockets to close; `retirement_pending` is the same fail-closed
+  wait for another bind-identity change.
+
+No manual action clears these: the supervisor retries on its own, and the
+metrics clear when it succeeds.
 
 ### Istio status CAS
 
@@ -191,7 +197,7 @@ Emitted with the Istio status CAS families after `FERRUM_K8S_CONTROLLER_ENABLED=
 
 **Suggested investigation:** on a Gateway API parent-status timeout, scrape these together. High last-reconcile duration with climbing reconciliations points at CPU/API contention. Frozen reconciliations point at a wedged reconciler. `watch_idle_relists` still zero inside one idle window is expected and does not by itself prove a dead watch.
 
-A single reconcile whose `last_reconcile_duration_milliseconds` dwarfs its neighbours, paired with a rise in `status_request_timeouts_total`, is the issue #4239 shape: the status patch batch is awaited inline on the serialized reconcile loop, so one stalled Kubernetes status write stops every other object's status from being published for as long as it is allowed to run. The controller now bounds every status request (5s), every object (10s), and every batch (15s), so that blockage can no longer reach the conformance suite's 60s parent-status wait. The stalled object is logged with its kind, namespace, name, and phase and is replanned on the next reconcile.
+A single reconcile whose `last_reconcile_duration_milliseconds` dwarfs its neighbours, paired with a rise in `status_request_timeouts_total`, means a stalled Kubernetes status write (issue #4239): the status patch batch is awaited inline on the serialized reconcile loop, so one slow write delays every other object's status. The controller bounds every status request (5s), every object (10s), and every batch (15s), so that delay cannot reach the conformance suite's 60s parent-status wait. The stalled object is logged with its kind, namespace, name, and phase and is replanned on the next reconcile.
 
 ### Data-path load shedding, upstream health, and pool saturation
 
@@ -273,9 +279,8 @@ that token covers is labelled `dispatch_policy_rejected` here). Access-log
 `ferrum_plugin_log_sink_records_accepted_total{plugin}` publish the record
 accounting of the per-plugin observability sinks (`http_logging`,
 `tcp_logging`, `udp_logging`, `ws_logging`, `statsd_logging`, `loki_logging`,
-`kafka_logging`, `ai_transcript_audit`, `api_chargeback_sink`). Before these
-families existed the sinks logged their discards but published nothing, so a
-truncated audit trail was invisible on `/metrics`.
+`kafka_logging`, `ai_transcript_audit`, `api_chargeback_sink`), so a
+truncated audit trail is visible on `/metrics` rather than only in logs.
 
 These are **not** the same as `ferrum_log_sink_*{sink}`, which covers only the
 process-global stdout/stderr writers, and not the same as

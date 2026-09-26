@@ -13,7 +13,7 @@ self-relative trends; do not promote opportunistic laptop numbers into CI floors
 > 3 clean repetitions, all `total_errors=0` and `total_nxdomain=0`,
 > `runner_health_ok=true`, max CPU steal 0.0%). This run intentionally selected
 > `suites=dns`, so `mesh_complete` / `hbone_complete` and aggregate
-> `ready_to_publish_baselines=false` are false by selection — they do **not**
+> `ready_to_publish_baselines` are false by selection — they do **not**
 > invalidate the accepted DNS suite. Mesh Criterion and HBONE baselines come
 > from an earlier all-suite collection (see combined provenance in
 > `tests/performance/mesh/baseline.md`); that run's failed DNS portion must not
@@ -142,8 +142,8 @@ publishing partial rows from a failed all-suite collection.
   TCP, matching the client transport) + gateway txid rewriting cost. Subtract
   the direct-stub baseline to attribute gateway overhead. The stub must listen
   on both transports; a UDP-only stub makes TCP rows connection-refused.
-- Localhost-only topology; Linux `recvmmsg` vs other OS UDP paths differ —
-  publish per runner OS/class.
+- Localhost-only topology; kernel UDP behavior differs by OS (the DNS proxy
+  reads one datagram per `recv_from` everywhere) — publish per runner OS/class.
 - CP stub publishes one slice; slice-churn cost belongs to `mesh/slice_apply`,
   not these rows.
 - Shared-runner CPU steal can inflate p99; publication fails closed above **5.0%**

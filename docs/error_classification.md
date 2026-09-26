@@ -52,7 +52,7 @@ Two helpers live with the enum:
 
 `TlsError` requires an independently known setup context; a typed rustls variant or peer-provided alert description alone is not proof that application bytes were never processed. `io::Error::get_ref()` is still inspected so setup callers do not lose typed rustls payloads. Display text is not used when a typed source is reachable. Do **not** classify by matching `"connection was not ready"`: that label also covers every other reason a pooled connection was not ready; the typed `is_canceled` flag is the evidence. An origin error after reqwest's connect phase without `is_canceled` is indistinguishable from case (4) and stays `ConnectionReset`.
 
-Case (3) also covers a request queued at the moment its pooled HTTP/1 connection is reset or closed (issue #5714). tokio's channel send checks for closure and publishes the request in two separate steps. If the connection closes between them, the request misses hyper's drain and is never dequeued. The vendored hyper-util ([patch 001](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md)) then releases the connection's only sender, so the request fails with hyper `is_canceled()`: hyper-util retries it on a new connection when the old one was reused, and otherwise it reaches the gateway as `ConnectionPoolError`. Before that patch, the same request waited out `backend_read_timeout_ms` and was reported as `ReadWriteTimeout` (504), although no byte reached the backend.
+Case (3) also covers a request queued at the moment its pooled HTTP/1 connection is reset or closed (issue #5714). tokio's channel send checks for closure and publishes the request in two separate steps. If the connection closes between them, the request misses hyper's drain and is never dequeued. The vendored hyper-util ([patch 001](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md)) then releases the connection's only sender, so the request fails with hyper `is_canceled()`: hyper-util retries it on a new connection when the old one was reused, and otherwise it reaches the gateway as `ConnectionPoolError` rather than waiting out `backend_read_timeout_ms` as a spurious `ReadWriteTimeout` (504).
 
 Every pre-wire io verdict in `classify_typed_chain` is gated the same way (issue #4536): `ConnectionRefused`, `ConnectionReset` → `ConnectionRefused`, `TimedOut` → `ConnectionTimeout`, and `EADDRNOTAVAIL` → `PortExhaustion` are issued only when `phase_is_connect` is true; after the connect phase the same signals classify post-wire. `classify_reqwest_error` runs its `is_port_exhaustion` walk **inside** the `is_connect()` branch for the same reason — only a dial can exhaust ephemeral ports.
 
@@ -62,7 +62,7 @@ Omitted TLS `close_notify` is teardown (#4051): `UnexpectedEof` whose Display co
 
 When hyper reports the live backend-mTLS failure as a typed pool cancellation, `ConnectionPoolError` remains pre-wire and replayable under `retry_on_connect_failure`, and the public token stays `connection_failure`. A rustls error exposed only after reqwest's connect phase is conservatively post-wire (`X-Gateway-Error: backend_error`, circuit-breaker and passive health charged on the post-wire path), so non-idempotent retries remain subject to `retryable_methods`.
 
-`PluginHttpClient` (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) has a separate safe-method transport-retry list. It is not `!request_reached_wire()`: GET/HEAD/OPTIONS also replay some post-wire classes (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `RequestError`, `ReadWriteTimeout`). After issue #4406 that list includes `ConnectionPoolError` so a hyper `is_canceled` drop still retries. It still omits `TlsError` (handshake misconfig rarely recovers on replay) and the health-neutral policy classes. Gateway backend dispatch continues to use `request_reached_wire` / `retry_on_connect_failure`.
+`PluginHttpClient` (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) has a separate safe-method transport-retry list. It is not `!request_reached_wire()`: GET/HEAD/OPTIONS also replay some post-wire classes (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `RequestError`, `ReadWriteTimeout`). The list includes `ConnectionPoolError` so a hyper `is_canceled` drop still retries (issue #4406). It still omits `TlsError` (handshake misconfig rarely recovers on replay) and the health-neutral policy classes. Gateway backend dispatch continues to use `request_reached_wire` / `retry_on_connect_failure`.
 
 ## Per-protocol classifiers
 
@@ -83,13 +83,11 @@ The H3 pool returns a typed [`H3PoolError`](../src/http3/client.rs) whose `reque
 
 Direct-H2 pool acquisition and pooled request dispatch have different phase boundaries. Acquisition errors are pre-wire. Once a pooled sender is acquired, `hyper::Error::is_canceled()` is the only typed proof that dispatch never occurred; every other known or unknown send failure is post-wire. In particular, a connect-only class inferred from an inner I/O source is normalized to `ProtocolError`, because an inner `ConnectionRefused` or port-exhaustion errno cannot prove that an already-pooled request was never sent.
 
-The HTTP/1.1 dispatches Ferrum drives on hyper directly — the HBONE inner HTTP/1.1 pool and the Unix-socket backend pool (`proxy_to_backend_hbone_after_ready` / `proxy_to_backend_unix` in [`src/proxy/mod.rs`](../src/proxy/mod.rs)) — send with `try_send_request`, so their pre-wire evidence is stronger than `is_canceled()` alone: a `TrySendError` that hands the request back (`take_message()` is `Some`) proves hyper never dequeued it, and hyper polls a request body only after dequeuing, so no byte of the head or the body reached the backend. A reused lease replays that request once on a fresh connection; a fresh lease reports `ConnectionPoolError` (`502`, pre-wire) whether the body was buffered or streaming. A canceled error *without* the request keeps the older rule: `ConnectionPoolError` only for a replayable body, `ProtocolError` otherwise. That includes a request queued at the moment its pooled connection was reset or closed (issue #5720): tokio's channel send checks for closure and publishes the request in two separate steps, so the request can land after the connection task drained its queue and exited. Both dispatches watch the sender's readiness while they wait ([`h1_send_release`](../src/proxy/h1_send_release.rs)) and drop the connection's only sender once it stops accepting requests, which fails the stranded request with the request handed back. Without that it waited out `backend_read_timeout_ms` and was reported as `ReadWriteTimeout` (`504`), or never resolved when that timeout is `0`.
+The HTTP/1.1 dispatches Ferrum drives on hyper directly — the HBONE inner HTTP/1.1 pool and the Unix-socket backend pool (`proxy_to_backend_hbone_after_ready` / `proxy_to_backend_unix` in [`src/proxy/mod.rs`](../src/proxy/mod.rs)) — send with `try_send_request`, so their pre-wire evidence is stronger than `is_canceled()` alone: a `TrySendError` that hands the request back (`take_message()` is `Some`) proves hyper never dequeued it, and hyper polls a request body only after dequeuing, so no byte of the head or the body reached the backend. A reused lease replays that request once on a fresh connection; a fresh lease reports `ConnectionPoolError` (`502`, pre-wire) whether the body was buffered or streaming. A canceled error *without* the request keeps the older rule: `ConnectionPoolError` only for a replayable body, `ProtocolError` otherwise. That includes a request queued at the moment its pooled connection was reset or closed (issue #5720): tokio's channel send checks for closure and publishes the request in two separate steps, so the request can land after the connection task drained its queue and exited. Both dispatches watch the sender's readiness while they wait ([`h1_send_release`](../src/proxy/h1_send_release.rs)) and drop the connection's only sender once it stops accepting requests, which fails the stranded request with the request handed back instead of leaving it to wait out `backend_read_timeout_ms` (a spurious `ReadWriteTimeout` / `504`, or no resolution at all when that timeout is `0`).
 
 ## Stream-family typed errors (`StreamSetupError`)
 
-TCP and UDP relays previously classified their setup-phase failures by `.contains()`-matching shared error-message prefixes (`STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED`, etc.) to disambiguate frontend vs backend TLS, plugin rejects, and load-balancer failures. That mechanism was fragile: a typo at a construction site or a reworded `format!()` silently broke cause attribution.
-
-[`StreamSetupError`](../src/proxy/stream_error.rs) replaces the substring approach with a typed kind:
+TCP and UDP relays attribute setup-phase failures (frontend vs backend TLS, plugin rejects, load-balancer failures, …) through a typed kind carried by [`StreamSetupError`](../src/proxy/stream_error.rs), not by matching error-message prefixes such as `STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED`:
 
 ```rust
 pub enum StreamSetupKind {
@@ -97,10 +95,14 @@ pub enum StreamSetupKind {
     BackendTlsHandshake,    // gateway → backend TCP-TLS failed (backend-side)
     BackendDtlsHandshake,   // gateway → backend DTLS failed (backend-side)
     RejectedByPlugin,       // umbrella for ACL/policy/throttle rejections (client-side)
+    ClientDisconnectedDuringAdmission, // client reset while fault injection delayed admission (client-side)
     DnsLookup,              // backend hostname did not resolve (backend-side, pre-wire)
     NoHealthyTargets,       // LB pool empty, empty subset, or no family-matching backends (backend-side)
     CircuitBreakerOpen,     // per-proxy passive-health circuit breaker is open (backend-side)
     BackendMaxConnectionsExceeded, // DestinationRule connectionPool.tcp.maxConnections cap hit at backend dial (backend-side)
+    UnsupportedStreamPolicy, // configured stream policy this path cannot apply yet (backend-side)
+    AuthorizationExpired,   // admitting credential expired during post-admission setup (client-side, health-neutral)
+    ClientTrustWithdrawn,   // frontend client-cert trust withdrawn during setup (client-side, health-neutral)
     SniAdmissionRefused,    // opaque-TLS SNI listener refused before any backend dial (gateway-local)
 }
 ```
@@ -195,9 +197,11 @@ The cause/direction mappers walk the chain via `find_stream_setup_error()` — `
 | `H2Handshake` | `TlsError` | HTTP/2 handshake over TLS (pre-wire) |
 | `H2cHandshake` | `ConnectionRefused` | HTTP/2 cleartext handshake — fails before any stream is opened, so request bytes never reach the application layer (pre-wire) |
 | `InvalidServerName` | `DnsLookupError` | rustls rejected the SNI name (pre-wire) |
-| `BackendRequest` | `ConnectionReset` | hyper `send_request` failed post-handshake — request bytes may already be on the wire, so this is **post-wire** by definition. Excluded from `is_connect_class()` so `retry_on_connect_failure` cannot bypass `retry_on_methods` and replay non-idempotent POSTs |
+| `BackendRequest` | `ConnectionReset` | hyper `send_request` failed post-handshake — request bytes may already be on the wire, so this is **post-wire** by definition. Excluded from `is_connect_class()` so `retry_on_connect_failure` cannot bypass `retryable_methods` and replay non-idempotent POSTs |
 | `TrustWithdrawn` | `TrustWithdrawn` | An accepted gateway trust publication withdrew an authority while a mesh transport was being established, or after a pooled transport was checked out but before it opened a stream (issue #3859). Pre-wire and backend-health-neutral — see the taxonomy table above |
 | `DispatchCanceled` | `ConnectionPoolError` | Pooled H2 `send_request` returned hyper `is_canceled` for a **fully collected, caller-retained** outbound body — hyper's contract that the request was **never dispatched**. Pre-wire / connect-class so `retry_on_connect_failure` can redial after invalidating the stale sender. The criterion is REPLAYABILITY, not the carrier shape: a buffered body written through the `backend_write_timeout_ms` upload pump (issue #4055) is still the same caller-owned `Bytes`, so it keeps this kind. Only genuinely unreplayable streaming / channel bodies keep `BackendRequest` on `is_canceled` |
+| `ProtocolNack` | `ConnectionPoolError` | Typed RFC 9113 NACK on a buffered request: remote `GOAWAY(NO_ERROR)` excluding the stream, or `RST_STREAM(REFUSED_STREAM)`. Pre-wire — see [Native gRPC Protocol NACKs](retry.md#native-grpc-protocol-nacks) |
+| `MaxConnections` | `BackendConnectionLimit` | DestinationRule `connectionPool.tcp.maxConnections` ceiling reached; no new socket was opened. Pre-wire and backend-health-neutral |
 
 `GrpcBackendUnavailableKind::is_connect_class()` enumerates the pre-wire kinds; the gRPC and H3→gRPC retry loops use it to decide whether `retry_on_connect_failure` is eligible for a given failure. A regression test (`test_every_connect_class_kind_classifies_as_pre_wire`) enforces the invariant that every connect-class kind classifies to `!request_reached_wire(class)` so the retry-loop predicate and the canonical wire boundary cannot drift.
 
@@ -213,7 +217,7 @@ The eager-buffer path (`buffered_backend_response_from_eager_collect` in [`src/p
 
 A pre-wire class is impossible on the eager-buffer path (response headers have already arrived, so a handshake failure cannot appear here), but one is coerced to `ConnectionReset` anyway so the documented `connection_error == !request_reached_wire(error_class)` boundary holds even if the classifier changes. Dispatch-level failures keep their classified pre-wire label so `retry_on_connect_failure` can still rotate to another target.
 
-A backend FIN (or `UnexpectedEof`) before a complete HTTP body is `ConnectionClosed`. That class is post-wire, the same as the previous `RequestError` catch-all: `request_reached_wire` is `true` for both, so `BackendResponse::connection_error` stays `false` and `retry_on_connect_failure` does not replay the request. Non-idempotent methods are therefore not retried via the connect-failure path. Circuit-breaker accounting *does* change: `error_class_is_post_wire_backend_failure` includes `ConnectionClosed` and not `RequestError`, so a truncated body that had been a phantom success (HTTP 200 + catch-all class) now trips the breaker as a backend failure. When the public status is already 502 and 502 is in `failure_status_codes`, the breaker already trips via status.
+A backend FIN (or `UnexpectedEof`) before a complete HTTP body is `ConnectionClosed`. That class is post-wire, so `BackendResponse::connection_error` stays `false` and `retry_on_connect_failure` does not replay the request; non-idempotent methods are not retried via the connect-failure path. `error_class_is_post_wire_backend_failure` includes `ConnectionClosed` (but not the `RequestError` catch-all), so a truncated body trips the circuit breaker as a backend failure even when the relayed status was 200. When the public status is already 502 and 502 is in `failure_status_codes`, the breaker already trips via status.
 
 ## WebSocket graceful close
 
@@ -253,9 +257,9 @@ produce a `ferrum_requests_total{proxy_id,method,...}` series or a transaction
 log row: a pre-parse reject has no `RequestContext`, no matched proxy, no method
 and no `proxy_id`, and never reaches a plugin cache.
 
-Admitted (well-formed) HTTP/1 requests keep the existing in-place observe path
-and the same vectored writes as on `main`; the connection I/O type Hyper is
-handed does not change.
+Admitted (well-formed) HTTP/1 requests are unaffected: they keep the in-place
+observe path and vectored writes, and the connection I/O type Hyper is handed
+does not change.
 
 Other Hyper parse failures the scanner cannot identify (for example a
 non-numeric `Content-Length` that Hyper rejects at parse time, a truncated
@@ -435,8 +439,8 @@ the gateway applies configured JSON body rules. That is a deterministic policy
 refusal: HTTP **502** with the existing `Response body too large` JSON error
 and numeric `limit`, plus the existing
 gateway-owned `overload` header token. It uses `DispatchPolicyRejected`, not
-`GatewayBufferCapacity` or `ResponseBodyTooLarge`. The closed sets remain seven
-header tokens and nineteen error classes. Private request provenance restores
+`GatewayBufferCapacity` or `ResponseBodyTooLarge`, so the closed sets stay at
+eight header tokens and nineteen error classes. Private request provenance restores
 the header after mutable hooks and stamps the class in the shared transaction-log
 funnel, including native H3 and cross-protocol paths.
 

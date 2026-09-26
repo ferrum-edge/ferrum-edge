@@ -15,13 +15,14 @@ cache limit and the zero-dollar spending budget remain unchanged.
 
 ## Data boundary
 
-The producer installs nightly-2025-07-01 and the existing checksum-pinned
-sccache wrapper, runs cargo test --locked in fuzz, then stops its compiler-cache
-server before snapshotting only .cache/sccache. Its explicit empty RUSTFLAGS
-matches the production Fuzz lane and clears the root Cargo configuration's mold
-linker flags; this isolated producer does not install that optional linker.
-It restores and saves no Actions cache. Capture and handoff happen only after this actual property suite passes;
-a competing lane cannot evict the source between a build and a later restore.
+The producer installs `nightly-2025-07-01` and the existing checksum-pinned
+sccache wrapper, runs `cargo test --locked` in `fuzz/`, then stops its
+compiler-cache server before snapshotting only `.cache/sccache`. Its explicit
+empty `RUSTFLAGS` matches the production Fuzz lane and clears the root Cargo
+configuration's mold linker flags; this isolated producer does not install that
+optional linker. It restores and saves no Actions cache. Capture and handoff
+happen only after the property suite passes, so a competing lane cannot evict
+the source between a build and a later restore.
 
 This is a separate transfer validation, with its producer exercised on relevant
 PRs rather than every production change. It preserves the production sanitizer
@@ -76,8 +77,8 @@ writes, FIPS, release profiles or compiler settings.
 
 Production integration still needs capture from the existing required build
 lanes, compatible lane and toolchain identity, same-input and source-changing
-compiler reuse, bounded retained generations, and later-main retention evidence for Unit, Lint and
-Artifacts. If moving compiler stores alone leaves too much Actions cache data,
+compiler reuse, bounded retained generations, and later-main retention evidence
+for Unit, Lint and Artifacts. If moving compiler stores alone leaves too much Actions cache data,
 target/dependency persistence must also be addressed. The prior target payload
 measurement came from an already-pruned Actions archive and cannot bound an
 unpruned end-of-build target directory.

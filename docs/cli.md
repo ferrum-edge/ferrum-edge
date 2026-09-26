@@ -12,7 +12,7 @@ sudo cp target/release/ferrum-edge /usr/local/bin/
 
 # From a pre-built release download (Linux x86_64 example)
 # Pin an immutable semver tag (vX.Y.Z from the Releases page). Do not rely on a moving
-# "latest" channel: README forbids it, and GitHub /releases/latest also skips prerelease tags.
+# "latest" channel: GitHub /releases/latest skips prerelease tags.
 set -euo pipefail
 TAG=v0.9.7  # replace with the desired vX.Y.Z tag from the Releases page
 BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
@@ -26,7 +26,7 @@ sudo install -m 0755 ferrum-edge-linux-x86_64 /usr/local/bin/ferrum-edge
 ferrum-edge version
 ```
 
-Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86_64`, and the ARM64 pair) are dynamically linked against glibc. The declared runtime floor is **GLIBC_2.34** (RHEL 9 / Rocky Linux 9 / AlmaLinux 9, which also covers Ubuntu 22.04 and Debian 12). The x86_64 GNU binaries are built in a digest-pinned **AlmaLinux 8.10** sysroot (glibc 2.28) by the same job that checksums and uploads them, and that job ABI-scans and smoke-tests the exact staged bytes before publishing them, so the released artifact is the artifact that was verified. ARM64 GNU artifacts come from the isolated Cross build, already target an older glibc, and are re-checked as published. Beyond glibc, the remaining dynamic libraries are `libgcc_s.so.1` and, when the Kafka stack does not static-link zlib, `libz.so.1`. Any GNU artifact whose GLIBC version-need records exceed 2.34, whose `DT_NEEDED` set is outside that allowlist, whose `e_machine` does not match the advertised `*-x86_64` / `*-aarch64` architecture, or that embeds a `DT_RPATH` / `DT_RUNPATH`, fails the release.
+Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86_64`, and the ARM64 pair) are dynamically linked against glibc. The declared runtime floor is **GLIBC_2.34** (RHEL 9 / Rocky Linux 9 / AlmaLinux 9, which also covers Ubuntu 22.04 and Debian 12). The x86_64 GNU binaries are built in a digest-pinned **AlmaLinux 8.10** sysroot (glibc 2.28); ARM64 GNU artifacts come from the Cross build. Beyond glibc, the only other dynamic libraries are `libgcc_s.so.1` and, when the Kafka stack does not static-link zlib, `libz.so.1`. The release job ABI-scans and smoke-tests the exact bytes it publishes and fails on any artifact that needs a newer glibc, links other libraries, targets the wrong architecture, or embeds an RPATH/RUNPATH.
 
 Alternative approaches:
 - **Symlink**: `sudo ln -s /path/to/ferrum-edge /usr/local/bin/ferrum-edge`
@@ -114,7 +114,7 @@ ferrum-edge validate [OPTIONS]
 
 ### What is validated
 
-0. **External secrets** — before settings are parsed, `validate` resolves the `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` suffixes into their base `FERRUM_*` variables exactly as `run` does. Empty suffixed variables are treated as unset in every build. A non-empty `_FILE` source must resolve to a **regular file** (a symlinked pathname is followed, but the opened target is what is type-checked, so Kubernetes projected secrets still work) holding at most **64 KiB** of valid UTF-8 that is non-empty after trailing-whitespace trimming; a FIFO, socket, device, or directory is refused before any read, and an oversized, non-UTF-8, or empty source fails the command. Those failures name the suffixed variable and the failure class — `not a regular file`, `credential file exceeds the maximum of 65536 bytes`, `content is not valid UTF-8` — and never the path. Validation therefore sees the same configuration the gateway would start with, and the same failures apply: an unreadable or unreachable non-empty source fails the command, and a base variable combined with a non-empty suffixed source for the same key is a conflict. Which suffixes a binary can resolve is a **build-time** property: `_FILE` works in every build, while `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` require the matching secret-backend Cargo feature (`secrets-vault`, `secrets-aws`, `secrets-azure`, `secrets-gcp`, or the `cloud-secrets` umbrella). The default feature set compiles none of them, so on a default binary a non-empty cloud suffix is not silently ignored — it fails the command with an unsupported-suffix error. No environment variable or settings value can enable a provider that was not compiled in; use a binary or image built with the required feature (the published Docker images build with `cloud-secrets`). Conflict detection is environment-only: the resolver runs before `ferrum.conf` is parsed and inspects only the process environment, so *both* the base variable and the suffixed source must be environment-provided and non-empty for the conflict to be reported. A base variable supplied by the settings file is not a competing source — the suffixed source is materialized into the environment and then wins under the normal env-over-`ferrum.conf` precedence, silently overriding the settings-file value. Keep secret base variables and their suffixed sources in the same layer. When at least one source resolves, `validate` prints an `External secrets: OK` block on stdout **unconditionally** — it is part of the validate report, like `Settings (ferrum.conf): OK`, and is not gated on `FERRUM_LOG_LEVEL`/`RUST_LOG` or on `-v/--verbose` (the report is a `println!`, not a tracing record, so it stays visible at the default warn log level). The block lists only the resolved base variable and provider names, never source references — file paths, Vault paths, cloud resource IDs — and never secret values:
+0. **External secrets** — before settings are parsed, `validate` resolves the `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` suffixes into their base `FERRUM_*` variables exactly as `run` does, so validation sees the same configuration the gateway would start with. Details are under [External secret resolution](#external-secret-resolution) below. When at least one source resolves, `validate` prints an `External secrets: OK` block on stdout **unconditionally** — it is part of the validate report, like `Settings (ferrum.conf): OK`, and is not gated on `FERRUM_LOG_LEVEL`/`RUST_LOG` or on `-v/--verbose`. The block lists only the resolved base variable and provider names, sorted by base variable name, never source references (file paths, Vault paths, cloud resource IDs) or secret values:
 
 ```text
 External secrets: OK
@@ -128,32 +128,6 @@ Validation passed.
 ```
 
 `run` reports the same non-secret facts as structured `info!` records instead, so serving modes keep normal log-level semantics.
-
-The report lines are sorted by base variable name. Candidate sources are discovered by iterating the environment into a hash map, so without an explicit sort two runs on identical input could list them in different orders; sorting keeps `validate` output diffable between machines and CI runs.
-
-Failures are held to the same disclosure rule as the success report. A failed fetch names the base variable, the provider, and the failure reason — an absent `_FILE` source reports `Failed to read FERRUM_X_FILE: credential path not found` — but never the source reference itself, even when a provider SDK echoes the resource it was asked for. A one- or two-byte source reference cannot be removed selectively without corrupting arbitrary words, so if it appears in provider-controlled detail that detail is replaced by a fixed key-level failure instead of being echoed. Once external values are materialized into the environment they are also withheld from *subsequent* settings and spec diagnostics: a malformed `FERRUM_DB_PORT_FILE` reports `Invalid FERRUM_DB_PORT value <redacted: value from external secret source>. Expected a valid u16 integer` rather than printing the fetched secret. Normal validation-report facts may still show directly configured values. Rejection and startup diagnostics instead withhold supplied scalar values regardless of whether they came from an external secret source, while retaining field names, failure reasons, allowed bounds, and recovery guidance.
-
-The same rule holds for diagnostics that are *not* failures. A warning raised while settings are parsed — `FERRUM_TLS_EARLY_DATA_METHODS includes non-GET method '...'`, say — is emitted directly to the log sink and never passes through the command's exit status, so it is filtered at the point every record is serialized rather than only on the error path. Values are matched in the forms a validator can actually print them in, not just verbatim: trimmed, per-entry for comma-separated lists, case-normalized, and JSON-escaped. A run whose only externally resolved variable is a valid one therefore still succeeds, prints `External secrets: OK`, and shows `<redacted: value from external secret source>` in place of the value in any warning about it.
-
-Discovery tolerates a non-Unicode environment. Secret resolution enumerates the environment before settings are parsed, and it does so without decoding: an unrelated variable whose name or value is not valid UTF-8 — common in POSIX environments — is skipped by a raw-byte `FERRUM_` prefix screen and cannot fail the command. Two cases do fail closed, because silently ignoring them could drop a configured secret source: a `FERRUM_*` variable whose **name** is not valid Unicode (the `_FILE`/`_VAULT`/… suffix sits at the end of the name, so an undecodable name may itself be a source), and a recognized suffixed **source** variable whose value is not valid Unicode (an unusable source reference). Both report `Environment variable <NAME> is not valid Unicode`, with the name reduced to its ASCII skeleton (`?` for every other byte) so undecodable bytes are never echoed. A **third** case fails closed for the same reason: an ordinary direct `FERRUM_*` variable — no suffix, no competing source — whose *value* is not valid Unicode. Every downstream resolver reads the environment with `std::env::var`, which reports undecodable bytes as `Err`, i.e. as **unset**, so such a value would otherwise be silently replaced by a `ferrum.conf` entry, a smart-discovered default such as `./ferrum.conf`, or a built-in default, and the gateway would come up on settings the operator never chose. It is reported as `Environment variable <NAME> is not valid Unicode. Ferrum configuration values must be valid Unicode; fix or unset the variable.`, with the name reduced to its ASCII skeleton — the undecodable bytes are never echoed. Smart path discovery checks these variables for *presence* rather than decodability, so an undecodable `FERRUM_CONF_PATH` or `FERRUM_FILE_CONFIG_PATH` is never overwritten before the resolver can reject it.
-
-**Conflict takes precedence.** A non-Unicode direct value also still counts as a directly configured source, so when a suffixed source competes for the same key the specific `Multiple secret sources configured for <NAME>` diagnostic is reported instead — it is the more actionable of the two, and it is checked first. The unsupported-suffix and invalid-source-name failures above are checked earlier still. In every ordering the command fails; only which message you get changes.
-
-Two ordering properties matter for a `validate` that reads its own settings path from a secret source. `FERRUM_CONF_PATH_FILE` is materialized into `FERRUM_CONF_PATH` *before* the settings file is opened, so the resolved path is the one validated. That requires the resolver itself never to read `ferrum.conf`, which is why both `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` and `FERRUM_GCP_SECRET_MANAGER_ENDPOINT` are read from the environment only at this stage (see [configuration.md](configuration.md)). And a `_FILE` source pointing at a stalled mount fails after that timeout instead of hanging the command — the read is abandoned rather than waited on. A FIFO, socket, device, or directory never reaches that timeout at all: the shared credential reader refuses every non-regular source before reading it, so those fail immediately.
-
-A resolved value that cannot be placed in the process environment is reported rather than fatal: a source whose contents contain a NUL byte (binary material behind a `_FILE` path, say) fails with `Secret resolved for FERRUM_X from file contains a NUL byte and cannot be placed in the process environment.` The value is never named.
-
-Smart path discovery yields to a suffixed source. When `FERRUM_CONF_PATH_FILE` (or the `_VAULT`/`_AWS`/`_AZURE`/`_GCP` equivalent) is set, `validate` and `run` do **not** auto-discover `./ferrum.conf`, `./config/ferrum.conf`, or `/etc/ferrum/ferrum.conf`, and the same holds for `FERRUM_FILE_CONFIG_PATH_FILE` and the `./resources.yaml` family. A discovered default is the lowest-precedence source there is, so treating it as a competing one would fail the command with a multiple-sources error in any working directory that merely happened to contain a settings or resources file. An **explicit** `-s/--settings` or `-c/--spec` path is different — that is a genuine two-sources-for-one-key mistake and is still reported as a conflict.
-
-Resource discovery runs after external secret resolution and settings loading.
-A `FERRUM_FILE_CONFIG_PATH` in the selected `ferrum.conf` suppresses resource
-discovery. `--spec` overrides the direct environment and settings file; a
-configured external source retains the documented conflict check for an explicit
-CLI path. A bare `ferrum-edge` invocation prints usage and exits nonzero; use `run`.
-
-File-mode inference is likewise the *lowest*-precedence mode source, and it runs after secrets are resolved so that every source above it is visible first. `run` and `validate` fall back to `FERRUM_MODE=file` only when a spec path is configured **and** no mode was set by any higher-precedence source — matching the documented `CLI > env > conf file > smart defaults > hardcoded` order. Both commands check `-m/--mode` first (via `apply_run_overrides` / `apply_validate_overrides`), then `FERRUM_MODE` in the environment, then a `FERRUM_MODE_FILE`/`_VAULT`/`_AWS`/`_AZURE`/`_GCP` source, then `FERRUM_MODE` in `ferrum.conf`. A spec path that is itself supplied by a suffixed source still infers file mode, because it has been materialized into `FERRUM_FILE_CONFIG_PATH` by then. Externalizing the mode and the spec path together is therefore supported: neither shadows the other, and the inference never manufactures a second competing source for `FERRUM_MODE`.
-
-The report withholds externally sourced values, not just the ones that appear in errors. `validate` prints its findings with plain stdout writes, which are not log records and are not an error return, so each value-bearing field is filtered where it is printed. A field whose variable was resolved from an external source is withheld by name — `FERRUM_MODE_FILE` containing `database` prints `Mode: <redacted: value from external secret source>`, not `Mode: Database` — while the surrounding validation result, including `Validation passed.` and the spec-document counts, is unaffected. `run` withholds the same value on its own startup log line for the same reason: `Operating mode:` re-renders the resolved value as the `Database` enum variant, a form the log-record redactor deliberately does not derive, so that line is withheld by variable name too.
 
 1. **Settings** (`ferrum.conf`) — all 300+ environment variables are parsed and validated (ports, paths, TLS configuration, pool sizes, etc.)
 2. **Spec** (resources YAML/JSON, file mode only):
@@ -170,7 +144,7 @@ The report withholds externally sourced values, not just the ones that appear in
 3. **Startup security** (env-level TLS/CIDR/metrics surfaces shared with `run`) — side-effect-free loaders that `serve()` also uses, so `validate` cannot report success for configs that refuse to start. Mode-scoped:
    - TLS policy (`TlsPolicy::from_env_config`) and CRLs (`FERRUM_TLS_CRL_FILE_PATH`) for file/database/cp/dp/mesh, and for `node_agent` when admin HTTPS security intent applies (complete HTTPS that would bind, or explicit nonzero HTTPS intent)
    - Strict `FERRUM_ADMIN_ALLOWED_CIDRS` and `FERRUM_METRICS_ALLOWED_CIDRS` / metrics bearer policy; node-agent validates these when any admin surface is active (plaintext HTTP or complete HTTPS), matching `run`
-   - Frontend TLS material (missing, mismatched, expired, or malformed cert/key) when both `FERRUM_FRONTEND_TLS_CERT_PATH` and `FERRUM_FRONTEND_TLS_KEY_PATH` are set (file/database/dp; mesh validates an explicit frontend pair via the same identity loader `run` uses). Mesh also loads a configured `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` when the topology has an inbound TLS-terminating listener under the no-slice PERMISSIVE baseline (same byte loader as mesh `run`'s inbound TLS snapshot); missing/unreadable material fails closed. PEM/expiry parsing runs only when a mesh server identity is also configured (explicit frontend cert/key, gateway SVID file cert/key, or a non-`none` `FERRUM_MESH_CA_BACKEND`), matching `load_mesh_frontend_tls`'s path into `load_mesh_tls_config_with_identity_and_client_ca_bytes`. Passthrough-only topologies such as `east_west_gateway`, and fully DISABLE mTLS modes, skip an unused client CA. `validate` cannot fetch an applied PeerAuthentication slice, so it may conservatively validate a configured CA that a later all-DISABLE dynamic slice would leave unused; it does not claim exact knowledge of the live effective mTLS mode.
+   - Frontend TLS material (missing, mismatched, expired, or malformed cert/key) when both `FERRUM_FRONTEND_TLS_CERT_PATH` and `FERRUM_FRONTEND_TLS_KEY_PATH` are set (file/database/dp; mesh validates an explicit frontend pair via the same identity loader `run` uses). Mesh also loads a configured `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` when the topology has an inbound TLS-terminating listener under the no-slice PERMISSIVE baseline (same byte loader as mesh `run`'s inbound TLS snapshot); missing/unreadable material fails closed. PEM/expiry parsing runs only when a mesh server identity is also configured (explicit frontend cert/key, gateway SVID file cert/key, or a non-`none` `FERRUM_MESH_CA_BACKEND`), as in `run`. Passthrough-only topologies such as `east_west_gateway`, and fully DISABLE mTLS modes, skip an unused client CA. Because `validate` cannot fetch the applied PeerAuthentication slice, it may validate a configured CA that a later all-DISABLE slice would leave unused.
    - Admin TLS material when admin HTTPS is enabled (`FERRUM_ADMIN_HTTPS_PORT != 0` and both admin cert/key paths are set). For `node_agent`, explicit nonzero HTTPS intent fails closed even when cert/key are missing; the inherited inactive default HTTPS port without TLS intent stays HTTP-only compatible.
    - DTLS frontend cert (+ optional client CA) expiry when both `FERRUM_DTLS_CERT_PATH` and `FERRUM_DTLS_KEY_PATH` are set (file/database/dp)
    - Does **not** bind sockets, spawn servers, mutate stores, mint random JWT secrets, or connect to a database/CP
@@ -179,6 +153,24 @@ The report withholds externally sourced values, not just the ones that appear in
 5. **Injector runtime** — the same runtime parser and serving TLS loader as `run`: TLS cert/key pairing and material, plaintext opt-in, trust domain, capture settings, CIDRs, JWT secret references, and container resource quantities. No webhook listener is bound.
 6. **Node-agent runtime** — the same `NodeAgentConfig` parser as `run`, including the required node name and capture/fallback contract. No kernel probe, eBPF load, capture installation, or node-agent listener is started.
 7. **Config migration input** (`migrate` mode with `FERRUM_MIGRATE_ACTION=config`) — the same bounded file reader, syntax parser, and required version detection as startup. Validation does not migrate the file or create a backup. Database migration actions (`up`/`status`) validate settings only; they do not connect to a database or inspect/apply its schema.
+
+### External secret resolution
+
+`run` and `validate` share these rules:
+
+- **Empty values** — an empty suffixed variable is treated as unset in every build.
+- **`_FILE` sources** — must resolve to a **regular file** (symlinks are followed and the opened target is type-checked, so Kubernetes projected secrets work) holding at most **64 KiB** of valid UTF-8 that is non-empty after trailing-whitespace trimming. A FIFO, socket, device, or directory is refused before any read. Failures name the suffixed variable and the failure class — `not a regular file`, `credential file exceeds the maximum of 65536 bytes`, `content is not valid UTF-8` — never the path. An absent file reports `Failed to read FERRUM_X_FILE: credential path not found`. A read on a stalled mount is abandoned after `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` instead of hanging.
+- **Build-time providers** — `_FILE` works in every build; `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` require the matching Cargo feature (`secrets-vault`, `secrets-aws`, `secrets-azure`, `secrets-gcp`, or the `cloud-secrets` umbrella). The default feature set compiles none of them, so on a default binary a non-empty cloud suffix fails the command with an unsupported-suffix error rather than being silently ignored. No setting can enable a provider that was not compiled in; the published Docker images build with `cloud-secrets`.
+- **Conflicts** — an unreadable or unreachable non-empty source fails the command, and a base variable plus a non-empty suffixed source for the same key is a conflict (`Multiple secret sources configured for <NAME>`). Conflict detection is environment-only: the resolver runs before `ferrum.conf` is parsed, so a base variable set in the settings file is not a competing source — the suffixed source is materialized into the environment and silently wins under the normal env-over-`ferrum.conf` precedence. Keep secret base variables and their suffixed sources in the same layer.
+- **Environment-only resolver settings** — because the resolver never reads `ferrum.conf`, `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` and `FERRUM_GCP_SECRET_MANAGER_ENDPOINT` are read from the environment only at this stage (see [configuration.md](configuration.md)). This is also why `FERRUM_CONF_PATH_FILE` is materialized into `FERRUM_CONF_PATH` *before* the settings file is opened.
+- **Smart path discovery yields to a suffixed source** — when `FERRUM_CONF_PATH_FILE` (or its `_VAULT`/`_AWS`/`_AZURE`/`_GCP` equivalent) is set, `./ferrum.conf`, `./config/ferrum.conf`, and `/etc/ferrum/ferrum.conf` are **not** auto-discovered; the same holds for `FERRUM_FILE_CONFIG_PATH_FILE` and the `./resources.yaml` family. An **explicit** `-s/--settings` or `-c/--spec` path plus a suffixed source is still reported as a conflict.
+- **Non-Unicode environment** — unrelated variables whose name or value is not valid UTF-8 are skipped. Three cases fail closed because ignoring them could silently drop configuration: a `FERRUM_*` variable whose **name** is not valid Unicode, a suffixed **source** variable whose value is not valid Unicode, and a direct `FERRUM_*` variable whose **value** is not valid Unicode (it would otherwise read as unset and be replaced by a `ferrum.conf` entry or default). They report `Environment variable <NAME> is not valid Unicode` (the last adds `Ferrum configuration values must be valid Unicode; fix or unset the variable.`), with the name reduced to its ASCII skeleton (`?` for every other byte). **Conflict takes precedence**: if a suffixed source competes with a non-Unicode direct value, the `Multiple secret sources` diagnostic is reported instead; unsupported-suffix and invalid-source-name failures are checked earlier still. Either way the command fails.
+- **NUL bytes** — a resolved value containing a NUL byte cannot be placed in the environment and fails with `Secret resolved for FERRUM_X from file contains a NUL byte and cannot be placed in the process environment.`
+- **Mode and spec from secrets** — a `FERRUM_MODE_FILE`/`_VAULT`/`_AWS`/`_AZURE`/`_GCP` source ranks with the environment for [mode inference](#mode-inference), and a spec path supplied by a suffixed source still infers file mode. Externalizing both together is supported.
+
+Resource discovery runs after external secret resolution and settings loading. A `FERRUM_FILE_CONFIG_PATH` in the selected `ferrum.conf` suppresses resource discovery, and `--spec` overrides the environment and settings file. A bare `ferrum-edge` invocation prints usage and exits nonzero; use `run`.
+
+**Externally sourced values are never printed.** Failure diagnostics name the base variable, the provider, and the reason, but not the source reference, even when a provider SDK echoes it (a one- or two-byte reference that cannot be removed safely causes the provider detail to be replaced with a fixed key-level failure). After materialization, externally sourced values are withheld from later settings and spec diagnostics, from warnings emitted during parsing (matched verbatim, trimmed, per list entry, case-normalized, and JSON-escaped), and from `validate` report fields. For example, a malformed `FERRUM_DB_PORT_FILE` reports `Invalid FERRUM_DB_PORT value <redacted: value from external secret source>. Expected a valid u16 integer`, and `FERRUM_MODE_FILE` containing `database` prints `Mode: <redacted: value from external secret source>` (`run` withholds its `Operating mode:` log line the same way). The overall result, including `Validation passed.` and spec counts, is unaffected. Rejection and startup diagnostics also withhold directly supplied scalar values, keeping field names, failure reasons, allowed bounds, and recovery guidance.
 
 ### Examples
 
@@ -273,59 +265,41 @@ Spec (/etc/ferrum/resources.yaml): OK
 Error: Startup security validation failed: Invalid TLS configuration: ...
 ```
 
+### Diagnostic redaction
+
 Startup and validation failures include the full cause chain, from the outer
-operation to the underlying failure. Configuration deserialization withholds
-offending document scalars (including unregistered inline PEM and tokens) before
-retaining the error. Serde families are sanitized structurally: the path is kept
-separate and only the bare inner diagnostic's exact leading family is classified.
-Diagnostics keep field paths, available line/column positions, expected types,
-and missing/unknown/duplicate field names. Paths and unknown-field messages echo
-document **keys**; they are diagnostic context, not confidential value storage.
-The second layer is render-time withholding: **each original cause** in both
-`run` and `validate` first passes through the configured-URL and registered-secret
-scrubbers, then the custom quoted-span sanitizer, before the causes are joined.
-If credential scrubbing changes quote or escape syntax, that cause is withheld
-in full as `<redacted diagnostic>` so removing a secret delimiter cannot expose
-another value. Every double- or single-quoted span is withheld, through the end
-of that cause if unterminated; backticks remain. An unmatched quote cannot consume
-the next cause's field path or reason. Backup, validation-pipeline, SQL/Mongo rejection
-and unknown-plugin log records use the same sanitizer before emission.
-Validators must use backticks for schema names and Debug-escaped double quotes
-(`{value:?}` for strings) for document values, or omit the values. A validator
-following this convention is safe by construction
-at rendering; interpolating a document scalar bare is a defect, not an exception
-to the convention. Parser errors use custom sanitization; the exact bare YAML
-`duplicate entry with key` family preserves its key as a backticked duplicate
-field, without classifying path-prefixed text.
-For withheld CIDRs, use the field path to locate the value; the reason and allowed
-prefix-length bounds remain visible, while the supplied prefix is withheld.
-Capture settings and annotation overrides follow the same convention: boolean,
-port, mark, UID, and CIDR rejections retain their field and allowed bounds without
-echoing the supplied value. Capture warnings use sanitized causes before emission.
-Localized mesh, stock-xDS, gateway migration, and backup
-version rejections withhold the supplied `version` and retain the supported
-version and reason, including migration warnings. Database-mode `validate`
-checks a configured JSON backup through the same loader without a database dial.
-The semantic audit converted mesh service IPs, resource names, hosts, target
-references, CIDRs, ext-authz/JWT-header diagnostics, gateway host/reference
-diagnostics, plugin provider/schema/tag names and numeric bounds. Audited plugin type
-rejections Debug-escape the complete JSON rendering, including numbers, arrays
-and objects, so embedded values cannot escape through another shape. CORS and
-sibling regex validators omit library errors that reproduce patterns; OpenAPI
-and AI tool JSON Schema admission also uses fixed rejection reasons. The owning
-field/index and the fixed rejection reason remain visible.
-Generic object visitors enforce shape; their document/value adapters own error
-sanitization. YAML preserves native admission and original error positions, then
-replays failed typed deserialization through a value tree to separate the error
-from its path. In-memory trees have no original source position to recover.
-The final rendering also redacts credentials in exact configured
-primary/replica/failover database URLs and registered resolved external-secret
-values and their bounded derived forms.
-The URL inventory reads raw settings only: it never fetches database TLS sources
-or materializes temporary PEM files. Owning loaders must sanitize TLS-augmented
-or differently normalized URLs, password-only fragments, provider references,
-and arbitrary provider/driver/custom-validation payloads; the final renderer is
-not a general secret detector.
+operation to the underlying failure, without needing `-v`. They keep field
+paths, line/column positions, expected types, missing/unknown/duplicate field
+names, failure reasons, and allowed bounds, but withhold the configuration
+**values** that caused them:
+
+- Document scalars (including inline PEM and tokens) are removed when a
+  deserialization error is captured. Paths and unknown-field messages still
+  echo document **keys**; they are diagnostic context, not confidential value
+  storage.
+- When rendered, **each original cause** in both `run` and `validate` passes
+  through the configured-URL and registered-secret scrubbers, then a
+  quoted-span sanitizer: every double- or single-quoted span is withheld
+  (through the end of that cause if unterminated); backticks remain. If
+  credential scrubbing changes quote or escape syntax, that cause is withheld
+  in full as `<redacted diagnostic>`.
+- Credentials in the exact configured primary/replica/failover database URLs,
+  and registered resolved external-secret values and their bounded derived
+  forms, are redacted. The URL inventory reads raw settings only (it never
+  fetches database TLS sources), so this final renderer is not a general
+  secret detector.
+- Rejected CIDRs, capture settings, annotation overrides, and localized mesh,
+  stock-xDS, gateway migration, and backup `version` values are withheld;
+  use the field path to locate the value. Backup, validation-pipeline, SQL/Mongo
+  rejection, unknown-plugin, and capture-warning log records use the same
+  sanitizer.
+
+Database-mode `validate` checks a configured JSON backup through the same
+loader without a database dial.
+
+Contributor convention: validators must use backticks for schema names and
+Debug-escaped double quotes (`{value:?}` for strings) for document values, or
+omit the values. Interpolating a document scalar bare is a defect.
 
 For example, `run -m mesh` with a localized mesh file missing a workload
 selector reports the file-loading context followed by
@@ -337,7 +311,11 @@ backtrace; `-v` is not required to see the causes and still selects log verbosit
 
 ## reload
 
-Send SIGHUP to a running gateway instance. Only supported on Unix platforms (Linux, macOS, BSDs). SIGHUP triggers a hot config reload **in file mode**, and in mesh mode when the config source is a local file or xDS consumer. In every other mode (`database`, `cp`, `dp`, `injector`, `node_agent`, `migrate`, and mesh with native `MeshSubscribe`) the gateway logs the signal and ignores it — it is not a reload mechanism there; use database polling (`FERRUM_DB_POLL_INTERVAL`), control-plane push, or a rolling restart instead. The signal is delivered regardless of the target's mode, so `reload` exits `0` either way and prints a second line naming this scope; because every mode registers a hangup handler, a SIGHUP to a non-reloading gateway is a logged no-op rather than an undrained termination. In file mode, SIGHUP re-reads the spec under the same fail-closed stability contract as startup (byte-identical consecutive probes; rejects non-atomic/torn updates), then atomically swaps a valid candidate without dropping connections. An unstable or invalid candidate keeps the last known-good live generation and marks authenticated `/health` as `degraded` with `config_rejected: true` until a later successful (Applied or Unchanged) reload clears it.
+Send SIGHUP to a running gateway instance. Only supported on Unix platforms (Linux, macOS, BSDs).
+
+SIGHUP triggers a hot config reload **in file mode**, and in mesh mode when the config source is a local file or xDS consumer. In every other mode (`database`, `cp`, `dp`, `injector`, `node_agent`, `migrate`, and mesh with native `MeshSubscribe`) the gateway logs the signal and ignores it; use database polling (`FERRUM_DB_POLL_INTERVAL`), control-plane push, or a rolling restart instead. The CLI cannot tell which mode the target runs in, so `reload` exits `0` whenever the signal is delivered and prints a second line describing this scope.
+
+In file mode, SIGHUP re-reads the spec under the same fail-closed stability contract as startup (byte-identical consecutive probes; rejects non-atomic/torn updates), then atomically swaps a valid candidate without dropping connections. An unstable or invalid candidate keeps the last known-good live generation and marks authenticated `/health` as `degraded` with `config_rejected: true` until a later successful (Applied or Unchanged) reload clears it.
 
 ```
 ferrum-edge reload [OPTIONS]
@@ -476,7 +454,7 @@ $ ferrum-edge version --json
 
 ## ambient-udp-preflight
 
-Privileged one-shot Ambient UDP node preflight (issue #3809). Retires both
+Privileged one-shot Ambient UDP node preflight. Retires both
 predecessor UDP placements on this node and publishes the node-scoped cleanup
 proof the settled host placement requires. Exits non-zero without publishing
 when it cannot prove completion.
@@ -486,13 +464,9 @@ pod**, so Kubernetes guarantees it completes before the steady-state proxy
 container starts. See
 [the privileged node preflight](mesh.md#the-privileged-node-preflight).
 
-`--settings` is materialized before any config read and before worker threads,
-matching `run` / `validate`. The command then installs Ferrum's process-default
-rustls provider through the existing FIPS gate, resolves external secrets,
-initializes lifecycle-owned logging, and verifies the fully resolved FIPS
-posture before any Kubernetes TLS client is built. It does not parse serving
-`EnvConfig` or start gateway/listener infrastructure. `version`, `reload`, and
-`health` remain early-exit commands and do not take this path.
+Like `run` and `validate`, it applies `--settings`, the FIPS gate, and
+external secret resolution before building any Kubernetes TLS client. It does
+not parse the serving configuration or start any gateway listeners.
 
 ```
 ferrum-edge ambient-udp-preflight [OPTIONS]

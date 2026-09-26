@@ -34,7 +34,7 @@ cd tests/performance/mesh-dns-e2e
 ./run.sh --skip-build               # reuse existing release binaries
 ```
 
-The first run will `cargo build --release` both the harness crate and (in `$PROJECT_ROOT`) the root `ferrum-edge` binary. Subsequent runs reuse those artefacts unless source changes. Add `--skip-build` to short-circuit even the freshness check.
+Without `--skip-build`, `run.sh` runs `cargo build --release` for both the harness crate and (in `$PROJECT_ROOT`) the root `ferrum-edge` binary; Cargo reuses the artifacts when sources are unchanged. `--skip-build` skips the build step entirely.
 
 ## Why a stub control plane?
 
@@ -68,9 +68,9 @@ A direct-stub baseline run is appended for the `upstream-forward` class so opera
   bound, and cleanup stops only the gateway/CP-stub/upstream-stub PIDs this run
   started (graceful `SIGTERM`, bounded wait, then `SIGKILL`). It never kills an
   unrelated listener sharing one of those ports.
-- **Localhost-only.** The default DNS listener is `127.0.0.1:15053`. The harness binds load gen, gateway, CP stub, and upstream stub all on `127.0.0.1`, so this is single-host. No remote-client measurements.
+- **Localhost-only.** The harness binds the load generator, gateway DNS listener (`127.0.0.1:15053`), CP stub, and upstream stub all on `127.0.0.1`, so this is single-host. No remote-client measurements.
 - **No baseline for mesh-internal traffic.** Mesh-internal hostnames are synthesised by `DnsResolutionTable::from_mesh_slice` from the slice — they don't exist anywhere else. Report numbers absolute, not comparative.
-- **macOS vs Linux UDP recv.** Linux uses `recvmmsg` for the gateway UDP frontend recv; macOS falls back to `recvfrom`. Same query/response shape but somewhat different cliff-edge throughput. Capture baselines per-OS.
+- **macOS vs Linux.** The DNS proxy's UDP frontend reads one datagram per `recv_from` on both platforms, but kernel UDP and scheduler behavior differ, so the throughput ceiling differs. Capture baselines per OS.
 - **No mTLS to the CP stub.** `FERRUM_DP_CP_GRPC_URLS=http://...` keeps the gRPC channel plaintext. Production mesh DPs would use `https://` + the CA bundle; this harness skips that on purpose.
 - **No workload identity / CA (benchmark-only).** `start_gateway()` sets `FERRUM_MESH_ALLOW_NO_CA=true` so the synthetic local gateway can start mesh mode without gateway SVID material or a CA backend. That dev/test opt-out is read from the environment and is refused when `FERRUM_MESH_PRODUCTION_MODE=true`. Production mesh must provide identity and a trust bundle (or SPIRE/internal CA issuance); do not copy this escape hatch outside local perf harnesses.
 - **Slice churn is not measured.** The CP stub publishes one slice and idles. The slice-apply path (which atomically rebuilds `DnsResolutionTable` via `ArcSwap`) is exercised exactly once at startup. For slice-churn perf, run `tests/performance/mesh/`'s `slice_apply` bench.

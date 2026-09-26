@@ -19,13 +19,13 @@ cargo build
 
 ## `example_audit_plugin` storage notes
 
-Runtime writes use the gateway SQL configuration database via
+Runtime writes go to the gateway's SQL configuration database, resolved via
 `EnvConfig::resolve_effective_sql_backend` (`FERRUM_DB_TYPE` / `FERRUM_DB_URL` /
-`FERRUM_DB_TLS_*`). MongoDB is rejected. `start_background_tasks` resolves the
-source configuration without I/O. On first background use,
-`EffectiveSqlBackend::connect_lazy` snapshots TLS material under a five-second
-budget and creates the lazy pool; its material stays owned by that pool.
-Snapshot or connection failures follow the batching retry/warn path.
+`FERRUM_DB_TLS_*`). MongoDB is not supported. `start_background_tasks` only
+resolves configuration (no I/O). On first background use,
+`EffectiveSqlBackend::connect_lazy` snapshots TLS material (five-second budget)
+and creates a lazy pool that owns that material. Snapshot or connection
+failures are logged and retried by the batching path.
 
 ## Uninstall / leftover schema
 

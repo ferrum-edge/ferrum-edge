@@ -1,9 +1,7 @@
 # Ferrum Edge Database Baselines and Initialization
 
-Ferrum Edge is in active build-out with no deployed-user compatibility obligation.
-Core schema changes update the initial baseline directly; breaking changes are expected.
-This guide covers database initialization, integrity checks, and independently
-owned custom-plugin migrations.
+This guide covers database initialization, migration-history integrity checks,
+and independently owned custom-plugin migrations.
 
 ## Overview
 
@@ -11,17 +9,18 @@ owned custom-plugin migrations.
   `_ferrum_migrations` with a content-derived checksum.
 - MongoDB initializes from one canonical index plan.
 - `database` and `cp` startup initialize fresh databases automatically;
-  `FERRUM_MODE=migrate` provides explicit `up`, `status`, and dry-run actions.
+  `FERRUM_MODE=migrate` provides explicit `up`, `status`, `config`, and dry-run
+  actions.
 - A changed SQL baseline requires a fresh database. Startup does not alter old
   columns, replace indexes, backfill old records, or rewrite migration history.
 
 ## Build-Out Schema Policy
 
-Ferrum Edge is still in active build-out. During this phase, core database
-schema changes are folded into the current baseline schema (`V001`) instead of
-being added as new core schema migrations (`V002`, `V003`, etc.). Breaking
-database-schema changes are acceptable during build-out, and compatibility
-shims for legacy columns, fields, environment variables, config shapes, or
+Ferrum Edge is in active build-out with no deployed-user compatibility
+obligation. During this phase, core database schema changes are
+folded into the current baseline schema (`V001`) instead of being added as new
+core schema migrations (`V002`, `V003`, etc.). Breaking database-schema changes
+are acceptable, and compatibility shims for legacy columns, fields, environment variables, config shapes, or
 database values are not required unless explicitly requested.
 
 Operationally, anyone running a build-out branch or recent `main` snapshot
@@ -144,12 +143,10 @@ CREATE TABLE _ferrum_migrations (
 
 ### Upgrading from Pre-Migration Versions
 
-Databases that predate migration tracking are not auto-bootstrapped. Back up the database and rebuild it from the current baseline before starting a current binary against it.
-
-Build-out caveat: newer development snapshots may intentionally fold schema
-changes into the baseline instead of adding an upgrade migration. In that case,
-operators running those snapshots need to recreate or rebuild the database
-schema as described in [Build-Out Schema Policy](#build-out-schema-policy).
+Databases that predate migration tracking are not auto-bootstrapped. Back up
+the database and rebuild it from the current baseline before starting a current
+binary against it. The same applies whenever the `V001` baseline changes during
+build-out (see [Build-Out Schema Policy](#build-out-schema-policy)).
 
 ### Cross-Database Support
 
@@ -193,7 +190,10 @@ Custom plugins can declare their own database migrations that run alongside core
 1. A custom plugin exports a `plugin_migrations()` function from its `.rs` file in `custom_plugins/`
 2. The build script detects this function automatically and generates a collector
 3. When `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` is run, plugin migrations execute **after** core migrations
-4. Plugin migrations are tracked in `_ferrum_plugin_migrations` (separate from `_ferrum_migrations`)
+4. At `database` / `cp` startup, pending plugin migrations are only logged as a
+   warning unless `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true`, which applies them
+   before config is loaded (a failure is then fatal)
+5. Plugin migrations are tracked in `_ferrum_plugin_migrations` (separate from `_ferrum_migrations`)
 
 ### Plugin Migration Tracking Table
 
@@ -311,11 +311,12 @@ Dialect transactionality for custom-plugin migrations:
   enclosing transaction so statement/tracking boundaries never become
   ambiguously half-transactional. **All MySQL custom migrations — including
   DML-only bodies — are therefore non-atomic with the tracking insert and must
-  be idempotent / re-runnable.** Pre-existing DML-only MySQL custom migrations written under the older per-migration atomic contract must be reviewed for re-run safety under this runner. For a plugin-owned index that must recover
+  be idempotent / re-runnable.** For a plugin-owned index that must recover
   across every statement boundary, pair `DROP INDEX name ON table` immediately
   with the exact `CREATE INDEX` definition. The runner tolerates only
-  structured MySQL error `1091` (missing key) on a two-token `DROP INDEX name ON table` statement (the `ALTER TABLE ... DROP INDEX` spelling is not tolerated); every
-  creation failure remains fatal. A retry then either removes the prior
+  structured MySQL error `1091` (missing key) on a two-token
+  `DROP INDEX name ON table` statement (not the `ALTER TABLE ... DROP INDEX`
+  spelling); every creation failure remains fatal. A retry then either removes the prior
   definition or observes a missing index before reconstructing the intended
   one. Prefer idempotent table DDL (`CREATE TABLE IF NOT EXISTS`) and
   plugin-prefixed names, and do not use this pattern to replace indexes owned
@@ -396,12 +397,6 @@ FERRUM_MODE=migrate \
   ferrum-edge run
 ```
 
-`status` is strictly read-only. If the core or plugin tracking table does not
-exist, Ferrum reports every known migration as pending without creating either
-tracking table. If any applied sequence is unknown, incomplete, duplicate,
-orphaned, or checksum-drifted, `status` returns an integrity error and exits
-non-zero instead of reporting the database as healthy.
-
 ### Check Migration Status
 
 ```bash
@@ -411,6 +406,12 @@ FERRUM_MODE=migrate \
   FERRUM_DB_URL=sqlite://ferrum.db \
   ferrum-edge run
 ```
+
+`status` is strictly read-only. If the core or plugin tracking table does not
+exist, Ferrum reports every known migration as pending without creating either
+tracking table. If any applied sequence is unknown, incomplete, duplicate,
+orphaned, or checksum-drifted, `status` returns an integrity error and exits
+non-zero instead of reporting the database as healthy.
 
 Example output:
 ```
@@ -461,9 +462,11 @@ or custom-plugin tracking tables, schema objects, collections, or indexes.
 | `FERRUM_MODE` | `migrate` | Activates the migration CLI mode |
 | `FERRUM_MIGRATE_ACTION` | `up` (default), `status`, `config` | What migration action to perform |
 | `FERRUM_MIGRATE_DRY_RUN` | `true` / `false` | Preview changes without applying |
-| `FERRUM_DB_TYPE` | `sqlite`, `postgres`, `mysql` | Required for `up` and `status` actions |
-| `FERRUM_DB_URL` | Database connection URL | Required for `up` and `status` actions |
+| `FERRUM_DB_TYPE` | `sqlite`, `postgres`, `mysql`, `mongodb` | Required for `up` and `status` actions |
+| `FERRUM_DB_URL` | Database connection URL | Required for `up` and `status` actions (including MongoDB dry-run) |
+| `FERRUM_MONGO_DATABASE` | Database name (default `ferrum`) | MongoDB database to index |
 | `FERRUM_FILE_CONFIG_PATH` | Path to config file | Required for `config` action |
+| `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS` | `true` / `false` (default) | `database` / `cp` startup only: apply pending custom-plugin migrations instead of warning |
 
 ## Updating Baselines (Developer Guide)
 
@@ -605,13 +608,15 @@ FERRUM_MODE=migrate \
   ferrum-edge run
 ```
 
-Preview the canonical plan without connecting:
+Preview the canonical plan without connecting (`FERRUM_DB_URL` is still
+required by startup validation):
 
 ```bash
 FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=up \
   FERRUM_MIGRATE_DRY_RUN=true \
   FERRUM_DB_TYPE=mongodb \
+  FERRUM_DB_URL="mongodb://localhost:27017" \
   ferrum-edge run
 ```
 

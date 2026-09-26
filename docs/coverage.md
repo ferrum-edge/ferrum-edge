@@ -7,13 +7,13 @@ and CI scope is `--lib`, the four unit targets (`--test unit_tests`,
 plans also run the subprocess `functional_tests` suite against the
 instrumented `ferrum-edge` binary in dedicated shards (see
 [Functional coverage shards](#functional-coverage-shards)); the default local
-`scripts/coverage.sh` run omits it, and `--functional` adds a curated subset. Conformance tests, custom plugins,
-vendored crates, and performance workspaces stay outside the baseline because
-they use separate coverage reporters or are not actionable for the core proxy
-codebase. Build inputs such as `build.rs`, `proto/**`, and
-`ebpf/**` remain report-ignored for the default baseline, but they are coverage
-trigger surfaces in CI: changing them runs the full coverage matrix instead of
-the plugin-only or no-op PR path.
+`scripts/coverage.sh` run omits it, and `--functional` adds a curated subset.
+Conformance tests, custom plugins, vendored crates, and performance
+workspaces stay outside the baseline because they use separate coverage
+reporters or are not actionable for the core proxy codebase. Build inputs such
+as `build.rs`, `proto/**`, and `ebpf/**` are report-ignored for the default
+baseline. Pull requests normally skip instrumented coverage; see
+[CI Baseline And Gates](#ci-baseline-and-gates).
 
 ## Running Locally
 
@@ -105,86 +105,96 @@ CI gate.
 
 The `Coverage` workflow runs on pull requests, merge-queue `merge_group`
 events, pushes to `main`, manual dispatch, and Sundays at 06:00 UTC. It
-publishes an HTML report, LCOV file, JSON
-summary, and terminal summary as a 30-day GitHub Actions artifact named
-`coverage-report` whenever coverage is collected. It also writes the overall
-coverage percentage and lowest/highest-covered files to the workflow step
-summary. The Coverage workflow's `Merge Coverage` job is a branch-protection
-required check in its own right; the main `CI` workflow no longer waits on it
-with a mirror job, so a PR or merge-queue group merges only once coverage has
-completed for the same SHA via the required check.
+publishes an HTML report, LCOV file, JSON summary, and terminal summary as a
+30-day GitHub Actions artifact named `coverage-report` whenever coverage is
+collected. It also writes the overall coverage percentage and
+lowest/highest-covered files to the workflow step summary. The Coverage
+workflow's `Merge Coverage` job is a branch-protection required check in its
+own right (the main `CI` workflow does not mirror it), so a PR or merge-queue
+group merges only once coverage has completed for the same SHA.
 
-The full default-branch gate is based on the latest completed `main` coverage
-artifact available when the gate was introduced on 2026-06-20:
+The current floors are set in the `env` block of `.github/workflows/coverage.yml`:
 
-| Scope | Remote baseline | Gate |
-| --- | ---: | ---: |
-| Overall line coverage | `210900/269397` lines, **78.29%** | **78.28%** |
-| `src/plugins/` line coverage | `54957/64665` lines, **84.99%** | **84.98%** |
-| Changed coverable `src/plugins/` lines on plugin PRs | same plugin baseline | **84.98%** |
+| Scope | Gate | Applies to |
+| --- | ---: | --- |
+| Overall line coverage | **81.00%** (`MIN_OVERALL_LINE_COVERAGE`) | Full matrix only |
+| `src/plugins/` line coverage | **89.00%** (`MIN_PLUGINS_LINE_COVERAGE`) | Full matrix only |
+| Changed coverable `src/plugins/` lines | **84.98%** (`MIN_CHANGED_PLUGIN_LINE_COVERAGE`) | Plugin and shard-scoped PR plans only (not selected by the active planner; see below) |
 
-The thresholds are intentionally rounded down from the measured remote values
-so presentation precision does not fail a run, while any real coverage drop in
-overall or plugin coverage still fails the full default-branch gate.
+Floors are rounded down from measured remote values so presentation precision
+does not fail a run, while any real drop still fails the full gate. The gate
+was introduced on 2026-06-20 at 78.28% overall / 84.98% plugins (measured
+`210900/269397` and `54957/64665` lines). The overall and plugin floors were
+raised after the functional shards landed; run 36117488050 measured 82.79%
+overall (`526,752/636,227` lines) and 90.81% for `src/plugins/`
+(`154,123/169,721` lines).
 
-PR coverage is mode-aware:
+The active planner, `select_plan` in `.github/scripts/coverage_plan.py`,
+treats coverage as a main-branch backstop:
 
-- Pull requests that touch only plugin coverage-relevant files keep the
-  plugin-specific mode: they run the `lib-unit` shard (`--lib` and
-  the four unit targets) and the merge job reuses that shard's profraw/artifacts
-  instead of re-collecting coverage. The changed-line plugin gate still applies
-  to coverable `src/plugins/` lines. This mode is used only when all
-  coverage-relevant changes are plugin-scoped; mixed plugin and core changes
-  select the affected core shards and still enforce the plugin changed-line
-  gate when plugin files are in the diff.
-- Pull requests that touch classifiable core coverage-relevant files run an
-  explicit shard-scoped plan: `lib-unit` plus only the integration shards that
-  own the changed tree. Isolated trees stay narrow: `src/admin/**` selects the
-  admin-bearing shards, `src/modes/mesh/**` selects the mesh shards, and
-  protocol trees such as `src/http3/**` select the protocol data-plane shard.
-  Shared runtime trees select every integration family they feed rather than an
-  optimistic single shard: `src/config/**`, `src/config_delta.rs`,
-  `src/proxy/**`, `src/dns/**`, `src/grpc/**`, `src/identity/**`, `src/pool/**`,
-  `src/connection_pool.rs`, `src/xds/**`, and `src/modes/control_plane.rs`
-  select the full matrix. `src/tls/**` selects mesh plus protocol shards;
-  file, database, and data-plane mode files select admin plus protocol shards;
-  `src/config_sources/**` selects admin-config plus both mesh shards. The
-  required `Merge Coverage` check verifies that every
-  planned shard succeeded, that exactly those shard artifacts are present, and
-  that reports are still published. Partial shard reports do not enforce the
-  overall or `src/plugins/` floors because those floors are only meaningful on
-  the complete matrix.
-- Pull requests that touch neither plugin nor core coverage-relevant files keep
-  the required `Merge Coverage` check as a fast no-op.
+- Pull requests and merge groups skip every instrumented shard, and the
+  required `Merge Coverage` check reports as a fast no-op.
+- A pull request or merge group that edits a coverage controller
+  (`coverage.yml`, `coverage_plan.py`, `verify_coverage_workflow.py`,
+  `scripts/check_coverage_thresholds.py`, `scripts/coverage.sh`) runs the full
+  matrix so the tooling change is exercised before it lands.
 - Push to `main`, `schedule`, `workflow_dispatch`, empty or unavailable diffs,
-  coverage-controller edits, dependency/build-graph inputs (`Cargo.toml`,
-  `Cargo.lock`, `build.rs`, `proto/**`, `ebpf/**`, `.cargo/**`,
-  `rust-toolchain.toml`), unknown coverage-relevant paths, and malformed or
-  hostile changed-path transport fail closed to the full matrix (lib-unit, the
-  five integration shards, and the three functional shards) and
-  still enforce the overall and `src/plugins/` thresholds. Classifiable paths
-  use the conservative repository-relative `[A-Za-z0-9._+@~ /-]` alphabet, so
-  Markdown controls cannot alter the Coverage Plan summary. A skipped planned
-  shard cannot green the merge aggregate.
-- Pushes to `main`, manual dispatches, and scheduled runs therefore keep
-  published main coverage complete and semantically unchanged.
+  and malformed or hostile changed-path transport fail closed to the full
+  matrix (lib-unit, the five integration shards, and the three functional
+  shards), which enforces the overall and `src/plugins/` floors. Classifiable
+  paths use the conservative repository-relative `[A-Za-z0-9._+@~ /-]`
+  alphabet, so Markdown controls cannot alter the Coverage Plan summary. A
+  skipped planned shard cannot green the merge aggregate.
+- Because pushes to `main`, manual dispatches, and scheduled runs always use
+  the full matrix, published main coverage stays complete. A commit that trips
+  a floor turns `main` red and is not releasable.
 
-Plugin coverage-relevant paths are `src/plugins/**`, `src/plugin_cache.rs`,
-`tests/unit/plugins/**`,
-and `tests/functional/functional_redis_rate_limiting_test.rs`.
-The authoritative planner lives in `.github/scripts/coverage_plan.py` so the
-workflow and examples use one path decision table. The coverage workflow
-verifier in `.github/scripts/verify_coverage_workflow.py` mechanically checks
-the matrix/aggregate contract, including exact planned shard outcomes, artifact
-presence, and required reporting. On pull requests and
+`select_scoped_plan` keeps a path-scoped classification for diagnostics and a
+possible future opt-in; the workflow does not currently use it. When selected,
+it works as follows:
+
+- Plugin-only diffs use the plugin mode: they run the `lib-unit` shard
+  (`--lib` and the four unit targets) and the merge job reuses that shard's
+  profraw/artifacts instead of re-collecting coverage. Only this mode and the
+  shard-scoped mode enforce the changed-line plugin gate
+  (`MIN_CHANGED_PLUGIN_LINE_COVERAGE`) on coverable `src/plugins/` lines; mixed
+  plugin and core changes select the affected core shards and keep that gate.
+- Classifiable core diffs run a shard-scoped plan: `lib-unit` plus only the
+  integration shards that own the changed tree. `src/admin/**` selects the
+  admin shards, `src/modes/mesh/**` the mesh shards, and protocol trees such as
+  `src/http3/**` the protocol data-plane shard. Shared runtime trees
+  (`src/config/**`, `src/config_delta.rs`, `src/proxy/**`, `src/dns/**`,
+  `src/grpc/**`, `src/identity/**`, `src/pool/**`, `src/connection_pool.rs`,
+  `src/xds/**`, `src/modes/control_plane.rs`) select the full matrix.
+  `src/tls/**` selects mesh plus protocol shards; file, database, and
+  data-plane mode files select admin plus protocol shards;
+  `src/config_sources/**` selects admin-config plus both mesh shards. Partial
+  shard reports do not enforce the overall or `src/plugins/` floors, which are
+  only meaningful on the complete matrix.
+- Dependency/build-graph inputs (`Cargo.toml`, `Cargo.lock`, `build.rs`,
+  `proto/**`, `ebpf/**`, `.cargo/**`, `rust-toolchain.toml`) and unknown
+  coverage-relevant paths fail closed to the full matrix; diffs with no
+  coverage-relevant files skip.
+
+In every mode, the required `Merge Coverage` check verifies that every planned
+shard succeeded, that exactly those shard artifacts are present, and that
+reports are still published.
+
+For the scoped classification, plugin coverage-relevant paths are
+`src/plugins/**`, `src/plugin_cache.rs`, `tests/unit/plugins/**`, and
+`tests/functional/functional_redis_rate_limiting_test.rs`. The authoritative
+planner is `.github/scripts/coverage_plan.py`, so the workflow and examples use
+one path decision table. `.github/scripts/verify_coverage_workflow.py`
+mechanically checks the matrix/aggregate contract, including exact planned
+shard outcomes, artifact presence, and required reporting. On pull requests and
 merge-queue groups, the `Coverage Plan` job collects changed files with
 `git diff --name-only --no-renames` so a rename's source and destination are
 both classified and a move into an irrelevant path cannot suppress a required
-gate. Generated, ignored, or
-otherwise non-coverable changed lines are ignored consistently with the LCOV
-report. The report ignore regex excludes `vendor/`, `tests/`, `build.rs`,
-`target/`, `custom_plugins/`, `ebpf/`, and `proto/`; those exclusions do not
-hide `build.rs`, `proto/**`, or `ebpf/**` from CI trigger decisions.
+gate. Generated, ignored, or otherwise non-coverable changed lines are
+ignored consistently with the LCOV report. The report ignore regex excludes
+`vendor/`, `tests/`, `build.rs`, `target/`, `custom_plugins/`, `ebpf/`, and
+`proto/`; those exclusions do not hide `build.rs`, `proto/**`, or `ebpf/**`
+from the scoped planner's trigger decisions.
 
 To inspect the same remote results without running coverage locally:
 
@@ -194,8 +204,8 @@ gh run download <run-id> --repo ferrum-edge/ferrum-edge --name coverage-report -
 python3 scripts/check_coverage_thresholds.py \
   --coverage-json /tmp/ferrum-coverage/coverage.json \
   --lcov /tmp/ferrum-coverage/lcov.info \
-  --min-overall-line 78.28 \
-  --min-plugins-line 84.98
+  --min-overall-line 81.00 \
+  --min-plugins-line 89.00
 ```
 
 For PR changed-line investigation, compare against the PR base SHA:
@@ -211,9 +221,10 @@ python3 scripts/check_coverage_thresholds.py \
 The normal full-mode PR `CI` workflow also includes required plugin hardening
 regressions:
 
-- The `Unit Tests` job runs the cache byte-accounting and last-known-good plugin
-  reload regressions explicitly before the complete unit suite. Keeping both
-  invocations in one job reuses the compiled `unit_tests` binary.
+- The `Unit Tests (plugins-b)` shard runs the cache byte-accounting and
+  last-known-good plugin reload regressions explicitly (`--exact`) before its
+  complete unit target. Keeping both invocations in one job reuses the compiled
+  `unit_plugins_b_tests` binary.
 - `Plugin Hardening Redis Regression`: multi-instance Redis request
   deduplication with `FERRUM_REDIS_REQUIRED=1`, so Redis startup failures cannot
   silently skip the regression. Covers cross-gateway lock/completed-value
@@ -276,15 +287,14 @@ a symlink, because `functional_cli_test` hard-links that path into temp
 directories, and a relative symlink copied that way dangles. The test run
 reuses that binary: `--no-report` implies cargo-llvm-cov's `--no-clean` (the two
 flags conflict), so it does not run `cargo clean -p ferrum-edge` and rebuild the
-linked binary. The step sets
-`FERRUM_SKIP_GATEWAY_BUILD=1` so no test process rebuilds an uninstrumented
-binary. The spawned gateways inherit `LLVM_PROFILE_FILE` and
-write their profiles next to the test binaries' profiles when they exit. The
-step sets `LLVM_PROFILE_FILE_NAME=ferrum-edge-functional-%4m.profraw`: the
-default cargo-llvm-cov name carries `%p`, which would write one multi-megabyte
-profile per test and gateway process, so every process of one binary instead
-merges online into a pool of at most four files. A
-gateway stopped with SIGTERM flushes its profile; one stopped with SIGKILL (a
+linked binary. The step sets `FERRUM_SKIP_GATEWAY_BUILD=1` so no test process
+rebuilds an uninstrumented binary. The spawned gateways inherit
+`LLVM_PROFILE_FILE` and write their profiles next to the test binaries'
+profiles when they exit. The step sets
+`LLVM_PROFILE_FILE_NAME=ferrum-edge-functional-%4m.profraw`: the default
+cargo-llvm-cov name carries `%p`, which would write one multi-megabyte profile
+per test and gateway process, so every process of one binary instead merges
+online into a pool of at most four files. A gateway stopped with SIGTERM flushes its profile; one stopped with SIGKILL (a
 bare `Child::kill()`) does not, so moving legacy `kill()` teardown to the shared
 graceful-shutdown helper raises measured coverage without new tests.
 
@@ -313,15 +323,12 @@ two-attempt retry; failed downloads, invalid ZIPs, CRC errors, tar failures, and
 missing profiles fail the step. The pipeline drains tar end padding so ZIP CRC
 verification finishes, and `pipefail` preserves both processes' failures.
 The required `Merge Coverage` check, shard-success checks, report commands,
-ignore regex, full/changed-line gates, and exact-SHA publication evidence remain
-unchanged. The operative workflow floors are **81.00% overall** (raised from
-77.50% once the functional shards lifted the measured figure to 82.79%,
-`526,752/636,227` lines in run 36117488050), **89.00% plugins** (raised from
-84.50%; the same run measured `src/plugins/` at 90.81%, `154,123/169,721`
-lines), and **84.98% changed plugin lines**; the earlier baseline table above records the historical
-introduction values.
+ignore regex, full/changed-line gates, and exact-SHA publication evidence are
+unaffected by this transport (floors: see
+[CI Baseline And Gates](#ci-baseline-and-gates)).
 
-Before-change observations from the two successful main runs on 2026-09-06:
+Observations from two successful main runs on 2026-09-06, before streaming
+extraction was introduced:
 
 | Measurement | [34008463617](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34008463617) | [34018271783](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34018271783) |
 | --- | ---: | ---: |
@@ -353,13 +360,13 @@ Log timestamps put download-to-extract intervals at approximately 3m15s and
 extraction, cleanup, and other step overhead. The old download interval itself
 includes ZIP decompression and writing the expanded tar, so these are not pure
 network measurements. Streaming removes about 30 GiB of intermediate tar writes
-and rereads per full run; its net wall-time benefit remains unmeasured until
-hosted CI runs this change. ZIP size, upload cost, and report-generation cost
+and rereads per full run; its net wall-time benefit was not measured in these
+runs. ZIP size, upload cost, and report-generation cost
 are not expected to improve. These different-SHA runs are timing evidence, not
 a same-source coverage-equivalence comparison. Identical cross-run object
 content and the cost of duplicate workspace metadata have not been established.
 The latest lib/unit log reports 21m07s compilation and about 9m26s running its
-two suites; this change does not add shards or address compilation latency.
+two suites; streaming extraction does not address compilation latency.
 
 Hosted workflow regression tests exercise the actual transport shell using
 small ZIP/tar fixtures: forced ZIP64 headers, pagination, unplanned artifacts,
@@ -369,8 +376,7 @@ profiles, profile bytes, executable modes, and sequential shared-object
 overwrites. Actual coverage artifacts retain their format and objects; ZIP CRC
 checks validate the stream on every hosted merge. The step summary now records
 exact ZIP/tar bytes, download/extraction seconds per shard, and fan-in wall time
-for comparison with subsequent exact-head CI. No local test or benchmark result
-is claimed for this optimization.
+for comparison with subsequent exact-head CI.
 
 Cancellation remains a separate limitation: GitHub re-evaluates job and step
 conditions, and an `always()` job can continue after cancellation

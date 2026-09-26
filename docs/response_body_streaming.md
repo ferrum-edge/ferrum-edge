@@ -60,13 +60,13 @@ When `response_body_mode: stream` is active and no plugin requires buffering, th
 
 1. Sends the backend request and receives the response status and headers.
 2. Checks whether the response qualifies for **adaptive buffering** (see below).
-3. If not buffered, begins forwarding the response to the client **without waiting for the full body** via a `CoalescingBody` adapter that batches small backend chunks (typically 8–32 KB) into larger 128 KB frames for efficient forwarding.
+3. If not buffered, begins forwarding the response to the client **without waiting for the full body**, through the generic `Coalescing` adapter that batches small backend chunks into larger frames (see [Response Body Coalescing](#response-body-coalescing)).
 
 This means the client sees the first byte of the response as soon as the backend sends it, rather than waiting for the entire response to be collected — unless adaptive buffering applies.
 
 ### Small Response Buffering
 
-When a backend response has a known `Content-Length ≤ 64 KiB` (configurable), the gateway collects the entire body into a single allocation via `response.bytes().await` instead of streaming through the async coalescing adapter. For typical JSON API payloads, this single allocation is cheaper than driving the coalescing adapter's poll loop and frame accounting at all. Responses without `Content-Length` or with `Content-Length` above the cutoff always stream.
+When a backend response has a known `Content-Length ≤ 64 KiB` (configurable), the gateway collects the entire body into a single bounded allocation instead of streaming it through the coalescing adapter. For typical JSON API payloads this is cheaper than driving the adapter's poll loop and frame accounting. Responses without `Content-Length` or with `Content-Length` above the cutoff always stream.
 
 Body-bearing SSE responses (`Content-Type: text/event-stream`) **always stream** regardless of `Content-Length`, since they represent inherently unbounded or latency-sensitive streams.
 
@@ -92,8 +92,8 @@ For `ProxyBody`-backed responses that stream (either below the adaptive buffer m
 | Source | Used for | Builder |
 |--------|----------|---------|
 | `ReqwestFrameSource` | reqwest streams (HTTP/1.1, HTTP/2-via-reqwest) | `coalescing_body`, `size_limited_streaming_body` |
-| `Incoming` (hyper) | direct HTTP/2 pool, gRPC pool | `coalescing_h2_body` |
-| `H3FrameSource` | native H3 backend pool | `coalescing_h3_body` |
+| `Incoming` (hyper) | direct HTTP/2 pool, gRPC pool | `coalescing_h2_body_strip_hop_by_hop_trailers`, `size_limited_coalescing_h2_body_strip_hop_by_hop_trailers` |
+| `H3FrameSource` | native H3 backend pool | `coalescing_h3_body`, `size_limited_streaming_h3_body` |
 
 For those `ProxyBody` builders, the coalescing logic — buffer accumulation, large-frame pass-through, opportunistic flush on `Pending`, optional time-based flush, trailer/error stashing — lives entirely in the generic adapter. There is no separate H1/H2/H3 `ProxyBody` coalescer to keep in sync. The H2/H3 adapters are trailer-safe: gRPC trailers (`grpc-status`, `grpc-message`) and h3 trailers are stashed while buffered data is flushed, then returned on the next poll.
 
@@ -113,7 +113,7 @@ This reduces the number of write syscalls by ~8–16× for large responses compa
 
 #### Direct HTTP/2 Large-Response Bypass
 
-Direct HTTP/2 responses have a narrow large-response bypass — `direct_streaming_h2_body` is used in place of `coalescing_h2_body` — to avoid a copy when coalescing cannot help:
+Direct HTTP/2 responses have a narrow large-response bypass — `direct_streaming_h2_body_strip_hop_by_hop_trailers` is used in place of the coalescing builder — to avoid a copy when coalescing cannot help:
 
 - `Content-Length` must be present, so the gateway can make the decision once before streaming.
 - The response must fit within `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, or that limit must be disabled.
@@ -121,7 +121,7 @@ Direct HTTP/2 responses have a narrow large-response bypass — `direct_streamin
 
 Unknown-size responses keep the coalescer because it is also the streaming size-enforcement path when `Content-Length` is absent. Small and mid-sized known responses below 512 KiB also keep the coalescer because they may arrive as multiple smaller backend DATA frames where write amortization still helps.
 
-gRPC streaming responses intentionally stay on `coalescing_h2_body`; preserving trailers and large-payload batching matters more there.
+gRPC streaming responses intentionally stay on the coalescing builder; preserving trailers and large-payload batching matters more there.
 
 #### Operator-Tunable Knobs
 
@@ -134,7 +134,7 @@ Each protocol has its own coalesce knob with bounds tuned for its native framing
 | `FERRUM_HTTP3_COALESCE_MAX_BYTES` | `32_768` (32 KiB) | same as above | H3 native + cross-protocol bridge |
 | `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | `[50 µs, 100 ms]` | H3 time-based flush deadline |
 
-The H1/H2-via-reqwest path uses a fixed 128 KiB target (`COALESCE_TARGET` in `body.rs`) — there is no env-var knob for it because `Pending` opportunistically flushes the buffer on every poll-wakeup gap, so SSE / trickle-style backends are not held back regardless of target size.
+The reqwest-backed path uses a fixed 128 KiB target (`COALESCE_TARGET` in `body.rs`). There is no knob for the target because the adapter flushes on every `Pending`, so SSE / trickle-style backends are not held back regardless of target size. `FERRUM_RESPONSE_COALESCE_FLUSH_MS` (default `0` = off, max `1000`) can instead hold sub-target frames for a bounded window on that path, clamped to half of `backend_read_timeout_ms`; it helps bulk transfer and delays low-rate streams, so enable it only on bulk-transfer routes (see [configuration.md](configuration.md)).
 
 ### Decision Flow
 
@@ -240,8 +240,8 @@ and then skipped, saving memory and latency for bodies the WAF would not scan.
 
 This downgrade is **narrowing-only**: it never forces buffering, so plugins that
 need the body (caching, compression, response transforms, or `waf` for an
-allowlisted type) are unaffected. With retries configured, ordinary responses
-stay buffered. An active buffering plugin may explicitly opt an inherently
+allowlisted type) are unaffected. With retries configured, the downgrade does
+not apply to ordinary responses. An active buffering plugin may explicitly opt an inherently
 streaming representation out after headers arrive only when every other active
 buffering plugin reports that it does not need that content type; the MCP and
 A2A gateways use this for `text/event-stream`, whose retry decision is complete
@@ -515,12 +515,11 @@ Buffered response collection, every awaited pre-commitment response phase
 (`after_proxy`, the buffered normalize / inspect / transform hooks, the final
 client-visible body and header policies, and the response-committed hook), and
 one last authoritative check immediately before the response head is committed
-are all bounded by the same absolute plan. Before that composition those phases
-were bounded only by the client RPC deadline, which is absent for an ordinary
-HTTP request — so a slow hook could carry an admitted credential past its own
-expiry and then commit a **protected** response head, or commit a streaming head
-only to terminal-error it immediately afterwards when the fixed pre-commitment
-terminal was still available.
+are all bounded by the same absolute plan. The client RPC deadline alone is not
+enough (it is absent for an ordinary HTTP request): a slow hook could otherwise
+carry an admitted credential past its expiry and then commit a **protected**
+response head, or commit a streaming head only to terminal-error it immediately
+afterwards while the fixed pre-commitment terminal was still available.
 
 Composing the two owners into one instant is not enough on its own, because the
 two owners want different outcomes. Each awaited phase therefore carries the
@@ -576,9 +575,8 @@ both streaming relays mark each write in flight
 cancels the whole relay from outside. A cut write is answered with a reset,
 never an appended frame.
 
-The committed-response observer is the one phase where an elapsed bound used to
-mean "continue in the background". That detach survives only for the
-client-owned RPC deadline. When the authorization bound wins, the pending hook —
+The committed-response observer is the one phase where an elapsed bound can
+mean "continue in the background", and only for the client-owned RPC deadline. When the authorization bound wins, the pending hook —
 which owns a **clone of the request context and the protected response body** —
 is dropped rather than spawned, and every remaining observer is skipped: a
 detached continuation is precisely a protected-data side effect running after
@@ -1015,8 +1013,6 @@ HTTP/1.1 clients never receive a trailer section from this handler: hyper writes
 
 Every relayed section is governed exactly like the direct-HTTP/2 streaming relay's (next section): response-direction hop-by-hop names are stripped, then the response-header policy boundary drops any field the configured policy governs. When nothing in a plain-HTTP section survives, the body ends on its last DATA frame instead of an empty trailer frame (a reqwest gRPC terminal section keeps its frame). A buffered response carries no backend trailers when the gateway replaced the body (plugin reject, a late gateway-selected terminal), for `HEAD`, or for a status that forbids content.
 
-Before issue #5760 the reqwest relay read `Response::bytes_stream()`, which yields DATA only, and every buffered collector kept the body only. Which path a response took depended on whether the capability registry had already classified the backend, so the same configuration relayed trailers on one run and dropped them on the next.
-
 #### Backend trailers on the direct-HTTP/2 streaming path
 
 A direct-H2 streaming response (`ResponseBody::StreamingH2`) commits its initial HEADERS frame before the backend's TRAILERS frame exists, so it crosses the same response-header policy boundary the native-H3 streaming relays cross. Every direct / size-limited / coalescing variant of that arm therefore installs the same reconciliation, described in full in [docs/http3.md → Backend trailers and response header policy](http3.md#backend-trailers-and-response-header-policy): declared `Plugin::response_trailer_policy()` names and prefixes, the observed pre-policy mutation witness, and the fail-closed `Unbounded` arm (`response_transformer`). Without it, `security_headers` configured with `{"remove": ["x-powered-by"]}` is a no-op on the initial header map when the backend sends `x-powered-by` only as a trailer, and the field lands on the wire after the policy already ran. The same absent→absent gap lets a trailer-only `content-encoding`, validator, or `x-amz-checksum-*` reintroduce representation metadata that `ai_stream_router`'s Anthropic SSE normalization already invalidated; that plugin declares the shared exact-name inventory plus the checksum prefixes, preserving unrelated application trailers.
@@ -1033,24 +1029,24 @@ Implementation notes: the whole boundary is skipped when no signal could act —
 
 HTTP/3 responses support **streaming** across three distinct paths. See [docs/http3.md](http3.md) for the full dispatch model.
 
-**H3 frontend → H3 backend** (in `http3/server.rs`, when the concrete HTTPS backend target is already classified as H3-capable): The H3 server's dedicated proxy path uses `Http3ConnectionPool::request_streaming()` to return a live `RequestStream`, then forwards response chunks directly to the QUIC client via `send_data()` with backpressure-aware adaptive coalescing (8–32 KiB accumulation, 2ms time-based flushing).
+**H3 frontend → H3 backend** (in `http3/server.rs`, when the concrete HTTPS backend target is already classified as H3-capable): The H3 server's dedicated proxy path uses `Http3ConnectionPool::request_streaming()` to return a live `RequestStream`, then forwards response chunks directly to the QUIC client via `send_data()` with backpressure-aware coalescing (the `FERRUM_HTTP3_COALESCE_*` window, 32 KiB by default, plus a time-based flush every `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS`, 200 µs by default).
 
-**H1/H2 frontend → H3 backend** (in `proxy/mod.rs`): When `stream_response=true`, the dispatch path uses `Http3ConnectionPool::request_streaming()` and returns `ResponseBody::StreamingH3`. The response body builder wraps the h3 `RequestStream` in `CoalescingH3Body` (configurable coalesce target) or `DirectH3Body` (zero-overhead passthrough), bridging h3's `recv_data()` async API to `http_body::Body` for hyper to forward to the HTTP/1.1 or H2 client. This eliminates the previous full-body buffering that occurred on this cross-protocol path.
+**H1/H2 frontend → H3 backend** (in `proxy/mod.rs`): When `stream_response=true`, the dispatch path uses `Http3ConnectionPool::request_streaming()` and returns `ResponseBody::StreamingH3`. The response body builder wraps the h3 `RequestStream` with `coalescing_h3_body` (`Coalescing<H3FrameSource>`), `size_limited_streaming_h3_body`, or `direct_streaming_h3_body` (zero-overhead passthrough), bridging h3's `recv_data()` API to `http_body::Body` for hyper to forward to the HTTP/1.1 or H2 client.
 
 **H3 frontend → non-H3 backend** (in `http3/cross_protocol.rs`, any request whose backend target is not classified as H3-capable or whose flavor != `Plain`): The H3 listener drives the same reqwest / HTTP/2 / gRPC backends as the H1/H2 proxy path:
 
-- **Request body** — streamed via a bounded `tokio::sync::mpsc` bridge into `reqwest::Body::wrap_stream` for `Plain` flavor. Mirrors the H1/H2 plugin-driven policy: stream by default, buffer only when a plugin pre-collected the body. Bridge capacity is `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` (default 32). `Grpc` flavor buffers the request body because the gRPC pool's retry-safe framing expects `Bytes`; unary gRPC bodies are small so this is acceptable.
+- **Request body** — streamed via a bounded `tokio::sync::mpsc` bridge into `reqwest::Body::wrap_stream` for `Plain` flavor. Mirrors the H1/H2 plugin-driven policy: stream by default, buffer only when a plugin pre-collected the body. Bridge capacity is `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` (default 32). `Grpc` flavor streams request DATA and trailers through a bounded channel into `GrpcBody::Channel` when no retry, body plugin, or pre-buffered body requires replay; otherwise it keeps the buffered representation.
 - **Response body** — streamed frame-by-frame with the same `http3_coalesce_*` window as the native H3 writer, so QUIC frame cadence is identical across dispatch kinds. `Plain` polls `reqwest::Response::chunk()`; `Grpc` polls hyper `Incoming::frame()` so trailer frames split off for `RequestStream::send_trailers()`.
 
-When plugins require response body access (e.g., `ai_token_metrics`, `response_transformer`) or retries are configured, HTTP/3 responses fall back to **buffered** mode via `Http3ConnectionPool::request()` with full `on_response_body` and `transform_response_body` plugin hook support.
+On the H3 frontend, when plugins require response body access (e.g., `ai_token_metrics`, `response_transformer`) or retries are configured, responses fall back to **buffered** mode with full `on_response_body` and `transform_response_body` plugin hook support (subject to the after-headers release described in [Response-Header-Aware Downgrade](#response-header-aware-downgrade-after-response-headers)).
 
 ### gRPC
 
 gRPC supports **full bidirectional streaming** of both request and response bodies when no plugins need body access and no retries are configured.
 
-**Request body streaming**: The `GrpcConnectionPool` uses a `GrpcBody` sum type (`Buffered(Full<Bytes>)` | `Streaming(Incoming)`) so the same pool handles both buffered and streaming request bodies. When `proxy_grpc_request_streaming()` is used, the `Incoming` body is wrapped in `GrpcBody::Streaming` and forwarded frame-by-frame — each H2 DATA frame is sent to the backend immediately, with memory bounded by the H2 flow-control window size. When retries or plugins require the body, the gateway collects it once into `GrpcBody::Buffered`. A body already collected for an earlier phase such as `hmac_auth` authentication or `request_mirror` is reused with its original method and raw metadata, under the gRPC receive-size and request-body timeout limits. Applicable transforms and final hooks run once after the earliest consumer; an already prepared body is dispatched without a second hook pass. H3 follows the same single-prebuffer contract through its cross-protocol bridge.
+**Request body streaming**: The `GrpcConnectionPool` uses a `GrpcBody` enum (buffered variants, `Streaming` over the client `Incoming`, `Pumped` for the [gateway-owned upload pump](#the-gateway-owned-upload-pump), and `Channel` for the H3 bridge) so the same pool handles both buffered and streaming request bodies. When `proxy_grpc_request_streaming()` is used, the client body is wrapped in a streaming variant and forwarded frame-by-frame — each H2 DATA frame is sent to the backend immediately, with memory bounded by the H2 flow-control window size. When retries or plugins require the body, the gateway collects it once into `GrpcBody::Buffered`. A body already collected for an earlier phase such as `hmac_auth` authentication or `request_mirror` is reused with its original method and raw metadata, under the gRPC receive-size and request-body timeout limits. Applicable transforms and final hooks run once after the earliest consumer; an already prepared body is dispatched without a second hook pass. H3 follows the same single-prebuffer contract through its cross-protocol bridge.
 
-**Response body streaming**: HTTP/2 DATA frames are forwarded as they arrive from the backend, wrapped in `CoalescingH2Body` for efficient batching. HTTP/2 trailers (`grpc-status`, `grpc-message`) are forwarded automatically via hyper's `Incoming` body framing. The terminal trailer block first crosses the response-header policy boundary: `grpc-status` / `grpc-message` / `grpc-status-details-bin` always survive, while trailer-borne application metadata is reconciled against the policy the response headers already applied — see [docs/http3.md → Native gRPC terminal metadata](http3.md#native-grpc-terminal-metadata).
+**Response body streaming**: HTTP/2 DATA frames are forwarded as they arrive from the backend, wrapped in the `Coalescing<Incoming>` adapter for efficient batching. HTTP/2 trailers (`grpc-status`, `grpc-message`) are forwarded automatically via hyper's `Incoming` body framing. The terminal trailer block first crosses the response-header policy boundary: `grpc-status` / `grpc-message` / `grpc-status-details-bin` always survive, while trailer-borne application metadata is reconciled against the policy the response headers already applied — see [docs/http3.md → Native gRPC terminal metadata](http3.md#native-grpc-terminal-metadata).
 
 When native-gRPC-capable plugins require response body access or retries are configured, gRPC falls back to **buffered** mode for both request and response — the full body and trailers are collected before constructing the response. `ai_token_metrics` is HTTP-only: enabling it alone does not alter native gRPC streaming or inspect protobuf frames.
 
@@ -1060,10 +1056,10 @@ WebSocket connections are bidirectional streams and do not use `response_body_mo
 
 ## ProxyBody Type
 
-The streaming architecture is built on the `ProxyBody` enum in `src/proxy/body.rs`:
+The streaming architecture is built on `ProxyBody` in `src/proxy/body.rs`, a struct that carries per-response guards and wraps one of three body kinds:
 
 ```rust
-pub enum ProxyBody {
+enum ProxyBodyKind {
     Full(Full<Bytes>),     // Buffered: complete body in memory
     Stream(Pin<Box<...>>), // Streaming: zero-overhead passthrough (default)
     Tracked(TrackedBody),  // Streaming: with completion tracking (opt-in)
@@ -1077,12 +1073,12 @@ Helper constructors:
 - `ProxyBody::from_string(s)` — Create a buffered body from a string
 - `ProxyBody::empty()` — Create an empty body
 - `body::coalescing_body(response, content_length, read_timeout_ms, flush_after, trailers)` — Create a streaming body with chunk coalescing (128 KB target). Default for reqwest-backed HTTP/1.1 responses. Builds `Coalescing<ReqwestFrameSource>` over the response's real frames; `trailers` (`ReqwestResponseTrailers`) relays the governed trailer section or drops it when the client cannot receive one.
-- `body::direct_streaming_body(response, content_length, read_timeout_ms, trailers)` — Zero-overhead passthrough for reqwest streams. Used when both `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` and `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0`.
+- `body::direct_streaming_body(response, content_length, read_timeout_ms, trailers)` — Zero-overhead passthrough for reqwest streams. Used when `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0`, `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0`, and `FERRUM_RESPONSE_COALESCE_FLUSH_MS=0`.
 - `body::size_limited_streaming_body(response, max_bytes, content_length, read_timeout_ms, trailers)` — Streaming body with frame-by-frame size enforcement via `SizeLimitedStreamingResponse` + coalescing. Used when `max_response_body_size_bytes > 0` and the **backend** did not declare a canonical Content-Length (captured before `after_proxy`; a hook-authored field cannot skip this constructor).
-- `body::coalescing_h2_body(body, content_length, coalesce_target)` — H2 DATA frame coalescing for gRPC streaming and HTTP/2 direct pool. Builds `Coalescing<Incoming>`. Trailer-safe.
-- `body::direct_streaming_h2_body(body, content_length)` — Zero-overhead H2 passthrough; used for the large-response bypass and the H2 fast path.
-- `body::coalescing_h3_body(recv_stream, content_length, coalesce_min, coalesce_max, flush_interval)` — Bridges h3's `recv_data()` API to `http_body::Body` with chunk coalescing. Builds `Coalescing<H3FrameSource>`. Used for H1/H2 frontend → H3 backend streaming via `ResponseBody::StreamingH3`.
-- `body::direct_streaming_h3_body(recv_stream, content_length)` — Zero-overhead passthrough for H3 response data. Used when no coalescing/size limits apply.
+- `body::coalescing_h2_body_strip_hop_by_hop_trailers(body, content_length, coalesce_target, ..)` — H2 DATA frame coalescing for gRPC streaming and the HTTP/2 direct pool. Builds `Coalescing<Incoming>`. Trailer-safe.
+- `body::direct_streaming_h2_body_strip_hop_by_hop_trailers(body, content_length, ..)` — Zero-overhead H2 passthrough; used for the large-response bypass and the H2 fast path.
+- `body::coalescing_h3_body(recv_stream, .., coalesce_min_bytes, coalesce_max_bytes, flush_interval, ..)` — Bridges h3's `recv_data()` API to `http_body::Body` with chunk coalescing. Builds `Coalescing<H3FrameSource>`. Used for H1/H2 frontend → H3 backend streaming via `ResponseBody::StreamingH3`.
+- `body::direct_streaming_h3_body(recv_stream, ..)` — Zero-overhead passthrough for H3 response data. Used when no coalescing/size limits apply.
 - `ProxyBody::into_tracked(self, baseline)` — Wrap any streaming `ProxyBody` (returned by any of the builders above) in completion tracking, returning `(ProxyBody, Arc<StreamingMetrics>)`. No-op on `Full` or already-`Tracked` bodies. Use this so the tracked path picks up the same coalescing / size-limit / SSE-bypass behaviour as the default streaming path — there is no separate "tracked" body builder.
 
 ## When to Use Buffer Mode
@@ -1107,7 +1103,7 @@ after-headers retry opt-in, so a response it will not sample is released to
 stream there too; only the responses it actually captures stay buffered and
 mid-body retryable.
 
-Note: response body size limits are now enforced via `SizeLimitedStreamingResponse` even when the backend omitted Content-Length — explicit buffer mode is no longer required for size enforcement. A post-`after_proxy` Content-Length cannot suppress that adapter.
+Note: buffer mode is not required for response size enforcement. `SizeLimitedStreamingResponse` enforces the limit on streams whose backend omitted `Content-Length`, and a post-`after_proxy` `Content-Length` cannot suppress that adapter.
 
 Use `response_body_mode: stream` (default) when:
 

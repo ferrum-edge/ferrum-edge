@@ -32,6 +32,9 @@ PR #506 ships a gateway-side suppression for the recv_response graceful-close ra
 
 ## Hand-off — how to file the upstream issue + PR
 
+Done: the issue and PR are filed as hyperium/h3#338 and hyperium/h3#339. The
+steps below are kept as the record of how they were filed.
+
 The patch is currently shipped via the vendored crate at `vendor/h3-0.0.8-ferrum-patched/` and wired in via `[patch.crates-io]` in the workspace `Cargo.toml`. The artifacts in this directory exist so we can submit the same fix upstream and ultimately retire the vendor copy. To file the upstream work:
 
 1. **Open the issue.** GitHub → hyperium/h3 → New issue → paste `issue.md`. Capture the issue number.
@@ -39,7 +42,6 @@ The patch is currently shipped via the vendored crate at `vendor/h3-0.0.8-ferrum
 3. **Push the fork branch.**
    ```bash
    # The fork exists at https://github.com/jeremyjpj0916/h3 (already created).
-   # Clone (or use the existing local checkout at /Volumes/JustusStorage/Claude/ferrum-edge/h3-fork):
    git clone https://github.com/jeremyjpj0916/h3.git
    cd h3
    git checkout -b fix/recv-frame-drain-on-quic-close
@@ -92,16 +94,19 @@ With the vendored crate in place, the gateway-side suppression in PR #506 still 
 - Deferred connection error: `poll_next_drains_buffered_headers_before_quic_close`, `poll_next_drains_a_buffered_frame_when_it_reads_the_quic_close`, `poll_data_drains_buffered_body_before_quic_close`, and `poll_data_surfaces_quic_close_over_a_truncated_buffered_body`. They prove the buffered frames and body are delivered, the stored error then surfaces exactly once without another transport poll, and a close that truncates a DATA frame surfaces as the connection error rather than `UnexpectedEnd`.
 - Stream errors are never deferred: `poll_data_surfaces_stream_reset_over_a_truncated_buffered_body`, `poll_data_surfaces_stream_reset_over_a_buffered_frame`, `poll_next_surfaces_stream_reset_over_a_buffered_frame`, `poll_data_surfaces_unknown_stream_error_over_a_buffered_body`, and `poll_next_surfaces_unknown_stream_error_over_a_buffered_frame`.
 
-CI runs them in the `test-vendor-patches` job (`cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`).
+CI runs them in the `test-vendor-patches` job (`Vendored Patch Regressions`; `cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`).
 
 ## Retirement — when upstream merges
 
-Once `hyperium/h3` releases a version with the fix:
+Once `hyperium/h3` releases a version with the fix **and** patches 002–005 are
+also retired (all five share `vendor/h3-0.0.8-ferrum-patched`; see the
+inventory's `Removal trigger` column in
+[dependency-policy.md](../../dependency-policy.md#vendored-crate-inventory)):
 
 1. **Update the registry floor.** Bump `h3 = "X.Y.Z"` in `Cargo.toml` `[dependencies]` to the version that includes the fix.
-2. **Drop the vendored crate** (mandatory — currently in use):
-   - Remove the `h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }` line from the `[patch.crates-io]` block at the bottom of `Cargo.toml`. If `reqwest` (the other `[patch.crates-io]` entry) is also retired by then and the block becomes empty, drop the block + its comment header too.
-   - `git rm -r vendor/h3-0.0.8-ferrum-patched`. If `vendor/` becomes empty (i.e., the reqwest vendor was already retired), delete it too.
+2. **Drop the vendored crate:**
+   - Remove the `h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }` line from the `[patch.crates-io]` block in `Cargo.toml` and its mirror in `tests/performance/mesh/Cargo.toml`. If the block becomes empty (every other vendored crate already retired), drop the block and its comment header too.
+   - `git rm -r vendor/h3-0.0.8-ferrum-patched`. If `vendor/` becomes empty, delete it too.
    - `cargo build` — confirm we're now pulling h3 from crates.io and the registry version is being resolved.
    - `cargo test --test unit_tests && cargo test --test integration_tests && cargo build --bin ferrum-edge && cargo test --test functional_tests -- --ignored` — confirm the registry version still passes regression tests for the graceful-close race (the inline regression tests we added live in the vendored frame.rs and disappear with it; the upstream version is expected to carry equivalents).
 3. **Leave PR #506's gateway-side suppression in place.** It's correct behavior independently of the upstream fix:
@@ -109,7 +114,7 @@ Once `hyperium/h3` releases a version with the fix:
    - `connection_error=false` for `GracefulRemoteClose` is the right contract — the request reached the wire.
    - The retry semantics, CB semantics, and passive-health semantics that PR #506 nailed down are correct on their own merits.
    The upstream fix removes the SYMPTOM (the 502 at recv_response when HEADERS are buffered); the gateway-side change ensures we behave correctly in the failure modes that DO remain (e.g., the recv_response close happens BEFORE any HEADERS bytes are buffered, which the upstream fix can't recover either).
-4. **Update CLAUDE.md** — the "Backend Capability Registry" / "Upstream h3 fix tracked separately" paragraph references the vendored crate (`vendor/h3-0.0.8-ferrum-patched`); replace that with a note that the fix landed upstream in h3 vX.Y.Z.
+4. **Update docs that reference the vendored crate** (`vendor/h3-0.0.8-ferrum-patched`) — note that the fix landed upstream in h3 vX.Y.Z, and follow the retirement procedure in [dependency-policy.md](../../dependency-policy.md#retiring-a-vendored-patch) (inventory row, lifecycle JSON, drift manifest).
 5. **Update `docs/http3.md`** — remove any "this still 502s" caveat once normal responses survive the race.
 6. **Move this directory to `docs/upstream-h3-patches/_retired/001-recv-frame-drain-on-quic-close/`** with a `STATUS.md` noting the merge commit and version. Keeps the audit trail without cluttering the active patches list. If `docs/upstream-h3-patches/` becomes empty (no other active patches and no `_retired/` content you want to surface), tidy as appropriate.
 

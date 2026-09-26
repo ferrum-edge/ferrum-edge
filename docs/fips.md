@@ -266,7 +266,7 @@ Precedence follows Ferrum's standard order: **CLI > environment > `ferrum.conf`
 
 | Setting | Values | Default |
 |---|---|---|
-| `--fips-mode` / `FERRUM_FIPS_MODE` | `off`, `enforce` (also `true`/`false`/`on`/`disabled`) | `off` |
+| `--fips-mode` / `FERRUM_FIPS_MODE` | `off` or `enforce` (aliases: `false`/`0`/`disabled`/`disable` and `true`/`1`/`on`/`enabled`/`enable`) | `off` |
 | `FERRUM_FIPS_REQUIRED_PROVIDER` | `aws-lc-fips` | `aws-lc-fips` |
 
 An unrecognized `FERRUM_FIPS_MODE` value is a configuration error, not a silent
@@ -461,14 +461,13 @@ the entry and discloses nothing.
   attestation, semantic-cache Redis envelope authentication, trust-material
   rotation, duplicate-JSON verdict memoization, policy provenance, and
   identity-bound connection-pool keys — run through `crate::fips::approved`,
-  which is backed by the selected module. They were migrated off the RustCrypto
-  `sha2`/`hmac` crates for exactly this reason: an approved *algorithm* computed
-  by an unvalidated *implementation* is still outside the boundary.
+  which is backed by the selected module, rather than the RustCrypto
+  `sha2`/`hmac` crates: an approved *algorithm* computed by an unvalidated
+  *implementation* is still outside the boundary.
 - Ferrum's only stored-password representation is `hmac_sha256:<64 hex>`, an
   approved keyed MAC. A stored hash in any other representation is refused: it
-  would be a KDF Ferrum has not classified. The unreferenced `argon2`
-  dependency was **removed** from the build rather than policy-gated, so no
-  non-approved KDF is linked at all.
+  would be a KDF Ferrum has not classified. Ferrum does not depend on `argon2`
+  or any other password-hashing crate for stored credentials.
 - SHA-1 remains present for the RFC 6455 `Sec-WebSocket-Accept` handshake value,
   a non-security cache-poisoning guard over a fixed public GUID that carries no
   key and protects no secret. Non-security content-addressing digests listed in
@@ -500,7 +499,7 @@ the entry and discloses nothing.
   nothing. They are computed through the provider seam, and the inventory
   records them as `outside-boundary` for exactly the same reason as the RFC 6455
   handshake value. Do not read them as SHA-1 signature verification.
-- JWT-SVID trust material (issue #3617) admits an EC authority only after proving
+- JWT-SVID trust material admits an EC authority only after proving
   the published point actually lies on its named curve. That proof is a bounded
   ephemeral ECDH agreement at the provider seam (`fips::ec_point_on_named_curve`
   — `ring` on an ordinary build, the AWS-LC FIPS module on a `fips` build), whose
@@ -531,6 +530,7 @@ the entry and discloses nothing.
   (`FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH`), a `backend_scheme: dtls`
   stream proxy, and a `udp_logging` sink with `dtls: true`. See
   §"DTLS: why the whole transport is refused".
+
 Every diagnostic is bounded — at most 8 offending entries are named, followed by
 a count — and carries no secret, key material, path, or free-form
 operator-supplied value.
@@ -538,7 +538,7 @@ operator-supplied value.
 ## The module boundary
 
 A FIPS 140-2/140-3 certificate covers a **cryptographic module**, not an
-application. When the AWS-LC-FIPS integration ships, the boundary is:
+application. With the AWS-LC FIPS integration, the boundary is:
 
 **Inside the module** — block ciphers and AEADs, hashes and HMAC, the DRBG,
 signature generation/verification, key agreement, and the TLS/QUIC key schedules
@@ -605,7 +605,7 @@ Dispositions:
   rejected, never as a standing residual-work list.
 
 A note on the last two, because the distinction is the whole point of the table:
-Ferrum-owned production source no longer imports RustCrypto `sha2` or `hmac`.
+Ferrum-owned production source does not import RustCrypto `sha2` or `hmac`.
 Even non-security SHA-256 work such as ETags, telemetry identities,
 configuration-drift summaries, and xDS nonces uses the selected-provider seam,
 so there is no second Ferrum-owned implementation to misclassify later. Those
@@ -688,18 +688,17 @@ Retiring the refusal means routing `dimpl`'s protocol randomness through its own
 `secure_random` provider hook; that is an upstream change, tracked with the rest
 of the vendored `dimpl` patch lifecycle in `docs/dependency-policy.md`.
 
-### External secret providers: why this changed to a refusal
+### External secret providers: why they are refused
 
-An earlier revision of this document recorded the cloud secret backends as
-`outside-boundary` — allowed, on the reasoning that secrets resolve once at
-startup before the gateway serves. That was an *implicit* claim that a
-pre-serving TLS session to a credential store does not matter. It does: that
-session carries the gateway's private keys and JWT secrets, and it is the one
+Cloud secret backends resolve secrets once at startup, before the gateway
+serves, but that pre-serving TLS session to the credential store still matters:
+it carries the gateway's private keys and JWT secrets, and it is the one
 connection whose compromise hands over everything else. Ferrum cannot route
 those SDK stacks onto the selected module and cannot attest to what they use, so
-an enforcing process now refuses them at
+an enforcing process refuses them at
 `fips::policy::check_external_secret_sources`, called from
-`main::resolve_startup_secrets` **before any provider client is constructed**.
+`gateway_entry::resolve_startup_secrets` **before any provider client is
+constructed**.
 
 The `cloud-secrets` build still compiles under `--features fips` and is audited
 in CI for exactly that reason: the refusal is what stands between the
@@ -726,6 +725,7 @@ each, then compiles each against the real module:
 | `fips,bench-pool-profile` | Supported — includes the H1 allocator observer and adds sampled pool counters without changing cryptographic operations or provider selection; the combination receives the same resolved-graph audit and hosted compile gate |
 | `fips,bench-udp-profile` | Supported — default-off UDP source-site counters add no crypto dependencies; the combination receives the same resolved-graph audit and hosted compile gate |
 | `fips,bench-h1-profile,bench-udp-profile` | Supported — the combined diagnostic features retain the existing allocator and selected crypto provider under the same hosted gates |
+| `fips,acme,pkcs11,ebpf` | Supported — the combined operational features, under the same resolved-graph audit and hosted compile gate |
 | `fips,cloud-secrets` | **Builds, refused at runtime** (above) |
 
 ## Verifying a deployment

@@ -20,18 +20,16 @@ paths:
 
 ## Local Testing Policy
 
-- Test only what changed locally; CI is the full gate.
-- Rust changes: `cargo fmt --all -- --check`, targeted clippy with `cargo clippy --lib --tests -p ferrum-edge -- -D warnings`, and targeted tests.
-- Docs/comment-only changes: `git diff --check` and any relevant doc formatter/linter.
-- Config/schema/spec/template changes: validate the changed surface, such as `ferrum-edge validate`, OpenAPI/schema checks, or targeted config/admin tests.
-- Reserve `cargo clippy --all-targets -- -D warnings` for shared infrastructure, broad refactors, pre-release/pre-merge, or congested CI.
+The root CLAUDE.md "Testing Policy" applies (test what changed; CI is the full gate). Additionally:
+
+- Targeted clippy is `cargo clippy --lib --tests -p ferrum-edge -- -D warnings`. CI runs `cargo clippy --all-targets -- -D warnings`; run that locally only for shared infrastructure, broad refactors, pre-release/pre-merge, or congested CI.
+- Config/schema/spec/template changes: validate the changed surface, e.g. `ferrum-edge validate`, OpenAPI/schema checks, or targeted config/admin tests.
 
 ## Cargo Target Isolation
 
-- Leave `CARGO_TARGET_DIR` unset across parallel worktrees. Cargo's default per-worktree `target/` avoids shared build locks.
-- A stale inherited `CARGO_TARGET_DIR` causes `Blocking waiting for file lock on build directory`. Work around one command with `unset CARGO_TARGET_DIR && cargo ...`.
-- Sharing `SCCACHE_DIR` is safe. The repo `.cargo/config.toml` already uses `sccache`.
-- Within one workspace, run fmt, clippy, and tests sequentially because they share that workspace target dir.
+- Leave `CARGO_TARGET_DIR` unset across parallel worktrees so each uses its own `target/`. A stale inherited value causes `Blocking waiting for file lock on build directory`; work around it per command with `unset CARGO_TARGET_DIR && cargo ...`.
+- Sharing `SCCACHE_DIR` is safe; the repo `.cargo/config.toml` already uses `sccache`.
+- Within one workspace, run fmt, clippy, and tests sequentially because they share that workspace's target dir.
 
 ## Environment Isolation
 
@@ -281,7 +279,7 @@ shares.
 ## CI Expectations
 
 - Full-mode PR CI runs formatting and integration-shard coverage inside `ci-plan`; independent readonly `ci-policy` runs the complete immutable-base policy self-tests and scan alongside compilation, including on light-mode PRs. `Tests` requires successful planning, successful policy, and its post-verification `verified=true` output even in light mode. The planner pins its own authenticated base before extracting trusted planner modules and cheaply rejects frozen verifier/workflow edits. Full mode then runs consolidated test jobs (unit + inline lib, Consul + LDAP), two integration shards, four functional shards (the service-backed `data-plane` / `data-plane-runtime` pair is serial per runner), lint, perf regression, and the native Linux x86_64 pr-build compile gate. `merge_group` also compile-gates macOS x86_64/ARM64 with `cargo check` and Windows x86_64 with a linked pr-build; push-to-main uses the fast Linux verification build and packages tested Linux binaries into an Actions image artifact. Production builds run only in release.yml after a version tag is created. The planner also emits trusted, fail-closed Helm/eBPF/Secret Backends (`run_secrets_backends`)/PKCS#11 SoftHSM (`run_pkcs11`) path gates so irrelevant jobs skip before runner allocation. Secret Backends and PKCS#11 remain required when their planner outputs are true and may skip when those outputs are false; pushes to `main`, manual runs, empty/unavailable diffs, unclassifiable paths, a missing or non-`true` `paths_classifiable` handshake from an old trusted-base planner, and gate-controller edits fail closed and schedule both. Ordinary non-vendored documentation, license, and agent-instruction-only PRs stay on a lightweight diff-hygiene + `Tests` aggregate path; vendored Markdown and live-suite contract/runbook docs still select full mode. On full-mode PRs, the perf-regression job always runs lightweight protocol-perf static contracts (workflow/evaluator self-tests + scenario `py_compile`) after checkout; the expensive HTTP overhead benchmark runs only for shared runtime infrastructure (top-level `src/*.rs`), proxy/connection hot paths, file-mode startup and config, performance fixtures, or dependency/build-graph changes; plugin-internal, admin, secrets, and unrelated-mode changes skip the benchmark. The job's `setup-rust-ci` `ci-perf` cache includes both `. -> target` and `tests/performance/mesh -> target` so the standalone Criterion workspace is not a cold compile. It always runs on pushes to `main` and manual `workflow_dispatch`, and runs fail-closed when the PR diff cannot be computed.
-- Branch protection must directly require the nine dedicated checks: `Tests`, `Merge Coverage`, `Gateway API Conformance`, `Mesh E2E Sidecar Live`, `Trusted Cross Build Policy`, `Multicluster Federation Live`, `Multicluster Poller Partition Live`, `Ambient Host UDP Live`, and `FIPS Build & Test`. The launch-readiness governance lane was removed in #4010, so `Launch Readiness Integrity` and `Launch Readiness Gate` no longer exist and must not be listed here. The dedicated workflows trigger on every PR and on `merge_group`, and path-filter internally; do not add polling mirror jobs back to `ci.yml`. See `docs/ci_cd.md` for the live no-bypass posture and merge-queue SHA semantics. `NodeWaypoint eBPF Live`, `Istio Status CAS Live`, and `CNI Lifecycle Live` use the same trusted-base classifier and always-reporting aggregate pattern but are **not** branch-protection-required.
+- Branch protection must directly require the nine dedicated checks: `Tests`, `Merge Coverage`, `Gateway API Conformance`, `Mesh E2E Sidecar Live`, `Trusted Cross Build Policy`, `Multicluster Federation Live`, `Multicluster Poller Partition Live`, `Ambient Host UDP Live`, and `FIPS Build & Test`. Do not list `Launch Readiness Integrity` or `Launch Readiness Gate`; that lane was removed (#4010). The dedicated workflows trigger on every PR and on `merge_group`, and path-filter internally; do not add polling mirror jobs back to `ci.yml`. See `docs/ci_cd.md` for the live no-bypass posture and merge-queue SHA semantics. `NodeWaypoint eBPF Live`, `Istio Status CAS Live`, and `CNI Lifecycle Live` use the same trusted-base classifier and always-reporting aggregate pattern but are **not** branch-protection-required.
 - Production release is gated on the COMPLETE required set. `.github/required-publication-checks.json` is the canonical machine-consumed inventory; both `release-dispatch.yml` and `release.yml` run `verify_publication_gate.py --enforce release` for the exact selected commit. `verify_required_ci.py` checks inventory parity and the release contracts. Ordinary main CI and `gateway-api-conformance.yml` have no publication-evidence collector or polling job. The trusted base freezes the release dispatcher, production publisher, input validator, evidence verifier, and inventory; ordinary PRs cannot approve their own changes to those controls. Missing, queued, in-progress, failed, cancelled, skipped, timed-out, wrong-SHA/event/branch/path/id, and untrusted evidence blocks version-tag creation and production publication. A policy override does not create successful release evidence. See `docs/ci_cd.md` -> "Publish-blocking required checks".
 - Push to main never publishes registry images or GitHub Releases. Start Production Release (`release-dispatch.yml`) takes a stable version tag, verifies the selected main SHA, and creates the tag using RELEASE_TAG_TOKEN. The separate tag-triggered release.yml builds and publishes production artifacts.
 - Tags `v*` create versioned releases and Docker tags.
@@ -304,10 +302,10 @@ Functional tests are ignored by default. Conformance reporter emits `target/conf
 
 - `tests/performance/multi_protocol/` is not a workspace member and has its own lockfile.
   The workspace `Tests` aggregate therefore never builds it; its own tests
-  (`tests/metrics_tests.rs`, `tests/test_benchmark_validity.py`) run in the
+  (its `tests/metrics_tests.rs` and `tests/test_benchmark_validity.py`) run in the
   `Benchmark Harness Tests` workflow, which triggers on any change under
   `tests/performance/multi_protocol/**`. Add new harness tests where that lane
   reaches them.
 - Keep protocol deps aligned with root `Cargo.toml`. DTLS, H2, H3, QUIC, tonic, prost, rustls, and related crates can silently fail when versions drift.
 - When bumping a shared dependency, update the multi-protocol manifest and run `cd tests/performance/multi_protocol && cargo update -p <crate>`.
-- Preserve `# SYNC:` comments.
+- Preserve the `# SYNC:` comments in both manifests.

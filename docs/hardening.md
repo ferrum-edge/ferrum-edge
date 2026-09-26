@@ -20,11 +20,10 @@ Companion documents:
 > stability commitment.
 >
 > **Feature availability by release.** Resource labels (`labels` /
-> `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig) landed on
-> `main` in [#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483) on
-> 2026-09-12. Published releases through **v0.9.4** reject the field with
-> ``unknown field `labels` ``. **v0.9.5 is the first tagged release with resource
-> labels**; pin v0.9.5 or later and follow the
+> `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig,
+> [#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483)) require
+> **v0.9.5 or later**; releases through v0.9.4 reject the field with
+> ``unknown field `labels` ``. Follow the
 > [upgrade guidance](upgrade_guide.md#upgrading-to-095).
 > Companion clients that inject `labels.provisioned-by`
 > require matching gateway builds: Git Forge Ops ≥
@@ -103,7 +102,7 @@ See [admin_metrics.md](admin_metrics.md) and
 | Police revocation for the issuers you own | `FERRUM_TLS_CRL_FILE_PATH` | a CRL bundle refreshed ahead of its own `nextUpdate` | [CRL Policy](frontend_tls.md#crl-policy) |
 | Staple OCSP where your CA supports it | `FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE` | a refreshed DER response source | [TLS Material Sources](configuration.md#tls-material-sources) |
 | Rotate certificates without a restart | `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` | `true` with file/provider-backed sources | [Configuration Reference](configuration.md#tls-material-sources) |
-| Resolve the real client IP only from peers you trust | `FERRUM_TRUSTED_PROXIES` | your load-balancer CIDRs, never empty-and-trusting | [Client IP resolution](client_ip_resolution.md) |
+| Resolve the real client IP only from peers you trust | `FERRUM_TRUSTED_PROXIES` | your load-balancer CIDRs only (empty, the default, ignores forwarded headers) | [Client IP resolution](client_ip_resolution.md) |
 
 Frontend/admin TLS live reload is **off by default**; with it off, rotating
 frontend material requires a configuration reload or a restart. Inline PEM is
@@ -189,9 +188,9 @@ topology. Node-agent deployments have their own posture document:
 
 | Do this | Setting or field | Secure value | Reference |
 |---|---|---|---|
-| Always verify token expiry on JWT auth | plugin `jwt` config | expiry validation is required, never disabled | [Plugin reference](plugins.md) |
+| Always verify token expiry on JWT auth | `jwt_auth` plugin config | expiry validation is required, never disabled | [Plugin reference](plugins.md) |
 | Bound remote signing-key trust | `jwks_auth` `jwks_max_stale_seconds` | shorter than the default hour when revocation must converge fast | [SECURITY.md](../SECURITY.md) |
-| Fail closed when the shared rate-limit store is unreachable | `rate_limiting` `redis_failure_policy` | `fail_closed` — must be set explicitly; the default is now `local_fallback` | [rate_limiting](plugins.md#rate_limiting) |
+| Fail closed when the shared rate-limit store is unreachable | `rate_limiting` `redis_failure_policy` | `fail_closed` — must be set explicitly; the default is `local_fallback` | [rate_limiting](plugins.md#rate_limiting) |
 | Enforce, do not just monitor, the WAF | WAF plugin mode | enforcement mode; the default rule pack ships monitor-only | [Default rules ship monitor-only](waf.md#default-rules-ship-monitor-only--and-how-to-enforce-them) |
 | Bound request bodies | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | a real ceiling; `0` is unlimited | [Size limits](size_limits.md) |
 | Keep plugin egress inside the backend policy | `FERRUM_BACKEND_ALLOW_IPS` and the CIDR lists | see §4 — plugin endpoints are screened by the same policy | [Backend Egress / SSRF Protection](configuration.md#backend-egress--ssrf-protection) |
@@ -254,11 +253,10 @@ are accepted and silently weaken the deployment.
 | `FERRUM_MESH_CA_BOOTSTRAP_DEV=true` | Mints a self-signed root for the internal CA backend. Refused under `FERRUM_MESH_PRODUCTION_MODE`. |
 | `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT=true` | Admits plaintext (h2c) stock ADS endpoints. Development only. |
 | `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` on a networked address | Sends the entire configuration stream, including the plane bearer token, in cleartext. |
+| `udp_max_response_amplification_factor: 0` on a `udp`/`dtls` proxy | Removes the reply budget (unset defaults to `8.0`), so any small-request/large-response backend becomes a spoofed-source reflector. The listener logs a startup warning. |
 
-UDP amplification and datagram limits are deliberately **not** listed here
-because those defaults are being revised; read
-[tcp_udp_proxy.md](tcp_udp_proxy.md) for the current values before exposing a UDP
-listener.
+Read [tcp_udp_proxy.md](tcp_udp_proxy.md) for the other UDP datagram and
+session limits before exposing a UDP listener.
 
 ## Verifying a deployment
 

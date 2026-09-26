@@ -65,10 +65,9 @@ prompt, including continuation prompts and any permitted nested delegation.
    launcher refuses `--model` (exit 2) unless it names exactly that model, so no other
    Qwen/DeepSeek variant and no rolling alias is dispatchable from this skill. Do not
    substitute a different provider or model.
-6. The pin is the **dated snapshot**, not the rolling `deepseek-v4-pro` alias. The operator pinned
-   `-0813` for its limited-time discounted rate; the rolling alias also serves on this plan, so
-   this pin is a cost choice rather than an availability constraint. Re-pin here and in
-   `scripts/dispatch-agent.sh` together, and re-validate, if the snapshot is retired.
+6. The pin is deliberate: it is not the rolling `deepseek-v4-pro` alias. To change or retire it,
+   re-pin here, in `scripts/dispatch-agent.sh`, and in `references/agent-brief.md` together, then
+   re-validate.
 
 ## Isolate every worker
 
@@ -113,8 +112,8 @@ exits.
 Start each worker in its own long-lived execution session and retain its exact session handle or
 PID. Prefer one tool call per worker so completions and failures remain attributable. Never wrap
 the fleet in a single shell command, use `killall opencode`, or use `pkill opencode`; the user may
-have unrelated opencode sessions. Cap this workflow at 7 concurrent workers unless the user
-sets a lower limit.
+have unrelated opencode sessions. Cap this workflow at seven concurrent workers unless
+the user sets a lower limit.
 
 ## Pin the worker role
 
@@ -126,9 +125,10 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
-opencode-agents, grok-agents, astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents, composer-agents, or any
-.agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
+skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents,
+grok-agents, composer-agents, qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
+opencode-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested
+workers.
 ```
 
 This prevents a worker from replacing the selected model through nested delegation.

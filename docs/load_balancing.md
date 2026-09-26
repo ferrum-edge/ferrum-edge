@@ -47,13 +47,13 @@ An upstream whose configuration did not change keeps its balancer instance, and 
 - the active-connection count (`least_connections`, and the per-target connection metrics),
 - the latency EWMA and its sample count (`least_latency`).
 
-A target is the same target when it has the same `host:port` in the same namespace-qualified upstream. This is the key the balancer has always used for this state. Two entries of one upstream that share a `host:port` (the same endpoint under different Services, subsets, or port-policy lanes) share one count. The same endpoint listed in two different upstreams has separate state in each.
+A target is the same target when it has the same `host:port` in the same namespace-qualified upstream. Two entries of one upstream that share a `host:port` (the same endpoint under different Services, subsets, or port-policy lanes) share one count. The same endpoint listed in two different upstreams has separate state in each.
 
 The new balancer shares these counters with the old one; nothing is copied. An open connection holds its target's counter directly, not the balancer, so when it closes it decrements the counter the new balancer reads. For example, if target `A` holds 1,000 long-lived WebSocket sessions and a scale-up adds target `C`, `A` still shows 1,000 connections and new connections go to the idle targets. A known-slow target also keeps its EWMA, so the upstream does not go back to round-robin warm-up.
 
-Because a rebuild no longer resets a surviving target's count, every proxy path (HTTP/1.1, HTTP/2, gRPC, WebSocket, every HTTP/3 path, TCP, and UDP) releases its connection count through one RAII guard that ends the count exactly once on every exit, including early returns, cancellation, and panics.
+Because a rebuild does not reset a surviving target's count, every proxy path (HTTP/1.1, HTTP/2, gRPC, WebSocket, every HTTP/3 path, TCP, and UDP) releases its connection count through one RAII guard that ends the count exactly once on every exit, including early returns, cancellation, and panics.
 
-**`least_latency` does not re-warm on scale events.** Previously, a service-discovery update sent the whole upstream back through round-robin warm-up, which also re-sampled every target. Now only newly added targets are explored. Once all healthy targets are warmed, selection is pure lowest-EWMA, and a target that gets no traffic records no passive samples. A target whose EWMA was inflated by a past slow period, and that has no health transitions, therefore keeps receiving no traffic until it is removed from the set or recovers through a health check (recovery reseeds its EWMA; see [Recovery](#least-latency)). There is no time-based EWMA decay or exploration for warmed targets. Configure **active health checks** on `least_latency` upstreams to avoid this: every successful probe records its round-trip time into the target's EWMA, so a target that receives no traffic still tracks its real latency.
+**`least_latency` does not re-warm on scale events.** After a service-discovery update, only newly added targets are explored. Once all healthy targets are warmed, selection is pure lowest-EWMA, and a target that gets no traffic records no passive samples. A target whose EWMA was inflated by a past slow period, and that has no health transitions, therefore keeps receiving no traffic until it is removed from the set or recovers through a health check (recovery reseeds its EWMA; see [Recovery](#least-latency)). There is no time-based EWMA decay or exploration for warmed targets. Configure **active health checks** on `least_latency` upstreams to avoid this: every successful probe records its round-trip time into the target's EWMA, so a target that receives no traffic still tracks its real latency.
 
 Round-robin counters, weighted round-robin schedules, and consistent-hash rings are rebuilt from the new target set. A removed target's state is dropped with the old balancer, so state does not grow over time. If the target is added again later, it starts clean: zero connections and no latency samples. Connections that were opened to it before it was removed close against their old, detached counter and never change the count of the re-added target. Counts saturate at zero and never go negative.
 
@@ -123,7 +123,7 @@ Each target represents a single backend server within an upstream.
 
 ### Weight
 
-The `weight` field controls how much traffic a target receives relative to others in weighted algorithms. A target with `weight: 5` receives 5x the traffic of a target with `weight: 1`. Weights are ignored by non-weighted algorithms (round robin, least connections, random).
+The `weight` field controls how much traffic a target receives relative to others in weighted algorithms. A target with `weight: 5` receives 5x the traffic of a target with `weight: 1`. Only `weighted_round_robin` uses weights; the other algorithms ignore them.
 
 ```yaml
 targets:
@@ -138,6 +138,23 @@ targets:
 ### Path
 
 The optional `path` field on a target overrides the proxy's `backend_path` when that target is selected by the load balancer. This allows different targets within the same upstream to serve different backend path prefixes.
+
+```yaml
+upstreams:
+  - id: "versioned-api"
+    algorithm: weighted_round_robin
+    targets:
+      - host: "10.0.1.1"
+        port: 8080
+        path: "/v2/api"    # requests to this target use /v2/api as the path prefix
+        weight: 9
+      - host: "10.0.1.2"
+        port: 8080
+        path: "/v1/api"    # requests to this target use /v1/api as the path prefix
+        weight: 1
+```
+
+When `path` is not set on a target, the proxy's `backend_path` is used as the path prefix (or no prefix if `backend_path` is also unset). When `path` is set, it fully replaces `backend_path` — the two are not concatenated.
 
 ## Subset Routing
 
@@ -172,23 +189,6 @@ upstreams:
           hash_on: "header:x-session"
 ```
 
-```yaml
-upstreams:
-  - id: "versioned-api"
-    algorithm: weighted_round_robin
-    targets:
-      - host: "10.0.1.1"
-        port: 8080
-        path: "/v2/api"    # requests to this target use /v2/api as the path prefix
-        weight: 9
-      - host: "10.0.1.2"
-        port: 8080
-        path: "/v1/api"    # requests to this target use /v1/api as the path prefix
-        weight: 1
-```
-
-When `path` is not set on a target, the proxy's `backend_path` is used as the path prefix (or no prefix if `backend_path` is also unset). When `path` is set, it fully replaces `backend_path` — the two are not concatenated.
-
 ## Load Balancing Algorithms
 
 ### Round Robin
@@ -197,7 +197,7 @@ When `path` is not set on a target, the proxy's `backend_path` is used as the pa
 
 Distributes requests evenly across all healthy targets in sequential order. Each target gets an equal share of traffic regardless of weight.
 
-**Concurrency model:** Parent, port-override, and locality-distribute selection counters reuse the same 16 cache-line-padded per-thread shards as WRR (`wrr_counter_shard`). Each worker advances its own shard, so small healthy sets no longer bounce a single shared cache line on every pick. Shards are initialized with distinct golden-ratio phase offsets (same stride family as non-zero WRR schedules) so a synchronized first wave does not lockstep onto one RR target, random seed, or distribute bucket. Workers do not share one global interleaving; each shard is itself a full round-robin (or random / warm-up RR) walk, so long-run ratios stay even and a single worker's ticket stream remains deterministic within its shard.
+**Concurrency model:** Parent, port-override, and locality-distribute selection counters reuse the same 16 cache-line-padded per-thread shards as WRR (`wrr_counter_shard`). Each worker advances its own shard, so small healthy sets do not bounce a single shared cache line on every pick. Shards are initialized with distinct golden-ratio phase offsets (same stride family as non-zero WRR schedules) so a synchronized first wave does not lockstep onto one RR target, random seed, or distribute bucket. Workers do not share one global interleaving; each shard is itself a full round-robin (or random / warm-up RR) walk, so long-run ratios stay even and a single worker's ticket stream remains deterministic within its shard.
 
 ```yaml
 upstreams:
@@ -239,7 +239,7 @@ With weights 5:1 and 60 requests, `large-server` receives 50 requests and `small
 
 The smooth WRR algorithm ensures the distribution is interleaved. For example, with weights 5:1, the sequence is approximately: `L, L, L, L, S, L, L, L, L, L, S, L, ...` rather than `L, L, L, L, L, S, L, L, L, L, L, S, ...`.
 
-**Concurrency model:** Each WRR lane (parent upstream, subset, or port override) keeps a **bounded multi-fingerprint cache** of precomputed smooth-WRR orders behind `ArcSwap` slots (8 slots). Every cached healthy set owns an independent set of 16 cache-line-padded `AtomicU64` selection-counter shards, preventing alternating per-proxy health or retry fingerprints from aliasing onto one counter parity and preventing small healthy sets from bouncing a single shared cache line under concurrency. Threads are assigned across a fixed 16-shard bound, so high worker counts may share shards without growing per-lane memory. Steady-state picks are wait-free across Tokio workers (slot scan + sharded atomic counter). Each shard walks the same precomputed smooth-WRR order, so uncapped cached periods match configured weights without a per-request blocking mutex; workers intentionally do **not** share one global interleaving. On a cache miss, a publisher uses `try_lock` to fill empty slots immediately and to rate-sample replacements once the cache is full; contending missers and unsampled misses never build an ephemeral smooth schedule — they take an allocation-free O(candidate) weighted lottery (or all-zero round-robin) over eligible positive-weight targets. That miss fallback preserves reachability and unhealthy/excluded-target safety but does **not** claim exact smooth-WRR interleaving. Smooth schedule construction is additionally bounded by an explicit work budget (`schedule_steps × positive_candidates`, capped at 8192 × 128): when a pathological candidate × period product would exceed that budget, the publisher stores an exact-key lottery-only sentinel so the same fingerprint does not repeatedly attempt the quadratic NGINX build; matching hits then reuse the allocation-free lottery / all-zero RR path. Schedules are a pure function of exact healthy-set membership and immutable target weights on the current `LoadBalancer` generation (config reload swaps the balancer `Arc`), so no invalidate flag is required and the >128-target path cannot reuse a schedule after a hash collision. Each shard counter wraps with `% order.len()` and does not bias ratios. Exact normalized periods up to 8192 entries are retained; larger periods are proportionally apportioned into 8192 entries while reserving at least one entry for every positive-weight target, then smoothed over that complete bounded period when the work budget allows. Those capped schedules are bounded approximations of pathological exact periods (they retain every positive-weight target but do not claim exact configured ratios when the uncapped period would exceed 8192). At most a fixed number of healthy-set schedules are retained per lane. Hosted CI's WRR contention microbenchmark therefore applies its mandatory parallel-throughput floor to mid/large cardinalities (32/129): a skewed 4-target 5:1:1:1 fixture still runs, but concurrent clone/drop of the heavy `Arc<UpstreamTarget>` is an output-refcount hotspot rather than a schedule-mutex detector.
+**Concurrency model:** Each WRR lane (parent upstream, subset, or port override) keeps a **bounded multi-fingerprint cache** of precomputed smooth-WRR orders behind `ArcSwap` slots (8 slots). Every cached healthy set owns an independent set of 16 cache-line-padded `AtomicU64` selection-counter shards, preventing alternating per-proxy health or retry fingerprints from aliasing onto one counter parity and preventing small healthy sets from bouncing a single shared cache line under concurrency. Threads are assigned across a fixed 16-shard bound, so high worker counts may share shards without growing per-lane memory. Steady-state picks are wait-free across Tokio workers (slot scan + sharded atomic counter). Each shard walks the same precomputed smooth-WRR order, so uncapped cached periods match configured weights without a per-request blocking mutex; workers intentionally do **not** share one global interleaving. On a cache miss, a publisher uses `try_lock` to fill empty slots immediately and to rate-sample replacements once the cache is full; contending missers and unsampled misses never build an ephemeral smooth schedule — they take an allocation-free O(candidate) weighted lottery (or all-zero round-robin) over eligible positive-weight targets. That miss fallback preserves reachability and unhealthy/excluded-target safety but does **not** claim exact smooth-WRR interleaving. Smooth schedule construction is additionally bounded by an explicit work budget (`schedule_steps × positive_candidates`, capped at 8192 × 128): when a pathological candidate × period product would exceed that budget, the publisher stores an exact-key lottery-only sentinel so the same fingerprint does not repeatedly attempt the quadratic NGINX build; matching hits then reuse the allocation-free lottery / all-zero RR path. Schedules are a pure function of exact healthy-set membership and immutable target weights on the current `LoadBalancer` generation (config reload swaps the balancer `Arc`), so no invalidate flag is required and the >128-target path cannot reuse a schedule after a hash collision. Each shard counter wraps with `% order.len()` and does not bias ratios. Exact normalized periods up to 8192 entries are retained; larger periods are proportionally apportioned into 8192 entries while reserving at least one entry for every positive-weight target, then smoothed over that complete bounded period when the work budget allows. Those capped schedules are bounded approximations of pathological exact periods (they retain every positive-weight target but do not claim exact configured ratios when the uncapped period would exceed 8192). At most a fixed number of healthy-set schedules are retained per lane.
 
 Subset and port WRR lanes remain isolated from each other and from the parent lane.
 
@@ -561,12 +561,15 @@ upstreams:
 | `unhealthy_threshold` | integer | `3` | Consecutive failures before marking unhealthy |
 | `healthy_status_codes` | array | `[200, 302]` | HTTP status codes considered healthy |
 | `use_tls` | boolean | `false` | Use HTTPS for health probe requests instead of HTTP |
+| `probe_type` | string | `http` | Probe kind: `http` (GET `http_path`, check status), `tcp` (a successful connect is healthy), `udp` (send `udp_probe_payload`; any reply within the timeout is healthy), or `grpc` (`grpc.health.v1.Health/Check`) |
+| `udp_probe_payload` | string | — | Hex-encoded payload for `udp` probes |
+| `grpc_service_name` | string | — | Service name for `grpc` probes; empty checks overall server health |
 
 **How it works:**
 
 1. A background task is spawned for each target in the upstream.
-2. Every `interval_seconds`, the task sends an HTTP GET to `http://<host>:<port><http_path>` (or `https://` when `use_tls: true`).
-3. If the response status code is in `healthy_status_codes`, it counts as a success.
+2. Every `interval_seconds`, the task probes the target. For the default `http` probe that is an HTTP GET to `http://<host>:<port><http_path>` (or `https://` when `use_tls: true`).
+3. For `http` probes, a response status code in `healthy_status_codes` counts as a success.
 4. After `unhealthy_threshold` consecutive failures (bad status code, timeout, or connection error), the target is marked **unhealthy** and excluded from load balancing.
 5. After `healthy_threshold` consecutive successes, the target is marked **healthy** again and re-included.
 
@@ -693,8 +696,10 @@ Set on 5xx responses to categorize the failure. This is the **stable
 client-facing contract** — a closed set of eight `&'static str` tokens.
 Access-log `error_class` and `ferrum_requests_total{error_class}` use the
 **granular** `ErrorClass::as_str` spelling when a class exists
-(`dns_lookup_error`, `connection_refused`, `tls_error`, …) plus the four
-gateway-authored tokens below when the rejection has no `ErrorClass`. Map
+(`dns_lookup_error`, `connection_refused`, `tls_error`, …) plus five
+gateway-authored tokens when there is no `ErrorClass` (`circuit_breaker_open`,
+`overload`, `config_stale`, `concurrency_limit`, and `backend_error` for an
+unclassified backend 5xx). Map
 each granular class to its header token in
 [error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
 The header is omitted on 2xx/3xx/4xx.
@@ -727,11 +732,16 @@ stale-config fences are unchanged (they do not carry `X-Gateway-Error`).
 |-------|---------|
 | `degraded` | All targets in the upstream were marked unhealthy. The request was routed via the all-unhealthy fallback path — the selected target may still be failing |
 
+HTTP/3 responses carry `X-Gateway-Upstream-Status: degraded` under the same
+condition. With `FERRUM_ADD_VIA_HEADER=true`, HTTP/3 responses append the
+configured Via pseudonym using the backend hop's protocol (`1.1`, `2.0`, or
+`3.0`), including cross-protocol bridges and buffered responses. Existing Via
+hops are retained. Buffered mesh responses report `1.1`, like H1/H2, when their
+retained body has no wire version metadata.
+
 Both headers are gateway-owned. On every protocol and dispatch path, the
 gateway strips a backend-supplied copy (header or trailer) before it writes its
-own value, so a backend cannot forge either one. A backend-returned 5xx relayed
-on an HTTP/3 streaming path or the HTTP/3 bridge's buffered path currently
-carries no `X-Gateway-Error` at all (see the linked page). They are not authenticated,
+own value, so a backend cannot forge either one. They are not authenticated,
 so trust them only on a response from a gateway you authenticated. See
 [error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
 
@@ -911,9 +921,9 @@ This separation means you can configure the breaker to trip on connection errors
 
 Breakers are cached per `proxy_id` (direct backend) or `proxy_id::host:port` (upstream/target). Concurrent callers for the same key and config share one breaker instance. When the cache is at capacity, requests for **new** keys still proceed with a transient (uncached) breaker that does not retain state across requests and does not grow the map; entries already in the cache remain replaceable when their config changes.
 
-Entries are reclaimed on config reload **and** on every service-discovery publication: when a discovery provider retires a target, the breakers for that target are released for every proxy routing to the discovered upstream, in the same pass that reclaims its health-check state. Pod/endpoint churn therefore no longer accumulates dead entries between config changes.
+Entries are reclaimed on config reload **and** on every service-discovery publication: when a discovery provider retires a target, the breakers for that target are released for every proxy routing to the discovered upstream, in the same pass that reclaims its health-check state. Pod/endpoint churn therefore does not accumulate dead entries between config changes.
 
-A transient breaker never accumulates failures, so it can never open. `ferrum_circuit_breaker_cache_admission_refused_total` (see `docs/prometheus_metrics.md`) counts every request that was handed one; a non-zero and rising value means circuit breaking is silently degraded for newly seen keys and `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` should be raised.
+A transient breaker never accumulates failures, so it can never open. `ferrum_circuit_breaker_cache_admission_refused_total` (see [Prometheus metrics](prometheus_metrics.md)) counts every request that was handed one; a non-zero and rising value means circuit breaking is silently degraded for newly seen keys and `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` should be raised.
 
 ## Configuration Reference
 
@@ -1198,11 +1208,3 @@ upstreams:
         port: 8080
         weight: 1
 ```
-
-HTTP/3 client responses also expose `X-Gateway-Upstream-Status: degraded` when
-selection uses the all-unhealthy fallback. With `FERRUM_ADD_VIA_HEADER=true`,
-HTTP/3 responses append the configured Via pseudonym using the backend hop's
-protocol (`1.1`, `2.0`, or `3.0`), including cross-protocol bridges and buffered
-responses. Existing Via hops are retained. Buffered mesh responses retain the
-shared H1/H2 convention of reporting `1.1` when their retained body has no wire
-version metadata.

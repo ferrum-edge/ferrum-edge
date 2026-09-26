@@ -44,100 +44,99 @@ Each is toggled independently under `inspect`; at least one must be enabled.
 | `mcp_tool_calls` | `false` | MCP JSON-RPC `tools/call` request bodies (`params.name` + `params.arguments`), including calls inside JSON-RPC **batch arrays**. Omitted `params.arguments` normalizes to `{}` before evaluation (MCP zero-argument calls); provider response `function.arguments` omissions are not normalized. |
 | `a2a_methods` | `false` | A2A JSON-RPC method names (governed against the `tools` map), including batch arrays. |
 
-For **streaming**, tool-call SSE frames are **held** (not forwarded) until the
-call is complete and cleared by policy/approval, then the held frames are
-released; on a block the stream is **cut with a terminal SSE error event** and
-the held frames are dropped — the disallowed call never reaches the client.
-Duplicate `tool_calls[].index` values in one frame, or conflicting /
-changing `tool_calls[].id` values for the same `(choice, index)` slot, are
-**ungovernable** and fail closed in enforce mode on both the live inspector and
-buffered-SSE extraction — they are never concatenated into a synthetic
-allowed identity. Duplicate `choices[].index` entries and explicitly empty or
-non-string call IDs are likewise malformed. JSON `null` for `tool_calls[].id`
-is treated as omitted (same as a missing field), matching nearby null-as-absent
-conventions. Introducing an ID only after an untagged fragment is an identity
-change and fails closed; an omitted / null ID remains valid on continuation
-fragments after a stable ID was established.
-Ordinary content/role deltas stream through live **until a tool-call batch
-opens**; once a batch is pending, ALL subsequent events (other choices'
-content, keepalives) are held too and released in original arrival order when
-the batch clears — so an allowed multi-choice stream is never reordered, and a
-denied one cannot leak content that arrived after the held call. With
-multi-choice (`n > 1`) streams, a batch is finalized only once **every** choice
-holding tool calls has reported a `finish_reason` (or the stream ends), and
-later tool-call deltas form a new, independently governed batch. The plugin detects `"stream": true`
-in JSON POST bodies and prefers the reqwest dispatch path for those requests.
-Inspection itself is dispatch-arm-independent: reqwest, direct HTTP/2, and
-native HTTP/3 streaming responses all drive the same inspector chain, including
-requests whose final body transform introduced the streaming marker and
-bodyless requests whose backend unexpectedly answers with SSE.
-Requests marked streaming still buffer a plain-JSON fallback
-response so `tool_calls` in it are governed (a `text/event-stream` response
-is released back to the stream path only when streaming inspection is enabled
-and a live inspector will govern it). The live inspector attaches to a
-**stream-marked** governed request's response **regardless of the response
-`Content-Type`**, not only `text/event-stream`: a `request_transformer` can
-add `"stream": true` after the proxy's buffering decisions, in which case the
-backend's plain `application/json` SSE fallback is delivered on the streaming
-path — the attached inspector then governs it by body shape instead of label.
-With a streaming-only configuration, the pre-header decision conservatively
-buffers every 2xx response until response headers can refine the choice; any
-ambiguous non-SSE response stays buffered even when the request was not marked
-streaming. Scope the plugin to AI routes and budget for the resulting
-latency/memory cost when enabling streaming inspection without buffered-response
-inspection.
-Framed gRPC / gRPC-Web responses never get an inspector, and a request with
-no streaming marker never does either, so ordinary buffered traffic is
-unaffected. SSE parsing (live and buffered) accepts all three spec line
-terminators (`\r\n`, `\r`, `\n`), so a CR-only stream's events are parsed and
-governed like any other; a `\r` at a chunk edge is held until the next chunk
-disambiguates a straddled `\r\n`. The inspector also sniffs the stream's
-body shape from its leading bytes: a JSON-shaped stream (an SSE fallback, or
-a Chat
-Completions JSON body a transform relabeled `text/event-stream`) is held in
-full and governed at end-of-stream like a buffered JSON body — a denied call
-is never forwarded, an allowed body is released unchanged. A stream whose
-leading bytes are **neither SSE-shaped nor JSON-shaped** is uninspectable: it
-is held in full, cut at end-of-stream in enforce mode, and released unchanged
-in dry-run. "SSE-shaped" accepts any syntactically valid SSE field or comment
-line — printable text with a `:` separator in the first line — since the SSE
-spec ignores unknown field names and legitimate providers open streams with
-extension/heartbeat lines like `ping: 1`; opaque treatment is reserved for
-genuinely binary starts (gzip magic, control bytes) and a complete first line
-with no `:` separator. A stream whose shape never resolves before
-end-of-stream is resolved conservatively there: bytes that are **not valid
-UTF-8** (never classifiable as SSE or JSON) get the same opaque treatment —
-cut in enforce, released in dry-run — while a colon-less printable UTF-8
-fragment, which provably contains no `data:` frame, is released unchanged.
+### Streaming behavior
 
-**Response buffering on governed requests:** when this plugin governs response
-tool calls for a request, a 2xx response with a **missing or non-JSON
-`Content-Type`** is **buffered and inspected**, not streamed — a transform
-chain can relabel `Content-Type` while the body is still Chat Completions
-JSON, so ambiguous labels are treated fail-closed and run through the
-JSON-shape fallback. A buffered body that is **SSE-shaped** (its first
-non-empty line is a syntactically valid SSE field or comment line — printable
-text with a `:` separator, e.g. `data: …`, a `: ping` keepalive comment, or
-an extension field like `ping: 1`) is routed through buffered-SSE
-governance regardless of its label, so an upstream that omits
-`text/event-stream` — or a transform that relabels it — cannot deliver
-tool-call deltas uninspected; conversely, an SSE-**labeled** body that is
-actually JSON-shaped is governed through the buffered-JSON path. A buffered
-SSE-labeled body that carries a `Content-Encoding` is **decoded first**
-(gzip/br, the same decode as the final re-check) and the decoded frames are
-governed. Response labels released back to the streaming path: framed gRPC /
-gRPC-Web content types (owned by the gRPC machinery, out of this plugin's
-scope) always, and `text/event-stream` **only when streaming inspection is
-enabled and the response carries no `Content-Encoding`** so the live SSE
-inspector will attach and can actually parse the frames — an **encoded SSE
-response stays buffered even with streaming inspection enabled** (the
-inspector reads the raw byte stream, where compressed bytes parse as zero
-events; the buffered path decodes and governs instead, failing closed on an
-undecodable encoding in enforce mode). With streaming inspection
-disabled, SSE stays buffered and is governed by buffered-SSE governance (or
-the JSON-shape fallback if the label was lying). Operators should expect
-mislabeled, unlabeled, or compressed SSE responses on governed routes to be
-delivered buffered rather than streamed.
+- **Hold and release.** Tool-call SSE frames are **held** (not forwarded) until
+  the call is complete and cleared by policy/approval, then released. On a block
+  the stream is **cut with a terminal SSE error event** and the held frames are
+  dropped, so the disallowed call never reaches the client.
+- **Ordering.** Ordinary content/role deltas stream live **until a tool-call
+  batch opens**. While a batch is pending, ALL later events (other choices'
+  content, keepalives) are held too and released in arrival order when the batch
+  clears, so an allowed multi-choice stream is never reordered and a denied one
+  cannot leak content that arrived after the held call. With multi-choice
+  (`n > 1`) streams, a batch is finalized only once **every** choice holding
+  tool calls has reported a `finish_reason` (or the stream ends); later
+  tool-call deltas form a new, independently governed batch.
+- **Call identity.** Duplicate `tool_calls[].index` values in one frame, or
+  conflicting / changing `tool_calls[].id` values for the same
+  `(choice, index)` slot, are **ungovernable** and fail closed in enforce mode
+  (live inspector and buffered-SSE extraction alike); they are never
+  concatenated into a synthetic allowed identity. Duplicate `choices[].index`
+  entries and explicitly empty or non-string call IDs are also malformed. JSON
+  `null` for `tool_calls[].id` is treated as omitted. Introducing an ID only
+  after an untagged fragment is an identity change and fails closed; an
+  omitted / null ID remains valid on continuation fragments after a stable ID
+  was established.
+- **Which responses get an inspector.** The plugin detects `"stream": true` in
+  JSON POST bodies and prefers the reqwest dispatch path for those requests,
+  but inspection itself is dispatch-arm-independent: reqwest, direct HTTP/2,
+  and native HTTP/3 streaming responses all drive the same inspector chain. The
+  live inspector attaches to a **stream-marked** governed request's response
+  **regardless of the response `Content-Type`** — including requests whose
+  final body transform introduced the streaming marker (a `request_transformer`
+  can add `"stream": true` after the proxy's buffering decisions) and bodyless
+  requests whose backend unexpectedly answers with SSE. Framed gRPC / gRPC-Web
+  responses never get an inspector, and neither does a request with no
+  streaming marker, so ordinary buffered traffic is unaffected.
+- **Buffering cost.** Requests marked streaming still buffer a plain-JSON
+  fallback response so `tool_calls` in it are governed (a `text/event-stream`
+  response is released to the stream path only when streaming inspection is
+  enabled and a live inspector will govern it). With a streaming-only
+  configuration, the pre-header decision conservatively buffers every 2xx
+  response until response headers can refine the choice; any ambiguous non-SSE
+  response stays buffered even when the request was not marked streaming. Scope
+  the plugin to AI routes and budget for the latency/memory cost when enabling
+  streaming inspection without buffered-response inspection.
+- **Line terminators.** SSE parsing (live and buffered) accepts all three spec
+  line terminators (`\r\n`, `\r`, `\n`). A `\r` at a chunk edge is held until
+  the next chunk disambiguates a straddled `\r\n`.
+- **Body-shape sniffing.** The inspector classifies the stream from its leading
+  bytes:
+  - *SSE-shaped* — any syntactically valid SSE field or comment line (printable
+    text with a `:` separator in the first line). The SSE spec ignores unknown
+    field names and providers open streams with lines like `ping: 1`, so these
+    are parsed normally.
+  - *JSON-shaped* — an SSE fallback, or a Chat Completions JSON body a transform
+    relabeled `text/event-stream`. Held in full and governed at end-of-stream
+    like a buffered JSON body: a denied call is never forwarded, an allowed body
+    is released unchanged.
+  - *Opaque* — neither SSE- nor JSON-shaped (gzip magic, control bytes, or a
+    complete first line with no `:`). Held in full, cut at end-of-stream in
+    enforce mode, released unchanged in dry-run.
+  - *Unresolved at end-of-stream* — bytes that are not valid UTF-8 get the
+    opaque treatment; a colon-less printable UTF-8 fragment, which provably
+    contains no `data:` frame, is released unchanged.
+
+### Response buffering on governed requests
+
+When this plugin governs response tool calls for a request, labels are not
+trusted, because a transform chain can relabel `Content-Type` while the body is
+still Chat Completions JSON:
+
+- A 2xx response with a **missing or non-JSON `Content-Type`** is **buffered
+  and inspected**, not streamed, and runs through the JSON-shape fallback.
+- A buffered body that is **SSE-shaped** (first non-empty line is a valid SSE
+  field or comment line, e.g. `data: …`, a `: ping` keepalive, or `ping: 1`) is
+  governed as buffered SSE regardless of its label, so an upstream that omits
+  `text/event-stream` cannot deliver tool-call deltas uninspected. Conversely,
+  an SSE-**labeled** body that is actually JSON-shaped is governed as buffered
+  JSON.
+- A buffered SSE-labeled body with a `Content-Encoding` is **decoded first**
+  (gzip/br, the same decode as the final re-check) and the decoded frames are
+  governed.
+- Released back to the streaming path: framed gRPC / gRPC-Web content types
+  (owned by the gRPC machinery) always, and `text/event-stream` **only when
+  streaming inspection is enabled and the response carries no
+  `Content-Encoding`**. An **encoded SSE response stays buffered even with
+  streaming inspection enabled**, because the live inspector reads raw bytes
+  where compressed data parses as zero events; the buffered path decodes and
+  governs instead, failing closed on an undecodable encoding in enforce mode.
+- With streaming inspection disabled, SSE stays buffered and is governed as
+  buffered SSE (or via the JSON-shape fallback if the label was wrong).
+
+Expect mislabeled, unlabeled, or compressed SSE responses on governed routes to
+be delivered buffered rather than streamed.
 
 ## Modes
 
@@ -174,7 +173,7 @@ The plugin therefore scans every governed payload for a live **tool-call
 marker**: an object member named `tool_calls`, `toolCalls`, `tool_call`,
 `toolCall`, `tool_use`, `toolUse`, `function_call`, `functionCall`,
 `function_calls`, or `functionCalls` whose value is non-`null` and non-empty,
-or a block tagged `"type": "tool_use"` / `"function_call"` / `"tool-call"`.
+or a block tagged `"type": "tool_use"` / `"toolUse"` / `"function_call"` / `"tool-call"`.
 A payload that carries such a marker but from which **no call could be
 extracted** is ungovernable.
 
@@ -542,12 +541,14 @@ When `observability.emit_metadata` is on (default), the plugin writes
 (`allow` / `dry_run` / `deny` / `require_approval` / `approved` /
 `approval_denied`),
 `tool_names`, `risk` (max), `policy_ids`, `approval_id`, `arguments_hashes`
-(SHA-256, when `hash_arguments` is on), `redacted_tools`, and — when global
-`mode: dry_run` observes duplicate-key ambiguity without blocking —
-`uninspectable_reason` (`ambiguous_json`, or `unrecognized_tool_call_shape`
-when a payload carried an unreadable tool-call shape; never raw body bytes).
-`unrecognized_tool_call_shape` is recorded in **both** modes and under **both**
-`unknown_shape_action` settings, and never sets `decision`.
+(SHA-256, when `hash_arguments` is on), `redacted_tools`, and
+`uninspectable_reason` (fixed values only, never raw body bytes):
+
+- `ambiguous_json` — recorded when global `mode: dry_run` observes
+  duplicate-key ambiguity without blocking.
+- `unrecognized_tool_call_shape` — recorded when a payload carried an
+  unreadable tool-call shape, in **both** modes and under **both**
+  `unknown_shape_action` settings. It never sets `decision`.
 
 **Bounded observation ledgers.** The comma-delimited cumulative fields —
 `tool_names`, `policy_ids`, `approval_id`, `arguments_hashes`, and

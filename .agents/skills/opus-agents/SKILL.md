@@ -42,16 +42,17 @@ prompt, including continuation prompts and any permitted nested delegation.
 ## Preflight
 
 1. Read `AGENTS.md`, the relevant `.claude/rules/*.md`, and the issue or PR before dispatching.
-2. Confirm the standalone claude CLI is resolvable, then run `claude --version`, `claude auth status`,
-   and `claude --help` against it. The launcher resolves the binary in this order and refuses
-   any candidate under `com.conductor.app`, because Conductor's bundled copy lags the standalone
-   release:
+2. Confirm the standalone claude CLI is resolvable, then run `claude --version`,
+   `claude auth status`, and `claude --help` against it. The launcher resolves the binary in this
+   order and refuses any candidate under `com.conductor.app`, because Conductor's bundled copy
+   lags the standalone release:
    - `CLAUDE_BIN` if it points at an executable absolute path,
    - `~/.local/bin/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude`,
    - `claude` on `PATH`.
-3. Confirm that the installed CLI exposes `--effort` with `low`, `medium`, `high`, `xhigh`, and `max`.
+3. Confirm that the installed CLI exposes `--effort` with `low`, `medium`, `high`, `xhigh`, and
+   `max`.
 4. Use the pinned model `claude-opus-5-5[1m]`. Use `opus[1m]` only when the user explicitly asks
-   for the rolling latest Opus rather than Opus 5.
+   for the rolling latest Opus rather than Opus 5.5.
 5. If the user explicitly requests fast mode, confirm the CLI accepts the `fastMode` setting and
    that the account and selected Opus model are eligible. Fast mode requires separate usage-credit
    availability and can be disabled by organization policy.
@@ -137,8 +138,10 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents, grok-agents, or any
-.agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
+skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents,
+grok-agents, composer-agents, qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
+opencode-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested
+workers.
 ```
 
 This prevents a worker from replacing the selected model or effort through nested delegation.

@@ -28,7 +28,11 @@ When `FERRUM_DB_TLS_MODE` is unset, Ferrum does not add or force database TLS se
 
 Under enforced FIPS mode (`FERRUM_FIPS_MODE=enforce`), a PostgreSQL or MySQL config database may not be reached over an unauthenticated connection. An explicitly configured `FERRUM_DB_TLS_MODE` of `disable`, `allow`, `prefer`, or `require` refuses startup, because none of those modes validate the server certificate chain; only `verify-ca` and `verify-full` are admitted. When `FERRUM_DB_TLS_MODE` is unset, each configured `FERRUM_DB_URL`, `FERRUM_DB_FAILOVER_URLS` entry, and `FERRUM_DB_READ_REPLICA_URL` must itself select a verifying mode (`sslmode=verify-ca` or `sslmode=verify-full` for PostgreSQL; `ssl-mode=VERIFY_CA` or `ssl-mode=VERIFY_IDENTITY` for MySQL) — absent or weaker URL parameters are refused the same way. See [FIPS mode](fips.md) for the full admission boundary.
 
-For PostgreSQL and MySQL mTLS, `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH` must be set together. For MongoDB, `FERRUM_DB_TLS_CLIENT_CERT_PATH` may point to an already-combined client cert+key PEM when `FERRUM_DB_TLS_CLIENT_KEY_PATH` is omitted.
+Startup validation rules:
+
+- Setting any `FERRUM_DB_TLS_*` certificate path requires `FERRUM_DB_TLS_MODE`, and certificate paths are rejected with `FERRUM_DB_TLS_MODE=disable`.
+- `FERRUM_DB_TLS_CA_CERT_PATH` requires `verify-ca` or `verify-full`.
+- For PostgreSQL and MySQL mTLS, `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH` must be set together. For MongoDB, `FERRUM_DB_TLS_CLIENT_CERT_PATH` may point to an already-combined client cert+key PEM when `FERRUM_DB_TLS_CLIENT_KEY_PATH` is omitted. A client key without a client certificate is always rejected.
 
 For PostgreSQL and MySQL, Ferrum appends TLS query parameters to `FERRUM_DB_URL`, `FERRUM_DB_READ_REPLICA_URL`, and each URL in `FERRUM_DB_FAILOVER_URLS`. For MongoDB, Ferrum configures the MongoDB driver `TlsOptions`; MongoDB URI TLS options can also be used directly.
 
@@ -40,7 +44,7 @@ For PostgreSQL and MySQL, Ferrum appends TLS query parameters to `FERRUM_DB_URL`
 | `allow` | `sslmode=allow` | N/A | N/A | Maybe | No | No | PostgreSQL-only. Tries plaintext first, then retries TLS if plaintext fails. Not a production-safe setting. |
 | `prefer` | `sslmode=prefer` | `ssl-mode=PREFERRED` | N/A | Maybe | No | No | Tries TLS first, but may fall back to plaintext when the server does not support TLS. |
 | `require` | `sslmode=require` | `ssl-mode=REQUIRED` | TLS enabled with invalid certificates allowed | Yes | No | No | Requires encryption but does not verify the server certificate or hostname. Use only for testing or separately authenticated private networks. |
-| `verify-ca` | `sslmode=verify-ca` | `ssl-mode=VERIFY_CA` | N/A | Yes | Yes | No | Requires TLS and verifies that the certificate chain ends at the CONFIGURED CA only, but does not verify the requested hostname. `FERRUM_DB_TLS_CA_CERT_PATH` (or `FERRUM_DB_TLS_CA_CERT_SOURCE`) is mandatory for this mode. |
+| `verify-ca` | `sslmode=verify-ca` | `ssl-mode=VERIFY_CA` | N/A | Yes | Yes | No | Requires TLS and verifies that the certificate chain ends at the configured CA only, but does not verify the requested hostname. `FERRUM_DB_TLS_CA_CERT_PATH` (or `FERRUM_DB_TLS_CA_CERT_SOURCE`) is mandatory for this mode. |
 | `verify-full` | `sslmode=verify-full` | `ssl-mode=VERIFY_IDENTITY` | TLS enabled with certificate validation | Yes | Yes | Yes | Requires TLS, validates the CA chain, and verifies the requested hostname. A configured CA is the only trust anchor; with no configured CA the platform's bundled public roots are used. This is the recommended production mode. |
 
 For PostgreSQL, client certificate parameters can be present with `allow` or `prefer`, but those modes may still use plaintext. Client-certificate authentication effectively requires `require`, `verify-ca`, or `verify-full`; use `verify-full` for production.
@@ -95,11 +99,13 @@ constructor resolves them directly into its owned snapshot. There is no
 intermediate persisted `ferrum-db-*` copy or process-wide material cache.
 Custom SQL consumers must use `EffectiveSqlBackend::connect_lazy` (or the
 `DatabaseStore` constructors), rather than handing an unresolved source URL
-to SQLx. The audit example does this on first background use. These URLs may
+to SQLx; the example audit plugin
+([`custom_plugins/examples/example_audit_plugin.rs`](../custom_plugins/examples/example_audit_plugin.rs))
+does this on first background use. These URLs may
 contain credentials or inline PEM and must never be logged; database URL
 redaction withholds all SQL TLS material option values.
 
-Each snapshot is a private temporary file, so PostgreSQL/MySQL pools now
+Each snapshot is a private temporary file, so PostgreSQL/MySQL pools
 require a writable temporary directory (`TMPDIR`, or `/tmp` when it is unset)
 even when all TLS material is file-backed; the files are created mode `0600`,
 overwritten with zeros before they are unlinked, and the in-memory PEM buffer

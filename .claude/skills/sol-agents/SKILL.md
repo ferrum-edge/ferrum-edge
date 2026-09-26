@@ -17,6 +17,9 @@ do not duplicate them in this directory.
   --effort <low|medium|high|xhigh|max|ultra>
 ```
 
+Append `--fast` only when the user explicitly requests fast mode for that dispatch or fleet.
+The shared launcher pins `gpt-6-sol`.
+
 Read the canonical skill before dispatch for effort selection, preflight, isolation, failure
 handling, and verification. For implementer mode, read
 [agent-brief.md](../../../.agents/skills/sol-agents/references/agent-brief.md).

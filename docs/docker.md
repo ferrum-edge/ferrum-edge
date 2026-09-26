@@ -164,16 +164,11 @@ mode, probes `/live` and readiness, restarts the gateway, and checks that the
 original migration records persist in a valid SQLite database. It removes its
 containers, volume, and temporary snapshots on exit.
 
-CI wiring is a follow-up: the existing production default-image smoke is inline
-in `.github/workflows/node-waypoint-ebpf-live.yml`, not in an extensible smoke
-script. This change leaves the production Dockerfile workflow jobs untouched;
-the new script is not yet an automated CI gate.
+This script is not yet wired into CI as an automated gate.
 
 ### Health Check
 
-The container includes a built-in health check using the `ferrum-edge health` CLI subcommand (no curl needed):
-
-The image default command is `ferrum-edge run`; override the Docker command with another subcommand such as `validate`, `health`, or `version` when needed.
+The container includes a built-in `HEALTHCHECK` that runs the `ferrum-edge health` CLI subcommand (no curl needed). The image entrypoint is `ferrum-edge` with default command `run`; pass another subcommand such as `validate`, `health`, or `version` to override it.
 
 ```bash
 # Check container health
@@ -218,7 +213,7 @@ docker-compose up ferrum-sqlite
 Production-grade setup with managed PostgreSQL:
 
 ```bash
-# Set environment variables (optional)
+# Required: compose refuses to start without these
 export POSTGRES_PASSWORD="secure-password"
 export FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret"
 
@@ -233,7 +228,7 @@ docker-compose --profile postgres up ferrum-postgres
 **Environment**:
 - HTTP: http://localhost:8001
 - Admin API: bound to loopback inside the container and **not published** by default (see the admin-exposure note at the top of `docker-compose.yml` to enable host access)
-- PostgreSQL: localhost:5432
+- PostgreSQL: reachable as `postgres:5432` on the compose network only (not published to the host)
 
 **Database Initialization**:
 - Tables auto-created on first startup
@@ -282,13 +277,10 @@ docker-compose --profile cp-dp up
   - Admin API: bound to loopback inside the container and **not published** by default (see the admin-exposure note at the top of `docker-compose.yml` to enable host access)
   - gRPC: localhost:50051
 
-- **Data Plane 1**:
-  - HTTP: http://localhost:8002
-  - Admin API (read-only): http://localhost:9003
+- **Data Plane 1**: HTTP http://localhost:8002
+- **Data Plane 2**: HTTP http://localhost:8003
 
-- **Data Plane 2**:
-  - HTTP: http://localhost:8003
-  - Admin API (read-only): http://localhost:9004
+The DPs' read-only Admin API binds to loopback inside each container and is not published.
 
 **Architecture**:
 ```
@@ -319,13 +311,13 @@ docker-compose --profile cp-dp up
 
 ## Configuration via Environment Variables
 
-All Ferrum Edge configuration uses environment variables. See the main [README.md](../README.md) for the complete environment variable reference.
+All Ferrum Edge configuration uses environment variables. See [configuration.md](configuration.md) for the complete environment variable reference.
 
 ### Essential Variables
 
 ```bash
 # Operating mode (required)
-FERRUM_MODE=database              # database, file, cp, dp
+FERRUM_MODE=database              # database, file, cp, dp, mesh, ...
 
 # Logging
 FERRUM_LOG_LEVEL=info            # error, warn, info, debug, trace
@@ -465,9 +457,9 @@ FERRUM_DB_URL=postgres://user:pass@rds-endpoint.amazonaws.com/ferrum
 
 ### 3. Logging and Monitoring
 
-**Structured JSON Logs**:
+**Structured JSON Logs** (logs are always JSON on stdout):
 ```bash
-# Enable JSON logging
+# Raise verbosity from the image default (warn)
 docker run -e FERRUM_LOG_LEVEL=info ferrum-edge:latest
 
 # Ship logs to aggregator
@@ -523,11 +515,7 @@ services:
 
 ### 5. Scaling
 
-**Horizontal Scaling** (CP/DP Mode):
-```bash
-# Start multiple DP nodes
-docker-compose --profile cp-dp up --scale ferrum-dp=5
-```
+**Horizontal Scaling** (CP/DP Mode): the bundled `docker-compose.yml` defines two fixed DP services (`ferrum-dp-1`, `ferrum-dp-2`) with container names and host ports, so `--scale` does not apply to them. Add more DP services, or run DPs under an orchestrator such as Kubernetes.
 
 **Load Balancing**:
 ```bash
@@ -581,8 +569,8 @@ lifecycle:
 # Update image
 docker-compose pull
 
-# Restart with new image (one at a time)
-docker-compose up -d --no-deps --build ferrum-edge
+# Restart one service with the new image (repeat per service)
+docker-compose up -d --no-deps --build ferrum-dp-1
 ```
 
 **Blue-Green Deployment**:
@@ -607,14 +595,16 @@ gzip backup.sql
 aws s3 cp backup.sql.gz s3://my-backups/$(date +%Y%m%d).sql.gz
 ```
 
-**Point-in-Time Recovery**:
+**Restore from a Dump**:
 ```bash
-# Restore PostgreSQL from backup
-docker-compose down
-docker volume rm ferrum_postgres_data
-docker-compose up -d postgres
-docker exec -i ferrum-postgres-db psql -U ferrum < backup.sql
-docker-compose up -d ferrum-postgres
+# Restore PostgreSQL from backup.sql (gunzip it first if compressed).
+# Compose prefixes volume names with the project name (by default the
+# directory name); check `docker volume ls` for the exact name.
+docker-compose --profile postgres down
+docker volume rm <project>_postgres_data
+docker-compose --profile postgres up -d postgres
+docker exec -i ferrum-postgres-db psql -U ferrum ferrum < backup.sql
+docker-compose --profile postgres up -d ferrum-postgres
 ```
 
 ## Docker Compose Commands
@@ -624,7 +614,7 @@ docker-compose up -d ferrum-postgres
 docker-compose up -d
 
 # View logs
-docker-compose logs -f ferrum-edge
+docker-compose logs -f ferrum-sqlite
 
 # Stop services
 docker-compose down
@@ -633,10 +623,7 @@ docker-compose down
 docker-compose down -v
 
 # Restart a service
-docker-compose restart ferrum-edge
-
-# Scale service (for DP mode)
-docker-compose up -d --scale ferrum-dp=5
+docker-compose restart ferrum-sqlite
 
 # Check health (container HEALTHCHECK; admin port is not published by default)
 docker-compose ps

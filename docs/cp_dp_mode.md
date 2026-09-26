@@ -1,6 +1,6 @@
 # Control Plane / Data Plane Mode
 
-Ferrum Edge supports a distributed CP/DP architecture where one Control Plane instance manages configuration and multiple Data Plane instances handle traffic. The CP pushes configuration to DPs via gRPC server-streaming, enabling centralized management with horizontally scaled traffic handling.
+Ferrum Edge supports a distributed CP/DP architecture where a Control Plane (one or more instances) manages configuration and multiple Data Plane instances handle traffic. The CP pushes configuration to DPs via gRPC server-streaming, enabling centralized management with horizontally scaled traffic handling.
 
 ## Architecture
 
@@ -69,10 +69,16 @@ does not certify that every namespace's configuration is deliverable.
 
 ### Authentication
 
-All gRPC calls are authenticated with JWT HS256 tokens:
+All gRPC calls are authenticated with bearer JWTs:
 - The CP validates the `authorization` header (Bearer token) on every RPC
 - The DP sends its auth token in the gRPC metadata on every request
-- Both CP and DP use the same shared secret for JWT signing/verification
+- By default both sides share `FERRUM_CP_DP_GRPC_JWT_SECRET` (HS256): the DP
+  mints short-lived tokens and the CP verifies them
+- Alternatively the CP verifies against `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH`
+  (multiple keys, asymmetric algorithms, per-key namespace ceilings — see
+  [cp_namespace_tenancy.md](cp_namespace_tenancy.md#trust-binding-ghsa-3f2j-wwqw-grmg)),
+  and a DP can present an externally issued token from
+  `FERRUM_DP_CP_GRPC_TOKEN_FILE` instead of minting one
 
 The `iss` claim must be a single JSON string equal to
 `FERRUM_CP_DP_GRPC_JWT_ISSUER` (RFC 7519 §4.1.1); arrays and other non-string
@@ -166,6 +172,39 @@ by a retained credential with the same namespace policy. Removing that
 credential, or changing its trusted namespace ceiling, closes its existing
 streams. Invalid reloads retain the last accepted verifier.
 
+Startup and that reload worker share one coherent-generation loader: the bundle
+document and every `secret_path` / `public_key_path` it names are read from a
+single filesystem generation, so a rotation can never pair one generation's
+namespace ceiling with another generation's key material. A Kubernetes projected
+mount is pinned by `..data` descriptor before the document is read; any path
+outside a pinned generation must carry a `material_sha256`. A candidate that
+cannot prove coherence is rejected with a closed reason label and retains the
+entire prior verifier — it is never partially applied. Each referenced file and
+the aggregate path-backed material retained for one candidate are limited to 1
+MiB. See
+[cp_namespace_tenancy.md](cp_namespace_tenancy.md#rotation-is-atomic-per-source-generation).
+
+DPs and mesh/xDS clients use their existing bounded reconnect backoff and reread
+`FERRUM_DP_CP_GRPC_TOKEN_FILE` (or mint a new short-lived token) on each attempt.
+The fixed-cardinality
+`ferrum_grpc_config_stream_terminations_total{surface,reason}` metric and
+structured `grpc_config_stream_*` audit events distinguish `expired`,
+`verification_key_removed`, `server_max_lifetime`, `trust_stale`, and
+`transport_closed` without token, claim, key, node, or namespace labels.
+
+A rejected trust-bundle reload retains the entire previous verifier, but only
+for `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS` (default 900). The first refusal
+marks trust reload degraded on authenticated `/health` and in the
+`ferrum_cp_dp_trust_*` families; a stalled worker is immediately degraded and
+`ferrum_cp_dp_trust_reload_worker_stalled` without failing readiness inside the
+bound. At the bound the CP fails readiness, refuses new ConfigSync,
+MeshSubscribe, and xDS streams, and ends established ones with `trust_stale`.
+Admin-JWT-authenticated `/health`/`/status` also carry `active_generation`, a
+keyed HMAC-SHA-256 identifier for replica convergence. Metrics bearer tokens
+and metrics-allowlisted source addresses receive the remaining detailed trust
+diagnostics with this field set to `null`. See
+[cp_namespace_tenancy.md](cp_namespace_tenancy.md#retention-of-an-unrevalidatable-verifier-is-bounded-issue-3813).
+
 ### Aggregate configuration-stream admission
 
 Listener connection caps (`FERRUM_CP_GRPC_MAX_CONNECTIONS` /
@@ -232,44 +271,11 @@ because native ConfigSync and MeshSubscribe still occupy the slots. Under
 [configuration.md](configuration.md) and
 [mesh.md → xDS ADS admission budgets](mesh.md#xds-ads-admission-budgets).
 
-Startup and that reload worker share one coherent-generation loader: the bundle
-document and every `secret_path` / `public_key_path` it names are read from a
-single filesystem generation, so a rotation can never pair one generation's
-namespace ceiling with another generation's key material. A Kubernetes projected
-mount is pinned by `..data` descriptor before the document is read; any path
-outside a pinned generation must carry a `material_sha256`. A candidate that
-cannot prove coherence is rejected with a closed reason label and retains the
-entire prior verifier — it is never partially applied. Each referenced file and
-the aggregate path-backed material retained for one candidate are limited to 1
-MiB. See
-[cp_namespace_tenancy.md](cp_namespace_tenancy.md#rotation-is-atomic-per-source-generation).
-
-DPs and mesh/xDS clients use their existing bounded reconnect backoff and reread
-`FERRUM_DP_CP_GRPC_TOKEN_FILE` (or mint a new short-lived token) on each attempt.
-The fixed-cardinality
-`ferrum_grpc_config_stream_terminations_total{surface,reason}` metric and
-structured `grpc_config_stream_*` audit events distinguish `expired`,
-`verification_key_removed`, `server_max_lifetime`, `trust_stale`, and
-`transport_closed` without token, claim, key, node, or namespace labels.
-
-A rejected trust-bundle reload retains the entire previous verifier, but only
-for `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS` (default 900). The first refusal
-marks trust reload degraded on authenticated `/health` and in the
-`ferrum_cp_dp_trust_*` families; a stalled worker is immediately degraded and
-`ferrum_cp_dp_trust_reload_worker_stalled` without failing readiness inside the
-bound. At the bound the CP fails readiness, refuses new ConfigSync,
-MeshSubscribe, and xDS streams, and ends established ones with `trust_stale`.
-Admin-JWT-authenticated `/health`/`/status` also carry `active_generation`, a
-keyed HMAC-SHA-256 identifier for replica convergence. Metrics bearer tokens
-and metrics-allowlisted source addresses receive the remaining detailed trust
-diagnostics with this field set to `null`. See
-[cp_namespace_tenancy.md](cp_namespace_tenancy.md#retention-of-an-unrevalidatable-verifier-is-bounded-issue-3813).
-
 ### Config Sync Flow
 
 1. DP connects to CP's gRPC endpoint with JWT authentication
 2. CP sends an immediate `ConfigUpdate` with the full current config (type=FULL_SNAPSHOT)
-3. CP polls the database incrementally at `FERRUM_DB_POLL_INTERVAL` seconds using indexed `updated_at` queries
+3. CP polls the database incrementally every `FERRUM_DB_POLL_INTERVAL` seconds (default 30), reading durable `config_changes` records after its last accepted sequence cursor and point-loading only the changed resources
 4. When changes are detected, CP broadcasts a `ConfigUpdate` with type=DELTA containing only the added/modified/removed resources
 5. If gateway-to-mesh trust bundles are configured, the CP includes them in the `trust_bundles_json` side channel on both stream updates and unary full snapshots so DPs can refresh mesh peer trust without placing trust material in the DP-facing `GatewayConfig` JSON
 6. DPs apply the delta surgically — only affected caches (router, plugin, consumer, load balancer) are updated
@@ -504,7 +510,7 @@ refused with a bounded size diagnostic and the previous generation stays live.
 ##### Publication semantics
 
 The `trust_bundles_json` side channel carries three distinct states, and the CP
-now states exactly one of them per message:
+states exactly one of them per message:
 
 | State | Wire value | Meaning |
 |---|---|---|
@@ -515,8 +521,7 @@ now states exactly one of them per message:
 Full snapshots always state the complete current state (`Replace` when the
 namespace has a record, `Clear` when it does not), so a reconnecting data plane
 reconstructs trust from the snapshot alone. Resource deltas always state
-`Unchanged`: before issue #3727 the delta path passed `None`, which encoded as
-`null`, so **every** ordinary configuration change silently revoked the
+`Unchanged`, so an ordinary configuration change never revokes the
 subscriber's trust.
 
 Every Replace crosses the same `config::gateway_trust` validator at admin/store
@@ -1077,9 +1082,12 @@ in a failover set must use the same value.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `FERRUM_MODE` | Yes | Set to `cp` |
-| `FERRUM_CP_GRPC_LISTEN_ADDR` | Yes | gRPC listen address (e.g., `0.0.0.0:50051`). Set port to `0` to disable the gRPC listener. A non-loopback **plaintext** bind (no CP gRPC TLS) is refused at startup unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` |
+| `FERRUM_CP_GRPC_LISTEN_ADDR` | No | gRPC listen address (default `0.0.0.0:50051` in CP mode). Set port to `0` to disable the gRPC listener. A non-loopback **plaintext** bind (no CP gRPC TLS) is refused at startup unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` |
 | `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT` | No | Permit plaintext gRPC config sync on a non-loopback address (default `false`). Loopback (`127.0.0.1`/`::1`/`localhost`) plaintext is always allowed; even when permitted, plaintext logs a high-severity warning on both CP and DP |
-| `FERRUM_CP_DP_GRPC_JWT_SECRET` | Yes | Shared JWT secret for CP/DP gRPC auth |
+| `FERRUM_CP_DP_GRPC_JWT_SECRET` | Unless trust bundle set | Shared JWT secret for CP/DP gRPC auth |
+| `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` | No | Multi-key DP verifier document; replaces the shared secret. See [cp_namespace_tenancy.md](cp_namespace_tenancy.md) |
+| `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS` | No | How long a rejected trust-bundle reload may keep the previous verifier (default `900`) |
+| `FERRUM_CP_NAMESPACES` | No | Serve several namespaces (CSV, or `*`); unset = only `FERRUM_NAMESPACE`. See [Namespace Pairing](#namespace-pairing) |
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | No | PEM certificate for gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | No | PEM private key for gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | PEM CA for verifying DP client certs (mTLS) |
@@ -1105,7 +1113,11 @@ in a failover set must use the same value.
 | `FERRUM_DP_CP_GRPC_URLS` | Yes | Comma-separated priority-ordered CP URLs (`http://` or `https://`). A non-loopback `http://` (plaintext) URL is refused at startup unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` |
 | `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT` | No | Permit a non-loopback `http://` (plaintext) CP URL (default `false`). Loopback URLs are always allowed; even when permitted, plaintext logs a high-severity warning |
 | `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | Retry primary CP interval when on fallback (default: 300) |
-| `FERRUM_CP_DP_GRPC_JWT_SECRET` | Yes | Shared JWT secret for CP/DP gRPC auth (same value as CP) |
+| `FERRUM_CP_DP_GRPC_JWT_SECRET` | Unless token file set | Shared JWT secret for CP/DP gRPC auth (same value as CP) |
+| `FERRUM_DP_CP_GRPC_TOKEN_FILE` | No | Path to an externally issued bearer token, re-read on each connect attempt, used instead of minting one |
+| `FERRUM_NAMESPACE` | No | Namespace this DP subscribes to; the CP must serve it (default `ferrum`) |
+| `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` | No | Maximum age of the last applied CP snapshot while no CP is authoritative (default `3600`; `0` = unbounded, unsafe). See [Bounded last-known-good configuration age](#bounded-last-known-good-configuration-age) |
+| `FERRUM_DP_CONFIG_STALE_ACTION` | No | `fail_closed` (default) or `readiness_only` at the staleness bound |
 | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | No | PEM CA cert for verifying CP server cert |
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | No | PEM client cert for mTLS |
 | `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` | No | PEM client key for mTLS |
@@ -1119,7 +1131,7 @@ in a failover set must use the same value.
 
 ### Shared JWT Secret
 
-The CP and DP must use the same `FERRUM_CP_DP_GRPC_JWT_SECRET` value. The DP automatically generates short-lived JWTs (59-minute TTL) from this secret on each connection attempt, and the CP validates them with the same secret. No manual JWT generation is required.
+Unless the CP uses a trust bundle, the CP and DP must use the same `FERRUM_CP_DP_GRPC_JWT_SECRET` value. The DP automatically generates short-lived JWTs (59-minute TTL) from this secret on each connection attempt, and the CP validates them with the same secret. No manual JWT generation is required.
 
 The examples below use SQLite for local development and PostgreSQL for the TLS
 deployment path. CP mode supports the same database backends as database mode:
@@ -1214,7 +1226,7 @@ See [admin_api.md](admin_api.md#cluster-status) for full response schemas.
 ## DP Admin API
 
 The Data Plane exposes a read-only Admin API for monitoring:
-- All write operations (create/update/delete proxies, consumers, plugins) return `403 Forbidden`
+- All write operations (create/update/delete proxies, consumers, plugins) return `403 Forbidden`; `POST /restore` returns `503` (`No database`)
 - Read operations (list proxies, consumers, plugin configs, health checks) are served from the DP's in-memory cached config
 - Responses include `X-Data-Source: cached` header to indicate the data comes from the cache rather than a live database
 - Authenticated `/health` detail includes `cached_config` (availability, loaded_at, proxy/consumer counts); unauthenticated probes receive only `status` and `ready`
