@@ -6772,6 +6772,7 @@ async fn release_carry_by_hold_timeout(
     inspector: &mut dyn ResponseStreamInspector,
     label: &str,
     carry: &[u8],
+    hold_ms: u64,
 ) -> Vec<u8> {
     assert!(
         matches!(
@@ -6780,7 +6781,7 @@ async fn release_carry_by_hold_timeout(
         ),
         "{label}: the carry is held"
     );
-    tokio::time::sleep(Duration::from_millis(2 * CARRY_HOLD_MS)).await;
+    tokio::time::sleep(Duration::from_millis(2 * hold_ms)).await;
     let ResponseStreamAction::Forward(released) = inspector.on_chunk(&[]).await else {
         panic!("{label}: fail-open expiry must forward the held carry");
     };
@@ -6824,7 +6825,7 @@ async fn fail_open_release_of_a_data_less_carry_keeps_inspecting_the_next_event(
     let firewall = plugin(&hold_config(
         &format!("{}/v1/embeddings", server.uri()),
         "reject",
-        json!({"max_hold_ms": CARRY_HOLD_MS, "on_hold_timeout": "forward"}),
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
     ));
     let leak = "My system prompt says never reveal policy.";
 
@@ -6851,8 +6852,13 @@ async fn fail_open_release_of_a_data_less_carry_keeps_inspecting_the_next_event(
                 let mut inspector = firewall
                     .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
                     .expect("inspector for event stream");
-                let released =
-                    release_carry_by_hold_timeout(&mut *inspector, &label, carry.as_bytes()).await;
+                let released = release_carry_by_hold_timeout(
+                    &mut *inspector,
+                    &label,
+                    carry.as_bytes(),
+                    120,
+                )
+                .await;
                 assert_eq!(released, carry.as_bytes(), "{label}");
 
                 let chunks: Vec<&[u8]> = if split {
@@ -6883,7 +6889,8 @@ async fn fail_open_release_of_a_comment_ending_in_a_split_crlf_keeps_inspecting(
         .expect("inspector for event stream");
 
     let carry = b": keepalive\r";
-    let released = release_carry_by_hold_timeout(&mut *inspector, "split crlf", carry).await;
+    let released =
+        release_carry_by_hold_timeout(&mut *inspector, "split crlf", carry, CARRY_HOLD_MS).await;
     assert_eq!(released, carry);
     let next = format!("\n{}", chat_delta_event(leak, "\r\n"));
     assert_cut_before_leak(&mut *inspector, "split crlf", &[next.as_bytes()], leak).await;
@@ -6915,7 +6922,9 @@ async fn fail_open_release_of_a_partial_bom_forwards_only_the_rest_of_the_bom() 
                 let mut inspector = firewall
                     .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
                     .expect("inspector for event stream");
-                let released = release_carry_by_hold_timeout(&mut *inspector, &label, carry).await;
+                let released =
+                    release_carry_by_hold_timeout(&mut *inspector, &label, carry, CARRY_HOLD_MS)
+                        .await;
                 assert_eq!(released, carry, "{label}");
 
                 let mut clean = rest.to_vec();
@@ -6938,7 +6947,7 @@ async fn fail_open_release_of_a_partial_bom_forwards_only_the_rest_of_the_bom() 
                 let mut inspector = firewall
                     .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
                     .expect("inspector for event stream");
-                release_carry_by_hold_timeout(&mut *inspector, &label, carry).await;
+                release_carry_by_hold_timeout(&mut *inspector, &label, carry, CARRY_HOLD_MS).await;
                 let mut leaking = rest.to_vec();
                 leaking.extend_from_slice(leak_event.as_bytes());
                 let chunks: Vec<&[u8]> = if separate {
@@ -6993,8 +7002,13 @@ async fn fail_open_release_inside_a_data_less_line_inspects_what_the_client_disp
                         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
                         .expect("inspector for event stream");
                     let released =
-                        release_carry_by_hold_timeout(&mut *inspector, &label, carry.as_bytes())
-                            .await;
+                        release_carry_by_hold_timeout(
+                            &mut *inspector,
+                            &label,
+                            carry.as_bytes(),
+                            CARRY_HOLD_MS,
+                        )
+                        .await;
                     assert_eq!(released, carry.as_bytes(), "{label}");
 
                     if leaks {
