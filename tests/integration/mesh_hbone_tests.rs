@@ -2586,8 +2586,9 @@ fn inbound_relay_resolved_loopback_screen_is_wired_on_tcp_and_udp_dial_paths() {
     );
 }
 
-/// A gateway-side HBONE DNS-screen 403 after `check_circuit_breaker` admitted a
-/// HALF_OPEN probe must release that slot without changing backend health.
+/// A gateway-side HBONE DNS-screen policy refusal (403 denial or 503
+/// not-ready) after `check_circuit_breaker` admitted a HALF_OPEN probe must
+/// release that slot without changing backend health, whatever its status.
 /// Real connection failures still trip the breaker.
 #[test]
 fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
@@ -2608,26 +2609,29 @@ fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
     assert_eq!(cb.state_name(), "half_open");
     assert_eq!(cb.half_open_in_flight(), 1);
 
-    settle_hbone_backend_connect_circuit_breaker_outcome_for_test(&cb, StatusCode::FORBIDDEN, true);
-    assert_eq!(
-        cb.state_name(),
-        "half_open",
-        "DNS-screen 403 must not reopen the breaker"
-    );
-    assert_eq!(
-        cb.half_open_in_flight(),
-        0,
-        "DNS-screen 403 must release the HALF_OPEN probe slot"
-    );
-    assert!(
-        cb.can_execute().is_ok(),
-        "after a health-neutral denial the next probe must still be admissible"
-    );
-    assert_eq!(cb.half_open_in_flight(), 1);
+    for status in [StatusCode::FORBIDDEN, StatusCode::SERVICE_UNAVAILABLE] {
+        settle_hbone_backend_connect_circuit_breaker_outcome_for_test(&cb, status, true, true);
+        assert_eq!(
+            cb.state_name(),
+            "half_open",
+            "DNS-screen {status} policy refusal must not reopen the breaker"
+        );
+        assert_eq!(
+            cb.half_open_in_flight(),
+            0,
+            "DNS-screen {status} policy refusal must release the HALF_OPEN probe slot"
+        );
+        assert!(
+            cb.can_execute().is_ok(),
+            "after a health-neutral refusal the next probe must still be admissible"
+        );
+        assert_eq!(cb.half_open_in_flight(), 1);
+    }
 
     settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
         &cb,
         StatusCode::BAD_GATEWAY,
+        false,
         true,
     );
     assert_eq!(
@@ -2639,40 +2643,71 @@ fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
 }
 
 /// The byte-stream CONNECT error arm must settle the selected-target breaker
-/// through the production helper: FORBIDDEN (DNS-screen policy) is neutral,
-/// every other connect failure is a failure. Double-settlement is forbidden.
+/// through the ONE production helper: a DNS-screen relay refusal is neutral,
+/// every other connect failure is a failure. `connect_backend` returns only the
+/// denial; the handler derives its terminal once via
+/// `record_inbound_relay_refusal`. Double-settlement is forbidden.
 #[test]
 fn inbound_hbone_dns_screen_denial_settles_half_open_via_production_helper() {
     let src = include_str!("../../src/proxy/hbone_proxy.rs");
-    let collapsed: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        collapsed.contains(
-            "settle_hbone_backend_connect_circuit_breaker_outcome( &cb, err.status, cb_probe.take_slot(), );"
-        ),
-        "connect_backend error arm must settle the same selected-target breaker"
-    );
+    let collapsed = collapsed_tokens(src);
+    let helper = "settle_hbone_backend_connect_circuit_breaker_outcome";
     assert_eq!(
-        collapsed
-            .matches("settle_hbone_backend_connect_circuit_breaker_outcome")
-            .count(),
+        collapsed.matches(helper).count(),
         2,
         "helper definition plus the one connect_backend error-arm call site"
     );
     assert!(
         collapsed.contains(
-            "if status == StatusCode::FORBIDDEN { cb.record_neutral(is_half_open_probe); } else { cb.record_failure(status.as_u16(), true, is_half_open_probe); }"
+            "if policy_refusal { cb.record_neutral(is_half_open_probe); } else { cb.record_failure(status.as_u16(), true, is_half_open_probe); }"
         ),
-        "FORBIDDEN DNS-screen denials must record_neutral; other connect failures record_failure"
+        "policy refusals must record_neutral; other connect failures record_failure"
     );
-    let connect_err_arm = collapsed
-        .split("\"HBONE backend connection failed\"")
-        .nth(1)
-        .expect("connect_backend error logging")
-        .split("ctx.metadata.insert( \"error_class\"")
-        .next()
-        .expect("error_class metadata after breaker settlement");
+
+    let tcp = collapsed_tokens(rust_fn_body(src, "async fn connect_backend("));
     assert!(
-        !connect_err_arm.contains("record_failure") && !connect_err_arm.contains("record_neutral"),
+        tcp.contains(
+            "Err(denial) => return Err(HboneConnectFailure::RelayDenied(denial.as_str())),"
+        ),
+        "connect_backend must return only the screen's denial"
+    );
+    assert!(
+        !tcp.contains("inbound_relay_refusal_terminal")
+            && !tcp.contains("record_inbound_relay_refusal"),
+        "connect_backend must not derive the refusal terminal"
+    );
+
+    let (_, connect_err_arm) = collapsed
+        .split_once("let backend = match connect_backend(")
+        .expect("handle_hbone_request must dial through connect_backend");
+    let (connect_err_arm, _) = connect_err_arm
+        .split_once("ctx.metadata .insert(\"error_class\".to_string(), class.to_string());")
+        .expect("the connect error arm must end by stamping error_class");
+    assert!(
+        connect_err_arm.contains(
+            "let terminal = record_inbound_relay_refusal(ctx, denial, Some(destination), false);"
+        ),
+        "the handler must derive the TCP refusal terminal once, from the shared recorder"
+    );
+    assert!(
+        connect_err_arm.contains("(err.status, err.body, err.phase, err.class, false)"),
+        "a backend DNS/dial failure must never settle as a policy refusal"
+    );
+    assert!(
+        connect_err_arm.contains(
+            "settle_hbone_backend_connect_circuit_breaker_outcome( &cb, status, policy_refusal, cb_probe.take_slot(), );"
+        ),
+        "connect_backend error arm must settle the same selected-target breaker"
+    );
+    assert_eq!(
+        connect_err_arm.matches(helper).count(),
+        1,
+        "the connect error arm must settle through the helper exactly once"
+    );
+    assert!(
+        !connect_err_arm.contains("record_failure")
+            && !connect_err_arm.contains("record_neutral")
+            && !connect_err_arm.contains("record_success"),
         "the connect error arm must not double-settle beside the helper"
     );
 }

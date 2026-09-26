@@ -15270,16 +15270,19 @@ pub mod _test_support {
     }
 
     /// Production HBONE CONNECT circuit-breaker settlement after
-    /// `connect_backend`. External tests use this so a DNS-screen 403 cannot
-    /// drift from the served HALF_OPEN accounting.
+    /// `connect_backend`. External tests use this so a DNS-screen policy
+    /// refusal (403 denial or 503 not-ready) cannot drift from the served
+    /// HALF_OPEN accounting.
     pub fn settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
         cb: &crate::circuit_breaker::CircuitBreaker,
         status: hyper::StatusCode,
+        policy_refusal: bool,
         is_half_open_probe: bool,
     ) {
         crate::proxy::settle_hbone_backend_connect_circuit_breaker_outcome(
             cb,
             status,
+            policy_refusal,
             is_half_open_probe,
         )
     }

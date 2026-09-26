@@ -2775,8 +2775,7 @@ fn build_inbound_hbone_relay_proxy(
             authority_port = port,
             denial = denial.as_str(),
             terminator_local_ip = ?accepted_local_ip,
-            "Refusing authenticated inbound CONNECT: the destination is not one this proxy \
-             terminates for"
+            "Refusing inbound CONNECT relay synthesis for this destination; denial names why"
         );
         return Err(InboundConnectRelayRefusal::new(denial.as_str(), host, port));
     }

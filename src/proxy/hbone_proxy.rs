@@ -60,9 +60,16 @@ struct HboneConnectError {
     message: String,
     target_url: Option<String>,
     resolved_ip: Option<String>,
-    /// The `mesh.relay.denial_reason` when the post-DNS screen refused the
-    /// relay destination; `status`, `body` and `phase` are then its terminal.
-    relay_denial: Option<&'static str>,
+}
+
+/// Why `connect_backend` produced no backend connection.
+enum HboneConnectFailure {
+    /// The post-DNS screen refused the relay destination; carries its
+    /// `mesh.relay.denial_reason`. The handler derives the terminal once,
+    /// through `record_inbound_relay_refusal`.
+    RelayDenied(&'static str),
+    /// A DNS or dial failure, answered with its own terminal.
+    Backend(HboneConnectError),
 }
 
 struct HboneUdpSocketOpenError {
@@ -314,17 +321,19 @@ impl HboneUdpRelayEnd {
 
 /// Settle the selected-target breaker after `connect_backend` returns.
 ///
-/// A gateway-side DNS-screen 403 (`DispatchPolicyRejected`) is health-neutral:
-/// every HALF_OPEN probe `check_circuit_breaker` admitted must be settled, but
-/// this refusal is not evidence about the backend. Real connection failures
-/// still record a failure. Callers must invoke this at most once per connect
-/// attempt.
+/// A `policy_refusal` — the post-DNS relay screen's `403` denial or its `503`
+/// not-ready answer (`DispatchPolicyRejected`) — is health-neutral: every
+/// HALF_OPEN probe `check_circuit_breaker` admitted must be settled, but the
+/// refusal is not evidence about the backend. Real DNS and connection failures
+/// record a failure with their `status`. This is the ONE settlement site for a
+/// failed connect; callers invoke it exactly once per connect attempt.
 pub(crate) fn settle_hbone_backend_connect_circuit_breaker_outcome(
     cb: &crate::circuit_breaker::CircuitBreaker,
     status: StatusCode,
+    policy_refusal: bool,
     is_half_open_probe: bool,
 ) {
-    if status == StatusCode::FORBIDDEN {
+    if policy_refusal {
         cb.record_neutral(is_half_open_probe);
     } else {
         cb.record_failure(status.as_u16(), true, is_half_open_probe);
@@ -617,7 +626,7 @@ async fn connect_backend(
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
     mesh: Option<&MeshConfig>,
-) -> Result<HboneBackendConnection, HboneConnectError> {
+) -> Result<HboneBackendConnection, HboneConnectFailure> {
     let (host, port) = effective_hbone_backend_target(proxy, upstream_target);
     let target_url = format!("tcp://{host}:{port}");
 
@@ -638,32 +647,21 @@ async fn connect_backend(
             proxy.dns_cache_ttl_seconds,
         )
         .await
-        .map_err(|err| HboneConnectError {
-            status: StatusCode::BAD_GATEWAY,
-            body: br#"{"error":"DNS resolution for backend failed"}"#,
-            phase: "hbone_dns",
-            class: retry::ErrorClass::DnsLookupError,
-            message: err.to_string(),
-            target_url: Some(target_url.clone()),
-            resolved_ip: None,
-            relay_denial: None,
+        .map_err(|err| {
+            HboneConnectFailure::Backend(HboneConnectError {
+                status: StatusCode::BAD_GATEWAY,
+                body: br#"{"error":"DNS resolution for backend failed"}"#,
+                phase: "hbone_dns",
+                class: retry::ErrorClass::DnsLookupError,
+                message: err.to_string(),
+                target_url: Some(target_url.clone()),
+                resolved_ip: None,
+            })
         })?;
     let candidates =
         match screen_ordinary_inbound_hbone_relay_dns_candidates(proxy, mesh, candidates) {
             Ok(candidates) => candidates,
-            Err(denial) => {
-                let terminal = inbound_relay_refusal_terminal(denial.as_str(), false);
-                return Err(HboneConnectError {
-                    status: terminal.status,
-                    body: terminal.body,
-                    phase: terminal.deny_policy,
-                    class: retry::ErrorClass::DispatchPolicyRejected,
-                    message: denial.as_str().to_string(),
-                    target_url: Some(target_url),
-                    resolved_ip: None,
-                    relay_denial: Some(denial.as_str()),
-                });
-            }
+            Err(denial) => return Err(HboneConnectFailure::RelayDenied(denial.as_str())),
         };
     let socket_mark = (proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
         && node_waypoint_inbound_relay_mark_enabled())
@@ -683,7 +681,7 @@ async fn connect_backend(
             if class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
             }
-            return Err(HboneConnectError {
+            return Err(HboneConnectFailure::Backend(HboneConnectError {
                 status: StatusCode::BAD_GATEWAY,
                 body: br#"{"error":"Backend HBONE connection failed"}"#,
                 phase: "hbone_connect",
@@ -691,11 +689,10 @@ async fn connect_backend(
                 message: err.to_string(),
                 target_url: Some(target_url),
                 resolved_ip: Some(last_addr.ip().to_string()),
-                relay_denial: None,
-            });
+            }));
         }
         Err(crate::dns::CandidateConnectError::TimedOut { last_addr }) => {
-            return Err(HboneConnectError {
+            return Err(HboneConnectFailure::Backend(HboneConnectError {
                 status: StatusCode::GATEWAY_TIMEOUT,
                 body: br#"{"error":"Backend HBONE connection timed out"}"#,
                 phase: "hbone_connect_timeout",
@@ -706,8 +703,7 @@ async fn connect_backend(
                 ),
                 target_url: Some(target_url),
                 resolved_ip: Some(last_addr.ip().to_string()),
-                relay_denial: None,
-            });
+            }));
         }
     };
 
@@ -1292,33 +1288,46 @@ pub(super) async fn handle_hbone_request(
     .await
     {
         Ok(backend) => backend,
-        Err(err) => {
-            if let Some(denial) = err.relay_denial {
-                let (app_host, app_port) =
-                    effective_hbone_backend_target(proxy, upstream_target.as_deref());
-                warn!(
-                    proxy_id = %proxy.id,
-                    app_host,
-                    app_port,
-                    denial,
-                    terminator_local_ip = ?ctx.mesh_inbound_terminator_ip,
-                    "Rejected inbound CONNECT whose resolved destination is not one this proxy \
-                     terminates for"
-                );
-                // `connect_backend` already answered with this same terminal.
-                let destination = relay_denied_destination(app_host, app_port);
-                record_inbound_relay_refusal(ctx, denial, Some(destination), false);
-            } else {
-                error!(
-                    proxy_id = %proxy.id,
-                    backend_target = ?err.target_url,
-                    backend_resolved_ip = ?err.resolved_ip,
-                    error_kind = retry::error_class_log_kind(err.class),
-                    error_class = %err.class,
-                    error = %err.message,
-                    "HBONE backend connection failed"
-                );
-            }
+        Err(failure) => {
+            let (status, body, phase, class, policy_refusal) = match failure {
+                HboneConnectFailure::RelayDenied(denial) => {
+                    let (app_host, app_port) =
+                        effective_hbone_backend_target(proxy, upstream_target.as_deref());
+                    warn!(
+                        proxy_id = %proxy.id,
+                        app_host,
+                        app_port,
+                        denial,
+                        terminator_local_ip = ?ctx.mesh_inbound_terminator_ip,
+                        "Refused inbound CONNECT after screening its resolved destination; \
+                         denial names why"
+                    );
+                    // The ONE terminal for this refusal (403 denial, or 503
+                    // before the first mesh slice).
+                    let destination = relay_denied_destination(app_host, app_port);
+                    let terminal =
+                        record_inbound_relay_refusal(ctx, denial, Some(destination), false);
+                    (
+                        terminal.status,
+                        terminal.body,
+                        terminal.deny_policy,
+                        retry::ErrorClass::DispatchPolicyRejected,
+                        true,
+                    )
+                }
+                HboneConnectFailure::Backend(err) => {
+                    error!(
+                        proxy_id = %proxy.id,
+                        backend_target = ?err.target_url,
+                        backend_resolved_ip = ?err.resolved_ip,
+                        error_kind = retry::error_class_log_kind(err.class),
+                        error_class = %err.class,
+                        error = %err.message,
+                        "HBONE backend connection failed"
+                    );
+                    (err.status, err.body, err.phase, err.class, false)
+                }
+            };
             if let Some(cb_config) = &proxy.circuit_breaker {
                 let cb = state.circuit_breaker_cache.get_or_create(
                     &proxy.namespace,
@@ -1326,25 +1335,20 @@ pub(super) async fn handle_hbone_request(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                if err.relay_denial.is_some() {
-                    // A refused destination (403, or 503 before the first
-                    // slice) is a policy answer, not a backend failure.
-                    cb.record_neutral(cb_probe.take_slot());
-                } else {
-                    settle_hbone_backend_connect_circuit_breaker_outcome(
-                        &cb,
-                        err.status,
-                        cb_probe.take_slot(),
-                    );
-                }
+                settle_hbone_backend_connect_circuit_breaker_outcome(
+                    &cb,
+                    status,
+                    policy_refusal,
+                    cb_probe.take_slot(),
+                );
             }
             ctx.metadata
-                .insert("error_class".to_string(), err.class.to_string());
+                .insert("error_class".to_string(), class.to_string());
             let reject = finalize_reject_response_with_after_proxy_hooks(
                 plugins,
                 ctx,
-                err.status,
-                Bytes::from_static(err.body),
+                status,
+                Bytes::from_static(body),
                 HashMap::new(),
                 false,
             )
@@ -1354,7 +1358,7 @@ pub(super) async fn handle_hbone_request(
                 ctx,
                 reject.http_status.as_u16(),
                 start_time,
-                err.phase,
+                phase,
                 plugin_execution_ns,
             )
             .await;
