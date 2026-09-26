@@ -602,18 +602,6 @@ impl PassiveEjection {
     }
 }
 
-/// Process-wide publication counter for the active-unhealthy target set.
-///
-/// Every mutation of any [`ActiveUnhealthyTargets`] bumps this counter AFTER
-/// the map change lands (`Release`). Load balancers tag their cached
-/// active-eligibility snapshot with the value they observed (`Acquire`)
-/// BEFORE scanning the map, so a mutation that races a scan is guaranteed to
-/// leave the counter ahead of the tag and force a recompute on the next
-/// selection. Being process-wide (rather than per map instance) means a
-/// balancer can never mistake one checker's generation `N` for another
-/// checker's generation `N` after a `HealthChecker` swap.
-static ACTIVE_HEALTH_GENERATION: AtomicU64 = AtomicU64::new(0);
-
 /// Result of [`ActiveUnhealthyTargets::insert_if_vacant`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VacantInsert {
@@ -632,14 +620,25 @@ static ACTIVE_UNHEALTHY_TARGETS_IDS: AtomicU64 = AtomicU64::new(1);
 /// Active-probe unhealthy set: `"namespace|upstream_id::host:port"` → epoch ms
 /// of the ejection, shared by every proxy that routes through the upstream.
 ///
-/// Wraps the `DashMap` so every mutation publishes a generation bump (see
-/// [`ACTIVE_HEALTH_GENERATION`]). The selection hot path never scans this map
-/// while the generation it cached is still current, and never calls
-/// `DashMap::is_empty()` / `len()`, which lock every shard.
+/// Wraps the `DashMap` so every mutation publishes a generation bump. The
+/// selection hot path never scans this map while the generation it cached is
+/// still current, and never calls `DashMap::is_empty()` / `len()`, which lock
+/// every shard.
+///
+/// The generation is per instance: every mutation bumps it AFTER the map
+/// change lands (`Release`). Load balancers tag their cached
+/// active-eligibility snapshot with the value they observed (`Acquire`)
+/// BEFORE scanning the map, so a mutation that races a scan is guaranteed to
+/// leave the counter ahead of the tag and force a recompute on the next
+/// selection. Snapshots are keyed on `(id, generation)`, so two maps that
+/// happen to sit at the same generation (e.g. after a `HealthChecker` swap)
+/// are never confused, and a mutation of one checker's map never invalidates
+/// projections of another's.
 #[derive(Debug)]
 pub struct ActiveUnhealthyTargets {
     map: DashMap<String, u64>,
     id: u64,
+    generation: AtomicU64,
 }
 
 impl Default for ActiveUnhealthyTargets {
@@ -653,6 +652,7 @@ impl ActiveUnhealthyTargets {
         Self {
             map: DashMap::new(),
             id: ACTIVE_UNHEALTHY_TARGETS_IDS.fetch_add(1, Ordering::Relaxed),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -665,16 +665,17 @@ impl ActiveUnhealthyTargets {
         self.id
     }
 
-    /// Current publication generation. Cheap (one relaxed-cost `Acquire`
-    /// load of a read-mostly cache line); safe to call per selection.
+    /// Current publication generation of this map instance. Cheap (one
+    /// relaxed-cost `Acquire` load of a read-mostly cache line); safe to call
+    /// per selection. Only meaningful together with [`Self::id`].
     #[inline]
     pub fn generation(&self) -> u64 {
-        ACTIVE_HEALTH_GENERATION.load(Ordering::Acquire)
+        self.generation.load(Ordering::Acquire)
     }
 
     #[inline]
     fn publish(&self) {
-        ACTIVE_HEALTH_GENERATION.fetch_add(1, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     #[inline]
