@@ -131,6 +131,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   violating route is `Accepted=False` with a field-specific reason instead of
   producing a corrupted `Location`. An empty `replaceFullPath` redirects to
   `/`.
+- With `FERRUM_TLS_EARLY_DATA_METHODS` set, HTTP/3 no longer answers
+  `425 Too Early`, or forwards `Early-Data: 1`, for a request the client sent
+  after the TLS handshake (#5761). Every such connection is accepted through
+  quinn's 0.5-RTT path, and the handshake-completion signal reached the request
+  accept loop through a separate task. A request arriving in the same flight
+  as the client's `Finished`, which is typical for a resumed client that sends
+  no 0-RTT data, could be accepted before that signal and classified as early
+  data. The accept loop now tracks quinn's completion signal itself and checks
+  it again for every accepted stream, outside tokio's cooperative budget. A
+  request is early data only when the handshake was still pending at that
+  check, which means the stream was opened by 0-RTT data; such requests are
+  still method-gated and marked `Early-Data: 1`. The reverse does not hold: a
+  0-RTT request whose stream is checked after the handshake completed is
+  handled as a 1-RTT request, as RFC 8470 §6.4 permits for early data a server
+  processes after the handshake completes. That processing is the "delay"
+  treatment §6.2 allows, so §6.2 is still satisfied. A replay can never
+  complete a handshake, so every instance still handles replayed copies as
+  early data. The check is one atomic load per stream, made only while the
+  handshake is pending.
 - An HTTP/3 client that stops reading a streamed response can no longer hold
   it past the route rule's `request` or `backendRequest` timeout (#5646,
   PR #5741). A client that withholds QUIC flow control parks the gateway's

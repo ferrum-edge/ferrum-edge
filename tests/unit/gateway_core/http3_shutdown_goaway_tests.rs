@@ -357,33 +357,36 @@ fn h3_accept_loop_reads_only_the_binary_keepalive_tier() {
     );
 }
 
-/// Both `select!` branches must carry the arm, and it must stay after the
+/// The single accept-loop `select!` (shared by 0-RTT and full-handshake
+/// connections) must carry the arm exactly once, and it must stay after the
 /// shutdown arm so `biased;` ordering keeps process shutdown first.
 #[test]
-fn both_select_branches_observe_keepalive_pressure_after_shutdown() {
+fn accept_loop_select_observes_keepalive_pressure_after_shutdown() {
     let src = compact(server_src());
-    assert_eq!(
-        src.matches("h3_keepalive_pressure_raised(&mutkeepalive_pressure_rx),if!h3_goaway_sent")
-            .count(),
-        2,
-        "both the 0-RTT and the full-handshake select branches must observe the tier"
-    );
-    let shutdown_first = src
-        .match_indices("_=shutdown_rx.changed(),if!h3_goaway_sent")
+    let shutdown_arm = "_=shutdown_rx.changed(),if!h3_goaway_sent";
+    let pressure_arm = "h3_keepalive_pressure_raised(&mutkeepalive_pressure_rx),if!h3_goaway_sent";
+    let shutdown = src
+        .match_indices(shutdown_arm)
         .map(|(i, _)| i)
         .collect::<Vec<_>>();
     let pressure = src
-        .match_indices("h3_keepalive_pressure_raised(&mutkeepalive_pressure_rx)")
+        .match_indices(pressure_arm)
         .map(|(i, _)| i)
         .collect::<Vec<_>>();
-    assert_eq!(shutdown_first.len(), 2);
-    assert_eq!(pressure.len(), 2);
-    for (s, p) in shutdown_first.iter().zip(pressure.iter()) {
-        assert!(
-            s < p,
-            "the shutdown arm must precede the pressure arm under `biased;`"
-        );
-    }
+    assert_eq!(
+        shutdown.len(),
+        1,
+        "the single accept-loop select must have exactly one shutdown arm"
+    );
+    assert_eq!(
+        pressure.len(),
+        1,
+        "the single accept-loop select must observe the keepalive tier exactly once"
+    );
+    assert!(
+        shutdown[0] < pressure[0],
+        "the shutdown arm must precede the pressure arm under `biased;`"
+    );
 }
 
 // ---------------------------------------------------------------------------

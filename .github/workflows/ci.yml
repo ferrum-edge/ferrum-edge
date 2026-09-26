@@ -1893,6 +1893,7 @@ jobs:
               functional_destination_active_requests_h3_test
               functional_h3_grpc_web_test
               functional_h3_grpc_streaming_test
+              functional_h3_early_data_classification_test
               functional_h3_mtls_early_data_test
               functional_request_termination_h3_test
               functional_policy_path_canonicalization_test

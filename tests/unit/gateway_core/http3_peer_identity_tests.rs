@@ -17,15 +17,22 @@
 //!   5. Slots are per connection — one connection's identity cannot leak into
 //!      another's, and a connection whose handshake never completed keeps an
 //!      empty slot.
-//!   6. The 0.5-RTT accept loop snapshots ready streams before publishing
-//!      successful handshake completion.
+//!   6. Each accepted request stream is classified from the handshake state
+//!      at the instant it was accepted (issue #5761): a stream accepted after
+//!      the handshake-completion signal fired is never early data, even when
+//!      the accept loop had not observed that signal yet, and a stream
+//!      accepted while the handshake was still pending stays early data.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use ferrum_edge::http3::peer_identity::{
-    H3ConnectionIdentity, H3PeerIdentity, quic_max_early_data_size,
+    H3ConnectionIdentity, H3PeerIdentity, ZeroRttCompletion, quic_max_early_data_size,
     server_0rtt_handshake_succeeded, zero_rtt_admitted,
 };
+use tokio::sync::oneshot;
 
 fn leaf() -> Vec<u8> {
     vec![0x30, 0x82, 0x01, 0xAA]
@@ -117,22 +124,238 @@ fn h3_early_data_uses_the_bounded_stateful_resumption_cache() {
 }
 
 #[test]
-fn h3_accepts_ready_early_streams_before_publishing_handshake_completion() {
+fn h3_classifies_each_accepted_stream_from_the_handshake_state_at_accept() {
+    // Issue #5761. The accept loop owns quinn's completion signal (no relay
+    // task whose wake-up a 1-RTT stream could overtake), polls it ahead of
+    // request acceptance, and re-reads it for every accepted stream before the
+    // stream's identity snapshot is taken.
     let source = compact_whitespace(include_str!("../../../src/http3/server.rs"));
+    assert!(
+        source.contains("handshake_completion=ZeroRttCompletion::pending(zero_rtt_accepted);"),
+        "the 0.5-RTT branch must hand quinn's completion signal to the accept loop"
+    );
     let selection = source
-        .find("tokio::select!{biased;accepted=h3_conn.accept()")
-        .expect("the H3 accept loop must poll request acceptance first");
-    let completion = source[selection..]
-        .find("completed=completion_rx")
+        .find("select!{biased;zero_rtt_accepted=handshake_completion.outcome(),")
+        .expect("the accept loop must poll handshake completion ahead of acceptance");
+    let acceptance = source[selection..]
+        .find("accepted=h3_conn.accept()=>")
         .map(|offset| selection + offset)
-        .expect("the H3 accept loop must observe handshake completion");
-    let publication = source[completion..]
-        .find("peer_identity.publish_handshake_result(handshake_succeeded,peer_certs)")
-        .map(|offset| completion + offset)
-        .expect("successful handshake completion must publish through the identity slot");
+        .expect("the H3 accept loop must accept request streams");
+    let admitted = source[acceptance..]
+        .find("Ok(Some(resolver))=>{")
+        .map(|offset| acceptance + offset)
+        .expect("the H3 accept loop must admit accepted request streams");
+    let classification = source[admitted..]
+        .find("letidentity=peer_identity.accepted_stream_snapshot(&muthandshake_completion,")
+        .map(|offset| admitted + offset)
+        .expect("every accepted stream must be classified through accepted_stream_snapshot");
+    let dispatch = source[admitted..]
+        .find("tokio::spawn(asyncmove{")
+        .map(|offset| admitted + offset)
+        .expect("accepted request streams are dispatched onto their own task");
 
-    assert!(selection < completion);
-    assert!(completion < publication);
+    assert!(selection < acceptance);
+    assert!(
+        classification < dispatch,
+        "a stream must be classified before its request task is spawned"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Per-stream classification against the handshake-completion signal
+// ---------------------------------------------------------------------------
+
+/// Stand-in for quinn's server-side `ZeroRttAccepted`: a oneshot that the
+/// connection driver completes when the handshake reaches `Connected` and drops
+/// when the connection fails first.
+struct FakeZeroRttAccepted(oneshot::Receiver<bool>);
+
+impl Future for FakeZeroRttAccepted {
+    type Output = bool;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map(|result| result.unwrap_or(false))
+    }
+}
+
+fn zero_rtt_connection() -> (
+    oneshot::Sender<bool>,
+    ZeroRttCompletion<FakeZeroRttAccepted>,
+) {
+    let (driver, signal) = oneshot::channel();
+    (
+        driver,
+        ZeroRttCompletion::pending(FakeZeroRttAccepted(signal)),
+    )
+}
+
+#[tokio::test]
+async fn one_rtt_stream_accepted_before_the_loop_saw_completion_is_not_early_data() {
+    // The #5761 ordering: the client's `Finished` and its first 1-RTT request
+    // arrive together. Quinn completes the handshake (firing the signal) and
+    // only then hands out the stream, but the accept loop has not been woken
+    // for the completion yet. The stream must still be classified 1-RTT.
+    let slot = H3ConnectionIdentity::pre_handshake();
+    let (driver, mut completion) = zero_rtt_connection();
+    // A server with no client 0-RTT reports `false` even on success.
+    driver.send(false).expect("completion receiver is alive");
+
+    let stream = slot
+        .accepted_stream_snapshot(&mut completion, || true, || None)
+        .await;
+    assert!(
+        !stream.is_early_data,
+        "a request accepted after handshake completion must never be 425'd or marked \
+         Early-Data: 1"
+    );
+    assert!(!completion.is_pending(), "the observed signal is consumed");
+
+    let later = slot
+        .accepted_stream_snapshot(&mut completion, || true, || None)
+        .await;
+    assert!(!later.is_early_data);
+}
+
+#[tokio::test]
+async fn stream_accepted_while_the_handshake_is_pending_stays_early_data() {
+    // The genuine 0-RTT ordering: quinn handed the stream out before the
+    // handshake completed. It is early data for its whole life, and the peer
+    // certificate is not even consulted.
+    let slot = H3ConnectionIdentity::pre_handshake();
+    let (driver, mut completion) = zero_rtt_connection();
+
+    let early = slot
+        .accepted_stream_snapshot(
+            &mut completion,
+            || unreachable!("connection state is read only once the signal fired"),
+            || unreachable!("no identity may be read before the handshake completed"),
+        )
+        .await;
+    assert!(
+        early.is_early_data,
+        "a 0-RTT request must stay replay-gated"
+    );
+    assert!(early.client_cert_der.is_none());
+    assert!(completion.is_pending());
+
+    driver.send(true).expect("completion receiver is alive");
+    let later = slot
+        .accepted_stream_snapshot(&mut completion, || true, || None)
+        .await;
+    assert!(
+        !later.is_early_data,
+        "streams accepted after completion are 1-RTT"
+    );
+    assert!(
+        early.is_early_data,
+        "an early stream keeps its classification after the handshake completes"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_handshake_keeps_every_stream_early_data() {
+    // The driver drops the signal (quinn's `ZeroRttAccepted` then yields
+    // `false`) on a closed connection: the slot must stay pre-handshake and
+    // must not pick up an identity.
+    let slot = H3ConnectionIdentity::pre_handshake();
+    let (driver, mut completion) = zero_rtt_connection();
+    drop(driver);
+
+    let stream = slot
+        .accepted_stream_snapshot(&mut completion, || false, || Some(vec![leaf()]))
+        .await;
+    assert!(stream.is_early_data);
+    assert!(stream.client_cert_der.is_none());
+    assert!(!completion.is_pending());
+
+    let later = slot
+        .accepted_stream_snapshot(&mut completion, || true, || Some(vec![leaf()]))
+        .await;
+    assert!(
+        later.is_early_data,
+        "a failed handshake is never retried into success"
+    );
+    assert!(later.client_cert_der.is_none());
+}
+
+#[tokio::test]
+async fn a_fired_signal_is_observed_after_the_task_spent_its_coop_budget() {
+    // Quinn's signal is a tokio oneshot receiver, which reports `Pending` once
+    // the polling task has spent its cooperative budget even when the value is
+    // already there. A busy accept loop must still see an already-fired signal,
+    // or a 1-RTT stream would be answered 425 / forwarded with Early-Data: 1.
+    let slot = H3ConnectionIdentity::pre_handshake();
+    let (driver, mut completion) = zero_rtt_connection();
+    driver.send(false).expect("completion receiver is alive");
+
+    // Far more ready messages than tokio's per-poll budget.
+    let (budget_tx, mut budget_rx) = tokio::sync::mpsc::unbounded_channel();
+    for _ in 0..1024 {
+        budget_tx.send(()).expect("receiver is alive");
+    }
+
+    let stream = std::future::poll_fn(|cx| {
+        while let Poll::Ready(Some(())) = budget_rx.poll_recv(cx) {}
+        assert!(
+            !budget_rx.is_empty(),
+            "the receiver must have stopped on the exhausted coop budget"
+        );
+        let snapshot = slot.accepted_stream_snapshot(&mut completion, || true, || None);
+        let mut snapshot = std::pin::pin!(snapshot);
+        snapshot.as_mut().poll(cx)
+    })
+    .await;
+    assert!(
+        !stream.is_early_data,
+        "an exhausted coop budget must not hide a fired completion signal"
+    );
+    assert!(!completion.is_pending());
+}
+
+#[tokio::test]
+async fn completion_is_yielded_once_and_never_polled_again() {
+    let (driver, mut completion) = zero_rtt_connection();
+    assert_eq!(completion.observe_now().await, None);
+
+    driver.send(true).expect("completion receiver is alive");
+    assert_eq!(completion.observe_now().await, Some(true));
+    // The inner receiver is dropped after it resolved, so later polls are a
+    // plain `Pending` rather than a poll-after-completion.
+    assert_eq!(completion.observe_now().await, None);
+    assert!(!completion.is_pending());
+
+    let mut resolved = ZeroRttCompletion::<FakeZeroRttAccepted>::resolved();
+    assert!(!resolved.is_pending());
+    assert_eq!(resolved.observe_now().await, None);
+}
+
+#[tokio::test]
+async fn the_accept_loop_select_branch_resolves_with_the_signal() {
+    let (driver, mut completion) = zero_rtt_connection();
+    driver.send(true).expect("completion receiver is alive");
+    assert!(completion.outcome().await);
+    assert!(!completion.is_pending());
+}
+
+#[tokio::test]
+async fn a_full_handshake_connection_never_classifies_a_stream_as_early_data() {
+    // Every full-handshake accept path publishes before the accept loop runs
+    // and tracks no completion signal.
+    let slot = H3ConnectionIdentity::pre_handshake();
+    slot.publish_handshake_result(true, Some(vec![leaf()]));
+    let mut completion = ZeroRttCompletion::<FakeZeroRttAccepted>::resolved();
+
+    let stream = slot
+        .accepted_stream_snapshot(
+            &mut completion,
+            || unreachable!("no completion signal is tracked"),
+            || unreachable!("no completion signal is tracked"),
+        )
+        .await;
+    assert!(!stream.is_early_data);
+    assert_eq!(stream.client_cert_der.as_deref(), Some(&leaf()));
 }
 
 // ---------------------------------------------------------------------------
