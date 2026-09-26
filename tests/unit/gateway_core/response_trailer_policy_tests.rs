@@ -1178,11 +1178,11 @@ fn every_reqwest_streaming_dispatch_site_carries_the_trailer_decision() {
     // Issue #5760: the reqwest relay reads real frames, so its backend trailer
     // section reaches the client exactly like the direct-H2 relay's. The arm
     // resolves ONE trailer decision (governed relay, or drop when the client
-    // cannot receive a trailer section) and every mutually-exclusive body it
-    // builds — the inspector task plus the three streaming adapters — must
-    // receive it. A branch built without it would not compile, but one built
-    // from a second, ungoverned `relay(None)` would forward the section
-    // outside the response-header policy.
+    // cannot receive a trailer section). The two relay constructors are
+    // mutually exclusive: gRPC owns terminal metadata, while plain responses
+    // use the ordinary relay. Each must receive the sealed trailer governor,
+    // and every body consumer — the inspector task plus the three streaming
+    // adapters — must receive the resulting decision.
     let src = include_str!("../../../src/proxy/mod.rs");
     let arm = src
         .split("reqwest_backend_guard,\n        } => {")
@@ -1191,15 +1191,25 @@ fn every_reqwest_streaming_dispatch_site_carries_the_trailer_decision() {
         .split("ResponseBody::StreamingH2(mut resp) => {")
         .next()
         .expect("bounded reqwest streaming arm");
+    let compact_arm = arm.split_whitespace().collect::<String>();
     assert_eq!(
-        arm.matches("ReqwestResponseTrailers::relay(").count(),
+        compact_arm
+            .matches("ReqwestResponseTrailers::relay_grpc_terminal(streaming_trailer_governor.take(),")
+            .count(),
         1,
-        "the reqwest arm must build exactly one relaying trailer decision"
+        "the gRPC terminal relay must carry the sealed trailer governor"
+    );
+    assert_eq!(
+        compact_arm
+            .matches("ReqwestResponseTrailers::relay(streaming_trailer_governor.take(),")
+            .count(),
+        1,
+        "the plain relay must carry the sealed trailer governor"
     );
     assert_eq!(
         arm.matches("streaming_trailer_governor.take()").count(),
-        1,
-        "the relaying decision must carry the sealed trailer governor"
+        2,
+        "both mutually-exclusive relaying decisions must consume the sealed trailer governor"
     );
     assert!(
         arm.contains("if reqwest_trailers_relayed {"),
