@@ -770,6 +770,8 @@ async fn grpc_web_passthrough_streamed_uploads_count_decoded_request_messages() 
     let (_text_backend, text_port) =
         spawn_h2c_backend("application/grpc-web-text+proto", passthrough_text_body()).await;
 
+    // This plain route takes the streamed arm because it has no
+    // `response_body_mode: buffer`, no body plugin, and the upload has unknown length.
     let mut proxies = Vec::new();
     for suffix in ["h1", "h2"] {
         for (mode, backend_port) in [("bin", binary_port), ("text", text_port)] {

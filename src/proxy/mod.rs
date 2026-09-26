@@ -35538,10 +35538,12 @@ async fn handle_proxy_request_inner(
                     &mut held_frontend_grpc_upload,
                     // Scans the upload's own framing: a pass-through
                     // gRPC-Web upload counts decoded message frames only.
-                    Some(crate::plugins::mesh::prometheus_helpers::GrpcMessageTap::new(
-                        Arc::clone(&ctx.grpc_request_messages_observed),
-                        crate::plugins::grpc_web::request_upload_grpc_message_framing(&ctx),
-                    )),
+                    Some(
+                        crate::plugins::mesh::prometheus_helpers::GrpcMessageTap::new(
+                            Arc::clone(&ctx.grpc_request_messages_observed),
+                            crate::plugins::grpc_web::request_upload_grpc_message_framing(&ctx),
+                        ),
+                    ),
                     // The buffered arms `fetch_max` the collected length into
                     // this counter; the streamed arm has no collected length,
                     // so the body publishes its forwarded DATA tally at upload

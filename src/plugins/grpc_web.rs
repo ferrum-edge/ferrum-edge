@@ -3285,7 +3285,10 @@ impl GrpcWebTrailerStatusObserver {
         }
     }
 
-    /// Observe the next client-visible body bytes, in wire order.
+    /// Observe the next client-visible body bytes, in wire order. This decoder
+    /// and `GrpcLengthPrefixedScanner` must agree: decode base64 per 4-character
+    /// group, and a frame is a message iff `flag & 0x80 == 0`, so a change to one
+    /// decoder must be mirrored in the other.
     pub(crate) fn push(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -3361,6 +3364,9 @@ impl GrpcWebTrailerStatusObserver {
         self.messages
     }
 
+    /// Walk decoded frames using the same rules as `GrpcLengthPrefixedScanner`:
+    /// base64 is decoded per 4-character group, and a frame is a message iff
+    /// `flag & 0x80 == 0`. A change to one decoder must be mirrored in the other.
     fn push_binary(&mut self, mut data: &[u8]) {
         while !data.is_empty() {
             if self.frame == ObservedGrpcWebFrame::Header {

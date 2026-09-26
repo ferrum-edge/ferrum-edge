@@ -397,6 +397,10 @@ impl GrpcLengthPrefixedScanner {
         }
     }
 
+    /// Decode each complete 4-character base64 group before passing frames to
+    /// `push_frames`. This decoder and `GrpcWebTrailerStatusObserver` must agree:
+    /// decode per 4-character group, and a frame is a message iff `flag & 0x80 == 0`,
+    /// so a change to one decoder must be mirrored in the other.
     fn push_base64(&mut self, mut data: &[u8], messages: &AtomicU64) {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD as BASE64;
@@ -435,6 +439,9 @@ impl GrpcLengthPrefixedScanner {
         self.text_group_len = rest.len() as u8;
     }
 
+    /// Walk decoded frames using the same rules as `GrpcWebTrailerStatusObserver`:
+    /// base64 is decoded per 4-character group, and a frame is a message iff
+    /// `flag & 0x80 == 0`. A change to one decoder must be mirrored in the other.
     fn push_frames(&mut self, mut data: &[u8], messages: &AtomicU64) {
         while !data.is_empty() {
             if let Some(left) = self.remaining {
