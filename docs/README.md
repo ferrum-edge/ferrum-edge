@@ -193,6 +193,13 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
   [PR text](upstream-h3-quinn-patches/002-send-stream-stopped-watch/pr-description.md),
   [patch](upstream-h3-quinn-patches/002-send-stream-stopped-watch/h3-quinn-send-stream-stopped-watch.patch))
 
+### hyper
+
+- 001 — [reset an upgraded HTTP/2 CONNECT stream with `CONNECT_ERROR`](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md)
+  ([issue draft](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/issue.md),
+  [PR text](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/pr-description.md),
+  [patch](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/hyper-upgraded-h2-connect-error-reset.patch))
+
 ### hyper-util
 
 - 001 — [release an HTTP/1 sender once its dispatcher stops reading](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md)

@@ -349,6 +349,31 @@ async fn v1_header_from_trusted_peer_sets_client_address() {
     backend.task.abort();
 }
 
+/// A v1 header arriving over several delayed TCP writes, with the request in
+/// the same write as its final LF, is consumed exactly: the request bytes
+/// after the CRLF still reach Hyper (issue #5839).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v1_header_split_across_writes_keeps_the_request_bytes() {
+    let backend = start_echo_backend().await;
+    let gateway = Gateway::plain(backend.port, Mode::V1, "127.0.0.1", "").await;
+
+    let header = v1_header(CLIENT);
+    let (head, lf) = header.split_at(header.len() - 1);
+    let mut stream = gateway.connect().await;
+    stream.set_nodelay(true).expect("nodelay");
+    for chunk in head.chunks(9) {
+        send(&mut stream, chunk).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut last = lf.to_vec();
+    last.extend_from_slice(&get_request(""));
+    send(&mut stream, &last).await;
+    assert_ok_with_xff(&read_response(&mut stream).await, CLIENT);
+
+    gateway.shutdown().await;
+    backend.task.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_header_from_trusted_peer_sets_client_address() {
     let backend = start_echo_backend().await;

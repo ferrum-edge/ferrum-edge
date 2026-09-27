@@ -2292,6 +2292,77 @@ pub(crate) fn validate_tcp_connection_throttle_attachments(
     }
 }
 
+/// Whether an effective plugin config can require the parsed WebSocket relay.
+///
+/// Built-ins answer from the config-independent
+/// [`crate::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS`] declaration. An
+/// out-of-tree plugin is constructed and asked through
+/// [`Plugin::requires_websocket_framing`]; a plugin that cannot be constructed
+/// is reported as an error so the caller fails closed.
+fn plugin_config_may_require_websocket_framing(
+    pc: &PluginConfig,
+    http_client: &PluginHttpClient,
+) -> Result<bool, String> {
+    let name = pc.plugin_name.as_str();
+    if crate::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS.contains(&name) {
+        return Ok(true);
+    }
+    if crate::plugins::builtin_plugin_parity_meta(name).is_some() {
+        return Ok(false);
+    }
+    match crate::plugins::create_plugin_with_http_client(name, &pc.config, http_client.clone()) {
+        Ok(Some(plugin)) => Ok(plugin.requires_websocket_framing()),
+        Ok(None) => Err(format!("unknown plugin {name:?}")),
+        Err(error) => Err(error),
+    }
+}
+
+/// Refuse `websocket_permessage_deflate: passthrough` on every proxy whose
+/// effective plugin chain can require the parsed WebSocket relay.
+///
+/// A session that negotiates `permessage-deflate` carries RSV1-compressed
+/// frames the gateway framer cannot decode, so the proxy relays it as raw
+/// bytes and a plugin that inspects, counts, or bounds WebSocket messages
+/// would silently see nothing. Every enabled plugin config that effectively
+/// applies to the proxy counts — proxy-scoped, proxy-group, or an inherited
+/// global — and an execution trigger does not exempt it. The runtime also
+/// keeps stripping the offer whenever the live chain requires framing, so a
+/// graph that bypassed this gate still fails closed to the default.
+pub(crate) fn websocket_permessage_deflate_passthrough_errors(
+    gateway_config: &GatewayConfig,
+    http_client: &PluginHttpClient,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for proxy in gateway_config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.websocket_permessage_deflate.is_passthrough())
+    {
+        for pc in &gateway_config.plugin_configs {
+            if !plugin_config_effectively_applies_to_proxy(pc, proxy, gateway_config) {
+                continue;
+            }
+            match plugin_config_may_require_websocket_framing(pc, http_client) {
+                Ok(false) => {}
+                Ok(true) => errors.push(format!(
+                    "proxy_id={:?}: `websocket_permessage_deflate: passthrough` cannot be \
+                     combined with plugin {:?} (`id`={:?}): it requires the parsed WebSocket \
+                     relay, and a negotiated permessage-deflate session is relayed as compressed \
+                     raw bytes it could not inspect",
+                    proxy.id, pc.plugin_name, pc.id
+                )),
+                Err(error) => errors.push(format!(
+                    "proxy_id={:?}: `websocket_permessage_deflate: passthrough` requires every \
+                     effective plugin to declare its WebSocket framing needs; plugin {:?} \
+                     (`id`={:?}) could not be evaluated: {error}",
+                    proxy.id, pc.plugin_name, pc.id
+                )),
+            }
+        }
+    }
+    errors
+}
+
 fn create_tcp_connection_throttle_plugin(
     pc: &PluginConfig,
     gateway_config: &GatewayConfig,
@@ -4389,7 +4460,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     http_client: &PluginHttpClient,
 ) -> Result<(), String> {
     validate_gateway_plugin_composition(config)?;
-    let mut errors = Vec::new();
+    let mut errors = websocket_permessage_deflate_passthrough_errors(config, http_client);
     let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
     let mut scoped_plugins: SecurityCompositionPluginMap<'_> = HashMap::new();
     let mut proxy_scoped_configs: ProxyScopedConfigIndex = HashMap::new();

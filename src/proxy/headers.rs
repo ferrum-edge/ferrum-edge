@@ -780,6 +780,12 @@ pub(crate) const X_GATEWAY_ERROR_HEADER: &str = "x-gateway-error";
 /// Wire name of the gateway-owned degraded-routing header
 /// (`X-Gateway-Upstream-Status`).
 pub(crate) const X_GATEWAY_UPSTREAM_STATUS_HEADER: &str = "x-gateway-upstream-status";
+/// Wire name of the gateway-owned opaque diagnostic reference
+/// (`X-Ferrum-Diagnostic-Ref`, issue #5767). Only
+/// [`crate::diagnostic_ref::stamp_response_headers`] writes it, as the last
+/// step before the response head reaches the client.
+pub(crate) const X_FERRUM_DIAGNOSTIC_REF_HEADER: &str =
+    crate::diagnostic_ref::DIAGNOSTIC_REF_HEADER;
 
 /// The single list of client-facing diagnostic response fields only the
 /// gateway may author. A backend (or serverless function) copy is removed at
@@ -788,8 +794,11 @@ pub(crate) const X_GATEWAY_UPSTREAM_STATUS_HEADER: &str = "x-gateway-upstream-st
 /// leftover copy with [`strip_gateway_owned_diagnostic_response_headers`]
 /// before writing its own value. Add a new gateway-authored diagnostic field
 /// here, never at an individual dispatch path.
-pub(crate) const GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS: [&str; 2] =
-    [X_GATEWAY_ERROR_HEADER, X_GATEWAY_UPSTREAM_STATUS_HEADER];
+pub(crate) const GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS: [&str; 3] = [
+    X_GATEWAY_ERROR_HEADER,
+    X_GATEWAY_UPSTREAM_STATUS_HEADER,
+    X_FERRUM_DIAGNOSTIC_REF_HEADER,
+];
 
 /// Whether `name` is one of [`GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`],
 /// compared ASCII-case-insensitively.

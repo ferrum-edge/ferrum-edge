@@ -205,6 +205,8 @@ tags:
     description: CP/DP cluster status and operational introspection
   - name: Backend Capabilities
     description: Inspect and force-refresh the per-backend-target protocol classification cache (H1/H2/H3/h2c/gRPC)
+  - name: Diagnostics
+    description: Resolve opaque gateway diagnostic references (X-Ferrum-Diagnostic-Ref) to scoped, operator-only detail
   - name: Node-Waypoint
     description: Inspect the per-pod identity index used by node-waypoint topology (mesh-only)
   - name: Service-Waypoint
@@ -2472,6 +2474,196 @@ paths:
                     type: string
 
   # ── Node-Waypoint identities (mesh NodeWaypoint topology) ───────────
+  /diagnostics/v1/refs/{ref}:
+    get:
+      operationId: getDiagnosticRef
+      summary: Resolve a gateway diagnostic reference
+      description: |
+        Resolves an opaque `X-Ferrum-Diagnostic-Ref` value to the gateway-owned
+        detail behind it (issue #5767). With `FERRUM_DIAGNOSTIC_REFS=errors`,
+        every HTTP/1.1, HTTP/2, and HTTP/3 proxy response that carries the
+        gateway's own `X-Gateway-Error` token also carries a reference of the
+        form `fd1_` plus 32 lowercase hex digits (128 CSPRNG bits). With
+        `FERRUM_DIAGNOSTIC_REFS=all` (issue #5846), every other
+        gateway-authored error response carries one too: plugin rejections
+        (for example `401`, `403`, `429`), gateway policy fences, and routing
+        `404`s, including gRPC Trailers-Only rejections. Such a reference has
+        a `null` `gateway_error`, and its detail names the rejecting phase and,
+        when known, plugin. A backend's own error response never carries a
+        reference, whether relayed to the client or replayed by a plugin (a
+        cache hit, an idempotent replay, a serverless terminate reply, a
+        federated provider response), and a reference is stamped only on a
+        head whose status is the one its rejection recorded. The
+        reference embeds nothing; the detail is retained only in the memory of
+        the gateway process that served the response, for
+        `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900) and at most
+        `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` references (oldest evicted first).
+        Query the admin listener of that same process.
+
+        **Authorization.** A valid admin JWT is required (`401` otherwise), and
+        it must carry both the `diagnostics:read` scope (a `scope` claim that is
+        an OAuth 2.0 space-delimited string or an array of strings; the admin
+        `role` never implies it) and an `ns` claim (`403` otherwise). These two
+        checks depend only on the credential, never on the reference. The
+        `X-Ferrum-Namespace` header is ignored.
+
+        **No probing.** A malformed, unknown, expired, or evicted reference, a
+        reference minted for a namespace the token's `ns` claim does not name,
+        and every reference while the feature is off all answer the same
+        `404`.
+
+        **Rate limit and audit.** Every attempt is charged against its JWT
+        `sub`'s share of the lookup budget before the credential checks,
+        including one then refused with `403`; one `sub` may use at most half
+        of `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10, at
+        least 1) per second. Only an attempt whose credential carries the
+        `diagnostics:read` scope and an `ns` claim is also charged against the
+        global per-second budget, so refused credentials cannot exhaust it;
+        `429` with `Retry-After: 1` above either. Every `200` and `404` emits one WARN-level
+        `audit.event = "diagnostic_ref_lookup"` event naming the JWT subject,
+        the reference (or `malformed`), and the result; `403` and `429` events
+        are throttled to one per second each and carry
+        `suppressed_since_last`. `ferrum_diagnostic_ref_lookups_total{result}`
+        counts every attempt.
+
+        The response is versioned by `schema_version`. It never contains
+        request or response bodies, headers, paths, query strings,
+        credentials, client addresses, or raw error text.
+      tags: [Diagnostics]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: ref
+          in: path
+          required: true
+          description: The `X-Ferrum-Diagnostic-Ref` value.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Reference resolved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagnosticRefLookup"
+              examples:
+                connection_failure:
+                  summary: A DNS failure behind a `connection_failure` token
+                  value:
+                    schema_version: ferrum.diagnostic_ref.v1
+                    ref: fd1_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
+                    namespace: ferrum
+                    created_at: "2026-09-27T10:15:02.114Z"
+                    expires_at: "2026-09-27T10:30:02.114Z"
+                    protocol: http2
+                    status: 502
+                    gateway_error: connection_failure
+                    detail_available: true
+                    detail:
+                      error_class: dns_lookup_error
+                      body_error_class: null
+                      rejection_phase: null
+                      route_timeout_phase: null
+                      backend_dispatch: pre_wire_failure
+                      proxy_id: orders-api
+                      backend_target: "https://orders.internal:8443"
+                      duration_bucket: lt_100ms
+                      attempts:
+                        - attempt: 1
+                          backend_dispatch: pre_wire_failure
+                          error_class: dns_lookup_error
+                tls_retry:
+                  summary: A retried backend TLS verification failure
+                  value:
+                    schema_version: ferrum.diagnostic_ref.v1
+                    ref: fd1_8e2b4d6f0a1c3e5a7b9d1f3a5c7e9b0d
+                    namespace: ferrum
+                    created_at: "2026-09-27T10:16:40.502Z"
+                    expires_at: "2026-09-27T10:31:40.502Z"
+                    protocol: http1
+                    status: 502
+                    gateway_error: connection_failure
+                    detail_available: true
+                    detail:
+                      error_class: tls_error
+                      body_error_class: null
+                      rejection_phase: null
+                      route_timeout_phase: null
+                      backend_dispatch: pre_wire_failure
+                      proxy_id: payments-api
+                      backend_target: "https://payments.internal:8443"
+                      duration_bucket: lt_1s
+                      attempts:
+                        - attempt: 1
+                          backend_dispatch: backend_response
+                          status: 503
+                        - attempt: 2
+                          backend_dispatch: pre_wire_failure
+                          error_class: tls_error
+                          tls:
+                            failure: certificate_verification
+                            reason: expired
+                plugin_rejection:
+                  summary: An `all`-mode reference on a plugin `401`
+                  value:
+                    schema_version: ferrum.diagnostic_ref.v1
+                    ref: fd1_1a3c5e7f9b0d2f4a6c8e0b2d4f6a8c0e
+                    namespace: ferrum
+                    created_at: "2026-09-27T10:17:11.020Z"
+                    expires_at: "2026-09-27T10:32:11.020Z"
+                    protocol: http2
+                    status: 401
+                    gateway_error: null
+                    detail_available: true
+                    detail:
+                      error_class: null
+                      body_error_class: null
+                      rejection_phase: null
+                      route_timeout_phase: null
+                      backend_dispatch: not_dispatched
+                      proxy_id: orders-api
+                      backend_target: "https://orders.internal:8443"
+                      duration_bucket: lt_10ms
+                      rejection:
+                        source: plugin
+                        phase: authenticate
+                        plugin: key_auth
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            The admin JWT lacks the `diagnostics:read` scope or carries no `ns`
+            claim. The attempt still counts against the lookup rate limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: |
+            Malformed, unknown, expired, or evicted reference; a reference
+            outside the token's namespaces; or diagnostic references are off.
+            All cases answer identically.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: |
+            Lookup rate limit exceeded, globally or for this JWT `sub`; retry
+            after the indicated delay.
+          headers:
+            Retry-After:
+              description: Always `1`.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
   /node-waypoint/identities:
     get:
       operationId: getNodeWaypointIdentities
@@ -9833,6 +10025,28 @@ components:
             idle timer; multiplexed H3 connections with other active streams may
             stay open. Startup/reload warnings are logged only for affected proxies
             when an H3 WebSocket listener is actually reachable.
+        websocket_permessage_deflate:
+          type: string
+          enum: [strip, passthrough]
+          default: strip
+          description: |
+            RFC 7692 `permessage-deflate` handling for WebSocket upgrades on this
+            proxy (HTTP-family proxies only; stream proxies must use `strip`).
+
+            - `strip` (default): the client's `Sec-WebSocket-Extensions` offer
+              never reaches the backend and no extension is negotiated, so every
+              message stays inspectable by WebSocket frame plugins.
+            - `passthrough`: `permessage-deflate` offer elements reach the backend
+              unchanged and the backend's `permessage-deflate` answer reaches the
+              client unchanged on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+              Extended CONNECT. Every other extension token is still stripped. A
+              session that negotiates the extension is relayed as raw bytes, so
+              gateway WebSocket frame and fragment limits do not apply to it.
+              Refused (400) on a proxy with any plugin that requires the parsed
+              WebSocket relay (`waf`, `ws_frame_logging`,
+              `ws_message_size_limiting`, `ws_rate_limiting`, or a custom plugin
+              whose `requires_websocket_framing()` is true), whether attached
+              directly, through a proxy group, or inherited from a global plugin.
         udp_idle_timeout_seconds:
           type: integer
           format: uint64
@@ -9980,6 +10194,8 @@ components:
                 type: "null"
               response_body_mode:
                 const: stream
+              websocket_permessage_deflate:
+                const: strip
           else:
             anyOf:
               - required: [hosts]
@@ -37312,6 +37528,239 @@ components:
             class preserves that classification instead of downgrading
             it (the record is then intentionally stale).
 
+    DiagnosticRefLookup:
+      type: object
+      description: |
+        Versioned diagnostic reference detail (`schema_version`
+        `ferrum.diagnostic_ref.v1`). Additive fields may appear within a
+        schema version; a breaking change bumps it.
+      required:
+        - schema_version
+        - ref
+        - namespace
+        - created_at
+        - expires_at
+        - protocol
+        - status
+        - gateway_error
+        - detail_available
+        - detail
+      properties:
+        schema_version:
+          type: string
+          enum: [ferrum.diagnostic_ref.v1]
+        ref:
+          type: string
+          pattern: "^fd1_[0-9a-f]{32}$"
+          description: The resolved reference.
+        namespace:
+          type: string
+          description: Data-plane namespace of the gateway that minted the reference.
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: When the reference stops resolving (earlier if evicted).
+        protocol:
+          type: string
+          enum: [http1, http2, http3]
+          description: Client-facing protocol of the response that carried the reference.
+        status:
+          type: integer
+          minimum: 100
+          maximum: 599
+          description: Client-visible HTTP status of that response.
+        gateway_error:
+          type: [string, "null"]
+          enum:
+            - connection_failure
+            - backend_timeout
+            - backend_error
+            - circuit_breaker_open
+            - overload
+            - config_stale
+            - concurrency_limit
+            - request_timeout
+            - null
+          description: |
+            The public `X-Gateway-Error` token of that response, or `null` for
+            an `all`-mode reference on a gateway rejection that carries no
+            token.
+        detail_available:
+          type: boolean
+          description: |
+            `false` until the request's terminal transaction record exists (a
+            streamed response records it when its body ends), and, in `errors`
+            mode, for the gateway admission fences (overload, stale
+            configuration) that answer before a request context exists. In
+            `all` mode those fences and routing `404`s record their detail
+            before the response is written.
+        detail:
+          oneOf:
+            - $ref: "#/components/schemas/DiagnosticRefDetail"
+            - type: "null"
+    DiagnosticRefDetail:
+      type: object
+      description: |
+        Operator-only detail copied from the request's terminal transaction
+        record. Every string is a closed vocabulary or operator configuration.
+      required:
+        - error_class
+        - body_error_class
+        - rejection_phase
+        - route_timeout_phase
+        - backend_dispatch
+        - proxy_id
+        - backend_target
+        - duration_bucket
+      properties:
+        error_class:
+          type: [string, "null"]
+          description: |
+            Granular backend dispatch classification, as the access log names
+            it (for example `dns_lookup_error`, `connection_refused`,
+            `tls_error`, `read_write_timeout`).
+        body_error_class:
+          type: [string, "null"]
+          description: Classification of a failure while streaming the response body.
+        rejection_phase:
+          type: [string, "null"]
+          enum:
+            - circuit_breaker_open
+            - concurrency_limit
+            - overload
+            - config_stale
+            - null
+          description: Gateway rejection phase, when the gateway refused the request itself.
+        route_timeout_phase:
+          type: [string, "null"]
+          enum: [before_dispatch, dispatch, retry_backoff, null]
+          description: Phase of a route rule's total request deadline that produced a `504`.
+        backend_dispatch:
+          type: string
+          enum: [not_dispatched, pre_wire_failure, ambiguous_failure, backend_response]
+          description: Whether and how far the request reached a backend.
+        proxy_id:
+          type: [string, "null"]
+          description: ID of the matched proxy.
+        backend_target:
+          type: [string, "null"]
+          description: |
+            Backend origin (`scheme://host:port`) the request was dispatched
+            to. Userinfo, path, query, and fragment are removed.
+        duration_bucket:
+          type: string
+          enum: [lt_10ms, lt_100ms, lt_1s, lt_10s, ge_10s, unknown]
+          description: Coarse total request duration.
+        rejection:
+          $ref: "#/components/schemas/DiagnosticRefRejection"
+        attempts:
+          type: array
+          maxItems: 8
+          description: |
+            Every backend attempt the request made, in dispatch order: one for
+            each attempt a retry replaced and one for the attempt whose outcome
+            the client saw (issue #5846). At most 8 are listed; later ones are
+            counted in `attempts_omitted`. Absent when no backend was
+            attempted.
+          items:
+            $ref: "#/components/schemas/DiagnosticRefAttempt"
+        attempts_omitted:
+          type: integer
+          minimum: 1
+          description: Attempts made beyond the 8 listed. Absent when none were.
+    DiagnosticRefRejection:
+      type: object
+      description: |
+        The gateway policy or plugin that rejected the request (issue #5846).
+        Absent for a backend dispatch outcome. Every value is a compiled-in
+        label or a plugin type name, never request material.
+      required: [source, phase]
+      properties:
+        source:
+          type: string
+          enum: [plugin, gateway, routing]
+          description: |
+            `plugin` for a plugin hook rejection (authentication,
+            authorization, rate limiting, request validation, ...), `gateway`
+            for a gateway policy fence (allowed methods, connection limits,
+            circuit breaker, admission fences), `routing` for a request no
+            route matched.
+        phase:
+          type: string
+          maxLength: 64
+          description: |
+            Rejection phase or policy, for example `on_request_received`,
+            `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
+            `websocket_connection_limit`, `overload`, `route_not_found`, or
+            `mesh_registry_only`. Always one of the gateway's compiled-in
+            phase labels; any other phase is reported as `other`.
+        plugin:
+          type: string
+          maxLength: 64
+          description: |
+            Name of the rejecting plugin, when the phase that rejected knows
+            it. Absent otherwise.
+    DiagnosticRefAttempt:
+      type: object
+      description: One backend attempt of the request (issue #5846).
+      required: [attempt, backend_dispatch]
+      properties:
+        attempt:
+          type: integer
+          minimum: 1
+          description: 1-based attempt number; `1` is the first dispatch.
+        backend_dispatch:
+          type: string
+          enum: [pre_wire_failure, ambiguous_failure, backend_response]
+          description: How far this attempt reached the backend.
+        status:
+          type: integer
+          minimum: 100
+          maximum: 599
+          description: The backend's HTTP status. Present only for a `backend_response` attempt.
+        error_class:
+          type: string
+          description: Granular classification of a failed attempt (for example `tls_error`).
+        tls:
+          $ref: "#/components/schemas/DiagnosticRefTlsDetail"
+    DiagnosticRefTlsDetail:
+      type: object
+      description: |
+        Closed description of a backend TLS failure, taken from the typed TLS
+        error, on a `tls_error` attempt when it was available. Certificate
+        contents, names, and times are never included.
+      required: [failure]
+      properties:
+        failure:
+          type: string
+          enum:
+            - certificate_verification
+            - alert_received
+            - no_certificates_presented
+            - peer_incompatible
+            - peer_misbehaved
+            - invalid_message
+            - unexpected_message
+            - decrypt_error
+            - no_application_protocol
+            - invalid_crl
+            - other
+        reason:
+          type: string
+          description: |
+            For `certificate_verification`, the verification reason
+            (`expired`, `not_valid_yet`, `unknown_issuer`, `bad_signature`,
+            `not_valid_for_name`, `revoked`, `invalid_purpose`,
+            `unsupported_signature_algorithm`, `bad_encoding`,
+            `unhandled_critical_extension`, `unknown_revocation_status`,
+            `expired_revocation_list`, `invalid_ocsp_response`,
+            `application_verification_failure`, or `other`). For
+            `alert_received`, the TLS alert in snake case (`unknown_ca`,
+            `handshake_failure`, `bad_certificate`, `certificate_required`,
+            ..., or `other`). Absent for other failures.
     BackendCapabilitiesResponse:
       type: object
       required: [entries]

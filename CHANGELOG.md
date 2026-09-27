@@ -9,6 +9,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Diagnostic references for every gateway-authored error, with rejection and
+  per-attempt detail** (#5846). `FERRUM_DIAGNOSTIC_REFS` takes a new `all`
+  value: besides the responses `errors` already references (those carrying the
+  gateway's own `X-Gateway-Error`), plugin rejections (for example `key_auth`
+  `401`, `access_control` `403`, `rate_limiting` `429`), gateway policy fences,
+  and routing `404`s now carry an `X-Ferrum-Diagnostic-Ref`, including gRPC
+  Trailers-Only rejections, on HTTP/1.1, HTTP/2, and HTTP/3. A response is
+  referenced only when its rejection site recorded it, for the status the head
+  carries, before the head was written. A backend's own error response never
+  is, whether relayed to the client or replayed by a plugin (a
+  `response_caching` or `ai_semantic_cache` hit, a `request_deduplication`
+  replay, a `serverless_function` terminate reply, an `ai_federation` provider
+  response). Such a reference resolves with a `null` `gateway_error`. In both
+  modes the `GET /diagnostics/v1/refs/{ref}` detail gains an optional
+  `rejection` object (`source` `plugin`/`gateway`/`routing`, the rejecting
+  `phase` from a compiled-in set or `other`, and the `plugin` name when known)
+  and an optional `attempts` list: one entry per backend attempt actually sent,
+  retries included, with its dispatch outcome, backend status or granular
+  `error_class`, and for a TLS failure a closed `tls` object naming the
+  certificate verification reason (`expired`, `unknown_issuer`, ...) or the
+  received alert (`unknown_ca`, ...). At most 8 attempts are listed
+  (`attempts_omitted` counts the rest). Every value is a compiled-in label or a
+  plugin type name; bodies, headers, paths, credentials, certificate contents,
+  and raw error text are never recorded. `off` is unchanged and `errors`
+  references the same responses as before; its lookup bodies now also carry the
+  optional `attempts` list and, for a `5xx` rejection, the `rejection` object —
+  an additive change, and a detail with neither keeps its previous shape.
+  Lookup scope, namespace binding, uniform `404`s, and rate limits are
+  unchanged. The references are still resolvable only on the process that
+  minted them.
+
+- **Opt-in WebSocket `permessage-deflate` passthrough** (#5769). A new
+  per-proxy `websocket_permessage_deflate` field takes `strip` (default,
+  unchanged behavior) or `passthrough`. With `passthrough`, the client's RFC 7692
+  `permessage-deflate` offer and the backend's answer pass unchanged on
+  HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3 Extended CONNECT; every other
+  `Sec-WebSocket-Extensions` token is still stripped. A negotiated session is
+  relayed as raw bytes, so gateway frame-size and incomplete-message bounds do
+  not apply to it. Config validation refuses `passthrough` on stream proxies and
+  on any proxy where a plugin requiring the parsed WebSocket relay is effective
+  (`waf`, `ws_frame_logging`, `ws_message_size_limiting`, `ws_rate_limiting`, or
+  a custom plugin whose `requires_websocket_framing()` is true), whether
+  attached directly, through a proxy group, or inherited from a global plugin;
+  the runtime also keeps stripping the offer whenever the live chain needs
+  framing. SQL stores gain a `proxies.websocket_permessage_deflate` column in the
+  `V001` baseline schema. **Upgrade notes:** an existing SQLite, PostgreSQL, or
+  MySQL database created by v0.9.8 or earlier fails startup with a `V001`
+  checksum mismatch; recreate it and re-import its configuration. MongoDB is
+  unaffected. `Proxy` rejects unknown fields, so a DP that predates this field
+  rejects the whole namespace snapshot from a CP that sends it: upgrade every DP
+  before enabling `passthrough` on the CP.
+
+- Gateway-owned diagnostic references (#5767). With the new
+  `FERRUM_DIAGNOSTIC_REFS=errors` (default `off`), every HTTP/1.1, HTTP/2, and
+  HTTP/3 response that carries the gateway's own `X-Gateway-Error` token also
+  carries an opaque `X-Ferrum-Diagnostic-Ref: fd1_<32 hex>` header: 128 bits
+  from the process CSPRNG with no embedded cause, route, backend, or tenant.
+  An operator tool resolves it with the new admin
+  `GET /diagnostics/v1/refs/{ref}`, which requires an admin JWT carrying the
+  `diagnostics:read` scope and an `ns` claim. The versioned body
+  (`ferrum.diagnostic_ref.v1`) names the precise `error_class`, how far the
+  request reached a backend, the route-deadline or rejection phase, the
+  matched proxy, the backend origin, and a duration bucket. It never carries
+  bodies, headers, paths, credentials, or raw error text. A reference outside
+  the token's namespaces answers `404` like an unknown one. Every lookup
+  attempt, including one refused with `403`, is charged to its JWT `sub`'s
+  share (half of `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND`, default 10);
+  only an attempt whose credential passes the scope and `ns` checks also
+  spends the global budget, so refused credentials cannot lock out operators.
+  Every attempt is audit-logged (refused and rate-limited events throttled to
+  one per second). References live only in process
+  memory (roughly 0.5–1 KB each), bounded by
+  `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900) and
+  `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` (default 10000, oldest evicted first),
+  with four new `ferrum_diagnostic_ref*` families on `/metrics`. The public
+  eight-token `X-Gateway-Error` vocabulary is unchanged.
+
 - **Inbound PROXY protocol on the HTTP/HTTPS proxy listeners** (#5768). The
   new `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` and
   `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS` settings (`off` by default, or `v1`,
@@ -38,6 +115,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and HTTP/3 bodies without `Content-Length` are still caught. Rejections set
   `waf.block_reason=content_type`; recorded bodies set
   `waf.body_uninspected=content_type`.
+
+### Fixed
+
+- An HBONE relay that ends on a socket error now resets its HTTP/2 CONNECT
+  stream with `RST_STREAM(CONNECT_ERROR)` (RFC 9113 §8.5) instead of closing it
+  with a clean `END_STREAM` (#5781). This covers the byte-stream relay (for
+  example, a backend that resets the connection) and the datagram relay (a
+  `tunnel_read_error`, `tunnel_write_error`, `app_send_error`, or
+  `app_recv_error` ending). Before, the client could not tell a failed tunnel
+  from a normal close, and a truncated byte stream looked complete. A peer
+  close or idle expiry still ends the stream with `END_STREAM`. A byte-stream
+  failure after the backend's FIN was already relayed stays `END_STREAM`,
+  because the stream's send side has finished. Resetting an upgraded stream
+  needs a vendored hyper 1.9.0 (`vendor/hyper-1.9.0-ferrum-patched/`) that adds
+  `Upgraded::reset_with_connect_error()`; see
+  `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/`.
+- An HBONE relay cut short by a backend read or write deadline
+  (`backend_read_timeout_ms`, `backend_write_timeout_ms`) or by an
+  admission-fence revocation now also resets its CONNECT stream with
+  `RST_STREAM(CONNECT_ERROR)` instead of closing it with a clean `END_STREAM`
+  (#5858). Before, a backend that stalled mid-response, or a tunnel revoked
+  mid-stream, looked to the client like a complete byte stream. The datagram
+  relay also resets on a tunnel write stall and a revocation. The byte-stream
+  relay also resets when the TCP half-close cap
+  (`FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS`) expires: the cap runs from the
+  half-close regardless of activity, so it can cut a backend that is still
+  streaming its response. Only a peer close or an idle expiry still ends the
+  stream with `END_STREAM`.
+- With `FERRUM_DIAGNOSTIC_REFS=errors`, a response a plugin replayed or
+  relayed as origin content no longer gets an `X-Ferrum-Diagnostic-Ref`, even
+  when it carries an `X-Gateway-Error` token (#5860). For example, a
+  `response_caching` hit of a backend `502` stored because
+  `cacheable_status_codes` lists `502` is left unmarked, in `all` mode too.
+  The gateway's own error responses are referenced as before, on HTTP/1.1,
+  HTTP/2, gRPC, and HTTP/3.
+- A Gateway API listener port whose HTTP/3 (QUIC) task died now gets HTTP/3
+  back in the same reconcile pass (#5840). Before, the rebind could run before
+  the dead endpoint released its UDP socket. It then failed with
+  `Address already in use`, published an active `bind_failed` on the `quic`
+  half, and left HTTP/3 down until the next retry. The rebind now waits up to
+  2 seconds per reconcile pass for the socket to be released and retries
+  only that error. A socket still held after that is reported and retried as
+  before. The same wait applies when a dead or replaced TCP listener takes its
+  QUIC half with it.
+- A UDP port moving between a Gateway API listener's HTTP/3 (QUIC) half and a
+  UDP/DTLS stream proxy now changes hands in the reconcile that moves it
+  (#5843). Adding a UDP/DTLS stream proxy on a Gateway HTTPS port, or removing
+  one so that QUIC comes back, could fail with `Address already in use`. The
+  two listener managers reconcile the same config change concurrently, so one
+  side could bind before the other had released the socket. The stream proxy
+  then reported a `BindFailed` stream listener, or the QUIC half reported
+  `bind_failed`, until that manager's 30-second retry. Both managers now share
+  a record of the UDP ports their listeners' sockets hold. An entry lasts until
+  the socket actually closes, which can be after the listener task has ended:
+  QUIC connections and UDP/DTLS sessions keep the socket open until they
+  finish. A bind on a port that a Ferrum listener's socket holds, or closed in
+  the last second, retries that error. Each reconcile pass has a 2-second
+  budget for these retries, shared by its ports and started at its first such
+  collision, so a stream listener pass spends at most 2 seconds on them. A
+  Gateway pass also keeps the separate 2-second budget for QUIC halves it
+  retired itself (#5840), so one Gateway pass can spend up to about 4 seconds
+  in total. If the port is still held after that, the failure is reported as
+  before. It is then retried when the other side's socket on that same port
+  closes, rather than 30 seconds later, including when the socket closes while
+  a reconcile started by a config change is still running. A port owned by
+  anything outside Ferrum still fails on the first attempt, unless a Ferrum
+  listener held that port number within the last second. No socket options
+  change; two sockets never share the port.
+- Two orderings of that UDP port handoff no longer leave the port waiting for
+  the 30-second retry (#5851). First, a UDP/DTLS stream listener that closed
+  its socket during the Gateway listener manager's startup reconcile, or
+  before its supervisor started, was missed, so a QUIC half that startup pass
+  reported as `bind_failed` stayed down until the retry. The Gateway manager
+  now follows stream listener releases from the moment it is created. The
+  stream listener manager's first reconcile had the same gap for QUIC releases
+  and now starts its supervisor before its final release check. Second, a
+  stream listener's pass only checks that the port is free: its listener task
+  binds the socket afterwards, and a QUIC half could take the port in between
+  when config changed quickly. That task's bind failed after the pass had
+  already reported its failures, so nothing retried it. The task now retries
+  that bind the same way, with its own 2-second budget. A listener shut down
+  while it waits stops at once, so removing or replacing it is never delayed.
+- A UDP/DTLS stream listener whose own bind gave up after that 2-second budget
+  is retried as soon as the QUIC half on its port closes, even when the QUIC
+  socket closed just before the listener reported the failure (#5855). The
+  stream listener manager could judge that close before the failure was
+  recorded, so the port waited for the 30-second retry. The listener task now
+  checks for such a close after it records its failure and asks for a new
+  reconcile itself, which restarts the listener even if its task has not
+  finished exiting yet.
+
+### Security
+
+- `X-Ferrum-Diagnostic-Ref` is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS`
+  says (#5767): a backend or serverless-function copy, in the headers or the
+  trailers, is stripped at every backend response boundary, as
+  `X-Gateway-Error` already is (#5759), and a plugin- or hook-written copy is
+  stripped at the final client boundary, so neither a backend nor a plugin can
+  pre-seed or forge a reference.
+
+### Performance
+
+- **PROXY v1 header read on the HTTP/HTTPS proxy listeners and stream
+  proxies** (#5839). A listener with inbound PROXY protocol in `v1` or `auto`
+  mode, and a TCP stream proxy with `stream_proxy_protocol`, now peeks the v1
+  line and consumes it with one exact-length read, instead of one read per
+  byte (up to about 100 syscalls per connection). Only the header is consumed;
+  the TLS ClientHello, HTTP request, or stream payload that follows it is left
+  for the next reader. Size limit, 5-second deadline, and refusal behavior are
+  unchanged.
 
 ## [0.9.8] - 2026-09-27
 

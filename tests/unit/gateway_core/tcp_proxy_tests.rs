@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use ferrum_edge::_test_support::{
-    StreamIoSide, bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts,
-    classify_stream_error, classify_stream_setup_error, disconnect_cause_for_failure,
-    relay_failure_is_client_facing, tcp_fault_admission_retry_delays_for_test,
+    STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE, STREAM_RELAY_IDLE_TIMEOUT_MESSAGE, StreamIoSide,
+    bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts, classify_stream_error,
+    classify_stream_setup_error, disconnect_cause_for_failure, relay_failure_is_client_facing,
+    relay_failure_is_idle_expiry, tcp_fault_admission_retry_delays_for_test,
     tcp_fault_admission_should_cancel_for_test, tcp_stream_summary_from_clocks_for_test,
     wait_for_tcp_peer_reset_for_test,
 };
@@ -1848,6 +1849,121 @@ async fn test_backend_write_timeout_fires_on_stuck_backend() {
         "failure message should reflect inactivity, got: {}",
         msg
     );
+}
+
+/// Issue #5858: the HBONE byte-stream relay ends its CONNECT stream cleanly
+/// only on an idle expiry and resets it on every other timeout, so the relay's
+/// first failure must keep the four timeouts apart. The idle window and the
+/// half-close cap are both side-less `(Unknown, ReadWriteTimeout, None)` and
+/// differ only by their shared message constants; a backend read or write
+/// deadline always carries a direction and `Some(side)`. Only the idle window
+/// is an idle expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_relay_timeouts_keep_idle_expiry_apart_from_cap_and_deadlines() {
+    // Idle window: nothing moves in either direction.
+    let idle = bidirectional_copy_for_test(
+        NeverReadStream,
+        NeverReadStream,
+        Some(Duration::from_millis(500)),
+        None,
+        8 * 1024,
+    )
+    .await
+    .first_failure
+    .expect("idle expiry must produce first_failure");
+    assert_eq!(
+        idle,
+        (
+            Direction::Unknown,
+            ErrorClass::ReadWriteTimeout,
+            None,
+            STREAM_RELAY_IDLE_TIMEOUT_MESSAGE.to_string(),
+        )
+    );
+    assert!(relay_failure_is_idle_expiry(&idle));
+
+    // Half-close cap: the client half-closes and the backend keeps streaming,
+    // so the idle window never expires and only the cap can end the relay.
+    let (client, mut client_peer) = tokio::io::duplex(4096);
+    let (backend, mut backend_peer) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let _ = client_peer.write_all(b"REQUEST").await;
+        let _ = client_peer.shutdown().await;
+        let mut sink = Vec::new();
+        let _ = client_peer.read_to_end(&mut sink).await;
+    });
+    tokio::spawn(async move {
+        loop {
+            if backend_peer.write_all(b"chunk").await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let capped = bidirectional_copy_for_test(
+        client,
+        backend,
+        Some(Duration::from_secs(30)),
+        Some(Duration::from_millis(300)),
+        8 * 1024,
+    )
+    .await;
+    assert!(
+        capped.bytes_backend_to_client > 0,
+        "the backend must still have been streaming when the cap fired"
+    );
+    let cap = capped
+        .first_failure
+        .expect("half-close cap expiry must produce first_failure");
+    assert_eq!(
+        cap,
+        (
+            Direction::Unknown,
+            ErrorClass::ReadWriteTimeout,
+            None,
+            STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE.to_string(),
+        )
+    );
+    assert!(
+        !relay_failure_is_idle_expiry(&cap),
+        "the half-close cap can cut a live stream and is not an idle expiry"
+    );
+
+    // Backend read deadline: the backend stops producing bytes.
+    let read_deadline = bidirectional_copy_for_test_with_timeouts(
+        NeverReadStream,
+        NeverReadStream,
+        None,
+        None,
+        Some(Duration::from_millis(500)),
+        None,
+        8 * 1024,
+    )
+    .await
+    .first_failure
+    .expect("backend read deadline must produce first_failure");
+    assert_eq!(read_deadline.0, Direction::BackendToClient);
+    assert_eq!(read_deadline.1, ErrorClass::ReadWriteTimeout);
+    assert_eq!(read_deadline.2, Some(StreamIoSide::Read));
+    assert!(!relay_failure_is_idle_expiry(&read_deadline));
+
+    // Backend write deadline: the backend stops draining.
+    let write_deadline = bidirectional_copy_for_test_with_timeouts(
+        NeverWriteStream,
+        NeverWriteStream,
+        None,
+        None,
+        None,
+        Some(Duration::from_millis(500)),
+        8 * 1024,
+    )
+    .await
+    .first_failure
+    .expect("backend write deadline must produce first_failure");
+    assert_eq!(write_deadline.0, Direction::ClientToBackend);
+    assert_eq!(write_deadline.1, ErrorClass::ReadWriteTimeout);
+    assert_eq!(write_deadline.2, Some(StreamIoSide::Write));
+    assert!(!relay_failure_is_idle_expiry(&write_deadline));
 }
 
 /// When backend timeouts are enabled but no traffic flows, the read timeout

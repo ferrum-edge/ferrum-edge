@@ -2,7 +2,7 @@
 //!
 //! Ferrum Edge carries vendored, patched copies of upstream crates under
 //! `vendor/**` (sqlx-core, reqwest, h3, h3-quinn, tungstenite,
-//! tokio-tungstenite, dimpl, hyper-util — see `docs/dependency-policy.md` and
+//! tokio-tungstenite, dimpl, hyper-util, hyper — see `docs/dependency-policy.md` and
 //! `docs/upstream-*-patches/`). Those copies are
 //! a supply-chain surface: any byte of them ships in the binary. This test pins
 //! their contents to a committed manifest so vendored code cannot drift beyond

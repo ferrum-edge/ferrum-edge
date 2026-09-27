@@ -1991,6 +1991,7 @@ pub async fn run(
                             client_crls: h3_client_crls,
                             started_tx: Some(h3_started_tx),
                             frontend_tls_reload: h3_reload,
+                            udp_port_hold: None,
                         },
                     )
                     .await

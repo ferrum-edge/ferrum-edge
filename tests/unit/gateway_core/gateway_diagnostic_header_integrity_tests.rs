@@ -1,7 +1,8 @@
 //! Integrity of the gateway-owned client diagnostic surface.
 //!
-//! * `X-Gateway-Error` and `X-Gateway-Upstream-Status` are gateway-owned
-//!   (#5759): one shared list names them, every backend response boundary
+//! * `X-Gateway-Error`, `X-Gateway-Upstream-Status` (#5759), and
+//!   `X-Ferrum-Diagnostic-Ref` (#5767) are gateway-owned: one shared list
+//!   names them, every backend response boundary
 //!   (reqwest / direct hyper / native gRPC, native HTTP/3, the HTTP/3 bridge,
 //!   and every trailer section) drops a backend-supplied copy, and the final
 //!   client wire sanitizer still keeps the gateway's own values.
@@ -37,7 +38,11 @@ use ferrum_edge::retry::{
     intern_http_observability_error_class,
 };
 
-const GATEWAY_OWNED: [&str; 2] = ["x-gateway-error", "x-gateway-upstream-status"];
+const GATEWAY_OWNED: [&str; 3] = [
+    "x-gateway-error",
+    "x-gateway-upstream-status",
+    "x-ferrum-diagnostic-ref",
+];
 
 /// A backend response head that forges both gateway-owned fields beside an
 /// ordinary application header.
@@ -47,6 +52,10 @@ fn forged_backend_headers() -> http::HeaderMap {
     headers.insert("x-app", "kept".parse().unwrap());
     headers.insert("x-gateway-error", "backend_error".parse().unwrap());
     headers.insert("x-gateway-upstream-status", "degraded".parse().unwrap());
+    headers.insert(
+        "x-ferrum-diagnostic-ref",
+        "fd1_00000000000000000000000000000000".parse().unwrap(),
+    );
     headers
 }
 
@@ -124,6 +133,10 @@ fn forged_trailers() -> Vec<(&'static str, &'static str)> {
         ("grpc-status", "0"),
         ("x-gateway-error", "backend_timeout"),
         ("x-gateway-upstream-status", "degraded"),
+        (
+            "x-ferrum-diagnostic-ref",
+            "fd1_00000000000000000000000000000000",
+        ),
         ("x-keep", "yes"),
     ]
 }
@@ -186,6 +199,7 @@ fn grpc_web_trailer_frame_never_carries_forged_diagnostics() {
         assert_eq!(status, 0);
         assert!(frame.contains("x-keep: yes"), "{frame}");
         assert!(!frame.contains("x-gateway-"), "{frame}");
+        assert!(!frame.contains("x-ferrum-diagnostic-ref"), "{frame}");
     }
 }
 

@@ -58,6 +58,7 @@ use crate::proxy::headers::{
     sanitize_backend_request_trailers, sanitize_client_response_headers_for_wire,
     strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
 };
+use crate::proxy::udp_port_handoff::UdpPortHold;
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
     log_pre_backend_rejected_request, log_rejected_request, log_rejected_request_with_path,
@@ -380,6 +381,12 @@ pub struct Http3ListenerOptions {
     /// cert won't bind to QUIC) keeps the previous server config and emits a
     /// `warn!`.
     pub frontend_tls_reload: Option<Http3FrontendTlsReload>,
+    /// The Gateway listener's claim on this port in the in-process UDP port
+    /// ledger (issue #5843). Armed as soon as the UDP bind succeeds and then
+    /// owned by the socket Quinn shares with its endpoint driver and every
+    /// connection, so it is released when that socket closes rather than when
+    /// the listener returns. `None` for listeners outside the ledger.
+    pub udp_port_hold: Option<UdpPortHold>,
 }
 
 /// Frontend TLS live-reload inputs for the H3 listener. This may be populated
@@ -441,6 +448,7 @@ pub async fn start_http3_listener(
             client_crls,
             started_tx: None,
             frontend_tls_reload: None,
+            udp_port_hold: None,
         },
     )
     .await
@@ -947,6 +955,130 @@ where
     }
 }
 
+/// Bind the UDP socket for an HTTP/3 listener and build its Quinn endpoint.
+///
+/// Quinn's `Endpoint::server` convenience constructor is gated on its `ring`
+/// or non-FIPS `aws-lc-rs` feature. The FIPS provider uses the distinct
+/// `aws-lc-rs-fips` feature, so the same endpoint is constructed explicitly
+/// instead of making listener availability depend on a non-validated provider
+/// feature being compiled too.
+///
+/// A Gateway listener's `udp_port_hold` (issue #5843) is armed as soon as the
+/// bind succeeds and handed to Quinn inside the socket itself, see
+/// [`PortHeldUdpSocket`].
+fn bind_h3_endpoint(
+    addr: SocketAddr,
+    server_config: Option<quinn::ServerConfig>,
+    udp_port_hold: Option<UdpPortHold>,
+) -> Result<quinn::Endpoint, anyhow::Error> {
+    let socket = std::net::UdpSocket::bind(addr)?;
+    if let Some(hold) = &udp_port_hold {
+        hold.arm();
+    }
+    socket.set_nonblocking(true)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
+    let config = quinn::EndpointConfig::default();
+    let Some(port_hold) = udp_port_hold else {
+        let endpoint = quinn::Endpoint::new(config, server_config, socket, runtime)?;
+        return Ok(endpoint);
+    };
+    let socket: Arc<dyn quinn::AsyncUdpSocket> = Arc::new(PortHeldUdpSocket {
+        inner: runtime.wrap_udp_socket(socket)?,
+        port_hold,
+    });
+    let endpoint =
+        quinn::Endpoint::new_with_abstract_socket(config, server_config, socket, runtime)?;
+    Ok(endpoint)
+}
+
+/// Quinn's UDP socket for a Gateway listener's HTTP/3 half, carrying that
+/// listener's claim on the port in the in-process UDP port ledger (issue
+/// #5843).
+///
+/// Quinn shares the socket between the endpoint state, which its separately
+/// spawned driver drops only after it observes the last `Endpoint` handle go
+/// away, and every live connection. The listener task returning therefore says
+/// nothing about when the socket closes. Owning the claim here releases it
+/// only when Quinn drops its last reference and the socket closes, so the
+/// stream listener manager treats a collision on the port as a pending handoff
+/// for exactly as long as it can still collide.
+///
+/// Every poller handed out keeps this wrapper alive, so no clone of the inner
+/// socket outlives it. Each method delegates unchanged.
+struct PortHeldUdpSocket {
+    // Declared first: fields drop in order, so the socket closes before the
+    // claim is released.
+    inner: Arc<dyn quinn::AsyncUdpSocket>,
+    port_hold: UdpPortHold,
+}
+
+impl std::fmt::Debug for PortHeldUdpSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortHeldUdpSocket")
+            .field("inner", &self.inner)
+            .field("port_hold", &self.port_hold)
+            .finish()
+    }
+}
+
+impl quinn::AsyncUdpSocket for PortHeldUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+        let inner = Arc::clone(&self.inner).create_io_poller();
+        Box::pin(PortHeldUdpPoller {
+            inner,
+            _socket: self,
+        })
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
+        self.inner.try_send(transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
+
+/// Write-readiness poller for [`PortHeldUdpSocket`]. The inner poller holds a
+/// clone of the inner socket, so it keeps the wrapper (and with it the claim)
+/// alive for as long as that clone exists.
+#[derive(Debug)]
+struct PortHeldUdpPoller {
+    inner: std::pin::Pin<Box<dyn quinn::UdpPoller>>,
+    _socket: Arc<PortHeldUdpSocket>,
+}
+
+impl quinn::UdpPoller for PortHeldUdpPoller {
+    fn poll_writable(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_writable(cx)
+    }
+}
+
 /// Start the HTTP/3 listener and optionally emit a startup signal after bind.
 pub async fn start_http3_listener_with_signal(
     addr: SocketAddr,
@@ -962,6 +1094,7 @@ pub async fn start_http3_listener_with_signal(
         client_crls,
         started_tx,
         frontend_tls_reload,
+        udp_port_hold,
     } = options;
 
     // DP mode binds the H3 socket while it waits for CP to deliver frontend TLS
@@ -1007,12 +1140,7 @@ pub async fn start_http3_listener_with_signal(
     };
 
     let (endpoint, adopted_quic) = if start_disabled {
-        let socket = std::net::UdpSocket::bind(addr)?;
-        socket.set_nonblocking(true)?;
-        let runtime = quinn::default_runtime()
-            .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
-        let endpoint =
-            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
+        let endpoint = bind_h3_endpoint(addr, None, udp_port_hold)?;
         info!("HTTP/3 listener started disabled until frontend TLS material is available");
         (
             endpoint,
@@ -1032,26 +1160,17 @@ pub async fn start_http3_listener_with_signal(
             client_trust_reload_active,
             &h3_config,
         )?;
-        // Quinn's `Endpoint::server` convenience constructor is gated on its
-        // `ring` or non-FIPS `aws-lc-rs` feature. The FIPS provider uses the
-        // distinct `aws-lc-rs-fips` feature, so construct the same endpoint
-        // explicitly instead of making listener availability depend on a
-        // non-validated provider feature being compiled too.
-        let socket = std::net::UdpSocket::bind(addr)?;
-        socket.set_nonblocking(true)?;
-        let runtime = quinn::default_runtime()
-            .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
-        // Fallible bind/build is done. When this scope will be armed, bind the
-        // endpoint without a serving config, then expose `set_server_config`
-        // inside the rustls transaction so verifier, served config, and
-        // generation cannot interleave with a concurrent reload. Binding with
-        // `None` refuses handshakes until that transaction runs — fail-closed,
-        // not a certificate-less serving config.
+        // When this scope will be armed, bind the endpoint without a serving
+        // config, then expose `set_server_config` inside the rustls
+        // transaction so verifier, served config, and generation cannot
+        // interleave with a concurrent reload. Binding with `None` refuses
+        // handshakes until that transaction runs — fail-closed, not a
+        // certificate-less serving config.
         let arm_client_trust =
             client_trust_reload_active && startup_client_trust.verifier.is_some();
+        let bind_server_config = (!arm_client_trust).then(|| server_config.clone());
+        let endpoint = bind_h3_endpoint(addr, bind_server_config, udp_port_hold)?;
         if arm_client_trust {
-            let endpoint =
-                quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
             let adopted_quic = Arc::new(arc_swap::ArcSwap::from_pointee(
                 None::<Arc<quinn::ServerConfig>>,
             ));
@@ -1069,15 +1188,8 @@ pub async fn start_http3_listener_with_signal(
             }
             (endpoint, adopted_quic)
         } else {
-            let adopted_quic = Arc::new(arc_swap::ArcSwap::from_pointee(Some(Arc::new(
-                server_config.clone(),
-            ))));
-            let endpoint = quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
-                Some(server_config),
-                socket,
-                runtime,
-            )?;
+            let server_config = Arc::new(server_config);
+            let adopted_quic = Arc::new(arc_swap::ArcSwap::from_pointee(Some(server_config)));
             (endpoint, adopted_quic)
         }
     };
@@ -2192,7 +2304,7 @@ async fn handle_h3_connection(
                     };
                     match resolved {
                         Ok((req, stream)) => {
-                            if let Err(e) = handle_h3_request(
+                            let request = handle_h3_request(
                                 req,
                                 stream,
                                 state,
@@ -2209,9 +2321,14 @@ async fn handle_h3_connection(
                                 peer_connection,
                                 stream_client_trust,
                                 stream_shutdown,
-                            )
-                            .await
-                            {
+                            );
+                            tokio::pin!(request);
+                            // Gateway diagnostic references (issue #5767): the
+                            // request task carries its slot so every response
+                            // head written deep inside it is stamped. A
+                            // pass-through when the store is off (the default).
+                            let result = crate::diagnostic_ref::run_h3_request(request).await;
+                            if let Err(e) = result {
                                 error!("HTTP/3 request error: {}", e);
                             }
                         }
@@ -2548,6 +2665,9 @@ async fn handle_h3_request(
     // Carry the operator's response-body ceiling so the buffered representation
     // gate bounds its decompression by the same limit the wire path enforces.
     ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
+    // The task-scoped diagnostic-reference slot (issue #5767), so the terminal
+    // transaction log can record the detail this request's reference names.
+    ctx.set_diagnostic_slot(crate::diagnostic_ref::current_h3_slot());
     let mut request_scheme = "https";
     ctx.request_is_secure = true;
     ctx.metadata
@@ -3089,6 +3209,16 @@ async fn handle_h3_request(
             (rm.proxy, rm.matched_prefix_len)
         }
         None => {
+            crate::diagnostic_ref::record_route_miss(
+                ctx.diagnostic_slot(),
+                crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE,
+                start_time,
+                h3_error_head_status(
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    StatusCode::NOT_FOUND,
+                ),
+            );
             record_h3_flavor_aware_reject(&state, http_flavor, 404);
             send_h3_error_flavor_aware(
                 &mut stream,
@@ -3433,6 +3563,7 @@ async fn handle_h3_request(
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     tracing::error!("Plugin result could not be converted to rejection parts");
                     run_h3_reject_response_committed_hooks(
@@ -3912,6 +4043,7 @@ async fn handle_h3_request(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
+                    crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
                         run_h3_reject_response_committed_hooks(
@@ -7073,6 +7205,13 @@ async fn handle_h3_request(
                 error!("Backend request failed (HTTP/3 streaming body): {}", e);
                 let h3_error_class = classify_h3_error(&e);
                 ctx.record_backend_dispatch_outcome(Some(h3_error_class), e.request_on_wire());
+                if h3_error_class == crate::retry::ErrorClass::TlsError {
+                    crate::diagnostic_ref::note_backend_tls_failure(
+                        ctx.diagnostic_slot(),
+                        e.as_error().as_ref(),
+                    );
+                }
+                ctx.record_backend_attempt(Some(h3_error_class), e.request_on_wire(), None);
                 crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
                 let is_client_request_body_disconnect =
                     is_h3_client_request_body_disconnect(&err_msg);
@@ -8883,6 +9022,12 @@ async fn handle_h3_request(
         // candidate for outcome/logging attribution, but nothing served this
         // response, so it must not become a sticky-affinity binding.
         let mut sticky_dispatch_refused = false;
+        // Diagnostic reference detail (issue #5846): set once the retry loop
+        // has recorded the attempt behind `result`, and cleared by every retry
+        // dispatch, so a loop that ends without dispatching again (a backoff
+        // deadline, a refused rotated target) records no attempt that was
+        // never sent.
+        let mut last_attempt_recorded = false;
         let (
             mut response_status,
             response_body,
@@ -9109,6 +9254,14 @@ async fn handle_h3_request(
                     }
                 }
 
+                // Diagnostic reference detail (issue #5846): this attempt is
+                // settled and a retry replaces it.
+                ctx.record_backend_attempt(
+                    result.error_class,
+                    result.request_on_wire,
+                    Some(result.status),
+                );
+                last_attempt_recorded = true;
                 // Backoff spends the route's total budget too; its expiry here
                 // is the health-neutral route timeout (#5646).
                 let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -9359,6 +9512,7 @@ async fn handle_h3_request(
                     Ok(result) => result,
                     Err(expiry) => h3_route_deadline_buffered_result(&mut ctx, expiry),
                 };
+                last_attempt_recorded = false;
             }
 
             (
@@ -9436,6 +9590,9 @@ async fn handle_h3_request(
             sticky_dispatch_refused = true;
         }
         ctx.record_backend_dispatch_outcome(h3_error_class, h3_request_on_wire);
+        if !last_attempt_recorded {
+            ctx.record_backend_attempt(h3_error_class, h3_request_on_wire, Some(response_status));
+        }
         // Record outcome against the final target (may differ from initial after retries).
         // `connection_error` shares the same typed body-on-wire signal as the
         // retry decision and CB above so passive-health / least-latency LB
@@ -10012,6 +10169,7 @@ async fn handle_h3_request(
                 &response_body,
             );
         }
+        let resp = crate::diagnostic_ref::stamp_h3_response(resp);
         let response_headers_sent = await_buffered_h3_write!(stream.send_response(resp));
         if response_headers_sent
             && !response_body.is_empty()
@@ -10366,6 +10524,11 @@ async fn run_h3_backend_admission_or_send_reject(
                 )
             };
             record_request(state, log_status_code);
+            crate::diagnostic_ref::record_admission_rejection(
+                ctx,
+                &rejection.plugin_name,
+                log_status_code,
+            );
             log_rejected_request(
                 plugins,
                 ctx,
@@ -14376,6 +14539,7 @@ async fn dispatch_grpc_native_h3(
         grpc_deadline_at,
         auth_deadline_plan,
     );
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     let response_header_write = crate::http3::stream_util::await_response_write_before_deadline(
         response_header_write_bound.deadline(),
         send_half.send_response(resp),
@@ -16924,6 +17088,7 @@ async fn send_h3_response_with_recv_halt(
         .header("content-type", "application/json")
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     stream
         .send_data(Bytes::copy_from_slice(body.as_bytes()))
@@ -17151,6 +17316,7 @@ async fn send_h3_pre_sanitized_reject_response_with_recv_halt(
     let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 reject response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     // Callers that flow through `apply_reject_after_proxy_and_synthetic_body_hooks`
     // already applied shared HEAD/204/205/304 no-body preparation. Skip DATA
@@ -17847,6 +18013,7 @@ async fn send_h3_aggregate_sse_response(
     let deadline = aggregate_sse_bound.deadline().unwrap_or(body.deadline());
     let auth_latch = ctx.authorization_termination_latch();
     let auth_family = crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http;
+    let response = crate::diagnostic_ref::stamp_h3_response(response);
 
     let (headers_write, head_offered) =
         crate::http3::stream_util::await_offered_authorized_headers_write(
@@ -18050,6 +18217,7 @@ where
     let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC error response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     stream.finish().await?;
     Ok(())
@@ -18578,6 +18746,7 @@ where
             let framed_body = framed_body.clone();
             let resp = h3_framed_unary_initial_response(&normalized.headers)
                 .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC framed reject: {}", e))?;
+            let resp = crate::diagnostic_ref::stamp_h3_response(resp);
             stream.send_response(resp).await?;
             stream.send_data(framed_body).await?;
             let trailers =
@@ -18681,6 +18850,7 @@ where
     let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC reject response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     stream.finish().await?;
     Ok(())
@@ -18936,6 +19106,20 @@ fn record_request(state: &ProxyState, status: u16) {
             .fetch_add(1, Ordering::Relaxed);
     }
     crate::runtime_metrics::global_ref().record_http_status(status);
+}
+
+/// HTTP status of the head [`send_h3_error_flavor_aware`] writes: a gRPC or
+/// gRPC-Web error answers `200` carrying its `grpc-status`.
+fn h3_error_head_status(
+    flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
+    http_status: StatusCode,
+) -> u16 {
+    if grpc_web_response_content_type.is_some() || matches!(flavor, HttpFlavor::Grpc) {
+        StatusCode::OK.as_u16()
+    } else {
+        http_status.as_u16()
+    }
 }
 
 /// Record the HTTP status actually emitted by a flavor-aware H3 rejection.
