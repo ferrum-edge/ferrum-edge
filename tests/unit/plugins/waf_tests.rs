@@ -2548,6 +2548,7 @@ fn rendered_waf_enforcement_rejection_keeps_all_fixed_remedies() {
             "enable anomaly scoring over an inspected HTTP rule",
             "enable a stream enforcement rule",
             "set `on_body_too_large` to `block` on an inspected body surface",
+            "set `on_unlisted_content_type` to `block` with request-body inspection on",
         ] {
             assert!(rendered.contains(expected), "{rendered}");
         }
