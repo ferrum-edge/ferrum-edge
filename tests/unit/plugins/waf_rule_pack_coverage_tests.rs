@@ -621,7 +621,8 @@ async fn php_and_node_code_injection_are_detected() {
     // PHP reads its own request body through `php://input`.
     let php_source: &[u8] = br#"{"source":"<?php echo 'hi'; ?>"}"#;
     let node_source: &[u8] = br#"{"source":"const cp = require('child_process');"}"#;
-    let php_wrapper_source: &[u8] = br#"{"source":"$raw = file_get_contents('php://input'); $t = fopen('php://temp', 'r+');"}"#;
+    let php_wrapper_source: &[u8] =
+        br#"{"source":"$raw = file_get_contents('php://input'); $t = fopen('php://temp', 'r+');"}"#;
     let phar_value: &[u8] = br#"{"template":"phar://uploads/x.jpg/y"}"#;
     assert_clean(&level_one, "FE-PHP-001-B", Surface::Body(JSON, php_source)).await;
     for body in [php_wrapper_source, phar_value] {
