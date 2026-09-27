@@ -833,6 +833,8 @@ impl GatewayListenerManager {
         &self,
         expected: &crate::request_epoch::RequestEpoch,
     ) -> ReconcileOutcome {
+        let quic_rebind_deadline =
+            tokio::time::Instant::now() + RETIRED_QUIC_SOCKET_RELEASE_BUDGET;
         let config = expected.config();
         let plan = GatewayListenerPlan::from_config(
             config,
@@ -1120,6 +1122,7 @@ impl GatewayListenerManager {
                         listener,
                         expected.config_generation,
                         quic_retired.contains(port),
+                        quic_rebind_deadline,
                     )
                     .await
                 {
@@ -1162,6 +1165,7 @@ impl GatewayListenerManager {
                             &mut listener,
                             expected.config_generation,
                             quic_retired.contains(port),
+                            quic_rebind_deadline,
                         )
                         .await
                     {
@@ -1379,18 +1383,19 @@ impl GatewayListenerManager {
         listener: &mut LiveListener,
         expected_generation: u64,
         quic_retired: bool,
+        deadline: tokio::time::Instant,
     ) -> Option<GatewayListenerBindFailure> {
         if !quic_retired {
             return self.ensure_quic(port, listener, expected_generation).await;
         }
-        let deadline = tokio::time::Instant::now() + RETIRED_QUIC_SOCKET_RELEASE_BUDGET;
         let mut backoff = RETIRED_QUIC_SOCKET_RELEASE_INITIAL_BACKOFF;
         loop {
             let failure = self.start_quic(port, listener, expected_generation).await?;
             // A newer epoch supersedes this pass; `reconcile` discards its
             // outcome and reconciles again, so waiting here buys nothing.
             let stale = self.state.request_epoch.load().config_generation != expected_generation;
-            if !failure.addr_in_use || stale || tokio::time::Instant::now() + backoff > deadline {
+            let now = tokio::time::Instant::now();
+            if !failure.addr_in_use || stale || now >= deadline || now + backoff >= deadline {
                 return Some(failure.report());
             }
             let error = &failure.failure.error;
@@ -2494,15 +2499,21 @@ mod tests {
                 }
             }
         };
-        // Release the port from a plain OS thread, well inside the rebind's
-        // release budget but after its first attempt has collided with it.
+        // Release the port from a plain OS thread, well inside the pass-wide
+        // rebind budget but after its first attempt has collided with it.
         let releaser = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(std::time::Duration::from_millis(350));
             drop(occupied);
         });
 
+        let reconcile_started = std::time::Instant::now();
         let failures = manager.reconcile().await;
+        let reconcile_elapsed = reconcile_started.elapsed();
         releaser.join().expect("releaser thread");
+        assert!(
+            reconcile_elapsed >= std::time::Duration::from_millis(300),
+            "reconcile returned before the held socket was released: {reconcile_elapsed:?}"
+        );
         assert!(
             failures.iter().any(|failure| {
                 failure.port == port

@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the dead endpoint released its UDP socket. It then failed with
   `Address already in use`, published an active `bind_failed` on the `quic`
   half, and left HTTP/3 down until the next retry. The rebind now waits up to
-  2 seconds for the socket to be released and retries only that error. A socket
-  still held after that is reported and retried as before. The same wait
-  applies when a dead or replaced TCP listener takes its QUIC half with it.
+  2 seconds per reconcile pass for the socket to be released and retries
+  only that error. A socket still held after that is reported and retried as
+  before. The same wait applies when a dead or replaced TCP listener takes its
+  QUIC half with it.
 
 ## [0.9.8] - 2026-09-27
 
