@@ -833,8 +833,7 @@ impl GatewayListenerManager {
         &self,
         expected: &crate::request_epoch::RequestEpoch,
     ) -> ReconcileOutcome {
-        let quic_rebind_deadline =
-            tokio::time::Instant::now() + RETIRED_QUIC_SOCKET_RELEASE_BUDGET;
+        let quic_rebind_deadline = tokio::time::Instant::now() + RETIRED_QUIC_SOCKET_RELEASE_BUDGET;
         let config = expected.config();
         let plan = GatewayListenerPlan::from_config(
             config,
