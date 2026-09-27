@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed, or covers a whole address family while a listener enables the
   setting.
 
+### Fixed
+
+- A Gateway API listener port whose HTTP/3 (QUIC) task died now gets HTTP/3
+  back in the same reconcile pass (#5840). Before, the rebind could run before
+  the dead endpoint released its UDP socket. It then failed with
+  `Address already in use`, published an active `bind_failed` on the `quic`
+  half, and left HTTP/3 down until the next retry. The rebind now waits up to
+  2 seconds per reconcile pass for the socket to be released and retries
+  only that error. A socket still held after that is reported and retried as
+  before. The same wait applies when a dead or replaced TCP listener takes its
+  QUIC half with it.
+
 ### Performance
 
 - **PROXY v1 header read on the HTTP/HTTPS proxy listeners** (#5839). A
