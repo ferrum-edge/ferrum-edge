@@ -48,13 +48,6 @@ use ferrum_edge::proxy::{
 };
 use ferrum_edge::tls::SharedFrontendTls;
 
-#[path = "../../scaffolding/port_registry.rs"]
-#[allow(dead_code)] // shared allocator; this target uses only the lease API
-mod port_registry;
-#[allow(dead_code)]
-#[path = "../../scaffolding/ports.rs"]
-mod ports;
-
 /// Upper bound for any single expected outcome. The header deadline is 5s, so
 /// a stalled-header close must land inside this window too.
 const WINDOW: Duration = Duration::from_secs(10);
@@ -687,10 +680,14 @@ async fn start_dynamic_tls_gateway(
     let slot: SharedFrontendTls = Arc::new(ArcSwap::new(Arc::new(Some(tls_config))));
 
     for attempt in 1..=5 {
-        let port = ports::reserve_port()
+        let reservation = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("reserve proxy port")
-            .drop_and_take_port();
+            .expect("reserve proxy port");
+        let port = reservation
+            .local_addr()
+            .expect("reserved proxy address")
+            .port();
+        drop(reservation);
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
