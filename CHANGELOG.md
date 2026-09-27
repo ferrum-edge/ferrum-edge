@@ -58,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   within the last second. No socket options change; two sockets never share
   the port.
 
+### Performance
+
+- **PROXY v1 header read on the HTTP/HTTPS proxy listeners and stream
+  proxies** (#5839). A listener with inbound PROXY protocol in `v1` or `auto`
+  mode, and a TCP stream proxy with `stream_proxy_protocol`, now peeks the v1
+  line and consumes it with one exact-length read, instead of one read per
+  byte (up to about 100 syscalls per connection). Only the header is consumed;
+  the TLS ClientHello, HTTP request, or stream payload that follows it is left
+  for the next reader. Size limit, 5-second deadline, and refusal behavior are
+  unchanged.
+
 ## [0.9.8] - 2026-09-27
 
 ### Changed
