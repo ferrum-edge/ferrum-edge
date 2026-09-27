@@ -28,7 +28,7 @@ use ferrum_edge::proxy::stream_listener::{
     NodeWaypointUdpSteerHold, StreamListenerDegradation, StreamListenerManager,
 };
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
-use ferrum_edge::proxy::udp_port_handoff::{UDP_PORT_HANDOFF_BUDGET, UdpPortOwner};
+use ferrum_edge::proxy::udp_port_handoff::{UDP_PORT_HANDOFF_BUDGET, UdpPortHandoff, UdpPortOwner};
 use ferrum_edge::request_epoch::RequestEpochStore;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -1305,20 +1305,27 @@ async fn udp_listener_bind_waits_for_an_in_process_udp_port_handoff() {
         .hold(port, UdpPortOwner::GatewayQuic);
     hold.arm();
 
-    // Release from a plain OS thread, well inside the budget but after the
-    // first bind attempt collided. The flag is raised before the socket goes,
-    // so reconcile never observes a successful bind in the gap between the two.
+    // Release from a plain OS thread only once a bind attempt has collided
+    // with the held socket and been classified as a handoff, so the retry path
+    // is what binds the port. The flag is raised before the socket goes, so
+    // reconcile never observes a successful bind in the gap between the two.
+    let ledger = Arc::clone(manager.udp_port_handoff());
     let released = Arc::new(AtomicBool::new(false));
     let releaser_released = released.clone();
     let releaser = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(350));
+        let collided = wait_for_handoff_retry(&ledger);
         releaser_released.store(true, Ordering::SeqCst);
         drop(occupied);
         drop(hold);
+        collided
     });
 
     let failures = manager.reconcile().await;
-    releaser.join().expect("releaser thread");
+    let collided = releaser.join().expect("releaser thread");
+    assert!(
+        collided,
+        "the UDP bind must have collided with the held socket and retried"
+    );
     assert!(
         failures.is_empty(),
         "a socket released within the budget must not surface as a bind failure: {failures:?}"
@@ -1365,6 +1372,10 @@ async fn udp_listener_bind_reports_a_still_held_handoff_port_after_the_budget() 
     assert_eq!(failures[0].1, port);
     assert!(failures[0].2.contains("already in use"), "{failures:?}");
     assert!(
+        manager.udp_port_handoff().handoff_retries() >= 1,
+        "the collision must have been classified as a handoff"
+    );
+    assert!(
         elapsed >= UDP_PORT_HANDOFF_BUDGET / 2,
         "the collision must have been retried within the budget, returned after {elapsed:?}"
     );
@@ -1378,6 +1389,56 @@ async fn udp_listener_bind_reports_a_still_held_handoff_port_after_the_budget() 
     );
 
     drop(hold);
+    drop(occupied);
+    manager.shutdown_all().await;
+}
+
+/// Block until `ledger` has classified a bind collision as a handoff, up to
+/// 10 seconds. Returns whether it did.
+fn wait_for_handoff_retry(ledger: &UdpPortHandoff) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while ledger.handoff_retries() == 0 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+/// Issue #5843: a Gateway QUIC half's release wakes the stream supervisor into
+/// a reconcile only when it freed a port one of this manager's UDP listeners
+/// failed to bind. A release of an unrelated port leaves the slow retry tick in
+/// charge.
+#[tokio::test]
+async fn only_a_release_of_a_failed_udp_port_triggers_a_reconcile() {
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP");
+    let port = occupied.local_addr().expect("addr").port();
+    let manager = create_manager(GatewayConfig {
+        proxies: vec![create_stream_proxy("udp-failed", BackendScheme::Udp, port)],
+        ..empty_config()
+    });
+    let failures = manager.reconcile().await;
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    let ledger = manager.udp_port_handoff();
+    let mut quic_releases = ledger.subscribe_releases(UdpPortOwner::GatewayQuic);
+
+    let unrelated_port = port.checked_add(1).unwrap_or(port - 1);
+    let unrelated = ledger.hold(unrelated_port, UdpPortOwner::GatewayQuic);
+    unrelated.arm();
+    drop(unrelated);
+    let released = quic_releases.try_recv().expect("the unrelated release");
+    assert!(
+        !manager.released_udp_ports_unblock_a_bind(&released),
+        "a release of an unrelated port must not trigger a reconcile"
+    );
+
+    let handed_over = ledger.hold(port, UdpPortOwner::GatewayQuic);
+    handed_over.arm();
+    drop(handed_over);
+    let released = quic_releases.try_recv().expect("the port's release");
+    assert!(manager.released_udp_ports_unblock_a_bind(&released));
+
     drop(occupied);
     manager.shutdown_all().await;
 }

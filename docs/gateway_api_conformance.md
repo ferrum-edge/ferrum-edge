@@ -529,16 +529,21 @@ newer epoch reserved the UDP port.
 The Gateway listener manager and the stream listener manager reconcile the same
 publication concurrently, so either side of that UDP port handoff can try to
 bind while the other still holds the socket (#5843). Both consult one
-in-process ledger of the UDP ports their datagram listeners hold. A bind that
-fails with `Address already in use` on a port the ledger shows held, or
-released within the last 10 seconds, is retried for up to 2 seconds per
-reconcile pass instead of waiting for the 30-second retry tick. A port no
-Ferrum listener holds fails on the first attempt as before, and a socket still
-held after the 2 seconds is reported as the ordinary bind failure. That
-failure is retried as soon as the other side releases a UDP port, not only on
-the next tick. TCP/TLS raw-stream collisions still refuse the whole HTTP-family
-listener; plaintext HTTP listeners remain unaffected by UDP/DTLS same-port
-claims.
+in-process ledger of the UDP ports their datagram listeners' sockets hold. An
+entry is added when the socket binds and removed when the socket closes, not
+when the listener task ends: Quinn keeps a QUIC socket open until its endpoint
+driver and every connection have dropped it, and UDP/DTLS session tasks keep
+their listener's socket open until they observe the shutdown. A bind that
+fails with `Address already in use` on a port the ledger shows held, or closed
+within the last second, is retried for up to 2 seconds per reconcile pass
+instead of waiting for the 30-second retry tick. A port no Ferrum listener
+holds fails on the first attempt as before, unless a Ferrum listener held that
+port number within the last second. A socket still held after the 2 seconds
+is reported as the ordinary bind failure. That failure is retried when the
+other side's socket on the same port closes, not only on the next tick;
+releases of other ports do not trigger a reconcile. TCP/TLS raw-stream
+collisions still refuse the whole HTTP-family listener; plaintext HTTP
+listeners remain unaffected by UDP/DTLS same-port claims.
 
 **Single-listener protocol remap.** When the whole route table declares exactly
 one listener port of a protocol class, a request arriving on the global process

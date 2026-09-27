@@ -24,6 +24,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::config::types::Proxy;
 use crate::proxy::datagram_client_address::DatagramMetadataError;
+use crate::proxy::udp_port_handoff::UdpPortHold;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 /// Default MTU for DTLS records. Conservative default that works over most networks.
@@ -1947,6 +1948,12 @@ pub struct DtlsServer {
     /// suppressed. Reported on every warning so the withheld volume stays
     /// visible without one record per peer.
     handshake_timeouts: Arc<AtomicU64>,
+    /// The owning stream listener's claim on this server's UDP port in the
+    /// in-process UDP port ledger (issue #5843). Every session driver keeps a
+    /// clone next to its clone of `socket`, so the claim is released only once
+    /// the server and every driver have let go of the socket. Declared after
+    /// `socket` so the server's own reference closes first.
+    udp_port_hold: Option<UdpPortHold>,
 }
 
 /// State for a server-side DTLS session being managed by the DtlsServer.
@@ -2700,7 +2707,14 @@ impl DtlsServer {
                 crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new(),
             ),
             handshake_timeouts: Arc::new(AtomicU64::new(0)),
+            udp_port_hold: None,
         }
+    }
+
+    /// Attach the owning stream listener's already-armed claim on this
+    /// server's UDP port (issue #5843); see the `udp_port_hold` field.
+    pub fn attach_udp_port_hold(&mut self, hold: UdpPortHold) {
+        self.udp_port_hold = Some(hold);
     }
 
     /// Atomically swap the DTLS crypto material used for **new** sessions.
@@ -3247,8 +3261,11 @@ impl DtlsServer {
             .map(|timeout| Instant::now() + timeout);
         let handshake_timeout_warn = self.handshake_timeout_warn.clone();
         let handshake_timeouts = self.handshake_timeouts.clone();
+        let udp_port_hold = self.udp_port_hold.clone();
 
         tokio::spawn(async move {
+            // Held for as long as this driver holds `socket`.
+            let _udp_port_hold = udp_port_hold;
             let _session_guard = SessionGuard {
                 sessions: sessions.clone(),
                 active_sessions: active_sessions.clone(),

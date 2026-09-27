@@ -26,7 +26,7 @@ use crate::tls::source::{CertSource, MaterialKind, load_material};
 use super::PerIpStreamAdmission;
 use super::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics};
 use super::udp_port_handoff::{
-    UDP_PORT_HANDOFF_BUDGET, UdpPortHandoff, UdpPortHandoffBackoff, UdpPortOwner,
+    ReleasedUdpPorts, UDP_PORT_HANDOFF_BUDGET, UdpPortHandoff, UdpPortHandoffBackoff, UdpPortOwner,
 };
 use super::udp_proxy::{UdpListenerConfig, UdpProxyMetrics};
 
@@ -2336,9 +2336,9 @@ impl StreamListenerManager {
         if self.supervisor_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        // A Gateway QUIC half releasing its UDP socket is the other side of a
+        // A Gateway QUIC half closing its UDP socket is the other side of a
         // port handoff (issue #5843). A UDP/DTLS bind that ran out of its
-        // in-pass budget waiting for that socket is retried when the socket is
+        // in-pass budget waiting for that socket is retried when that port is
         // released instead of on the next tick. Only the QUIC side's releases
         // are watched, so this manager's own listeners can never wake it.
         let mut quic_releases = self
@@ -2350,29 +2350,48 @@ impl StreamListenerManager {
             retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut quic_releases_open = true;
             loop {
-                tokio::select! {
-                    _ = retry.tick() => {}
-                    changed = quic_releases.changed(), if quic_releases_open => {
-                        if changed.is_err() {
+                let released = tokio::select! {
+                    _ = retry.tick() => None,
+                    released = quic_releases.recv(), if quic_releases_open => {
+                        if released.is_none() {
                             // The ledger is gone; keep the tick alone.
                             quic_releases_open = false;
                             continue;
                         }
+                        released
                     }
-                }
+                };
                 let Some(manager) = manager.upgrade() else {
                     break;
                 };
                 if manager.is_stopping() {
                     break;
                 }
-                if manager.reconciled.load(Ordering::Acquire)
-                    && (!manager.is_ready() || manager.has_degraded_listeners())
-                {
+                if !manager.reconciled.load(Ordering::Acquire) {
+                    continue;
+                }
+                let due = match &released {
+                    None => !manager.is_ready() || manager.has_degraded_listeners(),
+                    Some(released) => manager.released_udp_ports_unblock_a_bind(released),
+                };
+                if due {
                     manager.reconcile().await;
                 }
             }
         });
+    }
+
+    /// Whether a Gateway QUIC half's release freed a port one of this
+    /// manager's UDP/DTLS listeners failed to bind (issue #5843). The
+    /// supervisor reconciles on such a release only; releases of other ports
+    /// leave the slow retry tick in charge.
+    pub fn released_udp_ports_unblock_a_bind(&self, released: &ReleasedUdpPorts) -> bool {
+        let failures = self.bind_failures.load();
+        let failed_ports = failures
+            .iter()
+            .filter(|failure| matches!(failure.kind, StreamListenerDegradation::BindFailed))
+            .map(|failure| failure.listen_port);
+        released.includes_any(failed_ports)
     }
 
     fn is_stopping(&self) -> bool {
@@ -3487,21 +3506,18 @@ impl StreamListenerManager {
                 let generation_for_exit = generation;
                 let owner_for_exit = node_waypoint_udp_owner;
                 // Claim the port in the in-process UDP ledger for exactly as
-                // long as this task runs, so a Gateway QUIC bind that collides
-                // with it while it is being retired waits for the release
-                // (issue #5843). Armed now, not on `started`, because
-                // reconcile does not await the bind; the probe above just
-                // proved the port free. A bind that still fails merely marks
-                // the port recently released, which costs a later collision on
-                // it one bounded retry budget.
+                // long as the listener's socket stays open, so a Gateway QUIC
+                // bind that collides with it while it is being retired waits
+                // for the release (issue #5843). The listener arms the claim
+                // right after its bind succeeds and hands it to the socket its
+                // session tasks share, so a failed bind never marks the port
+                // as recently released and the claim outlives this task while
+                // any session still holds the socket.
                 let udp_port_hold = self
                     .udp_port_handoff
                     .hold(port_val, UdpPortOwner::StreamDatagram);
-                udp_port_hold.arm();
                 let join_handle = tokio::spawn(async move {
-                    // Dropped when this task finishes or is aborted.
-                    let _udp_port_hold = udp_port_hold;
-                    let result = super::udp_proxy::start_udp_listener(UdpListenerConfig {
+                    let listener_config = UdpListenerConfig {
                         port: port_val,
                         bind_addr,
                         proxy_id: proxy_id_owned.clone(),
@@ -3544,7 +3560,11 @@ impl StreamListenerManager {
                         node_waypoint_udp_owner,
                         node_waypoint_udp_destinations,
                         datagram_client_address,
-                    })
+                    };
+                    let result = super::udp_proxy::start_udp_listener_holding_port(
+                        listener_config,
+                        Some(udp_port_hold),
+                    )
                     .await;
                     started_for_exit.store(false, Ordering::Release);
                     if let Err(e) = result {
@@ -4175,7 +4195,7 @@ impl StreamListenerManager {
     /// is retried: the Gateway's QUIC half that this generation drains from
     /// the port (its manager reconciles the same publication concurrently and
     /// Quinn drops the socket after the listener task is joined), or a retired
-    /// UDP/DTLS listener whose reply tasks still hold the socket. Attempts back
+    /// UDP/DTLS listener whose session tasks still hold the socket. Attempts back
     /// off from 5 ms to 100 ms until `deadline`, which the first retry of the
     /// pass sets to [`UDP_PORT_HANDOFF_BUDGET`] from now and every later retry
     /// shares. Any other error, a port nothing in-process holds, and a socket

@@ -137,7 +137,7 @@ use crate::proxy::gateway_listener_status::{
     GatewayListenerStatus, GatewayListenerTransientEvent,
 };
 use crate::proxy::udp_port_handoff::{
-    UDP_PORT_HANDOFF_BUDGET, UdpPortHandoff, UdpPortHandoffBackoff, UdpPortOwner,
+    ReleasedUdpPorts, UDP_PORT_HANDOFF_BUDGET, UdpPortHandoff, UdpPortHandoffBackoff, UdpPortOwner,
 };
 
 /// Whether a Gateway listener port terminates TLS on the frontend.
@@ -670,7 +670,7 @@ pub struct GatewayListenerManager {
     /// assert on observability.
     status: Option<Arc<GatewayListenerStatus>>,
     /// The in-process UDP port ledger shared with the stream listener
-    /// manager's UDP/DTLS listeners (issue #5843). Every QUIC task holds its
+    /// manager's UDP/DTLS listeners (issue #5843). Every QUIC socket holds its
     /// port in it, and a QUIC bind that collides with a port the ledger reports
     /// as being handed over is retried within the pass budget.
     udp_ports: Arc<UdpPortHandoff>,
@@ -843,7 +843,7 @@ impl GatewayListenerManager {
         &self,
         expected: &crate::request_epoch::RequestEpoch,
     ) -> ReconcileOutcome {
-        let quic_rebind_deadline = tokio::time::Instant::now() + UDP_PORT_HANDOFF_BUDGET;
+        let mut quic_rebind_budget = QuicRebindBudget::new();
         let config = expected.config();
         let plan = GatewayListenerPlan::from_config(
             config,
@@ -1131,7 +1131,7 @@ impl GatewayListenerManager {
                         listener,
                         expected.config_generation,
                         quic_retired.contains(port),
-                        quic_rebind_deadline,
+                        &mut quic_rebind_budget,
                     )
                     .await
                 {
@@ -1174,7 +1174,7 @@ impl GatewayListenerManager {
                             &mut listener,
                             expected.config_generation,
                             quic_retired.contains(port),
-                            quic_rebind_deadline,
+                            &mut quic_rebind_budget,
                         )
                         .await
                     {
@@ -1350,6 +1350,21 @@ impl GatewayListenerManager {
         }
     }
 
+    /// Whether a stream listener's release freed a port one of the last pass's
+    /// QUIC halves failed to bind (issue #5843). Releases of other ports leave
+    /// the slow retry tick in charge.
+    fn released_udp_ports_unblock_a_quic_bind(&self, released: &ReleasedUdpPorts) -> bool {
+        let failures = self.bind_failures.load();
+        let failed_ports = failures
+            .iter()
+            .filter(|failure| {
+                failure.protocol == GatewayListenerProtocolHalf::Quic
+                    && failure.category == GatewayListenerFailureCategory::BindFailed
+            })
+            .map(|failure| failure.port);
+        released.includes_any(failed_ports)
+    }
+
     /// Bind the QUIC socket for a TLS-class listener when HTTP/3 is enabled.
     ///
     /// Returns the failure when the QUIC listener could not be started. The TCP
@@ -1375,44 +1390,54 @@ impl GatewayListenerManager {
     /// The same collision happens across managers (issue #5843): when this
     /// generation withdraws a UDP/DTLS stream proxy from the port, the stream
     /// listener manager retires it concurrently with this pass, and the stream
-    /// socket can still be open — not yet signalled, or held by reply tasks
+    /// socket can still be open — not yet signalled, or held by session tasks
     /// that have not observed the shutdown — when QUIC binds. The shared
-    /// [`UdpPortHandoff`] ledger identifies that case, and also covers a QUIC
-    /// socket this manager released in an earlier pass.
+    /// [`UdpPortHandoff`] ledger identifies that case for as long as the
+    /// socket is open, and also covers a QUIC socket this manager released in
+    /// an earlier pass.
     ///
-    /// In both cases only `EADDRINUSE` is retried, and only until `deadline`,
-    /// which the whole pass shares ([`UDP_PORT_HANDOFF_BUDGET`]). Handoff
-    /// eligibility is evaluated after each failed attempt rather than once up
-    /// front, because the other manager may arm or release its hold while this
-    /// pass runs. A port nothing in-process holds fails on the first attempt as
-    /// before; a socket still held at the deadline (for example by connections
-    /// the old endpoint is still driving) is reported as the bind failure and
-    /// retried by a later reconcile, which a stream listener's release wakes
-    /// early (see [`Self::run`]).
+    /// In both cases only `EADDRINUSE` is retried, within `budget`: a retired
+    /// port's wait is counted from the start of the pass, a handoff's from the
+    /// pass's first handoff collision, and each is shared by every port of its
+    /// kind ([`UDP_PORT_HANDOFF_BUDGET`]). Handoff eligibility is evaluated
+    /// after each failed attempt rather than once up front, because the other
+    /// manager may arm or release its hold while this pass runs. A port nothing
+    /// in-process holds fails on the first attempt as before; a socket still
+    /// held at the deadline (for example by connections the old endpoint is
+    /// still driving) is reported as the bind failure and retried by a later
+    /// reconcile, which the stream listener releasing that port wakes early
+    /// (see [`Self::run`]).
     async fn ensure_quic_in_pass(
         &self,
         port: u16,
         listener: &mut LiveListener,
         expected_generation: u64,
         quic_retired: bool,
-        deadline: tokio::time::Instant,
+        budget: &mut QuicRebindBudget,
     ) -> Option<GatewayListenerBindFailure> {
-        let mut backoff = UdpPortHandoffBackoff::new(deadline);
+        let mut backoff: Option<UdpPortHandoffBackoff> = None;
         loop {
             let failure = self.start_quic(port, listener, expected_generation).await?;
             // A newer epoch supersedes this pass; `reconcile` discards its
             // outcome and reconciles again, so waiting here buys nothing.
             let stale = self.state.request_epoch.load().config_generation != expected_generation;
-            let handoff = quic_retired || self.udp_ports.handoff_pending(port);
-            if !failure.addr_in_use || !handoff || stale {
+            if !failure.addr_in_use || stale {
                 return Some(failure.report());
             }
+            let deadline = if quic_retired {
+                budget.retired
+            } else if self.udp_ports.handoff_pending(port) {
+                budget.handoff_deadline()
+            } else {
+                return Some(failure.report());
+            };
             let error = &failure.failure.error;
             debug!(
                 port,
                 "Gateway API HTTP/3 bind is waiting for the previous owner to release its UDP \
                  socket: {error}"
             );
+            let backoff = backoff.get_or_insert_with(|| UdpPortHandoffBackoff::new(deadline));
             if !backoff.wait().await {
                 return Some(failure.report());
             }
@@ -1454,17 +1479,16 @@ impl GatewayListenerManager {
             client_crls: http3.client_crls.clone(),
             started_tx: Some(started_tx),
             frontend_tls_reload: http3.frontend_tls_reload(),
+            // The listener arms this right after its UDP bind succeeds and
+            // hands it to Quinn inside the socket, so the claim lasts exactly
+            // as long as the socket stays open — past this task, while the
+            // endpoint driver and live connections still hold it. A failed
+            // bind never arms it, so this pass cannot mistake its own failed
+            // attempt for a handoff and burn the retry budget on a port
+            // something else owns.
+            udp_port_hold: Some(self.udp_ports.hold(port, UdpPortOwner::GatewayQuic)),
         };
-        // The task owns one clone of the port's ledger hold, so it is released
-        // exactly when the listener returns or the task is aborted. It is armed
-        // below only once the bind succeeded: a failed bind must not mark the
-        // port as recently released, or this pass would mistake its own failed
-        // attempt for a handoff and burn the retry budget on a port something
-        // else owns.
-        let udp_port_hold = self.udp_ports.hold(port, UdpPortOwner::GatewayQuic);
-        let task_udp_port_hold = udp_port_hold.clone();
         let task = tokio::spawn(async move {
-            let _udp_port_hold = task_udp_port_hold;
             crate::http3::server::start_http3_listener_with_signal(
                 addr,
                 state,
@@ -1478,11 +1502,6 @@ impl GatewayListenerManager {
         });
         match started_rx.await {
             Ok(()) => {
-                // Armed before this clone drops. Should the task already have
-                // ended, this clone is the last one and records the release
-                // right after, which is still accurate: the socket was bound.
-                udp_port_hold.arm();
-                drop(udp_port_hold);
                 listener.quic = Some(task);
                 listener.quic_shutdown_tx = Some(quic_shutdown_tx);
                 if self.state.request_epoch.load().config_generation != expected_generation {
@@ -1705,11 +1724,11 @@ impl GatewayListenerManager {
         let mut retry = tokio::time::interval(BIND_RETRY_INTERVAL);
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         retry.tick().await; // the first tick completes immediately
-        // A UDP/DTLS stream listener releasing its socket is the other side of
-        // a QUIC port handoff (issue #5843). A QUIC bind that ran out of its
-        // in-pass budget waiting for that socket is retried when the socket is
+        // A UDP/DTLS stream listener closing its socket is the other side of a
+        // QUIC port handoff (issue #5843). A QUIC bind that ran out of its
+        // in-pass budget waiting for that socket is retried when that port is
         // released instead of on the next slow tick. Only stream releases are
-        // watched, so this manager's own QUIC tasks can never wake it.
+        // watched, so this manager's own QUIC sockets can never wake it.
         let mut stream_releases = self
             .udp_ports
             .subscribe_releases(UdpPortOwner::StreamDatagram);
@@ -1731,17 +1750,13 @@ impl GatewayListenerManager {
                     }
                     self.reconcile().await;
                 }
-                changed = stream_releases.changed(), if stream_releases_open => {
-                    if changed.is_err() {
+                released = stream_releases.recv(), if stream_releases_open => {
+                    let Some(released) = released else {
                         // The ledger is gone; keep the tick alone.
                         stream_releases_open = false;
                         continue;
-                    }
-                    let quic_bind_failed = self.bind_failures.load().iter().any(|failure| {
-                        failure.protocol == GatewayListenerProtocolHalf::Quic
-                            && failure.category == GatewayListenerFailureCategory::BindFailed
-                    });
-                    if quic_bind_failed {
+                    };
+                    if self.released_udp_ports_unblock_a_quic_bind(&released) {
                         self.reconcile().await;
                     }
                 }
@@ -1768,6 +1783,33 @@ const BIND_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// wedged accept loop cannot stall the supervisor, and fail-closed so the two
 /// frontend classes never coexist on one port.
 const CLASS_FLIP_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one reconcile pass may retry QUIC binds that collide with a UDP
+/// socket about to be released ([`GatewayListenerManager::ensure_quic_in_pass`]).
+struct QuicRebindBudget {
+    /// For ports whose QUIC task this pass retired: counted from the start of
+    /// the pass, because the retirement itself is part of it.
+    retired: tokio::time::Instant,
+    /// For in-process handoffs (issue #5843): started by the pass's first such
+    /// collision, as in the stream listener manager, so work earlier in the
+    /// pass (TCP binds, retirements of other ports) does not consume it.
+    handoff: Option<tokio::time::Instant>,
+}
+
+impl QuicRebindBudget {
+    fn new() -> Self {
+        Self {
+            retired: tokio::time::Instant::now() + UDP_PORT_HANDOFF_BUDGET,
+            handoff: None,
+        }
+    }
+
+    fn handoff_deadline(&mut self) -> tokio::time::Instant {
+        *self
+            .handoff
+            .get_or_insert_with(|| tokio::time::Instant::now() + UDP_PORT_HANDOFF_BUDGET)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2811,6 +2853,19 @@ mod tests {
         })
     }
 
+    /// Block until `ledger` has classified a bind collision as a handoff, up to
+    /// 10 seconds. Returns whether it did.
+    fn wait_for_handoff_retry(ledger: &crate::proxy::udp_port_handoff::UdpPortHandoff) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ledger.handoff_retries() == 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+
     /// Issue #5843, stream → QUIC: a QUIC bind that collides with a UDP socket
     /// another in-process datagram listener still holds must wait for the
     /// release within the pass budget instead of publishing `BindFailed` and
@@ -2833,21 +2888,24 @@ mod tests {
                 hold,
                 manager,
             } = fixture;
-            // Release from a plain OS thread, well inside the pass budget but
-            // after the first QUIC attempt collided. The flag is raised before
-            // the socket goes, so reconcile never observes a successful bind in
-            // the gap between the two.
+            // Release from a plain OS thread only once a QUIC attempt has
+            // collided with the held socket and been classified as a handoff,
+            // so the retry path is what binds the port. The flag is raised
+            // before the socket goes, so reconcile never observes a successful
+            // bind in the gap between the two.
+            let ledger = Arc::clone(&manager.udp_ports);
             let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let releaser_released = released.clone();
             let releaser = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(350));
+                let collided = wait_for_handoff_retry(&ledger);
                 releaser_released.store(true, std::sync::atomic::Ordering::SeqCst);
                 drop(occupied);
                 drop(hold);
+                collided
             });
 
             let failures = manager.reconcile().await;
-            releaser.join().expect("releaser thread");
+            let collided = releaser.join().expect("releaser thread");
             if attempt < MAX_PORT_BIND_ATTEMPTS
                 && failures.iter().any(|failure| {
                     failure.protocol == GatewayListenerProtocolHalf::Tcp
@@ -2858,6 +2916,10 @@ mod tests {
                 manager.shutdown_all().await;
                 continue;
             }
+            assert!(
+                collided,
+                "the QUIC bind must have collided with the held socket and retried"
+            );
             assert!(
                 failures.is_empty(),
                 "a UDP socket released within the budget must not surface as a bind failure: \
@@ -2894,12 +2956,10 @@ mod tests {
                 manager,
             } = fixture;
             let started = std::time::Instant::now();
-            let failures = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                manager.reconcile(),
-            )
-            .await
-            .expect("reconcile must give up on a UDP port that stays held");
+            let failures =
+                tokio::time::timeout(std::time::Duration::from_secs(20), manager.reconcile())
+                    .await
+                    .expect("reconcile must give up on a UDP port that stays held");
             let elapsed = started.elapsed();
             if attempt < MAX_PORT_BIND_ATTEMPTS
                 && failures
@@ -2918,6 +2978,10 @@ mod tests {
                 "a socket still held after the budget must be reported: {failures:?}"
             );
             assert!(
+                manager.udp_ports.handoff_retries() >= 1,
+                "the collision must have been classified as a handoff"
+            );
+            assert!(
                 elapsed >= UDP_PORT_HANDOFF_BUDGET / 2,
                 "the collision must have been retried within the budget, returned after \
                  {elapsed:?}"
@@ -2930,6 +2994,44 @@ mod tests {
             return;
         }
         panic!("could not reserve a TCP+UDP port pair in {MAX_PORT_BIND_ATTEMPTS} attempts");
+    }
+
+    /// Issue #5843: a stream listener's release wakes the supervisor into a
+    /// reconcile only when it freed a port whose QUIC half failed to bind. A
+    /// release of an unrelated port leaves the slow retry tick in charge.
+    #[tokio::test]
+    async fn only_a_release_of_a_failed_quic_port_wakes_the_supervisor() {
+        let (failed_port, unrelated_port) = (4433, 5353);
+        let manager = tls_h3_manager(test_state(tls_listener_config(failed_port, false)));
+        let failure = GatewayListenerBindFailure::quic(
+            failed_port,
+            GatewayListenerFailureCategory::BindFailed,
+            "Address already in use",
+        );
+        manager.bind_failures.store(Arc::new(vec![failure]));
+        let mut releases = manager
+            .udp_ports
+            .subscribe_releases(UdpPortOwner::StreamDatagram);
+
+        let unrelated = manager
+            .udp_ports
+            .hold(unrelated_port, UdpPortOwner::StreamDatagram);
+        unrelated.arm();
+        drop(unrelated);
+        let released = releases.try_recv().expect("the unrelated release");
+        assert_eq!(released.ports(), [unrelated_port]);
+        assert!(
+            !manager.released_udp_ports_unblock_a_quic_bind(&released),
+            "a release of an unrelated port must not trigger a reconcile"
+        );
+
+        let handed_back = manager
+            .udp_ports
+            .hold(failed_port, UdpPortOwner::StreamDatagram);
+        handed_back.arm();
+        drop(handed_back);
+        let released = releases.try_recv().expect("the failed port's release");
+        assert!(manager.released_udp_ports_unblock_a_quic_bind(&released));
     }
 
     /// Issue #5843, QUIC → stream, end to end: publishing a UDP stream claim on

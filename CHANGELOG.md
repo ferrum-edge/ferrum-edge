@@ -46,13 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   side could bind before the other had released the socket. The stream proxy
   then reported a `BindFailed` stream listener, or the QUIC half reported
   `bind_failed`, until that manager's 30-second retry. Both managers now share
-  a record of the UDP ports their listeners hold. A bind on a port that a
-  Ferrum listener holds or released in the last 10 seconds retries that error
-  for up to 2 seconds per reconcile pass. If the port is still held after that,
-  the failure is reported as before, and it is retried when the other side
-  releases a UDP port rather than 30 seconds later. A port owned by anything
-  outside Ferrum still fails on the first attempt. No socket options change;
-  two sockets never share the port.
+  a record of the UDP ports their listeners' sockets hold. An entry lasts until
+  the socket actually closes, which can be after the listener task has ended:
+  QUIC connections and UDP/DTLS sessions keep the socket open until they
+  finish. A bind on a port that a Ferrum listener's socket holds, or closed in
+  the last second, retries that error for up to 2 seconds per reconcile pass.
+  If the port is still held after that, the failure is reported as before. It
+  is then retried when the other side's socket on that same port closes,
+  rather than 30 seconds later. A port owned by anything outside Ferrum still
+  fails on the first attempt, unless a Ferrum listener held that port number
+  within the last second. No socket options change; two sockets never share
+  the port.
 
 ## [0.9.8] - 2026-09-27
 

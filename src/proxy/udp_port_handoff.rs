@@ -12,10 +12,10 @@
 //!
 //! - it has not been signalled yet (the other manager's pass has not reached
 //!   that port), or
-//! - its task has been joined but the socket itself outlives the join — Quinn
-//!   keeps it in endpoint state its separately spawned driver drops later, and
-//!   UDP stream reply tasks hold clones of the listener socket until they
-//!   observe the shutdown signal.
+//! - its listener task has been joined but the socket itself outlives the
+//!   join — Quinn shares it between endpoint state that its separately spawned
+//!   driver drops later and every live connection, and UDP/DTLS session tasks
+//!   hold clones of the listener socket until they observe the shutdown.
 //!
 //! Either way the bind fails with `EADDRINUSE` for a port that is about to be
 //! free, and without help would stay unbound until that manager's slow retry
@@ -23,28 +23,35 @@
 //!
 //! This ledger lets the acquiring side tell that transient in-process collision
 //! apart from a port genuinely owned by something else. Each managed datagram
-//! listener task owns a [`UdpPortHold`] for as long as it runs; a bind that
-//! fails with `EADDRINUSE` on a port [`UdpPortHandoff::handoff_pending`]
-//! reports is retried within a short, bounded, pass-wide budget
-//! ([`UDP_PORT_HANDOFF_BUDGET`]). A port the ledger knows nothing about fails
-//! immediately, exactly as before, and a socket still held when the budget
-//! runs out is reported as the ordinary bind failure. Two sockets never share a
-//! port: nothing here sets `SO_REUSEADDR` / `SO_REUSEPORT`, it only decides
-//! whether one more exclusive bind attempt is worth making.
+//! listener's claim ([`UdpPortHold`]) is armed as soon as its socket is bound
+//! and travels *with the socket*: it is owned by the socket object that every
+//! user of the socket shares (Quinn's abstract socket, the plain-UDP frontend
+//! socket, the DTLS server and its session drivers), so it is released when
+//! the last reference drops and the socket closes, not when the listener task
+//! returns. A bind that fails with `EADDRINUSE` on a port
+//! [`UdpPortHandoff::handoff_pending`] reports is retried within a short,
+//! bounded, pass-wide budget ([`UDP_PORT_HANDOFF_BUDGET`]). A port the ledger
+//! knows nothing about fails immediately, exactly as before, and a socket
+//! still held when the budget runs out is reported as the ordinary bind
+//! failure. Two sockets never share a port: nothing here sets `SO_REUSEADDR` /
+//! `SO_REUSEPORT`, it only decides whether one more exclusive bind attempt is
+//! worth making.
 //!
 //! As a fallback for a release slower than the budget, every release by one
-//! owner bumps a per-owner watch channel ([`UdpPortHandoff::subscribe_releases`])
-//! that the *other* manager's supervisor listens on, so an outstanding bind
-//! failure is retried when the port is actually released rather than on the
-//! next 30-second tick. Each manager subscribes only to the other owner's
-//! releases, so a listener that keeps failing can never wake its own manager
-//! into a reconcile loop.
+//! owner is appended to that owner's release log
+//! ([`UdpPortHandoff::subscribe_releases`]), which the *other* manager's
+//! supervisor follows. It reconciles only when a released port is one of its
+//! own outstanding bind failures, so an outstanding failure is retried when
+//! its port is actually released rather than on the next 30-second tick,
+//! while releases of unrelated ports cost nothing. Each manager subscribes
+//! only to the other owner's releases, so a listener that keeps failing can
+//! never wake its own manager into a reconcile loop.
 //!
 //! Not on any hot path: the ledger is touched only when a datagram listener
-//! starts or stops and when a bind has already failed.
+//! binds or closes its socket and when a bind has already failed.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -52,9 +59,10 @@ use tokio::sync::watch;
 
 /// How long one reconcile pass may spend, in total, retrying `EADDRINUSE` on
 /// ports another in-process datagram listener is handing over. Shared by every
-/// such port in the pass so unrelated listeners queued behind it are delayed by
-/// at most this much; a release slower than this falls back to the ordinary
-/// bind failure plus the release wakeup described in the module docs.
+/// such port in the pass and started by the first such collision, so unrelated
+/// listeners queued behind it are delayed by at most this much; a release
+/// slower than this falls back to the ordinary bind failure plus the release
+/// wakeup described in the module docs.
 pub const UDP_PORT_HANDOFF_BUDGET: Duration = Duration::from_secs(2);
 
 /// First pause between bind attempts while a handoff is pending. Doubles up to
@@ -65,12 +73,22 @@ pub const UDP_PORT_HANDOFF_INITIAL_BACKOFF: Duration = Duration::from_millis(5);
 pub const UDP_PORT_HANDOFF_MAX_BACKOFF: Duration = Duration::from_millis(100);
 
 /// How long after its last in-process holder released a port a bind collision
-/// on it is still treated as a pending handoff. Covers the socket outliving
-/// the joined listener task (Quinn's endpoint driver, UDP reply tasks, or a
-/// QUIC drain that was cut short by an abort). A genuinely foreign owner that
-/// grabs the port inside this window only costs one bounded budget of retries
-/// before it is reported.
-pub const UDP_PORT_RECENT_RELEASE_WINDOW: Duration = Duration::from_secs(10);
+/// on it is still treated as a pending handoff.
+///
+/// A claim is released only when its socket closes, so this no longer has to
+/// cover sockets outliving their listener task. It is a small cushion for the
+/// two orderings that remain: the acquiring side's bind can fail an instant
+/// before the release and consult the ledger an instant after it (a scheduler
+/// turn, or a stalled worker thread, apart), and a socket shared with session
+/// tasks can record its release while another clone of the socket is being
+/// dropped on another thread. A genuinely foreign owner that grabs the port
+/// inside this window only costs one bounded budget of retries before it is
+/// reported.
+pub const UDP_PORT_RECENT_RELEASE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Releases each owner's log keeps for its subscribers. A subscriber that
+/// falls further behind than this treats the gap as matching every port.
+const RELEASE_LOG_CAPACITY: usize = 64;
 
 /// Which Ferrum listener family holds a UDP port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,20 +107,32 @@ struct PortEntry {
     released_at: Option<Instant>,
 }
 
+/// One owner's recent releases, published to the other manager's supervisor.
+#[derive(Default)]
+struct ReleaseLog {
+    /// Sequence number of the latest release; `0` before the first.
+    seq: u64,
+    /// `(seq, port)` of the latest releases, oldest first, at most
+    /// [`RELEASE_LOG_CAPACITY`] of them.
+    recent: VecDeque<(u64, u16)>,
+}
+
 /// The shared ledger. One instance per process, owned by the stream listener
 /// manager and reached by the Gateway listener manager through `ProxyState`.
 pub struct UdpPortHandoff {
     ports: Mutex<HashMap<u16, PortEntry>>,
-    gateway_quic_released: watch::Sender<u64>,
-    stream_datagram_released: watch::Sender<u64>,
+    gateway_quic_released: watch::Sender<ReleaseLog>,
+    stream_datagram_released: watch::Sender<ReleaseLog>,
+    handoff_retries: AtomicU64,
 }
 
 impl Default for UdpPortHandoff {
     fn default() -> Self {
         Self {
             ports: Mutex::new(HashMap::new()),
-            gateway_quic_released: watch::channel(0).0,
-            stream_datagram_released: watch::channel(0).0,
+            gateway_quic_released: watch::channel(ReleaseLog::default()).0,
+            stream_datagram_released: watch::channel(ReleaseLog::default()).0,
+            handoff_retries: AtomicU64::new(0),
         }
     }
 }
@@ -112,9 +142,10 @@ impl UdpPortHandoff {
         Arc::new(Self::default())
     }
 
-    /// A hold on `port` for one listener task. It counts toward
-    /// [`Self::handoff_pending`] only once [`UdpPortHold::arm`] is called, so a
-    /// task whose bind fails never marks the port as recently released.
+    /// A claim on `port` for one listener's socket. It counts toward
+    /// [`Self::handoff_pending`] only once [`UdpPortHold::arm`] is called right
+    /// after the bind succeeds, so a listener whose bind fails never marks the
+    /// port as recently released.
     pub fn hold(self: &Arc<Self>, port: u16, owner: UdpPortOwner) -> UdpPortHold {
         UdpPortHold {
             inner: Arc::new(HoldInner {
@@ -127,25 +158,44 @@ impl UdpPortHandoff {
     }
 
     /// Whether a bind collision on `port` is plausibly an in-process handoff:
-    /// some managed datagram listener holds the port now, or released it
+    /// some managed datagram listener's socket holds the port now, or closed
     /// within [`UDP_PORT_RECENT_RELEASE_WINDOW`].
+    ///
+    /// Callers ask only after a bind failed with `EADDRINUSE`, so a `true`
+    /// answer is a collision about to be retried and is counted in
+    /// [`Self::handoff_retries`].
     pub fn handoff_pending(&self, port: u16) -> bool {
-        let ports = self.ports.lock().unwrap_or_else(PoisonError::into_inner);
-        ports.get(&port).is_some_and(|entry| {
-            entry.holds > 0
-                || entry
-                    .released_at
-                    .is_some_and(|at| at.elapsed() < UDP_PORT_RECENT_RELEASE_WINDOW)
-        })
+        let pending = {
+            let ports = self.ports.lock().unwrap_or_else(PoisonError::into_inner);
+            ports.get(&port).is_some_and(|entry| {
+                entry.holds > 0
+                    || entry
+                        .released_at
+                        .is_some_and(|at| at.elapsed() < UDP_PORT_RECENT_RELEASE_WINDOW)
+            })
+        };
+        if pending {
+            self.handoff_retries.fetch_add(1, Ordering::Relaxed);
+        }
+        pending
     }
 
-    /// A receiver that changes every time a hold owned by `owner` is released.
-    /// Subscribe to the *other* owner's releases only (see the module docs).
-    pub fn subscribe_releases(&self, owner: UdpPortOwner) -> watch::Receiver<u64> {
-        self.release_channel(owner).subscribe()
+    /// How many bind collisions [`Self::handoff_pending`] has classified as
+    /// in-process handoffs since the ledger was created. Diagnostic only.
+    pub fn handoff_retries(&self) -> u64 {
+        self.handoff_retries.load(Ordering::Relaxed)
     }
 
-    fn release_channel(&self, owner: UdpPortOwner) -> &watch::Sender<u64> {
+    /// Follow the releases of holds owned by `owner`, starting after the
+    /// latest one. Subscribe to the *other* owner's releases only (see the
+    /// module docs).
+    pub fn subscribe_releases(&self, owner: UdpPortOwner) -> UdpPortReleases {
+        let rx = self.release_channel(owner).subscribe();
+        let seen = rx.borrow().seq;
+        UdpPortReleases { rx, seen }
+    }
+
+    fn release_channel(&self, owner: UdpPortOwner) -> &watch::Sender<ReleaseLog> {
         match owner {
             UdpPortOwner::GatewayQuic => &self.gateway_quic_released,
             UdpPortOwner::StreamDatagram => &self.stream_datagram_released,
@@ -177,31 +227,118 @@ impl UdpPortHandoff {
                         .is_some_and(|at| now.duration_since(at) < UDP_PORT_RECENT_RELEASE_WINDOW)
             });
         }
-        // Wake the other manager only after the ledger records the release, so
-        // a reconcile it runs in response already sees the port as recently
+        // Publish only after the ledger records the release, so a reconcile the
+        // other manager runs in response already sees the port as recently
         // released and gives a lingering socket its bounded retry budget.
-        self.release_channel(owner)
-            .send_modify(|releases| *releases = releases.wrapping_add(1));
+        self.release_channel(owner).send_modify(|log| {
+            log.seq = log.seq.wrapping_add(1);
+            if log.recent.len() == RELEASE_LOG_CAPACITY {
+                log.recent.pop_front();
+            }
+            log.recent.push_back((log.seq, port));
+        });
     }
 }
 
-/// One listener task's claim on a UDP port in [`UdpPortHandoff`].
+/// One subscriber's view of one owner's releases.
+pub struct UdpPortReleases {
+    rx: watch::Receiver<ReleaseLog>,
+    /// Sequence number of the latest release already returned.
+    seen: u64,
+}
+
+impl UdpPortReleases {
+    /// Wait for the next release(s) and return the ports released since the
+    /// previous call, or `None` once the ledger is gone. Cancel-safe: nothing
+    /// is consumed until the wait completes.
+    pub async fn recv(&mut self) -> Option<ReleasedUdpPorts> {
+        self.rx.changed().await.ok()?;
+        Some(self.take())
+    }
+
+    /// [`Self::recv`] without waiting: `None` when nothing was released since
+    /// the previous call.
+    pub fn try_recv(&mut self) -> Option<ReleasedUdpPorts> {
+        self.rx.has_changed().ok()?.then(|| self.take())
+    }
+
+    fn take(&mut self) -> ReleasedUdpPorts {
+        let log = self.rx.borrow_and_update();
+        let seen = self.seen;
+        // Sequence numbers only wrap after 2^64 releases, so plain comparison
+        // is enough for a process lifetime.
+        let gap = log
+            .recent
+            .front()
+            .is_some_and(|&(seq, _)| seq > seen.wrapping_add(1));
+        let ports = log
+            .recent
+            .iter()
+            .filter(|&&(seq, _)| seq > seen)
+            .map(|&(_, port)| port)
+            .collect();
+        self.seen = log.seq;
+        ReleasedUdpPorts { ports, gap }
+    }
+}
+
+/// Ports one owner released since a subscriber last looked.
+#[derive(Debug)]
+pub struct ReleasedUdpPorts {
+    ports: Vec<u16>,
+    /// The subscriber fell behind the bounded log, so some released ports are
+    /// unknown.
+    gap: bool,
+}
+
+impl ReleasedUdpPorts {
+    /// Whether any of `ports` (a subscriber's outstanding bind failures) may
+    /// have been released. Always `true` for a non-empty `ports` when the
+    /// subscriber missed releases, so a failure is never left waiting on a
+    /// release it did not see.
+    pub fn includes_any(&self, ports: impl IntoIterator<Item = u16>) -> bool {
+        let mut ports = ports.into_iter();
+        if self.gap {
+            return ports.next().is_some();
+        }
+        ports.any(|port| self.ports.contains(&port))
+    }
+
+    /// The released ports the subscriber saw, oldest first.
+    pub fn ports(&self) -> &[u16] {
+        &self.ports
+    }
+}
+
+/// One listener socket's claim on a UDP port in [`UdpPortHandoff`].
 ///
-/// Cloneable so the manager can arm it after the task reports a successful
-/// bind while the task itself owns the other clone. The claim is released when
-/// the last clone drops — normally when the listener task finishes or is
-/// aborted, since the task future owns a clone.
+/// Owned by the socket object the listener shares with everything that can
+/// keep the socket open, so the claim is released exactly when that socket
+/// closes. Cloneable for owners whose socket users each hold their own clone
+/// (the DTLS server and its session drivers); the claim is released when the
+/// last clone drops.
 #[derive(Clone)]
 pub struct UdpPortHold {
     inner: Arc<HoldInner>,
 }
 
 impl UdpPortHold {
-    /// Count this hold from now on. Idempotent.
+    /// Count this hold from now on. Call right after the bind succeeds.
+    /// Idempotent.
     pub fn arm(&self) {
         if !self.inner.armed.swap(true, Ordering::AcqRel) {
             self.inner.ledger.arm(self.inner.port);
         }
+    }
+}
+
+impl std::fmt::Debug for UdpPortHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UdpPortHold")
+            .field("port", &self.inner.port)
+            .field("owner", &self.inner.owner)
+            .field("armed", &self.inner.armed.load(Ordering::Relaxed))
+            .finish()
     }
 }
 
