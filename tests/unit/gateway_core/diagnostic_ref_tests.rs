@@ -642,6 +642,29 @@ fn unauthorized_subjects_cannot_exhaust_the_global_lookup_budget() {
 }
 
 #[test]
+fn out_of_namespace_subjects_cannot_exhaust_the_global_lookup_budget() {
+    // A budget of 2 per second leaves each subject a share of 1. These
+    // credentials have the scope and an `ns` claim, but cannot read this store.
+    let store = store_with(10_000, Duration::from_secs(900), 2);
+    let reference = mint(&store, 502, "connection_failure");
+    let now = Instant::now() + Duration::from_secs(1);
+    let outside = namespaces(&["staging"]);
+    let bound = namespaces(&[NAMESPACE]);
+
+    for subject in ["staging-reader-a", "staging-reader-b"] {
+        let first = authorize_lookup(Some(&store), subject, true, &outside, &reference, now);
+        assert_eq!(label(&first), "not_found");
+        for _ in 0..20 {
+            let retry = authorize_lookup(Some(&store), subject, true, &outside, &reference, now);
+            assert_eq!(label(&retry), "rate_limited", "subject share spent");
+        }
+    }
+
+    let operator = authorize_lookup(Some(&store), OPERATOR, true, &bound, &reference, now);
+    assert_eq!(label(&operator), "found", "the global budget is untouched");
+}
+
+#[test]
 fn authorized_subject_over_its_share_is_rate_limited() {
     let store = store_with(10_000, Duration::from_secs(900), 4);
     assert_eq!(store.per_subject_lookup_rate_per_second(), 2);

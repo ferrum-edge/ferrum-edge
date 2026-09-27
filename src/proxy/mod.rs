@@ -21074,12 +21074,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     start_global_proxy_listener_with_tls_and_signal(
-        addr,
-        state,
-        shutdown,
-        tls_config,
-        None,
-        started_tx,
+        addr, state, shutdown, tls_config, None, started_tx,
     )
     .await
 }
@@ -21216,12 +21211,7 @@ pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     start_global_proxy_listener_with_dynamic_tls_and_signal(
-        addr,
-        state,
-        shutdown,
-        tls_slot,
-        None,
-        started_tx,
+        addr, state, shutdown, tls_slot, None, started_tx,
     )
     .await
 }

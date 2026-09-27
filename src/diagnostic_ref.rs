@@ -1014,13 +1014,14 @@ impl DiagnosticRefLookupAudit {
 ///    share of the rate limit first, including one that is then refused for
 ///    its credential, so a credential lacking the scope cannot probe without
 ///    limit. Only an attempt whose credential carries the scope and an `ns`
-///    binding is also charged against the global budget, so credentials that
-///    may not read references can never exhaust it for authorized operators.
+///    binding that allows the store's namespace is also charged against the
+///    global budget, so credentials that may not read references can never
+///    exhaust it for authorized operators.
 /// 2. The scope and namespace binding (they depend only on the credential).
 /// 3. The store's own namespace against the token's `ns` claim. Every
 ///    reference in the store belongs to that one namespace, so a caller
-///    outside it gets `NotFound` without the store being read: the answer and
-///    its cost are identical to an unknown reference.
+///    outside it is charged only its subject share and gets `NotFound` without
+///    the store being read, the same answer as an unknown reference.
 /// 4. The store.
 pub fn authorize_lookup(
     store: Option<&DiagnosticRefStore>,
@@ -1030,7 +1031,9 @@ pub fn authorize_lookup(
     reference: &str,
     now: Instant,
 ) -> DiagnosticRefLookup {
-    let authorized = scope_granted && allowed_namespaces.is_present();
+    let authorized = scope_granted
+        && allowed_namespaces.is_present()
+        && store.is_some_and(|store| allowed_namespaces.allows(store.namespace()));
     let admitted = match store {
         Some(store) => store.try_acquire_subject_lookup_at(now, subject, authorized),
         None => true,
