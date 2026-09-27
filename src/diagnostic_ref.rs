@@ -27,6 +27,13 @@
 //!   `GET /diagnostics/v1/refs/{ref}`, which requires an admin JWT carrying the
 //!   `diagnostics:read` scope and an `ns` claim; a reference outside the
 //!   token's namespaces is indistinguishable from an unknown one (`404`).
+//! * With `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true` (issue #5846) the store
+//!   mints `fd2_<8 hex replica id>_<32 hex>`: the replica id is 32 CSPRNG bits
+//!   drawn once per process ([`DiagnosticReplicaId`]). Another replica asked
+//!   for such a reference answers the same `404`, plus the owner hint header
+//!   [`DIAGNOSTIC_REF_OWNER_REPLICA_HEADER`] only for a caller authorized for
+//!   its own namespace. Untagged `fd1_` references keep resolving on the
+//!   process that minted them. The control plane does not proxy lookups.
 //! * The header is gateway-owned: a backend (or serverless function) copy is
 //!   stripped at every backend response boundary through
 //!   `proxy::headers::GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`, and the final
@@ -81,6 +88,10 @@ pub const DIAGNOSTIC_REF_HEADER: &str = "x-ferrum-diagnostic-ref";
 static DIAGNOSTIC_REF_HEADER_NAME: http::HeaderName =
     http::HeaderName::from_static(DIAGNOSTIC_REF_HEADER);
 
+/// [`DIAGNOSTIC_REF_OWNER_REPLICA_HEADER`] as a pre-built `HeaderName`.
+static DIAGNOSTIC_REF_OWNER_REPLICA_HEADER_NAME: http::HeaderName =
+    http::HeaderName::from_static(DIAGNOSTIC_REF_OWNER_REPLICA_HEADER);
+
 /// Version prefix of every reference. A future format changes the prefix.
 pub const DIAGNOSTIC_REF_PREFIX: &str = "fd1_";
 
@@ -92,6 +103,28 @@ const DIAGNOSTIC_REF_HEX_LEN: usize = DIAGNOSTIC_REF_RANDOM_BYTES * 2;
 
 /// Exact length of a well-formed reference: the prefix plus 32 hex digits.
 pub const DIAGNOSTIC_REF_LEN: usize = DIAGNOSTIC_REF_PREFIX.len() + DIAGNOSTIC_REF_HEX_LEN;
+
+/// Version prefix of a replica-tagged reference
+/// (`FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true`, issue #5846):
+/// `fd2_<8 hex replica id>_<32 hex>`.
+pub const DIAGNOSTIC_REF_TAGGED_PREFIX: &str = "fd2_";
+
+/// Random bytes behind one replica id (32 bits).
+const REPLICA_ID_BYTES: usize = 4;
+
+/// Lowercase hex digits encoding a replica id.
+pub const REPLICA_ID_HEX_LEN: usize = REPLICA_ID_BYTES * 2;
+
+/// Exact length of a well-formed replica-tagged reference: the prefix, the
+/// replica id, a `_` separator, and 32 hex digits.
+pub const DIAGNOSTIC_REF_TAGGED_LEN: usize =
+    DIAGNOSTIC_REF_TAGGED_PREFIX.len() + REPLICA_ID_HEX_LEN + 1 + DIAGNOSTIC_REF_HEX_LEN;
+
+/// Admin lookup response header naming the replica that minted a
+/// replica-tagged reference another replica was asked for. Sent only on that
+/// `404`, and only to a caller authorized for the answering replica's
+/// namespace.
+pub const DIAGNOSTIC_REF_OWNER_REPLICA_HEADER: &str = "x-ferrum-diagnostic-owner-replica";
 
 /// Admin JWT `scope` value that authorizes a diagnostic reference lookup.
 pub const DIAGNOSTICS_READ_SCOPE: &str = "diagnostics:read";
@@ -289,6 +322,40 @@ impl DiagnosticProtocol {
             Self::Http2 => "http2",
             Self::Http3 => "http3",
         }
+    }
+}
+
+/// Per-process replica id a replica-tagged store embeds in every reference it
+/// mints (issue #5846), so a lookup that reaches another replica can name the
+/// one to ask. 32 bits from the process CSPRNG, drawn once when the store is
+/// installed: it derives from no host name, address, pod, or node identity,
+/// and a restart draws a new one, exactly as it forgets every reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DiagnosticReplicaId([u8; REPLICA_ID_BYTES]);
+
+impl DiagnosticReplicaId {
+    /// A fresh replica id from the process CSPRNG, or `None` if it fails.
+    pub fn random() -> Option<Self> {
+        let mut bytes = [0u8; REPLICA_ID_BYTES];
+        SystemRandom::new().fill(&mut bytes).ok()?;
+        Some(Self(bytes))
+    }
+
+    pub const fn from_bytes(bytes: [u8; REPLICA_ID_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// The id as 8 lowercase hex digits, as references and hints carry it.
+    pub fn to_hex(self) -> String {
+        let mut out = String::with_capacity(REPLICA_ID_HEX_LEN);
+        push_hex(&mut out, &self.0);
+        out
+    }
+}
+
+impl std::fmt::Display for DiagnosticReplicaId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
     }
 }
 
@@ -929,14 +996,26 @@ fn rfc3339_millis(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// Encode 16 random bytes as a reference.
-fn encode_ref(key: &[u8; DIAGNOSTIC_REF_RANDOM_BYTES]) -> String {
-    let mut out = String::with_capacity(DIAGNOSTIC_REF_LEN);
-    out.push_str(DIAGNOSTIC_REF_PREFIX);
-    for byte in key {
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    for byte in bytes {
         out.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
         out.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
     }
+}
+
+/// Encode 16 random bytes as a reference: `fd1_<32 hex>`, or
+/// `fd2_<replica>_<32 hex>` for a replica-tagged store.
+fn encode_ref(replica: Option<DiagnosticReplicaId>, key: &RefKey) -> String {
+    let mut out = String::with_capacity(DIAGNOSTIC_REF_TAGGED_LEN);
+    match replica {
+        Some(replica) => {
+            out.push_str(DIAGNOSTIC_REF_TAGGED_PREFIX);
+            push_hex(&mut out, &replica.0);
+            out.push('_');
+        }
+        None => out.push_str(DIAGNOSTIC_REF_PREFIX),
+    }
+    push_hex(&mut out, key);
     out
 }
 
@@ -948,25 +1027,62 @@ fn hex_value(digit: u8) -> Option<u8> {
     }
 }
 
-/// Decode a reference into its random key. Only the exact
-/// `fd1_<32 lowercase hex>` shape is accepted.
-fn parse_ref(reference: &str) -> Option<[u8; DIAGNOSTIC_REF_RANDOM_BYTES]> {
-    if reference.len() != DIAGNOSTIC_REF_LEN {
+/// Decode exactly `2 * N` lowercase hex digits.
+fn parse_hex<const N: usize>(hex: &[u8]) -> Option<[u8; N]> {
+    if hex.len() != N * 2 {
         return None;
     }
-    let hex = reference.strip_prefix(DIAGNOSTIC_REF_PREFIX)?.as_bytes();
-    let mut key = [0u8; DIAGNOSTIC_REF_RANDOM_BYTES];
+    let mut bytes = [0u8; N];
     for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
         let high = hex_value(pair[0])?;
         let low = hex_value(pair[1])?;
-        *key.get_mut(index)? = (high << 4) | low;
+        *bytes.get_mut(index)? = (high << 4) | low;
     }
-    Some(key)
+    Some(bytes)
 }
 
-/// Whether `reference` has the exact `fd1_<32 lowercase hex>` shape.
+/// A decoded reference: its random key and, for the replica-tagged format,
+/// the replica that minted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedRef {
+    replica: Option<DiagnosticReplicaId>,
+    key: RefKey,
+}
+
+/// Decode a reference. Only the exact `fd1_<32 lowercase hex>` and
+/// `fd2_<8 lowercase hex>_<32 lowercase hex>` shapes are accepted.
+fn parse_ref(reference: &str) -> Option<ParsedRef> {
+    if reference.len() == DIAGNOSTIC_REF_LEN {
+        let hex = reference.strip_prefix(DIAGNOSTIC_REF_PREFIX)?.as_bytes();
+        return Some(ParsedRef {
+            replica: None,
+            key: parse_hex(hex)?,
+        });
+    }
+    if reference.len() != DIAGNOSTIC_REF_TAGGED_LEN {
+        return None;
+    }
+    let rest = reference
+        .strip_prefix(DIAGNOSTIC_REF_TAGGED_PREFIX)?
+        .as_bytes();
+    let (replica, rest) = rest.split_at_checked(REPLICA_ID_HEX_LEN)?;
+    let key = rest.strip_prefix(b"_")?;
+    Some(ParsedRef {
+        replica: Some(DiagnosticReplicaId(parse_hex(replica)?)),
+        key: parse_hex(key)?,
+    })
+}
+
+/// Whether `reference` has the exact `fd1_<32 lowercase hex>` or
+/// `fd2_<8 lowercase hex>_<32 lowercase hex>` shape.
 pub fn is_well_formed_ref(reference: &str) -> bool {
     parse_ref(reference).is_some()
+}
+
+/// The replica a well-formed replica-tagged reference names, or `None` for an
+/// untagged or malformed one.
+pub fn reference_replica(reference: &str) -> Option<DiagnosticReplicaId> {
+    parse_ref(reference)?.replica
 }
 
 #[derive(Debug)]
@@ -1067,6 +1183,10 @@ pub struct DiagnosticRefView {
     pub schema_version: &'static str,
     #[serde(rename = "ref")]
     pub reference: String,
+    /// Replica id of the gateway process that minted the reference, for a
+    /// replica-tagged store. Absent for untagged `fd1_` references.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica_id: Option<String>,
     pub namespace: String,
     pub created_at: String,
     pub expires_at: String,
@@ -1089,6 +1209,9 @@ pub struct DiagnosticRefView {
 pub struct DiagnosticRefStore {
     namespace: Arc<str>,
     mode: DiagnosticRefMode,
+    /// Replica id embedded in every reference this store mints, or `None`
+    /// for the untagged `fd1_` format (the default).
+    replica: Option<DiagnosticReplicaId>,
     ttl: Duration,
     ttl_wall: chrono::Duration,
     per_shard_capacity: usize,
@@ -1125,6 +1248,7 @@ impl DiagnosticRefStore {
         Self {
             namespace: namespace.into(),
             mode: DiagnosticRefMode::Errors,
+            replica: None,
             ttl,
             ttl_wall: chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::zero()),
             per_shard_capacity: (max_entries / SHARD_COUNT).max(1),
@@ -1156,6 +1280,18 @@ impl DiagnosticRefStore {
     /// Which responses this store mints references for (`errors` or `all`).
     pub fn mode(&self) -> DiagnosticRefMode {
         self.mode
+    }
+
+    /// The same store minting replica-tagged `fd2_` references that embed
+    /// `replica`. [`Self::new`] mints untagged `fd1_` references.
+    pub fn with_replica(mut self, replica: DiagnosticReplicaId) -> Self {
+        self.replica = Some(replica);
+        self
+    }
+
+    /// Replica id this store embeds in its references, when tagged.
+    pub fn replica(&self) -> Option<DiagnosticReplicaId> {
+        self.replica
     }
 
     /// Namespace every reference in this store belongs to.
@@ -1234,7 +1370,7 @@ impl DiagnosticRefStore {
         if SystemRandom::new().fill(&mut key).is_err() {
             return None;
         }
-        let reference = encode_ref(&key);
+        let reference = encode_ref(self.replica, &key);
         if let Some(slot) = slot
             && slot.minted.set(reference.clone()).is_err()
         {
@@ -1282,9 +1418,14 @@ impl DiagnosticRefStore {
     }
 
     /// Resolve a reference. `None` for a malformed, unknown, expired, or
-    /// evicted reference. Callers authorize the returned namespace.
+    /// evicted reference, and for one in the format or with the replica id
+    /// this store does not mint. Callers authorize the returned namespace.
     pub fn lookup_at(&self, now: Instant, reference: &str) -> Option<DiagnosticRefView> {
-        let key = parse_ref(reference)?;
+        let parsed = parse_ref(reference)?;
+        if parsed.replica != self.replica {
+            return None;
+        }
+        let key = parsed.key;
         let (expired, view) = {
             let mut shard = self.lock_shard(&key);
             let expired = shard.purge_expired(now);
@@ -1301,11 +1442,21 @@ impl DiagnosticRefStore {
         view
     }
 
+    /// The replica that minted `reference` when it is a well-formed
+    /// replica-tagged reference minted by another replica; `None` for this
+    /// replica's own references and for untagged or malformed ones. Reads
+    /// nothing but the reference itself.
+    pub fn foreign_owner(&self, reference: &str) -> Option<DiagnosticReplicaId> {
+        let owner = reference_replica(reference)?;
+        (Some(owner) != self.replica).then_some(owner)
+    }
+
     fn view(&self, reference: &str, entry: &Entry) -> DiagnosticRefView {
         let detail = entry.slot.as_ref().and_then(|slot| slot.view_detail());
         DiagnosticRefView {
             schema_version: DIAGNOSTIC_REF_SCHEMA_VERSION,
             reference: reference.to_string(),
+            replica_id: self.replica.map(DiagnosticReplicaId::to_hex),
             namespace: self.namespace.to_string(),
             created_at: rfc3339_millis(entry.created_at),
             expires_at: rfc3339_millis(entry.expires_at_wall),
@@ -1447,6 +1598,15 @@ impl DiagnosticRefStore {
                 self.lookups_total(result)
             ));
         }
+        if let Some(replica) = self.replica {
+            output.push_str(
+                "# HELP ferrum_diagnostic_ref_replica_info Replica id this gateway process embeds in its diagnostic references (value is always 1).\n\
+# TYPE ferrum_diagnostic_ref_replica_info gauge\n",
+            );
+            output.push_str(&format!(
+                "ferrum_diagnostic_ref_replica_info{{replica_id=\"{replica}\"}} 1\n"
+            ));
+        }
         output.push_str(
             "# HELP ferrum_diagnostic_refs_entries Diagnostic references currently retained in the bounded in-memory store.\n\
 # TYPE ferrum_diagnostic_refs_entries gauge\n",
@@ -1539,6 +1699,13 @@ pub enum DiagnosticRefLookup {
     /// Malformed, unknown, expired, evicted, outside the caller's namespaces,
     /// or the feature is off: one answer, so references cannot be probed.
     NotFound,
+    /// A replica-tagged reference another replica minted, asked of this one
+    /// by a caller authorized for this replica's namespace. Answered exactly
+    /// like [`Self::NotFound`] plus the owner hint
+    /// ([`DIAGNOSTIC_REF_OWNER_REPLICA_HEADER`]). The owner is read from the
+    /// reference alone: this replica never learns whether the owner exists,
+    /// still holds the reference, or serves the caller's namespace.
+    NotOwned(DiagnosticReplicaId),
     /// The admin JWT lacks the `diagnostics:read` scope.
     MissingScope,
     /// The admin JWT carries no `ns` claim, so it is not namespace-bound.
@@ -1551,12 +1718,23 @@ impl DiagnosticRefLookup {
     pub fn result(&self) -> DiagnosticRefLookupResult {
         match self {
             Self::Found(_) => DiagnosticRefLookupResult::Found,
-            Self::NotFound => DiagnosticRefLookupResult::NotFound,
+            Self::NotFound | Self::NotOwned(_) => DiagnosticRefLookupResult::NotFound,
             Self::MissingScope | Self::MissingNamespaceBinding => {
                 DiagnosticRefLookupResult::Forbidden
             }
             Self::RateLimited => DiagnosticRefLookupResult::RateLimited,
         }
+    }
+}
+
+/// Add the owner hint of a [`DiagnosticRefLookup::NotOwned`] answer to its
+/// `404` headers: [`DIAGNOSTIC_REF_OWNER_REPLICA_HEADER`] set to the owner's
+/// eight lowercase hex digits. The body stays the plain miss.
+pub fn insert_owner_hint(headers: &mut http::HeaderMap, owner: DiagnosticReplicaId) {
+    // Eight lowercase hex digits always form a valid value; a failure would
+    // only drop the hint, never change the miss.
+    if let Ok(value) = http::HeaderValue::from_str(&owner.to_hex()) {
+        headers.insert(&DIAGNOSTIC_REF_OWNER_REPLICA_HEADER_NAME, value);
     }
 }
 
@@ -1608,7 +1786,9 @@ impl DiagnosticRefLookupAudit {
 ///    reference in the store belongs to that one namespace, so a caller
 ///    outside it is charged only its subject share and gets `NotFound` without
 ///    the store being read, the same answer as an unknown reference.
-/// 4. The store.
+/// 4. The store. A replica-tagged reference another replica minted answers
+///    [`DiagnosticRefLookup::NotOwned`], which only this authorized path
+///    reaches: a caller refused at any earlier step never gets the hint.
 pub fn authorize_lookup(
     store: Option<&DiagnosticRefStore>,
     subject: &str,
@@ -1631,14 +1811,15 @@ pub fn authorize_lookup(
     } else if !allowed_namespaces.is_present() {
         DiagnosticRefLookup::MissingNamespaceBinding
     } else {
-        let view = match store {
-            Some(store) if allowed_namespaces.allows(store.namespace()) => {
-                store.lookup_at(now, reference)
-            }
-            _ => None,
-        };
-        match view {
-            Some(view) => DiagnosticRefLookup::Found(Box::new(view)),
+        let readable = store.filter(|store| allowed_namespaces.allows(store.namespace()));
+        match readable {
+            Some(store) => match store.lookup_at(now, reference) {
+                Some(view) => DiagnosticRefLookup::Found(Box::new(view)),
+                None => match store.foreign_owner(reference) {
+                    Some(owner) => DiagnosticRefLookup::NotOwned(owner),
+                    None => DiagnosticRefLookup::NotFound,
+                },
+            },
             None => DiagnosticRefLookup::NotFound,
         }
     };
@@ -1651,16 +1832,26 @@ pub fn authorize_lookup(
 static ACTIVE_STORE: OnceLock<DiagnosticRefStore> = OnceLock::new();
 
 /// Publish the process store from the accepted configuration. `off` installs
-/// nothing. Called once at startup, before any listener accepts traffic.
+/// nothing. With `replica_tag`, the store draws its replica id from the
+/// process CSPRNG and mints `fd2_` references; a CSPRNG failure fails startup
+/// rather than minting untagged references the operator did not ask for.
+/// Called once at startup, before any listener accepts traffic.
 pub fn install(
     mode: DiagnosticRefMode,
     namespace: &str,
     config: DiagnosticRefStoreConfig,
+    replica_tag: bool,
 ) -> Result<(), String> {
     if !mode.is_enabled() {
         return Ok(());
     }
-    let store = DiagnosticRefStore::new(namespace, config).with_mode(mode);
+    let mut store = DiagnosticRefStore::new(namespace, config).with_mode(mode);
+    if replica_tag {
+        let Some(replica) = DiagnosticReplicaId::random() else {
+            return Err(REPLICA_ID_ERROR.to_string());
+        };
+        store = store.with_replica(replica);
+    }
     ACTIVE_STORE
         .set(store)
         .map_err(|_| ALREADY_INSTALLED_ERROR.to_string())
@@ -1668,6 +1859,9 @@ pub fn install(
 
 const ALREADY_INSTALLED_ERROR: &str =
     "diagnostic reference store is already installed for this process";
+
+const REPLICA_ID_ERROR: &str =
+    "could not draw a diagnostic reference replica id from the process CSPRNG";
 
 /// [`install`] from an accepted [`crate::config::EnvConfig`].
 pub fn install_from_env_config(env_config: &crate::config::EnvConfig) -> Result<(), String> {
@@ -1679,12 +1873,19 @@ pub fn install_from_env_config(env_config: &crate::config::EnvConfig) -> Result<
             max_entries: env_config.diagnostic_ref_max_entries,
             lookup_rate_per_second: env_config.diagnostic_ref_lookup_rate_per_second,
         },
+        env_config.diagnostic_ref_replica_tag,
     )
 }
 
 /// The process store, or `None` when references are off.
 pub fn active_store() -> Option<&'static DiagnosticRefStore> {
     ACTIVE_STORE.get()
+}
+
+/// Replica id the process store embeds in its references, when references
+/// are on and replica-tagged.
+pub fn active_replica() -> Option<DiagnosticReplicaId> {
+    active_store()?.replica()
 }
 
 /// Whether the process store mints for gateway rejections (`all`).

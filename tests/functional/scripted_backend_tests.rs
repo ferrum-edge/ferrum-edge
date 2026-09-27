@@ -2717,6 +2717,134 @@ async fn diagnostic_refs_mark_gateway_errors_on_every_protocol_and_resolve_scope
     );
 }
 
+/// A replica-tagged diagnostics gateway (issue #5846) in front of `port`.
+async fn spawn_tagged_diagnostic_replica(port: u16) -> TestGateway {
+    TestGateway::builder()
+        .mode_file(file_mode_yaml_for_backend(port))
+        .log_level("warn")
+        .jwt_secret(DIAGNOSTIC_JWT_SECRET)
+        .jwt_issuer(DIAGNOSTIC_JWT_ISSUER)
+        .env("FERRUM_DIAGNOSTIC_REFS", "errors")
+        .env("FERRUM_DIAGNOSTIC_REF_REPLICA_TAG", "true")
+        .env("FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND", "1000")
+        .spawn()
+        .await
+        .expect("spawn gateway")
+}
+
+/// Status, owner hint header, and body of one admin lookup.
+async fn lookup_with_hint(
+    admin: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> (StatusCode, Option<String>, serde_json::Value) {
+    let response = admin
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("admin lookup response");
+    let status = response.status();
+    let hint = response
+        .headers()
+        .get("x-ferrum-diagnostic-owner-replica")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response.json().await.unwrap_or(serde_json::Value::Null);
+    (status, hint, body)
+}
+
+// Two replica-tagged gateway processes: a reference resolves only on the
+// replica that minted it; the other answers the plain miss, naming the owner
+// in `X-Ferrum-Diagnostic-Owner-Replica` only for a caller authorized for its
+// namespace, and never on a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn diagnostic_refs_name_the_owning_replica_only_to_authorized_callers() {
+    let unavailable = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let owner = spawn_tagged_diagnostic_replica(unavailable.port).await;
+    let peer = spawn_tagged_diagnostic_replica(unavailable.port).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let response = client
+        .get(owner.proxy_url("/api/diagnostic"))
+        .send()
+        .await
+        .expect("proxy response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let reference = response
+        .headers()
+        .get("x-ferrum-diagnostic-ref")
+        .and_then(|value| value.to_str().ok())
+        .expect("one gateway-minted reference")
+        .to_string();
+    let rest = reference.strip_prefix("fd2_").expect("fd2_ prefix");
+    let (owner_replica, key) = rest.split_once('_').expect("replica separator");
+    assert_eq!(owner_replica.len(), 8, "{reference}");
+    assert_eq!(key.len(), 32, "{reference}");
+
+    // The test relies on the two processes drawing different replica ids,
+    // which fails only with probability 2^-32.
+    let peer_reference = client
+        .get(peer.proxy_url("/api/diagnostic"))
+        .send()
+        .await
+        .expect("peer proxy response")
+        .headers()
+        .get("x-ferrum-diagnostic-ref")
+        .and_then(|value| value.to_str().ok())
+        .expect("one peer-minted reference")
+        .to_string();
+    let peer_replica = peer_reference
+        .strip_prefix("fd2_")
+        .and_then(|rest| rest.split_once('_'))
+        .map(|(replica, _)| replica)
+        .expect("peer fd2_ reference");
+    assert_ne!(
+        peer_replica, owner_replica,
+        "the two processes drew one replica id"
+    );
+
+    let admin = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("admin client");
+    let reader = diagnostic_token(json!({"scope": "diagnostics:read", "ns": ["ferrum"]}));
+    let other_tenant = diagnostic_token(json!({"scope": "diagnostics:read", "ns": ["staging"]}));
+    let no_scope = diagnostic_token(json!({"ns": ["ferrum"]}));
+    let path = format!("/diagnostics/v1/refs/{reference}");
+
+    // Owned lookup.
+    let (status, hint, body) = lookup_with_hint(&admin, &owner.admin_url(&path), &reader).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(hint, None);
+    assert_eq!(body["ref"], reference.as_str(), "{body}");
+    assert_eq!(body["replica_id"], owner_replica, "{body}");
+
+    // Non-owned lookup: the plain miss plus the owner hint.
+    let peer_url = peer.admin_url(&path);
+    let (status, hint, hinted_body) = lookup_with_hint(&admin, &peer_url, &reader).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{hinted_body}");
+    assert_eq!(hint.as_deref(), Some(owner_replica));
+    let unknown_url = peer.admin_url(&format!("/diagnostics/v1/refs/{FORGED_DIAGNOSTIC_REF}"));
+    let (status, hint, unknown_body) = lookup_with_hint(&admin, &unknown_url, &reader).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(hint, None);
+    assert_eq!(hinted_body, unknown_body, "same body as a miss");
+
+    // No hint across namespaces or on a refusal.
+    let (status, hint, body) = lookup_with_hint(&admin, &peer_url, &other_tenant).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(hint, None, "no cross-namespace hint");
+    assert_eq!(body, unknown_body);
+    let (status, hint, body) = lookup_with_hint(&admin, &peer_url, &no_scope).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(hint, None);
+}
+
 // With references on, a backend-forged reference on a backend 5xx is replaced
 // by exactly one gateway-minted reference, and one on a backend 2xx is simply
 // dropped: a backend can neither pre-seed a reference nor make a success look

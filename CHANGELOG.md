@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Diagnostic reference lookup across replicas** (#5846). The new opt-in
+  `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true` makes each gateway process embed a
+  random 32-bit replica id in its references
+  (`fd2_<8 hex replica>_<32 hex>`), drawn from the process CSPRNG at startup
+  and derived from no host, pod, or address. Asked for a reference another
+  process minted, `GET /diagnostics/v1/refs/{ref}` answers the same `404` and
+  body as any miss, plus an `X-Ferrum-Diagnostic-Owner-Replica` header naming
+  the owner, only for a token with `diagnostics:read` and an `ns` claim naming
+  the answering process's namespace. The owning process's `200` body adds
+  `replica_id`; the id is logged at startup at INFO and exported as
+  `ferrum_diagnostic_ref_replica_info{replica_id}`. Setting the flag while
+  `FERRUM_DIAGNOSTIC_REFS=off` logs a startup warning. `fd1_` references keep
+  resolving on the untagged process that minted them, and the control plane
+  does not proxy lookups. See `docs/plans/diagnostic_ref_cross_replica_adr.md`
+  for the design and rejected alternatives.
 - **Gateway-terminated WebSocket `permessage-deflate`** (#5769). A new
   `terminate` value for the per-proxy `websocket_permessage_deflate` field makes
   the gateway an RFC 7692 endpoint on each leg: it answers the client's offer
