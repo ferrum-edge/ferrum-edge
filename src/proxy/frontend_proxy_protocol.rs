@@ -37,13 +37,13 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::AsyncRead;
+use tokio::net::TcpStream;
 
 use crate::config::env_config::{EnvConfig, FrontendProxyProtocolMode};
 use crate::plugins::utils::log_sampling::warn_sampled;
 use crate::proxy::client_ip::TrustedProxies;
 use crate::proxy::proxy_protocol::{
-    AcceptedProxyVersions, ProxyProtocolError, ProxyProtocolResult, read_proxy_header_accepting,
+    AcceptedProxyVersions, ProxyProtocolError, ProxyProtocolResult, read_proxy_header_accepting_tcp,
 };
 
 /// Env key of the load-balancer source allowlist.
@@ -213,15 +213,16 @@ impl FrontendProxyProtocol {
     /// `AF_UNIX`). A forwarded IPv4-mapped IPv6 source is folded to native IPv4
     /// so it matches the principal a direct connection would produce. Any error
     /// means the caller must close the connection without answering.
-    pub async fn read_client_addr<R>(
+    ///
+    /// Only the header bytes are consumed: a v1 line is located by peeking and
+    /// then read exactly, so the TLS ClientHello or first HTTP byte that follows
+    /// it stays in the socket for the TLS acceptor or Hyper.
+    pub async fn read_client_addr(
         &self,
-        stream: &mut R,
+        stream: &mut TcpStream,
         peer: SocketAddr,
-    ) -> Result<SocketAddr, ProxyProtocolError>
-    where
-        R: AsyncRead + Unpin,
-    {
-        let header = read_proxy_header_accepting(
+    ) -> Result<SocketAddr, ProxyProtocolError> {
+        let header = read_proxy_header_accepting_tcp(
             stream,
             Some(FRONTEND_PROXY_PROTOCOL_HEADER_TIMEOUT_SECONDS),
             self.accepted,

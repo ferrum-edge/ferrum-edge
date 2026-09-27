@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed, or covers a whole address family while a listener enables the
   setting.
 
+### Performance
+
+- **PROXY v1 header read on the HTTP/HTTPS proxy listeners** (#5839). A
+  listener with inbound PROXY protocol in `v1` or `auto` mode now peeks the v1
+  line and consumes it with one exact-length read, instead of one read per
+  byte (up to about 100 syscalls per connection). Only the header is consumed;
+  the TLS ClientHello or HTTP request that follows it is left for the TLS or
+  HTTP parser. Size limit, 5-second deadline, and refusal behavior are
+  unchanged. Stream proxies with `stream_proxy_protocol` keep the byte-wise
+  reader.
+
 ## [0.9.8] - 2026-09-27
 
 ### Changed

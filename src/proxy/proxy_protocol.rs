@@ -44,6 +44,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::net::TcpStream;
 use tracing::warn;
 
 /// Outcome of parsing the PROXY protocol header from an inbound TCP stream.
@@ -197,7 +198,61 @@ async fn parse_proxy_header<R>(
 where
     R: AsyncRead + Unpin,
 {
-    // Read the first 6 bytes to decide v1 vs v2.
+    let (version, prefix) = read_signature_prefix(stream, accepted).await?;
+    match version {
+        // PROXY v1 text format: "PROXY <PROTO> <SRC> <DST> <SRC_PORT> <DST_PORT>\r\n"
+        HeaderVersion::V1 => parse_v1(stream, &prefix).await,
+        // PROXY v2 binary format: 12-byte signature then 4-byte fixed header.
+        HeaderVersion::V2 => parse_v2(stream, &prefix).await,
+    }
+}
+
+/// [`read_proxy_header_accepting`] for a raw [`TcpStream`].
+///
+/// Identical outcomes, caps, and timeout; the only difference is that a v1
+/// line is located with `peek` and then consumed with `read_exact` of exactly
+/// the header length (typically one peek and one read) instead of one read per
+/// byte. Bytes after the CRLF are never consumed, so the TLS ClientHello or the
+/// first HTTP byte stays in the socket for the next reader.
+pub async fn read_proxy_header_accepting_tcp(
+    stream: &mut TcpStream,
+    timeout_secs: Option<u64>,
+    accepted: AcceptedProxyVersions,
+) -> Result<ProxyProtocolResult, ProxyProtocolError> {
+    let secs = timeout_secs.unwrap_or(5);
+    let fut = parse_proxy_header_tcp(stream, accepted);
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ProxyProtocolError::Timeout),
+    }
+}
+
+async fn parse_proxy_header_tcp(
+    stream: &mut TcpStream,
+    accepted: AcceptedProxyVersions,
+) -> Result<ProxyProtocolResult, ProxyProtocolError> {
+    let (version, prefix) = read_signature_prefix(stream, accepted).await?;
+    match version {
+        HeaderVersion::V1 => parse_v1_peek(stream, &prefix).await,
+        HeaderVersion::V2 => parse_v2(stream, &prefix).await,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HeaderVersion {
+    V1,
+    V2,
+}
+
+/// Read the first 6 bytes and decide v1 vs v2, refusing a version this
+/// listener does not accept before any version-specific byte is consumed.
+async fn read_signature_prefix<R>(
+    stream: &mut R,
+    accepted: AcceptedProxyVersions,
+) -> Result<(HeaderVersion, [u8; 6]), ProxyProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut prefix = [0u8; 6];
     stream.read_exact(&mut prefix).await?;
 
@@ -205,14 +260,12 @@ where
         if !accepted.allows_v1() {
             return Err(ProxyProtocolError::VersionNotAccepted("v1"));
         }
-        // PROXY v1 text format: "PROXY <PROTO> <SRC> <DST> <SRC_PORT> <DST_PORT>\r\n"
-        parse_v1(stream, &prefix).await
+        Ok((HeaderVersion::V1, prefix))
     } else if prefix[..] == V2_SIG[..6] {
         if !accepted.allows_v2() {
             return Err(ProxyProtocolError::VersionNotAccepted("v2"));
         }
-        // PROXY v2 binary format: 12-byte signature then 4-byte fixed header.
-        parse_v2(stream, &prefix).await
+        Ok((HeaderVersion::V2, prefix))
     } else {
         Err(ProxyProtocolError::InvalidSignature)
     }
@@ -229,22 +282,76 @@ where
 {
     // We already consumed "PROXY " (6 bytes). Read remaining bytes one-by-one
     // until CRLF, capped at V1_MAX_LEN total (including the consumed prefix).
-    let mut rest: Vec<u8> = prefix.to_vec(); // start with what we have
-    let mut buf = [0u8; 1];
+    // A generic reader cannot peek, so one byte per read is the only way to
+    // never consume past the CRLF; `TcpStream` callers use `parse_v1_peek`.
+    let mut line = [0u8; V1_MAX_LEN];
+    line[..prefix.len()].copy_from_slice(prefix);
+    let mut filled = prefix.len();
     loop {
-        if rest.len() >= V1_MAX_LEN {
+        if filled >= V1_MAX_LEN {
             return Err(ProxyProtocolError::V1TooLong);
         }
-        stream.read_exact(&mut buf).await?;
-        rest.push(buf[0]);
+        stream.read_exact(&mut line[filled..filled + 1]).await?;
+        filled += 1;
         // Check for CRLF terminator
-        let n = rest.len();
-        if n >= 2 && rest[n - 2] == b'\r' && rest[n - 1] == b'\n' {
+        if line[filled - 2] == b'\r' && line[filled - 1] == b'\n' {
             break;
         }
     }
-    // `rest` now contains "PROXY ...\r\n". Strip trailing CRLF.
-    let line = std::str::from_utf8(&rest[..rest.len() - 2])
+    // `line[..filled]` now contains "PROXY ...\r\n". Strip trailing CRLF.
+    parse_v1_bytes(&line[..filled - 2])
+}
+
+/// [`parse_v1`] for a raw `TcpStream`: same cap, errors, and first-CRLF
+/// termination, without a syscall per byte.
+///
+/// Each round peeks whatever is buffered (up to the remaining cap). When the
+/// peeked bytes contain the CRLF, exactly the bytes through it are consumed
+/// and nothing after it is touched. Otherwise every peeked byte precedes the
+/// terminator and so belongs to the header: those bytes are consumed before
+/// peeking again, which also makes the next peek wait for new data instead of
+/// returning the same buffered bytes in a busy loop. A peer that closes before
+/// the CRLF gets the same `UnexpectedEof` I/O error as the byte-wise reader.
+async fn parse_v1_peek(
+    stream: &mut TcpStream,
+    prefix: &[u8; 6],
+) -> Result<ProxyProtocolResult, ProxyProtocolError> {
+    let mut line = [0u8; V1_MAX_LEN];
+    line[..prefix.len()].copy_from_slice(prefix);
+    let mut filled = prefix.len();
+    loop {
+        if filled >= V1_MAX_LEN {
+            return Err(ProxyProtocolError::V1TooLong);
+        }
+        let peeked = stream.peek(&mut line[filled..]).await?;
+        if peeked == 0 {
+            return Err(ProxyProtocolError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "early eof",
+            )));
+        }
+        let available = filled + peeked;
+        // A CR consumed in an earlier round may pair with an LF peeked now.
+        let search_from = filled - 1;
+        let terminator = line[search_from..available]
+            .windows(2)
+            .position(|pair| pair == b"\r\n");
+        let end = match terminator {
+            Some(offset) => search_from + offset + 2,
+            None => available,
+        };
+        stream.read_exact(&mut line[filled..end]).await?;
+        filled = end;
+        if terminator.is_some() {
+            break;
+        }
+    }
+    // `line[..filled]` now contains "PROXY ...\r\n". Strip trailing CRLF.
+    parse_v1_bytes(&line[..filled - 2])
+}
+
+fn parse_v1_bytes(line: &[u8]) -> Result<ProxyProtocolResult, ProxyProtocolError> {
+    let line = std::str::from_utf8(line)
         .map_err(|_| ProxyProtocolError::Malformed("non-UTF-8 v1 header".into()))?;
     parse_v1_line(line)
 }
