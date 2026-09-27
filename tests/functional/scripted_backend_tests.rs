@@ -3471,6 +3471,12 @@ async fn diagnostic_refs_list_only_attempts_actually_sent() {
 // in `cacheable_status_codes`) and then replays is origin content: the relayed
 // MISS keeps its #5767 reference, the cached HIT carries none. A
 // gateway-generated `502` on a route with the same plugin is still referenced.
+//
+// This is a regression guard, not proof of the #5860 skip: on HTTP/1.1 the
+// gateway adds `X-Gateway-Error` after the cache stores the entry, so the
+// replayed 502 carries no token and gets no reference even without the skip.
+// `diagnostic_ref_tests` proves the skip itself on a flagged, token-bearing
+// response.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn diagnostic_refs_errors_mode_leaves_cached_replays_unmarked() {
