@@ -2356,9 +2356,11 @@ With an `endpoint` configured, every sampled request also exports one `CLIENT` s
 
 Each attempt dispatches its own `traceparent`, naming the attempt's span with the request's trace ID and sampled flag, so the backend's `SERVER` span nests under the attempt that reached it. `tracestate` is forwarded unchanged. The `traceparent` echoed to the client still names the gateway `SERVER` span. Unsampled requests, propagation-only mode, and requests without `otel_tracing` dispatch exactly as before: the backend receives the gateway span's context and nothing extra is recorded.
 
-Attempts are instrumented where the gateway records a per-attempt outcome: the HTTP/1.1 and HTTP/2 frontend's backend loop (including its direct HTTP/2, native HTTP/3, HBONE, and mesh-mTLS dispatch), the native gRPC loop, and the HTTP/3 frontend's buffered retry loop. Any other dispatch path, such as WebSocket upgrades or an HTTP/3 request whose body is streamed, keeps the gateway span's `traceparent` and exports no attempt span, so a backend is never handed a parent that is not exported.
+Attempts are instrumented where the gateway records a per-attempt outcome: the HTTP/1.1 and HTTP/2 frontend's backend loop (including its direct HTTP/2, native HTTP/3, HBONE, and mesh-mTLS dispatch), the native gRPC loop, and the HTTP/3 frontend's buffered retry loop. Any other dispatch path, such as WebSocket upgrades or an HTTP/3 request whose body is streamed, keeps the gateway span's `traceparent` and exports no attempt span, so a backend is never handed a parent that is not exported. The same holds for the first attempt of an HTTP/3 request whose response buffering is decided from the backend's response headers: that attempt is dispatched by the header-refinement step, which is not instrumented, so it is counted but not exported, and a retry of it reports `gateway.backend.attempt` `2`.
 
 An attempt span starts when the attempt is dispatched (for the first HTTP/1.1/HTTP/2 attempt, when its prepared request is handed to the backend) and ends when its outcome is known: the response head for a streamed response, the complete response for a buffered one, or the failure. Retry backoff falls between attempt spans. The span is named for the request method (bounded as above).
+
+A request dropped mid-attempt never records that attempt's outcome, for example when the client disconnects while the backend is still working. Once the attempt was handed to the backend, the gateway still exports its span when the request is dropped, ended at that moment with `error.type` `cancelled` and no status, so the backend's `SERVER` span keeps an exported parent. An attempt refused before its handoff, for example by backend admission control, reached no backend and is not exported. The export only queues the span; if the export buffer is full the span is dropped, as any other span would be.
 
 | Attribute | Present when | Value |
 |---|---|---|
@@ -2368,7 +2370,7 @@ An attempt span starts when the attempt is dispatched (for the first HTTP/1.1/HT
 | `http.request.resend_count` | retries | Attempt number minus one |
 | `gateway.backend.retry_reason` | retries | Why the previous attempt was retried: its gateway error class (for example `connection_refused`), or `http_status` for a retryable status |
 | `http.response.status_code` | backend answered | The backend's status. Omitted when the gateway classified the attempt as a failure, whose status it synthesized |
-| `error.type` | failures | The gateway error class, or the status code of a `4xx`/`5xx` backend response |
+| `error.type` | failures | The gateway error class, the status code of a `4xx`/`5xx` backend response, or `cancelled` for an attempt whose request was dropped before it ended |
 | `gateway.backend.connection.reused` | pool observed it | `true` when the attempt rode a pooled connection it did not open, `false` when it set one up |
 | `gateway.backend.connection.setup_ms` | attempt set up a connection | Whole connection establishment, DNS through the HTTP/2 handshake |
 | `gateway.backend.connection.dns_ms`, `gateway.backend.connection.tcp_connect_ms`, `gateway.backend.connection.tls_handshake_ms` | the pool timed that phase | DNS resolution, TCP connect, and TLS handshake of the connection the attempt set up |
@@ -2377,7 +2379,7 @@ Connection attributes come only from what a pool measures. The direct HTTP/2 and
 
 Status follows the OTel HTTP client conventions: `ERROR` for a gateway error class and for any `4xx`/`5xx` backend response, `UNSET` otherwise.
 
-With tracing absent, the request unsampled, or propagation-only mode, every attempt hook is a single check and a pooled HTTP/2 or gRPC checkout adds one task-local lookup; nothing is allocated or locked. A sampled request allocates one recorder, a copy of the backend header map per attempt, and one span per attempt.
+With tracing absent, the request unsampled, or propagation-only mode, every attempt hook is a single check, and a pooled HTTP/2 or gRPC checkout or an HTTP/1.1/HTTP/2 backend handoff adds one task-local lookup; nothing is allocated or locked. A sampled request allocates one recorder, a copy of the backend header map per attempt, and one span per attempt.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

@@ -11,6 +11,9 @@
 //!   a connection that never came up), then two RPCs on a live target: the
 //!   first establishes the pooled connection with its measured setup phases,
 //!   the second rides it.
+//! * A client that aborts while a slow backend holds the attempt: the dropped
+//!   request still exports the attempt, as `cancelled`, so the backend's
+//!   parent span exists.
 //!
 //! ```bash
 //! cargo build --bin ferrum-edge && \
@@ -32,7 +35,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
 
 const CONNECTION_TIMINGS: [&str; 4] = [
     "gateway.backend.connection.setup_ms",
@@ -532,4 +536,109 @@ async fn grpc_attempt_spans_cover_connect_retries_and_pooled_connection_reuse() 
     }
 
     drop(refused);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn client_abort_mid_attempt_exports_the_cancelled_attempt_span() {
+    let collector = start_collector().await;
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    // The backend holds the request far past the client's abort.
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .steps([
+            HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/slow")),
+            HttpStep::Sleep(Duration::from_secs(30)),
+        ])
+        .spawn()
+        .expect("spawn backend");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "otel-attempts-cancelled",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            // The client abort must beat every gateway-side deadline, so the
+            // attempt never ends through the retry loop's own hook.
+            "backend_read_timeout_ms": 60000
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [otel_plugin(&collector)],
+    });
+    let harness = GatewayHarness::builder()
+        .file_config(serde_yaml::to_string(&config).expect("yaml"))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gateway_addr = harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .to_string();
+
+    let mut client = TcpStream::connect(gateway_addr.as_str())
+        .await
+        .expect("connect gateway");
+    client
+        .write_all(b"GET /api/slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("send request");
+    // Matched by request line: a startup capability probe may also land here.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let request = loop {
+        let requests = backend.received_requests().await;
+        if let Some(request) = requests
+            .into_iter()
+            .find(|request| request.method == "GET" && request.path == "/slow")
+        {
+            break request;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the request never reached the backend"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let (trace_id, parent) = traceparent_ids(request.header("traceparent").expect("traceparent"));
+    // RST rather than a lingering FIN, so the gateway drops the request at
+    // once. `SO_LINGER = 0` is exactly that RST and the socket is dropped on
+    // the next line, so the blocking-drop caveat behind the deprecation does
+    // not apply.
+    #[allow(deprecated)]
+    let _ = client.set_linger(Some(Duration::ZERO));
+    drop(client);
+
+    let spans = wait_for_spans(&collector, |spans| {
+        in_trace(spans, &trace_id).iter().any(is_client)
+    })
+    .await;
+    let trace = in_trace(&spans, &trace_id);
+    let clients = client_spans(trace.iter().copied());
+    assert_eq!(clients.len(), 1, "one attempt: {trace:#?}");
+    let cancelled = clients[0];
+    assert_eq!(
+        cancelled["spanId"],
+        parent.as_str(),
+        "the span the backend holds as its parent is exported"
+    );
+    assert!(
+        cancelled["parentSpanId"]
+            .as_str()
+            .is_some_and(|id| id.len() == 16 && id != parent),
+        "the attempt is a child of the gateway SERVER span: {cancelled:#}"
+    );
+    assert_eq!(string_attr(cancelled, "error.type"), Some("cancelled"));
+    assert_eq!(cancelled["status"]["code"], 2);
+    assert_eq!(int_attr(cancelled, "gateway.backend.attempt"), Some(1));
+    assert_eq!(int_attr(cancelled, "http.response.status_code"), None);
+    assert_eq!(
+        int_attr(cancelled, "server.port"),
+        Some(i64::from(backend_port))
+    );
 }

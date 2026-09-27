@@ -1056,6 +1056,46 @@ pub mod _test_support {
         (dispatched, output)
     }
 
+    /// A begun backend attempt's `otel_tracing` CLIENT span (issue #5864),
+    /// held as a dispatch site holds it, so a test can drop it (and the
+    /// request) before the attempt ends.
+    pub struct BackendAttemptForTest(crate::plugins::otel_tracing::BackendAttemptSpan);
+
+    impl BackendAttemptForTest {
+        /// Begin the next backend attempt, as its dispatch site does.
+        pub fn begin(
+            ctx: &crate::plugins::RequestContext,
+            backend_url: &str,
+            headers: &HashMap<String, String>,
+        ) -> Self {
+            Self(ctx.begin_backend_attempt_span(backend_url, headers))
+        }
+
+        /// The dispatch reports its own handoff to the backend, as
+        /// `proxy_to_backend` does: polling the attempt no longer hands it
+        /// over, [`note_backend_attempt_handed_off_for_test`] does.
+        pub fn handoff_reported_by_dispatch(&self) {
+            self.0.handoff_reported_by_dispatch();
+        }
+
+        /// The header map this attempt dispatches.
+        pub fn headers(&self, headers: &HashMap<String, String>) -> HashMap<String, String> {
+            self.0.headers(headers).clone()
+        }
+
+        /// Drive `attempt` in this attempt's scope.
+        pub async fn run<F: std::future::Future>(&self, attempt: F) -> F::Output {
+            let attempt = std::pin::pin!(attempt);
+            self.0.scope(attempt).await
+        }
+    }
+
+    /// Report, as `proxy_to_backend` does at its handoff, that the backend
+    /// attempt being polled was handed to the backend.
+    pub fn note_backend_attempt_handed_off_for_test() {
+        crate::plugins::otel_tracing::note_backend_attempt_handed_off();
+    }
+
     /// Report, as the connection pools do, that the backend attempt being
     /// polled rides a pooled connection it did not open.
     pub fn note_backend_connection_reused_for_test() {

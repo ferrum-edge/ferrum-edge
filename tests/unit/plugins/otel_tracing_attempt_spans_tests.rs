@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
+    BackendAttemptForTest, note_backend_attempt_handed_off_for_test,
     note_backend_connection_reused_for_test, note_backend_connection_setup_for_test,
     record_backend_attempt_for_test, run_backend_attempt_for_test,
 };
@@ -403,6 +404,109 @@ async fn an_attempt_no_dispatch_site_began_is_counted_but_not_exported() {
         traceparent_span_id(&dispatched["traceparent"]),
         retry["spanId"].as_str().unwrap()
     );
+}
+
+#[tokio::test]
+async fn a_handed_off_attempt_dropped_before_it_ends_exports_a_cancelled_span() {
+    let server = collector().await;
+    let plugin = otel(Some(&endpoint(&server)), json!({}));
+    let (ctx, headers) = traced_request(&plugin).await;
+    let trace_id = ctx.metadata["trace_id"].clone();
+    let server_span_id = ctx.metadata["span_id"].clone();
+
+    run_backend_attempt_for_test(&ctx, BACKEND_URL, &headers, async {}).await;
+    record_backend_attempt_for_test(&ctx, None, true, Some(503));
+
+    // The retry reaches the backend, then the client goes away: the handler
+    // future, and with it the attempt and the request context, is dropped
+    // before the attempt ends.
+    let attempt = BackendAttemptForTest::begin(&ctx, BACKEND_URL, &headers);
+    let dispatched = attempt.headers(&headers);
+    let in_flight = tokio::time::timeout(
+        Duration::from_millis(20),
+        attempt.run(std::future::pending::<()>()),
+    )
+    .await;
+    assert!(in_flight.is_err(), "the attempt is still in flight");
+    drop(attempt);
+    drop(ctx);
+
+    let clients = client_spans(&exported_spans(&server, 2).await);
+    assert_eq!(string_attr(&clients[0], "error.type"), Some("503"));
+    let cancelled = &clients[1];
+    assert_eq!(
+        cancelled["spanId"].as_str(),
+        Some(traceparent_span_id(&dispatched["traceparent"])),
+        "the span the backend holds as its parent is exported"
+    );
+    assert_eq!(cancelled["traceId"], trace_id.as_str());
+    assert_eq!(cancelled["parentSpanId"], server_span_id.as_str());
+    assert_eq!(string_attr(cancelled, "error.type"), Some("cancelled"));
+    assert_eq!(cancelled["status"]["code"], 2);
+    assert_eq!(int_attr(cancelled, "gateway.backend.attempt"), Some(2));
+    assert_eq!(int_attr(cancelled, "http.request.resend_count"), Some(1));
+    assert_eq!(
+        string_attr(cancelled, "gateway.backend.retry_reason"),
+        Some("http_status")
+    );
+    assert_eq!(int_attr(cancelled, "http.response.status_code"), None);
+}
+
+#[tokio::test]
+async fn an_attempt_never_handed_to_the_backend_is_not_exported_when_dropped() {
+    let server = collector().await;
+    let plugin = otel(Some(&endpoint(&server)), json!({}));
+
+    // Begun, then an early return before its dispatch was ever polled.
+    let (ctx, headers) = traced_request(&plugin).await;
+    let attempt = BackendAttemptForTest::begin(&ctx, BACKEND_URL, &headers);
+    drop(attempt);
+    drop(ctx);
+
+    // A dispatch that reports its own handoff refused the attempt before it
+    // (a backend admission rejection) and the request returned.
+    let (ctx, headers) = traced_request(&plugin).await;
+    let attempt = BackendAttemptForTest::begin(&ctx, BACKEND_URL, &headers);
+    attempt.handoff_reported_by_dispatch();
+    attempt.run(async {}).await;
+    drop(attempt);
+    drop(ctx);
+
+    // The same dispatch, dropped while still waiting to hand the attempt over.
+    let (ctx, headers) = traced_request(&plugin).await;
+    let attempt = BackendAttemptForTest::begin(&ctx, BACKEND_URL, &headers);
+    attempt.handoff_reported_by_dispatch();
+    let waiting = tokio::time::timeout(
+        Duration::from_millis(20),
+        attempt.run(std::future::pending::<()>()),
+    )
+    .await;
+    assert!(waiting.is_err(), "the attempt is still waiting");
+    drop(attempt);
+    drop(ctx);
+
+    assert_nothing_exported(&server).await;
+
+    // Control: once that dispatch reports the handoff, the dropped attempt
+    // is exported.
+    let (ctx, headers) = traced_request(&plugin).await;
+    let attempt = BackendAttemptForTest::begin(&ctx, BACKEND_URL, &headers);
+    attempt.handoff_reported_by_dispatch();
+    let sent = tokio::time::timeout(
+        Duration::from_millis(20),
+        attempt.run(async {
+            note_backend_attempt_handed_off_for_test();
+            std::future::pending::<()>().await
+        }),
+    )
+    .await;
+    assert!(sent.is_err(), "the attempt is still in flight");
+    drop(attempt);
+    drop(ctx);
+
+    let clients = client_spans(&exported_spans(&server, 1).await);
+    assert_eq!(string_attr(&clients[0], "error.type"), Some("cancelled"));
+    assert_eq!(int_attr(&clients[0], "gateway.backend.attempt"), Some(1));
 }
 
 #[tokio::test]

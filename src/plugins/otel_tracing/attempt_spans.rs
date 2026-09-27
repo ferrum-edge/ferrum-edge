@@ -18,16 +18,22 @@
 //!
 //! A dispatch path that never begins an attempt keeps the gateway SERVER
 //! span's `traceparent` and exports no attempt span, so an uninstrumented path
-//! can never hand a backend a parent span that is not exported.
+//! can never hand a backend a parent span that is not exported. A request
+//! dropped mid-attempt (the client went away, and its handler future with it)
+//! never reaches that hook: dropping the recorder exports the attempt in
+//! flight as `cancelled` once it was handed to the backend, so the backend's
+//! SERVER span still has an exported parent. An attempt never handed over
+//! carried its `traceparent` nowhere and is not exported.
 //!
 //! Cost: without an installed trace (tracing disabled, no exporter, or an
 //! unsampled request) every hook is one `Option` check, and a pooled-connection
-//! checkout adds one task-local lookup. Nothing allocates and nothing locks.
+//! checkout or a `proxy_to_backend` handoff adds one task-local lookup. Nothing
+//! allocates and nothing locks.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -67,13 +73,32 @@ impl AttemptSpanSink {
     }
 
     fn export(&self, span: SpanData) {
+        self.export_with(span, false);
+    }
+
+    /// [`Self::export`] for a `Drop`: never waits on the drop-log limiter,
+    /// skipping the rate-limited warning while another thread holds it.
+    fn export_without_blocking(&self, span: SpanData) {
+        self.export_with(span, true);
+    }
+
+    /// Hand `span` to the exporter's bounded, non-blocking queue.
+    fn export_with(&self, span: SpanData, without_blocking: bool) {
         let Err(error) = self.exporter.try_export(span) else {
             return;
         };
         let now_ms = crate::socket_opts::monotonic_now_ms();
-        let suppressed = match self.drop_log_limiter.lock() {
-            Ok(mut limiter) => limiter.on_event(now_ms),
-            Err(poisoned) => poisoned.into_inner().on_event(now_ms),
+        let suppressed = if without_blocking {
+            match self.drop_log_limiter.try_lock() {
+                Ok(mut limiter) => limiter.on_event(now_ms),
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().on_event(now_ms),
+                Err(TryLockError::WouldBlock) => None,
+            }
+        } else {
+            match self.drop_log_limiter.lock() {
+                Ok(mut limiter) => limiter.on_event(now_ms),
+                Err(poisoned) => poisoned.into_inner().on_event(now_ms),
+            }
         };
         if let Some(suppressed) = suppressed {
             warn!(
@@ -100,6 +125,9 @@ pub(crate) struct ConnectionEvidence {
     pub(crate) tcp_connect: Option<Duration>,
     pub(crate) tls_handshake: Option<Duration>,
 }
+
+/// `error.type` of an attempt whose request was dropped before it ended.
+const CANCELLED_ERROR_TYPE: &str = "cancelled";
 
 /// Attempt-specific span fields, present only on CLIENT attempt spans.
 #[derive(Debug, Clone)]
@@ -153,6 +181,18 @@ struct AttemptState {
     in_flight: Option<InFlightAttempt>,
 }
 
+impl AttemptState {
+    /// The retry reason of attempt number `attempt`: the outcome of the
+    /// attempt before it.
+    fn retry_reason(&self, attempt: u32) -> Option<&'static str> {
+        if attempt > 1 {
+            Some(self.last_outcome.unwrap_or("unknown"))
+        } else {
+            None
+        }
+    }
+}
+
 struct InFlightAttempt {
     span_id: String,
     server_address: Option<String>,
@@ -161,6 +201,14 @@ struct InFlightAttempt {
     /// first prepares its request, when it was handed to the backend.
     started_at: Instant,
     connection: ConnectionEvidence,
+    /// The attempt reached the backend, which therefore holds a `traceparent`
+    /// naming its span. Only a handed-off attempt is exported when the request
+    /// is dropped before the attempt ends.
+    handed_off: bool,
+    /// Whether the attempt's first scoped poll hands it to the backend. A
+    /// dispatch that admits and prepares the request first reports the
+    /// handoff itself instead ([`note_backend_attempt_handed_off`]).
+    handed_off_on_poll: bool,
 }
 
 impl BackendAttemptTrace {
@@ -223,6 +271,8 @@ impl BackendAttemptTrace {
             server_port,
             started_at: Instant::now(),
             connection: ConnectionEvidence::default(),
+            handed_off: false,
+            handed_off_on_poll: true,
         });
         BackendAttemptSpan(Some(Box::new(BegunAttempt {
             trace: Arc::clone(self),
@@ -238,21 +288,13 @@ impl BackendAttemptTrace {
         let (attempt, retry_reason, in_flight) = {
             let mut state = self.lock();
             state.recorded = state.recorded.saturating_add(1);
-            let retry_reason = if state.recorded > 1 {
-                Some(state.last_outcome.unwrap_or("unknown"))
-            } else {
-                None
-            };
+            let retry_reason = state.retry_reason(state.recorded);
             state.last_outcome = Some(attempt_outcome_label(error_class, response_status));
             (state.recorded, retry_reason, state.in_flight.take())
         };
         let Some(in_flight) = in_flight else {
             return;
         };
-        let duration_ms = ended_at
-            .saturating_duration_since(in_flight.started_at)
-            .as_secs_f64()
-            * 1000.0;
         // A gateway-classified failure carries a synthesized status, not one
         // the backend sent, so only an unclassified outcome reports its status.
         let http_status_code = response_status.filter(|_| error_class.is_none());
@@ -261,9 +303,35 @@ impl BackendAttemptTrace {
             (None, Some(status)) if status >= 400 => Some(status.to_string()),
             _ => None,
         };
+        let span = self.attempt_span(
+            in_flight,
+            ended_at,
+            attempt,
+            retry_reason,
+            http_status_code,
+            error_type,
+        );
+        self.sink.export(span);
+    }
+
+    /// The CLIENT span of `in_flight`, attempt number `attempt`, ended at
+    /// `ended_at`.
+    fn attempt_span(
+        &self,
+        in_flight: InFlightAttempt,
+        ended_at: Instant,
+        attempt: u32,
+        retry_reason: Option<&'static str>,
+        http_status_code: Option<u16>,
+        error_type: Option<String>,
+    ) -> SpanData {
+        let duration_ms = ended_at
+            .saturating_duration_since(in_flight.started_at)
+            .as_secs_f64()
+            * 1000.0;
         let span_name = http_method_for_span_name(&self.http_method).to_string();
         let otlp_error = error_type.is_some();
-        let span = SpanData::backend_attempt(
+        SpanData::backend_attempt(
             self.trace_id.clone(),
             in_flight.span_id,
             self.server_span_id.clone(),
@@ -282,14 +350,52 @@ impl BackendAttemptTrace {
                 error_type,
                 connection: in_flight.connection,
             },
-        );
-        self.sink.export(span);
+        )
     }
 
     fn update_in_flight(&self, update: impl FnOnce(&mut InFlightAttempt)) {
         if let Some(in_flight) = self.lock().in_flight.as_mut() {
             update(in_flight);
         }
+    }
+
+    /// A scoped poll of the attempt in flight: hands it to the backend unless
+    /// its dispatch reports the handoff itself.
+    fn note_attempt_polled(&self) {
+        self.update_in_flight(|attempt| {
+            if attempt.handed_off_on_poll {
+                attempt.handed_off = true;
+            }
+        });
+    }
+}
+
+impl Drop for BackendAttemptTrace {
+    /// The request was dropped (with it, every clone of its context) before
+    /// the attempt in flight ended: export that attempt as `cancelled` when
+    /// the backend holds its `traceparent`, so the backend's SERVER span is
+    /// not left under a parent that is never exported. Exclusive access means
+    /// the state lock is not taken, and the export only queues the span on the
+    /// exporter's bounded buffer, so a drop never blocks.
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(in_flight) = state.in_flight.take().filter(|attempt| attempt.handed_off) else {
+            return;
+        };
+        let attempt = state.recorded.saturating_add(1);
+        let retry_reason = state.retry_reason(attempt);
+        let span = self.attempt_span(
+            in_flight,
+            Instant::now(),
+            attempt,
+            retry_reason,
+            None,
+            Some(CANCELLED_ERROR_TYPE.to_string()),
+        );
+        self.sink.export_without_blocking(span);
     }
 }
 
@@ -328,11 +434,27 @@ impl BackendAttemptSpan {
         self.0.as_ref().map_or(base, |begun| &begun.headers)
     }
 
-    /// The dispatch began the backend dial / send at `handed_off_at`, after
-    /// preparing the request: the attempt starts there, never before it began.
+    /// The dispatch admits and prepares the request before it hands it to the
+    /// backend, and reports that handoff itself, from inside the attempt's
+    /// scope, with [`note_backend_attempt_handed_off`] (`proxy_to_backend`
+    /// through `BackendAttemptHandoff`). A poll alone then does not hand the
+    /// attempt over, so an attempt refused before the handoff (a backend
+    /// admission rejection) is never exported as sent.
+    pub(crate) fn handoff_reported_by_dispatch(&self) {
+        if let Some(begun) = self.0.as_ref() {
+            begun.trace.update_in_flight(|attempt| {
+                attempt.handed_off_on_poll = false;
+            });
+        }
+    }
+
+    /// The dispatch handed the attempt to the backend, beginning the backend
+    /// dial / send at `handed_off_at` after preparing the request: the attempt
+    /// starts there, never before it began.
     pub(crate) fn handed_off_at(&self, handed_off_at: Instant) {
         if let Some(begun) = self.0.as_ref() {
             begun.trace.update_in_flight(|attempt| {
+                attempt.handed_off = true;
                 attempt.started_at = attempt.started_at.max(handed_off_at);
             });
         }
@@ -386,12 +508,21 @@ pub(crate) fn poll_backend_attempt<F: Future>(
 ) -> Poll<F::Output> {
     match trace {
         None => attempt.poll(cx),
-        Some(trace) => ACTIVE_BACKEND_ATTEMPT.sync_scope(Arc::clone(trace), || attempt.poll(cx)),
+        Some(trace) => {
+            trace.note_attempt_polled();
+            ACTIVE_BACKEND_ATTEMPT.sync_scope(Arc::clone(trace), || attempt.poll(cx))
+        }
     }
 }
 
 fn with_active_attempt(update: impl FnOnce(&mut InFlightAttempt)) {
     let _ = ACTIVE_BACKEND_ATTEMPT.try_with(|trace| trace.update_in_flight(update));
+}
+
+/// The active attempt was handed to the backend, which from here holds its
+/// `traceparent`.
+pub(crate) fn note_backend_attempt_handed_off() {
+    with_active_attempt(|attempt| attempt.handed_off = true);
 }
 
 /// The active attempt rides a pooled connection it did not open.

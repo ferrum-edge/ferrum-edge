@@ -24,7 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reporting zero. Attempts are instrumented on the HTTP/1.1/HTTP/2 backend
   loop, the native gRPC loop, and the HTTP/3 frontend's buffered retry loop.
   Other dispatch paths keep the previous `traceparent` and export no attempt
-  span. `SERVER` spans are unchanged. With tracing absent, unsampled, or in
+  span. An attempt whose request is dropped before it ends (a client
+  disconnect) is exported with `error.type` `cancelled` once it reached the
+  backend, so the backend's span is never left under a parent that was not
+  exported. `SERVER` spans are unchanged. With tracing absent, unsampled, or in
   propagation-only mode, each hook costs one check and allocates nothing.
 
 - **Diagnostic references for every gateway-authored error, with rejection and

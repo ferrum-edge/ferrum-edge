@@ -39133,6 +39133,10 @@ async fn handle_proxy_request_inner(
             &current_url,
             owned_proxy_headers_ref.unwrap_or(&ctx.headers),
         );
+        // `proxy_to_backend` admits and prepares the request before it hands
+        // it over, and marks that handoff itself: an attempt refused before it
+        // (backend admission) never reached the backend and is not exported.
+        initial_attempt_span.handoff_reported_by_dispatch();
         let initial_attempt = await_backend_attempt_route_deadline(
             route_request_deadline,
             RouteAttemptBudget::from_handoff(
@@ -39175,7 +39179,9 @@ async fn handle_proxy_request_inner(
         let initial_handed_to_backend = initial_attempt_handoff.handed_to_backend();
         // The attempt span starts where the backend dial / send began, after
         // the dispatch prepared the request (issue #5864).
-        initial_attempt_span.handed_off_at(backend_admission_started_at);
+        if initial_handed_to_backend {
+            initial_attempt_span.handed_off_at(backend_admission_started_at);
+        }
         let initial_dispatch = match initial_attempt {
             Ok(dispatch) => dispatch,
             Err(expiry) => route_deadline_dispatch_result(
@@ -39969,6 +39975,7 @@ async fn handle_proxy_request_inner(
             &backend_url,
             owned_proxy_headers_ref.unwrap_or(&ctx.headers),
         );
+        dispatch_attempt_span.handoff_reported_by_dispatch();
         let dispatch_attempt = await_backend_attempt_route_deadline(
             route_request_deadline,
             RouteAttemptBudget::from_handoff(
@@ -40010,7 +40017,9 @@ async fn handle_proxy_request_inner(
         .await;
         let dispatch_handed_to_backend = dispatch_attempt_handoff.handed_to_backend();
         // See `initial_attempt_span.handed_off_at` in the retry arm above.
-        dispatch_attempt_span.handed_off_at(backend_admission_started_at);
+        if dispatch_handed_to_backend {
+            dispatch_attempt_span.handed_off_at(backend_admission_started_at);
+        }
         let dispatch = match dispatch_attempt {
             Ok(dispatch) => dispatch,
             Err(expiry) => route_deadline_dispatch_result(
@@ -50608,6 +50617,9 @@ impl BackendAttemptHandoff {
             let _ = self.retained_body.set(body.clone());
         }
         self.handed_to_backend.store(true, Ordering::Relaxed);
+        // The attempt's `otel_tracing` CLIENT span, if any, is now the parent
+        // the backend holds (issue #5864).
+        crate::plugins::otel_tracing::note_backend_attempt_handed_off();
     }
 
     /// The dispatch marker the route deadline wrapper observes.
@@ -66382,8 +66394,9 @@ mod tests {
             .find(call_marker)
             .expect("retry-loop call to proxy_grpc_request_from_bytes not found");
         let call_tail = &loop_body[call_idx..];
+        // Anchored on the pin that follows the call, not on its indentation.
         let call_end = call_tail
-            .find(");\n                    tokio::pin!(attempt);")
+            .find("tokio::pin!(attempt)")
             .expect("end of retry-loop call not found");
         let call_args = &call_tail[..call_end];
 
