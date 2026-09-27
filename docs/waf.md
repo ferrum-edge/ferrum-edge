@@ -109,7 +109,8 @@ by a blanket `additionalProperties: false` on the map itself:
 remains after `default_rule_action`, `rule_modes`, `rule_overrides`,
 `disabled_default_rules`, custom rules, paranoia filtering, and the request /
 response inspection toggles. Built-in rules are monitor-only unless opted in, so
-`mode: enforce` with only the default pack is not admitted. `mode: monitor`
+`mode: enforce` with only the default pack is not admitted unless one of the
+separate enforcement paths below is configured. `mode: monitor`
 with zero enforcing rules remains valid. Anomaly scoring (`scoring.enabled`) and
 stream transport guards (`stream.tcp_require_tls`, enforce-action
 `stream.signatures`) are separate enforcement paths and satisfy admission
@@ -119,7 +120,10 @@ when a body inspection hook can run: it rejects oversize governed HTTP bodies
 and WebSocket application messages under `mode: enforce` even if every rule
 stays monitor-only. `fail_closed` (the default), `scan_truncated`, and `skip`
 do not count, because they cannot reject unless some other enforcing body
-policy already exists.
+policy already exists. `on_unlisted_content_type: block` counts the same way
+when the request-body hook can run and some body can be unlisted (see
+[Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type));
+its `fail_closed` does not.
 
 ## Paranoia levels
 
@@ -518,25 +522,42 @@ gateway to buffer that body and decides over the **finalized** backend-visible
 headers and the actual bytes, so an empty upload always passes and an HTTP/2
 or HTTP/3 body sent without `Content-Length` is still caught. Bodies that
 could not be refused keep the streaming path. It applies only to
-`body_methods`, to non-exempt requests, and when this instance inspects
-request bodies at all; WebSocket messages carry no `Content-Type` and are
-always scanned.
+`body_methods`, to non-exempt requests, and when this instance's request-body
+hook runs at all (request and request-body inspection on, with an active
+request-body rule or `FE-ENCODING-001` / `FE-ENCODING-002` enabled); WebSocket
+messages carry no `Content-Type` and are always scanned.
+
+Because a refusing configuration reads the whole body before it rejects, a
+large or long-running upload receives its `403` only at end of stream (memory
+stays bounded by `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`), and a client-streaming
+or bidirectional gRPC call may wait for its deadline instead. `on_body_too_large:
+skip` does not avoid this buffering for unlisted bodies: it only skips oversize
+bodies the WAF would otherwise scan.
 
 A rejection sets `waf.action=blocked`, `waf.block_reason=content_type`, and
 `waf.body_uninspected=content_type`. A body that is recorded but not refused
-(`fail_closed` with no enforcing body rule here, or `mode: monitor`) carries
-`waf.body_uninspected=content_type` without the block fields; in `monitor`
-mode this is observed from the declared framing (`Content-Length` > 0 or
-`Transfer-Encoding`) without buffering, so stage the setting in `monitor`
-first to see which routes carry unlisted bodies. Under `mode: enforce`,
-`block` is itself a reachable admission enforcement path when request-body
-inspection is on.
+(`mode: monitor`, or `fail_closed` in enforce mode with no enforcing body
+policy applicable to the request) carries `waf.body_uninspected=content_type`
+without the block fields. Those bodies are not buffered: they are recorded
+from the request's declared framing (`Content-Length` > 0 or
+`Transfer-Encoding`), so an HTTP/2 or HTTP/3 body sent without
+`Content-Length` is **not** recorded. Staging the setting in `monitor` first
+shows which routes carry unlisted bodies, but undercounts such clients.
 
-Before switching to `block`, list every type your backends legitimately
-accept: add them to `body_content_types` (scanned as text), turn on
-`inspect_multipart` for uploads, or exempt upload-only routes with
-`global_exemptions`. gRPC (`application/grpc`) bodies are unlisted by default,
-so a `block` WAF on a gRPC route refuses them unless listed or exempted.
+Under `mode: enforce`, `block` is itself a reachable admission enforcement
+path when the request-body hook can run (as above) and at least one content
+type is left unscanned. With both `inspect_multipart` and
+`inspect_binary_body` on, every body is scanned, `block` can never fire, and it
+does not satisfy admission. `fail_closed` never satisfies admission.
+
+Before switching to `block` or `fail_closed`, list every type your backends
+legitimately accept: add them to `body_content_types` (scanned as text), turn
+on `inspect_multipart` for uploads, or exempt upload-only routes with
+`global_exemptions`. gRPC (`application/grpc`, gRPC-Web, `application/protobuf`)
+and image bodies are unlisted by default, so a non-empty one is refused under
+`block`, and under `fail_closed` wherever an enforcing request-body policy
+applies (for example with `default_rule_action: enforce` or anomaly scoring),
+unless the type is listed or the route exempted.
 Bodies on methods outside `body_methods` (for example a `GET` with a body)
 are not governed; add the method to `body_methods` if a backend reads such
 bodies.
@@ -924,15 +945,15 @@ logging sinks are configured (stdout, http, tcp, kafka, loki, …):
 `waf.block_reason`, `waf.scoring_instance`, `waf.would_block_reason`,
 `waf.paranoia`, plus `waf.scan_truncated` / `waf.scan_timed_out` /
 `waf.body_too_large` / `waf.body_too_large_target` (`request_body` or
-`response_body`) / `waf.body_uninspected` (`content_type`). All of these are fixed-cardinality; body bytes are never
-logged. Blocked
-requests reject before backend dispatch and still produce a transaction summary
-carrying these fields, so blocks are visible in the same per-request log line as
-allowed traffic.
+`response_body`) / `waf.body_uninspected` (`content_type`). All of these are
+fixed-cardinality; body bytes are never logged. Blocked requests reject before
+backend dispatch and still produce a transaction summary carrying these fields,
+so blocks are visible in the same per-request log line as allowed traffic.
 
 `waf.block_reason` names why a request was blocked: `rule`, `score`,
-`body_too_large`, `content_type`, or `scan_timeout` for HTTP-family traffic, and `tcp_require_tls`,
-`first_bytes_unavailable`, or `signature` for stream (TCP/UDP) traffic. Stream
+`body_too_large`, `content_type`, or `scan_timeout` for HTTP-family traffic, and
+`tcp_require_tls`, `first_bytes_unavailable`, or `signature` for stream (TCP/UDP)
+traffic. Stream
 inspection additionally records `waf.would_block_reason` (the same stream value
 set) on `monitor`-mode connections that *would* have blocked under `enforce`,
 so enforce-mode impact stays directly countable before you switch modes — in

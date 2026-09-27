@@ -285,6 +285,110 @@ async fn the_finalized_headers_decide() {
     );
 }
 
+#[tokio::test]
+async fn a_transformer_that_relabels_a_scanned_body_as_unlisted_is_refused() {
+    // The inbound type is scanned, so the body is buffered for the rules; a
+    // request transformer then rewrites it to a type the rules skip. The
+    // finalized map decides, so the relabelled body is refused for its type.
+    let plugin = recommended("block");
+    let mut ctx = request("POST", "/api/items", Some("application/json"));
+    assert!(plugin.should_buffer_request_body(&ctx));
+    let mut finalized = ctx.headers.clone();
+    finalized.insert("content-type".into(), "application/octet-stream".into());
+
+    let result = final_body(&plugin, &mut ctx, &finalized, SQLI_JSON).await;
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.block_reason"), Some("content_type"));
+
+    // Benign twin: the same rewrite of an empty body carries nothing to refuse.
+    let mut empty = request("POST", "/api/items", Some("application/json"));
+    let result = final_body(&plugin, &mut empty, &finalized, b"").await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&empty, "waf.body_uninspected"), None);
+}
+
+#[tokio::test]
+async fn log_to_metadata_false_still_refuses_but_records_nothing() {
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "on_unlisted_content_type": "block",
+        "log_to_metadata": false
+    }))
+    .unwrap();
+    let (buffers, result, ctx) = post(&plugin, Some("application/octet-stream"), SQLI_JSON).await;
+    assert!(buffers);
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.body_uninspected"), None);
+    assert_eq!(meta(&ctx, "waf.block_reason"), None);
+
+    // Observe-only path: monitor mode with metadata off writes nothing.
+    let plugin = waf(json!({
+        "mode": "monitor",
+        "on_unlisted_content_type": "block",
+        "log_to_metadata": false
+    }))
+    .unwrap();
+    let mut declared = request("POST", "/api/items", Some("application/octet-stream"));
+    declared
+        .headers
+        .insert("content-length".into(), "15".into());
+    let result = plugin.authorize(&mut declared).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&declared, "waf.body_uninspected"), None);
+}
+
+#[tokio::test]
+async fn fail_closed_in_monitor_mode_observes_and_never_refuses() {
+    let plugin = waf(json!({
+        "mode": "monitor",
+        "default_rule_action": "enforce",
+        "on_unlisted_content_type": "fail_closed"
+    }))
+    .unwrap();
+
+    let mut declared = request("POST", "/api/items", Some("application/octet-stream"));
+    declared
+        .headers
+        .insert("content-length".into(), "43".into());
+    assert!(
+        !plugin.should_buffer_request_body(&declared),
+        "monitor mode never buffers an unlisted body"
+    );
+    let result = plugin.authorize(&mut declared).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        meta(&declared, "waf.body_uninspected"),
+        Some("content_type")
+    );
+
+    let (_, result, ctx) = post(&plugin, Some("application/octet-stream"), SQLI_JSON).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.block_reason"), None);
+    assert_eq!(meta(&ctx, "waf.action"), None);
+}
+
+#[test]
+fn block_is_not_an_admission_enforcement_path_when_every_type_is_scanned() {
+    // With both scope toggles on, no body is ever unlisted, so `block` cannot
+    // fire and the monitor-only default pack leaves nothing that can block.
+    let error = waf(json!({
+        "mode": "enforce",
+        "inspect_binary_body": true,
+        "inspect_multipart": true,
+        "on_unlisted_content_type": "block"
+    }))
+    .unwrap_err();
+    assert!(error.contains("no enabled enforcement path"), "{error}");
+
+    // Either toggle alone leaves some type unlisted, so `block` is reachable.
+    for toggle in ["inspect_binary_body", "inspect_multipart"] {
+        let mut config = json!({ "mode": "enforce", "on_unlisted_content_type": "block" });
+        config[toggle] = json!(true);
+        assert!(waf(config).is_ok(), "{toggle}");
+    }
+}
+
 #[test]
 fn block_is_an_admission_enforcement_path_only_with_body_inspection() {
     // The built-in pack is monitor-only; `block` alone makes enforce reachable.

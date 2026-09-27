@@ -28317,7 +28317,10 @@ components:
             waf.block_reason=content_type and waf.body_uninspected=content_type;
             recorded-but-allowed bodies set waf.body_uninspected=content_type.
             Under mode enforce, block is a reachable admission enforcement path
-            when request-body inspection is on; fail_closed is not.
+            when the request-body hook can run (request-body inspection on with
+            an active request-body rule or FE-ENCODING-001/002) and at least one
+            content type is left unscanned (not both inspect_multipart and
+            inspect_binary_body); fail_closed is not.
         include_default_rules:
           type: [boolean, "null"]
           default: true
