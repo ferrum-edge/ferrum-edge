@@ -1204,7 +1204,10 @@ mod tests {
         // and a beyond-cap stack reduces by exactly MAX_DECODE_ROUNDS layers
         // (leaving residual encoding the caller flags as evasion).
         assert_eq!(layered_decode_inner("%25253Cx", StringEscapes::All).0, "<x");
-        assert_eq!(layered_decode_inner("%2525253Cx", StringEscapes::All).0, "%3Cx");
+        assert_eq!(
+            layered_decode_inner("%2525253Cx", StringEscapes::All).0,
+            "%3Cx"
+        );
     }
 
     #[test]
