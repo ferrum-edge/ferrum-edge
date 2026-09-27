@@ -4004,6 +4004,8 @@ impl StreamListenerManager {
         while let Ok(failure) = async_failure_rx.try_recv() {
             append_bind_failure(&self.bind_failures, failure);
         }
+        self.reconciled.store(true, Ordering::Release);
+
         // A Gateway QUIC half may have closed its socket on a port this pass
         // just failed to bind after the probe gave up but before the store
         // above. The supervisor has then already consumed that release against
@@ -4017,7 +4019,6 @@ impl StreamListenerManager {
             }
         }
 
-        self.reconciled.store(true, Ordering::Release);
         self.spawn_supervisor();
         bind_failures
     }
