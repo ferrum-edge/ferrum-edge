@@ -89,7 +89,7 @@ pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) 
     // and we still want the JSON/HTML-only decode to fire in that case.
     let (layered, converged) = layered_decode_inner(text);
     let candidates = [
-        Cow::Owned(layered),
+        layered,
         unicode_unescape(text),
         html_entity_decode(text),
         percent_decode_plus(text),
@@ -588,17 +588,36 @@ pub(super) fn canonical_query_component_views(raw: &str) -> CanonicalQueryViews<
     CanonicalQueryViews { primary, variants }
 }
 
+/// Whether any decoder could change `text`. Runs over every inspected body, so
+/// it uses the SIMD `memchr` searchers rather than a byte-at-a-time loop: a
+/// body with no marker at all — the common case — costs two vectorised passes.
 fn has_decodable_marker(text: &str) -> bool {
-    text.as_bytes()
-        .iter()
-        .any(|byte| matches!(byte, b'%' | b'+' | b'\\' | b'&'))
+    let bytes = text.as_bytes();
+    memchr::memchr3(b'%', b'+', b'\\', bytes).is_some() || memchr::memchr(b'&', bytes).is_some()
 }
 
 /// One round of the layered decode: percent, then unicode, then HTML entity.
-fn decode_round(text: &str) -> String {
-    let percent = percent_decode_plus(text).into_owned();
-    let unicode = unicode_unescape(&percent).into_owned();
-    html_entity_decode(&unicode).into_owned()
+///
+/// Each stage borrows when it has nothing to decode, and a borrowed stage
+/// hands its input straight to the next one, so a round over text that only
+/// one stage touches allocates once rather than three times. A round that
+/// changes nothing returns `Cow::Borrowed`, which is how
+/// [`layered_decode_inner`] recognises a fixed point without comparing the
+/// (up to `max_scan_bytes`-sized) strings.
+fn decode_round(text: &str) -> Cow<'_, str> {
+    let percent = percent_decode_plus(text);
+    let unicode = chain_stage(percent, unicode_unescape);
+    chain_stage(unicode, html_entity_decode)
+}
+
+/// Apply `stage` to `input`, keeping `input` (and its borrow of the round's
+/// original text) when the stage decoded nothing.
+fn chain_stage<'a>(input: Cow<'a, str>, stage: fn(&str) -> Cow<'_, str>) -> Cow<'a, str> {
+    let decoded = match stage(&input) {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(decoded) => Some(decoded),
+    };
+    decoded.map_or(input, Cow::Owned)
 }
 
 /// Run the layered decode and report whether it reached a fixed point within
@@ -610,20 +629,29 @@ fn decode_round(text: &str) -> String {
 /// by exhausting the iteration count: a payload that finishes decoding on the
 /// final allowed round (e.g. triple percent-encoding with a 3-round cap) has
 /// converged and must not be reported as a residual.
-fn layered_decode_inner(text: &str) -> (String, bool) {
-    let mut current = text.to_string();
+///
+/// Every decoder here only ever shortens its input when it decodes something,
+/// so a stage returns `Cow::Owned` exactly when it changed the text and a round
+/// that returns `Cow::Borrowed` is a fixed point. The equality check below is
+/// kept as a belt-and-braces guard; for a genuinely changed round it fails on
+/// the length comparison before touching the bytes.
+fn layered_decode_inner(text: &str) -> (Cow<'_, str>, bool) {
+    let mut current = Cow::Borrowed(text);
     let mut converged = true;
     for round in 0..MAX_DECODE_ROUNDS {
-        let next = decode_round(&current);
-        if next == current {
+        let next = match decode_round(&current) {
+            Cow::Owned(next) if next != *current => next,
             // Reached a fixed point before the cap — fully reduced.
-            break;
-        }
-        current = next;
+            _ => break,
+        };
+        current = Cow::Owned(next);
         // The last permitted round still changed the value; if a further round
         // would change it again the payload is stacked deeper than the cap.
         if round + 1 == MAX_DECODE_ROUNDS {
-            converged = decode_round(&current) == current;
+            converged = match decode_round(&current) {
+                Cow::Borrowed(_) => true,
+                Cow::Owned(next) => next == *current,
+            };
         }
     }
     (current, converged)
@@ -648,30 +676,65 @@ fn percent_decode_plus(text: &str) -> Cow<'_, str> {
 
 /// Decode JSON/JavaScript unicode escapes: `\uXXXX` (with surrogate pairs),
 /// `\u{XXXX}`, and `\xXX`. Unrecognized escapes keep their literal backslash.
+///
+/// Borrows unless at least one escape actually decodes: a body full of escapes
+/// this decoder does not recognise is returned untouched rather than copied.
+/// Literal text between escapes is copied in whole runs located with `memchr`,
+/// not one character at a time.
 fn unicode_unescape(text: &str) -> Cow<'_, str> {
+    decode_runs(text, b'\\', |after| {
+        decode_escape(after).map(|(cp, consumed)| (EntityVal::Cp(cp), consumed))
+    })
+}
+
+/// Shared run-copying driver for the backslash-escape and HTML-entity
+/// decoders.
+///
+/// `marker` is the ASCII byte that can start an escape. Everything between
+/// markers is copied as one slice; `decode` is offered the bytes after each
+/// marker and returns the decoded value plus how many of those bytes it
+/// consumed, or `None` to leave the marker as literal text. Markers and every
+/// byte an escape consumes are ASCII, so every slice boundary is a UTF-8
+/// character boundary. Returns `Cow::Borrowed` when nothing decoded.
+fn decode_runs(
+    text: &str,
+    marker: u8,
+    decode: impl Fn(&[u8]) -> Option<(EntityVal, usize)>,
+) -> Cow<'_, str> {
     let bytes = text.as_bytes();
-    if !bytes.contains(&b'\\') {
+    let Some(mut i) = memchr::memchr(marker, bytes) else {
         return Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            if let Some((cp, consumed)) = decode_escape(&bytes[i + 1..]) {
-                push_cp(&mut out, cp);
+    };
+    let mut out: Option<String> = None;
+    // Start of the literal run not yet copied into `out`.
+    let mut copied = 0;
+    loop {
+        match decode(&bytes[i + 1..]) {
+            Some((value, consumed)) => {
+                let out = out.get_or_insert_with(|| String::with_capacity(text.len()));
+                out.push_str(&text[copied..i]);
+                match value {
+                    EntityVal::Cp(cp) => push_cp(out, cp),
+                    EntityVal::Str(decoded) => out.push_str(decoded),
+                }
                 i += 1 + consumed;
-                continue;
+                copied = i;
             }
-            out.push('\\');
-            i += 1;
-            continue;
+            // The marker stays literal and joins the pending run.
+            None => i += 1,
         }
-        let len = utf8_char_len(bytes[i]);
-        let end = (i + len).min(bytes.len());
-        out.push_str(&text[i..end]);
-        i = end;
+        match bytes.get(i..).and_then(|rest| memchr::memchr(marker, rest)) {
+            Some(offset) => i += offset,
+            None => break,
+        }
     }
-    Cow::Owned(out)
+    match out {
+        Some(mut out) => {
+            out.push_str(&text[copied..]);
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(text),
+    }
 }
 
 /// Parse a single backslash escape from `after` (the bytes following `\`).
@@ -717,33 +780,11 @@ fn decode_escape(after: &[u8]) -> Option<(u32, usize)> {
 
 /// Decode HTML entities: numeric (`&#NN;`, `&#xHH;`) and a small named set
 /// covering the characters that compose injection syntax.
+///
+/// Borrows unless at least one entity actually decodes, and copies literal
+/// runs in bulk; see [`decode_runs`].
 fn html_entity_decode(text: &str) -> Cow<'_, str> {
-    let bytes = text.as_bytes();
-    if !bytes.contains(&b'&') {
-        return Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'&' {
-            if let Some((value, consumed)) = decode_entity(&bytes[i + 1..]) {
-                match value {
-                    EntityVal::Cp(cp) => push_cp(&mut out, cp),
-                    EntityVal::Str(s) => out.push_str(s),
-                }
-                i += 1 + consumed;
-                continue;
-            }
-            out.push('&');
-            i += 1;
-            continue;
-        }
-        let len = utf8_char_len(bytes[i]);
-        let end = (i + len).min(bytes.len());
-        out.push_str(&text[i..end]);
-        i = end;
-    }
-    Cow::Owned(out)
+    decode_runs(text, b'&', decode_entity)
 }
 
 enum EntityVal {
@@ -835,21 +876,6 @@ fn push_cp(out: &mut String, cp: u32) {
 }
 
 #[inline]
-fn utf8_char_len(first: u8) -> usize {
-    if first < 0x80 {
-        1
-    } else if first >> 5 == 0b110 {
-        2
-    } else if first >> 4 == 0b1110 {
-        3
-    } else if first >> 3 == 0b11110 {
-        4
-    } else {
-        1
-    }
-}
-
-#[inline]
 fn hex_digit(c: u8) -> Option<u32> {
     match c {
         b'0'..=b'9' => Some((c - b'0') as u32),
@@ -900,6 +926,12 @@ mod tests {
     fn unicode_unescape_decodes_json_payload() {
         assert_eq!(unicode_unescape(r"<script>"), "<script>");
         assert_eq!(unicode_unescape(r"${jndi"), "${jndi");
+    }
+
+    #[test]
+    fn unicode_unescape_borrows_when_no_escape_decodes() {
+        assert!(matches!(unicode_unescape(r"C:\q\z\k"), Cow::Borrowed(_)));
+        assert_eq!(unicode_unescape(r"日本\q\u003c\z"), r"日本\q<\z");
     }
 
     #[test]
@@ -959,6 +991,17 @@ mod tests {
             html_entity_decode("no entities"),
             Cow::Borrowed(_)
         ));
+        // A marker that never forms an entity is literal text: the input is
+        // returned as-is rather than copied, and literal runs between real
+        // entities survive intact.
+        assert!(matches!(
+            html_entity_decode("AT&T & Co; R&D"),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            html_entity_decode("Fish &amp; chips &amp chips &#x3c;b&gt; 日本 & more"),
+            "Fish & chips &amp chips <b> 日本 & more"
+        );
     }
 
     #[test]
@@ -1023,6 +1066,10 @@ mod tests {
         // (leaving residual encoding the caller flags as evasion).
         assert_eq!(layered_decode_inner("%25253Cx").0, "<x");
         assert_eq!(layered_decode_inner("%2525253Cx").0, "%3Cx");
+        // Nothing to decode: the input is borrowed through every round.
+        let (plain, converged) = layered_decode_inner("100% sure & done");
+        assert!(matches!(plain, Cow::Borrowed(_)));
+        assert!(converged);
     }
 
     #[test]

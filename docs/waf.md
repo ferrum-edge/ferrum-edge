@@ -36,10 +36,12 @@ and injector HTTP listeners do not use this adapter. HTTP/2 and HTTP/3 do not
 use this wire observer; their existing protocol-specific TE validation is
 unchanged.
 
-The WAF focuses on injection and disclosure signatures: SQLi, NoSQLi, command
-injection, XSS, SSTI, JNDI/Log4Shell, path traversal, LFI, RFI, SSRF, XXE,
-deserialization, prototype pollution, and (response-side) sensitive-data
-leakage.
+The WAF focuses on injection and disclosure signatures: SQLi (including blind
+time-delay, catalog enumeration, and error-based extraction), NoSQLi, command
+injection, XSS, SSTI, JNDI/Log4Shell, Shellshock, OGNL/Struts, PHP and Node.js
+code injection, path traversal, LFI, RFI, SSRF, XXE, deserialization gadgets,
+prototype pollution, HTTP response splitting, restricted-file probing,
+executable uploads, and (response-side) sensitive-data leakage.
 
 ## Operating modes and enforcement posture
 
@@ -109,7 +111,8 @@ by a blanket `additionalProperties: false` on the map itself:
 remains after `default_rule_action`, `rule_modes`, `rule_overrides`,
 `disabled_default_rules`, custom rules, paranoia filtering, and the request /
 response inspection toggles. Built-in rules are monitor-only unless opted in, so
-`mode: enforce` with only the default pack is not admitted. `mode: monitor`
+`mode: enforce` with only the default pack is not admitted unless one of the
+separate enforcement paths below is configured. `mode: monitor`
 with zero enforcing rules remains valid. Anomaly scoring (`scoring.enabled`) and
 stream transport guards (`stream.tcp_require_tls`, enforce-action
 `stream.signatures`) are separate enforcement paths and satisfy admission
@@ -119,7 +122,10 @@ when a body inspection hook can run: it rejects oversize governed HTTP bodies
 and WebSocket application messages under `mode: enforce` even if every rule
 stays monitor-only. `fail_closed` (the default), `scan_truncated`, and `skip`
 do not count, because they cannot reject unless some other enforcing body
-policy already exists.
+policy already exists. `on_unlisted_content_type: block` counts the same way
+when the request-body hook can run and some body can be unlisted (see
+[Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type));
+its `fail_closed` does not.
 
 ## Paranoia levels
 
@@ -293,24 +299,27 @@ and `rule_overrides`. Categories:
 
 | Category | Rules | Notes |
 | --- | --- | --- |
-| `sqli` | FE-SQLI-001..005 plus FE-SQLI-001-B..004-B | UNION/tautology/stacked (001–003) are level 1 across decoded query values and admitted request bodies; body mirrors use the exact query patterns. Those three accept either whitespace **or a bounded inline `/*…*/` comment** between SQL tokens, so `UNION/**/SELECT` and `;/**/DROP` are caught at level 1; the tautology rule also accepts an unspaced `\|\|` (`1'\|\|1=1`). The comment body is bounded, so a comment longer than the bound falls through to the comment-token catch-alls: 004 (query) and 004-B (body) are both level 2. SQLSTATE (005) is body-only level 2. |
+| `sqli` | FE-SQLI-001..009 plus FE-SQLI-001-B..004-B, FE-SQLI-006-B..010-B, and FE-SQLI-001-C..003-C | UNION/tautology/stacked (001–003) are level 1 across decoded query values and admitted request bodies; body mirrors use the exact query patterns. Those three accept either whitespace **or a bounded inline `/*…*/` comment** between SQL tokens, so `UNION/**/SELECT` and `;/**/DROP` are caught at level 1; the tautology rule also accepts an unspaced `\|\|` (`1'\|\|1=1`). The comment body is bounded, so a comment longer than the bound falls through to the comment-token catch-alls: 004 (query) and 004-B (body) are both level 2. SQLSTATE (005) is body-only level 2. Level 1 also covers blind time-delay probes (006: `SLEEP(n)`, `pg_sleep`, `BENCHMARK`, `WAITFOR DELAY`, Oracle `dbms_pipe`), catalog enumeration (007: `information_schema.`, `pg_catalog.`, `sqlite_master`, MSSQL `sys*` tables), error-based and out-of-band functions (008: `extractvalue`, `updatexml`, `load_file`, `INTO OUTFILE`, `xp_cmdshell`, `utl_http`), and quoted-string tautologies (009: `' or 'a'='a`, unspaced `'or'1'='1`). In 006, `sleep(n)` counts only after SQL-shaped context (a quote, `(`, `,`, `;`, `=`, `\|`, `&`, an SQL keyword, or the start of the value), so method calls such as `time.sleep(1)` stay clean. That context still matches source code (`foo(); sleep(1);`, `x = sleep(5)`, `benchmark(1000, fn)`), so the exact body mirror 006-B is level 2. Level-1 body coverage is 010-B: `sleep(n)` only after an SQL keyword (`AND`, `OR`, `SELECT`, `WHERE`, `ORDER BY`, …), after a closing quote and an SQL operator (`'+sleep(5)+'`, `'\|\|sleep(5)`), or as a branch of `IF(…, sleep(n), …)`; `BENCHMARK` only around an SQL function (`MD5(`, `SHA1(`, a subquery); and `pg_sleep`, `WAITFOR DELAY`, and the Oracle calls as in 006. 008 counts `load_file` only as a bare call on what MySQL reads — a quoted absolute or UNC path, a hex literal, or a `CHAR(` / `CONCAT(` / `UNHEX(` expression — so `def load_file(path):` and `loader.load_file(…)` stay clean. The `-C` mirrors apply 001–003 to cookie values. The Cookie header is split into crumbs on `;` before matching, so no raw crumb carries the stacked-statement `;` that 003-C needs: it can only fire on a percent-encoded `%3B`, once cookie values are also inspected in decoded form. |
 | `nosqli` | FE-NOSQL-001 (operator key), FE-NOSQL-002 (bracket operator, L2) | |
-| `command_injection` | FE-CMD-001..003 | shell-substitution (003) is level 2 |
+| `command_injection` | FE-CMD-001..004, FE-CMD-005-{Q,B} | shell-substitution (003) is level 2. 004 (query, L1) catches command execution without a classic `;cmd` chain: a backtick or `$(` subshell; a CR/LF separator followed by a Windows tool, a lower-case Unix tool, or a short lower-case command (`cat`, `id`, `sh`, `bash`) that ends the value or takes a flag, path, or quoted argument; `;`/`\|`/`&&` before a reconnaissance tool that never names a list item (`whoami`, `ifconfig`, `certutil`, `mkfifo`, …); `&&`/`\|\|` before a tool that can (`uname`, `busybox`, `powershell`, `pwsh`, `id`, `ls`, `sleep`, `ping`), or `;`/`\|` before one only when it takes a flag, path, or quoted argument, redirects, or chains again; `;`/`\|` before an argument shape a list never has (`busybox nc`/`wget`/`sh`/`ash`/`telnet`, `socat tcp:`/`udp:`/`exec:`/`-`, `ncat`/`netcat`/`nc` with a host and port); and `$IFS`. A CR/LF-separated short command also counts when a `#` comments out the rest of the line (`%0Aid%23`). 004 does not fire on delimited lists (`tags=linux;bash`, `tags=windows;powershell`, `skills=bash\|pwsh`, `fields=id\|uname`) or multi-line prose (`Order%0AID: 123`, `%0ACat food`), but the older level-1 001 still matches a list item that is one of its command words (`tags=linux;bash`, `tags=windows;powershell`, `q=dogs\|cat`); disable or scope FE-CMD-001 where such lists are expected. The cost is that a bare `x;uname` at the end of a value is not matched, because it cannot be told apart from a list. 005 flags explicit interpreter invocation (`/bin/sh`, `cmd /c`, `powershell -enc`, `sh -c`, `python -c`) at level 1 in query values and level 2 in bodies, where deployment APIs carry scripts. |
 | `jndi_injection` | FE-JNDI-001-{B,Q,H}, FE-JNDI-002-{B,Q,H} | **Log4Shell**; direct lookup is Critical/level 1 across body, query, and header; nested-obfuscation is level 2 |
-| `rce` | FE-SPRING4SHELL-001-{B,Q} | class-loader manipulation (CVE-2022-22965) |
+| `rce` | FE-SPRING4SHELL-001-{B,Q}, FE-SHELLSHOCK-001-{H,Q,QV}, FE-OGNL-001-{B,Q,H}, FE-PHP-001-{Q,B}, FE-PHP-002-{Q,B}, FE-NODE-001-{Q,B} | Spring4Shell class-loader manipulation (CVE-2022-22965). Shellshock (CVE-2014-6271) is Critical/level 1 and anchored to the **start** of a header value or query key/value — the position bash actually imports — so `function() {` in ordinary text never matches. OGNL (Apache Struts 2, including the CVE-2017-5638 `Content-Type` vector) is Critical/level 1 across body, query, and header. PHP code injection (`<?php`, `eval($_POST…)`, `system('…')`) and Node.js execution (`require('child_process')`, `process.mainModule`, `constructor.constructor('…')`) are level 1 in query values and level 2 in bodies, where code-hosting APIs carry source. PHP stream wrappers (`php://input`, `phar://`, `zip://`, `data://text/plain`) are level 1 in query values (002-Q) and level 2 in bodies (002-B), where PHP source reads its own request body through `file_get_contents('php://input')`. |
 | `prototype_pollution` | FE-PROTO-001/002 plus FE-PROTO-{001,002}-{Q,QV} | Body `__proto__` is level 1 and body `constructor.prototype` is level 2. The level-1 `-Q`/`-QV` mirrors scan decoded keys/values for `__proto__` and `constructor[prototype]`. |
 | `ldap_injection` | FE-LDAP-001..002 | |
 | `xpath_injection` | FE-XPATH-001, FE-XPATH-002 (L3, low value) | |
 | `ssti` | FE-SSTI-001 (broad, L2), FE-SSTI-002 (arithmetic probe, L1), FE-SSTI-003 (Java/Spring EL, L2) | |
-| `xss` | FE-XSS-001..005 plus `-B`/`-Q` body/query mirrors | script-tag and js-URL cover both query and body |
-| `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-B | FE-PATHTRAV-001..003 (FullUrl) also scan percent-decoded query values (including `%2f`); 001-B covers request bodies. Category labels do not select scan targets. |
+| `xss` | FE-XSS-001..005 plus `-B`/`-Q`/`-C` body/query/cookie mirrors, FE-XSS-006-{Q,B} | script-tag and script-URL cover query, body, and cookie values. The script-URL rule (002) tolerates the ASCII tab/LF/CR that browsers delete inside a URL (`java&#x09;script:`, `jav%0Aascript:`) and covers `vbscript:`; a real space (`java script:`) is prose, not a scheme. 006 flags active-content elements (`<svg`, `<iframe`, `<object`, `<embed`, `<base`, `<meta`, `<math>`, frames) at level 1 in query values and level 2 in bodies, where rich-text APIs carry markup. |
+| `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-{B,C} | FE-PATHTRAV-001..003 (FullUrl) also scan percent-decoded query values (including `%2f`); 001-B covers request bodies and 001-C cookie values. Category labels do not select scan targets. |
 | `lfi` / `rfi` | FE-LFI-001(+ -B), FE-RFI-001 (L2) | FE-LFI-001 (FullUrl) also inspects canonical query values; 001-B covers bodies. The `lfi` label itself does not. |
-| `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q) | metadata/private-IP and dangerous schemes; **level 1** across body and decoded query values (not the raw whole URI). Same dotted-IPv4 / `metadata.google.internal` / `file|gopher|dict|jar|ldap://` claims as the body rules; IPv6 and alternate textual IP forms are out of scope |
+| `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q), FE-SSRF-003-{Q,B} (L2) | metadata/private-IP and dangerous schemes; **level 1** across body and decoded query values (not the raw whole URI). Same dotted-IPv4 / cloud-metadata / `file|gopher|dict|jar|ldap://` claims as the body rules. Metadata endpoints are the IMDS address `169.254.169.254`, the AWS ECS credential endpoint `169.254.170.2`, the AWS IPv6 IMDS `fd00:ec2::254`, Alibaba Cloud's `100.100.100.200`, and `metadata.google.internal`. FE-SSRF-003 is **level 2** and needs a URL scheme in front, because development tooling legitimately passes `http://localhost:…` around. It covers `localhost` and `localhost.`, `0`, `0.0.0.0`, short dotted loopback (`127.1`, `127.0.1`), mixed dotted hex/octal (`0x7f.1`), and bracketed IPv6 (`[::1]`, `[::ffff:127.0.0.1]`, `[fe80::…]`). A host written as a single decimal, hex, or octal integer (`2130706433`, `0x7f000001`, `017700000001`) matches whatever address it encodes, loopback or not: legitimate URLs do not spell hosts that way, and the encoded address is exactly what the dotted-quad rules cannot see. |
 | `xxe` | FE-XXE-001 | external-entity markers; does not trip on `<!DOCTYPE html>` |
-| `deserialization` | FE-DESER-001..003 | Java / .NET / PHP markers |
+| `deserialization` | FE-DESER-001..005 | Java (base64 `rO0AB` or hex `aced0005`) / .NET BinaryFormatter / PHP serialized markers; unsafe YAML type tags (004: PyYAML `!!python/object/apply`, SnakeYAML CVE-2022-1471 gadgets, Psych `!ruby/object`); and polymorphic JSON type discriminators naming a gadget namespace (005: Fastjson/Jackson `@type`/`@class` in `com.sun.`, `java.net.`, `org.apache.`, …, and Json.NET `$type` in `System.Windows.Data.ObjectDataProvider`, …). 005 also matches the Fastjson autoType bypass spellings (`"Lcom.sun…;"`, `"LLcom…;;"`, `"[com.sun…"`) and Jackson's `WRAPPER_ARRAY` form, `["com.sun…", {…}]`, which has no discriminator key. JSON-LD `"@type": "Product"` and application-owned type names stay clean. |
 | `header_anomaly` | FE-HEADER-001..003 | control chars, method-override, header-borne injection (L2) |
 | `cookie_attack` | FE-COOKIE-001, FE-COOKIE-002 (Info, L3) | |
 | `encoding_evasion` / `parameter_pollution` / `method_abuse` | FE-ENCODING-001..002, FE-HPP-001, FE-METHOD-001 | encoding heuristics stay monitor under bulk `default_rule_action: enforce`; HPP and method-abuse inherit bulk enforce |
+| `http_response_splitting` | FE-CRLF-001 | a decoded CR/LF in a query value followed by a response header name (`Set-Cookie:`, `Location:`, …) or a status line — the shape that splits a response when an application reflects the value into a header (redirect targets, download names). Level 1. |
+| `restricted_file` | FE-RESTRICTED-001, FE-RESTRICTED-002 (L2) | matched on the **canonical** path, so `/%2egit/config` is `/.git/config`. 001 (level 1) covers version-control metadata (`.git/`, `.svn/`, `.hg/`), dotenv files, `.htaccess`/`.htpasswd`, credential stores (`.aws/`, `.ssh/`, `.docker/`, `.kube/`, `.npmrc`, `.netrc`, `.pgpass`, `id_rsa`), shell histories, `.DS_Store`, `web.config`, and `wp-config.php` together with its backup and editor-swap copies (`wp-config.php.bak`, `wp-config.php~`, `.wp-config.php.swp`). `.well-known`, `.github`, and `.gitignore` are not matched. 002 (level 2) covers backup, swap, and dump artifacts (`.bak`, `.old`, `.swp`, `.sql`, `.sqlite`, trailing `~`), which some sites publish legitimately. |
+| `file_upload` | FE-UPLOAD-001 | a `filename` / `filename*` parameter on a multipart `Content-Disposition` line naming a server-executable script (`.php`, `.phtml`, `.phar`, `.jsp`, `.aspx`, `.ashx`, `.cgi`, `.shtml`, `.htaccess`, …), including double extensions such as `shell.php.jpg` and the spellings Windows/IIS and C-backed handlers reduce to `shell.php`: a trailing dot or space, the `::$DATA` stream suffix, and a raw or `%00` NUL. A form or JSON field that merely names a file (`filename=index.php`) is not matched. Level 1, but multipart bodies are only scanned when `inspect_multipart` is enabled. |
 | stack trace / db error / source / fingerprint disclosure | FE-RESP-* | response-side; requires `response_inspection` |
 | `data_leak` | FE-DATA-LEAK-001..006 | credit card (Luhn), AWS/Stripe/GitHub keys, JWT (L2), private key |
 
@@ -493,6 +502,70 @@ if you remove `application/json` from `body_content_types`, `+json` types are
 excluded too, and a plugin configured with only `text/plain` inspects neither.
 `text/json` is in the default allowlist as an explicit entry, since it carries no
 suffix to key off.
+
+### Bodies outside the scan scope: `on_unlisted_content_type`
+
+The `Content-Type` a client declares is attacker-controlled, and many backends
+parse a body without consulting it: a Go handler that `json.Unmarshal`s the
+raw body, Flask's `get_json(force=True)`, a framework with a default body
+parser. Relabelling a JSON injection payload as `application/octet-stream`,
+`text/csv`, or sending it with no `Content-Type` at all used to skip every
+body rule silently. `on_unlisted_content_type` decides what happens to a
+request body whose type is outside the scan scope — not in
+`body_content_types` (including the `+json` / `+xml` suffix mapping), a
+multipart body while `inspect_multipart` is off, or a missing/unknown type
+while `inspect_binary_body` is off:
+
+| Value | Non-empty unlisted body |
+| --- | --- |
+| `allow` (default) | forwarded uninspected, as before |
+| `fail_closed` | rejected when an enforcing request-body policy applies to this request (an applicable `action: enforce` body rule, or anomaly scoring over one), so an enforcing rule cannot be sidestepped by relabelling; otherwise forwarded and recorded |
+| `block` | rejected while `mode: enforce` — a strict allowlist of inspectable types |
+
+The decision is exact: when a value could refuse the request, the WAF asks the
+gateway to buffer that body and decides over the **finalized** backend-visible
+headers and the actual bytes, so an empty upload always passes and an HTTP/2
+or HTTP/3 body sent without `Content-Length` is still caught. Bodies that
+could not be refused keep the streaming path. It applies only to
+`body_methods`, to non-exempt requests, and when this instance's request-body
+hook runs at all (request and request-body inspection on, with an active
+request-body rule or `FE-ENCODING-001` / `FE-ENCODING-002` enabled); WebSocket
+messages carry no `Content-Type` and are always scanned.
+
+Because a refusing configuration reads the whole body before it rejects, a
+large or long-running upload receives its `403` only at end of stream (memory
+stays bounded by `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`), and a client-streaming
+or bidirectional gRPC call may wait for its deadline instead. `on_body_too_large:
+skip` does not avoid this buffering for unlisted bodies: it only skips oversize
+bodies the WAF would otherwise scan.
+
+A rejection sets `waf.action=blocked`, `waf.block_reason=content_type`, and
+`waf.body_uninspected=content_type`. A body that is recorded but not refused
+(`mode: monitor`, or `fail_closed` in enforce mode with no enforcing body
+policy applicable to the request) carries `waf.body_uninspected=content_type`
+without the block fields. Those bodies are not buffered: they are recorded
+from the request's declared framing (`Content-Length` > 0 or
+`Transfer-Encoding`), so an HTTP/2 or HTTP/3 body sent without
+`Content-Length` is **not** recorded. Staging the setting in `monitor` first
+shows which routes carry unlisted bodies, but undercounts such clients.
+
+Under `mode: enforce`, `block` is itself a reachable admission enforcement
+path when the request-body hook can run (as above) and at least one content
+type is left unscanned. With both `inspect_multipart` and
+`inspect_binary_body` on, every body is scanned, `block` can never fire, and it
+does not satisfy admission. `fail_closed` never satisfies admission.
+
+Before switching to `block` or `fail_closed`, list every type your backends
+legitimately accept: add them to `body_content_types` (scanned as text), turn
+on `inspect_multipart` for uploads, or exempt upload-only routes with
+`global_exemptions`. gRPC (`application/grpc`, gRPC-Web, `application/protobuf`)
+and image bodies are unlisted by default, so a non-empty one is refused under
+`block`, and under `fail_closed` wherever an enforcing request-body policy
+applies (for example with `default_rule_action: enforce` or anomaly scoring),
+unless the type is listed or the route exempted.
+Bodies on methods outside `body_methods` (for example a `GET` with a body)
+are not governed; add the method to `body_methods` if a backend reads such
+bodies.
 
 Response inspection is **off by default**. Enable `response_inspection` (and
 `response_body_inspection` for body rules) to run the disclosure and
@@ -883,15 +956,15 @@ logging sinks are configured (stdout, http, tcp, kafka, loki, …):
 `waf.block_reason`, `waf.scoring_instance`, `waf.would_block_reason`,
 `waf.paranoia`, plus `waf.scan_truncated` / `waf.scan_timed_out` /
 `waf.body_too_large` / `waf.body_too_large_target` (`request_body` or
-`response_body`). All of these are fixed-cardinality; body bytes are never
-logged. Blocked
-requests reject before backend dispatch and still produce a transaction summary
-carrying these fields, so blocks are visible in the same per-request log line as
-allowed traffic.
+`response_body`) / `waf.body_uninspected` (`content_type`). All of these are
+fixed-cardinality; body bytes are never logged. Blocked requests reject before
+backend dispatch and still produce a transaction summary carrying these fields,
+so blocks are visible in the same per-request log line as allowed traffic.
 
 `waf.block_reason` names why a request was blocked: `rule`, `score`,
-`body_too_large`, or `scan_timeout` for HTTP-family traffic, and `tcp_require_tls`,
-`first_bytes_unavailable`, or `signature` for stream (TCP/UDP) traffic. Stream
+`body_too_large`, `content_type`, or `scan_timeout` for HTTP-family traffic, and
+`tcp_require_tls`, `first_bytes_unavailable`, or `signature` for stream (TCP/UDP)
+traffic. Stream
 inspection additionally records `waf.would_block_reason` (the same stream value
 set) on `monitor`-mode connections that *would* have blocked under `enforce`,
 so enforce-mode impact stays directly countable before you switch modes — in
@@ -935,6 +1008,7 @@ fire, then switch to `enforce`.
 | `on_scan_timeout` | enum | `log_and_allow` | `allow` / `block` / `fail_closed` / `log_and_allow` |
 | `max_scan_bytes` | int | `1048576` | body scan cap |
 | `on_body_too_large` | enum | `fail_closed` | `fail_closed` / `scan_truncated` / `skip` / `block` |
+| `on_unlisted_content_type` | enum | `allow` | `allow` / `fail_closed` / `block`; request bodies whose `Content-Type` is outside the scan scope (see [Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type)) |
 | `body_methods` | string[] | `[POST,PUT,PATCH]` | methods whose bodies are scanned |
 | `body_content_types` | string[] | `[application/json, text/json, application/x-www-form-urlencoded, application/xml, text/xml, text/plain, text/html]` | inspectable base content types; `+json` / `+xml` suffixed types match via their base family |
 | `inspect_multipart` | bool | `false` | scan multipart bodies |

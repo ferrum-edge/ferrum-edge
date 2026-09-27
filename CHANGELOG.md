@@ -126,6 +126,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mesh listeners are not covered. Startup fails if the trusted list is empty,
   malformed, or covers a whole address family while a listener enables the
   setting.
+- WAF `on_unlisted_content_type` closes the Content-Type relabelling bypass. A
+  request body whose declared type is outside the scan scope (not in
+  `body_content_types`, multipart without `inspect_multipart`, or a missing /
+  unknown type without `inspect_binary_body`) used to skip every body rule,
+  though many backends parse bodies without consulting the header.
+  `allow` (default) keeps that behavior; `fail_closed` rejects a non-empty
+  unlisted body when an enforcing request-body policy applies; `block` rejects
+  every one in enforce mode. Refusing configurations buffer the body and decide
+  over the finalized headers and actual bytes, so empty uploads pass and HTTP/2
+  and HTTP/3 bodies without `Content-Length` are still caught. Rejections set
+  `waf.block_reason=content_type`; recorded bodies set
+  `waf.body_uninspected=content_type`.
+- The built-in WAF rule pack now covers the attack classes an enterprise WAF is
+  expected to recognise out of the box. Level-1 signatures (monitor-only like
+  the rest of the pack) add blind time-delay, catalog-enumeration,
+  error-based/out-of-band, and quoted-string-tautology SQL injection across
+  query and body; cookie-borne SQLi, XSS, and traversal; Shellshock; OGNL /
+  Apache Struts 2 (including the CVE-2017-5638 `Content-Type` vector); PHP and
+  Node.js code injection and PHP stream wrappers in query values; command
+  execution without a classic `;cmd` chain; CRLF response splitting;
+  restricted-file probes on the canonical path (`/.git/`, `/.env`, `/.aws/`,
+  `id_rsa`, `web.config`, …); executable multipart uploads (including the
+  trailing-dot, trailing-space, `::$DATA`, and NUL spellings); and unsafe
+  YAML / polymorphic JSON deserialization gadgets (including Fastjson's
+  descriptor-form bypasses and Jackson's wrapper-array form). Body rules that
+  would match ordinary source code — the PHP, Node.js, and interpreter-call
+  mirrors, PHP stream wrappers (`FE-PHP-002-B`), and the query-shaped
+  time-delay mirror (`FE-SQLI-006-B`) — are paranoia level 2, as are
+  active-content HTML in bodies, backup/dump artifacts, and alternate loopback
+  spellings (`localhost`, `127.1`, `2130706433`, `[::1]`); level-1 body
+  time-delay coverage is the SQL-context-only `FE-SQLI-010-B`. `FE-XSS-002`
+  now tolerates the tab/LF/CR browsers delete inside a URL and covers
+  `vbscript:`, `FE-DESER-001` matches the hex serialization magic, and
+  `FE-SSRF-001` names the ECS credential endpoint, the AWS IPv6 IMDS, and
+  Alibaba Cloud's metadata address. `FE-XSS-002`, `FE-XSS-002-B`, and the
+  new `FE-XSS-002-C` are now named "Script URL scheme" instead of "JavaScript
+  URL"; dashboards or alerts that match on the rule name rather than the rule
+  id need updating.
+
+### Changed
+
+- WAF scanning is faster on the request path with identical results. Rule
+  sets run an `is_match` prefilter before collecting matches, so a clean
+  header, query, cookie, or path value (the common case) skips the overlapping
+  search and its allocation: 1.9–3.4x on request metadata. The escape and
+  entity decoders copy literal runs in bulk and return the input untouched when
+  nothing decodes, decode rounds chain without re-allocating, and the
+  decodable-marker gate uses SIMD `memchr`: building decoded body variants is
+  3–8x faster on bodies with JSON escapes, entities, or percent-encoding, and
+  ~10x faster on plain bodies. Global exemption checks no longer allocate or
+  parse the client IP when their lists are empty.
 
 ### Fixed
 

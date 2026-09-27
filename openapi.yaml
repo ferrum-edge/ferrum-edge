@@ -28310,6 +28310,30 @@ components:
             directions, so an origin-encoded body is decoded before the cap is
             measured. fail_closed, scan_truncated, and skip do not satisfy that
             admission gate.
+        on_unlisted_content_type:
+          type: [string, "null"]
+          enum: [allow, fail_closed, block, null]
+          default: allow
+          description: >-
+            Disposition for a non-empty request body whose Content-Type is
+            outside the scan scope (not in body_content_types including the
+            +json/+xml suffix mapping, multipart while inspect_multipart is
+            off, or missing/unknown while inspect_binary_body is off). The
+            declared type is attacker-controlled and many backends parse a body
+            without consulting it. allow (default) forwards it uninspected;
+            fail_closed rejects it when an enforcing request-body policy
+            applies to the request; block rejects every such body while mode is
+            enforce. A refusing configuration buffers the body and decides over
+            the finalized headers and actual bytes, so an empty body always
+            passes. Applies only to body_methods on non-exempt requests when
+            request-body inspection is on. Rejections set
+            waf.block_reason=content_type and waf.body_uninspected=content_type;
+            recorded-but-allowed bodies set waf.body_uninspected=content_type.
+            Under mode enforce, block is a reachable admission enforcement path
+            when the request-body hook can run (request-body inspection on with
+            an active request-body rule or FE-ENCODING-001/002) and at least one
+            content type is left unscanned (not both inspect_multipart and
+            inspect_binary_body); fail_closed is not.
         include_default_rules:
           type: [boolean, "null"]
           default: true

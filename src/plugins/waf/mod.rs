@@ -73,6 +73,7 @@ const WAF_CONFIG_KEYS: &[&str] = &[
     "max_scan_bytes",
     "on_scan_timeout",
     "on_body_too_large",
+    "on_unlisted_content_type",
     "include_default_rules",
     "disabled_default_rules",
     "rule_modes",
@@ -140,6 +141,29 @@ enum TooLargeAction {
     Block,
 }
 
+/// What happens to a request body the WAF will not inspect because its
+/// `Content-Type` falls outside the configured scan scope
+/// (`body_content_types`, `inspect_multipart`, `inspect_binary_body`).
+///
+/// The declared media type is attacker-controlled, and many backends parse a
+/// body without consulting it (Go handlers that `json.Unmarshal` the raw body,
+/// Flask `get_json(force=True)`, frameworks with a default body parser). A
+/// JSON payload sent as `application/octet-stream`, `text/csv`, or with no
+/// `Content-Type` at all therefore reaches such a backend while every body
+/// rule is skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnlistedContentTypeAction {
+    /// Default. Forward the body uninspected.
+    Allow,
+    /// Reject a non-empty unlisted body when an enforcing request-body policy
+    /// applies to this request, so an enforcing rule cannot be sidestepped by
+    /// relabelling the payload. Monitor-only policy never starts blocking.
+    FailClosed,
+    /// Strict allowlist: reject every non-empty unlisted body while globally
+    /// enforcing.
+    Block,
+}
+
 /// Which governed body a size decision is being made about. Selects the rule
 /// set whose enforcement is at stake so a request-only policy cannot make a
 /// response fail closed (and vice versa).
@@ -173,6 +197,7 @@ struct WafConfig {
     max_scan_bytes: usize,
     on_scan_timeout: TimeoutAction,
     on_body_too_large: TooLargeAction,
+    on_unlisted_content_type: UnlistedContentTypeAction,
     body_methods: Vec<String>,
     body_content_types: Vec<String>,
     inspect_multipart: bool,
@@ -380,6 +405,11 @@ impl Waf {
                 .as_deref()
                 .unwrap_or("fail_closed"),
         )?;
+        let on_unlisted_content_type = parse_unlisted_content_type_action(
+            optional_string(object, "on_unlisted_content_type")?
+                .as_deref()
+                .unwrap_or("allow"),
+        )?;
         let include_default_rules = optional_bool(object, "include_default_rules")?.unwrap_or(true);
         let disabled_default_rules = optional_string_vec(object, "disabled_default_rules")?
             .unwrap_or_default()
@@ -431,6 +461,8 @@ impl Waf {
         }
 
         let scoring = parse_scoring(object.get("scoring"))?;
+        let inspect_multipart = optional_bool(object, "inspect_multipart")?.unwrap_or(false);
+        let inspect_binary_body = optional_bool(object, "inspect_binary_body")?.unwrap_or(false);
         validate_enforce_mode_has_enforcing_rules(
             mode,
             &compiled,
@@ -441,8 +473,10 @@ impl Waf {
                 request_body: request_body_inspection,
                 response: response_inspection,
                 response_body: response_body_inspection,
+                every_request_body_content_type: inspect_multipart && inspect_binary_body,
             },
             on_body_too_large,
+            on_unlisted_content_type,
         )?;
 
         let config = WafConfig {
@@ -458,6 +492,7 @@ impl Waf {
             max_scan_bytes,
             on_scan_timeout,
             on_body_too_large,
+            on_unlisted_content_type,
             body_methods: optional_string_vec(object, "body_methods")?
                 .unwrap_or_else(default_body_methods)
                 .into_iter()
@@ -468,8 +503,8 @@ impl Waf {
                 .into_iter()
                 .map(|content_type| content_type.to_ascii_lowercase())
                 .collect(),
-            inspect_multipart: optional_bool(object, "inspect_multipart")?.unwrap_or(false),
-            inspect_binary_body: optional_bool(object, "inspect_binary_body")?.unwrap_or(false),
+            inspect_multipart,
+            inspect_binary_body,
             disallowed_methods: optional_string_vec(object, "disallowed_methods")?
                 .unwrap_or_default()
                 .into_iter()
@@ -604,6 +639,106 @@ impl Waf {
 
     fn request_body_eligible_for_scan(&self, content_type: Option<&str>) -> bool {
         self.should_inspect_body_content_type(content_type)
+    }
+
+    fn request_method_is_body_method(&self, ctx: &RequestContext) -> bool {
+        self.config
+            .body_methods
+            .iter()
+            .any(|method| method.eq_ignore_ascii_case(&ctx.method))
+    }
+
+    /// Whether `on_unlisted_content_type` governs this request at all: it is
+    /// configured, this instance inspects request bodies, the request is not
+    /// exempt, and its method is one whose body would be scanned. The
+    /// content-type test itself is left to the caller, which knows whether it
+    /// holds the inbound or the finalized header map.
+    fn unlisted_content_type_policy_applies(&self, ctx: &RequestContext) -> bool {
+        self.config.on_unlisted_content_type != UnlistedContentTypeAction::Allow
+            && self.requires_request_body_buffering()
+            && !self.exemptions.request_short_circuits(ctx)
+            && self.request_method_is_body_method(ctx)
+    }
+
+    /// Whether a non-empty unlisted body would be REFUSED on this request, as
+    /// opposed to merely observed. `fail_closed` asks the same question
+    /// `on_body_too_large: fail_closed` asks: could an enforcing request-body
+    /// policy have refused this body had it been inspectable?
+    fn unlisted_content_type_refuses(&self, ctx: &RequestContext) -> bool {
+        match self.config.on_unlisted_content_type {
+            UnlistedContentTypeAction::Allow => false,
+            UnlistedContentTypeAction::Block => self.config.mode == GlobalMode::Enforce,
+            UnlistedContentTypeAction::FailClosed => {
+                self.has_enforcing_body_policy(BodyDirection::Request, ctx)
+            }
+        }
+    }
+
+    /// Best-effort, metadata-only record that a body declared by the request's
+    /// framing will not be inspected because of its `Content-Type`, for
+    /// configurations that observe rather than refuse (`mode: monitor`, or
+    /// `fail_closed` with no enforcing body rule applicable here). Refusing
+    /// configurations decide exactly, over the finalized body, in
+    /// [`Self::decide_unlisted_content_type`]; this path never buffers, so an
+    /// HTTP/2 or HTTP/3 body sent without `Content-Length` is not observed.
+    ///
+    /// Cheapest tests first: an ordinary request with a scanned `Content-Type`
+    /// returns before the exemption walk and before `fail_closed` scans every
+    /// compiled rule for an applicable enforcing body policy.
+    fn observe_unlisted_content_type(&self, ctx: &mut RequestContext) {
+        if !self.config.log_to_metadata
+            || self.config.on_unlisted_content_type == UnlistedContentTypeAction::Allow
+            || self
+                .request_body_eligible_for_scan(ctx.headers.get("content-type").map(String::as_str))
+            || !crate::proxy::inbound_request_declares_body(ctx)
+            || !self.unlisted_content_type_policy_applies(ctx)
+            || self.unlisted_content_type_refuses(ctx)
+        {
+            return;
+        }
+        ctx.set_waf_metadata("waf.body_uninspected", "content_type");
+    }
+
+    /// The exact `on_unlisted_content_type` decision, over the finalized
+    /// backend-visible headers and body. Reached only for a request whose body
+    /// this instance does not scan; an empty body carries nothing to inspect
+    /// and always passes.
+    fn decide_unlisted_content_type(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if body.is_empty()
+            || !self.unlisted_content_type_policy_applies(ctx)
+            || self.request_body_eligible_for_scan(headers.get("content-type").map(String::as_str))
+        {
+            return PluginResult::Continue;
+        }
+        let refuses = self.unlisted_content_type_refuses(ctx);
+        if self.config.log_to_metadata {
+            ctx.set_waf_metadata("waf.body_uninspected", "content_type");
+            if refuses {
+                ctx.set_waf_metadata("waf.action", "blocked");
+                ctx.set_waf_metadata_if_absent("waf.block_reason", "content_type");
+            }
+        }
+        if refuses && self.config.log_to_stdout {
+            warn_sampled!(
+                target: "waf",
+                proxy = %proxy_id(ctx),
+                client_ip = %ctx.client_ip,
+                path = %ctx.path,
+                method = %ctx.method,
+                action = ?self.config.on_unlisted_content_type,
+                "WAF refused a request body whose Content-Type is outside the inspection scope"
+            );
+        }
+        if refuses {
+            self.reject()
+        } else {
+            PluginResult::Continue
+        }
     }
 
     /// Run the body/message scan under the scan budget.
@@ -1144,11 +1279,7 @@ impl Waf {
     ) -> bool {
         self.requires_request_body_buffering()
             && !self.exemptions.request_short_circuits(ctx)
-            && self
-                .config
-                .body_methods
-                .iter()
-                .any(|method| method.eq_ignore_ascii_case(&ctx.method))
+            && self.request_method_is_body_method(ctx)
             && self.request_body_eligible_for_scan(headers.get("content-type").map(String::as_str))
     }
 
@@ -1600,6 +1731,7 @@ impl Plugin for Waf {
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         if self.active {
             ctx.ensure_waf_metadata_initialized();
+            self.observe_unlisted_content_type(ctx);
         }
         if !self.active
             || !self.config.request_inspection
@@ -1633,13 +1765,19 @@ impl Plugin for Waf {
         if !self.requires_request_body_buffering() || self.exemptions.request_short_circuits(ctx) {
             return false;
         }
-        if !self
-            .config
-            .body_methods
-            .iter()
-            .any(|method| method.eq_ignore_ascii_case(&ctx.method))
-        {
+        if !self.request_method_is_body_method(ctx) {
             return false;
+        }
+        if !self.request_body_eligible_for_scan(ctx.headers.get("content-type").map(String::as_str))
+        {
+            // An unlisted body is never scanned. It is buffered only when
+            // `on_unlisted_content_type` would refuse a non-empty one here, so
+            // the final hook decides over the exact body — including an
+            // HTTP/2 or HTTP/3 body sent without `Content-Length` — and an
+            // empty upload still passes. Every other unlisted body keeps the
+            // streaming path. The checks above already cover the rest of
+            // `unlisted_content_type_policy_applies`.
+            return self.unlisted_content_type_refuses(ctx);
         }
         if self.config.on_body_too_large == TooLargeAction::Skip
             && let Some(content_length) = ctx.headers.get("content-length")
@@ -1648,7 +1786,7 @@ impl Plugin for Waf {
         {
             return false;
         }
-        self.request_body_eligible_for_scan(ctx.headers.get("content-type").map(String::as_str))
+        true
     }
 
     fn needs_request_body_bytes(&self) -> bool {
@@ -1687,7 +1825,7 @@ impl Plugin for Waf {
             ctx.ensure_waf_metadata_initialized();
         }
         if !self.request_body_policy_applies(ctx, headers) {
-            return PluginResult::Continue;
+            return self.decide_unlisted_content_type(ctx, headers, body);
         }
         // Scan the PLAINTEXT the backend will end up parsing, not the wire
         // octets. `inspectable_final_request_body` returns `body` itself unless
@@ -2102,6 +2240,17 @@ fn parse_timeout_action(raw: &str) -> Result<TimeoutAction, String> {
     }
 }
 
+fn parse_unlisted_content_type_action(raw: &str) -> Result<UnlistedContentTypeAction, String> {
+    match raw {
+        "allow" => Ok(UnlistedContentTypeAction::Allow),
+        "fail_closed" => Ok(UnlistedContentTypeAction::FailClosed),
+        "block" => Ok(UnlistedContentTypeAction::Block),
+        other => Err(format!(
+            "waf: `on_unlisted_content_type` must be allow, fail_closed, or block; got {other:?}"
+        )),
+    }
+}
+
 fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {
     match raw {
         "fail_closed" => Ok(TooLargeAction::FailClosed),
@@ -2121,6 +2270,9 @@ struct WafInspectionSurfaces {
     request_body: bool,
     response: bool,
     response_body: bool,
+    /// Both `inspect_multipart` and `inspect_binary_body` are on, so every
+    /// request body (including one with no `Content-Type`) is in scan scope.
+    every_request_body_content_type: bool,
 }
 
 impl WafInspectionSurfaces {
@@ -2146,6 +2298,7 @@ fn validate_enforce_mode_has_enforcing_rules(
     scoring: Option<&ScoringConfig>,
     surfaces: WafInspectionSurfaces,
     on_body_too_large: TooLargeAction,
+    on_unlisted_content_type: UnlistedContentTypeAction,
 ) -> Result<(), String> {
     if mode != GlobalMode::Enforce {
         return Ok(());
@@ -2171,12 +2324,17 @@ fn validate_enforce_mode_has_enforcing_rules(
     if oversize_body_block_is_reachable(on_body_too_large, compiled, surfaces) {
         return Ok(());
     }
+    if unlisted_content_type_block_is_reachable(on_unlisted_content_type, compiled, surfaces) {
+        return Ok(());
+    }
     Err(
         "waf: `mode` is `enforce` but no enabled enforcement path can block traffic. Built-in \
          rules are monitor-only by default; set `default_rule_action` to `enforce` or opt \
          rules in via `rule_modes` / `custom_rules[].action`, enable anomaly scoring over an \
-         inspected HTTP rule, enable a stream enforcement rule, or set `on_body_too_large` \
-         to `block` on an inspected body surface"
+         inspected HTTP rule, enable a stream enforcement rule, set `on_body_too_large` \
+         to `block` on an inspected body surface, or set `on_unlisted_content_type` to \
+         `block` with request-body inspection on and at least one content type left \
+         unscanned"
             .to_string(),
     )
 }
@@ -2204,6 +2362,26 @@ fn oversize_body_block_is_reachable(
         && surfaces.response_body
         && (compiled.response_body_rules_active || encoding_specials);
     request_hook || response_hook
+}
+
+/// `on_unlisted_content_type: block` rejects non-empty request bodies outside
+/// the scan scope whenever `mode` is `enforce`, independent of per-rule
+/// `action`. It is a reachable enforcement path exactly when the request-body
+/// hook that applies it can run and some body can be unlisted: with both
+/// `inspect_multipart` and `inspect_binary_body` on, every content type (and a
+/// missing one) is scanned, so `block` can never fire.
+fn unlisted_content_type_block_is_reachable(
+    on_unlisted_content_type: UnlistedContentTypeAction,
+    compiled: &CompiledRules,
+    surfaces: WafInspectionSurfaces,
+) -> bool {
+    on_unlisted_content_type == UnlistedContentTypeAction::Block
+        && !surfaces.every_request_body_content_type
+        && surfaces.request
+        && surfaces.request_body
+        && (compiled.request_body_rules_active
+            || compiled.find_rule_index("FE-ENCODING-001").is_some()
+            || compiled.find_rule_index("FE-ENCODING-002").is_some())
 }
 
 fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String> {
