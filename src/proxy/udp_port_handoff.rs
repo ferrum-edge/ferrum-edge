@@ -53,6 +53,16 @@
 //! supervisor itself if a port it failed was released since
 //! ([`UdpPortHandoff::released_since`]).
 //!
+//! The stream listener manager's pass only probes a UDP/DTLS port: the
+//! listener task it spawns binds the real socket afterwards, and a config
+//! change can hand the port to a Gateway QUIC half in that gap. That bind
+//! fails after the pass has published its failures and checked the release
+//! log, so the task rides out a handoff collision itself
+//! ([`UdpPortHold::bind`]) with its own budget, started by its own first
+//! collision, instead of reporting a failure nothing would retry before the
+//! 30-second tick (issue #5851). The wait runs in the listener task, never in
+//! a reconcile pass.
+//!
 //! Not on any hot path: the ledger is touched only when a datagram listener
 //! binds or closes its socket and when a bind has already failed.
 
@@ -62,6 +72,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
+use tracing::debug;
 
 /// How long one reconcile pass may spend, in total, retrying `EADDRINUSE` on
 /// ports another in-process datagram listener is handing over. Shared by every
@@ -188,6 +199,46 @@ impl UdpPortHandoff {
             self.handoff_retries.fetch_add(1, Ordering::Relaxed);
         }
         pending
+    }
+
+    /// Bind a UDP socket on `addr` for a managed datagram listener, retrying
+    /// `EADDRINUSE` while [`Self::note_bind_collision`] classifies it as an
+    /// in-process handoff. Attempts back off from
+    /// [`UDP_PORT_HANDOFF_INITIAL_BACKOFF`] to [`UDP_PORT_HANDOFF_MAX_BACKOFF`]
+    /// until `deadline`, which the first collision sets to
+    /// [`UDP_PORT_HANDOFF_BUDGET`] from then when it is still unset, so callers
+    /// that share one `deadline` share one budget. Any other error, a port
+    /// nothing in-process holds, and a socket still held at the deadline are
+    /// returned unchanged. Eligibility is re-checked after each failed attempt,
+    /// because the other manager may arm or release its hold meanwhile.
+    pub async fn bind(
+        &self,
+        addr: std::net::SocketAddr,
+        deadline: &mut Option<tokio::time::Instant>,
+    ) -> std::io::Result<tokio::net::UdpSocket> {
+        let mut backoff: Option<UdpPortHandoffBackoff> = None;
+        loop {
+            let error = match tokio::net::UdpSocket::bind(addr).await {
+                Ok(socket) => return Ok(socket),
+                Err(error) => error,
+            };
+            if error.kind() != std::io::ErrorKind::AddrInUse
+                || !self.note_bind_collision(addr.port())
+            {
+                return Err(error);
+            }
+            let now = tokio::time::Instant::now();
+            let deadline = *deadline.get_or_insert(now + UDP_PORT_HANDOFF_BUDGET);
+            debug!(
+                port = addr.port(),
+                "UDP listener bind is waiting for another in-process listener to release the \
+                 port: {error}"
+            );
+            let backoff = backoff.get_or_insert_with(|| UdpPortHandoffBackoff::new(deadline));
+            if !backoff.wait().await {
+                return Err(error);
+            }
+        }
     }
 
     /// How many bind collisions [`Self::note_bind_collision`] has classified as
@@ -364,6 +415,16 @@ impl UdpPortHold {
         if !self.inner.armed.swap(true, Ordering::AcqRel) {
             self.inner.ledger.arm(self.inner.port);
         }
+    }
+
+    /// Bind this hold's listener socket on `addr`, riding out an in-process
+    /// handoff of the port with a budget of its own (issue #5851); see
+    /// [`UdpPortHandoff::bind`]. For the listener task's own bind, which runs
+    /// after its manager's reconcile pass probed the port and published its
+    /// failures: a collision there would otherwise go unretried until the slow
+    /// tick. Does not arm the hold.
+    pub async fn bind(&self, addr: std::net::SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+        self.inner.ledger.bind(addr, &mut None).await
     }
 }
 

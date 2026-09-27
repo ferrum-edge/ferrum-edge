@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::backend_conn_limit::{BackendConnectionLimiter, SharedBackendConnectionLimiter};
 use crate::circuit_breaker::CircuitBreakerCache;
@@ -25,9 +25,7 @@ use crate::tls::source::{CertSource, MaterialKind, load_material};
 
 use super::PerIpStreamAdmission;
 use super::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics};
-use super::udp_port_handoff::{
-    ReleasedUdpPorts, UDP_PORT_HANDOFF_BUDGET, UdpPortHandoff, UdpPortHandoffBackoff, UdpPortOwner,
-};
+use super::udp_port_handoff::{ReleasedUdpPorts, UdpPortHandoff, UdpPortOwner};
 use super::udp_proxy::{UdpListenerConfig, UdpProxyMetrics};
 
 /// Live slot for a per-listener `DtlsServer`. The inner `Option<Arc<...>>` is
@@ -4005,6 +4003,13 @@ impl StreamListenerManager {
             append_bind_failure(&self.bind_failures, failure);
         }
         self.reconciled.store(true, Ordering::Release);
+        // The first pass launches the supervisor, which subscribes to QUIC
+        // releases synchronously here. Launching it before the check below
+        // leaves no gap on startup (issue #5851): a release after the
+        // subscription reaches the supervisor, which judges it against the
+        // failures stored above, and a release before it is caught by the
+        // check, whose wakeup the supervisor picks up as a stored permit.
+        self.spawn_supervisor();
 
         // A Gateway QUIC half may have closed its socket on a port this pass
         // just failed to bind after the probe gave up but before the store
@@ -4019,7 +4024,6 @@ impl StreamListenerManager {
             }
         }
 
-        self.spawn_supervisor();
         bind_failures
     }
 
@@ -4261,38 +4265,21 @@ impl StreamListenerManager {
     /// task is joined), or a retired UDP/DTLS listener whose session tasks
     /// still hold the socket. Attempts back off from 5 ms to 100 ms until
     /// `deadline`, which the first retry of the pass sets to
-    /// [`UDP_PORT_HANDOFF_BUDGET`] from now and every later retry shares. Any
-    /// other error, a port nothing in-process holds, and a socket still held at
-    /// the deadline are returned unchanged and reported as the ordinary bind
-    /// failure.
+    /// [`super::udp_port_handoff::UDP_PORT_HANDOFF_BUDGET`] from now and every
+    /// later retry shares. Any other error, a port nothing in-process holds,
+    /// and a socket still held at the deadline are returned unchanged and
+    /// reported as the ordinary bind failure.
+    ///
+    /// The probe socket is dropped before the listener task binds for real, so
+    /// the port can change hands again in between; the task's own bind rides
+    /// out that handoff separately
+    /// ([`super::udp_port_handoff::UdpPortHold::bind`], issue #5851).
     async fn probe_udp_port(
         &self,
         addr: std::net::SocketAddr,
         deadline: &mut Option<tokio::time::Instant>,
     ) -> std::io::Result<()> {
-        let mut backoff: Option<UdpPortHandoffBackoff> = None;
-        loop {
-            let error = match tokio::net::UdpSocket::bind(addr).await {
-                Ok(_probe) => return Ok(()),
-                Err(error) => error,
-            };
-            if error.kind() != std::io::ErrorKind::AddrInUse
-                || !self.udp_port_handoff.note_bind_collision(addr.port())
-            {
-                return Err(error);
-            }
-            let now = tokio::time::Instant::now();
-            let deadline = *deadline.get_or_insert(now + UDP_PORT_HANDOFF_BUDGET);
-            debug!(
-                port = addr.port(),
-                "Stream listener UDP bind is waiting for another in-process listener to release \
-                 the port: {error}"
-            );
-            let backoff = backoff.get_or_insert_with(|| UdpPortHandoffBackoff::new(deadline));
-            if !backoff.wait().await {
-                return Err(error);
-            }
-        }
+        self.udp_port_handoff.bind(addr, deadline).await.map(drop)
     }
 
     /// Resolve the OS bind address for `port` from the reconcile generation's
