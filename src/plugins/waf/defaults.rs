@@ -55,10 +55,11 @@ const PROTOTYPE_POLLUTION_PROTO: &str = r"(?i)__proto__";
 const PROTOTYPE_POLLUTION_CONSTRUCTOR: &str =
     r"(?i)constructor\s*(?:\.\s*prototype|\[\s*prototype\s*\])";
 
-/// Time-delay (blind) SQL injection probes, claimed by `FE-SQLI-006` and its
-/// body mirror. Automated tools lean on these because they need no reflected
-/// output: MySQL `SLEEP(n)` / `BENCHMARK(n, …)`, PostgreSQL `pg_sleep(n)`,
-/// MSSQL `WAITFOR DELAY '0:0:5'`, Oracle `dbms_lock.sleep` /
+/// Time-delay (blind) SQL injection probes, claimed by `FE-SQLI-006` (query,
+/// level 1) and its exact body mirror `FE-SQLI-006-B` (level 2). Automated
+/// tools lean on these because they need no reflected output: MySQL
+/// `SLEEP(n)` / `BENCHMARK(n, …)`, PostgreSQL `pg_sleep(n)`, MSSQL
+/// `WAITFOR DELAY '0:0:5'`, Oracle `dbms_lock.sleep` /
 /// `dbms_pipe.receive_message`, and SQLite `randomblob` amplification.
 ///
 /// `sleep(n)` is also ordinary application code (`time.sleep(1)`,
@@ -68,7 +69,24 @@ const PROTOTYPE_POLLUTION_CONSTRUCTOR: &str =
 /// whitespace-or-bounded-comment separator the level-1 signatures above use.
 /// A method call (`.sleep(`) never qualifies. The remaining alternatives name
 /// database-specific functions that are not general-purpose code.
+///
+/// That context is tight enough for a query value but not for a request body
+/// that carries source code: `foo();\n sleep(1);`, `x = sleep(5)`,
+/// `(sleep(1))`, and `benchmark(1000, fn)` are all ordinary code. The body
+/// mirror is therefore level 2, and level-1 body coverage comes from
+/// `SQLI_TIME_DELAY_SQL_CONTEXT`.
 const SQLI_TIME_DELAY: &str = r#"(?i)(?:(?:^|[(,;='"|&]|\b(?:and|or|xor|select|union|where|having|if|then|else|when)\b)(?:\s|/\*(?s:.){0,64}?\*/)*(?:sleep|pg_sleep)\s*\(\s*\d+(?:\.\d+)?\s*\)|\bbenchmark\s*\(\s*\d+\s*,|\bwaitfor(?:\s|/\*(?s:.){0,64}?\*/)+(?:delay|time)(?:\s|/\*(?s:.){0,64}?\*/)*['"]\d|\bdbms_(?:lock\.sleep|pipe\.receive_message)\s*\(|\brandomblob\s*\(\s*\d{6,})"#;
+
+/// Level-1 body time-delay signature, claimed by `FE-SQLI-010-B`. `sleep(n)`
+/// counts only where no general-purpose language puts it: after an SQL
+/// keyword (`AND`, `OR`, `XOR`, `SELECT`, `UNION`, `WHERE`, `HAVING`, `THEN`,
+/// `RLIKE`, `ORDER BY`), after a closing quote and an SQL operator
+/// (`'+sleep(5)+'`, `'||sleep(5)`), or as a branch of `IF(…, sleep(n), …)`.
+/// `BENCHMARK` needs an SQL function as its expression (`MD5(`, `SHA1(`, a
+/// subquery), so `benchmark(1000, fn)` stays clean. `pg_sleep`,
+/// `WAITFOR DELAY`, the Oracle `dbms_*` calls, and `randomblob` are
+/// database-specific and keep the query rule's shape.
+const SQLI_TIME_DELAY_SQL_CONTEXT: &str = r#"(?i)(?:\b(?:and|or|xor|select|union|where|having|then|rlike|by)\b(?:\s|/\*(?s:.){0,64}?\*/|\()*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|['"](?:\s|/\*(?s:.){0,64}?\*/)*(?:\|\||&&|[-+*=^])(?:\s|/\*(?s:.){0,64}?\*/|\()*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|\bif\s*\([^;]{0,64}?,(?:\s|/\*(?s:.){0,64}?\*/)*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|\bpg_sleep\s*\(\s*\d|\bbenchmark\s*\(\s*\d+\s*,\s*(?:(?:md5|sha1?|sha2|encode|aes_encrypt|compress|concat|rand|char)\s*\(|\(\s*select\b)|\bwaitfor(?:\s|/\*(?s:.){0,64}?\*/)+(?:delay|time)(?:\s|/\*(?s:.){0,64}?\*/)*['"]\d|\bdbms_(?:lock\.sleep|pipe\.receive_message)\s*\(|\brandomblob\s*\(\s*\d{6,})"#;
 
 /// Database catalog enumeration, claimed by `FE-SQLI-007` and its body
 /// mirror. Only catalog objects that ordinary application traffic never
@@ -84,7 +102,13 @@ const SQLI_SCHEMA_ENUMERATION: &str = r"(?i)(?:\binformation_schema(?:\s|/\*(?s:
 /// `updatexml` / `load_file` / `INTO OUTFILE`, MSSQL `xp_*` / `sp_OA*` /
 /// `OPENROWSET`, Oracle `utl_http` / `utl_inaddr` / `dbms_java`, and
 /// PostgreSQL large-object file access.
-const SQLI_ERROR_OR_OOB_FUNCTION: &str = r"(?i)(?:\b(?:extractvalue|updatexml)\s*\(|\bload_file\s*\(|\binto(?:\s|/\*(?s:.){0,64}?\*/)+(?:out|dump)file\b|\bxp_(?:cmdshell|dirtree|regread|fileexist|subdirs)\b|\bsp_(?:oacreate|oamethod|execute_external_script)\b|\bopenrowset\s*\(|\butl_(?:http\.request|inaddr\.get_host_(?:address|name)|file\.fopen)\b|\bdbms_(?:java\.runjava|xmlquery|scheduler\.create_job)\b|\blo_(?:import|export)\s*\()";
+///
+/// `load_file` is also an ordinary function name (`def load_file(path):`,
+/// `loader.load_file('/etc/app.conf')`), so it counts only as a bare call
+/// whose argument is what MySQL reads: a quoted absolute or UNC path, a hex
+/// literal, or a `CHAR(` / `CONCAT(` / `UNHEX(` / `FROM_BASE64(` expression.
+/// A method call (`.load_file(`) never qualifies.
+const SQLI_ERROR_OR_OOB_FUNCTION: &str = r#"(?i)(?:\b(?:extractvalue|updatexml)\s*\(|(?:^|[^.\w$])load_file\s*\(\s*(?:0x[0-9a-f]{2,}|(?:char|concat|unhex|from_base64)\s*\(|['"](?:/|\\\\|[a-z]:[\\/]))|\binto(?:\s|/\*(?s:.){0,64}?\*/)+(?:out|dump)file\b|\bxp_(?:cmdshell|dirtree|regread|fileexist|subdirs)\b|\bsp_(?:oacreate|oamethod|execute_external_script)\b|\bopenrowset\s*\(|\butl_(?:http\.request|inaddr\.get_host_(?:address|name)|file\.fopen)\b|\bdbms_(?:java\.runjava|xmlquery|scheduler\.create_job)\b|\blo_(?:import|export)\s*\()"#;
 
 /// Quoted-string tautology (`' or 'a'='a`, `'or'1'='1`, `" || ""="`),
 /// claimed by `FE-SQLI-009` and its body mirror. `FE-SQLI-002` covers the
@@ -114,16 +138,28 @@ const HTML_ACTIVE_CONTENT_ELEMENT: &str =
     r"(?i)<(?:iframe|frame|frameset|object|embed|applet|base|meta|link|svg|math|isindex)\b";
 
 /// Command execution without a classic `;cmd` chain, claimed by
-/// `FE-CMD-004` (query values). Three shapes, each chosen so that ordinary
-/// delimited lists (`tags=linux;bash`, `q=dogs|cat`) stay clean:
+/// `FE-CMD-004` (query values). Each shape is chosen so that ordinary
+/// delimited lists (`tags=linux;bash`, `skills=bash|pwsh`,
+/// `fields=id|uname`) and multi-line prose (`Order%0AID: 12345`,
+/// `%0ACat food`) stay clean:
 ///
 /// * a backtick or `$(` subshell running a common command;
-/// * a CR/LF command separator (`%0a`) followed by a command;
-/// * `;`, `|`, `&&`, or `||` followed by a reconnaissance or download tool
-///   that is not also an English word;
+/// * a CR/LF command separator (`%0a`) followed by a Windows tool name, by a
+///   Unix tool name in the lower case a Unix shell requires, or by a short
+///   command word (`cat`, `id`, `sh`, `nc`, `bash`, `python`, `perl`) in lower
+///   case that then ends the value, chains, redirects, or takes an argument
+///   shaped like a flag, path, variable, or quoted string;
+/// * `;`, `|`, `&&`, or `||` followed by a reconnaissance tool that never
+///   names a list item (`whoami`, `ifconfig`, `certutil`, `mkfifo`, …);
+/// * `&&` or `||` — which lists do not use — followed by a tool that can also
+///   be a list item (`uname`, `busybox`, `powershell`, `pwsh`, `socat`, …),
+///   or `;` / `|` followed by one of those tools only when it takes a flag,
+///   path, or quoted argument, redirects, or chains again;
 ///
-/// plus the `$IFS` field-separator trick used to smuggle spaces.
-const CMD_EXTENDED_EXECUTION: &str = r"(?i)(?:(?:`|\$\()\s*(?:cat|tac|head|tail|ls|id|echo|printf|rm|ping|sleep|env|pwd|uname|whoami|curl|wget|nc|ncat|bash|sh|zsh|python[23]?|perl|ruby|php|base64|xxd|nslookup|dig|ifconfig)\b|[\r\n]\s*(?:whoami|uname|ifconfig|ipconfig|nslookup|wget|curl|nc|ncat|bash|sh|powershell|pwsh|certutil|python[23]?|perl|cat|id)\b|(?:[;|]|&&)\s*(?:whoami|uname|ifconfig|ipconfig|nslookup|busybox|ncat|netcat|socat|powershell|pwsh|certutil|bitsadmin|systeminfo|tasklist|mkfifo)\b|\$\{?IFS\}?)";
+/// plus the `$IFS` field-separator trick used to smuggle spaces. A bare
+/// `x;uname` at the end of a value is indistinguishable from the list
+/// `fields=id;uname` and is deliberately not matched.
+const CMD_EXTENDED_EXECUTION: &str = r#"(?i)(?:(?:`|\$\()\s*(?:cat|tac|head|tail|ls|id|echo|printf|rm|ping|sleep|env|pwd|uname|whoami|curl|wget|nc|ncat|bash|sh|zsh|python[23]?|perl|ruby|php|base64|xxd|nslookup|dig|ifconfig)\b|[\r\n]\s*(?:(?:whoami|ipconfig|certutil|powershell|pwsh|systeminfo)\b|(?-i:uname|ifconfig|nslookup|wget|curl|ncat)\b|(?-i:cat|id|sh|nc|bash|python[23]?|perl)(?:\s*$|\s*[;|&<>`]|\s+[-/.~$'"]))|(?:[;|]|&&)\s*(?:whoami|ifconfig|ipconfig|nslookup|certutil|bitsadmin|systeminfo|tasklist|mkfifo)\b|(?:&&|\|\|)\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh)\b|[;|]\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh)(?:\s+[-/$'"]|\s*[<>`]|\s*&&|\s*\|\|)|\$\{?IFS\}?)"#;
 
 /// Explicit shell / interpreter invocation, claimed by `FE-CMD-005-Q`
 /// (level 1) and `FE-CMD-005-B` (level 2, because deployment and CI APIs
@@ -153,8 +189,11 @@ const PHP_CODE_INJECTION: &str = r#"(?i)(?:<\?(?:php\b|=)|\b(?:eval|assert|syste
 
 /// PHP stream wrappers that turn file-access sinks into code execution or
 /// arbitrary reads (`php://input`, `phar://` deserialization, `zip://`,
-/// `data://text/plain`), claimed by `FE-PHP-002` and its query mirror.
-/// `php://filter` and `expect://` are already claimed by `FE-LFI-001`.
+/// `data://text/plain`), claimed by `FE-PHP-002-Q` (level 1) and
+/// `FE-PHP-002-B` (level 2, because PHP source reads its own request body
+/// through `file_get_contents('php://input')` and buffers through
+/// `php://temp` / `php://memory`). `php://filter` and `expect://` are already
+/// claimed by `FE-LFI-001`.
 const PHP_STREAM_WRAPPER: &str = r"(?i)\b(?:php://(?:input|fd|memory|temp|stdin)|phar://|zip://|compress\.(?:zlib|bzip2)://|glob://|data://text/plain)";
 
 /// Node.js code execution / sandbox escape, claimed by `FE-NODE-001-Q`
@@ -171,9 +210,12 @@ const CRLF_HEADER_INJECTION: &str = r"(?i)[\r\n][\t ]*(?:set-cookie|location|ref
 /// Requests for version-control metadata, credential stores, and server
 /// configuration files, claimed by `FE-RESTRICTED-001`. Matched against the
 /// canonical policy path, which has already decoded `%2e` and refused dot
-/// segments, so `/%2egit/config` is seen as `/.git/config`. `.well-known`,
+/// segments, so `/%2egit/config` is seen as `/.git/config`. `wp-config.php`
+/// matches together with its backup and editor-swap copies
+/// (`wp-config.php.bak`, `wp-config.php~`, `.wp-config.php.swp`), because
+/// those serve the database password as plain text. `.well-known`,
 /// `.github`, and `.gitignore` are deliberately not matched.
-const RESTRICTED_FILE_ACCESS: &str = r"(?i)/(?:\.(?:git|svn|hg|bzr|cvs)(?:/|$)|\.env(?:\.[a-z0-9_-]+)*$|\.ht(?:access|passwd|digest)$|\.(?:aws|ssh|docker|kube|gnupg|azure)/|\.config/gcloud/|\.(?:npmrc|pypirc|netrc|pgpass|git-credentials|gitconfig|bash_history|zsh_history|mysql_history|psql_history|ds_store)$|web\.config$|wp-config\.php(?:\.[a-z0-9~_-]+)?$|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?$)";
+const RESTRICTED_FILE_ACCESS: &str = r"(?i)/(?:\.(?:git|svn|hg|bzr|cvs)(?:/|$)|\.env(?:\.[a-z0-9_-]+)*$|\.ht(?:access|passwd|digest)$|\.(?:aws|ssh|docker|kube|gnupg|azure)/|\.config/gcloud/|\.(?:npmrc|pypirc|netrc|pgpass|git-credentials|gitconfig|bash_history|zsh_history|mysql_history|psql_history|ds_store)$|web\.config$|\.?wp-config\.php(?:[.~_-][a-z0-9~._-]*)?$|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?$)";
 
 /// Backup, editor-swap, and database-dump artifacts, claimed by
 /// `FE-RESTRICTED-002` at level 2 (file-serving applications legitimately
@@ -181,11 +223,23 @@ const RESTRICTED_FILE_ACCESS: &str = r"(?i)/(?:\.(?:git|svn|hg|bzr|cvs)(?:/|$)|\
 const RESTRICTED_BACKUP_ARTIFACT: &str =
     r"(?i)(?:\.(?:bak|backup|old|orig|save|sav|swp|swo|tmp|sql|sqlite3?|db|dump|mdb|accdb)|~)$";
 
-/// A multipart `filename` / `filename*` parameter naming a server-executable
-/// script, including double extensions (`shell.php.jpg`) that permissive
-/// handler mappings still execute. Claimed by `FE-UPLOAD-001`; it only sees
-/// multipart bodies when `inspect_multipart` is enabled.
-const EXECUTABLE_UPLOAD_FILENAME: &str = r#"(?i)\bfilename\*?\s*=\s*(?:utf-8''|["'])?[^"';\r\n]{0,255}?\.(?:php[3-8s]?|pht(?:ml)?|phar|jspx?|jspf|jsw|jsv|aspx?|asa|asax|ascx|ashx|asmx|cshtml|vbhtml|cgi|shtml|htaccess)(?:\.[a-z0-9]{1,8})*(?:["';\r\n]|$)"#;
+/// A multipart `Content-Disposition` `filename` / `filename*` parameter naming
+/// a server-executable script, including double extensions (`shell.php.jpg`)
+/// that permissive handler mappings still execute. Claimed by
+/// `FE-UPLOAD-001`; it only sees multipart bodies when `inspect_multipart` is
+/// enabled.
+///
+/// The parameter must sit on a `Content-Disposition:` line, so a form or JSON
+/// field that merely names a file (`filename=index.php`) is not an upload.
+/// Windows and IIS strip trailing dots and spaces and treat `::$DATA` as the
+/// file's default stream, and a NUL (raw or `%00`) truncates the name in
+/// C-backed handlers, so `shell.php.`, `shell.php `, `shell.php::$DATA`, and
+/// `shell.php%00.jpg` all land as `shell.php` and all match. Both repeats are
+/// unbounded but confined by their classes, one to the header line and one to
+/// the parameter token: an unbounded class loop compiles to a single automaton
+/// state where a counted `{0,N}` repeat compiles to N, and a length bound
+/// would let a padded name slip past.
+const EXECUTABLE_UPLOAD_FILENAME: &str = r#"(?i)\bcontent-disposition\s*:[^\r\n]*?\bfilename\*?\s*=\s*(?:utf-8''|["'])?[^"';\r\n]*?\.(?:php[3-8s]?|pht(?:ml)?|phar|jspx?|jspf|jsw|jsv|aspx?|asa|asax|ascx|ashx|asmx|cshtml|vbhtml|cgi|shtml|htaccess)(?:\.[a-z0-9]{1,8})*[. ]*(?:::\$data)?(?:["';\r\n\x00]|%00|$)"#;
 
 /// Unsafe YAML / serializer language tags that instantiate arbitrary types
 /// (PyYAML `!!python/object/apply`, SnakeYAML CVE-2022-1471 gadgets, Psych
@@ -197,7 +251,15 @@ const YAML_GADGET_TAG: &str = r"(?i)(?:!!(?:python/(?:object(?:/apply|/new)?|nam
 /// `FE-DESER-005` (Fastjson autoType, Jackson default typing, Json.NET
 /// `TypeNameHandling`). JSON-LD's `"@type": "Person"` and application-owned
 /// type names are unaffected; only the known gadget namespaces are listed.
-const JSON_POLYMORPHIC_GADGET: &str = r#"(?i)["'](?:@type|\$type|@class|__type)["']\s*:\s*["'](?:com\.sun\.|java\.(?:net|lang|rmi|util\.logging)\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.|system\.(?:windows\.data\.objectdataprovider|diagnostics\.process|configuration\.install|management\.automation|web\.security|windows\.forms))"#;
+///
+/// Fastjson's autoType check is bypassed by JVM descriptor spellings it
+/// strips before loading the class (`"Lcom.sun.rowset.JdbcRowSetImpl;"`,
+/// `"LLcom…;;"`, and the array form `"[com…"`), so up to three leading `L` /
+/// `[` characters are accepted before the namespace. The second branch is
+/// Jackson's `WRAPPER_ARRAY` default typing, `["com.sun…", {…}]`, which carries
+/// no discriminator key: a gadget class name as the first array element
+/// followed by the object it types. Keep the two namespace lists identical.
+const JSON_POLYMORPHIC_GADGET: &str = r#"(?i)(?:["'](?:@type|\$type|@class|__type)["']\s*:\s*["'](?-i:[\[L]){0,3}(?:com\.sun\.|java\.(?:net|lang|rmi|util\.logging)\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.|system\.(?:windows\.data\.objectdataprovider|diagnostics\.process|configuration\.install|management\.automation|web\.security|windows\.forms))|\[\s*["'](?:com\.sun\.|java\.(?:net|lang|rmi|util\.logging)\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.|system\.(?:windows\.data\.objectdataprovider|diagnostics\.process|configuration\.install|management\.automation|web\.security|windows\.forms))[\w.$]*["']\s*,\s*\{)"#;
 
 /// Cloud-metadata endpoints and dotted IPv4 private/loopback/link-local forms
 /// claimed by `FE-SSRF-001` / `FE-SSRF-001-Q`. Body and query share this
@@ -214,13 +276,17 @@ const SSRF_METADATA_OR_PRIVATE_IP: &str = r"(?i)(?:169\.254\.169\.254|169\.254\.
 const SSRF_DANGEROUS_SCHEME: &str = r"(?i)\b(?:file|gopher|dict|jar|ldap)://";
 
 /// Loopback, unspecified, and link-local hosts spelled in forms that a
-/// dotted-quad signature cannot see — `localhost`, `0`, `0.0.0.0`, decimal
-/// (`2130706433`), hex (`0x7f000001`), octal (`017700000001`), mixed
-/// dotted hex/octal (`0x7f.1`), and bracketed IPv6 (`[::1]`,
-/// `[::ffff:127.0.0.1]`, `[fe80::…]`). Claimed by `FE-SSRF-003` at paranoia
-/// level 2: it requires a URL scheme in front, but development tooling
-/// legitimately passes `http://localhost:…` around.
-const SSRF_ALTERNATE_LOOPBACK_FORM: &str = r"(?i)\b(?:https?|ftp|gopher|dict|ldap|tftp)://(?:[^/@\s]*@)?(?:localhost|0|0\.0\.0\.0|0x[0-9a-f]{1,8}|0[0-7]{1,11}|[1-9]\d{7,9}|(?:0x[0-9a-f]{1,2}|0[0-7]{1,3})(?:\.(?:0x[0-9a-f]{1,2}|0[0-7]{0,3}|\d{1,3})){1,3}|\[(?:[0:]*:1|::|::ffff:[0-9a-f.:]+|fe80:[0-9a-f:%.]*)\])(?::\d{1,5})?(?:[/?#]|$)";
+/// dotted-quad signature cannot see — `localhost` (and the fully-qualified
+/// `localhost.`), `0`, `0.0.0.0`, short dotted loopback (`127.1`,
+/// `127.0.1`), mixed dotted hex/octal (`0x7f.1`), and bracketed IPv6
+/// (`[::1]`, `[::ffff:127.0.0.1]`, `[fe80::…]`). A host written as one
+/// decimal (`2130706433`), hex (`0x7f000001`), or octal (`017700000001`)
+/// integer matches whatever address it encodes: nothing legitimate spells a
+/// host that way, and the encoded address is exactly what the dotted-quad
+/// rules cannot see. Claimed by `FE-SSRF-003` at paranoia level 2: it
+/// requires a URL scheme in front, but development tooling legitimately
+/// passes `http://localhost:…` around.
+const SSRF_ALTERNATE_LOOPBACK_FORM: &str = r"(?i)\b(?:https?|ftp|gopher|dict|ldap|tftp)://(?:[^/@\s]*@)?(?:localhost\.?|0|0\.0\.0\.0|127(?:\.\d{1,3}){1,2}|0x[0-9a-f]{1,8}|0[0-7]{1,11}|[1-9]\d{7,9}|(?:0x[0-9a-f]{1,2}|0[0-7]{1,3})(?:\.(?:0x[0-9a-f]{1,2}|0[0-7]{0,3}|\d{1,3})){1,3}|\[(?:[0:]*:1|::|::ffff:[0-9a-f.:]+|fe80:[0-9a-f:%.]*)\])(?::\d{1,5})?(?:[/?#]|$)";
 
 pub fn default_rules() -> Vec<WafRule> {
     vec![
@@ -333,15 +399,22 @@ pub fn default_rules() -> Vec<WafRule> {
         // --- SQL injection: blind, enumeration, error-based, string
         // tautology. Query and body mirrors share one pattern each. ---
         rp("FE-SQLI-006", "Time-delay SQL injection", "sqli", Severity::High, RuleTarget::QueryValues, SQLI_TIME_DELAY, 1),
-        rp("FE-SQLI-006-B", "Time-delay SQL injection (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_TIME_DELAY, 1),
+        rp("FE-SQLI-006-B", "Time-delay SQL injection (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_TIME_DELAY, 2),
         rp("FE-SQLI-007", "Database catalog enumeration", "sqli", Severity::High, RuleTarget::QueryValues, SQLI_SCHEMA_ENUMERATION, 1),
         rp("FE-SQLI-007-B", "Database catalog enumeration (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_SCHEMA_ENUMERATION, 1),
         rp("FE-SQLI-008", "Error-based or out-of-band SQL function", "sqli", Severity::High, RuleTarget::QueryValues, SQLI_ERROR_OR_OOB_FUNCTION, 1),
         rp("FE-SQLI-008-B", "Error-based or out-of-band SQL function (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_ERROR_OR_OOB_FUNCTION, 1),
         rp("FE-SQLI-009", "Quoted string tautology SQL injection", "sqli", Severity::High, RuleTarget::QueryValues, SQLI_STRING_TAUTOLOGY, 1),
         rp("FE-SQLI-009-B", "Quoted string tautology SQL injection (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_STRING_TAUTOLOGY, 1),
+        // Level-1 body time-delay coverage: the query pattern's context
+        // accepts code shapes, so its exact body mirror above is level 2.
+        rp("FE-SQLI-010-B", "Time-delay SQL injection in SQL context (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_TIME_DELAY_SQL_CONTEXT, 1),
         // --- Cookie mirrors. Cookie values are an injection channel for
-        // every server framework that binds them to handler parameters. ---
+        // every server framework that binds them to handler parameters.
+        // `FE-SQLI-003-C` needs a `;`, and the Cookie header is split into
+        // crumbs on `;` before matching, so a raw crumb never contains one:
+        // the rule fires on a percent-encoded `%3B` once cookie values are
+        // also scanned in decoded form. ---
         rp("FE-SQLI-001-C", "UNION SELECT SQL injection (cookie)", "sqli", Severity::High, RuleTarget::Cookies, SQLI_UNION_SELECT, 1),
         rp("FE-SQLI-002-C", "Boolean tautology SQL injection (cookie)", "sqli", Severity::High, RuleTarget::Cookies, SQLI_BOOLEAN_TAUTOLOGY, 1),
         rp("FE-SQLI-003-C", "Stacked SQL statement (cookie)", "sqli", Severity::High, RuleTarget::Cookies, SQLI_STACKED_STATEMENT, 1),
@@ -367,7 +440,7 @@ pub fn default_rules() -> Vec<WafRule> {
         // --- PHP and Node.js code injection. ---
         rp("FE-PHP-001-Q", "PHP code injection (query)", "rce", Severity::High, RuleTarget::QueryValues, PHP_CODE_INJECTION, 1),
         rp("FE-PHP-001-B", "PHP code injection (body)", "rce", Severity::High, RuleTarget::BodyText, PHP_CODE_INJECTION, 2),
-        rp("FE-PHP-002", "PHP stream wrapper", "rce", Severity::High, RuleTarget::BodyText, PHP_STREAM_WRAPPER, 1),
+        rp("FE-PHP-002-B", "PHP stream wrapper (body)", "rce", Severity::High, RuleTarget::BodyText, PHP_STREAM_WRAPPER, 2),
         rp("FE-PHP-002-Q", "PHP stream wrapper (query)", "rce", Severity::High, RuleTarget::QueryValues, PHP_STREAM_WRAPPER, 1),
         rp("FE-NODE-001-Q", "Node.js code execution (query)", "rce", Severity::High, RuleTarget::QueryValues, NODE_CODE_INJECTION, 1),
         rp("FE-NODE-001-B", "Node.js code execution (body)", "rce", Severity::High, RuleTarget::BodyText, NODE_CODE_INJECTION, 2),

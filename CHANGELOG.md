@@ -109,17 +109,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error-based/out-of-band, and quoted-string-tautology SQL injection across
   query and body; cookie-borne SQLi, XSS, and traversal; Shellshock; OGNL /
   Apache Struts 2 (including the CVE-2017-5638 `Content-Type` vector); PHP and
-  Node.js code injection and PHP stream wrappers; command execution without a
-  classic `;cmd` chain; CRLF response splitting; restricted-file probes on the
-  canonical path (`/.git/`, `/.env`, `/.aws/`, `id_rsa`, `web.config`, …);
-  executable multipart uploads; and unsafe YAML / polymorphic JSON
-  deserialization gadgets. Code-shaped body mirrors, active-content HTML in
-  bodies, backup/dump artifacts, and alternate loopback spellings
-  (`localhost`, `2130706433`, `[::1]`) are paranoia level 2. `FE-XSS-002`
+  Node.js code injection and PHP stream wrappers in query values; command
+  execution without a classic `;cmd` chain; CRLF response splitting;
+  restricted-file probes on the canonical path (`/.git/`, `/.env`, `/.aws/`,
+  `id_rsa`, `web.config`, …); executable multipart uploads (including the
+  trailing-dot, trailing-space, `::$DATA`, and NUL spellings); and unsafe
+  YAML / polymorphic JSON deserialization gadgets (including Fastjson's
+  descriptor-form bypasses and Jackson's wrapper-array form). Body rules that
+  would match ordinary source code — the PHP, Node.js, and interpreter-call
+  mirrors, PHP stream wrappers (`FE-PHP-002-B`), and the query-shaped
+  time-delay mirror (`FE-SQLI-006-B`) — are paranoia level 2, as are
+  active-content HTML in bodies, backup/dump artifacts, and alternate loopback
+  spellings (`localhost`, `127.1`, `2130706433`, `[::1]`); level-1 body
+  time-delay coverage is the SQL-context-only `FE-SQLI-010-B`. `FE-XSS-002`
   now tolerates the tab/LF/CR browsers delete inside a URL and covers
   `vbscript:`, `FE-DESER-001` matches the hex serialization magic, and
   `FE-SSRF-001` names the ECS credential endpoint, the AWS IPv6 IMDS, and
-  Alibaba Cloud's metadata address.
+  Alibaba Cloud's metadata address. `FE-XSS-002`, `FE-XSS-002-B`, and the
+  new `FE-XSS-002-C` are now named "Script URL scheme" instead of "JavaScript
+  URL"; dashboards or alerts that match on the rule name rather than the rule
+  id need updating.
 
 ### Fixed
 
