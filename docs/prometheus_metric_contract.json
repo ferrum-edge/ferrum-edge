@@ -1687,6 +1687,62 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_diagnostic_ref_lookups_total",
+    "type": "counter",
+    "help": "Authenticated admin diagnostic reference lookups, by bounded result.",
+    "labels": [
+      "result"
+    ],
+    "subsystem": "diagnostic_refs",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_diagnostic_ref_replica_info",
+    "type": "gauge",
+    "help": "Replica id this gateway process embeds in its diagnostic references (value is always 1).",
+    "labels": [
+      "replica_id"
+    ],
+    "subsystem": "diagnostic_refs",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_diagnostic_refs_entries",
+    "type": "gauge",
+    "help": "Diagnostic references currently retained in the bounded in-memory store.",
+    "labels": [],
+    "subsystem": "diagnostic_refs",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_diagnostic_refs_evicted_total",
+    "type": "counter",
+    "help": "Diagnostic references removed from the store before lookup, by bounded reason.",
+    "labels": [
+      "reason"
+    ],
+    "subsystem": "diagnostic_refs",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_diagnostic_refs_minted_total",
+    "type": "counter",
+    "help": "Diagnostic references minted on gateway-authored error responses.",
+    "labels": [],
+    "subsystem": "diagnostic_refs",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_dp_config_cp_connected",
     "type": "gauge",
     "help": "Whether the DP currently has a ConfigSync stream to some control plane (1) or none (0).",

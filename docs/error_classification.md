@@ -318,8 +318,8 @@ Metrics and logs keep the granular class so PromQL and log alerts can split
 `port_exhaustion`. Values on every surface are compiled-in `&'static str` —
 never an error message, never a client- or backend-influenced string.
 
-`X-Gateway-Error` and `X-Gateway-Upstream-Status` are gateway-owned. Both
-names live in one shared list
+`X-Gateway-Error`, `X-Gateway-Upstream-Status`, and `X-Ferrum-Diagnostic-Ref`
+are gateway-owned. All three names live in one shared list
 ([`GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`](../src/proxy/headers.rs)).
 Every dispatch path strips a backend-supplied copy, in the response headers or
 the trailers, before any gateway value is written. That covers HTTP/1.1,
@@ -372,7 +372,8 @@ bodies. Only the HTTP header section carries the gateway's own token (see the
 [`grpc_web` plugin](plugins.md#grpc_web) for the pass-through relay).
 
 The headers are not authenticated, though: a client should trust them only on
-a response it received from a gateway it authenticated.
+a response it received from a gateway it authenticated. When a client needs to
+confirm what the gateway saw, use a diagnostic reference (below).
 
 ### Header tokens (`X-Gateway-Error`)
 
@@ -429,6 +430,224 @@ empty label. They are omitted from the access log in that case;
 `metadata.rejection_phase` still names the fence where there is one. Stream disconnects keep
 the granular `ErrorClass::as_str` values (19 compiled-in variants) and add
 that optional label on `ferrum_stream_disconnects_total`.
+
+## Gateway diagnostic references
+
+`X-Gateway-Error` stays coarse on purpose: one `connection_failure` covers DNS,
+TCP, TLS, pool, and egress-policy failures, and the precise class reaches only
+the access log. Diagnostic references (issue #5767) let an authorized operator
+tool resolve one specific response to the gateway's own detail without
+widening the public header surface. The feature is additive and off by
+default.
+
+**Enable.** Set `FERRUM_DIAGNOSTIC_REFS=errors` (see
+[configuration.md](configuration.md#observability)). Every HTTP/1.1, HTTP/2,
+and HTTP/3 response that carries the gateway's own `X-Gateway-Error` token then
+also carries:
+
+```
+X-Ferrum-Diagnostic-Ref: fd1_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
+```
+
+The value is `fd1_` plus 128 bits from the process CSPRNG in lowercase hex. It
+embeds nothing: no cause, route, backend, tenant, time, or counter. (With the
+opt-in `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true` it also names the minting
+process's random replica id; see
+[Lookup across replicas](#lookup-across-replicas).) With
+`errors`, a response without an `X-Gateway-Error` token never carries a
+reference, and a request never carries two. Neither does an origin-authored
+representation a plugin replayed or relayed, even when it carries an
+`X-Gateway-Error` token (issue #5860): a `response_caching` hit of a backend
+`502` stored because `cacheable_status_codes` lists `502` carries no reference,
+in either mode, while the gateway's own `502` still does.
+
+**`all` mode.** `FERRUM_DIAGNOSTIC_REFS=all` (issue #5846) references every
+gateway-authored error response, not only those with an `X-Gateway-Error`
+token:
+
+- plugin rejections (for example a `key_auth` `401`, an `access_control`
+  `403`, a `rate_limiting` `429`, a request-validation `400`), in every plugin
+  phase;
+- gateway policy fences (allowed methods, WebSocket connection limits,
+  backend connection limits, and the HTTP/1.1 and HTTP/2 frontend admission
+  fences: unverifiable HTTP/1 framing, withdrawn client-certificate trust,
+  overload, stale configuration);
+- routing `404`s (no route matched) and mesh `REGISTRY_ONLY` route misses.
+
+gRPC Trailers-Only rejections (HTTP `200` with a non-zero `grpc-status`) count
+as error responses. A gRPC-Web rejection whose `grpc-status` is carried only in
+the body's trailer frame (an HTTP `200` head without `grpc-status`) is not
+recognized as an error when the head is stamped, so it carries no reference:
+such a rejection can be under-marked, but it never gets a false reference. A
+response is gateway-authored only when its rejection site recorded it in the
+request's diagnostic slot before the head was written, and
+only on a head whose status is the one that rejection recorded (a rejection a
+later phase replaced marks nothing). A backend's own `4xx`/`5xx` never carries a
+reference: not when it is relayed to the client, and not when a plugin replays
+or relays it as its short-circuit (a `response_caching` or `ai_semantic_cache`
+hit, a `request_deduplication` idempotent replay, a `serverless_function`
+terminate reply, an `ai_federation` provider response or provider-failure
+envelope). Neither does a plugin short-circuit that answers `2xx`/`3xx`. The
+lookup of such a reference has a `null` `gateway_error`.
+
+**Ownership.** The header is gateway-owned whatever the setting. A backend or
+serverless-function copy, in the headers or the trailers, is stripped at every
+backend response boundary. The reference is stamped as the last step before the
+response head reaches the client — after every builder, plugin hook, and policy
+phase — and that final client boundary first removes any copy a plugin or hook
+wrote, even while the feature is off. A client therefore never sees a reference
+the gateway did not mint, and cannot pre-seed one.
+
+**Resolve.** `GET /diagnostics/v1/refs/{ref}` on the admin listener of the
+same gateway process (see [admin_api.md](admin_api.md#diagnostic-references);
+[Lookup across replicas](#lookup-across-replicas) covers finding that process).
+It requires an admin JWT with the `diagnostics:read` scope and an `ns` claim
+that names the gateway's namespace. An unknown, expired, evicted, or
+out-of-namespace reference answers `404` indistinguishably. The versioned body
+(`schema_version: ferrum.diagnostic_ref.v1`) names the public token and status,
+the protocol, and — once the request's terminal transaction record exists —
+the granular `error_class`, the body-streaming class, the gateway rejection
+phase, the route-deadline phase, how far the request reached a backend
+(`not_dispatched`, `pre_wire_failure`, `ambiguous_failure`,
+`backend_response`), the matched `proxy_id`, the backend origin
+(`scheme://host:port`), and a coarse duration bucket. It never carries bodies,
+headers, paths, query strings, credentials, client addresses, or raw error
+text.
+
+The detail also carries, when present (issue #5846):
+
+- `rejection`: the gateway policy or plugin that rejected the request —
+  `source` (`plugin`, `gateway`, or `routing`), the rejection `phase`
+  (`authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
+  `backend_admission`, `route_not_found`, ...), and the rejecting `plugin` name
+  when the phase knows it. The phase is always one of the gateway's compiled-in labels (any other is
+  reported as `other`); the plugin is a built-in plugin name or a custom plugin
+  type name of at most 64 label characters (anything else is dropped). Never
+  plugin configuration, credentials, or the rejection body. In `errors` mode a
+  rejection is recorded only for a `5xx`, so a `4xx` rejection costs no
+  diagnostic bookkeeping there.
+- `attempts`: every backend attempt, in dispatch order — one per attempt a
+  retry replaced plus the attempt the client saw. A retry loop that ends
+  without sending another attempt (its backoff reached the route or gRPC
+  deadline, the next target's circuit breaker was open, or the rotated target
+  was refused) adds no entry for it. Each names its `attempt`
+  number, `backend_dispatch`, the backend `status` when it got a response, the
+  granular `error_class` when it failed, and, for a `tls_error` whose typed
+  TLS error was available (HTTP/1.1 and HTTP/2 reqwest dispatch, direct HTTP/2
+  pool, gRPC, and native HTTP/3 streaming dispatch), a closed `tls` object: the
+  `failure` kind (`certificate_verification`, `alert_received`,
+  `no_certificates_presented`, ...) and its `reason` (`expired`,
+  `unknown_issuer`, `not_valid_for_name`, the received alert such as
+  `unknown_ca`, ...). Certificate contents, names, and times are never
+  recorded. At most 8 attempts are listed; `attempts_omitted` counts the rest.
+
+**Bounds.** References live only in process memory, in 16 independently locked
+shards, for `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900). At most
+`FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` (default 10000) are retained; a full shard
+evicts its oldest reference. Each retained reference costs roughly 0.5–1 KB
+(up to about 1.5 KB with a full attempt list and a rejection record), so the
+default holds about 5–10 MB and the 1000000 maximum up to about 0.5–1.5 GB. A restart forgets every reference. Lookup attempts are admitted at
+`FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) per second, with
+one JWT `sub` limited to half of that (at least 1). Every attempt counts
+against its `sub`'s share, including one refused with `403`; only an attempt
+whose credential passes the scope and `ns` checks also spends the global
+budget, so refused credentials cannot exhaust it. `429` answers above either
+budget. Each
+`200`/`404` emits one WARN-level `audit.event = "diagnostic_ref_lookup"` event;
+`403` and `429` events are throttled to one per second each. `/metrics` exports
+`ferrum_diagnostic_refs_minted_total`, `ferrum_diagnostic_refs_entries`,
+`ferrum_diagnostic_refs_evicted_total{reason}`, and
+`ferrum_diagnostic_ref_lookups_total{result}` while the feature is on.
+
+**Cost.** Off: one `OnceLock` load per HTTP-family request and one header
+removal per response head. On: one small
+shared slot per request; on a response that gets a reference, one CSPRNG read
+and one short shard-lock critical section; one uncontended per-request mutex
+per backend attempt. Detail is copied from the terminal transaction summary
+only for a 5xx, a classified dispatch error, or, in `all` mode, a recorded
+gateway rejection. Every recording site is a single `Option` check when
+references are off.
+
+**Not covered yet.** A reference resolves only on the gateway process that
+minted it; another replica can name that process (below) but never fetches the
+detail for you, and the control plane does not proxy lookups. Attempts carry no
+per-attempt timing. A rejection that a plugin hook answers outside the shared
+rejection path (for example an `after_proxy` hook replacing a backend
+response) is not recorded as gateway-authored, so `all` mode does not
+reference it.
+
+### Lookup across replicas
+
+The detail lives only in the memory of the process that minted the reference,
+so behind a load balancer an operator must query that process's admin
+listener. `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true` (issue #5846, default
+`false`) makes the reference say which process that is:
+
+```
+X-Ferrum-Diagnostic-Ref: fd2_1a2b3c4d_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
+```
+
+`fd2_` is followed by the process's replica id (8 lowercase hex digits), `_`,
+and the same 128 CSPRNG bits. The replica id is 32 bits drawn from the process
+CSPRNG when the store is installed. It is derived from nothing: no host name,
+pod name, node, address, or namespace, and a restart draws a new one, just as
+a restart forgets every reference. It is logged once at startup
+(`replica_id` on the INFO line "Diagnostic references carry this process's
+replica id", visible only with `FERRUM_LOG_LEVEL=info` or finer; the default
+`warn` hides it) and exported as
+`ferrum_diagnostic_ref_replica_info{replica_id="1a2b3c4d"} 1` on `/metrics`,
+so a Prometheus query joins it to the scrape target's pod and instance labels.
+The metric needs no log level, so it is the discovery path to rely on.
+The owning replica's lookup body carries it as `replica_id`.
+
+A lookup that reaches another replica:
+
+- answers the same `404` status and body as an unknown reference, is counted
+  as `not_found`, and is audited like any miss;
+- adds `X-Ferrum-Diagnostic-Owner-Replica: 1a2b3c4d` only when the caller
+  passed every check a `200` on that replica would need: the
+  `diagnostics:read` scope, an `ns` claim, and an `ns` claim that names the
+  answering replica's own namespace. A `403`, a `429`, a caller bound to other
+  namespaces, and a replica with references off never carry it. The owner is
+  read from the reference the caller supplied; the answering replica never
+  learns whether the owner exists, still holds the reference, or serves the
+  caller's namespace, so the hint cannot be used to probe another replica or
+  another namespace. The owner enforces its own namespace check when asked.
+
+An `fd1_` reference keeps resolving on the untagged replica that minted it, so
+a fleet can switch the flag replica by replica: an untagged replica still
+points at the owner of an `fd2_` reference, and a tagged replica answers an
+`fd1_` reference it did not mint with the plain `404`. A reference resolves
+only in the format its store mints, so re-spelling one format as the other
+never resolves.
+
+**What the tag reveals.** Untagged references are unlinkable. A tagged
+reference lets anyone who collects references (a client included) tell which
+responses one process served and roughly how many processes answered them,
+until the next restart. Watching the ids change over time also shows when
+processes restart, how a rollout proceeds, and whether a load balancer keeps a
+client on one process. It names no host, pod, node, or address. That exposure
+is why the tag is opt-in.
+
+**Rejected alternatives** (see
+[the ADR](plans/diagnostic_ref_cross_replica_adr.md)):
+
+- *Control-plane fan-out.* The CP↔DP ConfigSync channel is a stream the data
+  plane opens and the control plane only writes configuration to; the control
+  plane cannot call a data plane. Fan-out would need a new DP-side RPC that
+  carries diagnostic detail across the network, per-namespace authorization on
+  it, and time and concurrency bounds, and would still not cover `file` or
+  `database` fleets, which have no control plane.
+- *A shared store* (control plane, database, or Redis). Every referenced error
+  would cost a network write on the proxy path, the detail would leave the
+  process that owns it, and each store would need its own bounds and
+  retention.
+- *A hash of a host, pod, or node name.* A short unkeyed hash of a guessable
+  name can be reversed by a client. The DP `node_id` is itself a random
+  per-process id, but it exists only in `dp` mode, so reusing it would leave
+  `file` and `database` fleets without one.
+- *An operator-assigned id.* It needs per-replica configuration and silently
+  collides when two replicas share one.
 
 ## Adding a new error path
 

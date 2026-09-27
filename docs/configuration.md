@@ -926,6 +926,18 @@ origins in `allowed_ws_origins`. See
 [routing.md](routing.md#websocket-origin-admission) and
 [cors_plugin.md](cors_plugin.md#websocket-upgrades-and-cswsh).
 
+**Per-proxy WebSocket compression (`websocket_permessage_deflate`).** `strip`
+(default) keeps RFC 7692 `permessage-deflate` from being negotiated end to end.
+`passthrough` forwards only the `permessage-deflate` offer and answer unchanged on
+HTTP/1.1, H2 Extended CONNECT, and H3 Extended CONNECT; other extension tokens are
+still stripped, and a negotiated session is relayed as raw bytes, so
+`FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` and the incomplete-message bounds do not
+apply to it. Validation refuses `passthrough` on a proxy with any plugin that
+requires the parsed WebSocket relay (`waf`, `ws_frame_logging`,
+`ws_message_size_limiting`, `ws_rate_limiting`, or a custom plugin declaring
+`requires_websocket_framing()`), including through a proxy group or an inherited
+global plugin. See [routing.md](routing.md#websocket-compression-permessage-deflate).
+
 See [size_limits.md](size_limits.md) for detailed sizing guidance.
 
 **Route-scoped ceilings compose with these globals.** The `request_size_limiting`
@@ -1114,6 +1126,11 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | No | `false` | Track streaming response total latency (adds per-stream overhead) |
+| `FERRUM_DIAGNOSTIC_REFS` | No | `off` | Gateway diagnostic references (`off`, `errors`, or `all`; any other value fails startup). With `errors`, every HTTP/1.1, HTTP/2, and HTTP/3 response that carries the gateway's own `X-Gateway-Error` token also carries an opaque `X-Ferrum-Diagnostic-Ref: fd1_<32 hex>` (128 CSPRNG bits, no embedded cause, route, backend, or tenant). With `all`, every other gateway-authored error response carries one too: plugin rejections (`401`/`403`/`429`, ...), gateway policy fences, and routing `404`s; a backend's own error response never does, whether relayed or replayed by a plugin (a cache hit, an idempotent replay, a serverless terminate reply, a federated provider response). The lookup detail names the rejecting phase and plugin and every backend attempt (bounded to 8, with closed TLS alert / verification reasons). The precise cause is retained in process memory only and is readable only through the admin `GET /diagnostics/v1/refs/{ref}` with a JWT carrying the `diagnostics:read` scope and an `ns` claim. Backend copies of the header, and any copy a plugin or hook writes, are stripped whatever the setting. `off` allocates nothing. See [error_classification.md](error_classification.md#gateway-diagnostic-references) |
+| `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` | No | `900` | Lifetime of a diagnostic reference in the in-memory store, clamped to 1–86400. An expired reference answers `404` |
+| `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` | No | `10000` | Retained diagnostic references, clamped to 16–1000000 and split evenly across 16 shards; the oldest reference in a full shard is evicted first. Each retained reference costs roughly 0.5–1 KB (the entry, its request's detail slot, and the proxy ID and backend origin strings; up to about 1.5 KB with a full attempt list and a rejection record), so the default holds about 5–10 MB and the `1000000` maximum up to about 0.5–1.5 GB of process memory. Size it for the lookup window you need rather than the peak error rate: a sustained error burst fills the store at the error rate and then evicts the oldest references |
+| `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` | No | `10` | Admin diagnostic reference lookup attempts admitted per second across all callers, clamped to 1–10000. One JWT `sub` may use at most half of it (at least 1). Every attempt counts against its `sub`'s share, including one refused with `403`; only an attempt whose credential passes the scope and `ns` checks also counts globally, so refused credentials cannot exhaust the global budget. Above either budget the lookup answers `429` with `Retry-After: 1` |
+| `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG` | No | `false` | Embed this process's replica id in every diagnostic reference: `fd2_<8 hex replica>_<32 hex>` instead of `fd1_<32 hex>`. A lookup on a replica that did not mint the reference answers the same `404` and body as any miss, plus an `X-Ferrum-Diagnostic-Owner-Replica` header naming the replica to ask, sent only to a caller whose `diagnostics:read` token is bound to the answering replica's namespace. The id is 32 bits drawn from the process CSPRNG at startup (a restart draws a new one, as it forgets every reference); it names no host, pod, node, or address, but a client that collects references can tell which responses one process served. It is logged once at startup at INFO (hidden at the default `FERRUM_LOG_LEVEL=warn`) and exported as `ferrum_diagnostic_ref_replica_info{replica_id}` on `/metrics`. Setting it while `FERRUM_DIAGNOSTIC_REFS=off` has no effect and logs a startup `WARN`. `fd1_` references keep resolving on the untagged replica that minted them. See [error_classification.md](error_classification.md#lookup-across-replicas) |
 | `FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS` | No | `1000` | Background sampler interval for `/metrics/runtime` system metrics (minimum 100ms) |
 | `FERRUM_METRICS_WINDOW_1M_SECONDS` | No | `60` | Short status-code/request-rate window exposed by `/metrics/runtime` |
 | `FERRUM_METRICS_WINDOW_5M_SECONDS` | No | `300` | Long status-code/request-rate window exposed by `/metrics/runtime` |

@@ -55,6 +55,7 @@ use crate::proxy::datagram_client_address::{
 use crate::proxy::stream_error::{
     StreamSetupError, StreamSetupKind, find_stream_setup_error, stream_dns_setup_error,
 };
+use crate::proxy::udp_port_handoff::UdpPortHold;
 use crate::proxy::{HalfOpenProbeGuard, LoadBalancerConnectionGuard};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
@@ -2630,7 +2631,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
 #[cfg(target_os = "linux")]
 fn flush_gso_batch(
     gso_batch: &mut super::udp_batch::GsoBatchBuf,
-    frontend: &Arc<UdpSocket>,
+    frontend: &UdpSocket,
     client_addr: SocketAddr,
     local: Option<crate::socket_opts::PktinfoLocal>,
 ) -> std::io::Result<usize> {
@@ -2661,7 +2662,7 @@ fn flush_gso_batch(
 /// readiness at that boundary too.
 #[cfg(target_os = "linux")]
 async fn direct_send_to_client(
-    frontend: &Arc<UdpSocket>,
+    frontend: &UdpSocket,
     data: &[u8],
     client_addr: SocketAddr,
     local: Option<crate::socket_opts::PktinfoLocal>,
@@ -2769,7 +2770,7 @@ fn flush_sendmmsg_best_effort(
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn direct_send_reply_or_drop(
-    frontend: &Arc<UdpSocket>,
+    frontend: &UdpSocket,
     data: &[u8],
     client_addr: SocketAddr,
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
@@ -2816,7 +2817,7 @@ async fn direct_send_reply_or_drop(
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_sendmmsg_or_direct(
     send_batch: &mut super::udp_batch::SendMmsgBatch,
-    frontend: &Arc<UdpSocket>,
+    frontend: &UdpSocket,
     client_addr: SocketAddr,
     data: &[u8],
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
@@ -2904,7 +2905,7 @@ async fn enqueue_sendmmsg_or_direct(
 async fn drain_gso_to_sendmmsg_or_direct(
     gso_batch: &mut super::udp_batch::GsoBatchBuf,
     send_batch: &mut super::udp_batch::SendMmsgBatch,
-    frontend: &Arc<UdpSocket>,
+    frontend: &UdpSocket,
     client_addr: SocketAddr,
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     proxy_id: &str,
@@ -2969,7 +2970,7 @@ async fn drain_gso_to_sendmmsg_or_direct(
 async fn try_gso_send_or_fallback(
     gso_batch: &mut super::udp_batch::GsoBatchBuf,
     send_batch: &mut super::udp_batch::SendMmsgBatch,
-    frontend: &Arc<UdpSocket>,
+    frontend: &UdpSocket,
     client_addr: SocketAddr,
     data: &[u8],
     gso_failed: &mut bool,
@@ -3269,6 +3270,100 @@ fn resolve_udp_session_route(
     }
 }
 
+/// A plain-UDP listener's frontend socket together with the listener's claim
+/// on its port in the in-process UDP port ledger (issue #5843).
+///
+/// Session reply tasks keep clones of the frontend `Arc` after the listener's
+/// receive loop returns, until they observe the shutdown. Keeping the claim
+/// inside the shared socket releases it exactly when the last clone closes the
+/// socket, so the Gateway listener manager keeps treating a collision on the
+/// port as a pending handoff for as long as a reply task still holds it open.
+struct FrontendUdpSocket {
+    // Declared first: fields drop in order, so the socket closes before the
+    // claim is released.
+    socket: UdpSocket,
+    _port_hold: Option<UdpPortHold>,
+}
+
+impl FrontendUdpSocket {
+    /// Wrap a freshly bound socket, arming `port_hold` now that the bind has
+    /// succeeded.
+    fn new(socket: UdpSocket, port_hold: Option<UdpPortHold>) -> Self {
+        if let Some(hold) = &port_hold {
+            hold.arm();
+        }
+        Self {
+            socket,
+            _port_hold: port_hold,
+        }
+    }
+}
+
+impl std::ops::Deref for FrontendUdpSocket {
+    type Target = UdpSocket;
+
+    fn deref(&self) -> &UdpSocket {
+        &self.socket
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for FrontendUdpSocket {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.socket)
+    }
+}
+
+/// Bind a UDP/DTLS listener's frontend socket on `addr`.
+///
+/// A listener that holds a claim in the in-process UDP port ledger rides out a
+/// handoff of its port with a budget of its own ([`UdpPortHold::bind`], issue
+/// #5851). Its manager's reconcile pass only probed the port and dropped the
+/// probe socket before spawning this task, so a Gateway QUIC half can take the
+/// port in between; this bind then runs after the pass published its failures
+/// and checked the release log, and a failure here would otherwise wait for
+/// the 30-second supervisor tick. The wait is raced against the listener's
+/// shutdown signals, so a listener retired meanwhile returns `Ok(None)` at
+/// once and its manager's reconcile never waits on this budget.
+///
+/// Without a hold (standalone listeners and tests) this is a plain bind.
+async fn bind_frontend_udp_socket(
+    addr: SocketAddr,
+    udp_port_hold: Option<&UdpPortHold>,
+    shutdown: &watch::Receiver<bool>,
+    global_shutdown: Option<&watch::Receiver<bool>>,
+) -> std::io::Result<Option<UdpSocket>> {
+    let Some(hold) = udp_port_hold else {
+        return UdpSocket::bind(addr).await.map(Some);
+    };
+    // Clones, so waiting here consumes nothing the accept loop later watches.
+    let mut shutdown = shutdown.clone();
+    let mut global_shutdown = global_shutdown.cloned();
+    let stopped = async {
+        let global = async {
+            let stopped = match global_shutdown.as_mut() {
+                Some(rx) => rx.wait_for(|stop| *stop).await.is_ok(),
+                None => false,
+            };
+            if !stopped {
+                // No global signal, or its sender is gone: nothing to wait on.
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            // A dropped per-listener sender means the handle that owned this
+            // listener is gone, which is a stop as well.
+            _ = shutdown.wait_for(|stop| *stop) => {}
+            _ = global => {}
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = stopped => Ok(None),
+        socket = hold.bind(addr) => socket.map(Some),
+    }
+}
+
 /// Start a UDP proxy listener on the given port.
 ///
 /// For each incoming datagram from a new client address, a session is created
@@ -3278,6 +3373,19 @@ fn resolve_udp_session_route(
 /// When `frontend_dtls_config` is `Some`, the listener accepts DTLS-encrypted
 /// connections from clients (frontend DTLS termination). Otherwise, plain UDP.
 pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Error> {
+    start_udp_listener_holding_port(cfg, None).await
+}
+
+/// [`start_udp_listener`] for a listener whose port is claimed in the
+/// in-process UDP port ledger (issue #5843). `udp_port_hold` is armed right
+/// after the frontend socket binds and then travels with that socket (the
+/// plain-UDP frontend socket, or the DTLS server and its session drivers), so
+/// it is released when the socket closes rather than when this function
+/// returns. A bind that fails never arms it.
+pub async fn start_udp_listener_holding_port(
+    cfg: UdpListenerConfig,
+    udp_port_hold: Option<UdpPortHold>,
+) -> Result<(), anyhow::Error> {
     let UdpListenerConfig {
         port,
         bind_addr,
@@ -3408,6 +3516,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             node_waypoint_udp_owner,
             datagram_client_address,
             mesh_outbound_enforcement,
+            udp_port_hold,
         )
         .await;
     }
@@ -3425,7 +3534,17 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     let node_waypoint_udp_source = node_waypoint_udp_source_scoping;
 
     let addr = SocketAddr::new(bind_addr, port);
-    let frontend_socket = Arc::new(UdpSocket::bind(addr).await?);
+    let Some(frontend_socket) = bind_frontend_udp_socket(
+        addr,
+        udp_port_hold.as_ref(),
+        &shutdown,
+        global_shutdown.as_ref(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let frontend_socket = Arc::new(FrontendUdpSocket::new(frontend_socket, udp_port_hold));
 
     // NodeWaypoint UDP relay (issue #3286): replies leave THIS socket toward
     // the enrolled source pod, and the pod-veth tc guard drops UDP to an
@@ -4216,7 +4335,7 @@ async fn process_datagram(
     request_epoch: &Arc<RequestEpochStore>,
     health_checker: &Arc<HealthChecker>,
     dns_cache: &DnsCache,
-    frontend_socket: &Arc<UdpSocket>,
+    frontend_socket: &Arc<FrontendUdpSocket>,
     sessions: &SessionMap,
     pending_sessions: &PendingSessionMap,
     metrics: &Arc<UdpProxyMetrics>,
@@ -4552,7 +4671,7 @@ fn spawn_new_session_datagram(
     request_epoch: Arc<RequestEpochStore>,
     health_checker: Arc<HealthChecker>,
     dns_cache: DnsCache,
-    frontend_socket: Arc<UdpSocket>,
+    frontend_socket: Arc<FrontendUdpSocket>,
     sessions: SessionMap,
     pending_sessions: PendingSessionMap,
     metrics: Arc<UdpProxyMetrics>,
@@ -4701,7 +4820,7 @@ async fn process_new_session_datagram(
     request_epoch: &RequestEpochStore,
     health_checker: &HealthChecker,
     dns_cache: &DnsCache,
-    frontend_socket: &Arc<UdpSocket>,
+    frontend_socket: &Arc<FrontendUdpSocket>,
     sessions: &SessionMap,
     pending_sessions: &PendingSessionMap,
     metrics: &Arc<UdpProxyMetrics>,
@@ -5561,6 +5680,9 @@ async fn start_dtls_frontend_listener(
     datagram_client_address: Option<Arc<DatagramClientAddressGate>>,
     mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    // This listener's claim in the in-process UDP port ledger (issue #5843),
+    // armed once the DTLS server's socket is bound.
+    udp_port_hold: Option<UdpPortHold>,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
     let admission_overload = overload.clone();
@@ -5606,7 +5728,7 @@ async fn start_dtls_frontend_listener(
         // so the NodeWaypoint inbound auth mark has to be applied there rather
         // than here: the pod-veth tc guard drops UDP toward an enrolled pod IP
         // unless it carries the mark, which would otherwise strand every
-        // ServerHello and every application reply. `bind_with_limits` applies
+        // ServerHello and every application reply. `from_socket_with_limits` applies
         // it before the socket is used and fails the listener if it cannot,
         // so this is a startup precondition, not an optimization. Off for
         // every other DTLS listener.
@@ -5653,8 +5775,24 @@ async fn start_dtls_frontend_listener(
         // an established DTLS session twice.
         per_source_ip_admission: metrics.per_ip_admission.clone(),
     };
-    let server =
-        Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);
+    let Some(socket) = bind_frontend_udp_socket(
+        addr,
+        udp_port_hold.as_ref(),
+        &shutdown,
+        global_shutdown.as_ref(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to bind DTLS server on {}: {}", addr, e))?
+    else {
+        return Ok(());
+    };
+    let mut server =
+        crate::dtls::DtlsServer::from_socket_with_limits(socket, dtls_config, dtls_limits)?;
+    if let Some(hold) = udp_port_hold {
+        hold.arm();
+        server.attach_udp_port_hold(hold);
+    }
+    let server = Arc::new(server);
     // Publish the live DTLS server handle so StreamListenerManager can apply
     // the matching owner's generation (`publish_frontend_dtls_generation` or
     // `publish_mesh_node_waypoint_dtls_generation`) via `swap_frontend_config`
@@ -8272,7 +8410,7 @@ async fn create_session(
     epoch: &RequestEpoch,
     view: UdpSessionEpochView,
     dns_cache: &DnsCache,
-    frontend_socket: &Arc<UdpSocket>,
+    frontend_socket: &Arc<FrontendUdpSocket>,
     identity: DatagramClientIdentity,
     // Exact identity of this session on this listener: the client tuple, the
     // selected destination IP, the exact namespaced route owner (issue #3861),

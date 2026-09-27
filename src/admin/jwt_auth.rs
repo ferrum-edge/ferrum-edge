@@ -107,6 +107,24 @@ impl AdminClaims {
     pub fn allowed_namespaces(&self) -> Result<crate::grpc::auth::AllowedNamespaces, String> {
         crate::grpc::auth::parse_ns_claim(&self.additional)
     }
+
+    /// Whether the optional `scope` claim grants `scope`.
+    ///
+    /// Accepts the OAuth 2.0 space-delimited string form (RFC 8693 §4.2) or
+    /// an array of strings. A missing claim, any other shape, or a non-string
+    /// array member grants nothing: a capability is never inferred from a
+    /// malformed claim, and the admin `role` never implies a scope.
+    pub fn grants_scope(&self, scope: &str) -> bool {
+        match self.additional.get("scope") {
+            Some(serde_json::Value::String(granted)) => {
+                granted.split_ascii_whitespace().any(|s| s == scope)
+            }
+            Some(serde_json::Value::Array(granted)) => {
+                granted.iter().any(|s| s.as_str() == Some(scope))
+            }
+            _ => false,
+        }
+    }
 }
 
 /// JWT Configuration

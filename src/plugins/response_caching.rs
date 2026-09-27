@@ -3076,6 +3076,12 @@ impl Plugin for ResponseCaching {
         "response_caching"
     }
 
+    // Every short-circuit is a cached origin representation (HIT or
+    // REVALIDATED), never a rejection of this plugin's own.
+    fn rejects_with_origin_response(&self) -> bool {
+        true
+    }
+
     fn priority(&self) -> u16 {
         super::priority::RESPONSE_CACHING
     }

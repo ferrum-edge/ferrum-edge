@@ -1700,6 +1700,36 @@ impl Http3WebSocket {
         }
     }
 
+    /// Send pre-encoded client frame bytes verbatim, for frames the typed
+    /// helpers cannot express (e.g. an RSV1-flagged `permessage-deflate`
+    /// message). The caller owns RFC 6455 masking.
+    pub async fn send_raw_bytes(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_raw_frame(bytes).await
+    }
+
+    /// Read exactly `len` stream bytes without parsing frame headers, so the
+    /// caller can assert on reserved bits the frame parser does not surface.
+    pub async fn recv_raw_exact(
+        &mut self,
+        len: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        while self.read_buf.len() < len {
+            let mut chunk = tokio::time::timeout(Duration::from_secs(15), self.stream.recv_data())
+                .await
+                .map_err(|_| "websocket recv_data timed out")?
+                .map_err(|e| format!("websocket recv_data: {e}"))?
+                .ok_or("websocket stream ended before the expected raw bytes")?;
+            while chunk.has_remaining() {
+                let bytes = chunk.copy_to_bytes(chunk.remaining());
+                self.read_buf.extend_from_slice(&bytes);
+            }
+        }
+        Ok(self.read_buf.drain(..len).collect())
+    }
+
     async fn send_frame(
         &mut self,
         opcode: u8,

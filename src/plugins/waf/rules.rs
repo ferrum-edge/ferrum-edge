@@ -501,6 +501,9 @@ pub(super) struct CompiledRules {
     /// UTF-8 view that no active rule would consume.
     pub(super) request_body_text_rules_active: bool,
     pub(super) request_cheap_rules_active: bool,
+    /// Any compiled rule (text set or CIDR) targets cookies, so the cookie
+    /// scan and its decoded crumb views are skipped outright when none does.
+    pub(super) cookie_rules_active: bool,
     pub(super) response_header_rules_active: bool,
     pub(super) response_body_rules_active: bool,
     /// At least one rule compiled as detection-only. Lets the scan decision
@@ -900,6 +903,7 @@ struct RuleSetBuilders {
     request_body_rules_active: bool,
     request_body_text_rules_active: bool,
     request_cheap_rules_active: bool,
+    cookie_rules_active: bool,
     response_header_rules_active: bool,
     response_body_rules_active: bool,
 }
@@ -909,6 +913,7 @@ impl RuleSetBuilders {
         self.request_body_rules_active |= rule.target.is_request_body();
         self.request_body_text_rules_active |= matches!(&rule.target, RuleTarget::BodyText);
         self.request_cheap_rules_active |= rule.target.is_request_cheap();
+        self.cookie_rules_active |= matches!(rule.target, RuleTarget::Cookies);
         self.response_header_rules_active |= rule.target.is_response_header();
         self.response_body_rules_active |= rule.target.is_response_body();
 
@@ -1007,6 +1012,7 @@ impl RuleSetBuilders {
             request_body_rules_active: self.request_body_rules_active,
             request_body_text_rules_active: self.request_body_text_rules_active,
             request_cheap_rules_active: self.request_cheap_rules_active,
+            cookie_rules_active: self.cookie_rules_active,
             response_header_rules_active: self.response_header_rules_active,
             response_body_rules_active: self.response_body_rules_active,
         })

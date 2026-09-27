@@ -1182,6 +1182,14 @@ When no plugin contributes parser policy or returns `true` from
 otherwise forwards messages without entering plugin hooks. This aggregate
 framing requirement is pre-computed per proxy in `PluginCache` at reload time.
 
+The same aggregate requirement gates `websocket_permessage_deflate: passthrough`:
+config admission refuses passthrough on a proxy where any effective plugin can
+require the parsed relay (`waf`, `ws_frame_logging`, `ws_message_size_limiting`,
+`ws_rate_limiting`, or a custom plugin whose `requires_websocket_framing()` is
+`true`), and at runtime the offer is only forwarded when the proxy's precomputed
+requirement is `false`. A session that negotiates `permessage-deflate` always uses
+the raw relay, on H1, H2, and H3 alike.
+
 ## UDP Datagram Lifecycle (`on_udp_datagram`)
 
 UDP proxies support per-datagram plugin hooks that fire before each client-to-backend and backend-to-client datagram is forwarded. This is separate from the `on_stream_connect`/`on_stream_disconnect` lifecycle, which fires once per session.

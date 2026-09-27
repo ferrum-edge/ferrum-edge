@@ -38,6 +38,7 @@ tungstenite = { path = "../../../vendor/tungstenite-0.29.0-ferrum-patched" }
 tokio-tungstenite = { path = "../../../vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
 dimpl = { path = "../../../vendor/dimpl-0.6.1-ferrum-patched" }
 hyper-util = { path = "../../../vendor/hyper-util-0.1.21-ferrum-patched" }
+hyper = { path = "../../../vendor/hyper-1.9.0-ferrum-patched" }
 
 [[bench]]
 name = "authz_match"

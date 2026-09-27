@@ -356,8 +356,11 @@ impl Waf {
     ) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
         let subject = ScanSubject::Http(ctx);
+        // One `name: value` buffer for the whole map instead of one allocation
+        // per header.
+        let mut line = String::new();
         for (name, value) in headers {
-            let mut line = String::with_capacity(name.len() + value.len() + 2);
+            line.clear();
             line.push_str(name);
             line.push_str(": ");
             line.push_str(value);
@@ -411,6 +414,14 @@ impl Waf {
         let Some(set) = set else {
             return;
         };
+        // Almost every inspected value is clean. `is_match` stops at the first
+        // match and needs no per-call `SetMatches` allocation, while `matches`
+        // must run the overlapping search to the end and allocate its result;
+        // on short metadata values the prefilter is ~2-3x cheaper, and a real
+        // hit pays for both passes only on the rare matching value.
+        if !set.set.is_match(value) {
+            return;
+        }
         for index in set.set.matches(value) {
             self.push_if_allowed(outcome, &set.refs[index], value, subject, field);
         }
@@ -436,10 +447,11 @@ impl Waf {
         let Some(set) = set else {
             return;
         };
-        let matches = set.set.matches(value);
-        if !matches.matched_any() {
+        // Same clean-case prefilter as `scan_text_set`.
+        if !set.set.is_match(value) {
             return;
         }
+        let matches = set.set.matches(value);
         let text = String::from_utf8_lossy(value);
         for index in matches {
             self.push_if_allowed(
@@ -473,8 +485,9 @@ impl Waf {
                 continue;
             };
             self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
-            let (variants, _) = normalize::decoded_variants_with_residual(text);
-            for variant in variants {
+            // `text` is already JSON-unescaped; its single-character escapes
+            // are not resolved a second time.
+            for variant in normalize::decoded_json_value_variants(text) {
                 self.push_json_path_hit_if_matched(outcome, path_rule, &variant, text, subject);
             }
         }
@@ -517,28 +530,67 @@ impl Waf {
             && !rule.suppresses_text(fp_filter_target)
     }
 
+    /// Scan each `name=value` cookie crumb as sent AND as decoded.
+    ///
+    /// Frameworks disagree about cookie values: the Servlet API and Go's
+    /// `net/http` hand the application the raw octets, while PHP (`urldecode`,
+    /// so `+` is a space), Express `cookie-parser` (`decodeURIComponent`), and
+    /// Rails unescape them first. A WAF that only scans the raw crumb misses
+    /// `pref=%3Cscript%3E`; one that only scans the decoded form misses a raw
+    /// payload a non-decoding backend reads verbatim. So the raw crumb is
+    /// always scanned and every distinct decoded view is scanned beside it.
+    /// Cookie views are percent decodes (`%XX`, `%uXXXX`, `+` as a space and,
+    /// Express-style, as `+`, and the bounded layered percent decode), plus
+    /// the code-point escapes (`\uXXXX`, `\xXX`) of an Express `j:` JSON
+    /// cookie. JSON single-character escapes and HTML entities are not cookie
+    /// encodings, and resolving them would turn a `j:` cookie's `\n` into a
+    /// control character. Splitting on `;` happens first, so an encoded `%3B`
+    /// cannot forge an extra crumb. A crumb with nothing to decode costs no
+    /// allocation.
     fn scan_cookies(&self, outcome: &mut ScanOutcome, header: &str, subject: ScanSubject<'_>) {
+        if !self.compiled.cookie_rules_active {
+            return;
+        }
         for cookie in header.split(';') {
             let cookie = cookie.trim();
-            if !cookie.is_empty() {
-                let field = Field::Cookie(cookie_name(cookie));
-                self.scan_text_set(
-                    outcome,
-                    self.compiled.cookies.as_ref(),
-                    cookie,
-                    subject,
-                    field,
-                );
-                self.scan_cidr_rules_matching(
-                    outcome,
-                    cookie,
-                    &self.compiled.text_cidr_rules,
-                    subject,
-                    field,
-                    |target| matches!(target, RuleTarget::Cookies),
-                );
+            if cookie.is_empty() {
+                continue;
+            }
+            // One field per crumb, named from the RAW crumb, shared by every
+            // decoded view: a view's own decoded name (`prefs%3D=…` reads as
+            // `prefs`) must not pick up an exclusion the raw crumb does not
+            // name.
+            let field = Field::Cookie(cookie_name(cookie));
+            self.scan_cookie_view(outcome, cookie, subject, field);
+            let views = normalize::canonical_cookie_views(cookie);
+            for view in views.iter().filter(|view| *view != cookie) {
+                self.scan_cookie_view(outcome, view, subject, field);
             }
         }
+    }
+
+    fn scan_cookie_view(
+        &self,
+        outcome: &mut ScanOutcome,
+        cookie: &str,
+        subject: ScanSubject<'_>,
+        field: Field<'_>,
+    ) {
+        self.scan_text_set(
+            outcome,
+            self.compiled.cookies.as_ref(),
+            cookie,
+            subject,
+            field,
+        );
+        self.scan_cidr_rules_matching(
+            outcome,
+            cookie,
+            &self.compiled.text_cidr_rules,
+            subject,
+            field,
+            |target| matches!(target, RuleTarget::Cookies),
+        );
     }
 
     fn scan_query_pair(

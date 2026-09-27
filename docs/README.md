@@ -122,6 +122,7 @@ Contributing to Ferrum Edge itself.
 | [native_compiler_store_transfer.md](native_compiler_store_transfer.md) | Native compiler-store transfer proof |
 | [release_profile_study.md](release_profile_study.md) | Release build profile (LTO / codegen units) study |
 | [release_platform_build_study.md](release_platform_build_study.md) | Non-publishing macOS/Windows/Linux release-build timing study |
+| [plans/diagnostic_ref_cross_replica_adr.md](plans/diagnostic_ref_cross_replica_adr.md) | ADR: diagnostic reference lookup across replicas |
 | [plans/mesh_multicluster_lifecycle_adr.md](plans/mesh_multicluster_lifecycle_adr.md) | ADR: mesh multicluster lifecycle |
 | [plans/node_waypoint_transport_adr.md](plans/node_waypoint_transport_adr.md) | ADR: NodeWaypoint secured transport |
 | [plans/test_framework_scripted_backends.md](plans/test_framework_scripted_backends.md) | Scripted-backend test framework record |
@@ -192,6 +193,13 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
   ([issue](upstream-h3-quinn-patches/002-send-stream-stopped-watch/issue.md),
   [PR text](upstream-h3-quinn-patches/002-send-stream-stopped-watch/pr-description.md),
   [patch](upstream-h3-quinn-patches/002-send-stream-stopped-watch/h3-quinn-send-stream-stopped-watch.patch))
+
+### hyper
+
+- 001 — [reset an upgraded HTTP/2 CONNECT stream with `CONNECT_ERROR`](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md)
+  ([issue draft](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/issue.md),
+  [PR text](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/pr-description.md),
+  [patch](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/hyper-upgraded-h2-connect-error-reset.patch))
 
 ### hyper-util
 

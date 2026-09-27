@@ -438,6 +438,7 @@ where
         crate::proxy::earliest_deadline(grpc_deadline, route_deadline),
         plan,
     );
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     let outcome = await_authorized_headers_write(
         bound,
         crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
