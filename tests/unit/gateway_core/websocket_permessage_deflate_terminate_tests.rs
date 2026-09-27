@@ -147,8 +147,7 @@ async fn next_fault(
     let error = next_message(framer)
         .await
         .expect_err("the inflater must fail the read");
-    permessage_deflate_fault(&error)
-        .unwrap_or_else(|| panic!("not a deflate fault: {error}"))
+    permessage_deflate_fault(&error).unwrap_or_else(|| panic!("not a deflate fault: {error}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -293,10 +292,7 @@ fn legs_negotiate_independently() {
     assert_eq!(session.backend, None);
 
     let backend_only = offer_termination(None, false, &mut Vec::new())
-        .complete(
-            Some("permessage-deflate; client_no_context_takeover"),
-            4096,
-        )
+        .complete(Some("permessage-deflate; client_no_context_takeover"), 4096)
         .expect("valid backend answer");
     assert_eq!(backend_only.client_response, None);
     let session = backend_only.session.expect("the backend leg negotiated");
@@ -375,7 +371,9 @@ async fn fragmented_compressed_message_keeps_rsv1_on_its_first_frame_only() {
         Message::Ping(Bytes::from_static(b"ka"))
     );
     assert_eq!(
-        next_message(&mut framer).await.expect("reassembled message"),
+        next_message(&mut framer)
+            .await
+            .expect("reassembled message"),
         Message::text("fragmented permessage-deflate message")
     );
 }

@@ -576,8 +576,7 @@ fn ws_frame(first: u8, mask: Option<[u8; 4]>, payload: &[u8]) -> Vec<u8> {
     if payload.len() < 126 {
         frame.push(mask_bit | payload.len() as u8);
     } else {
-        let len = u16::try_from(payload.len())
-            .expect("fixture frames stay under 64 KiB");
+        let len = u16::try_from(payload.len()).expect("fixture frames stay under 64 KiB");
         frame.push(mask_bit | 126);
         frame.extend_from_slice(&len.to_be_bytes());
     }
@@ -891,7 +890,10 @@ impl WsLeg {
     async fn write(&mut self, frame: Vec<u8>) {
         match self {
             WsLeg::Io { io, .. } => io.write_all(&frame).await.expect("send client frame"),
-            WsLeg::H3(ws) => ws.send_raw_bytes(frame).await.expect("send H3 client frame"),
+            WsLeg::H3(ws) => ws
+                .send_raw_bytes(frame)
+                .await
+                .expect("send H3 client frame"),
         }
     }
 }
@@ -932,7 +934,11 @@ async fn exercise_terminated_session(leg: &mut WsLeg, backend: &mut TerminateBac
 
     // Repeated text exercises context takeover on the client leg in both
     // directions; the backend leg was asked to reset per message.
-    for text in ["ping-1", "ping-1", "a somewhat longer message, ping-1 again"] {
+    for text in [
+        "ping-1",
+        "ping-1",
+        "a somewhat longer message, ping-1 again",
+    ] {
         let frame = ws_frame(0xc1, Some(CLIENT_MASK), &client.deflate(text.as_bytes()));
         leg.write(frame).await;
         let (compressed, plaintext) = backend.next_message().await;
@@ -964,7 +970,10 @@ async fn functional_ws_deflate_terminate_http1_negotiates_each_leg() {
     let port = gateway.proxy_port;
 
     let (stream, head, pending) = h1_upgrade(port, "/terminate").await;
-    assert!(head.starts_with("HTTP/1.1 101"), "terminate upgrade: {head}");
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "terminate upgrade: {head}"
+    );
     assert_eq!(
         header_values(&head, "sec-websocket-extensions"),
         vec!["permessage-deflate"],
@@ -993,7 +1002,10 @@ async fn functional_ws_deflate_terminate_http1_negotiates_each_leg() {
     // backend leg: the gateway inflates toward the client and deflates toward
     // the backend.
     let (stream, head, pending) = h1_upgrade_offering(port, "/terminate", None).await;
-    assert!(head.starts_with("HTTP/1.1 101"), "terminate upgrade: {head}");
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "terminate upgrade: {head}"
+    );
     assert!(header_values(&head, "sec-websocket-extensions").is_empty());
     assert_eq!(
         backend.next_offer().await.as_deref(),
@@ -1084,7 +1096,10 @@ async fn functional_ws_deflate_terminate_bomb_closes_with_1009() {
     let gateway = start_terminate_gateway(backend.port).await;
 
     let (stream, head, pending) = h1_upgrade(gateway.proxy_port, "/terminate").await;
-    assert!(head.starts_with("HTTP/1.1 101"), "terminate upgrade: {head}");
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "terminate upgrade: {head}"
+    );
     assert_eq!(
         backend.next_offer().await.as_deref(),
         Some("permessage-deflate")
@@ -1119,7 +1134,10 @@ async fn functional_ws_deflate_terminate_waf_inspects_plaintext() {
     let gateway = start_terminate_gateway(backend.port).await;
 
     let (stream, head, pending) = h1_upgrade(gateway.proxy_port, "/terminate-waf").await;
-    assert!(head.starts_with("HTTP/1.1 101"), "terminate upgrade: {head}");
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "terminate upgrade: {head}"
+    );
     assert_eq!(
         header_values(&head, "sec-websocket-extensions"),
         vec!["permessage-deflate"],
