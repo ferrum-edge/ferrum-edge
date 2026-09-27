@@ -4476,7 +4476,8 @@ pub mod _test_support {
     }
 
     pub use crate::proxy::tcp_proxy::{
-        StreamCopyResult, StreamIoSide, relay_failure_is_client_facing,
+        STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE, STREAM_RELAY_IDLE_TIMEOUT_MESSAGE, StreamCopyResult,
+        StreamIoSide, relay_failure_is_client_facing, relay_failure_is_idle_expiry,
     };
 
     /// Reach into `tcp_proxy` to exercise the `Direction` + IO-side →

@@ -500,23 +500,21 @@ fn hbone_relay_body_outcome(
 /// Whether the byte-stream relay's first failure resets the CONNECT stream
 /// with `RST_STREAM(CONNECT_ERROR)` (issues #5781, #5858).
 ///
-/// Only the idle window and the half-close cap end the stream cleanly: the
-/// relay recorded them as a side-less `(Unknown, ReadWriteTimeout)` watchdog
-/// expiry, and the tunnel either went quiet or already finished one direction.
-/// Every other failure cut the byte stream short, and a clean `END_STREAM`
-/// would read as a complete response: a socket error on either side (RFC 9113
-/// section 8.5 assigns `CONNECT_ERROR` to a tunnel whose TCP connection
-/// failed), a backend read or write deadline (attributed to a direction and a
-/// side), and a fence revocation (`ConnectionAborted`).
+/// Only the idle window ends the stream cleanly
+/// ([`tcp_proxy::relay_failure_is_idle_expiry`]): nothing moved in either
+/// direction for the whole window, so the tunnel went quiet rather than being
+/// cut. Every other failure cut the byte stream short, and a clean
+/// `END_STREAM` would read as a complete response: a socket error on either
+/// side (RFC 9113 section 8.5 assigns `CONNECT_ERROR` to a tunnel whose TCP
+/// connection failed), a backend read or write deadline (attributed to a
+/// direction and a side), a fence revocation (`ConnectionAborted`), and the
+/// half-close cap. The cap is measured from the half-close regardless of
+/// activity, so it can cut a backend that is still streaming its response;
+/// when that direction already sent `END_STREAM` the reset is a no-op.
 fn hbone_relay_failure_resets_stream(
     first_failure: Option<&tcp_proxy::StreamFirstFailure>,
 ) -> bool {
-    first_failure.is_some_and(|(direction, class, side, _)| {
-        let clean_expiry = *direction == Direction::Unknown
-            && side.is_none()
-            && matches!(class, retry::ErrorClass::ReadWriteTimeout);
-        !clean_expiry
-    })
+    first_failure.is_some_and(|failure| !tcp_proxy::relay_failure_is_idle_expiry(failure))
 }
 
 /// End an HBONE tunnel's upgraded CONNECT stream once its relay is over (issue

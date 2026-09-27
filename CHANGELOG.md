@@ -125,9 +125,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RST_STREAM(CONNECT_ERROR)` instead of closing it with a clean `END_STREAM`
   (#5858). Before, a backend that stalled mid-response, or a tunnel revoked
   mid-stream, looked to the client like a complete byte stream. The datagram
-  relay also resets on a tunnel write stall and a revocation. Only a peer
-  close, an idle expiry, or the TCP half-close cap still ends the stream with
-  `END_STREAM`.
+  relay also resets on a tunnel write stall and a revocation. The byte-stream
+  relay also resets when the TCP half-close cap
+  (`FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS`) expires: the cap runs from the
+  half-close regardless of activity, so it can cut a backend that is still
+  streaming its response. Only a peer close or an idle expiry still ends the
+  stream with `END_STREAM`.
 - A Gateway API listener port whose HTTP/3 (QUIC) task died now gets HTTP/3
   back in the same reconcile pass (#5840). Before, the rebind could run before
   the dead endpoint released its UDP socket. It then failed with

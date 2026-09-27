@@ -127,6 +127,30 @@ fn create_mesh_proxy_state_with_config(
     consumers: Vec<Consumer>,
     plugin_configs: Vec<PluginConfig>,
 ) -> ProxyState {
+    create_mesh_proxy_state_with_env(proxy, consumers, plugin_configs, mesh_env_config())
+}
+
+/// The mesh-mode gateway settings every test in this file starts from.
+fn mesh_env_config() -> EnvConfig {
+    EnvConfig {
+        mode: OperatingMode::Mesh,
+        log_level: "error".to_string(),
+        proxy_http_port: 0,
+        proxy_https_port: 0,
+        admin_http_port: 0,
+        admin_https_port: 0,
+        shutdown_drain_seconds: 0,
+        max_connections: 0,
+        ..EnvConfig::default()
+    }
+}
+
+fn create_mesh_proxy_state_with_env(
+    proxy: Proxy,
+    consumers: Vec<Consumer>,
+    plugin_configs: Vec<PluginConfig>,
+    env_config: EnvConfig,
+) -> ProxyState {
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
         version: "1".to_string(),
@@ -148,17 +172,6 @@ fn create_mesh_proxy_state_with_config(
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
         gateway_trust_bundles: Vec::new(),
-    };
-    let env_config = EnvConfig {
-        mode: OperatingMode::Mesh,
-        log_level: "error".to_string(),
-        proxy_http_port: 0,
-        proxy_https_port: 0,
-        admin_http_port: 0,
-        admin_https_port: 0,
-        shutdown_drain_seconds: 0,
-        max_connections: 0,
-        ..EnvConfig::default()
     };
     ProxyState::new(
         config,
@@ -966,19 +979,80 @@ async fn start_stalling_backend() -> (
     (addr, handle, stop_tx)
 }
 
+/// Accepts one relay connection, reads the client's bytes up to their EOF (the
+/// client's half-close, relayed), then streams `chunk` every 50 ms and never
+/// closes, so the idle window never expires and only the relay's half-close cap
+/// can end the tunnel. `stop` releases the connection at teardown.
+async fn start_streaming_backend() -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+    oneshot::Sender<()>,
+) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind streaming backend");
+    let addr = listener.local_addr().expect("streaming backend addr");
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => return,
+            }
+        }
+        tokio::select! {
+            _ = stop_rx => {}
+            _ = async {
+                while stream.write_all(b"chunk").await.is_ok() {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            } => {}
+        }
+    });
+    (addr, handle, stop_tx)
+}
+
+/// What the client sends on a byte-stream tunnel before reading it to its end.
+#[derive(Clone, Copy)]
+enum ClientOpening {
+    /// Nothing: the client stays silent.
+    Silent,
+    /// `ping`, with the request stream left open.
+    Ping,
+    /// `ping` with `END_STREAM`: the client half-closes the tunnel.
+    PingThenHalfClose,
+}
+
 /// Run one byte-stream HBONE tunnel through `proxy` and return how the client
 /// saw it end. When `send_ping`, the client first sends `ping`; otherwise it
 /// stays silent.
-async fn byte_stream_relay_end(
+async fn byte_stream_relay_end(proxy: Proxy, send_ping: bool) -> (Vec<u8>, Result<(), h2::Error>) {
+    let opening = if send_ping {
+        ClientOpening::Ping
+    } else {
+        ClientOpening::Silent
+    };
+    byte_stream_relay_end_with(proxy, mesh_env_config(), opening).await
+}
+
+/// [`byte_stream_relay_end`] under `env_config`, with the client sending
+/// `opening`.
+async fn byte_stream_relay_end_with(
     mut proxy: Proxy,
-    send_ping: bool,
+    env_config: EnvConfig,
+    opening: ClientOpening,
 ) -> (Vec<u8>, Result<(), h2::Error>) {
     let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
     let spiffe_plugin = spiffe_identity_plugin_config(&proxy.id);
     proxy.plugins.push(PluginAssociation {
         plugin_config_id: spiffe_plugin.id.clone(),
     });
-    let state = create_mesh_proxy_state_with_config(proxy, vec![], vec![spiffe_plugin]);
+    let state = create_mesh_proxy_state_with_env(proxy, vec![], vec![spiffe_plugin], env_config);
     let (gateway_addr, shutdown_tx) = start_gateway_mtls(state, hbone_server_config(&certs)).await;
 
     let (mut sender, conn_task) =
@@ -995,9 +1069,10 @@ async fn byte_stream_relay_end(
         .expect("CONNECT response")
         .expect("CONNECT response");
     assert_eq!(resp.status(), StatusCode::OK);
-    if send_ping {
+    if !matches!(opening, ClientOpening::Silent) {
+        let end_of_stream = matches!(opening, ClientOpening::PingThenHalfClose);
         request_body
-            .send_data(Bytes::from_static(b"ping"), false)
+            .send_data(Bytes::from_static(b"ping"), end_of_stream)
             .expect("send CONNECT data");
     }
 
@@ -1067,6 +1142,38 @@ async fn hbone_relay_backend_read_timeout_sends_rst_stream_connect_error() {
 
     assert_eq!(&received[..], b"partial");
     let err = end.expect_err("a relay cut by the backend read deadline must be reset");
+    assert_eq!(err.reason(), Some(h2::Reason::CONNECT_ERROR));
+
+    let _ = backend_stop.send(());
+    backend_handle.await.expect("backend task");
+}
+
+/// Issue #5858: the half-close cap is measured from the client's half-close
+/// regardless of activity, so it can cut a backend that is still streaming its
+/// response. The client must see `RST_STREAM(CONNECT_ERROR)` after the bytes it
+/// did get, not the clean `END_STREAM` that reads as a complete response.
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_relay_half_close_cap_with_backend_streaming_sends_rst_stream_connect_error() {
+    let (backend_addr, backend_handle, backend_stop) = start_streaming_backend().await;
+    let mut proxy = create_mesh_proxy(backend_addr.port());
+    proxy.tcp_idle_timeout_seconds = Some(300);
+    proxy.backend_read_timeout_ms = 0;
+    proxy.backend_write_timeout_ms = 0;
+    // Only the half-close cap can end this relay: 1 s plus at most one 1 s
+    // watchdog tick, well inside the helper's 5 s bound.
+    let env_config = EnvConfig {
+        tcp_half_close_max_wait_seconds: 1,
+        ..mesh_env_config()
+    };
+
+    let (received, end) =
+        byte_stream_relay_end_with(proxy, env_config, ClientOpening::PingThenHalfClose).await;
+
+    assert!(
+        received.starts_with(b"chunk"),
+        "the backend must have been streaming when the cap fired, got {received:?}"
+    );
+    let err = end.expect_err("a relay cut by the half-close cap must be reset");
     assert_eq!(err.reason(), Some(h2::Reason::CONNECT_ERROR));
 
     let _ = backend_stop.send(());

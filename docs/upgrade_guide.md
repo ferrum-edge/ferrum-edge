@@ -38,11 +38,13 @@ error is no longer reported as complete.
 
 **HBONE deadlines and revocations reset the CONNECT stream (#5858).** A backend
 read or write deadline (`backend_read_timeout_ms`, `backend_write_timeout_ms`)
-that cuts a byte-stream HBONE relay, a datagram relay's tunnel write stall, and
-an admission-fence revocation of either relay now also end the `CONNECT`
-stream with `RST_STREAM(CONNECT_ERROR)` instead of `END_STREAM`. Only a peer
-close, an idle expiry, or the TCP half-close cap still ends with `END_STREAM`.
-A client that read a tunnel cut by a stalled backend or by policy as a
+that cuts a byte-stream HBONE relay, the TCP half-close cap
+(`FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS`) expiring on a byte-stream relay, a
+datagram relay's tunnel write stall, and an admission-fence revocation of
+either relay now also end the `CONNECT` stream with `RST_STREAM(CONNECT_ERROR)`
+instead of `END_STREAM`. Only a peer close or an idle expiry still ends with
+`END_STREAM`. A client that read a tunnel cut by a stalled backend, by the
+half-close cap while the backend was still streaming, or by policy as a
 complete stream now sees a stream error.
 
 **Dependencies**
