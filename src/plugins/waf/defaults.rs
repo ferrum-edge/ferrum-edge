@@ -107,8 +107,9 @@ const SQLI_SCHEMA_ENUMERATION: &str = r"(?i)(?:\binformation_schema(?:\s|/\*(?s:
 /// `loader.load_file('/etc/app.conf')`), so it counts only as a bare call
 /// whose argument is what MySQL reads: a quoted absolute or UNC path, a hex
 /// literal, or a `CHAR(` / `CONCAT(` / `UNHEX(` / `FROM_BASE64(` expression.
-/// A method call (`.load_file(`) never qualifies.
-const SQLI_ERROR_OR_OOB_FUNCTION: &str = r#"(?i)(?:\b(?:extractvalue|updatexml)\s*\(|(?:^|[^.\w$])load_file\s*\(\s*(?:0x[0-9a-f]{2,}|(?:char|concat|unhex|from_base64)\s*\(|['"](?:/|\\\\|[a-z]:[\\/]))|\binto(?:\s|/\*(?s:.){0,64}?\*/)+(?:out|dump)file\b|\bxp_(?:cmdshell|dirtree|regread|fileexist|subdirs)\b|\bsp_(?:oacreate|oamethod|execute_external_script)\b|\bopenrowset\s*\(|\butl_(?:http\.request|inaddr\.get_host_(?:address|name)|file\.fopen)\b|\bdbms_(?:java\.runjava|xmlquery|scheduler\.create_job)\b|\blo_(?:import|export)\s*\()"#;
+/// A method or associated-function call (`.load_file(`, `->load_file(`,
+/// `::load_file(`) never qualifies.
+const SQLI_ERROR_OR_OOB_FUNCTION: &str = r#"(?i)(?:\b(?:extractvalue|updatexml)\s*\(|(?:^|[^.\w$>:])load_file\s*\(\s*(?:0x[0-9a-f]{2,}|(?:char|concat|unhex|from_base64)\s*\(|['"](?:/|\\\\|[a-z]:[\\/]))|\binto(?:\s|/\*(?s:.){0,64}?\*/)+(?:out|dump)file\b|\bxp_(?:cmdshell|dirtree|regread|fileexist|subdirs)\b|\bsp_(?:oacreate|oamethod|execute_external_script)\b|\bopenrowset\s*\(|\butl_(?:http\.request|inaddr\.get_host_(?:address|name)|file\.fopen)\b|\bdbms_(?:java\.runjava|xmlquery|scheduler\.create_job)\b|\blo_(?:import|export)\s*\()"#;
 
 /// Quoted-string tautology (`' or 'a'='a`, `'or'1'='1`, `" || ""="`),
 /// claimed by `FE-SQLI-009` and its body mirror. `FE-SQLI-002` covers the
@@ -147,19 +148,25 @@ const HTML_ACTIVE_CONTENT_ELEMENT: &str =
 /// * a CR/LF command separator (`%0a`) followed by a Windows tool name, by a
 ///   Unix tool name in the lower case a Unix shell requires, or by a short
 ///   command word (`cat`, `id`, `sh`, `nc`, `bash`, `python`, `perl`) in lower
-///   case that then ends the value, chains, redirects, or takes an argument
-///   shaped like a flag, path, variable, or quoted string;
+///   case that then ends the value, chains, redirects, comments out the rest
+///   of the line (`#`), or takes an argument shaped like a flag, path,
+///   variable, or quoted string;
 /// * `;`, `|`, `&&`, or `||` followed by a reconnaissance tool that never
 ///   names a list item (`whoami`, `ifconfig`, `certutil`, `mkfifo`, …);
 /// * `&&` or `||` — which lists do not use — followed by a tool that can also
-///   be a list item (`uname`, `busybox`, `powershell`, `pwsh`, `socat`, …),
-///   or `;` / `|` followed by one of those tools only when it takes a flag,
-///   path, or quoted argument, redirects, or chains again;
+///   be a list item (`uname`, `busybox`, `powershell`, `pwsh`, `socat`, `id`,
+///   `ls`, `sleep`, `ping`, …), or `;` / `|` followed by one of those tools
+///   only when it takes a flag, path, or quoted argument, redirects, or
+///   chains again;
+/// * `;` or `|` followed by an argument shape a list never has: `busybox`
+///   running a network or shell applet (`nc`, `wget`, `sh`, `ash`,
+///   `telnet`), `socat` with a `tcp` / `udp` / `exec` / `-` address, or
+///   `ncat` / `netcat` / `nc` given a host and a port;
 ///
 /// plus the `$IFS` field-separator trick used to smuggle spaces. A bare
 /// `x;uname` at the end of a value is indistinguishable from the list
 /// `fields=id;uname` and is deliberately not matched.
-const CMD_EXTENDED_EXECUTION: &str = r#"(?i)(?:(?:`|\$\()\s*(?:cat|tac|head|tail|ls|id|echo|printf|rm|ping|sleep|env|pwd|uname|whoami|curl|wget|nc|ncat|bash|sh|zsh|python[23]?|perl|ruby|php|base64|xxd|nslookup|dig|ifconfig)\b|[\r\n]\s*(?:(?:whoami|ipconfig|certutil|powershell|pwsh|systeminfo)\b|(?-i:uname|ifconfig|nslookup|wget|curl|ncat)\b|(?-i:cat|id|sh|nc|bash|python[23]?|perl)(?:\s*$|\s*[;|&<>`]|\s+[-/.~$'"]))|(?:[;|]|&&)\s*(?:whoami|ifconfig|ipconfig|nslookup|certutil|bitsadmin|systeminfo|tasklist|mkfifo)\b|(?:&&|\|\|)\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh)\b|[;|]\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh)(?:\s+[-/$'"]|\s*[<>`]|\s*&&|\s*\|\|)|\$\{?IFS\}?)"#;
+const CMD_EXTENDED_EXECUTION: &str = r#"(?i)(?:(?:`|\$\()\s*(?:cat|tac|head|tail|ls|id|echo|printf|rm|ping|sleep|env|pwd|uname|whoami|curl|wget|nc|ncat|bash|sh|zsh|python[23]?|perl|ruby|php|base64|xxd|nslookup|dig|ifconfig)\b|[\r\n]\s*(?:(?:whoami|ipconfig|certutil|powershell|pwsh|systeminfo)\b|(?-i:uname|ifconfig|nslookup|wget|curl|ncat)\b|(?-i:cat|id|sh|nc|bash|python[23]?|perl)(?:\s*$|\s*[;|&<>`#]|\s+[-/.~$'"]))|(?:[;|]|&&)\s*(?:whoami|ifconfig|ipconfig|nslookup|certutil|bitsadmin|systeminfo|tasklist|mkfifo)\b|(?:&&|\|\|)\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh|id|ls|sleep|ping)\b|[;|]\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh)(?:\s+[-/$'"]|\s*[<>`]|\s*&&|\s*\|\|)|[;|]\s*(?:busybox\s+(?:nc|wget|sh|ash|telnet)\b|socat\s+(?:tcp|udp|exec|-)|(?:ncat|netcat|nc)\s+\S+\s+\d{1,5}\b)|\$\{?IFS\}?)"#;
 
 /// Explicit shell / interpreter invocation, claimed by `FE-CMD-005-Q`
 /// (level 1) and `FE-CMD-005-B` (level 2, because deployment and CI APIs
