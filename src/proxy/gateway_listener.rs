@@ -2500,13 +2500,15 @@ mod tests {
             }
         };
         // Release the port from a plain OS thread, well inside the pass-wide
-        // rebind budget but after its first attempt has collided with it.
+        // rebind budget but after its first attempt has collided with it. Raise
+        // the flag immediately before the socket is released so reconcile never
+        // observes a rebind in the gap between the two operations.
         let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let releaser_released = released.clone();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(350));
-            drop(occupied);
             releaser_released.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(occupied);
         });
 
         let failures = manager.reconcile().await;
