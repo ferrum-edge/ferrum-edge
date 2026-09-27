@@ -148,7 +148,9 @@ sustained.
   recovery counters once each, and the active gauge returns to `0` once the
   half is live again. On the `quic` half only the HTTP/3 listener is reaped and
   retried, so HTTP/1.1 and HTTP/2 keep serving that port and its routes stay
-  admitted.
+  admitted. The QUIC rebind waits up to 2 seconds for the dead endpoint to
+  release its UDP socket, so that brief release is not reported as
+  `bind_failed`.
 - `class_flip_deferred` means a frontend TLS-class change is waiting for the
   previous accept sockets to close; `retirement_pending` is the same fail-closed
   wait for another bind-identity change.

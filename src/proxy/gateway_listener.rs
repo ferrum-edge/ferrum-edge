@@ -128,7 +128,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, oneshot, watch};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::types::{DispatchKind, GatewayConfig};
 use crate::proxy::ProxyState;
@@ -467,6 +467,27 @@ impl GatewayListenerBindFailure {
             self.category,
             self.error.clone(),
         )
+    }
+}
+
+/// A QUIC start attempt that did not leave a live HTTP/3 task.
+struct QuicStartFailure {
+    failure: GatewayListenerBindFailure,
+    /// The UDP bind itself failed with `EADDRINUSE`. Only this error is worth
+    /// retrying while a retired QUIC endpoint releases the same port.
+    addr_in_use: bool,
+}
+
+impl QuicStartFailure {
+    /// Hand back the failure once it is final, logging a bind failure then —
+    /// never for an attempt that is about to be retried.
+    fn report(self) -> GatewayListenerBindFailure {
+        if self.failure.category == GatewayListenerFailureCategory::BindFailed {
+            let port = self.failure.port;
+            let error = &self.failure.error;
+            error!(port, "Gateway API HTTP/3 listener bind failed: {error}");
+        }
+        self.failure
     }
 }
 
@@ -849,6 +870,10 @@ impl GatewayListenerManager {
         let mut live = self.listeners.lock().await;
         let mut listener_task_ended_tcp: BTreeSet<u16> = BTreeSet::new();
         let mut listener_task_ended_quic: BTreeSet<u16> = BTreeSet::new();
+        // Ports whose previous QUIC task this pass retired. Its UDP socket can
+        // outlive the joined task briefly, so their QUIC rebind below waits for
+        // the release instead of reporting that transient `EADDRINUSE`.
+        let mut quic_retired: BTreeSet<u16> = BTreeSet::new();
 
         // Reap listeners whose TCP accept loop ended after startup. A finished
         // accept loop means the port is no longer served; leaving the entry in
@@ -874,6 +899,9 @@ impl GatewayListenerManager {
         for port in dead_tcp {
             if let Some(listener) = live.remove(&port) {
                 listener.signal_shutdown();
+                if listener.quic.is_some() {
+                    quic_retired.insert(port);
+                }
                 let (error, pending) = Self::describe_ended_listener(listener).await;
                 if !pending.is_empty() {
                     self.draining.lock().await.extend(
@@ -911,6 +939,7 @@ impl GatewayListenerManager {
             // bind/retirement error as the durable active failure instead of
             // claiming a recovery that did not occur.
             listener_task_ended_quic.insert(port);
+            quic_retired.insert(port);
             failures.push(GatewayListenerBindFailure::quic(
                 port,
                 GatewayListenerFailureCategory::ListenerTaskEnded,
@@ -959,6 +988,9 @@ impl GatewayListenerManager {
                 retire_reason
             );
             listener.signal_shutdown();
+            if listener.quic.is_some() {
+                quic_retired.insert(port);
+            }
             if replacing {
                 // The replacement binds the same port. Extra accept workers
                 // share one exclusive listen socket, so until every old
@@ -1083,7 +1115,12 @@ impl GatewayListenerManager {
                         ));
                     }
                 } else if let Some(error) = self
-                    .ensure_quic(*port, listener, expected.config_generation)
+                    .ensure_quic_in_pass(
+                        *port,
+                        listener,
+                        expected.config_generation,
+                        quic_retired.contains(port),
+                    )
                     .await
                 {
                     failures.push(error);
@@ -1120,7 +1157,12 @@ impl GatewayListenerManager {
                             ));
                         }
                     } else if let Some(error) = self
-                        .ensure_quic(*port, &mut listener, expected.config_generation)
+                        .ensure_quic_in_pass(
+                            *port,
+                            &mut listener,
+                            expected.config_generation,
+                            quic_retired.contains(port),
+                        )
                         .await
                     {
                         failures.push(error);
@@ -1313,19 +1355,79 @@ impl GatewayListenerManager {
         listener: &mut LiveListener,
         expected_generation: u64,
     ) -> Option<GatewayListenerBindFailure> {
+        self.start_quic(port, listener, expected_generation)
+            .await
+            .map(QuicStartFailure::report)
+    }
+
+    /// [`Self::ensure_quic`] as a reconcile pass runs it. `quic_retired` marks a
+    /// port whose previous QUIC task this same pass retired.
+    ///
+    /// Joining the retired task does not mean its UDP socket is closed: Quinn
+    /// keeps the socket in endpoint state that its separately spawned driver
+    /// task drops only after it observes the last `Endpoint` handle go away. A
+    /// rebind issued straight after the join can lose that race and fail with
+    /// `EADDRINUSE`, which would publish a `BindFailed` for a port whose only
+    /// fault is already recovered and leave HTTP/3 down until the next retry
+    /// tick. Only that error is retried, only within
+    /// [`RETIRED_QUIC_SOCKET_RELEASE_BUDGET`]; a socket still held after it
+    /// (for example by connections the old endpoint is still driving) is
+    /// reported as the bind failure and retried by a later reconcile as before.
+    async fn ensure_quic_in_pass(
+        &self,
+        port: u16,
+        listener: &mut LiveListener,
+        expected_generation: u64,
+        quic_retired: bool,
+    ) -> Option<GatewayListenerBindFailure> {
+        if !quic_retired {
+            return self.ensure_quic(port, listener, expected_generation).await;
+        }
+        let deadline = tokio::time::Instant::now() + RETIRED_QUIC_SOCKET_RELEASE_BUDGET;
+        let mut backoff = RETIRED_QUIC_SOCKET_RELEASE_INITIAL_BACKOFF;
+        loop {
+            let failure = self.start_quic(port, listener, expected_generation).await?;
+            // A newer epoch supersedes this pass; `reconcile` discards its
+            // outcome and reconciles again, so waiting here buys nothing.
+            let stale = self.state.request_epoch.load().config_generation != expected_generation;
+            if !failure.addr_in_use || stale || tokio::time::Instant::now() + backoff > deadline {
+                return Some(failure.report());
+            }
+            let error = &failure.failure.error;
+            debug!(
+                port,
+                "Gateway API HTTP/3 rebind is waiting for the retired QUIC endpoint to release \
+                 its UDP socket: {error}"
+            );
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(RETIRED_QUIC_SOCKET_RELEASE_MAX_BACKOFF);
+        }
+    }
+
+    /// One QUIC start attempt behind [`Self::ensure_quic`] and
+    /// [`Self::ensure_quic_in_pass`].
+    async fn start_quic(
+        &self,
+        port: u16,
+        listener: &mut LiveListener,
+        expected_generation: u64,
+    ) -> Option<QuicStartFailure> {
         let http3 = self.http3.as_ref()?;
         if listener.class != GatewayListenerClass::Tls || listener.quic.is_some() {
             return None;
         }
         let Some(tls_config) = self.tls.quic_initial_config() else {
-            return Some(GatewayListenerBindFailure::quic(
-                port,
-                GatewayListenerFailureCategory::FrontendTlsMissing,
-                format!(
-                    "port {port} has no frontend TLS material for an HTTP/3 listener; HTTP/3 is not \
-                     served on this Gateway listener port"
+            return Some(QuicStartFailure {
+                failure: GatewayListenerBindFailure::quic(
+                    port,
+                    GatewayListenerFailureCategory::FrontendTlsMissing,
+                    format!(
+                        "port {port} has no frontend TLS material for an HTTP/3 listener; HTTP/3 \
+                         is not served on this Gateway listener port"
+                    ),
                 ),
-            ));
+                addr_in_use: false,
+            });
         };
         let addr = SocketAddr::new(listener.bind_addr, port);
         let (started_tx, started_rx) = oneshot::channel();
@@ -1372,17 +1474,26 @@ impl GatewayListenerManager {
                 None
             }
             Err(_) => {
+                let mut addr_in_use = false;
                 let error = match task.await {
-                    Ok(Err(err)) => format!("{err:#}"),
+                    Ok(Err(err)) => {
+                        addr_in_use = err
+                            .chain()
+                            .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                            .any(|io| io.kind() == std::io::ErrorKind::AddrInUse);
+                        format!("{err:#}")
+                    }
                     Ok(Ok(())) => "HTTP/3 listener exited before reporting readiness".to_string(),
                     Err(err) => format!("HTTP/3 listener task panicked: {err}"),
                 };
-                error!(port, "Gateway API HTTP/3 listener bind failed: {error}");
-                Some(GatewayListenerBindFailure::quic(
-                    port,
-                    GatewayListenerFailureCategory::BindFailed,
-                    error,
-                ))
+                Some(QuicStartFailure {
+                    failure: GatewayListenerBindFailure::quic(
+                        port,
+                        GatewayListenerFailureCategory::BindFailed,
+                        error,
+                    ),
+                    addr_in_use,
+                })
             }
         }
     }
@@ -1606,6 +1717,22 @@ const BIND_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// wedged accept loop cannot stall the supervisor, and fail-closed so the two
 /// frontend classes never coexist on one port.
 const CLASS_FLIP_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a QUIC rebind waits for a QUIC task retired earlier in the same
+/// reconcile pass to release its UDP socket. Quinn closes that socket from its
+/// separately spawned endpoint driver, after the retired task has already been
+/// joined, so the release normally lags by a single scheduler turn. Bounded so
+/// a socket still held by the old endpoint's live connections falls back to the
+/// ordinary bind failure and the next reconcile retry.
+const RETIRED_QUIC_SOCKET_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// First pause between QUIC rebind attempts while a retired endpoint releases
+/// its UDP socket. Doubles up to [`RETIRED_QUIC_SOCKET_RELEASE_MAX_BACKOFF`].
+const RETIRED_QUIC_SOCKET_RELEASE_INITIAL_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(5);
+
+const RETIRED_QUIC_SOCKET_RELEASE_MAX_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(100);
 
 #[cfg(test)]
 mod tests {
@@ -2275,29 +2402,16 @@ mod tests {
             Some(1)
         );
 
-        // Clearing the handle lets the existing `ensure_quic` path retry the
-        // port. That retry can lose a race with the aborted endpoint's socket
-        // close, so recovery is asserted across retry passes rather than
-        // pinned to the first one — what matters is that HTTP/3 comes back
-        // without a restart and the status stays healthy.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            manager.reconcile().await;
-            if !status.snapshot().degraded() {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the QUIC half never rebound: {:?}",
-                status.snapshot()
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        // The reaping pass itself rebound HTTP/3 — it waits out the aborted
+        // endpoint's UDP socket release instead of leaving the port to a later
+        // retry — and a further pass keeps the port healthy.
+        let failures = manager.reconcile().await;
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(!status.snapshot().degraded(), "{:?}", status.snapshot());
         assert_eq!(manager.active_http3_ports().await, vec![port]);
         assert_eq!(manager.active_ports().await, vec![port]);
-        // The death is counted exactly once however many retries the rebind
-        // took: a still-failing retry ages its entry instead of re-counting an
-        // onset, so its recovery is counted once too.
+        // The death is counted exactly once: a follow-up pass re-counts
+        // neither its onset nor its recovery.
         assert_eq!(
             status
                 .cumulative()
@@ -2321,6 +2435,129 @@ mod tests {
                 })
                 .map(|series| series.value),
             Some(1)
+        );
+        manager.shutdown_all().await;
+    }
+
+    /// Joining a dead QUIC task does not close its UDP socket: Quinn's endpoint
+    /// driver drops it after the join, from its own task. The same-pass rebind
+    /// must wait out that release rather than publish the transient
+    /// `EADDRINUSE` as an active `BindFailed` and leave HTTP/3 down until a
+    /// later retry. A socket the test holds past the reconcile's first rebind
+    /// attempt stands in for the retired endpoint's lingering socket, so the
+    /// lost race is reproduced instead of left to scheduler timing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_quic_task_rebind_waits_for_the_retired_socket_release() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+        let status = Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
+        let (port, manager) = bind_manager_with_retry(|port| {
+            let mut config = port_scoped_config(port);
+            config
+                .http_tls_listen_ports
+                .insert((crate::config::types::default_namespace(), port));
+            tls_h3_manager(test_state(config)).with_status(status.clone())
+        })
+        .await;
+        assert_eq!(manager.active_http3_ports().await, vec![port]);
+
+        let tcp_id = {
+            let live = manager.listeners.lock().await;
+            let listener = live.get(&port).expect("listener");
+            listener.quic.as_ref().expect("quic task").abort();
+            listener.tcp.id()
+        };
+        while !manager
+            .listeners
+            .lock()
+            .await
+            .get(&port)
+            .expect("listener")
+            .quic_ended()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        let occupied = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match std::net::UdpSocket::bind(("127.0.0.1", port)) {
+                    Ok(socket) => break socket,
+                    Err(_) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the reaped QUIC listener never released {port}"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        };
+        // Release the port from a plain OS thread, well inside the rebind's
+        // release budget but after its first attempt has collided with it.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(occupied);
+        });
+
+        let failures = manager.reconcile().await;
+        releaser.join().expect("releaser thread");
+        assert!(
+            failures.iter().any(|failure| {
+                failure.port == port
+                    && failure.protocol == GatewayListenerProtocolHalf::Quic
+                    && failure.category == GatewayListenerFailureCategory::ListenerTaskEnded
+            }),
+            "raw bind_failures must still report the QUIC death: {failures:?}"
+        );
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure.category != GatewayListenerFailureCategory::BindFailed),
+            "a socket released within the budget must not surface as a bind failure: \
+             {failures:?}"
+        );
+        assert_eq!(manager.active_http3_ports().await, vec![port]);
+        assert_eq!(manager.active_ports().await, vec![port]);
+        {
+            let live = manager.listeners.lock().await;
+            let listener = live.get(&port).expect("listener must not be retired");
+            assert!(!listener.tcp_ended());
+            assert_eq!(listener.tcp.id(), tcp_id);
+        }
+
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.active_failures, 0, "{snapshot:?}");
+        assert!(!snapshot.degraded(), "{snapshot:?}");
+        assert!(snapshot.failures.is_empty(), "{snapshot:?}");
+        assert_eq!(
+            cumulative_series(
+                &status,
+                GatewayListenerProtocolHalf::Quic,
+                GatewayListenerFailureCategory::ListenerTaskEnded,
+                false,
+            ),
+            1
+        );
+        assert_eq!(
+            cumulative_series(
+                &status,
+                GatewayListenerProtocolHalf::Quic,
+                GatewayListenerFailureCategory::ListenerTaskEnded,
+                true,
+            ),
+            1
+        );
+        assert_eq!(
+            cumulative_series(
+                &status,
+                GatewayListenerProtocolHalf::Quic,
+                GatewayListenerFailureCategory::BindFailed,
+                false,
+            ),
+            0,
+            "a transient EADDRINUSE on the rebind must not count a BindFailed onset"
         );
         manager.shutdown_all().await;
     }
