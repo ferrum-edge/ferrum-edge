@@ -1428,7 +1428,11 @@ const DIRECT_UDP_LISTENER_ID: &str = "udp-task-handoff";
 /// tests that drive that proxy's listener task directly.
 fn direct_udp_listener_runtime(port: u16) -> StreamManagerRuntime {
     let config = GatewayConfig {
-        proxies: vec![create_stream_proxy(DIRECT_UDP_LISTENER_ID, BackendScheme::Udp, port)],
+        proxies: vec![create_stream_proxy(
+            DIRECT_UDP_LISTENER_ID,
+            BackendScheme::Udp,
+            port,
+        )],
         ..empty_config()
     };
     create_manager_runtime(Arc::new(ArcSwap::from_pointee(config.clone())), &config)
