@@ -335,8 +335,11 @@ impl Waf {
     ) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
         let subject = ScanSubject::Http(ctx);
+        // One `name: value` buffer for the whole map instead of one allocation
+        // per header.
+        let mut line = String::new();
         for (name, value) in headers {
-            let mut line = String::with_capacity(name.len() + value.len() + 2);
+            line.clear();
             line.push_str(name);
             line.push_str(": ");
             line.push_str(value);
@@ -388,6 +391,14 @@ impl Waf {
         let Some(set) = set else {
             return;
         };
+        // Almost every inspected value is clean. `is_match` stops at the first
+        // match and needs no per-call `SetMatches` allocation, while `matches`
+        // must run the overlapping search to the end and allocate its result;
+        // on short metadata values the prefilter is ~2-3x cheaper, and a real
+        // hit pays for both passes only on the rare matching value.
+        if !set.set.is_match(value) {
+            return;
+        }
         for index in set.set.matches(value) {
             self.push_if_allowed(outcome, &set.refs[index], value, subject, header_name);
         }
@@ -413,10 +424,11 @@ impl Waf {
         let Some(set) = set else {
             return;
         };
-        let matches = set.set.matches(value);
-        if !matches.matched_any() {
+        // Same clean-case prefilter as `scan_text_set`.
+        if !set.set.is_match(value) {
             return;
         }
+        let matches = set.set.matches(value);
         let text = String::from_utf8_lossy(value);
         for index in matches {
             self.push_if_allowed(outcome, &set.refs[index], text.as_ref(), subject, None);

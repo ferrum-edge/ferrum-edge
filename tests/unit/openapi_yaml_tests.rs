@@ -2427,6 +2427,20 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
             .is_err(),
         "schema must reject stream guard typo"
     );
+    for value in ["allow", "fail_closed", "block"] {
+        assert!(
+            validator
+                .validate(&json!({ "on_unlisted_content_type": value }))
+                .is_ok(),
+            "on_unlisted_content_type {value} must be admitted"
+        );
+    }
+    assert!(
+        validator
+            .validate(&json!({ "on_unlisted_content_type": "deny" }))
+            .is_err(),
+        "on_unlisted_content_type is a closed enum"
+    );
 }
 
 #[test]

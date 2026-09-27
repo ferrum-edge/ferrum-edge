@@ -2548,6 +2548,7 @@ fn rendered_waf_enforcement_rejection_keeps_all_fixed_remedies() {
             "enable anomaly scoring over an inspected HTTP rule",
             "enable a stream enforcement rule",
             "set `on_body_too_large` to `block` on an inspected body surface",
+            "set `on_unlisted_content_type` to `block` with request-body inspection on",
         ] {
             assert!(rendered.contains(expected), "{rendered}");
         }
@@ -4517,13 +4518,10 @@ async fn ssrf_query_benign_urls_and_unclaimed_forms_are_clean() {
     let _ = plugin.authorize(&mut path_version).await;
     assert!(!monitored(&path_version, "FE-SSRF-001-Q"));
 
-    // Existing SSRF rules claim dotted IPv4 + metadata.google.internal only.
-    let ipv6 = authorize_query(
-        &plugin,
-        "/w/rec",
-        "u=http://[fd00:ec2::254]/latest/meta-data/",
-    )
-    .await;
+    // Level-1 SSRF rules claim dotted IPv4 and named metadata endpoints only;
+    // alternate loopback spellings (`[::1]`, decimal, hex) are FE-SSRF-003 at
+    // paranoia level 2.
+    let ipv6 = authorize_query(&plugin, "/w/rec", "u=http://[::1]/latest/meta-data/").await;
     assert!(!monitored(&ipv6, "FE-SSRF-001-Q"));
     let decimal = authorize_query(&plugin, "/w/rec", "u=http://2130706433/").await;
     assert!(!monitored(&decimal, "FE-SSRF-001-Q"));
