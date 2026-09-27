@@ -31,7 +31,10 @@ fn an_armed_hold_marks_its_port_until_released_and_for_the_recent_window_after()
     let hold = ledger.hold(4433, UdpPortOwner::StreamDatagram);
     hold.arm();
     assert!(ledger.note_bind_collision(4433));
-    assert!(!ledger.note_bind_collision(4434), "other ports are unaffected");
+    assert!(
+        !ledger.note_bind_collision(4434),
+        "other ports are unaffected"
+    );
 
     // The acquiring side can fail its bind just before the release and ask
     // the ledger just after it, so the port stays eligible for the bounded

@@ -1463,7 +1463,11 @@ async fn a_release_during_a_config_reconcile_still_wakes_the_supervisor() {
     assert!(manager.reconcile().await.is_empty());
 
     config_arc.store(Arc::new(GatewayConfig {
-        proxies: vec![create_stream_proxy("udp-late-release", BackendScheme::Udp, port)],
+        proxies: vec![create_stream_proxy(
+            "udp-late-release",
+            BackendScheme::Udp,
+            port,
+        )],
         ..empty_config()
     }));
     let ledger = Arc::clone(manager.udp_port_handoff());
