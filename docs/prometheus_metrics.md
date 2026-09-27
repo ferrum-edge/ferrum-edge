@@ -148,9 +148,13 @@ sustained.
   recovery counters once each, and the active gauge returns to `0` once the
   half is live again. On the `quic` half only the HTTP/3 listener is reaped and
   retried, so HTTP/1.1 and HTTP/2 keep serving that port and its routes stay
-  admitted. The QUIC rebind waits up to 2 seconds per reconcile pass for the
-  dead endpoint to release its UDP socket, so that brief release is not
-  reported as `bind_failed`.
+  admitted. The QUIC rebind retries `Address already in use` while the dead
+  endpoint, or a UDP/DTLS stream proxy handing the port back, releases its UDP
+  socket, so that brief release is not reported as `bind_failed`. Each pass
+  has two independent 2-second budgets for this: one for sockets Ferrum's UDP
+  port ledger shows held or just closed, started by the first such collision,
+  and one from the start of the pass for retired QUIC halves the ledger has no
+  entry for. One pass can therefore wait up to about 4 seconds in total.
 - `class_flip_deferred` means a frontend TLS-class change is waiting for the
   previous accept sockets to close; `retirement_pending` is the same fail-closed
   wait for another bind-identity change.

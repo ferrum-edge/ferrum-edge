@@ -58,6 +58,7 @@ use crate::proxy::headers::{
     sanitize_backend_request_trailers, sanitize_client_response_headers_for_wire,
     strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
 };
+use crate::proxy::udp_port_handoff::UdpPortHold;
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
     log_pre_backend_rejected_request, log_rejected_request, log_rejected_request_with_path,
@@ -380,6 +381,12 @@ pub struct Http3ListenerOptions {
     /// cert won't bind to QUIC) keeps the previous server config and emits a
     /// `warn!`.
     pub frontend_tls_reload: Option<Http3FrontendTlsReload>,
+    /// The Gateway listener's claim on this port in the in-process UDP port
+    /// ledger (issue #5843). Armed as soon as the UDP bind succeeds and then
+    /// owned by the socket Quinn shares with its endpoint driver and every
+    /// connection, so it is released when that socket closes rather than when
+    /// the listener returns. `None` for listeners outside the ledger.
+    pub udp_port_hold: Option<UdpPortHold>,
 }
 
 /// Frontend TLS live-reload inputs for the H3 listener. This may be populated
@@ -441,6 +448,7 @@ pub async fn start_http3_listener(
             client_crls,
             started_tx: None,
             frontend_tls_reload: None,
+            udp_port_hold: None,
         },
     )
     .await
@@ -947,6 +955,130 @@ where
     }
 }
 
+/// Bind the UDP socket for an HTTP/3 listener and build its Quinn endpoint.
+///
+/// Quinn's `Endpoint::server` convenience constructor is gated on its `ring`
+/// or non-FIPS `aws-lc-rs` feature. The FIPS provider uses the distinct
+/// `aws-lc-rs-fips` feature, so the same endpoint is constructed explicitly
+/// instead of making listener availability depend on a non-validated provider
+/// feature being compiled too.
+///
+/// A Gateway listener's `udp_port_hold` (issue #5843) is armed as soon as the
+/// bind succeeds and handed to Quinn inside the socket itself, see
+/// [`PortHeldUdpSocket`].
+fn bind_h3_endpoint(
+    addr: SocketAddr,
+    server_config: Option<quinn::ServerConfig>,
+    udp_port_hold: Option<UdpPortHold>,
+) -> Result<quinn::Endpoint, anyhow::Error> {
+    let socket = std::net::UdpSocket::bind(addr)?;
+    if let Some(hold) = &udp_port_hold {
+        hold.arm();
+    }
+    socket.set_nonblocking(true)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
+    let config = quinn::EndpointConfig::default();
+    let Some(port_hold) = udp_port_hold else {
+        let endpoint = quinn::Endpoint::new(config, server_config, socket, runtime)?;
+        return Ok(endpoint);
+    };
+    let socket: Arc<dyn quinn::AsyncUdpSocket> = Arc::new(PortHeldUdpSocket {
+        inner: runtime.wrap_udp_socket(socket)?,
+        port_hold,
+    });
+    let endpoint =
+        quinn::Endpoint::new_with_abstract_socket(config, server_config, socket, runtime)?;
+    Ok(endpoint)
+}
+
+/// Quinn's UDP socket for a Gateway listener's HTTP/3 half, carrying that
+/// listener's claim on the port in the in-process UDP port ledger (issue
+/// #5843).
+///
+/// Quinn shares the socket between the endpoint state, which its separately
+/// spawned driver drops only after it observes the last `Endpoint` handle go
+/// away, and every live connection. The listener task returning therefore says
+/// nothing about when the socket closes. Owning the claim here releases it
+/// only when Quinn drops its last reference and the socket closes, so the
+/// stream listener manager treats a collision on the port as a pending handoff
+/// for exactly as long as it can still collide.
+///
+/// Every poller handed out keeps this wrapper alive, so no clone of the inner
+/// socket outlives it. Each method delegates unchanged.
+struct PortHeldUdpSocket {
+    // Declared first: fields drop in order, so the socket closes before the
+    // claim is released.
+    inner: Arc<dyn quinn::AsyncUdpSocket>,
+    port_hold: UdpPortHold,
+}
+
+impl std::fmt::Debug for PortHeldUdpSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortHeldUdpSocket")
+            .field("inner", &self.inner)
+            .field("port_hold", &self.port_hold)
+            .finish()
+    }
+}
+
+impl quinn::AsyncUdpSocket for PortHeldUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+        let inner = Arc::clone(&self.inner).create_io_poller();
+        Box::pin(PortHeldUdpPoller {
+            inner,
+            _socket: self,
+        })
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
+        self.inner.try_send(transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
+
+/// Write-readiness poller for [`PortHeldUdpSocket`]. The inner poller holds a
+/// clone of the inner socket, so it keeps the wrapper (and with it the claim)
+/// alive for as long as that clone exists.
+#[derive(Debug)]
+struct PortHeldUdpPoller {
+    inner: std::pin::Pin<Box<dyn quinn::UdpPoller>>,
+    _socket: Arc<PortHeldUdpSocket>,
+}
+
+impl quinn::UdpPoller for PortHeldUdpPoller {
+    fn poll_writable(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_writable(cx)
+    }
+}
+
 /// Start the HTTP/3 listener and optionally emit a startup signal after bind.
 pub async fn start_http3_listener_with_signal(
     addr: SocketAddr,
@@ -962,6 +1094,7 @@ pub async fn start_http3_listener_with_signal(
         client_crls,
         started_tx,
         frontend_tls_reload,
+        udp_port_hold,
     } = options;
 
     // DP mode binds the H3 socket while it waits for CP to deliver frontend TLS
@@ -1007,12 +1140,7 @@ pub async fn start_http3_listener_with_signal(
     };
 
     let (endpoint, adopted_quic) = if start_disabled {
-        let socket = std::net::UdpSocket::bind(addr)?;
-        socket.set_nonblocking(true)?;
-        let runtime = quinn::default_runtime()
-            .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
-        let endpoint =
-            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
+        let endpoint = bind_h3_endpoint(addr, None, udp_port_hold)?;
         info!("HTTP/3 listener started disabled until frontend TLS material is available");
         (
             endpoint,
@@ -1032,26 +1160,17 @@ pub async fn start_http3_listener_with_signal(
             client_trust_reload_active,
             &h3_config,
         )?;
-        // Quinn's `Endpoint::server` convenience constructor is gated on its
-        // `ring` or non-FIPS `aws-lc-rs` feature. The FIPS provider uses the
-        // distinct `aws-lc-rs-fips` feature, so construct the same endpoint
-        // explicitly instead of making listener availability depend on a
-        // non-validated provider feature being compiled too.
-        let socket = std::net::UdpSocket::bind(addr)?;
-        socket.set_nonblocking(true)?;
-        let runtime = quinn::default_runtime()
-            .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
-        // Fallible bind/build is done. When this scope will be armed, bind the
-        // endpoint without a serving config, then expose `set_server_config`
-        // inside the rustls transaction so verifier, served config, and
-        // generation cannot interleave with a concurrent reload. Binding with
-        // `None` refuses handshakes until that transaction runs — fail-closed,
-        // not a certificate-less serving config.
+        // When this scope will be armed, bind the endpoint without a serving
+        // config, then expose `set_server_config` inside the rustls
+        // transaction so verifier, served config, and generation cannot
+        // interleave with a concurrent reload. Binding with `None` refuses
+        // handshakes until that transaction runs — fail-closed, not a
+        // certificate-less serving config.
         let arm_client_trust =
             client_trust_reload_active && startup_client_trust.verifier.is_some();
+        let bind_server_config = (!arm_client_trust).then(|| server_config.clone());
+        let endpoint = bind_h3_endpoint(addr, bind_server_config, udp_port_hold)?;
         if arm_client_trust {
-            let endpoint =
-                quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
             let adopted_quic = Arc::new(arc_swap::ArcSwap::from_pointee(
                 None::<Arc<quinn::ServerConfig>>,
             ));
@@ -1069,15 +1188,8 @@ pub async fn start_http3_listener_with_signal(
             }
             (endpoint, adopted_quic)
         } else {
-            let adopted_quic = Arc::new(arc_swap::ArcSwap::from_pointee(Some(Arc::new(
-                server_config.clone(),
-            ))));
-            let endpoint = quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
-                Some(server_config),
-                socket,
-                runtime,
-            )?;
+            let server_config = Arc::new(server_config);
+            let adopted_quic = Arc::new(arc_swap::ArcSwap::from_pointee(Some(server_config)));
             (endpoint, adopted_quic)
         }
     };

@@ -634,6 +634,7 @@ async fn http3_listener_shutdown_with_no_connections_returns_promptly() {
                 client_crls: Arc::new(Vec::new()),
                 started_tx: None,
                 frontend_tls_reload: None,
+                udp_port_hold: None,
             },
         )
         .await;
@@ -695,6 +696,7 @@ async fn http3_listener_shutdown_with_zero_drain_returns_immediately() {
                 client_crls: Arc::new(Vec::new()),
                 started_tx: None,
                 frontend_tls_reload: None,
+                udp_port_hold: None,
             },
         )
         .await;

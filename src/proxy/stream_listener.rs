@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::backend_conn_limit::{BackendConnectionLimiter, SharedBackendConnectionLimiter};
 use crate::circuit_breaker::CircuitBreakerCache;
@@ -25,6 +25,9 @@ use crate::tls::source::{CertSource, MaterialKind, load_material};
 
 use super::PerIpStreamAdmission;
 use super::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics};
+use super::udp_port_handoff::{
+    ReleasedUdpPorts, UDP_PORT_HANDOFF_BUDGET, UdpPortHandoff, UdpPortHandoffBackoff, UdpPortOwner,
+};
 use super::udp_proxy::{UdpListenerConfig, UdpProxyMetrics};
 
 /// Live slot for a per-listener `DtlsServer`. The inner `Option<Arc<...>>` is
@@ -1106,6 +1109,26 @@ enum StreamBackendMetricEntry {
     Udp(Arc<UdpProxyMetrics>),
 }
 
+/// What woke the stream listener supervisor.
+enum SupervisorWake {
+    /// The slow retry tick.
+    Tick,
+    /// Gateway QUIC halves released these UDP ports (issue #5843).
+    Released(ReleasedUdpPorts),
+    /// A reconcile the supervisor did not run published a bind failure on a
+    /// port released while it ran; see `StreamListenerManager::reconcile_pass`.
+    Rescan,
+}
+
+/// Who runs a [`StreamListenerManager`] reconcile pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReconcileCaller {
+    /// The recovery supervisor, which follows Gateway QUIC releases itself.
+    Supervisor,
+    /// A config update, startup, or any other caller.
+    Other,
+}
+
 /// Manages the set of active TCP/UDP stream listeners.
 ///
 /// All state is behind a tokio `Mutex` to serialize reconciliation calls.
@@ -1382,6 +1405,19 @@ pub struct StreamListenerManager {
     /// maps and before the first `reconcile()`. Unset (the standalone/test
     /// path) means both dimensions are disabled.
     per_ip_stream_admission: std::sync::OnceLock<(PerIpStreamAdmission, PerIpStreamAdmission)>,
+    /// In-process ledger of UDP ports held by this manager's UDP/DTLS listeners
+    /// and by the Gateway listener manager's QUIC halves (issue #5843). Owned
+    /// here because `ProxyState` builds this manager synchronously and the
+    /// Gateway manager reaches it through `ProxyState`, so both sides of a UDP
+    /// port handoff consult the same instance.
+    udp_port_handoff: Arc<UdpPortHandoff>,
+    /// Wakes the supervisor to reconcile again when a pass it did not run
+    /// publishes a bind failure on a port a Gateway QUIC half released while
+    /// that pass was running (issue #5843). The supervisor judges each release
+    /// against the failures published at that moment, so without this a
+    /// release landing between such a pass's probe and its publication would
+    /// leave the port to the 30-second tick.
+    udp_release_rescan: Arc<tokio::sync::Notify>,
 }
 
 impl StreamListenerManager {
@@ -1633,7 +1669,15 @@ impl StreamListenerManager {
             backend_conn_limit: std::sync::OnceLock::new(),
             per_ip_stream_admission: std::sync::OnceLock::new(),
             stream_sni_plaintext_fallback: AtomicBool::new(false),
+            udp_port_handoff: UdpPortHandoff::new(),
+            udp_release_rescan: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// The UDP port ledger shared with the Gateway listener manager's QUIC
+    /// halves; see [`crate::proxy::udp_port_handoff`].
+    pub fn udp_port_handoff(&self) -> &Arc<UdpPortHandoff> {
+        &self.udp_port_handoff
     }
 
     /// Publish `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK`.
@@ -2320,25 +2364,69 @@ impl StreamListenerManager {
         if self.supervisor_started.swap(true, Ordering::AcqRel) {
             return;
         }
+        // A Gateway QUIC half closing its UDP socket is the other side of a
+        // port handoff (issue #5843). A UDP/DTLS bind that ran out of its
+        // in-pass budget waiting for that socket is retried when that port is
+        // released instead of on the next tick. Only the QUIC side's releases
+        // are watched, so this manager's own listeners can never wake it.
+        let mut quic_releases = self
+            .udp_port_handoff
+            .subscribe_releases(UdpPortOwner::GatewayQuic);
+        let release_rescan = Arc::clone(&self.udp_release_rescan);
         tokio::spawn(async move {
             let period = Duration::from_secs(30);
             let mut retry = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut quic_releases_open = true;
             loop {
-                retry.tick().await;
+                let wake = tokio::select! {
+                    _ = retry.tick() => SupervisorWake::Tick,
+                    released = quic_releases.recv(), if quic_releases_open => {
+                        let Some(released) = released else {
+                            // The ledger is gone; keep the tick alone.
+                            quic_releases_open = false;
+                            continue;
+                        };
+                        SupervisorWake::Released(released)
+                    }
+                    // A pass this task did not run found one of its new bind
+                    // failures already released; it checked, so just rerun.
+                    _ = release_rescan.notified() => SupervisorWake::Rescan,
+                };
                 let Some(manager) = manager.upgrade() else {
                     break;
                 };
                 if manager.is_stopping() {
                     break;
                 }
-                if manager.reconciled.load(Ordering::Acquire)
-                    && (!manager.is_ready() || manager.has_degraded_listeners())
-                {
-                    manager.reconcile().await;
+                if !manager.reconciled.load(Ordering::Acquire) {
+                    continue;
+                }
+                let due = match &wake {
+                    SupervisorWake::Tick => !manager.is_ready() || manager.has_degraded_listeners(),
+                    SupervisorWake::Released(released) => {
+                        manager.released_udp_ports_unblock_a_bind(released)
+                    }
+                    SupervisorWake::Rescan => true,
+                };
+                if due {
+                    manager.reconcile_pass(ReconcileCaller::Supervisor).await;
                 }
             }
         });
+    }
+
+    /// Whether a Gateway QUIC half's release freed a port one of this
+    /// manager's UDP/DTLS listeners failed to bind (issue #5843). The
+    /// supervisor reconciles on such a release only; releases of other ports
+    /// leave the slow retry tick in charge.
+    pub fn released_udp_ports_unblock_a_bind(&self, released: &ReleasedUdpPorts) -> bool {
+        let failures = self.bind_failures.load();
+        let failed_ports = failures
+            .iter()
+            .filter(|failure| matches!(failure.kind, StreamListenerDegradation::BindFailed))
+            .map(|failure| failure.listen_port);
+        released.includes_any(failed_ports)
     }
 
     fn is_stopping(&self) -> bool {
@@ -2393,10 +2481,25 @@ impl StreamListenerManager {
     /// that failed to start due to port binding errors. An empty vec means all
     /// listeners started successfully.
     pub async fn reconcile(&self) -> Vec<(String, u16, String)> {
+        self.reconcile_pass(ReconcileCaller::Other).await
+    }
+
+    /// [`Self::reconcile`], told whether the supervisor runs it. A Gateway
+    /// QUIC release that lands during a pass the supervisor runs reaches the
+    /// supervisor afterwards and is judged against this pass's failures; one
+    /// that lands during any other pass may already have been judged against
+    /// the older failures, so that pass checks it itself when it publishes
+    /// (issue #5843).
+    async fn reconcile_pass(&self, caller: ReconcileCaller) -> Vec<(String, u16, String)> {
         let _reconcile_guard = self.reconcile_serial.lock().await;
         if self.is_stopping() {
             return Vec::new();
         }
+        // Gateway QUIC releases that land while this pass runs; see
+        // `reconcile_pass` and the check where the failures are published.
+        let quic_release_mark = self
+            .udp_port_handoff
+            .release_mark(UdpPortOwner::GatewayQuic);
         // Every configured stream listener that is not serving after this
         // reconcile — hard bind failures AND deferred/degraded skips — is
         // accumulated here and published to the `/overload` snapshot. The
@@ -3066,6 +3169,13 @@ impl StreamListenerManager {
 
         // Start listeners for new or restarted entries
         let mut newly_started_nw_udp: Vec<String> = Vec::new();
+        // Pass-wide budget for UDP/DTLS binds that collide with a socket
+        // another in-process datagram listener is handing over (issue #5843).
+        // Started by the first such collision, so waits for unrelated
+        // retirements above do not consume it, and shared by every later one,
+        // so the listeners queued behind them are delayed by at most
+        // `UDP_PORT_HANDOFF_BUDGET` in total.
+        let mut udp_handoff_deadline: Option<tokio::time::Instant> = None;
         for (key, desired_listener) in &effective_desired {
             if self.listeners.lock().await.contains_key(key) {
                 continue;
@@ -3192,7 +3302,8 @@ impl StreamListenerManager {
             let bind_addr = *bind_addr;
             let probe_addr = std::net::SocketAddr::new(bind_addr, port_val);
             let probe_result = if scheme.is_udp() {
-                tokio::net::UdpSocket::bind(probe_addr).await.map(drop)
+                self.probe_udp_port(probe_addr, &mut udp_handoff_deadline)
+                    .await
             } else {
                 tokio::net::TcpListener::bind(probe_addr).await.map(drop)
             };
@@ -3444,8 +3555,19 @@ impl StreamListenerManager {
                 let key_for_exit = key.clone();
                 let generation_for_exit = generation;
                 let owner_for_exit = node_waypoint_udp_owner;
+                // Claim the port in the in-process UDP ledger for exactly as
+                // long as the listener's socket stays open, so a Gateway QUIC
+                // bind that collides with it while it is being retired waits
+                // for the release (issue #5843). The listener arms the claim
+                // right after its bind succeeds and hands it to the socket its
+                // session tasks share, so a failed bind never marks the port
+                // as recently released and the claim outlives this task while
+                // any session still holds the socket.
+                let udp_port_hold = self
+                    .udp_port_handoff
+                    .hold(port_val, UdpPortOwner::StreamDatagram);
                 let join_handle = tokio::spawn(async move {
-                    let result = super::udp_proxy::start_udp_listener(UdpListenerConfig {
+                    let listener_config = UdpListenerConfig {
                         port: port_val,
                         bind_addr,
                         proxy_id: proxy_id_owned.clone(),
@@ -3488,7 +3610,11 @@ impl StreamListenerManager {
                         node_waypoint_udp_owner,
                         node_waypoint_udp_destinations,
                         datagram_client_address,
-                    })
+                    };
+                    let result = super::udp_proxy::start_udp_listener_holding_port(
+                        listener_config,
+                        Some(udp_port_hold),
+                    )
                     .await;
                     started_for_exit.store(false, Ordering::Release);
                     if let Err(e) = result {
@@ -3878,8 +4004,21 @@ impl StreamListenerManager {
         while let Ok(failure) = async_failure_rx.try_recv() {
             append_bind_failure(&self.bind_failures, failure);
         }
-
         self.reconciled.store(true, Ordering::Release);
+
+        // A Gateway QUIC half may have closed its socket on a port this pass
+        // just failed to bind after the probe gave up but before the store
+        // above. The supervisor has then already consumed that release against
+        // the older failures and skipped it, so wake it to reconcile again
+        // rather than leave the port to the 30-second tick. The supervisor's
+        // own passes need no wakeup: it sees those releases once it returns.
+        if caller == ReconcileCaller::Other {
+            let released = self.udp_port_handoff.released_since(quic_release_mark);
+            if self.released_udp_ports_unblock_a_bind(&released) {
+                self.udp_release_rescan.notify_one();
+            }
+        }
+
         self.spawn_supervisor();
         bind_failures
     }
@@ -4110,6 +4249,50 @@ impl StreamListenerManager {
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// Pre-bind probe for a UDP/DTLS listener port that rides out an
+    /// in-process port handoff (issue #5843).
+    ///
+    /// Only `EADDRINUSE` on a port [`UdpPortHandoff::note_bind_collision`]
+    /// classifies as a handoff is retried: the Gateway's QUIC half that this
+    /// generation drains from the port (its manager reconciles the same
+    /// publication concurrently and Quinn drops the socket after the listener
+    /// task is joined), or a retired UDP/DTLS listener whose session tasks
+    /// still hold the socket. Attempts back off from 5 ms to 100 ms until
+    /// `deadline`, which the first retry of the pass sets to
+    /// [`UDP_PORT_HANDOFF_BUDGET`] from now and every later retry shares. Any
+    /// other error, a port nothing in-process holds, and a socket still held at
+    /// the deadline are returned unchanged and reported as the ordinary bind
+    /// failure.
+    async fn probe_udp_port(
+        &self,
+        addr: std::net::SocketAddr,
+        deadline: &mut Option<tokio::time::Instant>,
+    ) -> std::io::Result<()> {
+        let mut backoff: Option<UdpPortHandoffBackoff> = None;
+        loop {
+            let error = match tokio::net::UdpSocket::bind(addr).await {
+                Ok(_probe) => return Ok(()),
+                Err(error) => error,
+            };
+            if error.kind() != std::io::ErrorKind::AddrInUse
+                || !self.udp_port_handoff.note_bind_collision(addr.port())
+            {
+                return Err(error);
+            }
+            let now = tokio::time::Instant::now();
+            let deadline = *deadline.get_or_insert(now + UDP_PORT_HANDOFF_BUDGET);
+            debug!(
+                port = addr.port(),
+                "Stream listener UDP bind is waiting for another in-process listener to release \
+                 the port: {error}"
+            );
+            let backoff = backoff.get_or_insert_with(|| UdpPortHandoffBackoff::new(deadline));
+            if !backoff.wait().await {
+                return Err(error);
+            }
+        }
     }
 
     /// Resolve the OS bind address for `port` from the reconcile generation's
