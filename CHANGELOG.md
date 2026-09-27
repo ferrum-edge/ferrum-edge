@@ -26,6 +26,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mesh listeners are not covered. Startup fails if the trusted list is empty,
   malformed, or covers a whole address family while a listener enables the
   setting.
+- The built-in WAF rule pack now covers the attack classes an enterprise WAF is
+  expected to recognise out of the box. Level-1 signatures (monitor-only like
+  the rest of the pack) add blind time-delay, catalog-enumeration,
+  error-based/out-of-band, and quoted-string-tautology SQL injection across
+  query and body; cookie-borne SQLi, XSS, and traversal; Shellshock; OGNL /
+  Apache Struts 2 (including the CVE-2017-5638 `Content-Type` vector); PHP and
+  Node.js code injection and PHP stream wrappers; command execution without a
+  classic `;cmd` chain; CRLF response splitting; restricted-file probes on the
+  canonical path (`/.git/`, `/.env`, `/.aws/`, `id_rsa`, `web.config`, …);
+  executable multipart uploads; and unsafe YAML / polymorphic JSON
+  deserialization gadgets. Code-shaped body mirrors, active-content HTML in
+  bodies, backup/dump artifacts, and alternate loopback spellings
+  (`localhost`, `2130706433`, `[::1]`) are paranoia level 2. `FE-XSS-002`
+  now tolerates the tab/LF/CR browsers delete inside a URL and covers
+  `vbscript:`, `FE-DESER-001` matches the hex serialization magic, and
+  `FE-SSRF-001` names the ECS credential endpoint, the AWS IPv6 IMDS, and
+  Alibaba Cloud's metadata address.
 
 ## [0.9.8] - 2026-09-27
 
