@@ -1,0 +1,663 @@
+//! Gateway-owned diagnostic references (issue #5767).
+//!
+//! * A reference is `fd1_` plus 128 CSPRNG bits in lowercase hex, embeds
+//!   nothing, and is minted only for a response that carries a closed-set
+//!   `X-Gateway-Error` token.
+//! * Every stamp strips a forged or leftover copy first, and the backend
+//!   boundary predicate strips a backend copy, so a client never sees a
+//!   reference the gateway did not mint.
+//! * The store is bounded by TTL and entry count, and the lookup is scoped:
+//!   scope and namespace binding are required, and an out-of-namespace
+//!   reference is indistinguishable from an unknown one.
+
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+use ferrum_edge::diagnostic_ref::{
+    DIAGNOSTIC_REF_HEADER, DIAGNOSTIC_REF_LEN, DIAGNOSTIC_REF_PREFIX, DIAGNOSTIC_REF_SCHEMA_VERSION,
+    DiagnosticDetail, DiagnosticProtocol, DiagnosticRefLookup, DiagnosticRefLookupResult,
+    DiagnosticRefMode, DiagnosticRefStore, DiagnosticRefStoreConfig, DiagnosticSlot,
+    authorize_lookup, backend_origin, duration_bucket, is_well_formed_ref, stamp_response_headers,
+};
+use ferrum_edge::grpc::auth::AllowedNamespaces;
+use ferrum_edge::plugins::TransactionSummary;
+use ferrum_edge::proxy::headers::is_backend_response_strip_header;
+use ferrum_edge::retry::{ErrorClass, HTTP_OBSERVABILITY_ERROR_CLASSES};
+
+const NAMESPACE: &str = "ferrum";
+const UNKNOWN_REF: &str = "fd1_00000000000000000000000000000000";
+
+fn store_with(max_entries: usize, ttl: Duration, rate: u32) -> DiagnosticRefStore {
+    let config = DiagnosticRefStoreConfig {
+        ttl,
+        max_entries,
+        lookup_rate_per_second: rate,
+    };
+    DiagnosticRefStore::new(NAMESPACE, config)
+}
+
+fn default_store() -> DiagnosticRefStore {
+    store_with(10_000, Duration::from_secs(900), 10_000)
+}
+
+fn namespaces(names: &[&str]) -> AllowedNamespaces {
+    AllowedNamespaces::claimed(names.iter().map(|name| name.to_string()).collect())
+}
+
+fn gateway_error_headers(token: &str) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("content-type", "application/json".parse().unwrap());
+    headers.insert("x-gateway-error", token.parse().unwrap());
+    headers
+}
+
+fn mint(store: &DiagnosticRefStore, status: u16, token: &'static str) -> String {
+    store
+        .mint(DiagnosticProtocol::Http1, status, token, None)
+        .expect("CSPRNG-backed mint")
+}
+
+fn stamp(
+    store: &DiagnosticRefStore,
+    protocol: DiagnosticProtocol,
+    status: u16,
+    headers: &mut http::HeaderMap,
+) -> Option<String> {
+    stamp_response_headers(store, None, protocol, status, headers)
+}
+
+fn label(outcome: &DiagnosticRefLookup) -> &'static str {
+    match outcome {
+        DiagnosticRefLookup::Found(_) => "found",
+        DiagnosticRefLookup::NotFound => "not_found",
+        DiagnosticRefLookup::MissingScope => "missing_scope",
+        DiagnosticRefLookup::MissingNamespaceBinding => "missing_namespace_binding",
+        DiagnosticRefLookup::RateLimited => "rate_limited",
+    }
+}
+
+fn with_rejection_phase(mut summary: TransactionSummary, phase: &str) -> TransactionSummary {
+    let key = "rejection_phase".to_string();
+    summary.metadata.insert(key, phase.to_string());
+    summary
+}
+
+fn summary(status: u16, class: Option<ErrorClass>) -> TransactionSummary {
+    TransactionSummary {
+        plugin_trigger_decisions: Default::default(),
+        namespace: NAMESPACE.to_string(),
+        timestamp_received: "2026-09-27T00:00:00Z".to_string(),
+        client_ip: "203.0.113.7".to_string(),
+        consumer_username: Some("alice".to_string()),
+        auth_method: None,
+        http_method: "POST".to_string(),
+        request_path: "/orders/secret-path?token=abc".to_string(),
+        proxy_id: Some("orders-api".to_string()),
+        proxy_name: Some("orders".to_string()),
+        backend_target: Some(
+            "https://svc:hunter2@orders.internal:8443/v1/private?api_key=abc#frag".to_string(),
+        ),
+        backend_resolved_ip: Some("10.0.0.9".to_string()),
+        response_status_code: status,
+        latency_total_ms: 42.0,
+        latency_gateway_processing_ms: 1.0,
+        latency_backend_ttfb_ms: 0.0,
+        latency_backend_total_ms: 0.0,
+        latency_plugin_execution_ms: 0.0,
+        latency_plugin_external_io_ms: 0.0,
+        latency_gateway_overhead_ms: 1.0,
+        request_user_agent: Some("curl/8".to_string()),
+        response_streamed: false,
+        client_disconnected: false,
+        error_class: class,
+        body_error_class: None,
+        body_completed: false,
+        bytes_sent: 0,
+        bytes_received: 0,
+        grpc_request_messages: 0,
+        grpc_response_messages: 0,
+        mirror: false,
+        metadata: HashMap::new(),
+        ai_usage_export: None,
+        proxy_lifecycle_generation: None,
+    }
+}
+
+// ── configuration ──────────────────────────────────────────────────────────
+
+#[test]
+fn mode_parses_only_off_and_errors() {
+    assert_eq!(DiagnosticRefMode::parse("off"), Ok(DiagnosticRefMode::Off));
+    assert_eq!(
+        DiagnosticRefMode::parse(" Errors "),
+        Ok(DiagnosticRefMode::Errors)
+    );
+    assert_eq!(DiagnosticRefMode::default(), DiagnosticRefMode::Off);
+    assert!(!DiagnosticRefMode::Off.is_enabled());
+    assert!(DiagnosticRefMode::Errors.is_enabled());
+    for rejected in ["", "on", "all", "true", "error", "errors,all"] {
+        assert!(
+            DiagnosticRefMode::parse(rejected).is_err(),
+            "{rejected:?} must fail closed at startup"
+        );
+    }
+}
+
+#[test]
+fn protocol_follows_the_client_http_version() {
+    let cases = [
+        (http::Version::HTTP_10, DiagnosticProtocol::Http1),
+        (http::Version::HTTP_11, DiagnosticProtocol::Http1),
+        (http::Version::HTTP_2, DiagnosticProtocol::Http2),
+        (http::Version::HTTP_3, DiagnosticProtocol::Http3),
+    ];
+    for (version, expected) in cases {
+        assert_eq!(DiagnosticProtocol::from_http_version(version), expected);
+    }
+}
+
+#[test]
+fn store_bounds_are_clamped_never_unbounded() {
+    let tiny = store_with(0, Duration::ZERO, 0);
+    assert_eq!(tiny.ttl(), Duration::from_secs(1));
+    assert_eq!(tiny.capacity(), 16);
+
+    let huge = store_with(usize::MAX, Duration::from_secs(u64::MAX), u32::MAX);
+    assert_eq!(huge.ttl(), Duration::from_secs(86_400));
+    assert!(huge.capacity() <= 1_000_000);
+
+    let exact = store_with(10_000, Duration::from_secs(900), 10);
+    assert!(exact.capacity() <= 10_000);
+}
+
+// ── reference format ───────────────────────────────────────────────────────
+
+#[test]
+fn references_are_opaque_well_formed_and_unique() {
+    let store = default_store();
+    let mut seen = HashSet::new();
+    for _ in 0..2_000 {
+        let reference = mint(&store, 502, "connection_failure");
+        assert_eq!(reference.len(), DIAGNOSTIC_REF_LEN);
+        assert!(reference.starts_with(DIAGNOSTIC_REF_PREFIX));
+        let hex = &reference[DIAGNOSTIC_REF_PREFIX.len()..];
+        assert_eq!(hex.len(), 32, "128 bits of randomness");
+        let lowercase_hex = hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        assert!(lowercase_hex, "lowercase hex only: {reference}");
+        assert!(!reference.contains("connection_failure"));
+        assert!(!reference.contains(NAMESPACE));
+        assert!(is_well_formed_ref(&reference));
+        assert!(seen.insert(reference), "references must never repeat");
+    }
+}
+
+#[test]
+fn malformed_references_never_resolve() {
+    let store = default_store();
+    let good = mint(&store, 503, "overload");
+    let now = Instant::now();
+    assert!(store.lookup_at(now, &good).is_some());
+
+    let hex = &good[DIAGNOSTIC_REF_PREFIX.len()..];
+    let upper = format!("{DIAGNOSTIC_REF_PREFIX}{}", hex.to_ascii_uppercase());
+    let wrong_prefix = format!("fd2_{hex}");
+    let short = good[..good.len() - 1].to_string();
+    let long = format!("{good}0");
+    let non_hex = format!("{short}g");
+    let multibyte = format!("{}é", &good[..good.len() - 2]);
+    let malformed = [
+        upper.as_str(),
+        wrong_prefix.as_str(),
+        short.as_str(),
+        long.as_str(),
+        non_hex.as_str(),
+        multibyte.as_str(),
+        "",
+        "fd1_",
+        "../../etc/passwd",
+    ];
+    for bad in malformed {
+        assert!(!is_well_formed_ref(bad), "{bad:?}");
+        assert!(store.lookup_at(now, bad).is_none(), "{bad:?}");
+    }
+}
+
+// ── store behaviour ────────────────────────────────────────────────────────
+
+#[test]
+fn lookup_returns_the_versioned_view_and_detail_arrives_later() {
+    let store = default_store();
+    let slot = DiagnosticSlot::shared();
+    let protocol = DiagnosticProtocol::Http3;
+    let reference = store
+        .mint(protocol, 502, "connection_failure", Some(&slot))
+        .unwrap();
+    let now = Instant::now();
+
+    let pending = store.lookup_at(now, &reference).expect("minted reference");
+    assert_eq!(pending.schema_version, DIAGNOSTIC_REF_SCHEMA_VERSION);
+    assert_eq!(pending.reference, reference);
+    assert_eq!(pending.namespace, NAMESPACE);
+    assert_eq!(pending.protocol, DiagnosticProtocol::Http3);
+    assert_eq!(pending.status, 502);
+    assert_eq!(pending.gateway_error, "connection_failure");
+    assert!(!pending.detail_available);
+    assert!(pending.detail.is_none());
+
+    // The terminal transaction log may run after the response head was
+    // stamped (a streamed response); the store reads the shared slot.
+    let dns = summary(502, Some(ErrorClass::DnsLookupError));
+    let recorded = DiagnosticDetail::from_summary(&dns, "pre_wire_failure", None);
+    slot.record_detail(recorded);
+    let resolved = store.lookup_at(now, &reference).unwrap();
+    assert!(resolved.detail_available);
+    let detail = resolved.detail.expect("detail recorded");
+    assert_eq!(detail.error_class, Some("dns_lookup_error"));
+    assert_eq!(detail.backend_dispatch, "pre_wire_failure");
+
+    let view = store.lookup_at(now, &reference).unwrap();
+    let body = serde_json::to_value(view).unwrap();
+    let keys: HashSet<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected = HashSet::from([
+        "schema_version",
+        "ref",
+        "namespace",
+        "created_at",
+        "expires_at",
+        "protocol",
+        "status",
+        "gateway_error",
+        "detail_available",
+        "detail",
+    ]);
+    assert_eq!(keys, expected);
+    assert_eq!(body["protocol"], "http3");
+    assert_eq!(body["schema_version"], "ferrum.diagnostic_ref.v1");
+}
+
+#[test]
+fn first_recorded_detail_wins() {
+    let slot = DiagnosticSlot::shared();
+    let timeout = summary(504, Some(ErrorClass::ReadWriteTimeout));
+    let refused = summary(502, Some(ErrorClass::ConnectionRefused));
+    let first = DiagnosticDetail::from_summary(&timeout, "backend_response", Some("dispatch"));
+    let second = DiagnosticDetail::from_summary(&refused, "pre_wire_failure", None);
+    slot.record_detail(first);
+    slot.record_detail(second);
+    let detail = slot.detail().unwrap();
+    assert_eq!(detail.error_class, Some("read_write_timeout"));
+    assert_eq!(detail.route_timeout_phase, Some("dispatch"));
+}
+
+#[test]
+fn one_request_never_gets_two_references() {
+    let store = default_store();
+    let slot = DiagnosticSlot::shared();
+    let protocol = DiagnosticProtocol::Http3;
+    let first = store.mint(protocol, 502, "backend_error", Some(&slot));
+    let second = store.mint(protocol, 502, "backend_error", Some(&slot));
+    assert!(first.is_some());
+    assert_eq!(first, second);
+    assert_eq!(slot.minted_ref(), first.as_deref());
+    assert_eq!(store.minted_total(), 1);
+    assert_eq!(store.len(), 1);
+}
+
+#[test]
+fn references_expire_after_the_ttl() {
+    let store = store_with(10_000, Duration::from_secs(5), 10_000);
+    let start = Instant::now();
+    let protocol = DiagnosticProtocol::Http1;
+    let reference = store
+        .mint_at(start, protocol, 504, "backend_timeout", None)
+        .unwrap();
+    let before = start + Duration::from_secs(4);
+    let at_ttl = start + Duration::from_secs(5);
+    assert!(store.lookup_at(before, &reference).is_some());
+    assert!(
+        store.lookup_at(at_ttl, &reference).is_none(),
+        "a reference must not resolve once its TTL elapsed"
+    );
+    assert_eq!(store.evicted_expired_total(), 1);
+    assert!(store.is_empty(), "expired entries are purged");
+}
+
+#[test]
+fn overflow_evicts_the_oldest_and_never_exceeds_capacity() {
+    let store = store_with(16, Duration::from_secs(900), 10_000);
+    let start = Instant::now();
+    let protocol = DiagnosticProtocol::Http1;
+    let mut minted = Vec::new();
+    for offset in 0..400u64 {
+        let at = start + Duration::from_millis(offset);
+        let reference = store.mint_at(at, protocol, 502, "backend_error", None);
+        minted.push(reference.unwrap());
+        assert!(store.len() <= store.capacity());
+    }
+    assert_eq!(store.minted_total(), 400);
+    assert_eq!(
+        store.evicted_capacity_total() + store.len() as u64,
+        400,
+        "every minted reference is either retained or counted as evicted"
+    );
+    let now = start + Duration::from_secs(1);
+    let resolvable = minted
+        .iter()
+        .filter(|reference| store.lookup_at(now, reference).is_some())
+        .count();
+    assert_eq!(resolvable, store.len());
+    let newest = minted.last().unwrap();
+    assert!(
+        store.lookup_at(now, newest).is_some(),
+        "the newest reference always survives its own insertion"
+    );
+}
+
+#[test]
+fn lookup_rate_limit_is_a_fixed_one_second_window() {
+    let store = store_with(10_000, Duration::from_secs(900), 3);
+    let start = Instant::now() + Duration::from_secs(1);
+    assert!(store.try_acquire_lookup_at(start));
+    assert!(store.try_acquire_lookup_at(start));
+    assert!(store.try_acquire_lookup_at(start));
+    assert!(!store.try_acquire_lookup_at(start));
+    let same_second = start + Duration::from_millis(10);
+    let next_second = start + Duration::from_secs(1);
+    assert!(!store.try_acquire_lookup_at(same_second));
+    assert!(store.try_acquire_lookup_at(next_second));
+}
+
+// ── response stamping ──────────────────────────────────────────────────────
+
+#[test]
+fn stamp_replaces_a_forged_reference_on_a_gateway_error_response() {
+    let store = default_store();
+    let forged = format!("{DIAGNOSTIC_REF_PREFIX}{}", "0".repeat(32));
+    let mixed_case: http::HeaderName = "X-Ferrum-Diagnostic-Ref".parse().unwrap();
+    let second_forged = "fd1_ffffffffffffffffffffffffffffffff";
+    let mut headers = gateway_error_headers("connection_failure");
+    headers.append(DIAGNOSTIC_REF_HEADER, forged.parse().unwrap());
+    headers.append(mixed_case, second_forged.parse().unwrap());
+
+    let stamped = stamp(&store, DiagnosticProtocol::Http2, 502, &mut headers)
+        .expect("gateway-error response is stamped");
+
+    let values: Vec<_> = headers.get_all(DIAGNOSTIC_REF_HEADER).iter().collect();
+    assert_eq!(values.len(), 1, "exactly one reference reaches the client");
+    assert_eq!(values[0].to_str().unwrap(), stamped);
+    assert_ne!(stamped, forged);
+    assert!(store.lookup_at(Instant::now(), &forged).is_none());
+    let view = store.lookup_at(Instant::now(), &stamped).unwrap();
+    assert_eq!(view.gateway_error, "connection_failure");
+    assert_eq!(view.status, 502);
+    assert_eq!(view.protocol, DiagnosticProtocol::Http2);
+}
+
+#[test]
+fn stamp_strips_a_reference_from_a_response_without_gateway_error() {
+    let store = default_store();
+    let mut headers = http::HeaderMap::new();
+    headers.insert("content-type", "text/plain".parse().unwrap());
+    headers.insert(DIAGNOSTIC_REF_HEADER, UNKNOWN_REF.parse().unwrap());
+    let stamped = stamp(&store, DiagnosticProtocol::Http1, 200, &mut headers);
+    assert!(stamped.is_none());
+    assert!(!headers.contains_key(DIAGNOSTIC_REF_HEADER));
+    assert_eq!(store.minted_total(), 0);
+}
+
+#[test]
+fn stamp_ignores_an_out_of_vocabulary_gateway_error_value() {
+    let store = default_store();
+    let mut headers = gateway_error_headers("dns_lookup_error");
+    let stamped = stamp(&store, DiagnosticProtocol::Http1, 502, &mut headers);
+    assert!(
+        stamped.is_none(),
+        "only the closed eight-token vocabulary is gateway-authored"
+    );
+    assert!(!headers.contains_key(DIAGNOSTIC_REF_HEADER));
+    assert_eq!(store.minted_total(), 0);
+}
+
+#[test]
+fn every_public_token_is_stamped() {
+    let store = default_store();
+    for token in HTTP_OBSERVABILITY_ERROR_CLASSES {
+        let mut headers = gateway_error_headers(token);
+        let stamped = stamp(&store, DiagnosticProtocol::Http1, 503, &mut headers)
+            .unwrap_or_else(|| panic!("{token} must carry a reference"));
+        let view = store.lookup_at(Instant::now(), &stamped).unwrap();
+        assert_eq!(view.gateway_error, *token);
+        let public = headers.get("x-gateway-error").unwrap();
+        assert_eq!(
+            public.to_str().unwrap(),
+            *token,
+            "the public token itself is never rewritten"
+        );
+    }
+}
+
+#[test]
+fn backend_boundary_strips_the_reference_header_in_any_case() {
+    assert!(is_backend_response_strip_header(DIAGNOSTIC_REF_HEADER));
+    assert!(is_backend_response_strip_header("X-Ferrum-Diagnostic-Ref"));
+}
+
+// ── scoped lookup ──────────────────────────────────────────────────────────
+
+#[test]
+fn lookup_requires_scope_then_namespace_binding_before_reading_the_store() {
+    let store = default_store();
+    let reference = mint(&store, 502, "connection_failure");
+    let now = Instant::now();
+    let bound = namespaces(&[NAMESPACE]);
+    let unbound = AllowedNamespaces::empty();
+
+    let no_scope = authorize_lookup(Some(&store), false, &bound, &reference, now);
+    assert_eq!(label(&no_scope), "missing_scope");
+    let no_binding = authorize_lookup(Some(&store), true, &unbound, &reference, now);
+    assert_eq!(label(&no_binding), "missing_namespace_binding");
+    let forbidden = store.lookups_total(DiagnosticRefLookupResult::Forbidden);
+    assert_eq!(forbidden, 2);
+}
+
+#[test]
+fn out_of_namespace_reference_is_indistinguishable_from_unknown() {
+    let store = default_store();
+    let reference = mint(&store, 502, "connection_failure");
+    let now = Instant::now();
+    let staging = namespaces(&["staging"]);
+    let both = namespaces(&["staging", NAMESPACE]);
+
+    let other_tenant = authorize_lookup(Some(&store), true, &staging, &reference, now);
+    let unknown = authorize_lookup(Some(&store), true, &staging, UNKNOWN_REF, now);
+    assert_eq!(label(&other_tenant), "not_found");
+    assert_eq!(label(&unknown), "not_found");
+
+    match authorize_lookup(Some(&store), true, &both, &reference, now) {
+        DiagnosticRefLookup::Found(view) => assert_eq!(view.reference, reference),
+        other => panic!("authorized lookup must resolve, got {other:?}"),
+    }
+    let not_found = store.lookups_total(DiagnosticRefLookupResult::NotFound);
+    let found = store.lookups_total(DiagnosticRefLookupResult::Found);
+    assert_eq!(not_found, 2);
+    assert_eq!(found, 1);
+}
+
+#[test]
+fn lookup_with_the_feature_off_is_not_found() {
+    let bound = namespaces(&[NAMESPACE]);
+    let outcome = authorize_lookup(None, true, &bound, UNKNOWN_REF, Instant::now());
+    assert_eq!(label(&outcome), "not_found");
+}
+
+#[test]
+fn lookup_is_rate_limited_and_counted() {
+    let store = store_with(10_000, Duration::from_secs(900), 1);
+    let reference = mint(&store, 502, "connection_failure");
+    let now = Instant::now() + Duration::from_secs(1);
+    let bound = namespaces(&[NAMESPACE]);
+    let first = authorize_lookup(Some(&store), true, &bound, &reference, now);
+    let second = authorize_lookup(Some(&store), true, &bound, &reference, now);
+    assert_eq!(label(&first), "found");
+    assert_eq!(label(&second), "rate_limited");
+    let limited = store.lookups_total(DiagnosticRefLookupResult::RateLimited);
+    assert_eq!(limited, 1);
+}
+
+// ── detail content ─────────────────────────────────────────────────────────
+
+#[test]
+fn detail_carries_closed_classes_and_no_request_material() {
+    let shed = with_rejection_phase(summary(503, None), "adaptive_concurrency");
+    let detail = DiagnosticDetail::from_summary(&shed, "not_dispatched", None);
+    assert_eq!(detail.rejection_phase, Some("concurrency_limit"));
+    assert_eq!(detail.error_class, None);
+    assert_eq!(detail.proxy_id.as_deref(), Some("orders-api"));
+    assert_eq!(
+        detail.backend_target.as_deref(),
+        Some("https://orders.internal:8443"),
+        "userinfo, path, query, and fragment are removed"
+    );
+    assert_eq!(detail.duration_bucket, "lt_100ms");
+
+    let rendered = serde_json::to_string(&detail).unwrap();
+    let request_material = [
+        "hunter2",
+        "api_key",
+        "secret-path",
+        "token=abc",
+        "203.0.113.7",
+        "10.0.0.9",
+        "alice",
+        "curl/8",
+        "/v1/private",
+    ];
+    for leaked in request_material {
+        assert!(!rendered.contains(leaked), "leaked {leaked}: {rendered}");
+    }
+
+    let hostile = with_rejection_phase(summary(502, None), "attacker-chosen");
+    let hostile_detail = DiagnosticDetail::from_summary(&hostile, "not_dispatched", None);
+    assert_eq!(
+        hostile_detail.rejection_phase, None,
+        "an unknown phase is dropped, never echoed"
+    );
+}
+
+#[test]
+fn backend_origin_keeps_only_scheme_host_and_port() {
+    let kept = [
+        ("http://127.0.0.1:9/api?x=1", "http://127.0.0.1:9"),
+        ("HTTPS://user@[::1]:8443/#x", "https://[::1]:8443"),
+        ("orders.internal:8443", "orders.internal:8443"),
+    ];
+    for (target, origin) in kept {
+        assert_eq!(backend_origin(target).as_deref(), Some(origin), "{target}");
+    }
+    let long_host = format!("http://{}:80/", "a".repeat(400));
+    let dropped = [
+        "",
+        "http://",
+        "unix:///var/run/app.sock",
+        "http://host name:80/",
+        "not a url/with/path",
+        "ht tp://host:80",
+        long_host.as_str(),
+    ];
+    for target in dropped {
+        assert_eq!(backend_origin(target), None, "{target:?}");
+    }
+}
+
+#[test]
+fn duration_buckets_are_closed() {
+    assert_eq!(duration_bucket(-1.0), "unknown");
+    assert_eq!(duration_bucket(f64::NAN), "unknown");
+    assert_eq!(duration_bucket(0.0), "lt_10ms");
+    assert_eq!(duration_bucket(10.0), "lt_100ms");
+    assert_eq!(duration_bucket(999.9), "lt_1s");
+    assert_eq!(duration_bucket(9_999.0), "lt_10s");
+    assert_eq!(duration_bucket(10_000.0), "ge_10s");
+}
+
+// ── metrics ────────────────────────────────────────────────────────────────
+
+#[test]
+fn prometheus_exposition_names_every_family_with_bounded_labels() {
+    let store = store_with(16, Duration::from_secs(900), 10);
+    let _ = mint(&store, 502, "backend_error");
+    store.record_lookup(DiagnosticRefLookupResult::Found);
+    let text = store.render_prometheus();
+    let expected = [
+        "# TYPE ferrum_diagnostic_ref_lookups_total counter",
+        "ferrum_diagnostic_ref_lookups_total{result=\"found\"} 1",
+        "ferrum_diagnostic_ref_lookups_total{result=\"not_found\"} 0",
+        "ferrum_diagnostic_ref_lookups_total{result=\"forbidden\"} 0",
+        "ferrum_diagnostic_ref_lookups_total{result=\"rate_limited\"} 0",
+        "# TYPE ferrum_diagnostic_refs_entries gauge",
+        "ferrum_diagnostic_refs_entries 1",
+        "# TYPE ferrum_diagnostic_refs_evicted_total counter",
+        "ferrum_diagnostic_refs_evicted_total{reason=\"capacity\"} 0",
+        "ferrum_diagnostic_refs_evicted_total{reason=\"expired\"} 0",
+        "# TYPE ferrum_diagnostic_refs_minted_total counter",
+        "ferrum_diagnostic_refs_minted_total 1",
+    ];
+    for line in expected {
+        assert!(text.lines().any(|l| l == line), "missing `{line}`:\n{text}");
+    }
+    assert!(!text.contains("namespace="), "no tenant label");
+}
+
+// ── HTTP/3 stamp coverage ──────────────────────────────────────────────────
+
+const STAMP: &str = "crate::diagnostic_ref::stamp_h3_response";
+
+/// Every HTTP/3 response head is stamped: each `send_response(..)` site in
+/// `src/http3` is preceded by the `stamp_h3_response` rebinding of the head it
+/// writes, so a new writer cannot ship a gateway-error head without its
+/// reference (or with a plugin-forged one).
+#[test]
+fn every_http3_response_head_is_stamped() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/http3");
+    let mut sites = 0;
+    for entry in std::fs::read_dir(&dir).expect("read src/http3") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read http3 source");
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            let Some(start) = code.find(".send_response(") else {
+                continue;
+            };
+            let argument = &code[start + ".send_response(".len()..];
+            let Some(end) = argument.find(')') else {
+                continue;
+            };
+            let value = &argument[..end];
+            let stamp = format!("let {value} = {STAMP}({value});");
+            let window = &lines[index.saturating_sub(12)..index];
+            assert!(
+                window.iter().any(|prior| prior.trim() == stamp),
+                "{}:{}: `{}` is not stamped",
+                path.display(),
+                index + 1,
+                code
+            );
+            sites += 1;
+        }
+    }
+    assert!(sites >= 17, "only {sites} HTTP/3 head writes");
+}

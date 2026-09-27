@@ -3040,6 +3040,18 @@ pub struct EnvConfig {
     /// would rather drain such a replica set this to `true`; either way
     /// liveness (`/live`) stays healthy and no healthy listener is closed.
     pub gateway_listener_failure_fails_readiness: bool,
+    /// Which gateway-authored responses carry an opaque
+    /// `X-Ferrum-Diagnostic-Ref` (`FERRUM_DIAGNOSTIC_REFS`, issue #5767).
+    /// Default: `off` (no store is allocated).
+    pub diagnostic_refs: crate::diagnostic_ref::DiagnosticRefMode,
+    /// Lifetime of a diagnostic reference in the in-memory store. Default: 900.
+    pub diagnostic_ref_ttl_seconds: u64,
+    /// Retained-reference ceiling; the oldest is evicted on overflow.
+    /// Default: 10000.
+    pub diagnostic_ref_max_entries: usize,
+    /// Admin `GET /diagnostics/v1/refs/{ref}` lookups admitted per second.
+    /// Default: 10.
+    pub diagnostic_ref_lookup_rate_per_second: u32,
     /// Disable admin TLS certificate verification (for testing only)
     pub admin_tls_no_verify: bool,
 
@@ -4190,6 +4202,11 @@ impl Default for EnvConfig {
             admin_audit_pipeline: crate::admin::audit::AuditPipelineConfig::default(),
             admin_require_namespace_claim: false,
             gateway_listener_failure_fails_readiness: false,
+            diagnostic_refs: crate::diagnostic_ref::DiagnosticRefMode::Off,
+            diagnostic_ref_ttl_seconds: crate::diagnostic_ref::DEFAULT_TTL_SECONDS,
+            diagnostic_ref_max_entries: crate::diagnostic_ref::DEFAULT_MAX_ENTRIES,
+            diagnostic_ref_lookup_rate_per_second:
+                crate::diagnostic_ref::DEFAULT_LOOKUP_RATE_PER_SECOND,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
             stream_gateway_ref: None,
@@ -4455,6 +4472,34 @@ impl EnvConfig {
             gateway_listener_failure_fails_readiness: bool
                 = "FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS" => false;
         }
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [diagnostics]
+            diagnostic_refs: String = "FERRUM_DIAGNOSTIC_REFS" => "off".to_string();
+            diagnostic_ref_ttl_seconds: u64 = "FERRUM_DIAGNOSTIC_REF_TTL_SECONDS"
+                => crate::diagnostic_ref::DEFAULT_TTL_SECONDS,
+                clamp(
+                    crate::diagnostic_ref::MIN_TTL_SECONDS,
+                    crate::diagnostic_ref::MAX_TTL_SECONDS
+                );
+            diagnostic_ref_max_entries: usize = "FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES"
+                => crate::diagnostic_ref::DEFAULT_MAX_ENTRIES,
+                clamp(
+                    crate::diagnostic_ref::MIN_MAX_ENTRIES,
+                    crate::diagnostic_ref::MAX_MAX_ENTRIES
+                );
+            diagnostic_ref_lookup_rate_per_second: u32
+                = "FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND"
+                => crate::diagnostic_ref::DEFAULT_LOOKUP_RATE_PER_SECOND,
+                clamp(
+                    crate::diagnostic_ref::MIN_LOOKUP_RATE_PER_SECOND,
+                    crate::diagnostic_ref::MAX_LOOKUP_RATE_PER_SECOND
+                );
+        }
+        // Unknown values fail closed: a typo must neither disable nor widen
+        // which responses carry a diagnostic reference.
+        let diagnostic_refs = crate::diagnostic_ref::DiagnosticRefMode::parse(&diagnostic_refs)?;
         // Durable HTTPS-intent signal: the inherited default `9443` alone is not
         // an operator request. Capture whether the port key was actually present
         // so node-agent / shared planners can fail closed on explicit incomplete
@@ -5675,6 +5720,10 @@ impl EnvConfig {
             admin_audit_pipeline,
             admin_require_namespace_claim,
             gateway_listener_failure_fails_readiness,
+            diagnostic_refs,
+            diagnostic_ref_ttl_seconds,
+            diagnostic_ref_max_entries,
+            diagnostic_ref_lookup_rate_per_second,
             admin_tls_no_verify,
             enable_http3,
             http3_idle_timeout,

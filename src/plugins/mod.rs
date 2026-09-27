@@ -2573,6 +2573,11 @@ pub struct RequestContext {
     /// Latest dispatch outcome, retaining possible execution across retries.
     /// Only trusted transport code may set this; it is not serialized.
     backend_dispatch_state: BackendDispatchState,
+    /// Diagnostic-reference slot of this request (issue #5767). `None` unless
+    /// `FERRUM_DIAGNOSTIC_REFS` enabled the store. Set only by the HTTP
+    /// frontends; the terminal transaction log records the request's detail
+    /// into it. Not visible to plugins and not serialized.
+    diagnostic_slot: Option<Arc<crate::diagnostic_ref::DiagnosticSlot>>,
     /// Whether the gateway selected the health-neutral retained-response
     /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) or its deterministic
     /// JSON output-policy counterpart (`502`) for this request.
@@ -3727,6 +3732,25 @@ impl RequestContext {
         self.backend_dispatch_state
     }
 
+    /// Phase of the matched route rule's total request deadline that produced
+    /// this request's gateway-authored `504`, when one did.
+    pub(crate) fn route_request_timeout_phase(&self) -> Option<&'static str> {
+        self.route_request_timeout_phase
+    }
+
+    /// This request's diagnostic-reference slot (issue #5767).
+    pub(crate) fn diagnostic_slot(&self) -> Option<&Arc<crate::diagnostic_ref::DiagnosticSlot>> {
+        self.diagnostic_slot.as_ref()
+    }
+
+    /// Attach the frontend's diagnostic-reference slot (issue #5767).
+    pub(crate) fn set_diagnostic_slot(
+        &mut self,
+        slot: Option<Arc<crate::diagnostic_ref::DiagnosticSlot>>,
+    ) {
+        self.diagnostic_slot = slot;
+    }
+
     /// Carry a final-request-body hook context's plugin state back onto the
     /// live request context.
     ///
@@ -3879,6 +3903,7 @@ impl RequestContext {
             charged_backend_deadline_terminal: false,
             route_request_timeout_phase: None,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
+            diagnostic_slot: None,
             gateway_capacity_response_selected: false,
             gateway_representation_response_selected: false,
             final_body_policy_terminal_replacement: false,
@@ -5368,6 +5393,7 @@ impl RequestContext {
             charged_backend_deadline_terminal: self.charged_backend_deadline_terminal,
             route_request_timeout_phase: self.route_request_timeout_phase,
             backend_dispatch_state: self.backend_dispatch_state,
+            diagnostic_slot: self.diagnostic_slot.clone(),
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,
             final_body_policy_terminal_replacement: self.final_body_policy_terminal_replacement,
@@ -8867,6 +8893,12 @@ pub async fn log_with_mirror(
         }
     }
     let summary = stamped.as_deref().unwrap_or(summary);
+    // Gateway diagnostic reference (issue #5767): the terminal summary is the
+    // authoritative description of the client-visible outcome, so it is the
+    // detail a reference minted for this response resolves to.
+    if let Some(slot) = ctx.diagnostic_slot() {
+        crate::diagnostic_ref::record_request_detail(slot, summary, ctx);
+    }
     let precompute_mesh_key = plugins
         .iter()
         .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));

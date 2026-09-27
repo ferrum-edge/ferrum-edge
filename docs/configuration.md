@@ -1111,6 +1111,10 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | No | `false` | Track streaming response total latency (adds per-stream overhead) |
+| `FERRUM_DIAGNOSTIC_REFS` | No | `off` | Gateway diagnostic references (`off` or `errors`; any other value fails startup). With `errors`, every HTTP/1.1, HTTP/2, and HTTP/3 response that carries the gateway's own `X-Gateway-Error` token also carries an opaque `X-Ferrum-Diagnostic-Ref: fd1_<32 hex>` (128 CSPRNG bits, no embedded cause, route, backend, or tenant). The precise cause is retained in process memory only and is readable only through the admin `GET /diagnostics/v1/refs/{ref}` with a JWT carrying the `diagnostics:read` scope and an `ns` claim. Backend copies of the header are stripped whatever the setting. `off` allocates nothing. See [error_classification.md](error_classification.md#gateway-diagnostic-references) |
+| `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` | No | `900` | Lifetime of a diagnostic reference in the in-memory store, clamped to 1–86400. An expired reference answers `404` |
+| `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` | No | `10000` | Retained diagnostic references, clamped to 16–1000000 and split evenly across 16 shards; the oldest reference in a full shard is evicted first |
+| `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` | No | `10` | Admin diagnostic reference lookups admitted per second across all callers, clamped to 1–10000; above it the lookup answers `429` with `Retry-After: 1` |
 | `FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS` | No | `1000` | Background sampler interval for `/metrics/runtime` system metrics (minimum 100ms) |
 | `FERRUM_METRICS_WINDOW_1M_SECONDS` | No | `60` | Short status-code/request-rate window exposed by `/metrics/runtime` |
 | `FERRUM_METRICS_WINDOW_5M_SECONDS` | No | `300` | Long status-code/request-rate window exposed by `/metrics/runtime` |

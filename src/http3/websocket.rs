@@ -409,6 +409,7 @@ async fn write_h3_finalized_reject_body<S>(
             return;
         }
     };
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     if let Err(e) = stream.send_response(resp).await {
         debug!("H3 WS: failed to send reject response: {}", e);
         return;
@@ -1421,6 +1422,7 @@ pub(crate) async fn handle_h3_websocket(
     };
     crate::proxy::record_request(&state, 200);
 
+    let response = crate::diagnostic_ref::stamp_h3_response(response);
     if let Err(e) = stream.send_response(response).await {
         error!(proxy_id = %proxy.id, "H3 WS: failed to send 200 response: {}", e);
         return Err(anyhow::anyhow!("H3 WebSocket send_response: {}", e));

@@ -11212,6 +11212,7 @@ where
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     Ok(())
 }
@@ -11249,6 +11250,7 @@ where
     let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 error response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     let bytes = Bytes::from_static(body.as_bytes());
     let len = bytes.len() as u64;
@@ -11759,6 +11761,7 @@ where
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 reject response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     let len = body.len() as u64;
     if !body.is_empty() {
@@ -12227,6 +12230,7 @@ where
     )
     .body(())
     .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC reject response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     let _ = stream.finish().await;
     Ok(CrossProtocolOutcome {
@@ -12618,6 +12622,7 @@ where
     let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC error response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     let _ = stream.finish().await;
     Ok(CrossProtocolOutcome {

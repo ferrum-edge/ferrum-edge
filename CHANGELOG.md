@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Gateway-owned diagnostic references (#5767). With the new
+  `FERRUM_DIAGNOSTIC_REFS=errors` (default `off`), every HTTP/1.1, HTTP/2, and
+  HTTP/3 response that carries the gateway's own `X-Gateway-Error` token also
+  carries an opaque `X-Ferrum-Diagnostic-Ref: fd1_<32 hex>` header: 128 bits
+  from the process CSPRNG with no embedded cause, route, backend, or tenant.
+  An operator tool resolves it with the new admin
+  `GET /diagnostics/v1/refs/{ref}`, which requires an admin JWT carrying the
+  `diagnostics:read` scope and an `ns` claim. The versioned body
+  (`ferrum.diagnostic_ref.v1`) names the precise `error_class`, how far the
+  request reached a backend, the route-deadline or rejection phase, the
+  matched proxy, the backend origin, and a duration bucket. It never carries
+  bodies, headers, paths, credentials, or raw error text. A reference outside
+  the token's namespaces answers `404` like an unknown one. Lookups are
+  rate-limited (`FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND`, default 10) and
+  audit-logged. References live only in process memory, bounded by
+  `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900) and
+  `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` (default 10000, oldest evicted first),
+  with four new `ferrum_diagnostic_ref*` families on `/metrics`. The public
+  eight-token `X-Gateway-Error` vocabulary is unchanged.
+
+### Security
+
+- `X-Ferrum-Diagnostic-Ref` is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS`
+  says (#5767): a backend or serverless-function copy, in the headers or the
+  trailers, is stripped at every backend response boundary, as
+  `X-Gateway-Error` already is (#5759), so a backend cannot pre-seed or forge
+  a reference.
+
 ## [0.9.8] - 2026-09-27
 
 ### Changed

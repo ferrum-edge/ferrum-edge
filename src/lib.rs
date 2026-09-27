@@ -31,6 +31,7 @@ pub mod consumer_index;
 pub mod custom_plugins;
 pub mod data_path_metrics;
 pub mod date_cache;
+pub mod diagnostic_ref;
 #[cfg(test)]
 use diagnostic_test_logs::interest as diagnostic_test_interest;
 #[cfg(test)]

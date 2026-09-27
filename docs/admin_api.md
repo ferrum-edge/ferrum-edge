@@ -1692,6 +1692,69 @@ curl -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/audit?resource_type=proxy&resource_id=PROXY_ID"
 ```
 
+## Diagnostic References
+
+`GET /diagnostics/v1/refs/{ref}` resolves an opaque `X-Ferrum-Diagnostic-Ref`
+response header to the gateway's own detail about that response (issue
+#5767). References are minted only when `FERRUM_DIAGNOSTIC_REFS=errors`, only
+on HTTP/1.1, HTTP/2, and HTTP/3 proxy responses that carry the gateway's own
+`X-Gateway-Error` token, and only the gateway process that served the response
+can resolve them. See
+[error_classification.md](error_classification.md#gateway-diagnostic-references)
+for the contract and bounds.
+
+The token needs two claims beyond a normal admin JWT. The admin `role` never
+implies either:
+
+- `scope` containing `diagnostics:read`, either as an OAuth 2.0
+  space-delimited string (`"scope": "diagnostics:read"`) or as an array of
+  strings.
+- `ns`, naming the namespace(s) the caller may read. A reference is visible
+  only when its namespace (the serving gateway's `FERRUM_NAMESPACE`) is in the
+  claim. `X-Ferrum-Namespace` is ignored on this route.
+
+```bash
+curl -H "Authorization: Bearer $DIAGNOSTICS_TOKEN" \
+  http://localhost:9000/diagnostics/v1/refs/fd1_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
+```
+
+```json
+{
+  "schema_version": "ferrum.diagnostic_ref.v1",
+  "ref": "fd1_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f",
+  "namespace": "ferrum",
+  "created_at": "2026-09-27T10:15:02.114Z",
+  "expires_at": "2026-09-27T10:30:02.114Z",
+  "protocol": "http2",
+  "status": 502,
+  "gateway_error": "connection_failure",
+  "detail_available": true,
+  "detail": {
+    "error_class": "dns_lookup_error",
+    "body_error_class": null,
+    "rejection_phase": null,
+    "route_timeout_phase": null,
+    "backend_dispatch": "pre_wire_failure",
+    "proxy_id": "orders-api",
+    "backend_target": "https://orders.internal:8443",
+    "duration_bucket": "lt_100ms"
+  }
+}
+```
+
+| Status | When |
+|---|---|
+| `200` | Resolved. `detail` is `null` (and `detail_available` is `false`) until the request's terminal transaction record exists — a streamed response records it when its body ends — and for the overload and stale-configuration fences, which answer before a request context exists |
+| `401` | Missing or invalid admin JWT |
+| `403` | The JWT lacks the `diagnostics:read` scope or carries no `ns` claim. Decided from the credential alone, before the reference is read |
+| `404` | Malformed, unknown, expired, or evicted reference; a reference outside the token's `ns` namespaces; or references are off. All identical, so references cannot be probed |
+| `429` | More than `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) lookups in the current second, across all callers. Carries `Retry-After: 1` |
+
+Every lookup emits one WARN-level `audit.event = "diagnostic_ref_lookup"`
+event with the JWT subject, the reference (or `malformed`), and the result
+(`found`, `not_found`, `forbidden`, `rate_limited`), which also label
+`ferrum_diagnostic_ref_lookups_total{result}` on `/metrics`.
+
 ## Cluster Status
 
 The `/cluster` endpoint provides live CP/DP connection state. Available in all modes, but most useful in CP and DP modes.

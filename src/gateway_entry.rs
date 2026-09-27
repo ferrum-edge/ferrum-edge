@@ -817,6 +817,17 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         return 1;
     }
 
+    // Publish the bounded diagnostic reference store (issue #5767) before any
+    // listener can author a response. `FERRUM_DIAGNOSTIC_REFS=off` (the
+    // default) installs nothing.
+    if let Err(e) = crate::diagnostic_ref::install_from_env_config(&env_config) {
+        error!(
+            "Configuration error: {}",
+            render_startup_error(anyhow::anyhow!(e), &[])
+        );
+        return 1;
+    }
+
     // Apply the delayed-work admission budget before any listener can accept
     // traffic, so a fault-injection delay is never admitted against the
     // compiled-in default when the operator configured a smaller bound.
