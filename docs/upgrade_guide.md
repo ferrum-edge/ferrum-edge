@@ -34,8 +34,9 @@ reset, or a datagram send fails), the gateway now ends the HTTP/2 `CONNECT`
 stream with `RST_STREAM(CONNECT_ERROR)` (RFC 9113 §8.5) instead of a clean
 `END_STREAM`. A peer close, idle expiry, write stall, timeout, or fence
 revocation still ends with `END_STREAM`. HBONE clients that treated every
-tunnel end as a normal close now see a stream error on a failed relay; a
-truncated byte stream is no longer reported as complete.
+tunnel end as a normal close now see a stream error on a failed relay; a byte
+stream truncated by a socket error is no longer reported as complete (a backend
+read/write timeout or a revocation still ends with `END_STREAM`, see #5858).
 
 **Dependencies**
 
