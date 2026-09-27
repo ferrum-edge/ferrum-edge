@@ -861,7 +861,7 @@ enum WsLeg {
         io: Box<dyn ClientIo>,
         pending: Vec<u8>,
     },
-    H3(Http3WebSocket),
+    H3(Box<Http3WebSocket>),
 }
 
 impl WsLeg {
@@ -1085,7 +1085,7 @@ async fn functional_ws_deflate_terminate_http3_negotiates_each_leg() {
         backend.next_offer().await.as_deref(),
         Some("permessage-deflate")
     );
-    let mut leg = WsLeg::H3(ws);
+    let mut leg = WsLeg::H3(Box::new(ws));
     exercise_terminated_session(&mut leg, &mut backend).await;
 }
 
