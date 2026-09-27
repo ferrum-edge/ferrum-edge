@@ -2803,7 +2803,10 @@ async fn diagnostic_refs_name_the_owning_replica_only_to_authorized_callers() {
         .and_then(|rest| rest.split_once('_'))
         .map(|(replica, _)| replica)
         .expect("peer fd2_ reference");
-    assert_ne!(peer_replica, owner_replica, "the two processes drew one replica id");
+    assert_ne!(
+        peer_replica, owner_replica,
+        "the two processes drew one replica id"
+    );
 
     let admin = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
