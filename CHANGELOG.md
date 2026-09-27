@@ -108,6 +108,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anything outside Ferrum still fails on the first attempt, unless a Ferrum
   listener held that port number within the last second. No socket options
   change; two sockets never share the port.
+- Two orderings of that UDP port handoff no longer leave the port waiting for
+  the 30-second retry (#5851). First, a UDP/DTLS stream listener that closed
+  its socket during the Gateway listener manager's startup reconcile, or
+  before its supervisor started, was missed, so a QUIC half that startup pass
+  reported as `bind_failed` stayed down until the retry. The Gateway manager
+  now follows stream listener releases from the moment it is created. The
+  stream listener manager's first reconcile had the same gap for QUIC releases
+  and now starts its supervisor before its final release check. Second, a
+  stream listener's pass only checks that the port is free: its listener task
+  binds the socket afterwards, and a QUIC half could take the port in between
+  when config changed quickly. That task's bind failed after the pass had
+  already reported its failures, so nothing retried it. The task now retries
+  that bind the same way, with its own 2-second budget. A listener shut down
+  while it waits stops at once, so removing or replacing it is never delayed.
 
 ### Security
 

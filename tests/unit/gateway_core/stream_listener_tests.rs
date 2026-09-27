@@ -29,10 +29,13 @@ use ferrum_edge::proxy::stream_listener::{
 };
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
 use ferrum_edge::proxy::udp_port_handoff::{UDP_PORT_HANDOFF_BUDGET, UdpPortHandoff, UdpPortOwner};
+use ferrum_edge::proxy::udp_proxy::{
+    UdpListenerConfig, UdpProxyMetrics, start_udp_listener_holding_port,
+};
 use ferrum_edge::request_epoch::RequestEpochStore;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
@@ -1405,6 +1408,175 @@ fn wait_for_handoff_retry(ledger: &UdpPortHandoff) -> bool {
         std::thread::sleep(Duration::from_millis(5));
     }
     true
+}
+
+/// [`wait_for_handoff_retry`] without blocking a runtime worker, for tests that
+/// wait on the runtime that drives the colliding bind.
+async fn wait_for_handoff_retry_async(ledger: &UdpPortHandoff) -> bool {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while ledger.handoff_retries() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+const DIRECT_UDP_LISTENER_ID: &str = "udp-task-handoff";
+
+/// A stream manager runtime whose config holds one UDP proxy on `port`, for
+/// tests that drive that proxy's listener task directly.
+fn direct_udp_listener_runtime(port: u16) -> StreamManagerRuntime {
+    let config = GatewayConfig {
+        proxies: vec![create_stream_proxy(DIRECT_UDP_LISTENER_ID, BackendScheme::Udp, port)],
+        ..empty_config()
+    };
+    create_manager_runtime(Arc::new(ArcSwap::from_pointee(config.clone())), &config)
+}
+
+/// The listener config the manager builds for a plain UDP proxy on `port`, so a
+/// test can run the listener task directly: without the reconcile pass and its
+/// pre-bind probe, the task's own bind is the first to reach the port.
+fn direct_udp_listener_config(
+    runtime: &StreamManagerRuntime,
+    port: u16,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    started: Arc<AtomicBool>,
+) -> UdpListenerConfig {
+    UdpListenerConfig {
+        port,
+        bind_addr: "127.0.0.1".parse::<IpAddr>().unwrap(),
+        proxy_id: DIRECT_UDP_LISTENER_ID.to_string(),
+        proxy_namespace: ferrum_edge::config::types::default_namespace(),
+        dns_cache: DnsCache::new(DnsConfig::default()),
+        request_epoch: runtime.request_epoch.clone(),
+        health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        shutdown,
+        global_shutdown: None,
+        metrics: Arc::new(UdpProxyMetrics::default()),
+        frontend_dtls_config: None,
+        dtls_server_tx: None,
+        tls_no_verify: false,
+        tls_ca_bundle_path: None,
+        max_sessions: 1024,
+        frontend_tls_handshake_timeout_seconds: 10,
+        cleanup_interval_seconds: 10,
+        circuit_breaker_cache: Arc::new(CircuitBreakerCache::new()),
+        crls: Arc::new(Vec::new()),
+        backend_tls_reload_epoch: Arc::new(AtomicU64::new(0)),
+        tls_policy: None,
+        started,
+        sni_proxy_ids: None,
+        adaptive_buffer: Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+            true, true, 300, 8192, 262_144, 65_536, 6000,
+        )),
+        recvmmsg_batch_size: 64,
+        session_shard_amount: 0,
+        overload: Arc::new(ferrum_edge::overload::OverloadState::new()),
+        so_busy_poll_us: 0,
+        udp_gro_enabled: false,
+        udp_gso_enabled: false,
+        udp_pktinfo_enabled: false,
+        mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),
+        node_waypoint_udp_source_scoping: None,
+        node_waypoint_udp_owner: false,
+        node_waypoint_udp_destinations: None,
+        datagram_client_address: None,
+    }
+}
+
+/// Issue #5851: a reconcile pass only probes a UDP port, drops the probe
+/// socket, and spawns the listener task, which binds the real socket later. A
+/// Gateway QUIC half can take the port in that gap, and the task's bind then
+/// fails after the pass has published its failures and checked the QUIC
+/// release log, so nothing would retry it before the 30-second supervisor
+/// tick. The task's own bind must ride out the handoff instead. The listener
+/// task is driven directly, so its bind is the first to meet the held socket
+/// and ledger entry standing in for that QUIC half, and the release happens
+/// only after that bind has collided.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_udp_listener_task_bind_waits_for_an_in_process_udp_port_handoff() {
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP");
+    let port = occupied.local_addr().expect("addr").port();
+    let runtime = direct_udp_listener_runtime(port);
+    let ledger = Arc::clone(runtime.manager.udp_port_handoff());
+    let quic_hold = ledger.hold(port, UdpPortOwner::GatewayQuic);
+    quic_hold.arm();
+
+    let started = Arc::new(AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let listener_config = direct_udp_listener_config(&runtime, port, shutdown_rx, started.clone());
+    let task_hold = ledger.hold(port, UdpPortOwner::StreamDatagram);
+    let listener_task = start_udp_listener_holding_port(listener_config, Some(task_hold));
+    let listener = tokio::spawn(listener_task);
+
+    assert!(
+        wait_for_handoff_retry_async(&ledger).await,
+        "the listener task's bind must have collided with the held socket and retried"
+    );
+    assert!(
+        !started.load(Ordering::Acquire),
+        "the listener task bound while the port was still held"
+    );
+    drop(occupied);
+    drop(quic_hold);
+
+    let bound = tokio::time::timeout(Duration::from_secs(10), async {
+        while !started.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        bound.is_ok(),
+        "the listener task must bind once the held socket is released"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let outcome = tokio::time::timeout(Duration::from_secs(10), listener)
+        .await
+        .expect("the listener must stop on shutdown")
+        .expect("listener task");
+    assert!(outcome.is_ok(), "{outcome:?}");
+}
+
+/// A listener task waiting out a handoff stops as soon as it is shut down, so
+/// the reconcile that retires it never waits on that task's handoff budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_udp_listener_task_stops_waiting_for_a_handoff_when_shut_down() {
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP");
+    let port = occupied.local_addr().expect("addr").port();
+    let runtime = direct_udp_listener_runtime(port);
+    let ledger = Arc::clone(runtime.manager.udp_port_handoff());
+    let quic_hold = ledger.hold(port, UdpPortOwner::GatewayQuic);
+    quic_hold.arm();
+
+    let started = Arc::new(AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let listener_config = direct_udp_listener_config(&runtime, port, shutdown_rx, started.clone());
+    let task_hold = ledger.hold(port, UdpPortOwner::StreamDatagram);
+    let listener_task = start_udp_listener_holding_port(listener_config, Some(task_hold));
+    let listener = tokio::spawn(listener_task);
+    assert!(
+        wait_for_handoff_retry_async(&ledger).await,
+        "the listener task's bind must have collided with the held socket and retried"
+    );
+
+    // The port stays held, so only the shutdown can end the wait before the
+    // budget runs out.
+    let _ = shutdown_tx.send(true);
+    let outcome = tokio::time::timeout(UDP_PORT_HANDOFF_BUDGET / 2, listener)
+        .await
+        .expect("a shut-down listener must stop waiting for the handoff")
+        .expect("listener task");
+    assert!(
+        outcome.is_ok(),
+        "a listener shut down while it waits is not a bind failure: {outcome:?}"
+    );
+    assert!(!started.load(Ordering::Acquire));
+
+    drop(quic_hold);
+    drop(occupied);
 }
 
 /// Issue #5843: a Gateway QUIC half's release wakes the stream supervisor into
