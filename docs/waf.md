@@ -267,11 +267,13 @@ crumb holding both `%` and `+` is also matched percent-decoded with `+` kept,
 as Express reads it, so `x=%27+alert(1)+%27` is seen as `'+alert(1)+'` as
 well as `' alert(1) '`. Express `cookie-parser` runs `JSON.parse` on a value
 starting with `j:`, so such a crumb is also matched with its `\uXXXX` /
-`\u{...}` / `\xXX` escapes resolved. Other JSON string escapes and HTML
-entities are not cookie encodings, so a `j:` JSON cookie whose string holds
-`\n` is not read as a line feed. The header is split on `;` before decoding,
-so an encoded `%3B` cannot forge an extra crumb. As with queries, decoding is
-inspection-only.
+`\u{...}` / `\xXX` escapes and its `\"`, `\'`, `\/`, `\\` escapes resolved.
+Like Express, the WAF finds that value by splitting the raw crumb at its first
+`=`, so an encoded `=` in the name (`a%3Db=j:…`) does not hide it. The JSON
+control escapes (`\n`, `\t`, …) and HTML entities are not cookie encodings,
+so a `j:` JSON cookie whose string holds `\n` is not read as a line feed. The
+header is split on `;` before decoding, so an encoded `%3B` cannot forge an
+extra crumb. As with queries, decoding is inspection-only.
 
 The layered decode runs a bounded number of rounds (a cost guard against
 decompression-style blowups), so double- and triple-stacked encodings are fully
@@ -279,16 +281,19 @@ reduced but a payload stacked deeper than the cap is not. Rather than silently
 forwarding such a body, the WAF raises the `encoding_evasion` signal
 (`FE-ENCODING-001`) for it — the same rule that flags URL double-encoding. The
 signal fires when the value still holds a percent (`%XX`, `%uXXXX`) or HTML
-entity layer after the cap, or a `\uXXXX` / `\u{...}` / `\xXX` escape of ASCII
-punctuation, a space, or a control character behind a backslash run of any
-length. Two kinds of stack are deliberately not flagged: runs of the
-single-character escapes (`\n`, `\"`, `\\`, …), which are ordinary in
-multiply-stringified JSON, and code-point escapes of letters, digits, or
-non-ASCII characters (`\x64` in a Windows path, `\u00e9` in a name), which
-hide nothing a signature keys on. The
-overlong-UTF8 (`FE-ENCODING-002`), double-encoding, and null-byte
-(`FE-ENCODING-001`) markers are likewise checked against request and response
-**bodies**, not just the URL/path, so an overlong-encoded body payload that
+entity layer after the cap, or, behind a backslash run of any length, a
+`\uXXXX` / `\u{...}` escape of any ASCII character (letters included) or a
+control character, or a `\xXX` escape of ASCII punctuation, a space, or an
+ASCII control character. No JSON or JavaScript serializer writes ASCII as a
+`\u` escape, so a deep `\u0073elect` is evasion in itself, while `\xXX` is
+ordinary literal text in Windows paths, regex source, and hex dumps. Three
+kinds of stack are deliberately not flagged: runs of the single-character
+escapes (`\n`, `\"`, `\\`, …), which are ordinary in multiply-stringified
+JSON; `\u` escapes of non-ASCII characters (`\u00e9` in a name); and `\x`
+escapes of letters, digits, or C1 bytes (`\x64` or `bin\x86\Release` in a
+Windows path). The overlong-UTF8 (`FE-ENCODING-002`), double-encoding, and
+null-byte (`FE-ENCODING-001`) markers are likewise checked against request and
+response **bodies**, not just the URL/path, so an overlong-encoded body payload that
 lossy percent-decoding cannot recover to its literal character is still flagged
 as an evasion attempt.
 
@@ -634,10 +639,11 @@ including when no rule in that direction could have refused anything.
 `O(active_rules × max_scan_bytes)`, and body normalization multiplies it: a
 `max_scan_bytes`-sized form-encoded or JSON body containing `%`, `+`, `\`, or `&`
 produces up to five decoded variants, each rescanned (the fifth, the layered
-decode's second-to-last round, only when all three rounds changed the body). With
-the 1 MiB default cap that is several MiB of matching per request, and exceeding
-a 50 ms budget on such traffic is routine rather than exceptional. Measure the deadline rate in
-`waf.scan_timed_out` under `log_and_allow` first, then either raise
+decode's second-to-last round, only when all three rounds changed the body and
+that round still holds a `+`). With the 1 MiB default cap that is several MiB of
+matching per request, and exceeding a 50 ms budget on such traffic is routine
+rather than exceptional. Measure the deadline rate in `waf.scan_timed_out`
+under `log_and_allow` first, then either raise
 `scan_budget_ms`, lower `max_scan_bytes`, or trim the active rule set — the same
 "prefer sizing over rejecting" advice that applies to `max_scan_bytes` above.
 Turning on `fail_closed` (or `block`) while scans routinely exceed the budget

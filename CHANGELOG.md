@@ -215,13 +215,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `%u`, `+` as a space and, when the crumb also holds a `%`, as `+`, and the
   bounded layered percent decode), since PHP, Express `cookie-parser`, and
   Rails unescape cookie values before binding them; an Express `j:` JSON
-  cookie also has its `\uXXXX` / `\xXX` escapes resolved. The header is split
-  on `;` first, so an encoded `%3B` cannot forge an extra crumb.
+  cookie (found, as Express finds it, by splitting the raw crumb at its first
+  `=`) also has its `\uXXXX` / `\xXX` escapes and its `\"`, `\'`, `\/`,
+  `\\` escapes resolved. The header is split on `;` first, so an encoded
+  `%3B` cannot forge an extra crumb.
   `body_json_path` values, already unescaped by the JSON parser, do not have
   their single-character escapes resolved a second time. For the
   `FE-ENCODING-001` residual, collapsing a run of backslashes no longer counts
-  as an unreduced layer, while a `\u` / `\x` escape of punctuation, a space,
-  or a control character behind a backslash run of any length still does.
+  as an unreduced layer, while behind a backslash run of any length a `\u`
+  escape of any ASCII character or control character, or a `\x` escape of
+  punctuation, a space, or an ASCII control character, still does.
 
 ### Performance
 

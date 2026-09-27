@@ -99,12 +99,12 @@ fn decoded_variants(text: &str, escapes: StringEscapes) -> (Vec<String>, bool) {
     }
 
     // Layered decode catches stacked encodings (e.g. percent-encoded HTML
-    // entities). Its second-to-last round is kept too: the last round turns
-    // every `+` into a space, so `%252B` would otherwise only ever be seen as
-    // a space, never as the `+` a double-decoding application reads. The
-    // single-layer decodes are kept as well because a layered percent-decode
-    // can mangle a body that merely contains a literal `%`, and we still want
-    // the JSON/HTML-only decode to fire in that case.
+    // entities). Its second-to-last round is kept too when it holds a `+`:
+    // the last round turns every `+` into a space, so `%252B` would otherwise
+    // only ever be seen as a space, never as the `+` a double-decoding
+    // application reads. The single-layer decodes are kept as well because a
+    // layered percent-decode can mangle a body that merely contains a literal
+    // `%`, and we still want the JSON/HTML-only decode to fire in that case.
     let layered = layered_decode_inner(text, escapes);
     let candidates = [
         Some(Cow::Owned(layered.decoded)),
@@ -611,20 +611,23 @@ pub(super) fn canonical_query_component_views(raw: &str) -> CanonicalQueryViews<
 ///
 /// * the percent decode with `+` → space (PHP `urldecode`, Rails);
 /// * when that is itself still percent-encoded, the layered percent decode
-///   capped at [`MAX_DECODE_ROUNDS`], plus its second-to-last round, since
-///   the last round turns the `+` a `%252B` yields into a space;
+///   capped at [`MAX_DECODE_ROUNDS`], plus its second-to-last round when that
+///   holds a `+`, since the last round turns the `+` a `%252B` yields into a
+///   space;
 /// * when the crumb holds both `%` and `+`, the percent decode that keeps `+`
 ///   (Express `cookie-parser`, which uses `decodeURIComponent`);
-/// * when that Express reading of the value starts with `j:`, the same text
-///   with its `\uXXXX` / `\u{...}` / `\xXX` escapes resolved, because
-///   `cookie-parser` runs `JSON.parse` on such a value.
+/// * when the value (split from the raw crumb at its first `=`, as Express
+///   splits it, then decoded) starts with `j:`, that Express reading with its
+///   `\uXXXX` / `\u{...}` / `\xXX` escapes and its `\"`, `\'`, `\/`, `\\`
+///   escapes resolved, because `cookie-parser` runs `JSON.parse` on such a
+///   value.
 ///
 /// Callers split the `Cookie` header on `;` first, so `%3B` cannot forge an
-/// extra crumb. JSON single-character escapes and HTML entities are not
-/// cookie encodings: a `j:` JSON cookie whose string holds `\n` is a
-/// backslash and an `n` to the view that models it, so the control-character
-/// rule is not handed a line feed only a different decoder would produce. A
-/// crumb with nothing to decode costs no allocation.
+/// extra crumb. JSON control escapes and HTML entities are not cookie
+/// encodings: a `j:` JSON cookie whose string holds `\n` is a backslash and
+/// an `n` to the view that models it, so the control-character rule is not
+/// handed a line feed only a different decoder would produce. A crumb with
+/// nothing to decode costs no allocation.
 pub(super) fn canonical_cookie_views(raw: &str) -> CanonicalQueryViews<'_> {
     let primary = percent_decode_plus(raw);
     let mut variants = Vec::new();
@@ -638,11 +641,13 @@ pub(super) fn canonical_cookie_views(raw: &str) -> CanonicalQueryViews<'_> {
             };
             rounds = [rounds[1].take(), Some(next)];
         }
-        variants.extend(rounds.into_iter().flatten());
+        let [intermediate, last] = rounds;
+        variants.extend(intermediate.filter(|round| round.contains('+')));
+        variants.extend(last);
     }
     let plus_kept = raw.contains('+').then(|| percent_decode(raw, false));
     let express = plus_kept.as_deref().unwrap_or(&primary);
-    if let Some(json) = json_cookie_view(express) {
+    if let Some(json) = json_cookie_view(raw, express) {
         variants.push(json);
     }
     if let Some(Cow::Owned(plus_kept)) = plus_kept {
@@ -651,17 +656,22 @@ pub(super) fn canonical_cookie_views(raw: &str) -> CanonicalQueryViews<'_> {
     CanonicalQueryViews { primary, variants }
 }
 
-/// The code-point-decoded reading of an Express `j:` JSON cookie crumb, or
-/// `None` when the crumb is not one or has no code-point escape to resolve.
-fn json_cookie_view(crumb: &str) -> Option<String> {
-    let (_, value) = crumb.split_once('=')?;
+/// The `JSON.parse` reading of `express`, the Express-decoded text of the
+/// cookie crumb `raw`, or `None` when the crumb is not a `j:` JSON cookie or
+/// has no escape to resolve.
+///
+/// Express splits the raw crumb at its first `=` and decodes only the value,
+/// so `a%3Db=j:…` is a `j:` value to it even though the decoded crumb reads
+/// `a=b=j:…`.
+fn json_cookie_view(raw: &str, express: &str) -> Option<String> {
+    let (_, value) = raw.split_once('=')?;
     let value = value.trim();
     let value = value.strip_prefix('"').unwrap_or(value);
-    if !value.starts_with("j:") {
+    if !percent_decode(value, false).starts_with("j:") {
         return None;
     }
-    match string_unescape(crumb, StringEscapes::CodePointsOnly) {
-        Cow::Owned(decoded) if decoded != crumb => Some(decoded),
+    match string_unescape(express, StringEscapes::JsonCookie) {
+        Cow::Owned(decoded) if decoded != express => Some(decoded),
         _ => None,
     }
 }
@@ -684,8 +694,9 @@ struct LayeredDecode {
     /// The value after the last round that changed it.
     decoded: String,
     /// The value before the last permitted round, kept only when that round
-    /// changed it. The last round turns every `+` into a space, so this is
-    /// where a double-encoded `%252B` still reads as `+`.
+    /// changed it and the value holds a `+`. The last round turns every `+`
+    /// into a space, so this is where a double-encoded `%252B` still reads as
+    /// `+`; any other change the last round makes only reveals more.
     intermediate: Option<String>,
     /// `false` when the value was still actively decoding when the round cap
     /// was reached, i.e. it carries an encoding stacked deeper than the cap
@@ -715,7 +726,7 @@ fn layered_decode_inner(text: &str, escapes: StringEscapes) -> LayeredDecode {
         // would peel another real layer the payload is stacked deeper than the
         // cap. Backslash-run collapsing alone is not such a layer.
         if round + 1 == MAX_DECODE_ROUNDS {
-            intermediate = Some(previous);
+            intermediate = previous.contains('+').then_some(previous);
             converged = !has_pending_decode(&current);
         }
     }
@@ -822,10 +833,9 @@ fn percent_octet(bytes: &[u8]) -> Option<u8> {
 /// A code-point escape body behind a run of backslashes of *any* length is
 /// pending: each round halves the run, so later rounds reach the escape
 /// however deep it is stacked (16 backslashes then `u003c` is `<` five
-/// decodes later). It is counted only when the code point it yields can
-/// carry injection syntax (see [`code_point_hides_syntax`]); `\x64` in a
-/// Windows path or `\u00e9` in stringified text hides nothing a signature
-/// keys on.
+/// decodes later). Which escapes count depends on their form (see
+/// [`code_point_escape_hides_syntax`]): any deep `\u` escape of ASCII does,
+/// while `\x64` in a Windows path or `\u00e9` in stringified text does not.
 fn has_pending_decode(text: &str) -> bool {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -838,8 +848,7 @@ fn has_pending_decode(text: &str) -> bool {
             b'\\' => {
                 // Skip the whole run so every byte is visited once.
                 let run = rest.iter().take_while(|&&byte| byte == b'\\').count();
-                let escape = code_point_escape(&rest[run..]);
-                if escape.is_some_and(code_point_hides_syntax) {
+                if code_point_escape_hides_syntax(&rest[run..]) {
                     return true;
                 }
                 i += run;
@@ -852,23 +861,33 @@ fn has_pending_decode(text: &str) -> bool {
     html_entity_decode(text).as_ref() != text
 }
 
-/// The code point of a `\uXXXX` (or surrogate pair), `\u{...}`, or `\xXX`
-/// escape body at the start of `after` (the bytes following a backslash).
-fn code_point_escape(after: &[u8]) -> Option<u32> {
-    match after.first()? {
-        b'u' | b'U' | b'x' | b'X' => decode_escape(after).map(|(cp, _)| cp),
-        _ => None,
-    }
-}
-
-/// Whether a code point can carry injection syntax once decoded: ASCII
-/// punctuation (quotes, angle brackets, slashes, …), a space (a SQL token
-/// separator), or a control character (CR/LF, NUL, tab).
-fn code_point_hides_syntax(cp: u32) -> bool {
-    let Some(ch) = char::from_u32(cp) else {
+/// Whether the `\uXXXX` (or surrogate pair), `\u{...}`, or `\xXX` escape
+/// body at the start of `after` (the bytes following a backslash) is one a
+/// signature could miss while it stays encoded.
+///
+/// * `\u` / `\u{...}`: any ASCII character, or a C1 control. JSON and
+///   JavaScript serializers never write ASCII as a `\u` escape, so a deep
+///   `\u0073elect` or `<\u0073cript>` is evasion in itself even though it
+///   yields a letter.
+/// * `\xXX`: ASCII punctuation (quotes, angle brackets, slashes, …), a space
+///   (a SQL token separator), or an ASCII control (CR/LF, NUL, tab). `\x` is
+///   not a JSON escape: it shows up as literal text in Windows paths (`\x64`,
+///   `bin\x86\Release`), regex source, and hex dumps, so letters, digits, and
+///   C1 bytes are not counted.
+fn code_point_escape_hides_syntax(after: &[u8]) -> bool {
+    let unicode = match after.first() {
+        Some(b'u' | b'U') => true,
+        Some(b'x' | b'X') => false,
+        _ => return false,
+    };
+    let Some(ch) = decode_escape(after).and_then(|(cp, _)| char::from_u32(cp)) else {
         return false;
     };
-    ch.is_ascii_punctuation() || ch == ' ' || ch.is_control()
+    if unicode {
+        ch.is_ascii() || ch.is_control()
+    } else {
+        ch.is_ascii_punctuation() || ch == ' ' || ch.is_ascii_control()
+    }
 }
 
 fn is_single_char_escape(byte: u8) -> bool {
@@ -887,6 +906,12 @@ enum StringEscapes {
     /// (`\uXXXX`, `\u{...}`, `\xXX`) that model a second, application-level
     /// decode. The single-character escapes were resolved once already.
     CodePointsOnly,
+    /// An Express `j:` cookie value `JSON.parse` reads: the code-point escapes
+    /// and the escapes that yield a quote, slash, or backslash (`\"`, `\'`,
+    /// `\/`, `\\`). The control escapes (`\n`, `\r`, `\t`, `\b`, `\f`, `\v`)
+    /// stay a backslash and a letter, so the control-character rule is not
+    /// handed a line feed from a cookie.
+    JsonCookie,
 }
 
 impl StringEscapes {
@@ -895,7 +920,8 @@ impl StringEscapes {
         let single_char = after.first().copied().is_some_and(is_single_char_escape);
         match self {
             Self::CodePointsOnly if single_char => None,
-            Self::All | Self::CodePointsOnly => Some(escape),
+            Self::JsonCookie if single_char && escape.0 < 0x20 => None,
+            Self::All | Self::CodePointsOnly | Self::JsonCookie => Some(escape),
         }
     }
 }

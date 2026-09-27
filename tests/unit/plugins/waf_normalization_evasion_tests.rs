@@ -437,14 +437,33 @@ async fn code_point_escapes_behind_any_backslash_run_stay_residual() {
         );
     }
 
-    // A code-point escape that yields a letter or a non-ASCII character hides
-    // nothing a signature keys on, however deep it is stacked: a `\x64`
-    // directory in a multiply-stringified Windows path, or an accented name.
+    // No serializer writes an ASCII character as a `\u` escape, so a deep
+    // `\u` escape of a keyword letter is evasion even with the punctuation
+    // left raw.
+    for depth in [8, 16] {
+        let run = "\\".repeat(depth);
+        let select = format!(r#"{{"q":"1 union {run}u0073elect 1"}}"#);
+        let script = format!(r#"{{"v":"<{run}u0073cript>"}}"#);
+        for body in [select, script] {
+            let request = scan_body(&plugin, "text/plain", body.as_bytes()).await;
+            assert!(
+                hit(&request, "FE-ENCODING-001"),
+                "{body:?} must be flagged; hits={:?}",
+                hits(&request)
+            );
+        }
+    }
+
+    // A `\x` escape of a letter, a digit, or a C1 byte, and a `\u` escape of a
+    // non-ASCII character, hide nothing a signature keys on, however deep they
+    // are stacked: `\x64` or `\x86` in a multiply-stringified Windows path, or
+    // an accented name.
     for depth in [8, 16] {
         let run = "\\".repeat(depth);
         let windows = format!(r#"{{"path":"C:{run}x64{run}bin"}}"#);
+        let release = format!(r#"{{"path":"C:{run}bin{run}x86{run}Release"}}"#);
         let accented = format!(r#"{{"name":"caf{run}u00e9"}}"#);
-        for body in [windows, accented] {
+        for body in [windows, release, accented] {
             let request = scan_body(&plugin, "text/plain", body.as_bytes()).await;
             assert!(
                 !hit(&request, "FE-ENCODING-001"),
@@ -480,10 +499,13 @@ async fn express_json_cookies_resolve_code_point_escapes() {
     let plugin = custom_rule_waf(json!([contains_rule("CK-XSS", "cookies", "<script")]));
 
     // Express `cookie-parser` percent-decodes the value, then `JSON.parse`s a
-    // value starting with `j:`, which resolves `<` to `<`.
+    // value starting with `j:`, which resolves `\u003c` to `<`. Express splits
+    // the raw crumb at its first `=` and decodes only the value, so an encoded
+    // `=` in the name does not hide the `j:` value.
     for cookie in [
         "prefs=j%3A%7B%22n%22%3A%22%5Cu003cscript%5Cu003e%22%7D",
-        r#"prefs=j:{"n":"<script>"}"#,
+        "prefs=j:{\"n\":\"\\u003cscript\\u003e\"}",
+        "a%3Db=j%3A%7B%22n%22%3A%22%5Cu003cscript%5Cu003e%22%7D",
         r#"prefs=j:{"n":"\x3cscript"}"#,
     ] {
         let (_, request) = scan_cookie(&plugin, cookie).await;
@@ -494,7 +516,7 @@ async fn express_json_cookies_resolve_code_point_escapes() {
         );
     }
 
-    // Outside a `j:` value no framework reads `<` as `<`, and a `j:`
+    // Outside a `j:` value no framework reads `\u003c` as `<`, and a `j:`
     // cookie whose escape yields an ordinary character stays clean.
     for cookie in [
         "note=%5Cu003cscript%5Cu003e",
@@ -507,6 +529,30 @@ async fn express_json_cookies_resolve_code_point_escapes() {
             hits(&request)
         );
     }
+}
+
+#[tokio::test]
+async fn express_json_cookies_resolve_quote_escapes_but_not_control_escapes() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "scan_budget_ms": 0,
+        "custom_rules": [contains_rule("CK-TAUT", "cookies", "\"1\"=\"1")]
+    }))
+    .unwrap();
+
+    // `JSON.parse` turns `\"` into `"`, so the application reads a
+    // double-quoted tautology.
+    let (_, request) = scan_cookie(&plugin, r#"prefs=j:"a\" OR \"1\"=\"1""#).await;
+    assert!(hit(&request, "CK-TAUT"), "hits={:?}", hits(&request));
+
+    // An ordinary escaped quote stays clean, and the `\n` beside it is still a
+    // backslash and an `n` rather than a line feed.
+    let (_, benign) = scan_cookie(&plugin, r#"prefs=j:"say \"hi\"\nbye""#).await;
+    assert!(
+        !hit(&benign, "CK-TAUT") && !hit(&benign, "FE-COOKIE-001"),
+        "hits={:?}",
+        hits(&benign)
+    );
 }
 
 #[tokio::test]
