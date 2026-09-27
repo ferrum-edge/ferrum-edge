@@ -4402,9 +4402,10 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   half-close cap (`FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS`), or a revocation
   resets it with `CONNECT_ERROR`, so a backend that stalls mid-response no
   longer looks like one that finished. The half-close cap runs from the
-  client's half-close regardless of activity, so it can cut a backend that is
-  still streaming its response; when the backend already finished, the
-  stream's send side is closed and nothing is reset. A revocation resets
+  first half-close on either side regardless of activity, so after a client
+  half-close it can cut a backend that is still streaming its response; when
+  the backend half-closed first, the stream's send side is already closed and
+  nothing is reset. A revocation resets
   deliberately: the fence cut a live tunnel mid-stream, and a clean close
   would present the bytes relayed so far as the complete stream. A reset is
   only possible while the stream's send side is still open, so a failure
