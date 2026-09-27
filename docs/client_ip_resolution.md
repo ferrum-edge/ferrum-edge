@@ -8,6 +8,7 @@ When Ferrum Edge sits behind load balancers, CDNs, or reverse proxies, the TCP s
 - [Canonical Client Identity](#canonical-client-identity)
 - [Original Request Scheme](#original-request-scheme)
 - [Configuration](#configuration)
+- [Inbound PROXY Protocol On HTTP/HTTPS Listeners](#inbound-proxy-protocol-on-httphttps-listeners)
 - [Security Model](#security-model)
 - [Deployment Examples](#deployment-examples)
 - [How Client IP Is Used](#how-client-ip-is-used)
@@ -158,6 +159,51 @@ The effective header name is gateway-owned client-attribution state. Ferrum reje
 
 Values must contain exactly one parseable IP address or one parseable socket address whose host is an IP. Whitespace is trimmed, accepted values are normalized with Rust's `IpAddr` formatter, and any source port is discarded before the value is used in plugin context, rate-limit keys, and logs. For example, `2001:0db8:0000::0001` is stored as `2001:db8::1`, and CloudFront's `198.51.100.10:46532` is stored as `198.51.100.10`.
 
+## Inbound PROXY Protocol On HTTP/HTTPS Listeners
+
+An L4 load balancer (AWS NLB, GCP TCP/SSL proxy, HAProxy in `mode tcp`, MetalLB behind a TCP proxy) forwards the client's TCP stream without terminating it, so it cannot add `X-Forwarded-For` — least of all to TLS it cannot decrypt. It carries the client address in a [PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) v1/v2 header written before the first application byte instead. Ferrum reads that header on the process-global proxy listeners when you opt in per listener:
+
+```bash
+FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS=v2          # off | v1 | v2 | auto
+FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP=off           # plaintext listener left unchanged
+FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS=10.0.0.0/16   # the NLB's subnets
+```
+
+On an enabled listener the header is **required** — there is no optional mode:
+
+| Connection | Result |
+|---|---|
+| Socket peer outside `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS` | Dropped at accept, before any byte is read |
+| Trusted peer, valid header of an accepted version | Header consumed; its source address becomes the connection's client address |
+| Trusted peer, `LOCAL` command or `UNKNOWN` / `AF_UNSPEC` / `AF_UNIX` family (load-balancer health checks) | Header consumed; the load balancer's socket address stays the client address |
+| Trusted peer, no header, malformed header, header of the other version (`v1` / `v2` modes), or header not complete within 5 seconds | Closed with no response |
+
+The header is consumed before the TLS ClientHello on the HTTPS listener and before HTTP parsing on the plaintext one; the frontend TLS handshake timeout and the HTTP header-read timeout start only afterwards. Header size is capped by the shared stream-proxy parser (a 107-byte v1 line, a 512-byte v2 address block).
+
+The two windows run back to back per connection, not as one shared deadline: a trusted peer gets up to 5 seconds to finish the PROXY header, and then the full `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` (HTTPS) or `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` (plaintext) window. With the 10-second defaults, one HTTPS connection can therefore stay open for up to 15 seconds before its TLS handshake completes. Only peers in `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS` get the first window; everyone else is dropped at accept.
+
+### Precedence with `FERRUM_TRUSTED_PROXIES`
+
+The PROXY source address **replaces the socket peer** for the whole connection. Everything that would have used the socket peer uses it instead: the three-step resolution in [How It Works](#how-it-works), the outbound `X-Forwarded-For` hop, per-IP limits, IP plugins, and logs. In particular:
+
+1. `FERRUM_TRUSTED_PROXIES` is evaluated against the **PROXY source**, exactly as if the client had connected directly. An inbound `X-Forwarded-For` / `FERRUM_REAL_IP_HEADER` / `X-Forwarded-Proto` is believed only when that source is itself trusted — for example a CDN whose egress ranges you list in `FERRUM_TRUSTED_PROXIES`, sitting in front of the L4 load balancer.
+2. The load balancer's own address is never the forwarding peer. Listing it in `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS` only authorizes its PROXY header; it does not make any `X-Forwarded-For` believable, and it does not need to be in `FERRUM_TRUSTED_PROXIES`. (For a `LOCAL` health check the load balancer remains the peer, so `FERRUM_TRUSTED_PROXIES` applies to it as usual.)
+3. An IPv4-mapped IPv6 source (`::ffff:a.b.c.d`) is folded to native IPv4, like every other [canonical identity](#canonical-client-identity).
+
+```
+Client (203.0.113.50) → AWS NLB (10.0.4.17, PROXY v2) → Gateway HTTPS listener
+FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS=v2
+FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS=10.0.0.0/16
+```
+
+Result: the header names `203.0.113.50`, which becomes the client IP. A client-supplied `X-Forwarded-For: 198.51.100.1` is discarded because `203.0.113.50` is not in `FERRUM_TRUSTED_PROXIES`, and the backend receives `X-Forwarded-For: 203.0.113.50`.
+
+### Scope
+
+- Only the global `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT` listeners in `database`, `file`, and `dp` modes; enabling it in another mode fails startup. Gateway API listener ports (`listen_port` on HTTP-family proxies) and mesh listeners never read a PROXY header, and the per-proxy `stream_proxy_protocol` field stays stream-only.
+- HTTP/1.1 and HTTP/2 over TCP only. HTTP/3 (QUIC) has no standard PROXY carriage; the QUIC listener on the HTTPS port keeps using its UDP socket peer. With `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS` and `FERRUM_ENABLE_HTTP3` both enabled, HTTPS responses still advertise `h3` in `Alt-Svc`, so clients that switch to QUIC are identified by the UDP peer — the load balancer's address, unless it preserves the client IP for UDP. Either disable HTTP/3, or make sure the load balancer preserves the client source address on the UDP path (for example an AWS NLB UDP listener with client IP preservation).
+- Stream proxies keep their own per-proxy `stream_proxy_protocol` setting, trusted through `FERRUM_TRUSTED_PROXIES` (see [tcp_udp_proxy.md](tcp_udp_proxy.md)).
+
 ## Security Model
 
 The client IP resolution follows these security principles:
@@ -288,6 +334,12 @@ The resolved client IP (`ctx.client_ip`) is used throughout the gateway. It is a
 | **Forwarded (outbound, RFC 7239)** | `for=` carries the resolved client IP when `FERRUM_ADD_FORWARDED_HEADER` is enabled; client-supplied `Forwarded` is discarded so only the gateway-owned element reaches backends |
 
 ## Troubleshooting
+
+### Every connection is closed after enabling inbound PROXY protocol
+
+**Cause**: The load balancer's header is rejected. Look for the sampled warning `Closing connection: inbound PROXY protocol is required on this listener but the connection did not start with an accepted PROXY header` and read its `error` field. A common case is a v2 header whose address block exceeds the 512-byte cap (the `V2LengthExceeded` error, logged as `PROXY v2 address block length <N> exceeds safety cap`): large TLVs such as HAProxy `send-proxy-v2-ssl` / `send-proxy-v2-ssl-cn` with a long client-certificate subject push every header past it, so every connection is closed. Other `error` values name a wrong version (`v1` / `v2` mode), a malformed header, or a header that did not arrive within 5 seconds. A warning saying the socket peer is not in `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS` means the load balancer's own source address is missing from that list.
+
+**Fix**: Configure the load balancer to send a plain PROXY header without the SSL/certificate TLVs (for example HAProxy `send-proxy-v2` instead of `send-proxy-v2-ssl*`), match the version to the configured mode (or use `auto`), and list the load balancer's source addresses in `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS`.
 
 ### Client IP is always the load balancer's IP
 

@@ -62,6 +62,32 @@ pub enum ProxyProtocolResult {
     NoAddress,
 }
 
+/// Which PROXY protocol versions one listener accepts.
+///
+/// Stream proxies accept either version ([`read_proxy_header`]). The
+/// process-global HTTP/HTTPS listeners can be pinned to one version
+/// (`FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` / `_HTTPS` = `v1` / `v2`), in which
+/// case a header of the other version is refused exactly like a malformed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptedProxyVersions {
+    /// Only the v1 text header (`PROXY TCP4 ...\r\n`).
+    V1Only,
+    /// Only the v2 binary header.
+    V2Only,
+    /// Either version, auto-detected from the first bytes.
+    Any,
+}
+
+impl AcceptedProxyVersions {
+    fn allows_v1(self) -> bool {
+        matches!(self, Self::V1Only | Self::Any)
+    }
+
+    fn allows_v2(self) -> bool {
+        matches!(self, Self::V2Only | Self::Any)
+    }
+}
+
 /// Maximum in-memory PROXY header size accepted by [`parse_proxy_protocol_header_bytes`].
 #[cfg(feature = "fuzzing")]
 pub(crate) const PROXY_PROTOCOL_MAX_HEADER_BYTES: usize = {
@@ -98,6 +124,9 @@ pub enum ProxyProtocolError {
     /// Read timeout waiting for the PROXY header bytes.
     #[error("timeout reading PROXY protocol header")]
     Timeout,
+    /// A well-formed signature for a PROXY version this listener does not accept.
+    #[error("PROXY protocol {0} header is not accepted on this listener")]
+    VersionNotAccepted(&'static str),
 }
 
 // PROXY v2 signature: 12-byte fixed prefix. Keep byte-identical to
@@ -136,15 +165,35 @@ pub async fn read_proxy_header<R>(
 where
     R: AsyncRead + Unpin,
 {
+    read_proxy_header_accepting(stream, timeout_secs, AcceptedProxyVersions::Any).await
+}
+
+/// [`read_proxy_header`] restricted to the `accepted` PROXY versions.
+///
+/// The version is decided from the first six bytes, before any
+/// version-specific bytes are consumed, so a refused version never reads past
+/// the signature prefix. The header-size caps and the whole-read timeout are
+/// the same as [`read_proxy_header`]'s.
+pub async fn read_proxy_header_accepting<R>(
+    stream: &mut R,
+    timeout_secs: Option<u64>,
+    accepted: AcceptedProxyVersions,
+) -> Result<ProxyProtocolResult, ProxyProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
     let secs = timeout_secs.unwrap_or(5);
-    let fut = parse_proxy_header(stream);
+    let fut = parse_proxy_header(stream, accepted);
     match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
         Ok(result) => result,
         Err(_elapsed) => Err(ProxyProtocolError::Timeout),
     }
 }
 
-async fn parse_proxy_header<R>(stream: &mut R) -> Result<ProxyProtocolResult, ProxyProtocolError>
+async fn parse_proxy_header<R>(
+    stream: &mut R,
+    accepted: AcceptedProxyVersions,
+) -> Result<ProxyProtocolResult, ProxyProtocolError>
 where
     R: AsyncRead + Unpin,
 {
@@ -153,9 +202,15 @@ where
     stream.read_exact(&mut prefix).await?;
 
     if &prefix == V1_PREFIX {
+        if !accepted.allows_v1() {
+            return Err(ProxyProtocolError::VersionNotAccepted("v1"));
+        }
         // PROXY v1 text format: "PROXY <PROTO> <SRC> <DST> <SRC_PORT> <DST_PORT>\r\n"
         parse_v1(stream, &prefix).await
     } else if prefix[..] == V2_SIG[..6] {
+        if !accepted.allows_v2() {
+            return Err(ProxyProtocolError::VersionNotAccepted("v2"));
+        }
         // PROXY v2 binary format: 12-byte signature then 4-byte fixed header.
         parse_v2(stream, &prefix).await
     } else {

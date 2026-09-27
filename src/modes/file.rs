@@ -763,6 +763,11 @@ pub async fn serve(
         config.consumers.len()
     );
 
+    // Inbound PROXY protocol policy per global proxy listener (issue #5768).
+    // Resolved before anything is spawned so a refusal leaves nothing behind.
+    let proxy_protocol = proxy::frontend_proxy_protocol::global_listener_policies(&env_config)
+        .map_err(anyhow::Error::msg)?;
+
     // Open the observability delivery lifecycle for this serving cycle before
     // plugin activation registers any queue worker. A previous in-process
     // cycle that already drained leaves its generation permanently closed, so
@@ -1368,10 +1373,13 @@ pub async fn serve(
         bound.proxy_http = listener.local_addr().ok();
         let st = proxy_state.clone();
         let sh = shutdown_tx.subscribe();
+        let pp = proxy_protocol.http.clone();
         let h = tokio::spawn(async move {
-            proxy::start_proxy_listener_with_bound_listener(listener, st, sh, None)
-                .await
-                .context("HTTP proxy listener failed")
+            proxy::start_proxy_listener_with_bound_listener_and_proxy_protocol(
+                listener, st, sh, None, pp,
+            )
+            .await
+            .context("HTTP proxy listener failed")
         });
         handles.push(("HTTP proxy listener".to_string(), h));
         // Pre-bound listener is already accepting — no startup signal needed.
@@ -1381,6 +1389,7 @@ pub async fn serve(
         let st = proxy_state.clone();
         let sh = shutdown_tx.subscribe();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let pp = proxy_protocol.http.clone();
         let h = tokio::spawn(async move {
             info!(
                 "Starting HTTP proxy listener on {}",
@@ -1390,11 +1399,12 @@ pub async fn serve(
                     &http_addr.to_string(),
                 ))
             );
-            proxy::start_proxy_listener_with_tls_and_signal(
+            proxy::start_global_proxy_listener_with_tls_and_signal(
                 http_addr,
                 st,
                 sh,
                 None,
+                pp,
                 Some(started_tx),
             )
             .await
@@ -1416,10 +1426,13 @@ pub async fn serve(
             let st = proxy_state.clone();
             let sh = shutdown_tx.subscribe();
             let cfg = Some(tls_cfg_arc.clone());
+            let pp = proxy_protocol.https.clone();
             let h = tokio::spawn(async move {
-                proxy::start_proxy_listener_with_bound_listener(listener, st, sh, cfg)
-                    .await
-                    .context("HTTPS proxy listener failed")
+                proxy::start_proxy_listener_with_bound_listener_and_proxy_protocol(
+                    listener, st, sh, cfg, pp,
+                )
+                .await
+                .context("HTTPS proxy listener failed")
             });
             handles.push(("HTTPS proxy listener".to_string(), h));
         } else if env_config.proxy_https_port != 0 {
@@ -1432,6 +1445,7 @@ pub async fn serve(
                 .as_ref()
                 .and_then(|h| h.slot.clone());
             let cfg = Some(tls_cfg_arc.clone());
+            let pp = proxy_protocol.https.clone();
             let h = tokio::spawn(async move {
                 info!(
                     "Starting HTTPS proxy listener on {}",
@@ -1442,20 +1456,22 @@ pub async fn serve(
                     ))
                 );
                 let result = if let Some(slot) = reload_slot {
-                    proxy::start_proxy_listener_with_dynamic_tls_and_signal(
+                    proxy::start_global_proxy_listener_with_dynamic_tls_and_signal(
                         https_addr,
                         st,
                         sh,
                         slot,
+                        pp,
                         Some(started_tx),
                     )
                     .await
                 } else {
-                    proxy::start_proxy_listener_with_tls_and_signal(
+                    proxy::start_global_proxy_listener_with_tls_and_signal(
                         https_addr,
                         st,
                         sh,
                         cfg,
+                        pp,
                         Some(started_tx),
                     )
                     .await

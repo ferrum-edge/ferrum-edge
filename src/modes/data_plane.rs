@@ -32,6 +32,11 @@ pub async fn run(
 ) -> Result<(), anyhow::Error> {
     info!("DP mode: starting with empty config, waiting for CP");
 
+    // Inbound PROXY protocol policy per global proxy listener (issue #5768).
+    // Resolved before anything is spawned so a refusal leaves nothing behind.
+    let proxy_protocol = proxy::frontend_proxy_protocol::global_listener_policies(&env_config)
+        .map_err(anyhow::Error::msg)?;
+
     // Bounded last-known-good configuration age (issue #3726). Installed before
     // anything can accept a snapshot or report readiness, so the very first
     // CP event is already accounted for. The action string was validated in
@@ -540,6 +545,7 @@ pub async fn run(
         let (http_started_tx, http_started_rx) = tokio::sync::oneshot::channel();
         let http_startup_ready = startup_ready.clone();
         let http_serving_degraded = serving_degraded.clone();
+        let http_proxy_protocol = proxy_protocol.http.clone();
         let http_handle = tokio::spawn(async move {
             info!(
                 "Starting HTTP proxy listener on {}",
@@ -549,11 +555,12 @@ pub async fn run(
                     &http_addr.to_string(),
                 ))
             );
-            if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
+            if let Err(e) = proxy::start_global_proxy_listener_with_tls_and_signal(
                 http_addr,
                 http_state,
                 http_shutdown,
                 None,
+                http_proxy_protocol,
                 Some(http_started_tx),
             )
             .await
@@ -586,6 +593,7 @@ pub async fn run(
         let (https_started_tx, https_started_rx) = tokio::sync::oneshot::channel();
         let https_startup_ready = startup_ready.clone();
         let https_serving_degraded = serving_degraded.clone();
+        let https_proxy_protocol = proxy_protocol.https.clone();
         let https_handle = tokio::spawn(async move {
             info!(
                 "Starting HTTPS proxy listener on {}",
@@ -595,11 +603,12 @@ pub async fn run(
                     &https_addr.to_string(),
                 ))
             );
-            if let Err(e) = proxy::start_proxy_listener_with_dynamic_tls_and_signal(
+            if let Err(e) = proxy::start_global_proxy_listener_with_dynamic_tls_and_signal(
                 https_addr,
                 https_state,
                 https_shutdown,
                 tls_slot,
+                https_proxy_protocol,
                 Some(https_started_tx),
             )
             .await

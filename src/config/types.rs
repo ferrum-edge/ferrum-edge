@@ -5402,13 +5402,17 @@ impl GatewayConfig {
             // `stream_proxy_protocol` is valid on every stream family, with two
             // different framings: the connection-borne PROXY header on
             // tcp/tcp_tls, and the per-datagram PROXY v2 DGRAM envelope on
-            // udp/dtls (issue #3289). HTTP proxies use XFF instead and are
-            // still rejected.
+            // udp/dtls (issue #3289). HTTP-family proxies share the global
+            // HTTP/HTTPS listeners, so one proxy cannot decide how a listener
+            // reads its first bytes: inbound PROXY protocol for those is the
+            // listener-level `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` / `_HTTPS`
+            // setting (issue #5768), and the per-proxy flag stays rejected.
             if proxy.stream_proxy_protocol == Some(true) && !proxy.dispatch_kind.is_stream() {
                 errors.push(format!(
-                    "Proxy {:?} (scheme {}) sets stream_proxy_protocol but PROXY protocol is only \
-                     valid for tcp/tcp_tls/udp/dtls stream proxies — HTTP-family proxies resolve \
-                     the client IP from X-Forwarded-For",
+                    "Proxy {:?} (scheme {}) sets stream_proxy_protocol but that field is only \
+                     valid for tcp/tcp_tls/udp/dtls stream proxies — for HTTP-family proxies \
+                     enable inbound PROXY protocol on the listener with \
+                     FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP / FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS",
                     proxy.id,
                     proxy.scheme_display()
                 ));
@@ -7929,16 +7933,18 @@ impl Proxy {
         let effective_scheme = self.effective_scheme();
         let is_stream_proxy = effective_scheme.is_stream();
 
-        // Inbound PROXY protocol is a stream-family control: the connection
-        // header on tcp/tcps, the per-datagram DGRAM envelope on udp/dtls
-        // (issue #3289). Enforced here (single-proxy admin writes: POST/PUT
-        // /proxies and the API-spec proxy path) in addition to
-        // `GatewayConfig::validate_stream_proxies`, so a bad row can never
-        // persist and then wedge the next full-config load/reconcile.
+        // Per-proxy inbound PROXY protocol is a stream-family control: the
+        // connection header on tcp/tcps, the per-datagram DGRAM envelope on
+        // udp/dtls (issue #3289). HTTP-family proxies get it from the global
+        // listener setting instead (issue #5768). Enforced here (single-proxy
+        // admin writes: POST/PUT /proxies and the API-spec proxy path) in
+        // addition to `GatewayConfig::validate_stream_proxies`, so a bad row
+        // can never persist and then wedge the next full-config load/reconcile.
         if self.stream_proxy_protocol == Some(true) && !is_stream_proxy {
             errors.push(
                 "stream_proxy_protocol is only valid for tcp/tcps/udp/dtls stream proxies \
-                 (HTTP-family proxies resolve the client IP from X-Forwarded-For)"
+                 (for HTTP-family proxies enable inbound PROXY protocol on the listener with \
+                 FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP / FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS)"
                     .to_string(),
             );
         }
