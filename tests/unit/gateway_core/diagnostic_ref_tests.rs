@@ -1439,6 +1439,81 @@ async fn origin_representations_are_never_recorded_as_rejections() {
     assert!(slot.rejection().is_none(), "a serverless function's 502");
 }
 
+// An origin-authored representation a plugin replayed (a `response_caching`
+// HIT of a stored backend `502`) is never stamped, in `errors` mode as in
+// `all`, even when it carries an `X-Gateway-Error` token (issue #5860). A
+// gateway-authored `502` on an unmarked slot still is, on every protocol.
+#[test]
+fn origin_representations_are_never_stamped_in_any_mode() {
+    let protocols = [
+        DiagnosticProtocol::Http1,
+        DiagnosticProtocol::Http2,
+        DiagnosticProtocol::Http3,
+    ];
+    for store in [default_store(), all_mode_store()] {
+        let mode = store.mode();
+        for protocol in protocols {
+            let replayed = DiagnosticSlot::shared();
+            replayed.note_rejecting_plugin("response_caching");
+            replayed.note_origin_response();
+            let mut headers = gateway_error_headers("backend_error");
+            headers.insert(DIAGNOSTIC_REF_HEADER, UNKNOWN_REF.parse().unwrap());
+            let stamped =
+                stamp_response_headers(&store, Some(&replayed), protocol, 502, &mut headers);
+            assert!(stamped.is_none(), "{mode:?}/{protocol:?}: a cached 502");
+            assert!(
+                !headers.contains_key(DIAGNOSTIC_REF_HEADER),
+                "{mode:?}/{protocol:?}: the forged copy is still stripped"
+            );
+            assert!(headers.contains_key("x-gateway-error"));
+            assert_eq!(replayed.minted_ref(), None);
+
+            let generated = DiagnosticSlot::shared();
+            let mut headers = gateway_error_headers("connection_failure");
+            let stamped =
+                stamp_response_headers(&store, Some(&generated), protocol, 502, &mut headers);
+            assert!(
+                stamped.is_some(),
+                "{mode:?}/{protocol:?}: a gateway-generated 502 is referenced"
+            );
+        }
+        assert_eq!(store.minted_total(), protocols.len() as u64, "{mode:?}");
+    }
+}
+
+// A replay the request itself marks (an idempotent replay, a serverless
+// terminate reply) reaches the stamp through the rejection-log funnel, which
+// carries the marker into the slot whatever the status and mode.
+#[tokio::test]
+async fn rejection_funnel_carries_request_origin_markers_into_the_slot() {
+    use ferrum_edge::_test_support::set_serverless_terminate_response_for_test;
+
+    let store = default_store();
+    for status in [502u16, 404] {
+        let slot = DiagnosticSlot::shared();
+        let mut ctx = context_with_slot(&slot);
+        set_serverless_terminate_response_for_test(&mut ctx, true);
+        log_rejection(&ctx, status, "before_proxy").await;
+        assert!(slot.serves_origin_response(), "{status}");
+        assert!(slot.rejection().is_none(), "{status}");
+        let mut headers = gateway_error_headers("backend_error");
+        let stamped = stamp_response_headers(
+            &store,
+            Some(&slot),
+            DiagnosticProtocol::Http2,
+            status,
+            &mut headers,
+        );
+        assert!(stamped.is_none(), "{status}");
+    }
+    // An ordinary gateway rejection leaves the slot unmarked.
+    let slot = DiagnosticSlot::shared();
+    let ctx = context_with_slot(&slot);
+    log_rejection(&ctx, 503, "circuit_breaker_open").await;
+    assert!(!slot.serves_origin_response());
+    assert_eq!(store.minted_total(), 0);
+}
+
 #[tokio::test]
 async fn origin_response_plugins_declare_it() {
     let caching = ferrum_edge::plugins::create_plugin("response_caching", &serde_json::json!({}))
