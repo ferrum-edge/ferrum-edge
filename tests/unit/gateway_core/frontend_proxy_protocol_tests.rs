@@ -679,7 +679,10 @@ async fn start_dynamic_tls_gateway(
     let policy = global_listener_policies(&env)
         .expect("valid PROXY protocol policies")
         .https;
-    assert!(policy.is_some(), "the HTTPS listener enables PROXY protocol");
+    assert!(
+        policy.is_some(),
+        "the HTTPS listener enables PROXY protocol"
+    );
     let state = proxy_state(backend_port, env);
     let slot: SharedFrontendTls = Arc::new(ArcSwap::new(Arc::new(Some(tls_config))));
 
