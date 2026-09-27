@@ -122,6 +122,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already reported its failures, so nothing retried it. The task now retries
   that bind the same way, with its own 2-second budget. A listener shut down
   while it waits stops at once, so removing or replacing it is never delayed.
+- A UDP/DTLS stream listener whose own bind gave up after that 2-second budget
+  is retried as soon as the QUIC half on its port closes, even when the QUIC
+  socket closed just before the listener reported the failure (#5855). The
+  stream listener manager could judge that close before the failure was
+  recorded, so the port waited for the 30-second retry. The listener task now
+  checks for such a close after it records its failure and asks for a new
+  reconcile itself, which restarts the listener even if its task has not
+  finished exiting yet.
 
 ### Security
 
