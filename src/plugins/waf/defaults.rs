@@ -420,8 +420,8 @@ pub fn default_rules() -> Vec<WafRule> {
         // every server framework that binds them to handler parameters.
         // `FE-SQLI-003-C` needs a `;`, and the Cookie header is split into
         // crumbs on `;` before matching, so a raw crumb never contains one:
-        // the rule fires on a percent-encoded `%3B` once cookie values are
-        // also scanned in decoded form. ---
+        // the rule fires on a percent-encoded `%3B` through the decoded
+        // cookie views. ---
         rp("FE-SQLI-001-C", "UNION SELECT SQL injection (cookie)", "sqli", Severity::High, RuleTarget::Cookies, SQLI_UNION_SELECT, 1),
         rp("FE-SQLI-002-C", "Boolean tautology SQL injection (cookie)", "sqli", Severity::High, RuleTarget::Cookies, SQLI_BOOLEAN_TAUTOLOGY, 1),
         rp("FE-SQLI-003-C", "Stacked SQL statement (cookie)", "sqli", Severity::High, RuleTarget::Cookies, SQLI_STACKED_STATEMENT, 1),
