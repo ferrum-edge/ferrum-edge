@@ -2692,6 +2692,13 @@ static DIAGNOSTIC_REF_LOOKUP_AUDIT: crate::diagnostic_ref::DiagnosticRefLookupAu
 /// WARN, visible at the default log level; `403` and `429` events are
 /// throttled to one per second each, carrying how many were suppressed.
 ///
+/// A replica-tagged (`fd2_`) reference minted by another gateway process
+/// (issue #5846) answers the same `404` status and body as a miss. When the
+/// caller passed every check a `200` here would need (scope, `ns` binding, and
+/// this process's namespace), the `404` also carries
+/// `X-Ferrum-Diagnostic-Owner-Replica` naming the replica id the reference
+/// embeds, so operator tooling can route the lookup to that process.
+///
 /// `diagnostics_read_granted` comes from the claims the main admin gate
 /// already verified for this request; the token is not verified twice.
 fn diagnostic_ref_lookup_response(
@@ -2736,10 +2743,12 @@ fn diagnostic_ref_lookup_response(
                 &json!({"error": "Diagnostic reference could not be rendered"}),
             ),
         },
-        DiagnosticRefLookup::NotFound => json_response(
-            StatusCode::NOT_FOUND,
-            &json!({"error": "Diagnostic reference not found"}),
-        ),
+        DiagnosticRefLookup::NotFound => diagnostic_ref_not_found_response(),
+        DiagnosticRefLookup::NotOwned(owner) => {
+            let mut response = diagnostic_ref_not_found_response();
+            crate::diagnostic_ref::insert_owner_hint(response.headers_mut(), owner);
+            response
+        }
         DiagnosticRefLookup::MissingScope => json_response(
             StatusCode::FORBIDDEN,
             &json!({"error": "Diagnostic reference lookups require the `diagnostics:read` \
@@ -2761,6 +2770,14 @@ fn diagnostic_ref_lookup_response(
             response
         }
     }
+}
+
+/// The one `404` every unresolved diagnostic reference lookup answers.
+fn diagnostic_ref_not_found_response() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::NOT_FOUND,
+        &json!({"error": "Diagnostic reference not found"}),
+    )
 }
 
 /// `401` response for `/metrics` when the caller is not authorized to scrape.

@@ -2500,6 +2500,22 @@ paths:
         `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` references (oldest evicted first).
         Query the admin listener of that same process.
 
+        **Across replicas.** With `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true`
+        (issue #5846), references take the form `fd2_` plus the minting
+        process's replica id (8 lowercase hex digits, 32 bits drawn from the
+        process CSPRNG at startup and derived from no host, pod, or address),
+        `_`, and 32 lowercase hex digits. The owning process's `200` body adds
+        `replica_id`. Another process answers such a reference with the same
+        `404` and body as any miss, plus the `X-Ferrum-Diagnostic-Owner-Replica`
+        header naming the owner, and only for a caller whose token carries
+        `diagnostics:read` and an `ns` claim naming the answering process's
+        namespace. The owner is read from the reference itself; the answering
+        process never learns whether the owner exists or still holds it. The
+        control plane does not proxy lookups: send the lookup to the replica
+        whose startup log or `ferrum_diagnostic_ref_replica_info{replica_id}`
+        metric names that id. `fd1_` references keep resolving on the untagged
+        process that minted them.
+
         **Authorization.** A valid admin JWT is required (`401` otherwise), and
         it must carry both the `diagnostics:read` scope (a `scope` claim that is
         an OAuth 2.0 space-delimited string or an array of strings; the admin
@@ -2536,7 +2552,9 @@ paths:
         - name: ref
           in: path
           required: true
-          description: The `X-Ferrum-Diagnostic-Ref` value.
+          description: |
+            The `X-Ferrum-Diagnostic-Ref` value: `fd1_<32 hex>`, or
+            `fd2_<8 hex replica id>_<32 hex>` from a replica-tagged gateway.
           schema:
             type: string
       responses:
@@ -2641,8 +2659,23 @@ paths:
         "404":
           description: |
             Malformed, unknown, expired, or evicted reference; a reference
-            outside the token's namespaces; or diagnostic references are off.
-            All cases answer identically.
+            outside the token's namespaces; a replica-tagged reference another
+            gateway process minted; or diagnostic references are off. All cases
+            answer with the same status and body.
+          headers:
+            X-Ferrum-Diagnostic-Owner-Replica:
+              description: |
+                Replica id read from the caller's replica-tagged (`fd2_`)
+                reference when it names a replica other than this gateway
+                process. Any well-formed foreign tag is echoed, including a
+                stale or forged one: the gateway does not check that the named
+                replica exists. Sent only on that miss, and only
+                when the token carries `diagnostics:read` and an `ns` claim
+                naming this gateway's namespace. Never sent with any other
+                status.
+              schema:
+                type: string
+                pattern: "^[0-9a-f]{8}$"
           content:
             application/json:
               schema:
@@ -37554,8 +37587,15 @@ components:
           enum: [ferrum.diagnostic_ref.v1]
         ref:
           type: string
-          pattern: "^fd1_[0-9a-f]{32}$"
+          pattern: "^(fd1_[0-9a-f]{32}|fd2_[0-9a-f]{8}_[0-9a-f]{32})$"
           description: The resolved reference.
+        replica_id:
+          type: string
+          pattern: "^[0-9a-f]{8}$"
+          description: |
+            Replica id of the gateway process that minted a replica-tagged
+            (`fd2_`) reference (`FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true`).
+            Absent for `fd1_` references.
         namespace:
           type: string
           description: Data-plane namespace of the gateway that minted the reference.

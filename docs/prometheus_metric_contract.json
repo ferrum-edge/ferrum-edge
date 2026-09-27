@@ -1699,6 +1699,18 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_diagnostic_ref_replica_info",
+    "type": "gauge",
+    "help": "Replica id this gateway process embeds in its diagnostic references (value is always 1).",
+    "labels": [
+      "replica_id"
+    ],
+    "subsystem": "diagnostic_refs",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_diagnostic_refs_entries",
     "type": "gauge",
     "help": "Diagnostic references currently retained in the bounded in-memory store.",

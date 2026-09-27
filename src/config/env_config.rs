@@ -3093,6 +3093,11 @@ pub struct EnvConfig {
     /// Admin `GET /diagnostics/v1/refs/{ref}` lookups admitted per second.
     /// Default: 10.
     pub diagnostic_ref_lookup_rate_per_second: u32,
+    /// Embed this process's random replica id in every diagnostic reference
+    /// (`fd2_<replica>_<32 hex>`) so a lookup on another replica can name the
+    /// owner (`FERRUM_DIAGNOSTIC_REF_REPLICA_TAG`, issue #5846). Default:
+    /// `false` (untagged `fd1_` references that embed nothing).
+    pub diagnostic_ref_replica_tag: bool,
     /// Disable admin TLS certificate verification (for testing only)
     pub admin_tls_no_verify: bool,
 
@@ -4262,6 +4267,7 @@ impl Default for EnvConfig {
             diagnostic_ref_max_entries: crate::diagnostic_ref::DEFAULT_MAX_ENTRIES,
             diagnostic_ref_lookup_rate_per_second:
                 crate::diagnostic_ref::DEFAULT_LOOKUP_RATE_PER_SECOND,
+            diagnostic_ref_replica_tag: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
             stream_gateway_ref: None,
@@ -4554,6 +4560,7 @@ impl EnvConfig {
                     crate::diagnostic_ref::MIN_LOOKUP_RATE_PER_SECOND,
                     crate::diagnostic_ref::MAX_LOOKUP_RATE_PER_SECOND
                 );
+            diagnostic_ref_replica_tag: bool = "FERRUM_DIAGNOSTIC_REF_REPLICA_TAG" => false;
         }
         // Unknown values fail closed: a typo must neither disable nor widen
         // which responses carry a diagnostic reference.
@@ -5785,6 +5792,7 @@ impl EnvConfig {
             diagnostic_ref_ttl_seconds,
             diagnostic_ref_max_entries,
             diagnostic_ref_lookup_rate_per_second,
+            diagnostic_ref_replica_tag,
             admin_tls_no_verify,
             enable_http3,
             http3_idle_timeout,
