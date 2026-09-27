@@ -180,11 +180,26 @@ impl Waf {
                     continue;
                 }
                 let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
-                self.scan_query_pair(&mut outcome, raw_k, raw_v, subject);
+                // Exclusions name the parameter as the application reads it:
+                // the single percent-decode of the key, the same primary view
+                // a backend's query parser produces. Only decoded when some
+                // rule excludes query parameters; otherwise no rule compares
+                // the name.
+                let name = if self.compiled.query_exclusions_active {
+                    normalize::query_component_name(raw_k)
+                } else {
+                    Cow::Borrowed(raw_k)
+                };
+                self.scan_query_pair(&mut outcome, raw_k, raw_v, &name, subject);
             }
         } else {
+            // Materialized keys are already decoded: they are the names as
+            // the application reads them. Decoding one again would let a
+            // stored `%68tml` (sent as `%2568tml`) match an `html` exclusion
+            // that the whole-URL re-check, which compares these keys as they
+            // are, does not honour.
             for (key, value) in &ctx.query_params {
-                self.scan_query_pair(&mut outcome, key, value, subject);
+                self.scan_query_pair(&mut outcome, key, value, key, subject);
             }
         }
 
@@ -598,6 +613,7 @@ impl Waf {
         outcome: &mut ScanOutcome,
         raw_key: &str,
         raw_value: &str,
+        name: &str,
         subject: ScanSubject<'_>,
     ) {
         // One shared decode: split components are already isolated, then
@@ -607,11 +623,7 @@ impl Waf {
         // second, weaker decode of the already-normalized string.
         let key_views = normalize::canonical_query_component_views(raw_key);
         let value_views = normalize::canonical_query_component_views(raw_value);
-        // Exclusions name the parameter as the application reads it: the
-        // single percent-decode of the key, the same primary view a backend's
-        // query parser produces.
-        let name = normalize::query_component_name(raw_key);
-        let field = Field::QueryParam(name.as_ref());
+        let field = Field::QueryParam(name);
         for key in key_views.iter() {
             self.scan_text_set(
                 outcome,

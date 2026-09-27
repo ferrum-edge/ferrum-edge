@@ -525,6 +525,82 @@ async fn excluded_cookies_are_skipped_by_name() {
     assert!(listed(&request, "waf.rule_hits", "CK-MARKER"));
 }
 
+fn cookie_marker_waf(overrides: Value) -> Waf {
+    waf(json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CK-MARKER",
+            "category": "custom",
+            "target": "cookies",
+            "match_kind": "contains",
+            "pattern": "blocked-marker",
+            "action": "enforce"
+        }],
+        "rule_overrides": overrides
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_cookie_exclusion_covers_the_decoded_views_of_that_cookie() {
+    // The raw crumb holds `blocked%2Dmarker`, so only its percent-decoded view
+    // contains the pattern.
+    let strict = cookie_marker_waf(json!({}));
+    let (result, request) = with_header(&strict, "cookie", "prefs=blocked%2Dmarker").await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "baseline: the decoded view matches"
+    );
+    assert!(listed(&request, "waf.rule_hits", "CK-MARKER"));
+
+    let plugin = cookie_marker_waf(json!({
+        "CK-MARKER": { "exclude": { "cookies": ["prefs"] } }
+    }));
+    let (result, request) = with_header(&plugin, "cookie", "prefs=blocked%2Dmarker").await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{:?}",
+        meta(&request, "waf.rule_hits")
+    );
+
+    // The name comes from the raw crumb, never from a decoded view: the
+    // decoded `prefs==blocked-marker` must not borrow the `prefs` exclusion
+    // for a crumb whose raw name is `prefs%3D`.
+    let (result, request) = with_header(&plugin, "cookie", "prefs%3D=blocked%2Dmarker").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "CK-MARKER"));
+}
+
+#[tokio::test]
+async fn materialized_query_names_are_compared_as_stored() {
+    // Without a raw query string the scan reads the parsed map, whose keys are
+    // already decoded.
+    let plugin = recommended_with_overrides(json!({
+        "FE-XSS-001": { "exclude": { "query_params": ["html"] } }
+    }));
+
+    let mut request = ctx("GET", "/search");
+    request
+        .query_params
+        .insert("html".into(), "<script>widget()</script>".into());
+    let result = plugin.authorize(&mut request).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{:?}",
+        meta(&request, "waf.rule_hits")
+    );
+
+    // A stored `%68tml` is not decoded a second time into `html`.
+    let mut request = ctx("GET", "/search");
+    request
+        .query_params
+        .insert("%68tml".into(), "<script>".into());
+    let result = plugin.authorize(&mut request).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-XSS-001"));
+}
+
 #[test]
 fn exclusions_are_validated_against_the_rule_target() {
     let wrong_kind = waf(json!({

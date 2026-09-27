@@ -118,26 +118,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mesh listeners are not covered. Startup fails if the trusted list is empty,
   malformed, or covers a whole address family while a listener enables the
   setting.
-- WAF `detection_paranoia_level` runs rules above `paranoia_level` in a
-  detection-only band, like CRS's detection paranoia level. Band rules are
+- **WAF detection paranoia band** (#5847). `detection_paranoia_level` runs
+  rules above `paranoia_level` in a detection-only band, like CRS's detection
+  paranoia level. Band rules are
   scanned and reported in `waf.detection_rule_hits` / `waf.detection_paranoia`
   but never block, never score, never make a body policy enforcing, and never
   satisfy `mode: enforce` admission; a request whose only hits are in the band
   keeps `waf.action=clean`. Only an explicit `rule_modes: enforce` promotes a
   band rule. This lets operators measure a higher paranoia level on live
-  traffic before enabling it.
-- WAF `category_modes` sets the action of every built-in rule in a category
-  (`{"xss": "enforce", "ldap_injection": "disabled"}`). Precedence, lowest
+  traffic before enabling it. A band body rule still turns on inspection of
+  its body direction, so `on_body_too_large: block` and
+  `on_unlisted_content_type: block` then apply to that direction.
+- **WAF category modes** (#5847). `category_modes` sets the action of every
+  built-in rule in a category (`{"xss": "enforce", "ldap_injection":
+  "disabled"}`). Precedence, lowest
   first: `default_rule_action`, `category_modes`, `rule_overrides.action`,
   `rule_modes`. Naming an opt-in category such as `encoding_evasion` promotes
   it; custom rules keep their own action; unknown categories are rejected.
-- WAF field exclusions: `rule_overrides.<id>.exclude` names query parameters,
-  headers, or cookies that one rule must not inspect (CRS-style target
-  exclusions), so a false positive on one field no longer means disabling the
-  rule everywhere. Query names are compared after percent-decoding; a
-  `full_url` rule re-verifies a whole-URL match against the URL without the
-  excluded pairs, and `FE-HPP-001` ignores an excluded repeated parameter.
-  Exclusions that do not fit the rule's target are rejected.
+- **WAF field exclusions** (#5847). `rule_overrides.<id>.exclude` names query
+  parameters, headers, or cookies that one rule must not inspect (CRS-style
+  target exclusions), so a false positive on one field no longer means
+  disabling the rule everywhere. Query names are compared after
+  percent-decoding; a `full_url` rule re-verifies a whole-URL match against the
+  URL without the excluded pairs, and `FE-HPP-001` ignores an excluded repeated
+  parameter. A cookie exclusion is keyed on the raw crumb's name and also
+  covers that crumb's decoded views. Exclusions that do not fit the rule's
+  target, or that name no field, are rejected.
 - WAF `on_unlisted_content_type` closes the Content-Type relabelling bypass. A
   request body whose declared type is outside the scan scope (not in
   `body_content_types`, multipart without `inspect_multipart`, or a missing /

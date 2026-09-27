@@ -28435,7 +28435,7 @@ components:
                   type: string
                   minLength: 1
               exclude:
-                type: [object, "null"]
+                type: object
                 additionalProperties: false
                 description: >-
                   Field exclusions: stop this one rule inspecting the named
@@ -28448,8 +28448,12 @@ components:
                   duplicates. headers are case-insensitive and apply to
                   header_names, header_values, and response_headers rules.
                   cookies are cookie names and apply to cookies rules. An
-                  exclusion that does not fit the rule's target, or an empty
-                  object, is rejected.
+                  exclusion that does not fit the rule's target, or one that
+                  names no field (an empty object, or only null or empty
+                  lists), is rejected. Query pairs are split on & only and
+                  cookies on ; only, so a backend that also splits on ; (query)
+                  or , (cookie) can read an excluded pair's value as a further
+                  field the excluding rule does not inspect.
                 properties:
                   query_params:
                     type: [array, "null"]
@@ -28466,6 +28470,22 @@ components:
                     items:
                       type: string
                       minLength: 1
+                anyOf:
+                  - required: [query_params]
+                    properties:
+                      query_params:
+                        type: array
+                        minItems: 1
+                  - required: [headers]
+                    properties:
+                      headers:
+                        type: array
+                        minItems: 1
+                  - required: [cookies]
+                    properties:
+                      cookies:
+                        type: array
+                        minItems: 1
               conditions:
                 type: [object, "null"]
                 additionalProperties: false

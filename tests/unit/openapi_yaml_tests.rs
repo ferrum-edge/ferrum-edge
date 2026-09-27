@@ -2459,6 +2459,17 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
             .is_err(),
         "exclude is a closed object"
     );
+    for empty in [
+        json!(null),
+        json!({}),
+        json!({ "query_params": [], "headers": null }),
+    ] {
+        let config = json!({ "rule_overrides": { "FE-XSS-001": { "exclude": empty } } });
+        assert!(
+            validator.validate(&config).is_err(),
+            "exclude must name at least one field: {empty}"
+        );
+    }
     assert!(
         validator
             .validate(&json!({ "default_rule_actoin": "enforce" }))

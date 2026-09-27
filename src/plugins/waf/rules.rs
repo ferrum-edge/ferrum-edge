@@ -509,6 +509,10 @@ pub(super) struct CompiledRules {
     /// At least one rule compiled as detection-only. Lets the scan decision
     /// skip the detection-hit split entirely when no band is configured.
     pub(super) detection_rules_active: bool,
+    /// At least one rule excludes query parameters, so the query scan must
+    /// decode each pair's name. Without one the name is never compared and
+    /// the per-pair decode is skipped.
+    pub(super) query_exclusions_active: bool,
 }
 
 impl CompiledRules {
@@ -984,9 +988,15 @@ impl RuleSetBuilders {
 
     fn finish(self, rules: Vec<CompiledRule>) -> Result<CompiledRules, String> {
         let detection_rules_active = rules.iter().any(|rule| rule.detection_only);
+        let query_exclusions_active = rules.iter().any(|rule| {
+            rule.exclusions
+                .as_ref()
+                .is_some_and(|exclusions| !exclusions.query_params.is_empty())
+        });
         Ok(CompiledRules {
             rules,
             detection_rules_active,
+            query_exclusions_active,
             header_names: self.header_names.finish_text("header_names")?,
             header_values: self.header_values.finish_text("header_values")?,
             query_keys: self.query_keys.finish_text("query_keys")?,

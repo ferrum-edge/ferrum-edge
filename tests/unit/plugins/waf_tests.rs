@@ -8968,6 +8968,23 @@ fn waf_config_schema_and_constructor_admission_agree() {
         json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "paranoia_min": 5 } } }),
         json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "score": 4294967296u64 } } }),
         json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "action": "block" } } }),
+        // Field exclusions must name at least one field.
+        json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "exclude": null } } }),
+        json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "exclude": {} } } }),
+        json!({
+            "mode": "monitor",
+            "rule_overrides": { "FE-XSS-001": { "exclude": { "query_params": [] } } }
+        }),
+        json!({
+            "mode": "monitor",
+            "rule_overrides": { "FE-XSS-001": { "exclude": { "query_params": null } } }
+        }),
+        json!({
+            "mode": "monitor",
+            "rule_overrides": {
+                "FE-XSS-001": { "exclude": { "query_params": ["html"], "cookies": [] } }
+            }
+        }),
         // Rule pattern / match_kind / target conditions.
         body_rule(json!({})),
         body_rule(json!({ "pattern": "needle" })),

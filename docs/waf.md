@@ -70,8 +70,10 @@ rules into enforcement. There are three ways:
    still win per rule.
 2. **`category_modes`** — set the action of every built-in rule in a
    category: `{"xss": "enforce", "ldap_injection": "disabled"}`. Categories
-   are the `category` column of the [rule pack](#built-in-rule-pack); an
-   unknown category is rejected. Naming an opt-in category (for example
+   are the backticked keys in the `Category` column of the
+   [rule pack](#built-in-rule-pack) table (for example `sqli`,
+   `path_traversal`, `http_response_splitting`, `stack_trace`); an unknown
+   category is rejected. Naming an opt-in category (for example
    `encoding_evasion`) promotes its rules, unlike the bulk switch. Custom
    rules keep their own `action`.
 3. **`rule_modes`** — set the action of individual rules by id:
@@ -168,7 +170,8 @@ compiled and scanned but:
 - never make a body policy "enforcing", so they cannot trigger
   `on_body_too_large: fail_closed`, `on_scan_timeout: fail_closed`, a
   WebSocket close, or a fail-closed representation claim, and they do not
-  satisfy `mode: enforce` admission;
+  satisfy `mode: enforce` admission (the configuration-level `block`
+  dispositions are the exception; see below);
 - report through their own metadata: `waf.detection_rule_hits` (comma-joined
   ids) and `waf.detection_paranoia`. They are **not** added to
   `waf.rule_hits`, `waf.target`, or `waf.severity`, and a request whose only
@@ -178,7 +181,17 @@ compiled and scanned but:
 
 Detection-band body rules still cause request/response bodies (and WebSocket
 messages) to be buffered and scanned, so budget for that scan cost while the
-band is active. `detection_paranoia_level` below `paranoia_level` is rejected.
+band is active. Because the band turns on inspection of that body direction,
+the dispositions that refuse **every** inspected body by configuration rather
+than by a rule verdict apply to it too: in `mode: enforce`,
+`on_body_too_large: block` rejects an oversize body or WebSocket message, and
+`on_unlisted_content_type: block` rejects a non-empty unlisted request body,
+exactly as they would with a monitor-only body rule. This only changes
+behavior when the band supplies the first body rule in a direction (for
+example a custom-only pack whose one body rule sits in the band); the
+`fail_closed` variants of both settings are unaffected, since band rules never
+make a body policy enforcing. `detection_paranoia_level` below
+`paranoia_level` is rejected.
 
 ## Decode / normalization
 
@@ -417,7 +430,7 @@ and `rule_overrides`. Categories:
 | `http_response_splitting` | FE-CRLF-001 | a decoded CR/LF in a query value followed by a response header name (`Set-Cookie:`, `Location:`, …) or a status line — the shape that splits a response when an application reflects the value into a header (redirect targets, download names). Level 1. |
 | `restricted_file` | FE-RESTRICTED-001, FE-RESTRICTED-002 (L2) | matched on the **canonical** path, so `/%2egit/config` is `/.git/config`. 001 (level 1) covers version-control metadata (`.git/`, `.svn/`, `.hg/`), dotenv files, `.htaccess`/`.htpasswd`, credential stores (`.aws/`, `.ssh/`, `.docker/`, `.kube/`, `.npmrc`, `.netrc`, `.pgpass`, `id_rsa`), shell histories, `.DS_Store`, `web.config`, and `wp-config.php` together with its backup and editor-swap copies (`wp-config.php.bak`, `wp-config.php~`, `.wp-config.php.swp`). `.well-known`, `.github`, and `.gitignore` are not matched. 002 (level 2) covers backup, swap, and dump artifacts (`.bak`, `.old`, `.swp`, `.sql`, `.sqlite`, trailing `~`), which some sites publish legitimately. |
 | `file_upload` | FE-UPLOAD-001 | a `filename` / `filename*` parameter on a multipart `Content-Disposition` line naming a server-executable script (`.php`, `.phtml`, `.phar`, `.jsp`, `.aspx`, `.ashx`, `.cgi`, `.shtml`, `.htaccess`, …), including double extensions such as `shell.php.jpg` and the spellings Windows/IIS and C-backed handlers reduce to `shell.php`: a trailing dot or space, the `::$DATA` stream suffix, and a raw or `%00` NUL. A form or JSON field that merely names a file (`filename=index.php`) is not matched. Level 1, but multipart bodies are only scanned when `inspect_multipart` is enabled. |
-| stack trace / db error / source / fingerprint disclosure | FE-RESP-* | response-side; requires `response_inspection` |
+| `stack_trace` / `database_error` / `source_disclosure` / `fingerprinting` | FE-RESP-STACK-001..003, FE-RESP-DB-001, FE-RESP-SOURCE-001, FE-RESP-FP-001 | response-side; requires `response_inspection` |
 | `data_leak` | FE-DATA-LEAK-001..006 | credit card (Luhn), AWS/Stripe/GitHub keys, JWT (L2), private key |
 
 Disable the whole pack with `include_default_rules: false`, or selected rules
@@ -557,8 +570,19 @@ target exclusions):
   heuristics judge the rebuilt URL.
 - `headers` — header names, case-insensitive. Applies to `header_names`,
   `header_values`, and `response_headers` rules.
-- `cookies` — cookie names (the text before `=`), case-sensitive. Applies to
-  `cookies` rules.
+- `cookies` — cookie names (the text before `=` in the raw crumb),
+  case-sensitive. Applies to `cookies` rules, including their scans of the
+  crumb's percent-decoded views: the name always comes from the raw crumb, so
+  an encoded `prefs%3D=…` is not the `prefs` cookie.
+
+The exclusion boundary is the WAF's own split: query pairs on `&` only (as
+CRS and current query parsers split them) and cookie crumbs on `;` only.
+With `html` excluded, `html=x;evil=…` is one `html` pair to the WAF, so the
+excluding rule skips all of it, while a backend that also splits a query on
+`;` (Go before 1.17, older Python `parse_qs`) reads a second parameter,
+`evil`. The same applies to a legacy cookie parser that also splits on `,`.
+Every other rule still inspects that value; if such a backend sits behind the
+WAF, keep exclusions narrow or rely on `fp_filters` instead.
 
 Every other rule still inspects an excluded field, and the excluding rule
 still inspects every other field. Exclusions must fit the rule: naming
