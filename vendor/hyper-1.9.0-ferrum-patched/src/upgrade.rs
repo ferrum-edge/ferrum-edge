@@ -408,15 +408,6 @@ mod tests {
         upgraded.downcast::<Mock>().unwrap();
     }
 
-    #[cfg(feature = "http2")]
-    #[test]
-    fn ferrum_connect_error_reset_ignores_non_h2_upgrades() {
-        let mut upgraded = Upgraded::new(Mock, Bytes::new());
-
-        assert!(!upgraded.reset_with_connect_error());
-        upgraded.downcast::<Mock>().unwrap();
-    }
-
     // TODO: replace with tokio_test::io when it can test write_buf
     struct Mock;
 

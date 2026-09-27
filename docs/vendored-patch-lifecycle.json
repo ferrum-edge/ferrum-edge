@@ -754,7 +754,6 @@
       },
       "regression_tests": [
         "vendor/hyper-1.9.0-ferrum-patched (proto::h2::upgrade::ferrum_connect_error_reset_tests)",
-        "vendor/hyper-1.9.0-ferrum-patched (upgrade::tests::ferrum_connect_error_reset_ignores_non_h2_upgrades)",
         "tests/integration/mesh_hbone_tests.rs"
       ]
     }

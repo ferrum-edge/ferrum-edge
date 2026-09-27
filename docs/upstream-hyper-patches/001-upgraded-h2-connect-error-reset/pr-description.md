@@ -58,14 +58,14 @@ never reset.
 
 ## Tests
 
-In `src/proto/h2/upgrade.rs`, a real h2 client and server over
-`tokio::io::duplex`, with the server side wrapped in `Upgraded`:
+In `src/proto/h2/upgrade.rs`. Every test but the last runs a real h2 client
+and server over `tokio::io::duplex`, with the server side wrapped in
+`Upgraded`:
 
 - a reset, then an immediate drop, reaches the client as
   `RST_STREAM(CONNECT_ERROR)`; a second reset returns `false`;
 - a reset after data has reached the client;
 - a plain drop still sends `END_STREAM`;
 - after a completed `poll_shutdown`, the reset returns `false` and the client
-  sees `END_STREAM`.
-
-In `src/upgrade.rs`: a non-HTTP/2 upgrade returns `false` and still downcasts.
+  sees `END_STREAM`;
+- a non-HTTP/2 upgrade returns `false` and still downcasts.

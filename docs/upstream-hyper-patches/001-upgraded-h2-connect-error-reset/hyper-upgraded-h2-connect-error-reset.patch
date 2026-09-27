@@ -107,7 +107,7 @@
  impl Read for H2Upgraded {
      fn poll_read(
          mut self: Pin<&mut Self>,
-@@ -276,5 +314,150 @@
+@@ -276,5 +314,162 @@
          e.into_io().unwrap()
      } else {
          std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -123,6 +123,7 @@
 +    use h2::Reason;
 +
 +    use super::super::{ping, SendBuf};
++    use crate::common::io::Compat;
 +    use crate::rt::Write;
 +    use crate::upgrade::Upgraded;
 +
@@ -188,6 +189,17 @@
 +        poll_fn(|cx| Pin::new(&mut *upgraded).poll_flush(cx))
 +            .await
 +            .expect("flush the upgraded stream");
++    }
++
++    #[test]
++    fn reset_ignores_non_h2_upgrades() {
++        let (io, _peer) = tokio::io::duplex(64);
++        let mut upgraded = Upgraded::new(Compat::new(io), Bytes::new());
++
++        assert!(!upgraded.reset_with_connect_error());
++        upgraded
++            .downcast::<Compat<tokio::io::DuplexStream>>()
++            .expect("the IO is left in place");
 +    }
 +
 +    #[tokio::test]
@@ -292,10 +304,12 @@
  }
  
  impl Read for Upgraded {
-@@ -312,6 +337,16 @@
+@@ -310,6 +335,16 @@
+             }
+         } else {
              Err(self)
-         }
-     }
++        }
++    }
 +
 +    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
 +    fn __hyper_downcast_mut<T: Io>(&mut self) -> Option<&mut T> {
@@ -304,24 +318,6 @@
 +            unsafe { Some(&mut *(self as *mut (dyn Io + Send) as *mut T)) }
 +        } else {
 +            None
-+        }
-+    }
- }
- 
- mod sealed {
-@@ -370,6 +405,15 @@
-             .downcast::<crate::common::io::Compat<std::io::Cursor<Vec<u8>>>>()
-             .unwrap_err();
- 
-+        upgraded.downcast::<Mock>().unwrap();
-+    }
-+
-+    #[cfg(feature = "http2")]
-+    #[test]
-+    fn ferrum_connect_error_reset_ignores_non_h2_upgrades() {
-+        let mut upgraded = Upgraded::new(Mock, Bytes::new());
-+
-+        assert!(!upgraded.reset_with_connect_error());
-         upgraded.downcast::<Mock>().unwrap();
+         }
      }
- 
+ }

@@ -104,9 +104,9 @@ side has finished, so `reset_with_connect_error` returns `false`.
 
 In the vendored crate:
 
-- `proto::h2::upgrade::ferrum_connect_error_reset_tests` runs a real h2
-  client and server over an in-memory pipe, with the server side wrapped in
-  hyper's `Upgraded` and its send task spawned:
+- `proto::h2::upgrade::ferrum_connect_error_reset_tests`. Every test but the
+  last runs a real h2 client and server over an in-memory pipe, with the
+  server side wrapped in hyper's `Upgraded` and its send task spawned:
   - `reset_sends_rst_stream_connect_error`: a reset followed at once by a drop
     reaches the client as `RST_STREAM(CONNECT_ERROR)`, and a second reset
     returns `false`.
@@ -116,8 +116,8 @@ In the vendored crate:
     `END_STREAM`.
   - `reset_after_completed_shutdown_does_nothing`: after a completed shutdown
     the reset returns `false` and the client sees `END_STREAM`.
-- `upgrade::tests::ferrum_connect_error_reset_ignores_non_h2_upgrades`: a
-  non-HTTP/2 upgrade is left alone and still downcasts.
+  - `reset_ignores_non_h2_upgrades`: a non-HTTP/2 upgrade is left alone and
+    still downcasts.
 
 The `Vendored Patch Regressions` CI job runs them with
 

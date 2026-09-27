@@ -398,9 +398,7 @@ of the vendor copy and must keep passing after retirement:
 - An HBONE relay that ends on a socket error resets its CONNECT stream with
   `RST_STREAM(CONNECT_ERROR)`, while a normal close still ends it with
   `END_STREAM` (issue #5781) — the vendored hyper regressions
-  (`proto::h2::upgrade::ferrum_connect_error_reset_tests` and
-  `upgrade::tests::ferrum_connect_error_reset_ignores_non_h2_upgrades`), run
-  with
+  (`proto::h2::upgrade::ferrum_connect_error_reset_tests`), run with
   `cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset`,
   plus the gateway tests in `tests/integration/mesh_hbone_tests.rs`
   (`hbone_relay_backend_reset_sends_rst_stream_connect_error`,

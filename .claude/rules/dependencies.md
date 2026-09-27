@@ -281,8 +281,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   `backend_read_timeout_ms`.
 - hyper upgraded-stream reset (issue #5781): the vendored
   `--lib ferrum_connect_error_reset` tests in
-  `vendor/hyper-1.9.0-ferrum-patched/src/proto/h2/upgrade.rs` and
-  `src/upgrade.rs`, run by the `test-vendor-patches` job, plus the HBONE relay
+  `vendor/hyper-1.9.0-ferrum-patched/src/proto/h2/upgrade.rs`, run by the
+  `test-vendor-patches` job, plus the HBONE relay
   tests in `tests/integration/mesh_hbone_tests.rs`
   (`*_sends_rst_stream_connect_error`, `*_still_ends_stream_cleanly`). A relay
   that ends on a socket error resets its CONNECT stream with

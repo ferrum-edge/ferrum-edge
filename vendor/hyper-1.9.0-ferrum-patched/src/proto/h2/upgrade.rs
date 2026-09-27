@@ -326,6 +326,7 @@ mod ferrum_connect_error_reset_tests {
     use h2::Reason;
 
     use super::super::{ping, SendBuf};
+    use crate::common::io::Compat;
     use crate::rt::Write;
     use crate::upgrade::Upgraded;
 
@@ -391,6 +392,17 @@ mod ferrum_connect_error_reset_tests {
         poll_fn(|cx| Pin::new(&mut *upgraded).poll_flush(cx))
             .await
             .expect("flush the upgraded stream");
+    }
+
+    #[test]
+    fn reset_ignores_non_h2_upgrades() {
+        let (io, _peer) = tokio::io::duplex(64);
+        let mut upgraded = Upgraded::new(Compat::new(io), Bytes::new());
+
+        assert!(!upgraded.reset_with_connect_error());
+        upgraded
+            .downcast::<Compat<tokio::io::DuplexStream>>()
+            .expect("the IO is left in place");
     }
 
     #[tokio::test]
