@@ -15173,6 +15173,13 @@ async fn handle_websocket_request_authenticated(
         &state.mesh_egress_strip_baggage_keys,
     );
 
+    // RFC 7692 passthrough (issue #5769): only an opted-in proxy whose plugin
+    // chain never needs the parsed relay forwards the client's
+    // permessage-deflate offer. Default `strip` proxies short-circuit here.
+    let ws_deflate_offered = proxy.websocket_permessage_deflate.is_passthrough()
+        && !requires_websocket_framing
+        && push_permessage_deflate_offer(&mut client_headers, &proxy_headers);
+
     // Connect to backend BEFORE sending 101 to client.
     // If the backend is unreachable, we return 502 instead of a premature 101.
     // Supports retry with upstream target rotation for connection failures.
@@ -16167,6 +16174,17 @@ async fn handle_websocket_request_authenticated(
     if let Some(proto) = backend_handshake.negotiated_subprotocol().cloned() {
         ws_resp_builder = ws_resp_builder.header("sec-websocket-protocol", proto);
     }
+    // Forward the backend's permessage-deflate answer only when this upgrade
+    // offered it. Same post-policy placement as the subprotocol.
+    let ws_negotiated_deflate = if ws_deflate_offered {
+        backend_handshake.negotiated_permessage_deflate().cloned()
+    } else {
+        None
+    };
+    let ws_deflate_negotiated = ws_negotiated_deflate.is_some();
+    if let Some(extensions) = ws_negotiated_deflate {
+        ws_resp_builder = ws_resp_builder.header("sec-websocket-extensions", extensions);
+    }
 
     let upgrade_response = ws_resp_builder
         .body(ProxyBody::empty())
@@ -16194,7 +16212,10 @@ async fn handle_websocket_request_authenticated(
     let ws_conn_id = state.ws_connection_counter.fetch_add(1, Ordering::Relaxed);
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
-    let ws_tunnel = state.websocket_tunnel_mode;
+    // A negotiated permessage-deflate session carries RSV1-compressed frames
+    // the parsed relay would reject, so it always uses the raw relay. The
+    // offer was only forwarded with no framing plugin on the chain.
+    let ws_tunnel = state.websocket_tunnel_mode || ws_deflate_negotiated;
     let ws_tunnel_idle_disabled_safety_cap =
         websocket_tunnel_idle_disabled_safety_cap(state.env_config.tcp_half_close_max_wait_seconds);
     let ws_fragment_policy = WsFragmentPolicy::from_env(&state.env_config);
@@ -16621,10 +16642,117 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             // not reach the backend: a deflate-capable backend would accept it,
             // set rsv1 on data frames, and the bridge would tear the session
             // down with a protocol error. Strip the offer so no extension is
-            // ever negotiated end to end.
+            // ever negotiated end to end. A `websocket_permessage_deflate:
+            // passthrough` proxy re-adds only the permessage-deflate elements
+            // through `push_permessage_deflate_offer` (issue #5769).
             | "sec-websocket-extensions"
             | "x-geo-country"
         )
+}
+
+/// The only WebSocket extension a `websocket_permessage_deflate: passthrough`
+/// proxy negotiates end to end (RFC 7692).
+const PERMESSAGE_DEFLATE_EXTENSION: &str = "permessage-deflate";
+
+/// Keep only the `permessage-deflate` elements of a `Sec-WebSocket-Extensions`
+/// value (RFC 6455 §9.1 `extension-list`).
+///
+/// Each kept element is passed through byte-for-byte apart from surrounding
+/// whitespace, so offer parameters and the backend's negotiated parameters
+/// reach the other side unchanged. Every other extension token is dropped, and
+/// empty list elements are ignored (RFC 9110 §5.6.1). Returns `None` when no
+/// `permessage-deflate` element remains or the value is malformed (an
+/// unterminated quoted-string), so a garbled offer or answer fails closed to
+/// "no extension" — today's default.
+pub fn retain_permessage_deflate_extensions(value: &str) -> Option<String> {
+    let mut kept = String::new();
+    let mut element_start = 0usize;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    fn keep_element(element: &str, kept: &mut String) {
+        let element = element.trim();
+        let name = element.split(';').next().unwrap_or_default().trim();
+        if name.eq_ignore_ascii_case(PERMESSAGE_DEFLATE_EXTENSION) {
+            if !kept.is_empty() {
+                kept.push_str(", ");
+            }
+            kept.push_str(element);
+        }
+    }
+    for (index, byte) in value.bytes().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_quotes = true,
+            b',' => {
+                keep_element(&value[element_start..index], &mut kept);
+                element_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if in_quotes {
+        return None;
+    }
+    keep_element(&value[element_start..], &mut kept);
+    (!kept.is_empty()).then_some(kept)
+}
+
+/// Forward the client's `permessage-deflate` offer to the backend handshake of
+/// a `websocket_permessage_deflate: passthrough` proxy (issue #5769).
+///
+/// Reads the plugin-sanitized request headers, so a plugin that removed or
+/// rewrote the offer is honored, and refuses an offer the client nominated as
+/// hop-by-hop through `Connection`. Returns whether an offer was forwarded;
+/// only then may the backend's answer reach the client.
+pub(crate) fn push_permessage_deflate_offer(
+    client_headers: &mut Vec<(String, String)>,
+    proxy_headers: &HashMap<String, String>,
+) -> bool {
+    let Some((_, value)) =
+        proxy_header_entry_case_insensitive(proxy_headers, "sec-websocket-extensions")
+    else {
+        return false;
+    };
+    if headers_mod::parse_connection_listed_from_str_map(proxy_headers)
+        .iter()
+        .any(|listed| listed.eq_ignore_ascii_case("sec-websocket-extensions"))
+    {
+        return false;
+    }
+    let Some(offer) = retain_permessage_deflate_extensions(value) else {
+        return false;
+    };
+    client_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("sec-websocket-extensions"));
+    client_headers.push(("sec-websocket-extensions".to_string(), offer));
+    true
+}
+
+/// The `permessage-deflate` part of a backend handshake answer, or `None`.
+///
+/// Every `Sec-WebSocket-Extensions` field line is considered; a non-visible
+/// ASCII value fails closed. The caller forwards the result only when
+/// [`push_permessage_deflate_offer`] actually offered the extension.
+pub(crate) fn permessage_deflate_answer(
+    headers: &hyper::HeaderMap,
+) -> Option<hyper::header::HeaderValue> {
+    let mut values = headers.get_all(hyper::header::SEC_WEBSOCKET_EXTENSIONS).iter();
+    let first = values.next()?.to_str().ok()?;
+    let mut joined = first.to_string();
+    for value in values {
+        joined.push_str(", ");
+        joined.push_str(value.to_str().ok()?);
+    }
+    let answer = retain_permessage_deflate_extensions(&joined)?;
+    hyper::header::HeaderValue::from_str(&answer).ok()
 }
 
 fn push_forwardable_header_override(
@@ -17176,9 +17304,12 @@ pub(crate) fn websocket_backend_tls_sni_unsupported(proxy: &Proxy) -> bool {
 /// that offered a subprotocol list see no negotiated value and fail
 /// application-level handshakes.
 ///
-/// `Sec-WebSocket-Extensions` is intentionally NOT forwarded: the bridge
-/// doesn't speak `permessage-deflate` end-to-end, so signalling a negotiated
-/// extension would lead the client to decode raw frames as compressed.
+/// `negotiated_permessage_deflate` carries only the `permessage-deflate` part
+/// of the backend's `Sec-WebSocket-Extensions` answer. The frontend forwards it
+/// solely for a `websocket_permessage_deflate: passthrough` proxy that offered
+/// the extension, and then relays the session as raw bytes: the frame bridge
+/// cannot decode RSV1-compressed frames (issue #5769). Every other path keeps
+/// the extension stripped end to end.
 /// Backend WebSocket transport: TLS (or plain) over the byte-level idle
 /// activity adapter over TCP. The `WsActivityIo` layer sits UNDER the
 /// framer so fragmented-message read progress refreshes the shared idle
@@ -17190,6 +17321,7 @@ pub type BackendWsStream =
 pub(crate) struct BackendWsHandshake {
     pub stream: BackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
 }
 
 /// Backend WebSocket transport for a mesh egress session: the raw WebSocket
@@ -17203,6 +17335,7 @@ type MeshBackendWsStream = WebSocketStream<WsActivityIo<crate::proxy::hbone_pool
 pub(crate) struct MeshBackendWsHandshake {
     pub stream: MeshBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
 }
 
 /// Backend WebSocket transport for a sidecar-ingress Unix-domain backend
@@ -17218,6 +17351,7 @@ type UnixBackendWsStream = WebSocketStream<WsActivityIo<tokio::net::UnixStream>>
 pub(crate) struct UnixBackendWsHandshake {
     pub stream: UnixBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
     conn_lease: unix_backend_pool::UnixWebSocketConnLease,
 }
 
@@ -17243,6 +17377,16 @@ impl WsBackendHandshake {
             Self::Mesh(handshake) => handshake.negotiated_subprotocol.as_ref(),
             #[cfg(unix)]
             Self::Unix(handshake) => handshake.negotiated_subprotocol.as_ref(),
+        }
+    }
+
+    /// The backend's `permessage-deflate` answer (see [`BackendWsHandshake`]).
+    pub(crate) fn negotiated_permessage_deflate(&self) -> Option<&hyper::header::HeaderValue> {
+        match self {
+            Self::Direct(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
+            Self::Mesh(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
+            #[cfg(unix)]
+            Self::Unix(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
         }
     }
 }
@@ -17455,10 +17599,12 @@ pub(crate) async fn connect_websocket_backend(
         .headers()
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
+    let negotiated_permessage_deflate = permessage_deflate_answer(backend_response.headers());
 
     Ok(BackendWsHandshake {
         stream: backend_ws_stream,
         negotiated_subprotocol,
+        negotiated_permessage_deflate,
     })
 }
 
@@ -17624,10 +17770,12 @@ async fn connect_unix_websocket_backend(
         .headers()
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
+    let negotiated_permessage_deflate = permessage_deflate_answer(response.headers());
 
     Ok(UnixBackendWsHandshake {
         stream,
         negotiated_subprotocol,
+        negotiated_permessage_deflate,
         conn_lease,
     })
 }
@@ -17962,6 +18110,7 @@ pub(crate) async fn connect_mesh_websocket_backend(
             Ok(MeshBackendWsHandshake {
                 stream,
                 negotiated_subprotocol: ws_tunnel.negotiated_subprotocol,
+                negotiated_permessage_deflate: ws_tunnel.negotiated_permessage_deflate,
             })
         }
         MeshWsEgress::AmbientHbone => {
@@ -18182,10 +18331,12 @@ pub(crate) async fn connect_mesh_websocket_backend(
                 .headers()
                 .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
                 .cloned();
+            let negotiated_permessage_deflate = permessage_deflate_answer(response.headers());
 
             Ok(MeshBackendWsHandshake {
                 stream,
                 negotiated_subprotocol,
+                negotiated_permessage_deflate,
             })
         }
     }
@@ -19003,7 +19154,9 @@ pub(crate) fn publish_ws_policy_close(
 /// disabled by configuration.
 pub(crate) const WS_DRAIN_GRACE: Duration = Duration::from_secs(30);
 
-fn websocket_tunnel_idle_disabled_safety_cap(tcp_half_close_max_wait_seconds: u64) -> Duration {
+pub(crate) fn websocket_tunnel_idle_disabled_safety_cap(
+    tcp_half_close_max_wait_seconds: u64,
+) -> Duration {
     if tcp_half_close_max_wait_seconds == 0 {
         return WS_DRAIN_GRACE;
     }

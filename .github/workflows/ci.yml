@@ -1868,6 +1868,7 @@ jobs:
               functional_header_limits_test
               functional_early_data_test
               functional_ws_origin_test
+              functional_ws_permessage_deflate_test
               functional_allowed_methods_test
               functional_allowed_methods_logging_test
               functional_transaction_debugger_body_capture_test

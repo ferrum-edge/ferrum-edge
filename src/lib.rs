@@ -7659,6 +7659,33 @@ pub mod _test_support {
         crate::proxy::collect_forwardable_websocket_headers(raw_headers, proxy_headers)
     }
 
+    /// Forward a `permessage-deflate` offer the way a passthrough proxy does;
+    /// returns whether an offer was forwarded (issue #5769).
+    pub fn push_permessage_deflate_offer_for_test(
+        client_headers: &mut Vec<(String, String)>,
+        proxy_headers: &HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::push_permessage_deflate_offer(client_headers, proxy_headers)
+    }
+
+    /// The backend `permessage-deflate` answer a passthrough proxy forwards.
+    pub fn permessage_deflate_answer_for_test(
+        headers: &hyper::HeaderMap,
+    ) -> Option<hyper::header::HeaderValue> {
+        crate::proxy::permessage_deflate_answer(headers)
+    }
+
+    /// Refusals for `websocket_permessage_deflate: passthrough` proxies whose
+    /// effective plugin chain requires the parsed WebSocket relay.
+    pub fn websocket_permessage_deflate_passthrough_errors_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Vec<String> {
+        crate::plugin_cache::websocket_permessage_deflate_passthrough_errors(
+            config,
+            &crate::plugins::PluginHttpClient::default(),
+        )
+    }
+
     pub struct NormalizedRejectResponse {
         pub http_status: StatusCode,
         pub headers: HashMap<String, String>,

@@ -133,8 +133,8 @@ pub mod ws_message_size_limiting;
 pub mod ws_rate_limiting;
 
 pub use builtin_parity::{
-    BUILTIN_PLUGIN_PARITY_META, BuiltinPluginClassification, BuiltinPluginParityMeta,
-    builtin_plugin_parity_meta,
+    BUILTIN_PLUGIN_PARITY_META, BUILTIN_WEBSOCKET_FRAMING_PLUGINS, BuiltinPluginClassification,
+    BuiltinPluginParityMeta, builtin_plugin_parity_meta,
 };
 pub use utils::PluginHttpClient;
 

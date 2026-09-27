@@ -236,6 +236,7 @@ an omitted override inherits the process default.
 | Proxy `dns_cache_ttl_seconds`, TCP/H2 pool keepalive intervals and timeout | 1–86400 |
 | Proxy `pool_idle_timeout_seconds`, `udp_idle_timeout_seconds` | 1–3600 |
 | Proxy `tcp_idle_timeout_seconds`, `websocket_idle_timeout_seconds` | 0–86400; 0 disables the idle bound |
+| Proxy `websocket_permessage_deflate` | `strip` (default) or `passthrough`; `passthrough` is 400 on stream proxies and on proxies with an effective plugin that requires the parsed WebSocket relay |
 | Proxy H2 stream/connection window sizes | 65535–134217728 bytes |
 | Proxy H2 max frame size | 16384–1048576 bytes |
 | Proxy H2 max concurrent streams | 1–2147483647 |

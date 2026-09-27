@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Opt-in WebSocket `permessage-deflate` passthrough** (#5769). A new
+  per-proxy `websocket_permessage_deflate` field takes `strip` (default,
+  unchanged behavior) or `passthrough`. With `passthrough`, the client's RFC 7692
+  `permessage-deflate` offer and the backend's answer pass unchanged on
+  HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3 Extended CONNECT; every other
+  `Sec-WebSocket-Extensions` token is still stripped. A negotiated session is
+  relayed as raw bytes, so gateway frame-size and incomplete-message bounds do
+  not apply to it. Config validation refuses `passthrough` on stream proxies and
+  on any proxy where a plugin requiring the parsed WebSocket relay is effective
+  (`waf`, `ws_frame_logging`, `ws_message_size_limiting`, `ws_rate_limiting`, or
+  a custom plugin whose `requires_websocket_framing()` is true), whether
+  attached directly, through a proxy group, or inherited from a global plugin;
+  the runtime also keeps stripping the offer whenever the live chain needs
+  framing. SQL stores gain a `proxies.websocket_permessage_deflate` column in the
+  baseline schema; recreate development databases.
+
 - Gateway-owned diagnostic references (#5767). With the new
   `FERRUM_DIAGNOSTIC_REFS=errors` (default `off`), every HTTP/1.1, HTTP/2, and
   HTTP/3 response that carries the gateway's own `X-Gateway-Error` token also

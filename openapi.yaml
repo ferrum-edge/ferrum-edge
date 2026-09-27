@@ -9955,6 +9955,28 @@ components:
             idle timer; multiplexed H3 connections with other active streams may
             stay open. Startup/reload warnings are logged only for affected proxies
             when an H3 WebSocket listener is actually reachable.
+        websocket_permessage_deflate:
+          type: string
+          enum: [strip, passthrough]
+          default: strip
+          description: |
+            RFC 7692 `permessage-deflate` handling for WebSocket upgrades on this
+            proxy (HTTP-family proxies only; stream proxies must use `strip`).
+
+            - `strip` (default): the client's `Sec-WebSocket-Extensions` offer
+              never reaches the backend and no extension is negotiated, so every
+              message stays inspectable by WebSocket frame plugins.
+            - `passthrough`: `permessage-deflate` offer elements reach the backend
+              unchanged and the backend's `permessage-deflate` answer reaches the
+              client unchanged on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+              Extended CONNECT. Every other extension token is still stripped. A
+              session that negotiates the extension is relayed as raw bytes, so
+              gateway WebSocket frame and fragment limits do not apply to it.
+              Refused (400) on a proxy with any plugin that requires the parsed
+              WebSocket relay (`waf`, `ws_frame_logging`,
+              `ws_message_size_limiting`, `ws_rate_limiting`, or a custom plugin
+              whose `requires_websocket_framing()` is true), whether attached
+              directly, through a proxy group, or inherited from a global plugin.
         udp_idle_timeout_seconds:
           type: integer
           format: uint64
@@ -10102,6 +10124,8 @@ components:
                 type: "null"
               response_body_mode:
                 const: stream
+              websocket_permessage_deflate:
+                const: strip
           else:
             anyOf:
               - required: [hosts]

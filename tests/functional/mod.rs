@@ -157,6 +157,7 @@ mod functional_websocket_frame_limit_test;
 mod functional_websocket_limits_test;
 mod functional_websocket_test;
 mod functional_ws_origin_test;
+mod functional_ws_permessage_deflate_test;
 mod functional_ws_plugins_test;
 // Dedicated observer-off/on Linux lane in h1-internal-profile.yml.
 #[cfg(target_os = "linux")]

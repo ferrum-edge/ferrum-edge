@@ -571,3 +571,50 @@ async fn response_body_production_declarations_match_the_built_in_producers() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `websocket_permessage_deflate: passthrough` admission refuses every built-in
+// in `BUILTIN_WEBSOCKET_FRAMING_PLUGINS` without constructing it, and trusts
+// every other built-in to never need the parsed relay. Both halves of that
+// declaration have to stay true (issue #5769).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn websocket_framing_declarations_match_the_built_in_frame_plugins() {
+    let _registry = super::plugin_utils::log_schema_registry_guard();
+    use ferrum_edge::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS;
+
+    let inventory: BTreeSet<_> = BUILTIN_PLUGIN_PARITY_META.iter().map(|m| m.name).collect();
+    for member in BUILTIN_WEBSOCKET_FRAMING_PLUGINS {
+        assert!(
+            inventory.contains(member),
+            "{member} is declared a WebSocket framing plugin but is not a built-in plugin"
+        );
+    }
+
+    for entry in BUILTIN_PLUGIN_PARITY_META {
+        let declared = BUILTIN_WEBSOCKET_FRAMING_PLUGINS.contains(&entry.name);
+        let documents_frame_policy = entry.active_phases.contains("on_ws_frame")
+            || entry.active_phases.contains("parser-level");
+        assert!(
+            declared || !documents_frame_policy,
+            "{} documents WebSocket frame/parser policy but is missing from \
+             BUILTIN_WEBSOCKET_FRAMING_PLUGINS",
+            entry.name
+        );
+        if declared {
+            continue;
+        }
+
+        let config = minimal_plugin_config(entry.name);
+        let Ok(Some(plugin)) = create_plugin(entry.name, &config) else {
+            continue;
+        };
+        assert!(
+            !plugin.requires_websocket_framing(),
+            "{} requires the parsed WebSocket relay but is missing from \
+             BUILTIN_WEBSOCKET_FRAMING_PLUGINS, so passthrough admission would accept it",
+            entry.name
+        );
+    }
+}

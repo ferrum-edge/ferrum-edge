@@ -387,3 +387,40 @@ plugin_configs:
     scope: global
     enabled: true
 ```
+
+## WebSocket compression (`permessage-deflate`)
+
+By default the gateway strips the client's `Sec-WebSocket-Extensions` offer before
+the backend handshake, so RFC 7692 `permessage-deflate` is never negotiated end to
+end and every message stays inspectable by WebSocket frame plugins
+(`websocket_permessage_deflate: strip`).
+
+A proxy can opt into `websocket_permessage_deflate: passthrough`. The client's
+`permessage-deflate` offer elements then reach the backend unchanged, and the
+backend's `permessage-deflate` answer reaches the client unchanged, on HTTP/1.1,
+HTTP/2 Extended CONNECT, and HTTP/3 Extended CONNECT. Any other extension token in
+the offer or answer is still stripped. A session that actually negotiates the
+extension is relayed as raw bytes (the gateway frame parser cannot decode
+compressed frames), so `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` and the
+incomplete-message bounds do not apply to it — idle, lifetime, drain, and
+connection limits still do. A session whose backend declines the offer keeps the
+normal relay.
+
+Passthrough is refused by config validation (Admin API 400, file-mode startup,
+database / CP load) on any proxy that has a plugin requiring the parsed WebSocket
+relay — `waf`, `ws_frame_logging`, `ws_message_size_limiting`, `ws_rate_limiting`,
+or a custom plugin whose `requires_websocket_framing()` returns `true` — whether it
+is attached directly, through a proxy group, or inherited from a global plugin
+config. As a second guard, the runtime keeps stripping the offer whenever the
+proxy's live plugin chain requires framing. Stream proxies (`tcp`/`tcps`/`udp`/
+`dtls`) must keep `strip`.
+
+```yaml
+proxies:
+  - id: chat
+    listen_path: /chat
+    backend_scheme: http
+    backend_host: chat.internal
+    backend_port: 8080
+    websocket_permessage_deflate: passthrough
+```

@@ -109,6 +109,7 @@ pub(super) fn create_mesh_proxy(backend_port: u16) -> Proxy {
         compiled_stream_match: None,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
         allowed_methods: None,
         allowed_ws_origins: vec![],
         created_at: Utc::now(),

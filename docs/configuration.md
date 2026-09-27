@@ -926,6 +926,18 @@ origins in `allowed_ws_origins`. See
 [routing.md](routing.md#websocket-origin-admission) and
 [cors_plugin.md](cors_plugin.md#websocket-upgrades-and-cswsh).
 
+**Per-proxy WebSocket compression (`websocket_permessage_deflate`).** `strip`
+(default) keeps RFC 7692 `permessage-deflate` from being negotiated end to end.
+`passthrough` forwards only the `permessage-deflate` offer and answer unchanged on
+HTTP/1.1, H2 Extended CONNECT, and H3 Extended CONNECT; other extension tokens are
+still stripped, and a negotiated session is relayed as raw bytes, so
+`FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` and the incomplete-message bounds do not
+apply to it. Validation refuses `passthrough` on a proxy with any plugin that
+requires the parsed WebSocket relay (`waf`, `ws_frame_logging`,
+`ws_message_size_limiting`, `ws_rate_limiting`, or a custom plugin declaring
+`requires_websocket_framing()`), including through a proxy group or an inherited
+global plugin. See [routing.md](routing.md#websocket-compression-permessage-deflate).
+
 See [size_limits.md](size_limits.md) for detailed sizing guidance.
 
 **Route-scoped ceilings compose with these globals.** The `request_size_limiting`
