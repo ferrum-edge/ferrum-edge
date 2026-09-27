@@ -1396,9 +1396,19 @@ async fn egress_udp_relay_tunnel_close_still_ends_stream_cleanly() {
     request_body
         .send_data(Bytes::new(), true)
         .expect("end the tunnel's request stream");
-    let end = tokio::time::timeout(std::time::Duration::from_secs(5), response_body.data())
-        .await
-        .expect("the relay must end once the client closes the tunnel");
+    // The relay's shutdown may send `END_STREAM` on an empty DATA frame,
+    // which `data()` yields as an empty chunk before `None`. Skip those; a
+    // reset (`Err`) or real data is still a failure.
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match response_body.data().await {
+                Some(Ok(chunk)) if chunk.is_empty() => continue,
+                other => break other,
+            }
+        }
+    })
+    .await
+    .expect("the relay must end once the client closes the tunnel");
     assert!(
         end.is_none(),
         "a peer close must end the CONNECT stream with END_STREAM, got {end:?}"
