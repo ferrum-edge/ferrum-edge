@@ -32,11 +32,18 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 TCP or UDP relay ends on a socket error (for example the backend connection is
 reset, or a datagram send fails), the gateway now ends the HTTP/2 `CONNECT`
 stream with `RST_STREAM(CONNECT_ERROR)` (RFC 9113 §8.5) instead of a clean
-`END_STREAM`. A peer close, idle expiry, write stall, timeout, or fence
-revocation still ends with `END_STREAM`. HBONE clients that treated every
-tunnel end as a normal close now see a stream error on a failed relay; a byte
-stream truncated by a socket error is no longer reported as complete (a backend
-read/write timeout or a revocation still ends with `END_STREAM`, see #5858).
+`END_STREAM`. HBONE clients that treated every tunnel end as a normal close
+now see a stream error on a failed relay; a byte stream truncated by a socket
+error is no longer reported as complete.
+
+**HBONE deadlines and revocations reset the CONNECT stream (#5858).** A backend
+read or write deadline (`backend_read_timeout_ms`, `backend_write_timeout_ms`)
+that cuts a byte-stream HBONE relay, a datagram relay's tunnel write stall, and
+an admission-fence revocation of either relay now also end the `CONNECT`
+stream with `RST_STREAM(CONNECT_ERROR)` instead of `END_STREAM`. Only a peer
+close, an idle expiry, or the TCP half-close cap still ends with `END_STREAM`.
+A client that read a tunnel cut by a stalled backend or by policy as a
+complete stream now sees a stream error.
 
 **Dependencies**
 

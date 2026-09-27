@@ -84,18 +84,19 @@ for the oneshot. There is no change for a stream that is never reset.
 of moving it in, then ends the stream in `end_hbone_connect_stream`:
 
 - **Byte-stream relay** (`bidirectional_copy_for_fenced_relay`): resets when
-  the relay recorded a first failure that is neither a fence revocation nor a
-  `ReadWriteTimeout` (the idle window or a backend read/write deadline).
-  `hbone_relay_failure_resets_stream` decides.
-- **Datagram relay** (`relay_hbone_udp`): resets for the four socket-error
-  endings (`tunnel_read_error`, `tunnel_write_error`, `app_send_error`,
-  `app_recv_error`). `HboneUdpRelayEnd::resets_stream` decides. The relay's
-  `from_app` pump no longer half-closes the tunnel on its way out: every one
-  of its endings is an error, and a half-close would queue `END_STREAM`
-  ahead of the reset.
+  the relay recorded any first failure other than the idle window or the
+  half-close cap: a socket error, a backend read/write deadline (#5858), or a
+  fence revocation (#5858). `hbone_relay_failure_resets_stream` decides.
+- **Datagram relay** (`relay_hbone_udp`): resets for every ending except
+  `tunnel_closed` and `idle_timeout`: the four socket-error endings
+  (`tunnel_read_error`, `tunnel_write_error`, `app_send_error`,
+  `app_recv_error`), plus `tunnel_write_stalled` and `revoked` (#5858).
+  `HboneUdpRelayEnd::resets_stream` decides. The relay's `from_app` pump no
+  longer half-closes the tunnel on its way out: every one of its endings is
+  an error, and a half-close would queue `END_STREAM` ahead of the reset.
 
-Every other ending (a peer close, an idle expiry, a write stall, a
-revocation) drops the stream and keeps the clean `END_STREAM` it had before.
+Every other ending (a peer close, an idle expiry, the half-close cap) drops
+the stream and keeps the clean `END_STREAM` it had before.
 A failure after the byte-stream relay has already half-closed the stream
 toward the client (the backend sent FIN first) cannot be signalled: the send
 side has finished, so `reset_with_connect_error` returns `false`.

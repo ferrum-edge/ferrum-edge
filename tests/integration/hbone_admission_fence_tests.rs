@@ -30,7 +30,10 @@
 //!   first is never counted or classified as revoked, and a sweep that wins
 //!   first leaves its reason readable after the relay retires;
 //! * publications coalesce and revoke every live tunnel exactly once;
-//! * a revocation never lands on `ferrum_mesh_hbone_relay_failures_total`.
+//! * a revocation never lands on `ferrum_mesh_hbone_relay_failures_total`;
+//! * a revoked tunnel was cut short, so the peer sees its CONNECT stream reset
+//!   with `RST_STREAM(CONNECT_ERROR)`, not a clean `END_STREAM`, on both the
+//!   byte-stream and the datagram relay (issue #5858).
 //!
 //! and the CREDENTIAL dimension (issue #5568), which a sweep re-decides because
 //! an established inbound mTLS session is never re-handshaked. Its trust input
@@ -707,6 +710,28 @@ async fn assert_tunnel_closed(body: &mut h2::RecvStream) {
     .expect("revoked tunnel must close toward the peer");
 }
 
+/// A revoked tunnel was cut short, so the peer must see its CONNECT stream
+/// reset with `RST_STREAM(CONNECT_ERROR)` rather than the clean `END_STREAM`
+/// that reads as a completed relay (issue #5858). Anything still buffered
+/// before the cut is drained and ignored.
+async fn assert_tunnel_reset_with_connect_error(body: &mut h2::RecvStream) {
+    let err = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match body.data().await {
+                None => return None,
+                Some(Err(err)) => return Some(err),
+                Some(Ok(chunk)) => {
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                }
+            }
+        }
+    })
+    .await
+    .expect("revoked tunnel must close toward the peer")
+    .expect("a revoked tunnel must be reset, not ended with END_STREAM");
+    assert_eq!(err.reason(), Some(h2::Reason::CONNECT_ERROR));
+}
+
 async fn wait_for_sweep_after(state: &ProxyState, completed_before: u64) {
     tokio::time::timeout(DEADLINE, async {
         while state.hbone_admission_fence.sweeps_completed() <= completed_before {
@@ -872,7 +897,7 @@ async fn tightened_authorization_policy_revokes_live_tunnel_and_denies_the_next_
         .update_config(prepared_config(Some(fx.backend_port), vec![deny_client()]));
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
 
-    assert_tunnel_closed(&mut fx.tunnel.response_body).await;
+    assert_tunnel_reset_with_connect_error(&mut fx.tunnel.response_body).await;
     wait_for_no_live_tunnels(&fx.state).await;
     assert_eq!(
         revocation_counts(&fx.state),
@@ -1021,7 +1046,7 @@ async fn peer_authentication_swap_revokes_a_live_datagram_tunnel() {
         default_mode: MtlsMode::Disable,
         ..MeshInboundTlsPolicy::default()
     });
-    assert_tunnel_closed(&mut response_body).await;
+    assert_tunnel_reset_with_connect_error(&mut response_body).await;
     wait_for_no_live_tunnels(&state).await;
     assert_eq!(
         revocation_counts(&state),

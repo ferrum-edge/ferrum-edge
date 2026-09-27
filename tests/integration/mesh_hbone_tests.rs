@@ -926,14 +926,54 @@ async fn read_connect_body_to_end(body: &mut h2::RecvStream) -> (Vec<u8>, Result
     }
 }
 
-/// Run one byte-stream HBONE tunnel to a backend that writes `partial` and
-/// then closes, and return how the client saw the tunnel end.
-async fn byte_stream_relay_end_for_backend_close(
-    abortive: bool,
+/// Accepts one relay connection, waits for the client's first bytes, writes
+/// `partial`, then stalls: it holds the connection open and drains reads
+/// without ever writing again, so only a relay deadline can end the tunnel.
+/// `stop` releases the connection at teardown.
+async fn start_stalling_backend() -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+    oneshot::Sender<()>,
+) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind stalling backend");
+    let addr = listener.local_addr().expect("stalling backend addr");
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0_u8; 4096];
+        if stream.read(&mut buf).await.is_err() {
+            return;
+        }
+        if stream.write_all(b"partial").await.is_err() {
+            return;
+        }
+        tokio::select! {
+            _ = stop_rx => {}
+            _ = async {
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+            } => {}
+        }
+    });
+    (addr, handle, stop_tx)
+}
+
+/// Run one byte-stream HBONE tunnel through `proxy` and return how the client
+/// saw it end. When `send_ping`, the client first sends `ping`; otherwise it
+/// stays silent.
+async fn byte_stream_relay_end(
+    mut proxy: Proxy,
+    send_ping: bool,
 ) -> (Vec<u8>, Result<(), h2::Error>) {
     let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
-    let (backend_addr, backend_handle) = start_partial_reply_backend(abortive).await;
-    let mut proxy = create_mesh_proxy(backend_addr.port());
     let spiffe_plugin = spiffe_identity_plugin_config(&proxy.id);
     proxy.plugins.push(PluginAssociation {
         plugin_config_id: spiffe_plugin.id.clone(),
@@ -955,9 +995,11 @@ async fn byte_stream_relay_end_for_backend_close(
         .expect("CONNECT response")
         .expect("CONNECT response");
     assert_eq!(resp.status(), StatusCode::OK);
-    request_body
-        .send_data(Bytes::from_static(b"ping"), false)
-        .expect("send CONNECT data");
+    if send_ping {
+        request_body
+            .send_data(Bytes::from_static(b"ping"), false)
+            .expect("send CONNECT data");
+    }
 
     let mut response_body = resp.into_body();
     let end = tokio::time::timeout(
@@ -965,11 +1007,21 @@ async fn byte_stream_relay_end_for_backend_close(
         read_connect_body_to_end(&mut response_body),
     )
     .await
-    .expect("the tunnel must end once the backend closes");
+    .expect("the relay must end the tunnel within the deadline");
 
     shutdown_tx.send(true).expect("shutdown gateway");
-    backend_handle.await.expect("backend task");
     conn_task.abort();
+    end
+}
+
+/// Run one byte-stream HBONE tunnel to a backend that writes `partial` and
+/// then closes, and return how the client saw the tunnel end.
+async fn byte_stream_relay_end_for_backend_close(
+    abortive: bool,
+) -> (Vec<u8>, Result<(), h2::Error>) {
+    let (backend_addr, backend_handle) = start_partial_reply_backend(abortive).await;
+    let end = byte_stream_relay_end(create_mesh_proxy(backend_addr.port()), true).await;
+    backend_handle.await.expect("backend task");
     end
 }
 
@@ -995,6 +1047,54 @@ async fn hbone_relay_backend_close_still_ends_stream_cleanly() {
         end.is_ok(),
         "a normal backend close must end with END_STREAM, got {end:?}"
     );
+}
+
+/// Issue #5858: a backend that stalls mid-response past `backend_read_timeout`
+/// cuts the byte-stream relay short. The client must see
+/// `RST_STREAM(CONNECT_ERROR)` after the bytes it did get, not the clean
+/// `END_STREAM` that reads as a complete response.
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_relay_backend_read_timeout_sends_rst_stream_connect_error() {
+    let (backend_addr, backend_handle, backend_stop) = start_stalling_backend().await;
+    let mut proxy = create_mesh_proxy(backend_addr.port());
+    // Only the backend read deadline can end this relay: 500 ms plus at most
+    // one 1 s watchdog tick, well inside the helper's 5 s bound.
+    proxy.backend_read_timeout_ms = 500;
+    proxy.backend_write_timeout_ms = 0;
+    proxy.tcp_idle_timeout_seconds = Some(300);
+
+    let (received, end) = byte_stream_relay_end(proxy, true).await;
+
+    assert_eq!(&received[..], b"partial");
+    let err = end.expect_err("a relay cut by the backend read deadline must be reset");
+    assert_eq!(err.reason(), Some(h2::Reason::CONNECT_ERROR));
+
+    let _ = backend_stop.send(());
+    backend_handle.await.expect("backend task");
+}
+
+/// Issue #5858 control: an idle expiry is a legitimate end of the tunnel, not
+/// a truncation, and still ends the CONNECT stream with `END_STREAM`.
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_relay_idle_timeout_still_ends_stream_cleanly() {
+    let (backend_addr, backend_handle) = start_idle_backend().await;
+    let mut proxy = create_mesh_proxy(backend_addr.port());
+    proxy.tcp_idle_timeout_seconds = Some(1);
+    proxy.backend_read_timeout_ms = 0;
+    proxy.backend_write_timeout_ms = 0;
+
+    // The client stays silent so the idle backend never answers or closes.
+    // `read_connect_body_to_end` drains the empty DATA frame that may carry
+    // `END_STREAM` before `data()` yields `None`.
+    let (received, end) = byte_stream_relay_end(proxy, false).await;
+
+    assert!(received.is_empty(), "unexpected relay data: {received:?}");
+    assert!(
+        end.is_ok(),
+        "an idle expiry must end the CONNECT stream with END_STREAM, got {end:?}"
+    );
+
+    backend_handle.await.expect("backend task");
 }
 
 // ── EgressGateway external UDP ServiceEntry egress (issue #3263) ──────────

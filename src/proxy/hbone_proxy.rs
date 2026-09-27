@@ -245,10 +245,10 @@ pub(super) const HBONE_UDP_TERMINATION_METADATA_KEY: &str = "hbone.udp.terminati
 /// It drives the transaction summary's `body_completed` / `body_error_class` /
 /// `client_disconnected`, the `hbone.udp.termination_reason` metadata, a
 /// sampled warning for socket-error endings, and the wire end of the CONNECT
-/// stream: a socket-error ending resets it with `RST_STREAM(CONNECT_ERROR)`
-/// ([`Self::resets_stream`], issue #5781), and every other ending closes it
-/// with a clean `END_STREAM`. The `[u16 length][payload]` framing has no error
-/// record, so the reset is the only in-band error signal.
+/// stream: a peer close or idle expiry closes it with a clean `END_STREAM`,
+/// and every other ending resets it with `RST_STREAM(CONNECT_ERROR)`
+/// ([`Self::resets_stream`], issues #5781, #5858). The `[u16 length][payload]`
+/// framing has no error record, so the reset is the only in-band error signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HboneUdpRelayEnd {
     /// The tunnel peer ended its request stream.
@@ -296,12 +296,14 @@ impl HboneUdpRelayEnd {
         }
     }
 
-    /// Whether the ending is a socket error, which resets the CONNECT stream
-    /// with `RST_STREAM(CONNECT_ERROR)` instead of ending it cleanly (issue
-    /// #5781). A peer close, idle expiry, write stall, or fence revocation is
-    /// not a socket error and keeps the clean `END_STREAM`.
+    /// Whether the ending resets the CONNECT stream with
+    /// `RST_STREAM(CONNECT_ERROR)` instead of ending it cleanly. Only a peer
+    /// close or idle expiry is a completed relay and keeps the clean
+    /// `END_STREAM`. A socket error (issue #5781), a write stall past the write
+    /// deadline, or a fence revocation (issue #5858) cut the relay short and
+    /// reset it, exactly the endings [`Self::error_class`] reports.
     const fn resets_stream(self) -> bool {
-        self.io_error_kind().is_some()
+        !matches!(self, Self::TunnelClosed | Self::IdleTimeout)
     }
 
     /// Whether the tunnel side (the HBONE client) caused the ending.
@@ -496,24 +498,25 @@ fn hbone_relay_body_outcome(
 }
 
 /// Whether the byte-stream relay's first failure resets the CONNECT stream
-/// with `RST_STREAM(CONNECT_ERROR)` (issue #5781).
+/// with `RST_STREAM(CONNECT_ERROR)` (issues #5781, #5858).
 ///
-/// A socket error on either side does: RFC 9113 section 8.5 assigns
-/// `CONNECT_ERROR` to a tunnel whose TCP connection failed, and a clean
-/// `END_STREAM` would read as a complete backend response. A fence revocation
-/// and a timeout (the idle window or a backend read/write deadline, all
-/// `ReadWriteTimeout`) are not socket errors, and keep the clean `END_STREAM`
-/// the datagram relay also keeps for its idle expiry and write stall.
+/// Only the idle window and the half-close cap end the stream cleanly: the
+/// relay recorded them as a side-less `(Unknown, ReadWriteTimeout)` watchdog
+/// expiry, and the tunnel either went quiet or already finished one direction.
+/// Every other failure cut the byte stream short, and a clean `END_STREAM`
+/// would read as a complete response: a socket error on either side (RFC 9113
+/// section 8.5 assigns `CONNECT_ERROR` to a tunnel whose TCP connection
+/// failed), a backend read or write deadline (attributed to a direction and a
+/// side), and a fence revocation (`ConnectionAborted`).
 fn hbone_relay_failure_resets_stream(
     first_failure: Option<&tcp_proxy::StreamFirstFailure>,
-    revoked_by_fence: bool,
 ) -> bool {
-    match first_failure {
-        Some((_, class, _, _)) => {
-            !revoked_by_fence && !matches!(class, retry::ErrorClass::ReadWriteTimeout)
-        }
-        None => false,
-    }
+    first_failure.is_some_and(|(direction, class, side, _)| {
+        let clean_expiry = *direction == Direction::Unknown
+            && side.is_none()
+            && matches!(class, retry::ErrorClass::ReadWriteTimeout);
+        !clean_expiry
+    })
 }
 
 /// End an HBONE tunnel's upgraded CONNECT stream once its relay is over (issue
@@ -607,12 +610,10 @@ fn build_hbone_relay_summary(
 /// The datagram relay's transaction summary, built from WHY it ended (issue
 /// #5765).
 ///
-/// Only a peer close or idle expiry is a completed body. A socket error or a
-/// fence revocation is not, and carries its error class. A socket error also
-/// resets the CONNECT stream on the wire (issue #5781); a revocation or write
-/// stall ends it with the same clean `END_STREAM` as a completed relay, so
-/// this summary and its `hbone.udp.termination_reason` are what tell those
-/// apart.
+/// Only a peer close or idle expiry is a completed body. A socket error, a
+/// write stall, or a fence revocation is not, and carries its error class; each
+/// of those also resets the CONNECT stream on the wire (issues #5781, #5858),
+/// and this summary's `hbone.udp.termination_reason` says which one it was.
 #[allow(clippy::too_many_arguments)]
 fn build_hbone_udp_relay_summary(
     proxy: &Proxy,
@@ -1600,10 +1601,7 @@ pub(super) async fn handle_hbone_request(
                         });
                 end_hbone_connect_stream(
                     client_stream,
-                    hbone_relay_failure_resets_stream(
-                        result.first_failure.as_ref(),
-                        revoked_by_fence,
-                    ),
+                    hbone_relay_failure_resets_stream(result.first_failure.as_ref()),
                 );
                 if let Some((direction, class, side, message)) = result.first_failure.as_ref() {
                     if revoked_by_fence {
@@ -2286,8 +2284,8 @@ pub(super) async fn handle_hbone_udp_request(
         let relay_ctx = &tunnel.snapshot().ctx;
         match on_upgrade.await {
             Ok(upgraded) => {
-                // Lent to the relay so a socket-error ending can reset the
-                // CONNECT stream once the relay is over (issue #5781).
+                // Lent to the relay so an ending that cut the relay short can
+                // reset the CONNECT stream once the relay is over (issue #5781).
                 let mut io = TokioIo::new(upgraded);
                 let (bytes_to_app, bytes_to_tunnel, relay_end) =
                     relay_hbone_udp(&mut io, socket, idle, tunnel.revocation_token()).await;
@@ -2601,8 +2599,8 @@ const HBONE_UDP_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 /// → frame → tunnel. Either direction ending (EOF, error) ends the relay. The
 /// relay never closes the tunnel itself: the returned [`HboneUdpRelayEnd`]
 /// records WHY it ended (issue #5765), and the caller ends the CONNECT stream
-/// from it, resetting it on a socket error and otherwise closing it cleanly
-/// (issue #5781).
+/// from it, closing it cleanly after a peer close or idle expiry and otherwise
+/// resetting it (issues #5781, #5858).
 ///
 /// The idle window is refreshed on activity in **EITHER** direction — a shared
 /// `last_activity` timestamp bumped by both the tunnel→app reads and the
@@ -2626,8 +2624,8 @@ const HBONE_UDP_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 /// `revocation` is the admission fence's cancellation handle (issue #5042 step
 /// 1): it is a fourth arm of the same `select!` as the two pumps and the idle
 /// watchdog, so when it fires the surviving pumps are DROPPED and the caller
-/// ends the tunnel by dropping `Upgraded`. The peer observes the same
-/// end-of-stream it would from an idle expiry.
+/// resets the tunnel with `RST_STREAM(CONNECT_ERROR)` (issue #5858), so the
+/// peer can tell the cut from an idle expiry.
 async fn relay_hbone_udp<S>(
     tunnel: S,
     socket: tokio::net::UdpSocket,
@@ -2752,8 +2750,9 @@ where
             // Bound the write: a stalled HBONE peer (stopped reading / h2
             // flow-control exhausted) must not pin this task forever, especially
             // when the idle watchdog is disabled (codex r3). On stall, tear the
-            // relay down (break → the caller closes the tunnel cleanly). Only
-            // the datagrams the tunnel fully accepted are counted as relayed.
+            // relay down (break → the caller resets the tunnel, issue #5858).
+            // Only the datagrams the tunnel fully accepted are counted as
+            // relayed.
             match batch.write_to(&mut tunnel_write, write_deadline).await {
                 Ok(()) => {
                     from_app_bytes.fetch_add(
@@ -3524,15 +3523,9 @@ mod tests {
                 HboneUdpRelayEnd::TunnelClosed | HboneUdpRelayEnd::IdleTimeout
             );
             assert_eq!(end.error_class().is_none(), clean, "{end:?}");
-            // Issue #5781: only a socket error resets the CONNECT stream.
-            let socket_error = matches!(
-                end,
-                HboneUdpRelayEnd::TunnelReadFailed(_)
-                    | HboneUdpRelayEnd::TunnelWriteFailed(_)
-                    | HboneUdpRelayEnd::AppSendFailed(_)
-                    | HboneUdpRelayEnd::AppRecvFailed(_)
-            );
-            assert_eq!(end.resets_stream(), socket_error, "{end:?}");
+            // Issues #5781, #5858: every ending but a peer close or idle
+            // expiry resets the CONNECT stream.
+            assert_eq!(end.resets_stream(), !clean, "{end:?}");
         }
 
         let refused = HboneUdpRelayEnd::AppSendFailed(ErrorKind::ConnectionRefused);
