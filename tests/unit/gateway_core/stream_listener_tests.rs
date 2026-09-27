@@ -28,10 +28,11 @@ use ferrum_edge::proxy::stream_listener::{
     NodeWaypointUdpSteerHold, StreamListenerDegradation, StreamListenerManager,
 };
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
+use ferrum_edge::proxy::udp_port_handoff::{UDP_PORT_HANDOFF_BUDGET, UdpPortOwner};
 use ferrum_edge::request_epoch::RequestEpochStore;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
@@ -1282,6 +1283,128 @@ async fn test_reconcile_detects_port_conflict() {
 
     // Keep blocker alive until end of test
     drop(blocker);
+}
+
+/// Issue #5843, QUIC → stream: a UDP stream bind that collides with a socket
+/// another in-process datagram listener still holds must wait for the release
+/// within the reconcile budget instead of reporting `BindFailed` and waiting
+/// for the 30-second supervisor tick. The held socket and ledger entry stand in
+/// for the Gateway listener's QUIC half, which its own manager drains
+/// concurrently with this reconcile, so the lost race is reproduced instead of
+/// left to scheduler timing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_listener_bind_waits_for_an_in_process_udp_port_handoff() {
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP");
+    let port = occupied.local_addr().expect("addr").port();
+    let manager = create_manager(GatewayConfig {
+        proxies: vec![create_stream_proxy("udp-handoff", BackendScheme::Udp, port)],
+        ..empty_config()
+    });
+    let hold = manager
+        .udp_port_handoff()
+        .hold(port, UdpPortOwner::GatewayQuic);
+    hold.arm();
+
+    // Release from a plain OS thread, well inside the budget but after the
+    // first bind attempt collided. The flag is raised before the socket goes,
+    // so reconcile never observes a successful bind in the gap between the two.
+    let released = Arc::new(AtomicBool::new(false));
+    let releaser_released = released.clone();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(350));
+        releaser_released.store(true, Ordering::SeqCst);
+        drop(occupied);
+        drop(hold);
+    });
+
+    let failures = manager.reconcile().await;
+    releaser.join().expect("releaser thread");
+    assert!(
+        failures.is_empty(),
+        "a socket released within the budget must not surface as a bind failure: {failures:?}"
+    );
+    assert!(
+        released.load(Ordering::SeqCst),
+        "the UDP listener bound before the held socket was released"
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("the UDP listener must start once the port is released");
+    assert!(
+        manager.stream_bind_failures().is_empty(),
+        "{:?}",
+        manager.stream_bind_failures()
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// The handoff wait is bounded: a socket still held when the budget runs out
+/// is reported as the ordinary bind failure, and reconcile returns instead of
+/// retrying indefinitely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_listener_bind_reports_a_still_held_handoff_port_after_the_budget() {
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP");
+    let port = occupied.local_addr().expect("addr").port();
+    let manager = create_manager(GatewayConfig {
+        proxies: vec![create_stream_proxy("udp-held", BackendScheme::Udp, port)],
+        ..empty_config()
+    });
+    let hold = manager
+        .udp_port_handoff()
+        .hold(port, UdpPortOwner::GatewayQuic);
+    hold.arm();
+
+    let started = std::time::Instant::now();
+    let failures = tokio::time::timeout(Duration::from_secs(20), manager.reconcile())
+        .await
+        .expect("reconcile must give up on a port that stays held");
+    let elapsed = started.elapsed();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].1, port);
+    assert!(failures[0].2.contains("already in use"), "{failures:?}");
+    assert!(
+        elapsed >= UDP_PORT_HANDOFF_BUDGET / 2,
+        "the collision must have been retried within the budget, returned after {elapsed:?}"
+    );
+    let bind_failures = manager.stream_bind_failures();
+    assert!(
+        bind_failures.iter().any(|failure| {
+            failure.listen_port == port
+                && matches!(failure.kind, StreamListenerDegradation::BindFailed)
+        }),
+        "{bind_failures:?}"
+    );
+
+    drop(hold);
+    drop(occupied);
+    manager.shutdown_all().await;
+}
+
+/// A UDP port no in-process listener holds or recently released is not a
+/// handoff: the collision is reported on the first attempt, as before.
+#[tokio::test]
+async fn udp_listener_bind_does_not_wait_on_a_port_no_in_process_listener_holds() {
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP");
+    let port = occupied.local_addr().expect("addr").port();
+    let manager = create_manager(GatewayConfig {
+        proxies: vec![create_stream_proxy("udp-foreign", BackendScheme::Udp, port)],
+        ..empty_config()
+    });
+
+    let started = std::time::Instant::now();
+    let failures = manager.reconcile().await;
+    let elapsed = started.elapsed();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].2.contains("already in use"), "{failures:?}");
+    assert!(
+        elapsed < UDP_PORT_HANDOFF_BUDGET,
+        "a foreign owner must not be waited on: {elapsed:?}"
+    );
+
+    drop(occupied);
+    manager.shutdown_all().await;
 }
 
 /// Issue #2117: a non-fatal stream-listener bind failure must be surfaced as

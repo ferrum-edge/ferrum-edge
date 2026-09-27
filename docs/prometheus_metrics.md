@@ -150,7 +150,8 @@ sustained.
   retried, so HTTP/1.1 and HTTP/2 keep serving that port and its routes stay
   admitted. The QUIC rebind waits up to 2 seconds per reconcile pass for the
   dead endpoint to release its UDP socket, so that brief release is not
-  reported as `bind_failed`.
+  reported as `bind_failed`. The same wait covers a UDP port handed back from
+  a UDP/DTLS stream proxy whose socket is still closing.
 - `class_flip_deferred` means a frontend TLS-class change is waiting for the
   previous accept sockets to close; `retirement_pending` is the same fail-closed
   wait for another bind-identity change.

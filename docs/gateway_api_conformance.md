@@ -519,12 +519,24 @@ whose QUIC bind fails keeps serving H1/H2, reports the failure on
 A UDP/DTLS stream proxy on the same **numeric** port is a QUIC-only conflict:
 TCP and UDP are independent socket namespaces, so the HTTPS TCP listener stays
 bound and keeps serving H1/H2. The optional QUIC half is refused with a bounded
-`udp_stream_collision` reason, `ensure_quic` is not called while the claim
-exists, and the TCP port is **not** added to the whole-listener refused-route
-set. Adding the UDP/DTLS claim on reload drains only QUIC (existing H1/H2
-connections continue); removing it starts QUIC on the already-running TCP
-listener. A stale reconcile cannot restore QUIC after a newer epoch reserved
-the UDP port. TCP/TLS raw-stream collisions still refuse the whole HTTP-family
+`udp_stream_collision` reason, `ensure_quic_in_pass` is not called while the
+claim exists, and the TCP port is **not** added to the whole-listener
+refused-route set. Adding the UDP/DTLS claim on reload drains only QUIC
+(existing H1/H2 connections continue); removing it starts QUIC on the
+already-running TCP listener. A stale reconcile cannot restore QUIC after a
+newer epoch reserved the UDP port.
+
+The Gateway listener manager and the stream listener manager reconcile the same
+publication concurrently, so either side of that UDP port handoff can try to
+bind while the other still holds the socket (#5843). Both consult one
+in-process ledger of the UDP ports their datagram listeners hold. A bind that
+fails with `Address already in use` on a port the ledger shows held, or
+released within the last 10 seconds, is retried for up to 2 seconds per
+reconcile pass instead of waiting for the 30-second retry tick. A port no
+Ferrum listener holds fails on the first attempt as before, and a socket still
+held after the 2 seconds is reported as the ordinary bind failure. That
+failure is retried as soon as the other side releases a UDP port, not only on
+the next tick. TCP/TLS raw-stream collisions still refuse the whole HTTP-family
 listener; plaintext HTTP listeners remain unaffected by UDP/DTLS same-port
 claims.
 

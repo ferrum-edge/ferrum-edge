@@ -167,6 +167,7 @@ pub mod tcp_proxy;
 pub mod udp_batch;
 pub mod udp_placement_cleanup;
 pub mod udp_placement_migration;
+pub mod udp_port_handoff;
 pub mod udp_proxy;
 pub mod unix_backend;
 pub mod unix_backend_pool;
