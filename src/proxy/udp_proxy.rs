@@ -3314,6 +3314,56 @@ impl std::os::fd::AsRawFd for FrontendUdpSocket {
     }
 }
 
+/// Bind a UDP/DTLS listener's frontend socket on `addr`.
+///
+/// A listener that holds a claim in the in-process UDP port ledger rides out a
+/// handoff of its port with a budget of its own ([`UdpPortHold::bind`], issue
+/// #5851). Its manager's reconcile pass only probed the port and dropped the
+/// probe socket before spawning this task, so a Gateway QUIC half can take the
+/// port in between; this bind then runs after the pass published its failures
+/// and checked the release log, and a failure here would otherwise wait for
+/// the 30-second supervisor tick. The wait is raced against the listener's
+/// shutdown signals, so a listener retired meanwhile returns `Ok(None)` at
+/// once and its manager's reconcile never waits on this budget.
+///
+/// Without a hold (standalone listeners and tests) this is a plain bind.
+async fn bind_frontend_udp_socket(
+    addr: SocketAddr,
+    udp_port_hold: Option<&UdpPortHold>,
+    shutdown: &watch::Receiver<bool>,
+    global_shutdown: Option<&watch::Receiver<bool>>,
+) -> std::io::Result<Option<UdpSocket>> {
+    let Some(hold) = udp_port_hold else {
+        return UdpSocket::bind(addr).await.map(Some);
+    };
+    // Clones, so waiting here consumes nothing the accept loop later watches.
+    let mut shutdown = shutdown.clone();
+    let mut global_shutdown = global_shutdown.cloned();
+    let stopped = async {
+        let global = async {
+            let stopped = match global_shutdown.as_mut() {
+                Some(rx) => rx.wait_for(|stop| *stop).await.is_ok(),
+                None => false,
+            };
+            if !stopped {
+                // No global signal, or its sender is gone: nothing to wait on.
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            // A dropped per-listener sender means the handle that owned this
+            // listener is gone, which is a stop as well.
+            _ = shutdown.wait_for(|stop| *stop) => {}
+            _ = global => {}
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = stopped => Ok(None),
+        socket = hold.bind(addr) => socket.map(Some),
+    }
+}
+
 /// Start a UDP proxy listener on the given port.
 ///
 /// For each incoming datagram from a new client address, a session is created
@@ -3484,7 +3534,16 @@ pub async fn start_udp_listener_holding_port(
     let node_waypoint_udp_source = node_waypoint_udp_source_scoping;
 
     let addr = SocketAddr::new(bind_addr, port);
-    let frontend_socket = UdpSocket::bind(addr).await?;
+    let Some(frontend_socket) = bind_frontend_udp_socket(
+        addr,
+        udp_port_hold.as_ref(),
+        &shutdown,
+        global_shutdown.as_ref(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     let frontend_socket = Arc::new(FrontendUdpSocket::new(frontend_socket, udp_port_hold));
 
     // NodeWaypoint UDP relay (issue #3286): replies leave THIS socket toward
@@ -5669,7 +5728,7 @@ async fn start_dtls_frontend_listener(
         // so the NodeWaypoint inbound auth mark has to be applied there rather
         // than here: the pod-veth tc guard drops UDP toward an enrolled pod IP
         // unless it carries the mark, which would otherwise strand every
-        // ServerHello and every application reply. `bind_with_limits` applies
+        // ServerHello and every application reply. `from_socket_with_limits` applies
         // it before the socket is used and fails the listener if it cannot,
         // so this is a startup precondition, not an optimization. Off for
         // every other DTLS listener.
@@ -5716,8 +5775,19 @@ async fn start_dtls_frontend_listener(
         // an established DTLS session twice.
         per_source_ip_admission: metrics.per_ip_admission.clone(),
     };
+    let Some(socket) = bind_frontend_udp_socket(
+        addr,
+        udp_port_hold.as_ref(),
+        &shutdown,
+        global_shutdown.as_ref(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to bind DTLS server on {}: {}", addr, e))?
+    else {
+        return Ok(());
+    };
     let mut server =
-        crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?;
+        crate::dtls::DtlsServer::from_socket_with_limits(socket, dtls_config, dtls_limits)?;
     if let Some(hold) = udp_port_hold {
         hold.arm();
         server.attach_udp_port_hold(hold);

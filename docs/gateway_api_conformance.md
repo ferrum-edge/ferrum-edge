@@ -547,7 +547,13 @@ port number within the last second. A socket still held when the budget runs
 out is reported as the ordinary bind failure. That failure is retried when the
 other side's socket on the same port closes, not only on the next tick, even
 when the socket closes while a reconcile started by a config change is still
-running; releases of other ports do not trigger a reconcile. TCP/TLS raw-stream
+running; releases of other ports do not trigger a reconcile. Each manager
+follows the other's releases from before its first reconcile, so a socket that
+closes during startup, before the retry loop begins, is not missed (#5851). A
+stream listener's pass only checks that the port is free and its listener task
+binds the socket afterwards, so the task's own bind retries the same collision
+with a 2-second budget of its own; a listener shut down while it waits stops at
+once, so its manager's next reconcile never waits on it. TCP/TLS raw-stream
 collisions still refuse the whole HTTP-family listener; plaintext HTTP
 listeners remain unaffected by UDP/DTLS same-port claims.
 

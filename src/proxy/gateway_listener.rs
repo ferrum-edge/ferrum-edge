@@ -661,6 +661,15 @@ pub struct GatewayListenerManager {
     /// seen, and the slow retry tick only reconciles when a bind failure is
     /// outstanding, so a missed publication could stay missed indefinitely.
     revisions: Mutex<Option<watch::Receiver<u64>>>,
+    /// The stream listener manager's UDP/DTLS port releases (issue #5843),
+    /// subscribed in [`Self::new`] and consumed by [`Self::run`] for the same
+    /// reason as `revisions` (issue #5851). The mode's readiness reconcile runs
+    /// before `run` starts, so a release landing during or after that pass
+    /// would be marked seen by a subscription taken in `run`. If that pass left
+    /// a QUIC `BindFailed` on the released port, only the slow retry tick would
+    /// then rebind it. Held here, the release stays pending until `run` judges
+    /// it against the failures the readiness pass published.
+    stream_releases: Mutex<Option<crate::proxy::udp_port_handoff::UdpPortReleases>>,
     /// Process-global HTTP/HTTPS proxy sockets that can directly serve a
     /// same-port Gateway route without a second bind.
     existing_frontends: BTreeMap<u16, GatewayListenerClass>,
@@ -680,6 +689,8 @@ impl GatewayListenerManager {
     pub fn new(state: ProxyState, bind_addr: std::net::IpAddr, tls: GatewayListenerTls) -> Self {
         let revisions = state.subscribe_config_revision();
         let udp_ports = Arc::clone(state.stream_listener_manager.udp_port_handoff());
+        // Before the readiness reconcile can run; see `stream_releases`.
+        let stream_releases = udp_ports.subscribe_releases(UdpPortOwner::StreamDatagram);
         let mut existing_frontends = BTreeMap::new();
         if state.env_config.proxy_http_port != 0 {
             existing_frontends.insert(
@@ -699,6 +710,7 @@ impl GatewayListenerManager {
             listeners: Mutex::new(BTreeMap::new()),
             draining: Mutex::new(Vec::new()),
             revisions: Mutex::new(Some(revisions)),
+            stream_releases: Mutex::new(Some(stream_releases)),
             existing_frontends,
             bind_failures: arc_swap::ArcSwap::from_pointee(Vec::new()),
             status: None,
@@ -1734,10 +1746,16 @@ impl GatewayListenerManager {
         // QUIC port handoff (issue #5843). A QUIC bind that ran out of its
         // in-pass budget waiting for that socket is retried when that port is
         // released instead of on the next slow tick. Only stream releases are
-        // watched, so this manager's own QUIC sockets can never wake it.
-        let mut stream_releases = self
-            .udp_ports
-            .subscribe_releases(UdpPortOwner::StreamDatagram);
+        // watched, so this manager's own QUIC sockets can never wake it. The
+        // subscription was taken in `new()`, before the readiness reconcile,
+        // so a release during or after that pass is still pending here and is
+        // judged against the failures it published (issue #5851).
+        let mut stream_releases = match self.stream_releases.lock().await.take() {
+            Some(stream_releases) => stream_releases,
+            None => self
+                .udp_ports
+                .subscribe_releases(UdpPortOwner::StreamDatagram),
+        };
         let mut stream_releases_open = true;
         loop {
             if *shutdown.borrow() {
@@ -3002,6 +3020,83 @@ mod tests {
             drop(hold);
             drop(occupied);
             manager.shutdown_all().await;
+            return;
+        }
+        panic!("could not reserve a TCP+UDP port pair in {MAX_PORT_BIND_ATTEMPTS} attempts");
+    }
+
+    /// Issue #5851: the mode runs the readiness reconcile before it spawns
+    /// [`GatewayListenerManager::run`]. A stream listener that releases its
+    /// port after that pass left the port's QUIC half `BindFailed`, but before
+    /// the supervisor starts, must still wake the supervisor into a reconcile.
+    /// The subscription is taken in `new()`, so the release is still pending
+    /// when `run` starts instead of being marked seen, and HTTP/3 comes back
+    /// without waiting for the 30-second retry tick. The order is fixed by the
+    /// test itself: the release happens after `reconcile` returns and before
+    /// `run` is spawned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stream_release_before_the_supervisor_starts_still_wakes_it() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+        for attempt in 1..=MAX_PORT_BIND_ATTEMPTS {
+            let Some(fixture) = manager_with_occupied_udp_port().await else {
+                continue;
+            };
+            let OccupiedUdpPort {
+                port,
+                socket: occupied,
+                hold,
+                manager,
+            } = fixture;
+            // The readiness reconcile: the stream socket outlasts the handoff
+            // budget, so the QUIC half is reported `BindFailed`.
+            let failures = manager.reconcile().await;
+            if attempt < MAX_PORT_BIND_ATTEMPTS
+                && failures
+                    .iter()
+                    .any(|failure| failure.protocol == GatewayListenerProtocolHalf::Tcp)
+            {
+                // A parallel test took the TCP half after the probe.
+                drop(hold);
+                drop(occupied);
+                manager.shutdown_all().await;
+                continue;
+            }
+            assert!(
+                failures.iter().any(|failure| {
+                    failure.port == port
+                        && failure.protocol == GatewayListenerProtocolHalf::Quic
+                        && failure.category == GatewayListenerFailureCategory::BindFailed
+                }),
+                "the held socket must outlast the readiness pass: {failures:?}"
+            );
+            assert!(manager.active_http3_ports().await.is_empty());
+
+            // The stream listener closes its socket after the readiness pass
+            // published that failure and before the supervisor starts.
+            drop(occupied);
+            drop(hold);
+
+            let manager = Arc::new(manager);
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let supervisor = tokio::spawn(Arc::clone(&manager).run(shutdown_rx));
+            // Well inside the 30-second retry tick, so only the release can
+            // drive this rebind.
+            let rebound = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while manager.active_http3_ports().await != vec![port] {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            let _ = shutdown_tx.send(true);
+            let outcome = supervisor.await.expect("supervisor task");
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(
+                rebound.is_ok(),
+                "a stream release that landed before the supervisor started must rebind QUIC \
+                 before the retry tick"
+            );
             return;
         }
         panic!("could not reserve a TCP+UDP port pair in {MAX_PORT_BIND_ATTEMPTS} attempts");
