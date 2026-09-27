@@ -300,12 +300,15 @@ struct ListenerHandle {
     /// shared port can host same-ID passthrough proxies from two namespaces.
     sni_ids: Option<Vec<NamespacedResourceId>>,
     started: Arc<AtomicBool>,
-    /// Raised by a UDP/DTLS listener task as soon as its listener returns,
-    /// before it reports a failure (issue #5855). The report can wake the
-    /// supervisor while the task is still finishing, so reconcile treats a
-    /// raised flag like a finished `join_handle`; otherwise that wakeup's pass
-    /// could still see a live task and leave the port to the next retry. TCP
-    /// listener tasks never raise it: their exit is seen through `join_handle`.
+    /// Raised by a UDP/DTLS listener task once its listener has returned and
+    /// any failure is recorded, before it wakes the supervisor (issue #5855).
+    /// That wake can run a pass while the task is still finishing, so reconcile
+    /// treats a raised flag like a finished `join_handle`; otherwise the pass
+    /// could still see a live task and leave the port to the next retry. It is
+    /// never raised before the failure is recorded: a restart clears the
+    /// proxy's failures, and a failure appended after that clear would stay
+    /// until the next rebind. TCP listener tasks never raise it: their exit is
+    /// seen through `join_handle`.
     exited: Arc<AtomicBool>,
     tcp_metrics: Option<Arc<TcpProxyMetrics>>,
     udp_metrics: Option<Arc<UdpProxyMetrics>>,
@@ -3052,8 +3055,8 @@ impl StreamListenerManager {
             // let the start loop below re-validate and re-bind. Failures
             // surface in the `degraded` snapshot and are retried on the next
             // reconcile; this never crashes reconcile. A UDP/DTLS task whose
-            // listener already returned counts as exited even while it is
-            // still reporting its failure (`ListenerHandle::exited`).
+            // listener already returned and whose failure is recorded counts
+            // as exited even before the task finishes (`ListenerHandle::exited`).
             if handle.join_handle.is_finished() || handle.exited.load(Ordering::Acquire) {
                 warn!(
                     listener_key = %key,
@@ -3704,7 +3707,6 @@ impl StreamListenerManager {
                     )
                     .await;
                     started_for_exit.store(false, Ordering::Release);
-                    exited_for_exit.store(true, Ordering::Release);
                     if let Err(e) = result {
                         if let Some(hold) = before_failure_report_hold.as_ref() {
                             hold.wait().await;
@@ -3737,13 +3739,19 @@ impl StreamListenerManager {
                         // stored before the log is read and a release is
                         // logged before the supervisor reads the failures, so
                         // either this check sees the release or the
-                        // supervisor sees the failure. `exited` is already
-                        // raised, so the pass this wakes restarts the listener
-                        // even if this task has not finished yet.
+                        // supervisor sees the failure. `exited` is raised only
+                        // after the failure is recorded, so a pass that restarts
+                        // the listener clears this failure rather than racing
+                        // it, and it is raised before the wake, so the pass this
+                        // wakes restarts the listener even if this task has not
+                        // finished yet.
+                        exited_for_exit.store(true, Ordering::Release);
                         let released = udp_port_handoff.released_since(task_quic_release_mark);
                         if released.includes_any([port_val]) {
                             udp_release_rescan.notify_one();
                         }
+                    } else {
+                        exited_for_exit.store(true, Ordering::Release);
                     }
                     if owner_for_exit && let Some(steering) = node_waypoint_udp_steering {
                         // Do not await the listener map here: reconcile joins this
