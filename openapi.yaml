@@ -10055,9 +10055,11 @@ components:
               plugin stays allowed and sees plaintext. Decompression is bounded:
               a compressed frame may not exceed the frame ceiling, a frame may not
               inflate past it, and a message may not inflate past
-              `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default:
-              the reassembled-message ceiling); exceeding either closes with
-              1009. An invalid backend answer refuses the upgrade with 502.
+              `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default
+              1 MiB; `0` opts into the reassembled-message ceiling); exceeding
+              either closes with 1009. An invalid backend answer (including a
+              foreign extension, a malformed list, or a non-ASCII value) refuses
+              the upgrade with 502.
               Applies on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3 Extended
               CONNECT.
         udp_idle_timeout_seconds:

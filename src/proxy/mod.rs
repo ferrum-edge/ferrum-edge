@@ -16228,7 +16228,7 @@ async fn handle_websocket_request_authenticated(
     // Forward the backend's permessage-deflate answer only when this upgrade
     // offered it. Same post-policy placement as the subprotocol.
     let ws_negotiated_deflate = if ws_deflate_offered {
-        backend_handshake.negotiated_permessage_deflate().cloned()
+        backend_handshake.negotiated_permessage_deflate()
     } else {
         None
     };
@@ -16809,12 +16809,31 @@ pub(crate) fn begin_permessage_deflate_termination(
 /// Finish a `terminate` negotiation against the backend's handshake answer.
 /// An invalid answer is an error: RFC 7692 §7 requires the client (here the
 /// gateway) to fail the connection.
+///
+/// The backend's whole `Sec-WebSocket-Extensions` answer is judged, not just
+/// its `permessage-deflate` part: the gateway offered nothing else, so a
+/// foreign extension (RFC 6455 §4.1), a malformed list, or a non-ASCII value
+/// refuses the upgrade too.
 pub(crate) fn complete_permessage_deflate_termination(
     handshake: ws_permessage_deflate::TerminationHandshake,
     backend_handshake: &WsBackendHandshake,
     max_decompressed_message_bytes: usize,
 ) -> Result<ws_permessage_deflate::NegotiatedTermination, &'static str> {
-    let answer = match backend_handshake.negotiated_permessage_deflate() {
+    finish_permessage_deflate_termination(
+        handshake,
+        backend_handshake.backend_extensions(),
+        max_decompressed_message_bytes,
+    )
+}
+
+/// [`complete_permessage_deflate_termination`] against a raw extension answer
+/// (see [`backend_extensions_answer`]).
+pub(crate) fn finish_permessage_deflate_termination(
+    handshake: ws_permessage_deflate::TerminationHandshake,
+    backend_extensions: Option<&hyper::header::HeaderValue>,
+    max_decompressed_message_bytes: usize,
+) -> Result<ws_permessage_deflate::NegotiatedTermination, &'static str> {
+    let answer = match backend_extensions {
         Some(value) => Some(value.to_str().map_err(|_| "non-ASCII extension answer")?),
         None => None,
     };
@@ -16851,25 +16870,48 @@ pub(crate) fn push_permessage_deflate_offer(
     true
 }
 
-/// The `permessage-deflate` part of a backend handshake answer, or `None`.
+/// A backend handshake's whole `Sec-WebSocket-Extensions` answer, every field
+/// line joined with `", "` (RFC 9110 §5.3), or `None` when it sent none.
 ///
-/// Every `Sec-WebSocket-Extensions` field line is considered; a non-visible
-/// ASCII value fails closed. The caller forwards the result only when
-/// [`push_permessage_deflate_offer`] actually offered the extension.
-pub(crate) fn permessage_deflate_answer(
+/// Kept raw: a `terminate` proxy validates all of it, and a `passthrough`
+/// proxy extracts only the `permessage-deflate` part through
+/// [`permessage_deflate_answer_from`].
+pub(crate) fn backend_extensions_answer(
     headers: &hyper::HeaderMap,
 ) -> Option<hyper::header::HeaderValue> {
     let mut values = headers
         .get_all(hyper::header::SEC_WEBSOCKET_EXTENSIONS)
         .iter();
-    let first = values.next()?.to_str().ok()?;
-    let mut joined = first.to_string();
-    for value in values {
-        joined.push_str(", ");
-        joined.push_str(value.to_str().ok()?);
+    let first = values.next()?;
+    let mut rest = values.peekable();
+    if rest.peek().is_none() {
+        return Some(first.clone());
     }
-    let answer = retain_permessage_deflate_extensions(&joined)?;
+    let mut joined = first.as_bytes().to_vec();
+    for value in rest {
+        joined.extend_from_slice(b", ");
+        joined.extend_from_slice(value.as_bytes());
+    }
+    // Every part is already a valid field value, so the join is one too.
+    hyper::header::HeaderValue::from_bytes(&joined).ok()
+}
+
+/// The `permessage-deflate` part of a backend's extension answer (see
+/// [`backend_extensions_answer`]), or `None`. A non-visible-ASCII value fails
+/// closed. The caller forwards the result only when
+/// [`push_permessage_deflate_offer`] actually offered the extension.
+pub(crate) fn permessage_deflate_answer_from(
+    answer: &hyper::header::HeaderValue,
+) -> Option<hyper::header::HeaderValue> {
+    let answer = retain_permessage_deflate_extensions(answer.to_str().ok()?)?;
     hyper::header::HeaderValue::from_str(&answer).ok()
+}
+
+/// The `permessage-deflate` part of a backend handshake answer, or `None`.
+pub(crate) fn permessage_deflate_answer(
+    headers: &hyper::HeaderMap,
+) -> Option<hyper::header::HeaderValue> {
+    permessage_deflate_answer_from(&backend_extensions_answer(headers)?)
 }
 
 fn push_forwardable_header_override(
@@ -17421,12 +17463,12 @@ pub(crate) fn websocket_backend_tls_sni_unsupported(proxy: &Proxy) -> bool {
 /// that offered a subprotocol list see no negotiated value and fail
 /// application-level handshakes.
 ///
-/// `negotiated_permessage_deflate` carries only the `permessage-deflate` part
-/// of the backend's `Sec-WebSocket-Extensions` answer. The frontend forwards it
-/// solely for a `websocket_permessage_deflate: passthrough` proxy that offered
-/// the extension, and then relays the session as raw bytes: the frame bridge
-/// cannot decode RSV1-compressed frames (issue #5769). Every other path keeps
-/// the extension stripped end to end.
+/// `backend_extensions` carries the backend's whole `Sec-WebSocket-Extensions`
+/// answer. A `websocket_permessage_deflate: passthrough` proxy that offered
+/// the extension forwards only its `permessage-deflate` part and then relays
+/// the session as raw bytes: the frame bridge cannot decode RSV1-compressed
+/// frames (issue #5769). A `terminate` proxy validates the whole answer. Every
+/// other path keeps the extension stripped end to end.
 /// Backend WebSocket transport: TLS (or plain) over the byte-level idle
 /// activity adapter over TCP. The `WsActivityIo` layer sits UNDER the
 /// framer so fragmented-message read progress refreshes the shared idle
@@ -17438,7 +17480,7 @@ pub type BackendWsStream =
 pub(crate) struct BackendWsHandshake {
     pub stream: BackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
-    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
+    pub backend_extensions: Option<hyper::header::HeaderValue>,
 }
 
 /// Backend WebSocket transport for a mesh egress session: the raw WebSocket
@@ -17452,7 +17494,7 @@ type MeshBackendWsStream = WebSocketStream<WsActivityIo<crate::proxy::hbone_pool
 pub(crate) struct MeshBackendWsHandshake {
     pub stream: MeshBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
-    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
+    pub backend_extensions: Option<hyper::header::HeaderValue>,
 }
 
 /// Backend WebSocket transport for a sidecar-ingress Unix-domain backend
@@ -17468,7 +17510,7 @@ type UnixBackendWsStream = WebSocketStream<WsActivityIo<tokio::net::UnixStream>>
 pub(crate) struct UnixBackendWsHandshake {
     pub stream: UnixBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
-    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
+    pub backend_extensions: Option<hyper::header::HeaderValue>,
     conn_lease: unix_backend_pool::UnixWebSocketConnLease,
 }
 
@@ -17497,14 +17539,21 @@ impl WsBackendHandshake {
         }
     }
 
-    /// The backend's `permessage-deflate` answer (see [`BackendWsHandshake`]).
-    pub(crate) fn negotiated_permessage_deflate(&self) -> Option<&hyper::header::HeaderValue> {
+    /// The backend's whole extension answer (see [`BackendWsHandshake`]).
+    pub(crate) fn backend_extensions(&self) -> Option<&hyper::header::HeaderValue> {
         match self {
-            Self::Direct(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
-            Self::Mesh(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
+            Self::Direct(handshake) => handshake.backend_extensions.as_ref(),
+            Self::Mesh(handshake) => handshake.backend_extensions.as_ref(),
             #[cfg(unix)]
-            Self::Unix(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
+            Self::Unix(handshake) => handshake.backend_extensions.as_ref(),
         }
+    }
+
+    /// The `permessage-deflate` part of the backend's answer, which a
+    /// `passthrough` proxy forwards.
+    pub(crate) fn negotiated_permessage_deflate(&self) -> Option<hyper::header::HeaderValue> {
+        self.backend_extensions()
+            .and_then(permessage_deflate_answer_from)
     }
 }
 
@@ -17716,12 +17765,12 @@ pub(crate) async fn connect_websocket_backend(
         .headers()
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
-    let negotiated_permessage_deflate = permessage_deflate_answer(backend_response.headers());
+    let backend_extensions = backend_extensions_answer(backend_response.headers());
 
     Ok(BackendWsHandshake {
         stream: backend_ws_stream,
         negotiated_subprotocol,
-        negotiated_permessage_deflate,
+        backend_extensions,
     })
 }
 
@@ -17887,12 +17936,12 @@ async fn connect_unix_websocket_backend(
         .headers()
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
-    let negotiated_permessage_deflate = permessage_deflate_answer(response.headers());
+    let backend_extensions = backend_extensions_answer(response.headers());
 
     Ok(UnixBackendWsHandshake {
         stream,
         negotiated_subprotocol,
-        negotiated_permessage_deflate,
+        backend_extensions,
         conn_lease,
     })
 }
@@ -18227,7 +18276,7 @@ pub(crate) async fn connect_mesh_websocket_backend(
             Ok(MeshBackendWsHandshake {
                 stream,
                 negotiated_subprotocol: ws_tunnel.negotiated_subprotocol,
-                negotiated_permessage_deflate: ws_tunnel.negotiated_permessage_deflate,
+                backend_extensions: ws_tunnel.backend_extensions,
             })
         }
         MeshWsEgress::AmbientHbone => {
@@ -18448,12 +18497,12 @@ pub(crate) async fn connect_mesh_websocket_backend(
                 .headers()
                 .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
                 .cloned();
-            let negotiated_permessage_deflate = permessage_deflate_answer(response.headers());
+            let backend_extensions = backend_extensions_answer(response.headers());
 
             Ok(MeshBackendWsHandshake {
                 stream,
                 negotiated_subprotocol,
-                negotiated_permessage_deflate,
+                backend_extensions,
             })
         }
     }

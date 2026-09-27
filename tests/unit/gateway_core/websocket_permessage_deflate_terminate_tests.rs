@@ -7,15 +7,20 @@
 //! the shared relay's (masking enforced, auto-Pong off), over
 //! `PermessageDeflateIo`, so what they read is what frame plugins receive.
 
+use std::time::Duration;
+
 use bytes::Bytes;
+use ferrum_edge::_test_support::finish_permessage_deflate_termination_for_test;
 use ferrum_edge::proxy::ws_permessage_deflate::{
     BACKEND_OFFER, DeflateLegConfig, InflateLimits, MAX_WINDOW_BITS, PermessageDeflateEncoder,
-    PermessageDeflateFault, PermessageDeflateIo, PlainOutbound, WsDeflateTermination,
-    WsOutboundCodec, negotiate_client_offer, offer_termination, parse_backend_answer,
-    permessage_deflate_fault,
+    PermessageDeflateFault, PermessageDeflateIo, PlainOutbound, SCRATCH_BYTES,
+    WsDeflateTermination, WsOutboundCodec, inflate_message_for_test, negotiate_client_offer,
+    offer_termination, parse_backend_answer, permessage_deflate_fault,
 };
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 use futures_util::StreamExt;
+use hyper::HeaderMap;
+use hyper::header::{HeaderValue, SEC_WEBSOCKET_EXTENSIONS};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Error as WsError;
@@ -318,6 +323,43 @@ fn legs_negotiate_independently() {
     assert!(invalid.is_err(), "an invalid backend answer is refused");
 }
 
+#[test]
+fn whole_backend_extension_answer_is_validated() {
+    fn finish(lines: &[HeaderValue]) -> Result<bool, &'static str> {
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            headers.append(SEC_WEBSOCKET_EXTENSIONS, line.clone());
+        }
+        let handshake = offer_termination(None, false, &mut Vec::new());
+        finish_permessage_deflate_termination_for_test(handshake, &headers, 0)
+            .map(|negotiated| negotiated.session.is_some())
+    }
+
+    assert_eq!(finish(&[]), Ok(false), "no answer: plain backend leg");
+    assert_eq!(
+        finish(&[HeaderValue::from_static("permessage-deflate")]),
+        Ok(true)
+    );
+    // The gateway offered only permessage-deflate, so anything else in the
+    // answer (on any field line) fails the upgrade instead of being dropped.
+    let non_ascii = HeaderValue::from_bytes(b"permessage-deflate\xe9")
+        .expect("obs-text is a valid field value");
+    let refused: [&[HeaderValue]; 5] = [
+        &[HeaderValue::from_static("x-unrequested")],
+        &[
+            HeaderValue::from_static("x-unrequested"),
+            HeaderValue::from_static("permessage-deflate"),
+        ],
+        &[HeaderValue::from_static("permessage-deflate, x-other")],
+        &[HeaderValue::from_static("permessage-deflate; x=\"1")],
+        &[non_ascii.clone()],
+    ];
+    for lines in refused {
+        assert!(finish(lines).is_err(), "answer {lines:?} must be refused");
+    }
+    assert_eq!(finish(&[non_ascii]), Err("non-ASCII extension answer"));
+}
+
 // ---------------------------------------------------------------------------
 // Inflate: what the relay framer (and so every frame plugin) receives
 // ---------------------------------------------------------------------------
@@ -591,6 +633,56 @@ async fn frame_ceilings_bound_compressed_and_inflated_frames() {
         PermessageDeflateFault::DecompressedFrameTooLarge { max: 1024 }
     );
     assert_eq!(fault.close_frame().code, CloseCode::Size);
+}
+
+#[tokio::test]
+async fn a_stalled_compressed_frame_header_reserves_nothing() {
+    // An RSV1 header declaring a frame-ceiling-sized payload, a few payload
+    // bytes, then silence: the declared length must not be reserved.
+    let declared = LIMITS.max_frame_bytes as u64;
+    let mut wire = vec![FIN_RSV1_TEXT, 0x80 | 127];
+    wire.extend_from_slice(&declared.to_be_bytes());
+    wire.extend_from_slice(&MASK);
+    wire.extend_from_slice(&[0u8; 100]);
+    let (mut peer, gateway_side) = tokio::io::duplex(64 * 1024);
+    peer.write_all(&wire).await.expect("write wire bytes");
+    let mut io = PermessageDeflateIo::new(gateway_side, Bytes::new(), Some(LIMITS));
+    let mut buf = [0u8; 64];
+    let stalled = tokio::time::timeout(Duration::from_millis(50), io.read(&mut buf)).await;
+    assert!(stalled.is_err(), "the incomplete frame blocks the read");
+    assert!(
+        io.raw_buffer_capacity() <= SCRATCH_BYTES,
+        "a {declared}-byte header reserved {} bytes",
+        io.raw_buffer_capacity()
+    );
+    drop(peer);
+}
+
+#[test]
+fn inflate_buffer_capacity_never_exceeds_its_limit() {
+    const LIMIT: usize = 256 * 1024;
+    let limits = InflateLimits {
+        max_frame_bytes: LIMIT,
+        max_message_bytes: LIMIT,
+    };
+    // A bomb: the buffer stops one byte past the limit, and its capacity
+    // must not have doubled past it on the way.
+    let bomb = deflate(&vec![0u8; 8 << 20]);
+    let (result, capacity) = inflate_message_for_test(limits, &bomb);
+    assert_eq!(
+        result,
+        Err(PermessageDeflateFault::DecompressedMessageTooLarge { max: LIMIT })
+    );
+    assert!(capacity <= LIMIT + 1, "bomb capacity {capacity}");
+
+    // Legitimate frames up to the limit stay within it too, including one
+    // that lands exactly on it.
+    for len in [3 * SCRATCH_BYTES + 5, 150 * 1024, LIMIT] {
+        let plaintext = noise(len, 11);
+        let (result, capacity) = inflate_message_for_test(limits, &deflate(&plaintext));
+        assert_eq!(result, Ok(len));
+        assert!(capacity <= LIMIT + 1, "{len}-byte capacity {capacity}");
+    }
 }
 
 #[tokio::test]

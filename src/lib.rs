@@ -7714,6 +7714,20 @@ pub mod _test_support {
         crate::proxy::permessage_deflate_answer(headers)
     }
 
+    /// Finish a `websocket_permessage_deflate: terminate` negotiation against
+    /// a backend's handshake response headers, as the H1/H2/H3 paths do.
+    pub fn finish_permessage_deflate_termination_for_test(
+        handshake: crate::proxy::ws_permessage_deflate::TerminationHandshake,
+        headers: &hyper::HeaderMap,
+        max_decompressed_message_bytes: usize,
+    ) -> Result<crate::proxy::ws_permessage_deflate::NegotiatedTermination, &'static str> {
+        crate::proxy::finish_permessage_deflate_termination(
+            handshake,
+            crate::proxy::backend_extensions_answer(headers).as_ref(),
+            max_decompressed_message_bytes,
+        )
+    }
+
     /// Refusals for `websocket_permessage_deflate: passthrough` proxies whose
     /// effective plugin chain requires the parsed WebSocket relay.
     pub fn websocket_permessage_deflate_passthrough_errors_for_test(

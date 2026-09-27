@@ -398,6 +398,42 @@ fn test_shared_stream_admission_limits_apply_when_xds_is_disabled_on_cp() {
 }
 
 #[test]
+fn test_permessage_deflate_max_message_bytes_defaults_to_one_mib() {
+    // DEFLATE expands up to ~1032:1, so the decompressed-message bound must
+    // not default to the parser's (64 MiB) reassembled-message ceiling.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.websocket_permessage_deflate_max_message_bytes,
+                1 << 20
+            );
+            assert_eq!(
+                EnvConfig::default().websocket_permessage_deflate_max_message_bytes,
+                1 << 20
+            );
+        },
+    );
+    // `0` stays an explicit opt-in to the reassembled-message ceiling.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.websocket_permessage_deflate_max_message_bytes, 0);
+        },
+    );
+}
+
+#[test]
 fn test_http3_websocket_enabled_defaults_true() {
     // RFC 9220 WebSocket-over-HTTP/3 Extended CONNECT defaults to enabled.
     // Operators who run an H3 listener want WebSocket-over-H3 to "just work"

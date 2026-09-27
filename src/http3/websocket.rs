@@ -1479,7 +1479,7 @@ pub(crate) async fn handle_h3_websocket(
     // Forward the backend's permessage-deflate answer only when this upgrade
     // offered it; a negotiated session is relayed as raw bytes below.
     let ws_negotiated_deflate = if ws_deflate_offered {
-        backend_handshake.negotiated_permessage_deflate().cloned()
+        backend_handshake.negotiated_permessage_deflate()
     } else {
         None
     };

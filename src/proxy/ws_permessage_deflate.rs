@@ -28,10 +28,17 @@
 //! inflate past the decompressed-message ceiling
 //! (`FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES`, never above the
 //! parser's reassembled-message ceiling). Inflation stops one byte past the
-//! limit, so no buffer grows beyond its ceiling, and the relay closes the leg
-//! with 1009. The decoder keeps a fixed 32 KiB LZ77 window (the RFC 7692
-//! maximum, `*_max_window_bits=15`), so per-leg memory is fixed apart from
-//! those bounded buffers.
+//! limit and the relay closes the leg with 1009. Buffers grow only with bytes
+//! that actually arrived: a compressed frame's payload buffer is never
+//! reserved from its declared length, and an inflated frame's buffer never
+//! holds capacity beyond the frame's inflate limit plus one byte.
+//!
+//! Fixed per-leg state: a negotiated leg holds a DEFLATE decompressor (a 32
+//! KiB LZ77 window, the RFC 7692 maximum, about 45-60 KiB in all) and a 16 KiB
+//! read scratch from the start. The compressor toward a leg (about 240 KiB) is
+//! allocated the first time a message is compressed toward it and kept for the
+//! session, so a session that negotiated and used both legs holds about
+//! 0.6 MB beyond the bounded frame and message buffers.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -68,7 +75,7 @@ const DEFLATE_TAIL: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
 
 /// Raw bytes read from the transport per read call, and the inflate output
 /// step. Both are per-leg scratch, not per-message buffers.
-const SCRATCH_BYTES: usize = 16 * 1024;
+pub const SCRATCH_BYTES: usize = 16 * 1024;
 
 const FIN: u8 = 0x80;
 const RSV1: u8 = 0x40;
@@ -357,8 +364,8 @@ pub struct WsDeflateTermination {
     pub client: Option<DeflateLegConfig>,
     /// The backend leg negotiated the extension.
     pub backend: Option<DeflateLegConfig>,
-    /// `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES`; `0` means the
-    /// parser's reassembled-message ceiling.
+    /// `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default 1 MiB);
+    /// `0` opts into the parser's reassembled-message ceiling.
     pub max_decompressed_message_bytes: usize,
 }
 
@@ -478,7 +485,8 @@ impl WsOutboundCodec for Option<PermessageDeflateEncoder> {
 
 /// Compresses outgoing messages toward one leg (RFC 7692 §7.2.1).
 pub struct PermessageDeflateEncoder {
-    compress: Compress,
+    /// Allocated on the first message compressed toward this leg.
+    compress: Option<Compress>,
     reset_after_message: bool,
     /// Largest message that may be compressed; `None` means any.
     max_compressible_bytes: Option<usize>,
@@ -503,7 +511,7 @@ impl PermessageDeflateEncoder {
         // permits for any message.
         let window_limited = leg.outbound_max_window_bits < MAX_WINDOW_BITS;
         Self {
-            compress: Compress::new(Compression::default(), false),
+            compress: None,
             reset_after_message: leg.outbound_no_context_takeover || window_limited,
             max_compressible_bytes: window_limited.then(|| 1usize << leg.outbound_max_window_bits),
         }
@@ -522,33 +530,36 @@ impl PermessageDeflateEncoder {
         if payload.is_empty() || exceeds_window {
             return None;
         }
-        let compressed = self.deflate_sync(payload);
+        let compress = self
+            .compress
+            .get_or_insert_with(|| Compress::new(Compression::default(), false));
+        let compressed = Self::deflate_sync(compress, payload);
         if compressed.is_none() || self.reset_after_message {
-            self.compress.reset();
+            compress.reset();
         }
         compressed
     }
 
-    fn deflate_sync(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
+    fn deflate_sync(compress: &mut Compress, payload: &[u8]) -> Option<Vec<u8>> {
         let mut out: Vec<u8> = Vec::with_capacity(payload.len() / 2 + 64);
-        let start_in = self.compress.total_in();
+        let start_in = compress.total_in();
         loop {
             if out.capacity() - out.len() < 64 {
                 out.reserve(out.capacity().max(1024));
             }
-            let before_in = self.compress.total_in();
+            let before_in = compress.total_in();
             let before_out = out.len();
             let consumed = usize::try_from(before_in - start_in).ok()?;
-            self.compress
+            compress
                 .compress_vec(&payload[consumed..], &mut out, FlushCompress::Sync)
                 .ok()?;
-            let consumed = usize::try_from(self.compress.total_in() - start_in).ok()?;
+            let consumed = usize::try_from(compress.total_in() - start_in).ok()?;
             // The sync flush is complete once every input byte is consumed and
             // the compressor stopped short of filling the output.
             if consumed == payload.len() && out.len() < out.capacity() {
                 break;
             }
-            if self.compress.total_in() == before_in && out.len() == before_out {
+            if compress.total_in() == before_in && out.len() == before_out {
                 return None;
             }
         }
@@ -706,6 +717,31 @@ impl<S> PermessageDeflateIo<S> {
             },
         }
     }
+
+    /// Test hook: the capacity of the inflating leg's compressed-payload
+    /// buffer (`0` on a pass-through leg).
+    #[doc(hidden)]
+    pub fn raw_buffer_capacity(&self) -> usize {
+        self.reader
+            .as_ref()
+            .map_or(0, |reader| reader.raw.capacity())
+    }
+}
+
+/// Test hook: inflate `payload` as a whole compressed message (one final
+/// frame) on a fresh leg with `limits`. Returns the inflated length or the
+/// fault, and the capacity the inflate buffer reached.
+#[doc(hidden)]
+pub fn inflate_message_for_test(
+    limits: InflateLimits,
+    payload: &[u8],
+) -> (Result<usize, PermessageDeflateFault>, usize) {
+    let mut reader = InflateReader::new(limits, &[]);
+    let mut inflated = Vec::new();
+    let result = reader
+        .inflate_frame(payload, true, &mut inflated)
+        .map(|()| inflated.len());
+    (result, inflated.capacity())
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for PermessageDeflateIo<S> {
@@ -851,7 +887,8 @@ struct InflateReader {
     /// A BFINAL block ended the DEFLATE stream inside the current message.
     stream_ended: bool,
     /// Transport bytes not yet transcoded. Holds at most one compressed frame
-    /// (bounded by the frame ceiling) plus one read.
+    /// (bounded by the frame ceiling) plus one read, and grows only as those
+    /// bytes arrive: a declared frame length never reserves memory.
     raw: BytesMut,
     /// Transcoded bytes for the framer.
     out: VecDeque<Bytes>,
@@ -959,8 +996,9 @@ impl InflateReader {
                 mask,
                 len,
             } => {
+                // Wait for the whole payload without reserving its declared
+                // length: a header alone must not pin a frame-sized buffer.
                 if self.raw.len() < len {
-                    self.raw.reserve(len - self.raw.len());
                     return Ok(false);
                 }
                 let mut payload = self.raw.split_to(len);
@@ -968,7 +1006,8 @@ impl InflateReader {
                     unmask(&mut payload, mask);
                 }
                 let fin = first & FIN != 0;
-                let inflated = self.inflate_frame(&payload, fin)?;
+                let mut inflated = Vec::new();
+                self.inflate_frame(&payload, fin, &mut inflated)?;
                 self.out
                     .push_back(encode_wire_header(first & !RSV1, masked, inflated.len()));
                 if !inflated.is_empty() {
@@ -1045,26 +1084,27 @@ impl InflateReader {
         Ok(true)
     }
 
-    /// Inflate one compressed frame within the frame and message ceilings.
+    /// Inflate one compressed frame onto `inflated` (empty on entry) within
+    /// the frame and message ceilings.
     fn inflate_frame(
         &mut self,
         payload: &[u8],
         fin: bool,
-    ) -> Result<Vec<u8>, PermessageDeflateFault> {
+        inflated: &mut Vec<u8>,
+    ) -> Result<(), PermessageDeflateFault> {
         let message_room = self
             .limits
             .max_message_bytes
             .saturating_sub(self.message_inflated);
         let limit = message_room.min(self.limits.max_frame_bytes);
-        let mut inflated = Vec::new();
-        let mut result = self.inflate_into(payload, &mut inflated, limit);
+        let mut result = self.inflate_into(payload, inflated, limit);
         if result.is_ok() && fin && !self.stream_ended {
-            result = self.inflate_into(&DEFLATE_TAIL, &mut inflated, limit);
+            result = self.inflate_into(&DEFLATE_TAIL, inflated, limit);
         }
         match result {
             Ok(()) => {
                 self.message_inflated += inflated.len();
-                Ok(inflated)
+                Ok(())
             }
             Err(InflateStop::Invalid) => Err(PermessageDeflateFault::InvalidCompressedData),
             Err(InflateStop::Overflow) if message_room <= self.limits.max_frame_bytes => {
@@ -1079,7 +1119,8 @@ impl InflateReader {
     }
 
     /// Inflate `input` onto `out`, stopping as soon as `out` exceeds `limit`
-    /// (so it never holds more than `limit + 1` bytes).
+    /// (so it never holds more than `limit + 1` bytes, and never has more
+    /// capacity than that when it started empty).
     fn inflate_into(
         &mut self,
         input: &[u8],
@@ -1113,6 +1154,19 @@ impl InflateReader {
             let produced = usize::try_from(self.decompress.total_out() - before_out)
                 .map_err(|_| InflateStop::Invalid)?;
             offset += consumed;
+            // `chunk` keeps `out.len() + produced` within `limit + 1`. Grow
+            // geometrically, but never past that bound: amortized doubling
+            // would leave a bomb, or a near-limit frame, holding up to twice
+            // its ceiling.
+            if out.capacity() - out.len() < produced {
+                let target = out
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(SCRATCH_BYTES)
+                    .min(limit.saturating_add(1))
+                    .max(out.len() + produced);
+                out.reserve_exact(target - out.len());
+            }
             out.extend_from_slice(&self.scratch[..produced]);
             if out.len() > limit {
                 return Err(InflateStop::Overflow);

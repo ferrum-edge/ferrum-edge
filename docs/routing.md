@@ -436,10 +436,12 @@ Extended CONNECT alike:
   A client that does not offer the extension gets an uncompressed leg.
 - **Backend leg.** The backend receives the gateway's own offer,
   `Sec-WebSocket-Extensions: permessage-deflate`, whatever the client offered.
-  The answer must be one valid `permessage-deflate` element without
-  `client_max_window_bits` (which the gateway did not offer); anything else fails
-  the upgrade with 502 (`rejection_phase: websocket_permessage_deflate`). A
-  backend that declines gets an uncompressed leg.
+  The whole `Sec-WebSocket-Extensions` answer (every field line) must be one
+  valid `permessage-deflate` element without `client_max_window_bits` (which the
+  gateway did not offer); anything else — a foreign extension, a second element,
+  a malformed list, or a non-ASCII value — fails the upgrade with 502
+  (`rejection_phase: websocket_permessage_deflate`). A backend that sends no
+  extension answer gets an uncompressed leg.
 
 Every message is inflated before the shared frame relay parses it, so every frame
 and body-inspecting plugin — the WAF WebSocket scanner, `ws_message_size_limiting`,
@@ -457,14 +459,30 @@ Decompression is bounded per leg:
   (`FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`, or a lower `ws_message_size_limiting`
   `max_frame_bytes`), and one frame may not inflate past it;
 - a message may not inflate past
-  `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default `0`: the
-  reassembled-message ceiling, 4x the frame ceiling or a lower
-  `max_message_bytes`);
+  `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default 1 MiB, never
+  above the reassembled-message ceiling of 4x the frame ceiling or a lower
+  `max_message_bytes`; `0` explicitly opts into that ceiling);
 - inflation stops one byte past a limit and the session closes with 1009 in both
   directions; corrupt compressed data closes with 1007;
-- the LZ77 window is the RFC 7692 maximum of 32 KiB, so each negotiated leg holds
-  a fixed-size DEFLATE decompressor and compressor (a few hundred KiB) plus
-  buffers bounded by the frame and message ceilings.
+- buffers grow only with bytes that arrived: a compressed frame's declared length
+  reserves nothing, and an inflated frame never holds more than its limit plus
+  one byte;
+- the LZ77 window is the RFC 7692 maximum of 32 KiB. Each negotiated leg holds a
+  DEFLATE decompressor (about 50 KiB) and a 16 KiB read buffer from the start,
+  and a compressor (about 240 KiB) from the first message the gateway compresses
+  toward it, for the life of the session. A session with both legs negotiated
+  therefore holds about 0.6 MB, plus buffers bounded by the frame and message
+  ceilings. Size connection limits with that in mind.
+
+The message bound is also the amplification bound. DEFLATE expands up to about
+1032:1, so a peer can make the gateway inflate, inspect (every frame and body
+plugin, the WAF included), and re-compress a whole message for about 1/1000 of
+its size on the wire, and repeat that for every message. With the 1 MiB default
+that is about 1 KiB of wire data per 1 MiB of work. Setting the bound to `0`
+raises it to the reassembled-message ceiling — 64 MiB with the default 16 MiB
+frame size — where about 64 KiB of compressed data forces 64 MiB of memory and
+on the order of a second of CPU per message. Keep the bound as low as the
+application's largest legitimate message allows.
 
 Frame and message ceilings, fragment metering, and the incomplete-message bounds
 all apply to the decompressed messages the plugins see, and the wire
@@ -472,8 +490,9 @@ fragmentation is preserved. Terminate costs CPU on both legs; a session whose
 peers both decline compression uses the ordinary relay (including
 `FERRUM_WEBSOCKET_TUNNEL_MODE`), while a negotiated session always uses the parsed
 relay. Byte counters and `ws_frame_logging` sizes are decompressed sizes. As with
-`passthrough`, upgrade every DP before enabling `terminate` on the CP: a DP that
-predates the value rejects the namespace snapshot.
+`passthrough`, upgrade every DP, and every database-mode node sharing the DB,
+before enabling `terminate`: a DP that predates the value rejects the namespace
+snapshot, and a database-mode node that predates it rejects the proxy row.
 
 ```yaml
 proxies:

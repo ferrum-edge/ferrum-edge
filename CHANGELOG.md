@@ -23,14 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails the connection as before. Decompression is bounded: a compressed frame
   may not exceed the frame ceiling, a frame may not inflate past it, and a
   message may not inflate past the new
-  `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default `0`: the
-  reassembled-message ceiling); inflation stops one byte past a limit and the
-  session closes with 1009 (1007 for corrupt data). An invalid backend answer
+  `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default 1 MiB; `0`
+  opts into the reassembled-message ceiling). DEFLATE expands up to about
+  1032:1, so this bound also caps how much inflate, inspection, and
+  re-compression work a small compressed message can force. Inflation stops one
+  byte past a limit and the session closes with 1009 (1007 for corrupt data),
+  and buffers grow only with bytes that arrived. A session with both legs
+  negotiated holds about 0.6 MB of DEFLATE state. An invalid backend answer —
+  including a foreign extension, a malformed list, or a non-ASCII value —
   refuses the upgrade with 502. `strip` (default) and `passthrough` are
   unchanged and pay nothing. Stream proxies must keep `strip`. No schema change:
   the existing `proxies.websocket_permessage_deflate` column stores the new
   value. **Upgrade note:** a DP that predates `terminate` rejects a namespace
-  snapshot that uses it; upgrade every DP before enabling `terminate` on the CP.
+  snapshot that uses it, and a database-mode node that predates it rejects the
+  proxy row; upgrade every DP, and every database-mode node sharing the DB,
+  before enabling `terminate`.
 
 - **Diagnostic references for every gateway-authored error, with rejection and
   per-attempt detail** (#5846). `FERRUM_DIAGNOSTIC_REFS` takes a new `all`
