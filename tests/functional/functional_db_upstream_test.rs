@@ -48,11 +48,21 @@ async fn test_database_mode_upstream_load_balancing() {
     );
 
     // Start gateway in database mode.
+    //
+    // Round-robin selection counters are sharded per OS worker thread, each
+    // shard with its own starting phase (see "Round Robin" in
+    // docs/load_balancing.md): workers do not share one global interleaving.
+    // Tokio can move the keep-alive connection task to another worker between
+    // requests, which shifts the sequence onto a different shard and turns an
+    // exact 10/10/10 split into e.g. 10/11/9. One worker thread means one
+    // shard, so the 30 sequential requests below must walk a single strict
+    // rotation.
     let mut gateway = TestGateway::builder()
         .mode_database_sqlite()
         .jwt_issuer("ferrum-edge-test")
         .log_level("info")
         .db_poll_interval_seconds(2)
+        .env("FERRUM_WORKER_THREADS", "1")
         .spawn()
         .await
         .expect("Failed to start gateway");
@@ -160,6 +170,7 @@ async fn test_database_mode_upstream_load_balancing() {
     // Step 6: Send requests through the proxy and verify load balancing
     println!("\n--- Step 6: Test Round-Robin Load Balancing ---");
     let mut counts: HashMap<String, u32> = HashMap::new();
+    let mut sequence: Vec<String> = Vec::with_capacity(30);
 
     for i in 0..30 {
         let resp = client
@@ -177,15 +188,38 @@ async fn test_database_mode_upstream_load_balancing() {
                 );
                 let body = r.text().await.unwrap_or_default();
                 let server = parse_server_name(&body);
-                if !server.is_empty() {
-                    *counts.entry(server).or_insert(0) += 1;
-                }
+                assert!(
+                    !server.is_empty(),
+                    "Request {} response did not identify a backend: {}",
+                    i,
+                    body
+                );
+                *counts.entry(server.clone()).or_insert(0) += 1;
+                sequence.push(server);
             }
             Err(e) => panic!("Request {} failed: {}", i, e),
         }
     }
 
     println!("Round-robin distribution: {:?}", counts);
+    println!("Round-robin sequence: {:?}", sequence);
+
+    // Strict rotation: the first three picks cover three distinct backends and
+    // every later pick repeats the pick three positions earlier.
+    assert!(
+        sequence[0] != sequence[1] && sequence[1] != sequence[2] && sequence[0] != sequence[2],
+        "First three requests must hit three distinct backends, got {:?}",
+        sequence
+    );
+    for i in 3..sequence.len() {
+        assert_eq!(
+            sequence[i],
+            sequence[i - 3],
+            "Request {} broke the round-robin rotation: {:?}",
+            i,
+            sequence
+        );
+    }
 
     // Verify all 3 servers received traffic
     assert!(
