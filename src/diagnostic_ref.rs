@@ -19,19 +19,23 @@
 //!   token's namespaces is indistinguishable from an unknown one (`404`).
 //! * The header is gateway-owned: a backend (or serverless function) copy is
 //!   stripped at every backend response boundary through
-//!   `proxy::headers::GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`, and every
-//!   stamp strips any copy a plugin or hook left before writing its own, so a
-//!   client never sees a reference the gateway did not mint.
+//!   `proxy::headers::GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`, and the final
+//!   client boundary strips any copy a plugin or hook left, whatever
+//!   `FERRUM_DIAGNOSTIC_REFS` says, before an enabled store writes its own, so
+//!   a client never sees a reference the gateway did not mint.
 //!
 //! Hot-path cost: with the default `off`, one `OnceLock` load per HTTP-family
-//! request and nothing else. When enabled, one `Arc` slot per request, and only
-//! on a response that carries `X-Gateway-Error`, one CSPRNG read and one short
-//! critical section on one of [`SHARD_COUNT`] shard mutexes. Detail is copied
-//! into the slot from the terminal transaction summary, and only for a summary
-//! that can carry `X-Gateway-Error` (5xx or a classified dispatch error).
+//! request and one header-map removal per response head. When enabled, one
+//! `Arc` slot per request, and only on a response that carries
+//! `X-Gateway-Error`, one CSPRNG read and one short critical section on one of
+//! [`SHARD_COUNT`] shard mutexes. Detail is copied into the slot from the
+//! terminal transaction summary, and only for a summary that can carry
+//! `X-Gateway-Error` (5xx or a classified dispatch error).
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::hash::BuildHasher;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -85,6 +89,13 @@ pub const DEFAULT_LOOKUP_RATE_PER_SECOND: u32 = 10;
 pub const MIN_LOOKUP_RATE_PER_SECOND: u32 = 1;
 /// Upper clamp for `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND`.
 pub const MAX_LOOKUP_RATE_PER_SECOND: u32 = 10_000;
+
+/// Most distinct JWT subjects the per-subject lookup budget tracks within one
+/// one-second window. Subjects from earlier windows are purged when the table
+/// fills; a new subject that still finds it full is refused (`429`) rather
+/// than evicting a live subject's budget, so the table can never be used to
+/// reset another caller's count.
+pub const MAX_TRACKED_LOOKUP_SUBJECTS: usize = 4_096;
 
 /// Number of independently locked store shards. The first random byte of a
 /// reference selects its shard, so load spreads uniformly and one shard's
@@ -350,22 +361,29 @@ impl DiagnosticSlot {
 ///
 /// Only a summary that can accompany an `X-Gateway-Error` token (a 5xx or a
 /// classified dispatch error) is recorded, so the enabled feature does not
-/// copy strings for every successful request.
+/// copy strings for every successful request. The `error_class` is the one
+/// the transaction log reports, including a gateway output-policy refusal the
+/// request context selected after the summary was built, so the detail is
+/// identical whether it is recorded here synchronously or by the terminal log.
 pub(crate) fn record_request_detail(
     slot: &DiagnosticSlot,
     summary: &TransactionSummary,
     ctx: &crate::plugins::RequestContext,
 ) {
-    if slot.detail.get().is_some()
-        || (summary.response_status_code < 500 && summary.error_class.is_none())
-    {
+    if slot.detail.get().is_some() {
         return;
     }
-    slot.record_detail(DiagnosticDetail::from_summary(
+    let error_class = ctx.response_policy_error_class(summary.error_class);
+    if summary.response_status_code < 500 && error_class.is_none() {
+        return;
+    }
+    let mut detail = DiagnosticDetail::from_summary(
         summary,
         backend_dispatch_label(ctx.backend_dispatch_state()),
         ctx.route_request_timeout_phase(),
-    ));
+    );
+    detail.error_class = crate::retry::http_log_error_class(error_class);
+    slot.record_detail(detail);
 }
 
 fn rfc3339_millis(at: DateTime<Utc>) -> String {
@@ -460,6 +478,13 @@ impl Shard {
     }
 }
 
+/// One subject's admitted lookups in one fixed one-second window.
+#[derive(Debug, Clone, Copy)]
+struct SubjectWindow {
+    window: u64,
+    count: u32,
+}
+
 /// Bounded result label of one admin lookup, for
 /// `ferrum_diagnostic_ref_lookups_total{result}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,11 +551,17 @@ pub struct DiagnosticRefStore {
     ttl_wall: chrono::Duration,
     per_shard_capacity: usize,
     lookup_rate_per_second: u32,
+    per_subject_lookup_rate_per_second: u32,
     shards: Box<[Mutex<Shard>]>,
     epoch: Instant,
     /// Fixed one-second lookup window: high 32 bits are the window's second
     /// since `epoch`, low 32 bits the lookups admitted in it.
     rate_window: AtomicU64,
+    /// Per-subject share of the same one-second window, keyed by a
+    /// process-keyed hash of the JWT `sub` (bounded by
+    /// [`MAX_TRACKED_LOOKUP_SUBJECTS`]). Admin-lookup cold path only.
+    subject_windows: Mutex<HashMap<u64, SubjectWindow>>,
+    subject_hasher: RandomState,
     minted_total: AtomicU64,
     evicted_capacity_total: AtomicU64,
     evicted_expired_total: AtomicU64,
@@ -546,19 +577,23 @@ impl DiagnosticRefStore {
             Duration::from_secs(MAX_TTL_SECONDS),
         );
         let max_entries = config.max_entries.clamp(MIN_MAX_ENTRIES, MAX_MAX_ENTRIES);
+        let lookup_rate_per_second = config
+            .lookup_rate_per_second
+            .clamp(MIN_LOOKUP_RATE_PER_SECOND, MAX_LOOKUP_RATE_PER_SECOND);
         Self {
             namespace: namespace.into(),
             ttl,
             ttl_wall: chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::zero()),
             per_shard_capacity: (max_entries / SHARD_COUNT).max(1),
-            lookup_rate_per_second: config
-                .lookup_rate_per_second
-                .clamp(MIN_LOOKUP_RATE_PER_SECOND, MAX_LOOKUP_RATE_PER_SECOND),
+            lookup_rate_per_second,
+            per_subject_lookup_rate_per_second: (lookup_rate_per_second / 2).max(1),
             shards: (0..SHARD_COUNT)
                 .map(|_| Mutex::new(Shard::default()))
                 .collect(),
             epoch: Instant::now(),
             rate_window: AtomicU64::new(0),
+            subject_windows: Mutex::new(HashMap::new()),
+            subject_hasher: RandomState::new(),
             minted_total: AtomicU64::new(0),
             evicted_capacity_total: AtomicU64::new(0),
             evicted_expired_total: AtomicU64::new(0),
@@ -579,6 +614,12 @@ impl DiagnosticRefStore {
     /// Effective retained-reference ceiling (never above the configured one).
     pub fn capacity(&self) -> usize {
         self.per_shard_capacity * SHARD_COUNT
+    }
+
+    /// Share of the lookup budget one JWT `sub` may use per second: half the
+    /// configured budget, and at least one.
+    pub fn per_subject_lookup_rate_per_second(&self) -> u32 {
+        self.per_subject_lookup_rate_per_second
     }
 
     fn lock_shard(&self, key: &RefKey) -> MutexGuard<'_, Shard> {
@@ -706,9 +747,53 @@ impl DiagnosticRefStore {
         }
     }
 
-    /// Admit one admin lookup against the fixed one-second window.
+    /// The fixed one-second lookup window `now` falls in.
+    fn lookup_window(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_secs() & 0xFFFF_FFFF
+    }
+
+    /// Admit one admin lookup attempt by `subject` (the JWT `sub`): first
+    /// against that subject's share of the window, then against the global
+    /// budget. A subject over its share is refused without charging the
+    /// global budget, so no single credential can exhaust it for the others.
+    pub fn try_acquire_subject_lookup_at(&self, now: Instant, subject: &str) -> bool {
+        self.try_acquire_subject_window(now, subject) && self.try_acquire_lookup_at(now)
+    }
+
+    fn try_acquire_subject_window(&self, now: Instant, subject: &str) -> bool {
+        let window = self.lookup_window(now);
+        let limit = self.per_subject_lookup_rate_per_second;
+        let key = self.subject_hasher.hash_one(subject);
+        // Same poison reasoning as `lock_shard`: every mutation is a single
+        // map operation, so a recovered guard never exposes a torn entry.
+        let mut windows = self
+            .subject_windows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = windows.get_mut(&key) {
+            if entry.window != window {
+                *entry = SubjectWindow { window, count: 1 };
+                return true;
+            }
+            if entry.count >= limit {
+                return false;
+            }
+            entry.count += 1;
+            return true;
+        }
+        if windows.len() >= MAX_TRACKED_LOOKUP_SUBJECTS {
+            windows.retain(|_, entry| entry.window == window);
+            if windows.len() >= MAX_TRACKED_LOOKUP_SUBJECTS {
+                return false;
+            }
+        }
+        windows.insert(key, SubjectWindow { window, count: 1 });
+        true
+    }
+
+    /// Admit one admin lookup against the global fixed one-second window.
     pub fn try_acquire_lookup_at(&self, now: Instant) -> bool {
-        let window = now.saturating_duration_since(self.epoch).as_secs() & 0xFFFF_FFFF;
+        let window = self.lookup_window(now);
         let limit = u64::from(self.lookup_rate_per_second);
         let mut current = self.rate_window.load(Ordering::Relaxed);
         loop {
@@ -812,12 +897,20 @@ impl DiagnosticRefStore {
     }
 }
 
+/// Drop every client-bound copy of the reference header.
+///
+/// The header is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS` says, so the
+/// final client boundary calls this even when references are off: a plugin or
+/// hook can never hand a client a reference the gateway did not mint.
+/// `http::HeaderMap` normalizes field names to lowercase, so the one `remove`
+/// drops every spelling and every repeated value.
+pub fn strip_response_header(headers: &mut http::HeaderMap) {
+    headers.remove(DIAGNOSTIC_REF_HEADER);
+}
+
 /// Strip every client-bound copy of the reference header, then stamp a fresh
 /// reference when the response carries a gateway-authored `X-Gateway-Error`
 /// token from the closed vocabulary. Returns the stamped reference.
-///
-/// `http::HeaderMap` normalizes field names to lowercase, so the one `remove`
-/// drops every spelling and every repeated value a plugin or hook left.
 pub fn stamp_response_headers(
     store: &DiagnosticRefStore,
     slot: Option<&Arc<DiagnosticSlot>>,
@@ -825,7 +918,7 @@ pub fn stamp_response_headers(
     status: u16,
     headers: &mut http::HeaderMap,
 ) -> Option<String> {
-    headers.remove(DIAGNOSTIC_REF_HEADER);
+    strip_response_header(headers);
     let token = headers
         .get(crate::proxy::headers::X_GATEWAY_ERROR_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -866,36 +959,49 @@ impl DiagnosticRefLookup {
     }
 }
 
-/// Authorize and resolve one admin lookup.
+/// Authorize and resolve one admin lookup by the JWT subject `subject`.
 ///
-/// Order is fixed and independent of the reference: the scope and namespace
-/// binding are checked first (they depend only on the credential), then the
-/// rate limit, then the store. A reference that exists but belongs to a
-/// namespace the token does not name answers exactly like an unknown one.
+/// Order is fixed and independent of the reference:
+///
+/// 1. With the store enabled, every attempt is charged against the rate limit
+///    first (the subject's share, then the global budget), including one that
+///    is then refused for its credential, so a credential lacking the scope
+///    cannot probe without limit.
+/// 2. The scope and namespace binding (they depend only on the credential).
+/// 3. The store's own namespace against the token's `ns` claim. Every
+///    reference in the store belongs to that one namespace, so a caller
+///    outside it gets `NotFound` without the store being read: the answer and
+///    its cost are identical to an unknown reference.
+/// 4. The store.
 pub fn authorize_lookup(
     store: Option<&DiagnosticRefStore>,
+    subject: &str,
     scope_granted: bool,
     allowed_namespaces: &crate::grpc::auth::AllowedNamespaces,
     reference: &str,
     now: Instant,
 ) -> DiagnosticRefLookup {
-    let outcome = if !scope_granted {
+    let admitted = match store {
+        Some(store) => store.try_acquire_subject_lookup_at(now, subject),
+        None => true,
+    };
+    let outcome = if !admitted {
+        DiagnosticRefLookup::RateLimited
+    } else if !scope_granted {
         DiagnosticRefLookup::MissingScope
     } else if !allowed_namespaces.is_present() {
         DiagnosticRefLookup::MissingNamespaceBinding
-    } else if let Some(store) = store {
-        if !store.try_acquire_lookup_at(now) {
-            DiagnosticRefLookup::RateLimited
-        } else {
-            match store.lookup_at(now, reference) {
-                Some(view) if allowed_namespaces.allows(&view.namespace) => {
-                    DiagnosticRefLookup::Found(Box::new(view))
-                }
-                _ => DiagnosticRefLookup::NotFound,
-            }
-        }
     } else {
-        DiagnosticRefLookup::NotFound
+        let view = match store {
+            Some(store) if allowed_namespaces.allows(store.namespace()) => {
+                store.lookup_at(now, reference)
+            }
+            _ => None,
+        };
+        match view {
+            Some(view) => DiagnosticRefLookup::Found(Box::new(view)),
+            None => DiagnosticRefLookup::NotFound,
+        }
     };
     if let Some(store) = store {
         store.record_lookup(outcome.result());
@@ -971,14 +1077,10 @@ impl RequestDiagnostic {
         Arc::clone(&self.slot)
     }
 
+    /// Stamp (or strip) the reference on the response hyper receives.
     pub(crate) fn stamp(&self, status: u16, headers: &mut http::HeaderMap) {
-        let _ = stamp_response_headers(
-            self.store,
-            Some(&self.slot),
-            self.protocol,
-            status,
-            headers,
-        );
+        let _ =
+            stamp_response_headers(self.store, Some(&self.slot), self.protocol, status, headers);
     }
 }
 
@@ -1012,19 +1114,22 @@ pub(crate) fn current_h3_slot() -> Option<Arc<DiagnosticSlot>> {
 }
 
 /// Final stamp for an HTTP/3 response head, applied at every `send_response`
-/// site. Identity (no work beyond one `OnceLock` load) when references are
-/// off.
+/// site. When references are off it only strips a plugin- or hook-written
+/// copy of the gateway-owned header.
 pub(crate) fn stamp_h3_response(mut response: http::Response<()>) -> http::Response<()> {
-    if let Some(store) = active_store() {
-        let slot = H3_REQUEST_SLOT.try_with(Arc::clone).ok();
-        let status = response.status().as_u16();
-        let _ = stamp_response_headers(
-            store,
-            slot.as_ref(),
-            DiagnosticProtocol::Http3,
-            status,
-            response.headers_mut(),
-        );
+    match active_store() {
+        Some(store) => {
+            let slot = H3_REQUEST_SLOT.try_with(Arc::clone).ok();
+            let status = response.status().as_u16();
+            let _ = stamp_response_headers(
+                store,
+                slot.as_ref(),
+                DiagnosticProtocol::Http3,
+                status,
+                response.headers_mut(),
+            );
+        }
+        None => strip_response_header(response.headers_mut()),
     }
     response
 }

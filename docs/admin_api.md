@@ -1746,14 +1746,18 @@ curl -H "Authorization: Bearer $DIAGNOSTICS_TOKEN" \
 |---|---|
 | `200` | Resolved. `detail` is `null` (and `detail_available` is `false`) until the request's terminal transaction record exists — a streamed response records it when its body ends — and for the overload and stale-configuration fences, which answer before a request context exists |
 | `401` | Missing or invalid admin JWT |
-| `403` | The JWT lacks the `diagnostics:read` scope or carries no `ns` claim. Decided from the credential alone, before the reference is read |
+| `403` | The JWT lacks the `diagnostics:read` scope or carries no `ns` claim. Decided from the credential alone, before the reference is read. The attempt still counts against the rate limit |
 | `404` | Malformed, unknown, expired, or evicted reference; a reference outside the token's `ns` namespaces; or references are off. All identical, so references cannot be probed |
-| `429` | More than `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) lookups in the current second, across all callers. Carries `Retry-After: 1` |
+| `429` | More than `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) attempts in the current second across all callers, or more than half of it (at least 1) from one JWT `sub`. Every attempt counts, including one refused with `403`, and a subject over its share does not consume the global budget. Carries `Retry-After: 1` |
 
-Every lookup emits one WARN-level `audit.event = "diagnostic_ref_lookup"`
-event with the JWT subject, the reference (or `malformed`), and the result
-(`found`, `not_found`, `forbidden`, `rate_limited`), which also label
-`ferrum_diagnostic_ref_lookups_total{result}` on `/metrics`.
+Every `200` and `404` emits one WARN-level
+`audit.event = "diagnostic_ref_lookup"` event with the JWT subject, the
+reference (or `malformed`), and the result. `403` (`forbidden`) and `429`
+(`rate_limited`) events are throttled to one per second each and carry
+`suppressed_since_last`, so a misconfigured or hostile client cannot flood the
+log. The four results (`found`, `not_found`, `forbidden`, `rate_limited`) also
+label `ferrum_diagnostic_ref_lookups_total{result}` on `/metrics`, which counts
+every attempt.
 
 ## Cluster Status
 

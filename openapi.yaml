@@ -2502,12 +2502,17 @@ paths:
         and every reference while the feature is off all answer the same
         `404`.
 
-        **Rate limit and audit.** Lookups are admitted at
-        `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) per second
-        across all callers (`429` with `Retry-After: 1` above it), and every
-        lookup emits one WARN-level `audit.event = "diagnostic_ref_lookup"`
-        event naming the JWT subject, the reference (or `malformed`), and the
-        result.
+        **Rate limit and audit.** Every attempt is charged against the lookup
+        budget before the credential checks, including one then refused with
+        `403`. The budget is `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND`
+        (default 10) per second across all callers, and one JWT `sub` may use
+        at most half of it (at least 1); `429` with `Retry-After: 1` above
+        either. Every `200` and `404` emits one WARN-level
+        `audit.event = "diagnostic_ref_lookup"` event naming the JWT subject,
+        the reference (or `malformed`), and the result; `403` and `429` events
+        are throttled to one per second each and carry
+        `suppressed_since_last`. `ferrum_diagnostic_ref_lookups_total{result}`
+        counts every attempt.
 
         The response is versioned by `schema_version`. It never contains
         request or response bodies, headers, paths, query strings,
@@ -2556,7 +2561,7 @@ paths:
         "403":
           description: |
             The admin JWT lacks the `diagnostics:read` scope or carries no `ns`
-            claim.
+            claim. The attempt still counts against the lookup rate limit.
           content:
             application/json:
               schema:
@@ -2571,7 +2576,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "429":
-          description: Lookup rate limit exceeded; retry after the indicated delay.
+          description: |
+            Lookup rate limit exceeded, globally or for this JWT `sub`; retry
+            after the indicated delay.
           headers:
             Retry-After:
               description: Always `1`.

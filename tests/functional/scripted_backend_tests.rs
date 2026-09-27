@@ -2665,12 +2665,10 @@ async fn diagnostic_refs_mark_gateway_errors_on_every_protocol_and_resolve_scope
         assert_eq!(body["protocol"], protocol, "{body}");
         assert_eq!(body["status"], 502, "{body}");
         assert_eq!(body["gateway_error"], "connection_failure", "{body}");
+        // Every protocol, HTTP/3 included, reaches the terminal transaction
+        // log with the same slot; `resolve_detail` already waits for a record
+        // written after the head was flushed.
         let detail = &body["detail"];
-        if protocol == "http3" && body["detail_available"] != true {
-            // The HTTP/3 terminal record is written after the response is
-            // flushed; its reference and public fields are the contract here.
-            continue;
-        }
         assert_eq!(body["detail_available"], true, "{body}");
         assert_eq!(detail["proxy_id"], "scripted", "{body}");
         assert!(detail["error_class"].is_string(), "{body}");

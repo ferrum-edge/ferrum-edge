@@ -8,16 +8,20 @@
 //!   reference the gateway did not mint.
 //! * The store is bounded by TTL and entry count, and the lookup is scoped:
 //!   scope and namespace binding are required, and an out-of-namespace
-//!   reference is indistinguishable from an unknown one.
+//!   reference is indistinguishable from an unknown one (the store is not even
+//!   read).
+//! * Every lookup attempt, a refused one included, is charged against a
+//!   per-subject share and the global budget.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ferrum_edge::diagnostic_ref::{
-    DIAGNOSTIC_REF_HEADER, DIAGNOSTIC_REF_LEN, DIAGNOSTIC_REF_PREFIX, DIAGNOSTIC_REF_SCHEMA_VERSION,
-    DiagnosticDetail, DiagnosticProtocol, DiagnosticRefLookup, DiagnosticRefLookupResult,
-    DiagnosticRefMode, DiagnosticRefStore, DiagnosticRefStoreConfig, DiagnosticSlot,
-    authorize_lookup, backend_origin, duration_bucket, is_well_formed_ref, stamp_response_headers,
+    DIAGNOSTIC_REF_HEADER, DIAGNOSTIC_REF_LEN, DIAGNOSTIC_REF_PREFIX,
+    DIAGNOSTIC_REF_SCHEMA_VERSION, DiagnosticDetail, DiagnosticProtocol, DiagnosticRefLookup,
+    DiagnosticRefLookupResult, DiagnosticRefMode, DiagnosticRefStore, DiagnosticRefStoreConfig,
+    DiagnosticSlot, MAX_TRACKED_LOOKUP_SUBJECTS, authorize_lookup, backend_origin, duration_bucket,
+    is_well_formed_ref, stamp_response_headers, strip_response_header,
 };
 use ferrum_edge::grpc::auth::AllowedNamespaces;
 use ferrum_edge::plugins::TransactionSummary;
@@ -26,6 +30,7 @@ use ferrum_edge::retry::{ErrorClass, HTTP_OBSERVABILITY_ERROR_CLASSES};
 
 const NAMESPACE: &str = "ferrum";
 const UNKNOWN_REF: &str = "fd1_00000000000000000000000000000000";
+const OPERATOR: &str = "operator";
 
 fn store_with(max_entries: usize, ttl: Duration, rate: u32) -> DiagnosticRefStore {
     let config = DiagnosticRefStoreConfig {
@@ -444,6 +449,65 @@ fn every_public_token_is_stamped() {
 }
 
 #[test]
+fn strip_drops_every_copy_and_keeps_the_public_token() {
+    let mut headers = gateway_error_headers("connection_failure");
+    let mixed_case: http::HeaderName = "X-Ferrum-Diagnostic-Ref".parse().unwrap();
+    headers.append(DIAGNOSTIC_REF_HEADER, UNKNOWN_REF.parse().unwrap());
+    headers.append(mixed_case, UNKNOWN_REF.parse().unwrap());
+    strip_response_header(&mut headers);
+    assert!(!headers.contains_key(DIAGNOSTIC_REF_HEADER));
+    let public = headers.get("x-gateway-error").unwrap();
+    assert_eq!(public.to_str().unwrap(), "connection_failure");
+}
+
+/// The header is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS` says: both
+/// final client boundaries strip a plugin- or hook-written copy when the store
+/// is off, not only when an enabled store stamps.
+#[test]
+fn final_client_boundaries_strip_the_header_when_references_are_off() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let boundaries = [
+        (
+            "src/proxy/mod.rs",
+            "None => crate::diagnostic_ref::strip_response_header(resp.headers_mut()),",
+        ),
+        (
+            "src/diagnostic_ref.rs",
+            "None => strip_response_header(response.headers_mut()),",
+        ),
+    ];
+    for (file, off_arm) in boundaries {
+        let path = root.join(file);
+        let source = std::fs::read_to_string(&path).expect("read source");
+        assert!(
+            source.lines().any(|line| line.trim() == off_arm),
+            "{file}: the off-mode boundary must strip the reference header"
+        );
+    }
+}
+
+/// Detached terminal logging can be refused by `FERRUM_LOG_DELIVERY_MAX_TASKS`,
+/// so the detail a client's reference resolves to is recorded on the request
+/// task before the delivery is admitted, never only inside the spawned task.
+#[test]
+fn detached_terminal_logging_records_detail_before_admission() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("src/plugins/mod.rs");
+    let source = std::fs::read_to_string(&path).expect("read source");
+    let start = source
+        .find("pub fn spawn_bounded_terminal_summary_log(")
+        .expect("detached terminal logger");
+    let body = &source[start..];
+    let record = body
+        .find("crate::diagnostic_ref::record_request_detail(slot, &summary, ctx);")
+        .expect("synchronous detail record");
+    let spawn = body
+        .find("spawn_deadline_cleanup(")
+        .expect("bounded delivery spawn");
+    assert!(record < spawn, "detail must be recorded before admission");
+}
+
+#[test]
 fn backend_boundary_strips_the_reference_header_in_any_case() {
     assert!(is_backend_response_strip_header(DIAGNOSTIC_REF_HEADER));
     assert!(is_backend_response_strip_header("X-Ferrum-Diagnostic-Ref"));
@@ -459,9 +523,9 @@ fn lookup_requires_scope_then_namespace_binding_before_reading_the_store() {
     let bound = namespaces(&[NAMESPACE]);
     let unbound = AllowedNamespaces::empty();
 
-    let no_scope = authorize_lookup(Some(&store), false, &bound, &reference, now);
+    let no_scope = authorize_lookup(Some(&store), OPERATOR, false, &bound, &reference, now);
     assert_eq!(label(&no_scope), "missing_scope");
-    let no_binding = authorize_lookup(Some(&store), true, &unbound, &reference, now);
+    let no_binding = authorize_lookup(Some(&store), OPERATOR, true, &unbound, &reference, now);
     assert_eq!(label(&no_binding), "missing_namespace_binding");
     let forbidden = store.lookups_total(DiagnosticRefLookupResult::Forbidden);
     assert_eq!(forbidden, 2);
@@ -475,12 +539,12 @@ fn out_of_namespace_reference_is_indistinguishable_from_unknown() {
     let staging = namespaces(&["staging"]);
     let both = namespaces(&["staging", NAMESPACE]);
 
-    let other_tenant = authorize_lookup(Some(&store), true, &staging, &reference, now);
-    let unknown = authorize_lookup(Some(&store), true, &staging, UNKNOWN_REF, now);
+    let other_tenant = authorize_lookup(Some(&store), OPERATOR, true, &staging, &reference, now);
+    let unknown = authorize_lookup(Some(&store), OPERATOR, true, &staging, UNKNOWN_REF, now);
     assert_eq!(label(&other_tenant), "not_found");
     assert_eq!(label(&unknown), "not_found");
 
-    match authorize_lookup(Some(&store), true, &both, &reference, now) {
+    match authorize_lookup(Some(&store), OPERATOR, true, &both, &reference, now) {
         DiagnosticRefLookup::Found(view) => assert_eq!(view.reference, reference),
         other => panic!("authorized lookup must resolve, got {other:?}"),
     }
@@ -493,7 +557,7 @@ fn out_of_namespace_reference_is_indistinguishable_from_unknown() {
 #[test]
 fn lookup_with_the_feature_off_is_not_found() {
     let bound = namespaces(&[NAMESPACE]);
-    let outcome = authorize_lookup(None, true, &bound, UNKNOWN_REF, Instant::now());
+    let outcome = authorize_lookup(None, OPERATOR, true, &bound, UNKNOWN_REF, Instant::now());
     assert_eq!(label(&outcome), "not_found");
 }
 
@@ -503,12 +567,96 @@ fn lookup_is_rate_limited_and_counted() {
     let reference = mint(&store, 502, "connection_failure");
     let now = Instant::now() + Duration::from_secs(1);
     let bound = namespaces(&[NAMESPACE]);
-    let first = authorize_lookup(Some(&store), true, &bound, &reference, now);
-    let second = authorize_lookup(Some(&store), true, &bound, &reference, now);
+    let first = authorize_lookup(Some(&store), OPERATOR, true, &bound, &reference, now);
+    let second = authorize_lookup(Some(&store), OPERATOR, true, &bound, &reference, now);
     assert_eq!(label(&first), "found");
     assert_eq!(label(&second), "rate_limited");
     let limited = store.lookups_total(DiagnosticRefLookupResult::RateLimited);
     assert_eq!(limited, 1);
+}
+
+#[test]
+fn refused_attempts_are_charged_against_the_lookup_budget() {
+    // A budget of 2 per second leaves each subject a share of 1.
+    let store = store_with(10_000, Duration::from_secs(900), 2);
+    assert_eq!(store.per_subject_lookup_rate_per_second(), 1);
+    let reference = mint(&store, 502, "connection_failure");
+    let now = Instant::now() + Duration::from_secs(1);
+    let bound = namespaces(&[NAMESPACE]);
+
+    let no_scope = authorize_lookup(Some(&store), OPERATOR, false, &bound, &reference, now);
+    assert_eq!(label(&no_scope), "missing_scope");
+    let retry = authorize_lookup(Some(&store), OPERATOR, true, &bound, &reference, now);
+    assert_eq!(
+        label(&retry),
+        "rate_limited",
+        "the refused attempt spent the subject's share"
+    );
+    let later = now + Duration::from_secs(1);
+    let fresh = authorize_lookup(Some(&store), OPERATOR, true, &bound, &reference, later);
+    assert_eq!(label(&fresh), "found");
+}
+
+#[test]
+fn one_subject_cannot_exhaust_the_global_lookup_budget() {
+    let store = store_with(10_000, Duration::from_secs(900), 4);
+    assert_eq!(store.per_subject_lookup_rate_per_second(), 2);
+    let now = Instant::now() + Duration::from_secs(1);
+    let admitted = |subject: &str| store.try_acquire_subject_lookup_at(now, subject);
+
+    assert!(admitted("reader-a"));
+    assert!(admitted("reader-a"));
+    assert!(!admitted("reader-a"), "reader-a spent its share");
+    // The refused attempt above charged nothing globally: two slots remain.
+    assert!(admitted("reader-b"));
+    assert!(admitted("reader-b"));
+    assert!(!admitted("reader-c"), "the global budget is spent");
+
+    let later = now + Duration::from_secs(1);
+    assert!(store.try_acquire_subject_lookup_at(later, "reader-a"));
+}
+
+#[test]
+fn subject_table_is_bounded_and_fails_closed_when_full() {
+    let store = default_store();
+    let now = Instant::now() + Duration::from_secs(1);
+    for index in 0..MAX_TRACKED_LOOKUP_SUBJECTS {
+        let subject = format!("reader-{index}");
+        assert!(store.try_acquire_subject_lookup_at(now, &subject));
+    }
+    let overflow = store.try_acquire_subject_lookup_at(now, "one-too-many");
+    assert!(!overflow, "a full table never evicts a live subject");
+    assert!(
+        store.try_acquire_subject_lookup_at(now, "reader-0"),
+        "a tracked subject keeps its share"
+    );
+    let later = now + Duration::from_secs(1);
+    assert!(
+        store.try_acquire_subject_lookup_at(later, "one-too-many"),
+        "earlier windows are purged to admit a new subject"
+    );
+}
+
+#[test]
+fn out_of_namespace_lookup_never_reads_the_store() {
+    // A lookup purges expired entries on the shard it reads, so the expiry
+    // counter shows whether the store was read at all.
+    let store = store_with(10_000, Duration::from_secs(1), 10_000);
+    let start = Instant::now();
+    let protocol = DiagnosticProtocol::Http1;
+    let reference = store
+        .mint_at(start, protocol, 502, "connection_failure", None)
+        .unwrap();
+    let later = start + Duration::from_secs(5);
+    let staging = namespaces(&["staging"]);
+    let bound = namespaces(&[NAMESPACE]);
+
+    let other = authorize_lookup(Some(&store), OPERATOR, true, &staging, &reference, later);
+    assert_eq!(label(&other), "not_found");
+    assert_eq!(store.evicted_expired_total(), 0, "the store was not read");
+    let own = authorize_lookup(Some(&store), OPERATOR, true, &bound, &reference, later);
+    assert_eq!(label(&own), "not_found");
+    assert_eq!(store.evicted_expired_total(), 1);
 }
 
 // ── detail content ─────────────────────────────────────────────────────────

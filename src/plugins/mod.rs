@@ -8895,8 +8895,11 @@ pub async fn log_with_mirror(
     let summary = stamped.as_deref().unwrap_or(summary);
     // Gateway diagnostic reference (issue #5767): the terminal summary is the
     // authoritative description of the client-visible outcome, so it is the
-    // detail a reference minted for this response resolves to.
-    if let Some(slot) = ctx.diagnostic_slot() {
+    // detail a reference minted for this response resolves to. The first record
+    // wins: a detached delivery already recorded it before spawning.
+    if let Some(slot) = ctx.diagnostic_slot()
+        && slot.detail().is_none()
+    {
         crate::diagnostic_ref::record_request_detail(slot, summary, ctx);
     }
     let precompute_mesh_key = plugins
@@ -9008,6 +9011,13 @@ pub fn spawn_bounded_terminal_summary_log(
     summary: TransactionSummary,
     ctx: &RequestContext,
 ) {
+    // Gateway diagnostic reference (issue #5767): record the detail on the
+    // request task, before admission, so a delivery refused by
+    // `FERRUM_LOG_DELIVERY_MAX_TASKS` cannot leave the client's reference
+    // without its detail. The spawned `log_with_mirror` then finds it set.
+    if let Some(slot) = ctx.diagnostic_slot() {
+        crate::diagnostic_ref::record_request_detail(slot, &summary, ctx);
+    }
     let plugins = plugins.to_vec();
     let ctx = ctx.clone();
     let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {

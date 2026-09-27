@@ -30858,7 +30858,9 @@ pub async fn handle_proxy_request(
 /// Gateway diagnostic references (issue #5767) are stamped here, after every
 /// builder, hook, and policy phase, so the reference is the last word on the
 /// response head and no earlier phase can forge, replace, or duplicate it. With
-/// `FERRUM_DIAGNOSTIC_REFS=off` (the default) this is one `OnceLock` load.
+/// `FERRUM_DIAGNOSTIC_REFS=off` (the default) this is one `OnceLock` load plus
+/// one header removal: the header is gateway-owned either way, so a plugin- or
+/// hook-written copy never reaches the client.
 #[allow(clippy::too_many_arguments)]
 async fn handle_proxy_request_on_frontend_port(
     req: Request<Incoming>,
@@ -30885,14 +30887,16 @@ async fn handle_proxy_request_on_frontend_port(
         connection_metadata,
     )
     .await;
-    match diagnostic {
-        Some(diagnostic) => response.map(|mut resp| {
-            let status = resp.status().as_u16();
-            diagnostic.stamp(status, resp.headers_mut());
-            resp
-        }),
-        None => response,
-    }
+    response.map(|mut resp| {
+        match &diagnostic {
+            Some(diagnostic) => {
+                let status = resp.status().as_u16();
+                diagnostic.stamp(status, resp.headers_mut());
+            }
+            None => crate::diagnostic_ref::strip_response_header(resp.headers_mut()),
+        }
+        resp
+    })
 }
 
 /// Connection-scoped and process-wide admission fences, then the routed

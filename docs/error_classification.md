@@ -458,9 +458,9 @@ never carries two.
 serverless-function copy, in the headers or the trailers, is stripped at every
 backend response boundary. The reference is stamped as the last step before the
 response head reaches the client — after every builder, plugin hook, and policy
-phase — and the stamp first removes any copy a plugin or hook wrote. A client
-therefore never sees a reference the gateway did not mint, and cannot pre-seed
-one.
+phase — and that final client boundary first removes any copy a plugin or hook
+wrote, even while the feature is off. A client therefore never sees a reference
+the gateway did not mint, and cannot pre-seed one.
 
 **Resolve.** `GET /diagnostics/v1/refs/{ref}` on the admin listener of the
 same gateway process (see [admin_api.md](admin_api.md#diagnostic-references)).
@@ -480,15 +480,20 @@ text.
 **Bounds.** References live only in process memory, in 16 independently locked
 shards, for `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900). At most
 `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` (default 10000) are retained; a full shard
-evicts its oldest reference. A restart forgets every reference. Lookups are
-admitted at `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) per
-second (`429` above it), and each emits one WARN-level
-`audit.event = "diagnostic_ref_lookup"` event. `/metrics` exports
+evicts its oldest reference. Each retained reference costs roughly 0.5–1 KB,
+so the default holds about 5–10 MB and the 1000000 maximum up to about
+0.5–1 GB. A restart forgets every reference. Lookup attempts are admitted at
+`FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) per second, with
+one JWT `sub` limited to half of that (at least 1); every attempt counts,
+including one refused with `403`, and `429` answers above either budget. Each
+`200`/`404` emits one WARN-level `audit.event = "diagnostic_ref_lookup"` event;
+`403` and `429` events are throttled to one per second each. `/metrics` exports
 `ferrum_diagnostic_refs_minted_total`, `ferrum_diagnostic_refs_entries`,
 `ferrum_diagnostic_refs_evicted_total{reason}`, and
 `ferrum_diagnostic_ref_lookups_total{result}` while the feature is on.
 
-**Cost.** Off: one `OnceLock` load per HTTP-family request. On: one small
+**Cost.** Off: one `OnceLock` load per HTTP-family request and one header
+removal per response head. On: one small
 shared slot per request; on a response that carries `X-Gateway-Error`, one
 CSPRNG read and one short shard-lock critical section. Detail is copied from
 the terminal transaction summary only for a 5xx or a classified dispatch error.

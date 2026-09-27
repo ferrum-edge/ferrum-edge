@@ -133,7 +133,10 @@ fn forged_trailers() -> Vec<(&'static str, &'static str)> {
         ("grpc-status", "0"),
         ("x-gateway-error", "backend_timeout"),
         ("x-gateway-upstream-status", "degraded"),
-        ("x-ferrum-diagnostic-ref", "fd1_00000000000000000000000000000000"),
+        (
+            "x-ferrum-diagnostic-ref",
+            "fd1_00000000000000000000000000000000",
+        ),
         ("x-keep", "yes"),
     ]
 }
