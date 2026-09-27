@@ -725,6 +725,38 @@
         "vendor/hyper-util-0.1.21-ferrum-patched (client::legacy::client::ferrum_release_on_close_tests)",
         "vendor/hyper-util-0.1.21-ferrum-patched/tests/legacy_client.rs"
       ]
+    },
+    {
+      "id": "hyper-001-upgraded-h2-connect-error-reset",
+      "label": "hyper upgraded HTTP/2 stream resets with CONNECT_ERROR",
+      "crate": "hyper",
+      "vendored_version": "1.9.0",
+      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's upgraded HTTP/2 stream is private and dropping or shutting it down always sends a clean END_STREAM, so an HBONE relay that ended on a socket error was indistinguishable on the wire from a normal close; Upgraded::reset_with_connect_error() sends RST_STREAM(CONNECT_ERROR) instead (RFC 9113 section 8.5, #5781).",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "A hyper release can reset an upgraded HTTP/2 stream with a chosen error code.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.9.0-ferrum-patched (proto::h2::upgrade::ferrum_connect_error_reset_tests)",
+        "vendor/hyper-1.9.0-ferrum-patched (upgrade::tests::ferrum_connect_error_reset_ignores_non_h2_upgrades)",
+        "tests/integration/mesh_hbone_tests.rs"
+      ]
     }
   ]
 }

@@ -25,7 +25,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - Ferrum carries vendored upstream crates under `vendor/**`, wired via
   `[patch.crates-io]` in `Cargo.toml`: `sqlx-core 0.8.6`, `reqwest 0.13.3`,
   `h3 0.0.8`, `h3-quinn 0.0.10`, `tungstenite 0.29.0`,
-  `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, and `hyper-util 0.1.21`.
+  `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, `hyper-util 0.1.21`, and
+  `hyper 1.9.0`.
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
   `docs/vendored-patch-lifecycle.json`. Keep them, the
@@ -278,6 +279,14 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   the dispatcher's drain; releasing the only sender lets tokio drop the stranded
   envelope, so the request fails as unsent instead of hanging until
   `backend_read_timeout_ms`.
+- hyper upgraded-stream reset (issue #5781): the vendored
+  `--lib ferrum_connect_error_reset` tests in
+  `vendor/hyper-1.9.0-ferrum-patched/src/proto/h2/upgrade.rs` and
+  `src/upgrade.rs`, run by the `test-vendor-patches` job, plus the HBONE relay
+  tests in `tests/integration/mesh_hbone_tests.rs`
+  (`*_sends_rst_stream_connect_error`, `*_still_ends_stream_cleanly`). A relay
+  that ends on a socket error resets its CONNECT stream with
+  `RST_STREAM(CONNECT_ERROR)`; stock hyper can only send `END_STREAM`.
 - Per-request connect timeout across shared pool keys:
   `tests/integration/connection_pool_tests.rs`.
 - HTTP/3 graceful close with a buffered response is not a false 502:

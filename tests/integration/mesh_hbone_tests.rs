@@ -880,6 +880,123 @@ async fn hbone_connect_closes_idle_tunnel() {
     conn_task.abort();
 }
 
+/// Accepts one relay connection, waits for the client's first bytes, writes
+/// `partial`, then closes: abortively (`SO_LINGER=0`, a TCP RST) when
+/// `abortive`, otherwise with an ordinary FIN.
+async fn start_partial_reply_backend(
+    abortive: bool,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind partial-reply backend");
+    let addr = listener.local_addr().expect("partial-reply backend addr");
+    let handle = tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0_u8; 64];
+        if stream.read(&mut buf).await.is_err() {
+            return;
+        }
+        if stream.write_all(b"partial").await.is_err() {
+            return;
+        }
+        if abortive {
+            stream.set_zero_linger().expect("set abortive close");
+        } else {
+            let _ = stream.shutdown().await;
+        }
+    });
+    (addr, handle)
+}
+
+/// Read a CONNECT response body to its end. Returns the bytes received and
+/// the stream's ending: `Ok` for `END_STREAM`, or the error that ended it.
+async fn read_connect_body_to_end(body: &mut h2::RecvStream) -> (Vec<u8>, Result<(), h2::Error>) {
+    let mut received = Vec::new();
+    loop {
+        match body.data().await {
+            None => return (received, Ok(())),
+            Some(Ok(chunk)) => {
+                let _ = body.flow_control().release_capacity(chunk.len());
+                received.extend_from_slice(&chunk);
+            }
+            Some(Err(err)) => return (received, Err(err)),
+        }
+    }
+}
+
+/// Run one byte-stream HBONE tunnel to a backend that writes `partial` and
+/// then closes, and return how the client saw the tunnel end.
+async fn byte_stream_relay_end_for_backend_close(
+    abortive: bool,
+) -> (Vec<u8>, Result<(), h2::Error>) {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
+    let (backend_addr, backend_handle) = start_partial_reply_backend(abortive).await;
+    let mut proxy = create_mesh_proxy(backend_addr.port());
+    let spiffe_plugin = spiffe_identity_plugin_config(&proxy.id);
+    proxy.plugins.push(PluginAssociation {
+        plugin_config_id: spiffe_plugin.id.clone(),
+    });
+    let state = create_mesh_proxy_state_with_config(proxy, vec![], vec![spiffe_plugin]);
+    let (gateway_addr, shutdown_tx) = start_gateway_mtls(state, hbone_server_config(&certs)).await;
+
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let req = Request::builder()
+        .method(Method::CONNECT)
+        .uri("orders.default.svc.cluster.local:8080")
+        .body(())
+        .expect("connect request");
+    let (response_fut, mut request_body) = sender.send_request(req, false).expect("send CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("CONNECT response")
+        .expect("CONNECT response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    request_body
+        .send_data(Bytes::from_static(b"ping"), false)
+        .expect("send CONNECT data");
+
+    let mut response_body = resp.into_body();
+    let end = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_connect_body_to_end(&mut response_body),
+    )
+    .await
+    .expect("the tunnel must end once the backend closes");
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    backend_handle.await.expect("backend task");
+    conn_task.abort();
+    end
+}
+
+/// Issue #5781: a backend reset ends the byte-stream relay on a socket error,
+/// and the client must see `RST_STREAM(CONNECT_ERROR)` (RFC 9113 section 8.5),
+/// not the clean `END_STREAM` that reads as a complete response.
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_relay_backend_reset_sends_rst_stream_connect_error() {
+    let (_received, end) = byte_stream_relay_end_for_backend_close(true).await;
+
+    let err = end.expect_err("a relay that ended on a backend reset must not end cleanly");
+    assert_eq!(err.reason(), Some(h2::Reason::CONNECT_ERROR));
+}
+
+/// Issue #5781 control: a backend that closes normally still ends the CONNECT
+/// stream with `END_STREAM`, after everything it wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_relay_backend_close_still_ends_stream_cleanly() {
+    let (received, end) = byte_stream_relay_end_for_backend_close(false).await;
+
+    assert_eq!(&received[..], b"partial");
+    assert!(
+        end.is_ok(),
+        "a normal backend close must end with END_STREAM, got {end:?}"
+    );
+}
+
 // ── EgressGateway external UDP ServiceEntry egress (issue #3263) ──────────
 
 /// Mesh config for an EgressGateway that admits exactly one external UDP
@@ -1155,6 +1272,137 @@ async fn egress_udp_service_entry_destination_relays_request_and_response() {
     .await
     .expect("external udp reply");
     assert_eq!(echoed, b"pong:ping".to_vec());
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    external_handle.abort();
+    conn_task.abort();
+}
+
+/// Issue #5781: a datagram relay that ends on a socket error resets the
+/// CONNECT stream with `RST_STREAM(CONNECT_ERROR)`.
+///
+/// The admitted destination port stays reserved but refuses the relay: a
+/// connected UDP socket accepts datagrams only from its own peer, so the
+/// kernel answers the relay's datagram with ICMP port-unreachable, which the
+/// relay's connected socket reports on its next send or recv. Unix only:
+/// Windows reports that ICMP error differently.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn egress_udp_relay_socket_error_sends_rst_stream_connect_error() {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
+    let placeholder_peer = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind the placeholder's peer");
+    let placeholder = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind placeholder");
+    placeholder
+        .connect(placeholder_peer.local_addr().expect("peer addr"))
+        .await
+        .expect("connect placeholder to its peer");
+    let refused_port = placeholder.local_addr().expect("placeholder addr").port();
+    let state = create_egress_udp_gateway_state(egress_udp_mesh_config(
+        "127.0.0.1",
+        refused_port,
+        refused_port,
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_egress_udp_gateway(state, hbone_server_config(&certs)).await;
+
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response_fut, mut request_body) = sender
+        .send_request(
+            udp_connect_request(&format!("127.0.0.1:{refused_port}")),
+            false,
+        )
+        .expect("send udp CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("udp CONNECT response")
+        .expect("udp CONNECT response");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Keep sending until the tunnel ends, so the test does not depend on when
+    // the ICMP error arrives.
+    let mut response_body = resp.into_body();
+    let end = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            // Fails harmlessly once the stream has been reset.
+            let _ = request_body.send_data(frame_datagram(b"ping"), false);
+            let wait = std::time::Duration::from_millis(50);
+            if let Ok(item) = tokio::time::timeout(wait, response_body.data()).await {
+                break item;
+            }
+        }
+    })
+    .await
+    .expect("the relay never observed the refused destination socket");
+
+    let err = end
+        .expect("a socket-error ending must reset the stream, not end it cleanly")
+        .expect_err("the refused destination never replies");
+    assert_eq!(err.reason(), Some(h2::Reason::CONNECT_ERROR));
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    conn_task.abort();
+    drop(placeholder);
+    drop(placeholder_peer);
+}
+
+/// Issue #5781 control: when the client ends its side of a datagram tunnel,
+/// the relay ends cleanly and the CONNECT stream still closes with
+/// `END_STREAM`.
+#[tokio::test(flavor = "multi_thread")]
+async fn egress_udp_relay_tunnel_close_still_ends_stream_cleanly() {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
+    let (external_addr, external_handle) = start_external_udp_echo().await;
+    let state = create_egress_udp_gateway_state(egress_udp_mesh_config(
+        "127.0.0.1",
+        external_addr.port(),
+        external_addr.port(),
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_egress_udp_gateway(state, hbone_server_config(&certs)).await;
+
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response_fut, mut request_body) = sender
+        .send_request(
+            udp_connect_request(&format!("127.0.0.1:{}", external_addr.port())),
+            false,
+        )
+        .expect("send udp CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("udp CONNECT response")
+        .expect("udp CONNECT response");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    request_body
+        .send_data(frame_datagram(b"ping"), false)
+        .expect("send framed datagram");
+    let mut response_body = resp.into_body();
+    let echoed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_framed_datagram(&mut response_body),
+    )
+    .await
+    .expect("external udp reply");
+    assert_eq!(echoed, b"pong:ping".to_vec());
+
+    request_body
+        .send_data(Bytes::new(), true)
+        .expect("end the tunnel's request stream");
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), response_body.data())
+        .await
+        .expect("the relay must end once the client closes the tunnel");
+    assert!(
+        end.is_none(),
+        "a peer close must end the CONNECT stream with END_STREAM, got {end:?}"
+    );
 
     shutdown_tx.send(true).expect("shutdown gateway");
     external_handle.abort();

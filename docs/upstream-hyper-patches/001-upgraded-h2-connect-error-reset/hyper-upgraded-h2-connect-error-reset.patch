@@ -1,0 +1,327 @@
+--- a/src/common/io/rewind.rs
++++ b/src/common/io/rewind.rs
+@@ -47,9 +47,10 @@
+         (self.inner, self.pre.unwrap_or_default())
+     }
+ 
+-    // pub(crate) fn get_mut(&mut self) -> &mut T {
+-    //     &mut self.inner
+-    // }
++    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
++    pub(crate) fn get_mut(&mut self) -> &mut T {
++        &mut self.inner
++    }
+ }
+ 
+ impl<T> Read for Rewind<T>
+--- a/src/proto/h2/upgrade.rs
++++ b/src/proto/h2/upgrade.rs
+@@ -20,10 +20,15 @@
+ ) -> (H2Upgraded, UpgradedSendStreamTask<B>) {
+     let (tx, rx) = mpsc::channel(1);
+     let (error_tx, error_rx) = oneshot::channel();
++    let (reset_tx, reset_rx) = oneshot::channel();
+ 
+     (
+         H2Upgraded {
+-            send_stream: UpgradedSendStreamBridge { tx, error_rx },
++            send_stream: UpgradedSendStreamBridge {
++                tx,
++                error_rx,
++                reset_tx: Some(reset_tx),
++            },
+             recv_stream,
+             ping,
+             buf: Bytes::new(),
+@@ -32,11 +37,12 @@
+             h2_tx: send_stream,
+             rx,
+             error_tx: Some(error_tx),
++            reset_rx: Some(reset_rx),
+         },
+     )
+ }
+ 
+-pub(super) struct H2Upgraded {
++pub(crate) struct H2Upgraded {
+     ping: Recorder,
+     send_stream: UpgradedSendStreamBridge,
+     recv_stream: RecvStream,
+@@ -46,6 +52,7 @@
+ struct UpgradedSendStreamBridge {
+     tx: mpsc::Sender<Cursor<Box<[u8]>>>,
+     error_rx: oneshot::Receiver<crate::Error>,
++    reset_tx: Option<oneshot::Sender<Reason>>,
+ }
+ 
+ pin_project! {
+@@ -56,6 +63,7 @@
+         #[pin]
+         rx: mpsc::Receiver<Cursor<Box<[u8]>>>,
+         error_tx: Option<oneshot::Sender<crate::Error>>,
++        reset_rx: Option<oneshot::Receiver<Reason>>,
+     }
+ }
+ 
+@@ -113,6 +121,22 @@
+                 Poll::Pending => (),
+             }
+ 
++            // A requested reset wins over queued data and over the
++            // `END_STREAM` that a closed channel would send.
++            let reset = match me.reset_rx.as_mut() {
++                Some(reset_rx) => Pin::new(reset_rx).poll(cx),
++                None => Poll::Pending,
++            };
++            match reset {
++                Poll::Ready(Ok(reason)) => {
++                    me.h2_tx.send_reset(reason);
++                    return Poll::Ready(Ok(()));
++                }
++                // The upgraded half was dropped without asking for one.
++                Poll::Ready(Err(_canceled)) => *me.reset_rx = None,
++                Poll::Pending => (),
++            }
++
+             match me.rx.as_mut().poll_next(cx) {
+                 Poll::Ready(Some(cursor)) => {
+                     me.h2_tx
+@@ -155,6 +179,20 @@
+ 
+ // ===== impl H2Upgraded =====
+ 
++impl H2Upgraded {
++    /// Queues `RST_STREAM(reason)` in place of the `END_STREAM` that
++    /// dropping or shutting down this stream sends.
++    ///
++    /// Returns `false` if a reset was already queued or the send task has
++    /// already finished.
++    pub(crate) fn reset(&mut self, reason: Reason) -> bool {
++        match self.send_stream.reset_tx.take() {
++            Some(reset_tx) => reset_tx.send(reason).is_ok(),
++            None => false,
++        }
++    }
++}
++
+ impl Read for H2Upgraded {
+     fn poll_read(
+         mut self: Pin<&mut Self>,
+@@ -276,5 +314,150 @@
+         e.into_io().unwrap()
+     } else {
+         std::io::Error::new(std::io::ErrorKind::Other, e)
++    }
++}
++
++#[cfg(test)]
++mod ferrum_connect_error_reset_tests {
++    use std::future::poll_fn;
++    use std::pin::Pin;
++
++    use bytes::Bytes;
++    use h2::Reason;
++
++    use super::super::{ping, SendBuf};
++    use crate::rt::Write;
++    use crate::upgrade::Upgraded;
++
++    /// Opens an HTTP/2 `CONNECT` stream over an in-memory pipe. Returns the
++    /// server side as hyper's `Upgraded`, with its send task running, and the
++    /// client side's response body and request stream.
++    async fn connect_stream() -> (Upgraded, h2::RecvStream, h2::SendStream<Bytes>) {
++        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
++
++        let server = tokio::spawn(async move {
++            let mut conn = h2::server::Builder::new()
++                .handshake::<_, SendBuf<Bytes>>(server_io)
++                .await
++                .expect("server handshake");
++            let (req, mut respond) = conn
++                .accept()
++                .await
++                .expect("a CONNECT request")
++                .expect("accept the CONNECT request");
++            let send_stream = respond
++                .send_response(http::Response::new(()), false)
++                .expect("send the 200 response");
++            tokio::spawn(async move { while conn.accept().await.is_some() {} });
++            (req.into_body(), send_stream)
++        });
++
++        let (client, client_conn) = h2::client::handshake(client_io)
++            .await
++            .expect("client handshake");
++        tokio::spawn(async move {
++            let _ = client_conn.await;
++        });
++        let mut client = client.ready().await.expect("client ready");
++        let req = http::Request::builder()
++            .method(http::Method::CONNECT)
++            .uri("example.com:443")
++            .body(())
++            .expect("CONNECT request");
++        let (response, client_send) = client
++            .send_request(req, false)
++            .expect("send the CONNECT request");
++
++        let (recv_stream, send_stream) = server.await.expect("server task");
++        let response = response.await.expect("CONNECT response");
++        assert_eq!(response.status(), http::StatusCode::OK);
++
++        let (h2_upgraded, send_task) = super::pair(send_stream, recv_stream, ping::disabled());
++        tokio::spawn(send_task);
++        (
++            Upgraded::new(h2_upgraded, Bytes::new()),
++            response.into_body(),
++            client_send,
++        )
++    }
++
++    async fn write_all(upgraded: &mut Upgraded, mut buf: &[u8]) {
++        while !buf.is_empty() {
++            let n = poll_fn(|cx| Pin::new(&mut *upgraded).poll_write(cx, buf))
++                .await
++                .expect("write to the upgraded stream");
++            buf = &buf[n..];
++        }
++        poll_fn(|cx| Pin::new(&mut *upgraded).poll_flush(cx))
++            .await
++            .expect("flush the upgraded stream");
++    }
++
++    #[tokio::test]
++    async fn reset_sends_rst_stream_connect_error() {
++        let (mut upgraded, mut client_body, _client_send) = connect_stream().await;
++
++        assert!(upgraded.reset_with_connect_error());
++        assert!(!upgraded.reset_with_connect_error(), "a reset is queued once");
++        // Dropping right after the reset must not turn it into END_STREAM.
++        drop(upgraded);
++
++        let err = client_body
++            .data()
++            .await
++            .expect("the stream ends with an error, not END_STREAM")
++            .expect_err("RST_STREAM, not DATA");
++        assert_eq!(err.reason(), Some(Reason::CONNECT_ERROR));
++    }
++
++    #[tokio::test]
++    async fn reset_after_data_sends_rst_stream_connect_error() {
++        let (mut upgraded, mut client_body, _client_send) = connect_stream().await;
++
++        write_all(&mut upgraded, b"tunnel bytes").await;
++        let data = client_body
++            .data()
++            .await
++            .expect("DATA")
++            .expect("DATA, not an error");
++        assert_eq!(&data[..], b"tunnel bytes");
++
++        assert!(upgraded.reset_with_connect_error());
++
++        let err = client_body
++            .data()
++            .await
++            .expect("the stream ends with an error, not END_STREAM")
++            .expect_err("RST_STREAM, not DATA");
++        assert_eq!(err.reason(), Some(Reason::CONNECT_ERROR));
++        drop(upgraded);
++    }
++
++    #[tokio::test]
++    async fn drop_without_reset_ends_the_stream_cleanly() {
++        let (upgraded, mut client_body, _client_send) = connect_stream().await;
++
++        drop(upgraded);
++
++        assert!(
++            client_body.data().await.is_none(),
++            "a plain drop still sends END_STREAM"
++        );
++        assert!(client_body.is_end_stream());
++    }
++
++    #[tokio::test]
++    async fn reset_after_completed_shutdown_does_nothing() {
++        let (mut upgraded, mut client_body, _client_send) = connect_stream().await;
++
++        poll_fn(|cx| Pin::new(&mut upgraded).poll_shutdown(cx))
++            .await
++            .expect("shutdown");
++
++        assert!(!upgraded.reset_with_connect_error());
++        assert!(
++            client_body.data().await.is_none(),
++            "the completed shutdown already sent END_STREAM"
++        );
+     }
+ }
+--- a/src/upgrade.rs
++++ b/src/upgrade.rs
+@@ -160,6 +160,31 @@
+             }),
+         }
+     }
++
++    /// Resets an HTTP/2 upgrade's stream with `RST_STREAM(CONNECT_ERROR)`.
++    ///
++    /// Dropping or shutting down an `Upgraded` that came from an HTTP/2
++    /// `CONNECT` ends its stream with a clean `END_STREAM`, which the peer
++    /// cannot tell apart from a normal close. A tunnel that fails, for example
++    /// because the proxied TCP connection was reset, should reset the stream
++    /// with `CONNECT_ERROR` instead ([RFC 9113, Section 8.5]). This queues that
++    /// reset in place of the `END_STREAM`. Data written but not yet sent may
++    /// be discarded.
++    ///
++    /// Returns `true` if the reset was queued. Returns `false` and does
++    /// nothing if this is not an HTTP/2 upgrade, if a reset was already
++    /// queued, or if the stream's send side has already finished (for
++    /// example after a completed shutdown).
++    ///
++    /// [RFC 9113, Section 8.5]: https://www.rfc-editor.org/rfc/rfc9113#section-8.5
++    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
++    pub fn reset_with_connect_error(&mut self) -> bool {
++        let io: &mut (dyn Io + Send) = &mut **self.io.get_mut();
++        match io.__hyper_downcast_mut::<crate::proto::h2::upgrade::H2Upgraded>() {
++            Some(h2_upgraded) => h2_upgraded.reset(h2::Reason::CONNECT_ERROR),
++            None => false,
++        }
++    }
+ }
+ 
+ impl Read for Upgraded {
+@@ -312,6 +337,16 @@
+             Err(self)
+         }
+     }
++
++    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
++    fn __hyper_downcast_mut<T: Io>(&mut self) -> Option<&mut T> {
++        if self.__hyper_is::<T>() {
++            // Taken from `std::error::Error::downcast_mut()`.
++            unsafe { Some(&mut *(self as *mut (dyn Io + Send) as *mut T)) }
++        } else {
++            None
++        }
++    }
+ }
+ 
+ mod sealed {
+@@ -370,6 +405,15 @@
+             .downcast::<crate::common::io::Compat<std::io::Cursor<Vec<u8>>>>()
+             .unwrap_err();
+ 
++        upgraded.downcast::<Mock>().unwrap();
++    }
++
++    #[cfg(feature = "http2")]
++    #[test]
++    fn ferrum_connect_error_reset_ignores_non_h2_upgrades() {
++        let mut upgraded = Upgraded::new(Mock, Bytes::new());
++
++        assert!(!upgraded.reset_with_connect_error());
+         upgraded.downcast::<Mock>().unwrap();
+     }
+ 

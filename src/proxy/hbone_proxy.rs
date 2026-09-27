@@ -242,14 +242,13 @@ pub(super) const HBONE_UDP_TERMINATION_METADATA_KEY: &str = "hbone.udp.terminati
 
 /// Why [`relay_hbone_udp`] ended (issue #5765).
 ///
-/// hyper's upgraded HTTP/2 stream exposes no reset: closing or dropping it
-/// always ends the CONNECT stream with a clean `END_STREAM`, and the
-/// `[u16 length][payload]` framing has no error record. The wire end of an
-/// errored relay is therefore indistinguishable from an idle or peer close;
-/// this reason is what keeps them apart on the gateway side. It drives the
-/// transaction summary's `body_completed` / `body_error_class` /
-/// `client_disconnected`, the `hbone.udp.termination_reason` metadata, and a
-/// sampled warning for socket-error endings.
+/// It drives the transaction summary's `body_completed` / `body_error_class` /
+/// `client_disconnected`, the `hbone.udp.termination_reason` metadata, a
+/// sampled warning for socket-error endings, and the wire end of the CONNECT
+/// stream: a socket-error ending resets it with `RST_STREAM(CONNECT_ERROR)`
+/// ([`Self::resets_stream`], issue #5781), and every other ending closes it
+/// with a clean `END_STREAM`. The `[u16 length][payload]` framing has no error
+/// record, so the reset is the only in-band error signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HboneUdpRelayEnd {
     /// The tunnel peer ended its request stream.
@@ -295,6 +294,14 @@ impl HboneUdpRelayEnd {
             | Self::AppRecvFailed(kind) => Some(kind),
             _ => None,
         }
+    }
+
+    /// Whether the ending is a socket error, which resets the CONNECT stream
+    /// with `RST_STREAM(CONNECT_ERROR)` instead of ending it cleanly (issue
+    /// #5781). A peer close, idle expiry, write stall, or fence revocation is
+    /// not a socket error and keeps the clean `END_STREAM`.
+    const fn resets_stream(self) -> bool {
+        self.io_error_kind().is_some()
     }
 
     /// Whether the tunnel side (the HBONE client) caused the ending.
@@ -488,6 +495,42 @@ fn hbone_relay_body_outcome(
     (false, client_disconnected, Some(*class))
 }
 
+/// Whether the byte-stream relay's first failure resets the CONNECT stream
+/// with `RST_STREAM(CONNECT_ERROR)` (issue #5781).
+///
+/// A socket error on either side does: RFC 9113 section 8.5 assigns
+/// `CONNECT_ERROR` to a tunnel whose TCP connection failed, and a clean
+/// `END_STREAM` would read as a complete backend response. A fence revocation
+/// and a timeout (the idle window or a backend read/write deadline, all
+/// `ReadWriteTimeout`) are not socket errors, and keep the clean `END_STREAM`
+/// the datagram relay also keeps for its idle expiry and write stall.
+fn hbone_relay_failure_resets_stream(
+    first_failure: Option<&tcp_proxy::StreamFirstFailure>,
+    revoked_by_fence: bool,
+) -> bool {
+    match first_failure {
+        Some((_, class, _, _)) => {
+            !revoked_by_fence && !matches!(class, retry::ErrorClass::ReadWriteTimeout)
+        }
+        None => false,
+    }
+}
+
+/// End an HBONE tunnel's upgraded CONNECT stream once its relay is over (issue
+/// #5781). `reset` sends `RST_STREAM(CONNECT_ERROR)` in place of the clean
+/// `END_STREAM` that dropping the stream sends, so the peer can tell a failed
+/// relay from a normal close. Dropping here, before the relay's logging chain
+/// runs, keeps the wire end as prompt as it was when the relay owned the
+/// stream.
+fn end_hbone_connect_stream(upgraded: TokioIo<hyper::upgrade::Upgraded>, reset: bool) {
+    let mut upgraded = upgraded.into_inner();
+    if reset && !upgraded.reset_with_connect_error() {
+        // The stream's send side already finished (a completed half-close, or
+        // the peer reset it); there is nothing left to signal.
+        debug!("HBONE CONNECT stream already closed; no RST_STREAM sent");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_hbone_relay_summary(
     proxy: &Proxy,
@@ -563,9 +606,11 @@ fn build_hbone_relay_summary(
 /// #5765).
 ///
 /// Only a peer close or idle expiry is a completed body. A socket error or a
-/// fence revocation is not, and carries its error class: the wire end is a
-/// clean `END_STREAM` either way, so this summary — and its
-/// `hbone.udp.termination_reason` — is where the two stay distinguishable.
+/// fence revocation is not, and carries its error class. A socket error also
+/// resets the CONNECT stream on the wire (issue #5781); a revocation or write
+/// stall ends it with the same clean `END_STREAM` as a completed relay, so
+/// this summary and its `hbone.udp.termination_reason` are what tell those
+/// apart.
 #[allow(clippy::too_many_arguments)]
 fn build_hbone_udp_relay_summary(
     proxy: &Proxy,
@@ -1510,9 +1555,11 @@ pub(super) async fn handle_hbone_request(
         let relay_ctx = &tunnel.snapshot().ctx;
         match hbone_on_upgrade.await {
             Ok(upgraded) => {
-                let client_stream = TokioIo::new(upgraded);
+                // Lent to the relay so a failed relay can still reset the
+                // CONNECT stream once the copy is over (issue #5781).
+                let mut client_stream = TokioIo::new(upgraded);
                 let result = tcp_proxy::bidirectional_copy_for_fenced_relay(
-                    client_stream,
+                    &mut client_stream,
                     backend_stream,
                     relay_idle_timeout,
                     relay_half_close_cap,
@@ -1549,6 +1596,13 @@ pub(super) async fn handle_hbone_request(
                         .is_some_and(|(_, _, _, message)| {
                             message.as_str() == HBONE_ADMISSION_REVOKED_MESSAGE
                         });
+                end_hbone_connect_stream(
+                    client_stream,
+                    hbone_relay_failure_resets_stream(
+                        result.first_failure.as_ref(),
+                        revoked_by_fence,
+                    ),
+                );
                 if let Some((direction, class, side, message)) = result.first_failure.as_ref() {
                     if revoked_by_fence {
                         // Policy termination, already counted by the fence
@@ -2230,9 +2284,11 @@ pub(super) async fn handle_hbone_udp_request(
         let relay_ctx = &tunnel.snapshot().ctx;
         match on_upgrade.await {
             Ok(upgraded) => {
-                let io = TokioIo::new(upgraded);
+                // Lent to the relay so a socket-error ending can reset the
+                // CONNECT stream once the relay is over (issue #5781).
+                let mut io = TokioIo::new(upgraded);
                 let (bytes_to_app, bytes_to_tunnel, relay_end) =
-                    relay_hbone_udp(io, socket, idle, tunnel.revocation_token()).await;
+                    relay_hbone_udp(&mut io, socket, idle, tunnel.revocation_token()).await;
                 // Deregister before the summary and the logging chain. This
                 // relay has no per-direction failure record to classify from
                 // (unlike the byte-stream copy), so it reads the fence's own
@@ -2250,6 +2306,7 @@ pub(super) async fn handle_hbone_udp_request(
                 } else {
                     relay_end
                 };
+                end_hbone_connect_stream(io, relay_end.resets_stream());
                 let relay_error_class = relay_end.error_class();
                 if let Some(reason) = revoked_reason {
                     info!(
@@ -2539,11 +2596,11 @@ const HBONE_UDP_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Two-way datagram relay between an upgraded `udp`-CONNECT tunnel (framed) and a
 /// connected local `UdpSocket` (raw datagrams). Tunnel → unframe → `send`; `recv`
-/// → frame → tunnel. Either direction ending (EOF, error) ends the relay; on
-/// exit the tunnel write half is half-closed (h2 end-stream). hyper's upgraded
-/// stream cannot reset, so that end-stream is clean even when a socket error
-/// ended the relay; the returned [`HboneUdpRelayEnd`] is what records WHY
-/// (issue #5765).
+/// → frame → tunnel. Either direction ending (EOF, error) ends the relay. The
+/// relay never closes the tunnel itself: the returned [`HboneUdpRelayEnd`]
+/// records WHY it ended (issue #5765), and the caller ends the CONNECT stream
+/// from it, resetting it on a socket error and otherwise closing it cleanly
+/// (issue #5781).
 ///
 /// The idle window is refreshed on activity in **EITHER** direction — a shared
 /// `last_activity` timestamp bumped by both the tunnel→app reads and the
@@ -2566,10 +2623,9 @@ const HBONE_UDP_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 ///
 /// `revocation` is the admission fence's cancellation handle (issue #5042 step
 /// 1): it is a fourth arm of the same `select!` as the two pumps and the idle
-/// watchdog, so when it fires the surviving pumps are DROPPED and the tunnel
-/// ends by dropping `Upgraded` — no `shutdown()` is sent, because only the
-/// `from_app` pump running to completion reaches that call. The peer observes
-/// the same end-of-stream it would from an idle expiry.
+/// watchdog, so when it fires the surviving pumps are DROPPED and the caller
+/// ends the tunnel by dropping `Upgraded`. The peer observes the same
+/// end-of-stream it would from an idle expiry.
 async fn relay_hbone_udp<S>(
     tunnel: S,
     socket: tokio::net::UdpSocket,
@@ -2577,11 +2633,11 @@ async fn relay_hbone_udp<S>(
     revocation: tokio_util::sync::CancellationToken,
 ) -> (u64, u64, HboneUdpRelayEnd)
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     use bytes::BytesMut;
     use std::sync::atomic::AtomicU64;
-    use tokio::io::{AsyncWriteExt, split};
+    use tokio::io::split;
 
     let socket = Arc::new(socket);
     let (mut tunnel_read, mut tunnel_write) = split(tunnel);
@@ -2692,8 +2748,8 @@ where
             // Bound the write: a stalled HBONE peer (stopped reading / h2
             // flow-control exhausted) must not pin this task forever, especially
             // when the idle watchdog is disabled (codex r3). On stall, tear the
-            // relay down cleanly (break → tunnel half-close below). Only the
-            // datagrams the tunnel fully accepted are counted as relayed.
+            // relay down (break → the caller closes the tunnel cleanly). Only
+            // the datagrams the tunnel fully accepted are counted as relayed.
             match batch.write_to(&mut tunnel_write, write_deadline).await {
                 Ok(()) => {
                     from_app_bytes.fetch_add(
@@ -2720,7 +2776,9 @@ where
                 break HboneUdpRelayEnd::AppRecvFailed(kind);
             }
         };
-        let _ = tunnel_write.shutdown().await;
+        // No half-close here: every `from_app` ending is an error, and a
+        // half-close would queue a clean `END_STREAM` ahead of the caller's
+        // `RST_STREAM` (issue #5781).
         end
     };
 
@@ -3188,10 +3246,11 @@ mod tests {
         assert_eq!(summary.request_user_agent.as_deref(), Some("hbone-client"));
     }
 
-    // Issue #5765: the datagram relay reports WHY it ended. hyper's upgraded
-    // H2 stream cannot reset, so these drive the private relay loop over an
-    // in-memory tunnel and check the reason the transaction summary is built
-    // from.
+    // Issue #5765: the datagram relay reports WHY it ended. These drive the
+    // private relay loop over an in-memory tunnel and check the reason the
+    // transaction summary and the CONNECT stream's end are built from. The
+    // wire end over a real HBONE CONNECT (issue #5781) is covered in
+    // tests/integration/mesh_hbone_tests.rs.
 
     fn framed_datagram(payload: &[u8]) -> Vec<u8> {
         let mut out = bytes::BytesMut::new();
@@ -3461,6 +3520,15 @@ mod tests {
                 HboneUdpRelayEnd::TunnelClosed | HboneUdpRelayEnd::IdleTimeout
             );
             assert_eq!(end.error_class().is_none(), clean, "{end:?}");
+            // Issue #5781: only a socket error resets the CONNECT stream.
+            let socket_error = matches!(
+                end,
+                HboneUdpRelayEnd::TunnelReadFailed(_)
+                    | HboneUdpRelayEnd::TunnelWriteFailed(_)
+                    | HboneUdpRelayEnd::AppSendFailed(_)
+                    | HboneUdpRelayEnd::AppRecvFailed(_)
+            );
+            assert_eq!(end.resets_stream(), socket_error, "{end:?}");
         }
 
         let refused = HboneUdpRelayEnd::AppSendFailed(ErrorKind::ConnectionRefused);
