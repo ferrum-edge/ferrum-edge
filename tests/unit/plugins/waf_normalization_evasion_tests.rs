@@ -8,7 +8,10 @@
 //!   the value;
 //! * IIS / classic ASP and JavaScript `unescape()` `%uXXXX` escapes;
 //! * percent-encoded cookie values, which PHP, Express `cookie-parser`, and
-//!   Rails decode before binding them.
+//!   Rails decode before binding them — Express keeping `+` and running
+//!   `JSON.parse` on a `j:` value;
+//! * a double-encoded `%252B`, which is `+` after two decodes and a space
+//!   after three.
 //!
 //! Every assertion drives the real plugin hooks so it covers the complete
 //! view pipeline (raw scan plus bounded decoded variants), and each attack has
@@ -407,4 +410,178 @@ async fn json_path_values_are_not_json_unescaped_twice() {
     )
     .await;
     assert!(hit(&xss, "JP-XSS"), "hits={:?}", hits(&xss));
+}
+
+#[tokio::test]
+async fn code_point_escapes_behind_any_backslash_run_stay_residual() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "scan_budget_ms": 0,
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+
+    // Each round halves a backslash run, so a `<` escaped five or more JSON
+    // levels deep still has an escaped backslash in front of it after the
+    // round cap. Later decodes reach it all the same.
+    let deep_unicode = format!(r#"{{"v":"{}u003cscript"}}"#, "\\".repeat(16));
+    let deeper_unicode = format!(r#"{{"v":"{}u003cscript"}}"#, "\\".repeat(32));
+    let deep_hex = format!(r#"{{"v":"{}x3cscript"}}"#, "\\".repeat(16));
+    let deep_braced = format!(r#"{{"v":"{}u{{27}} or 1=1"}}"#, "\\".repeat(16));
+    for body in [deep_unicode, deeper_unicode, deep_hex, deep_braced] {
+        let request = scan_body(&plugin, "text/plain", body.as_bytes()).await;
+        assert!(
+            hit(&request, "FE-ENCODING-001"),
+            "{body:?} must be flagged; hits={:?}",
+            hits(&request)
+        );
+    }
+
+    // A code-point escape that yields a letter or a non-ASCII character hides
+    // nothing a signature keys on, however deep it is stacked: a `\x64`
+    // directory in a multiply-stringified Windows path, or an accented name.
+    for depth in [8, 16] {
+        let run = "\\".repeat(depth);
+        let windows = format!(r#"{{"path":"C:{run}x64{run}bin"}}"#);
+        let accented = format!(r#"{{"name":"caf{run}u00e9"}}"#);
+        for body in [windows, accented] {
+            let request = scan_body(&plugin, "text/plain", body.as_bytes()).await;
+            assert!(
+                !hit(&request, "FE-ENCODING-001"),
+                "{body:?} must not be flagged; hits={:?}",
+                hits(&request)
+            );
+        }
+    }
+}
+
+fn custom_rule_waf(rules: serde_json::Value) -> Waf {
+    Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "scan_budget_ms": 0,
+        "custom_rules": rules
+    }))
+    .unwrap()
+}
+
+fn contains_rule(id: &str, target: &str, pattern: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "category": "custom",
+        "target": target,
+        "match_kind": "contains",
+        "pattern": pattern
+    })
+}
+
+#[tokio::test]
+async fn express_json_cookies_resolve_code_point_escapes() {
+    let plugin = custom_rule_waf(json!([contains_rule("CK-XSS", "cookies", "<script")]));
+
+    // Express `cookie-parser` percent-decodes the value, then `JSON.parse`s a
+    // value starting with `j:`, which resolves `<` to `<`.
+    for cookie in [
+        "prefs=j%3A%7B%22n%22%3A%22%5Cu003cscript%5Cu003e%22%7D",
+        r#"prefs=j:{"n":"<script>"}"#,
+        r#"prefs=j:{"n":"\x3cscript"}"#,
+    ] {
+        let (_, request) = scan_cookie(&plugin, cookie).await;
+        assert!(
+            hit(&request, "CK-XSS"),
+            "{cookie:?} must be recognised; hits={:?}",
+            hits(&request)
+        );
+    }
+
+    // Outside a `j:` value no framework reads `<` as `<`, and a `j:`
+    // cookie whose escape yields an ordinary character stays clean.
+    for cookie in [
+        "note=%5Cu003cscript%5Cu003e",
+        "prefs=j%3A%7B%22n%22%3A%22caf%5Cu00e9%22%7D",
+    ] {
+        let (_, request) = scan_cookie(&plugin, cookie).await;
+        assert!(
+            !hit(&request, "CK-XSS"),
+            "{cookie:?} must stay clean; hits={:?}",
+            hits(&request)
+        );
+    }
+}
+
+#[tokio::test]
+async fn cookie_plus_is_scanned_both_as_plus_and_as_space() {
+    let plugin = custom_rule_waf(json!([
+        contains_rule("CK-PLUS", "cookies", "'+alert("),
+        contains_rule("CK-SPACE", "cookies", "' alert("),
+    ]));
+
+    // Express (`decodeURIComponent`) keeps `+`; PHP (`urldecode`) reads a
+    // space. Both readings reach the cookie rules.
+    let (_, request) = scan_cookie(&plugin, "x=%27+alert(1)+%27").await;
+    assert!(
+        hit(&request, "CK-PLUS") && hit(&request, "CK-SPACE"),
+        "hits={:?}",
+        hits(&request)
+    );
+
+    let (_, benign) = scan_cookie(&plugin, "blob=YWJj+ZGVm%2FZ2hp%3D%3D; q=it%27s+alright").await;
+    assert!(
+        !hit(&benign, "CK-PLUS") && !hit(&benign, "CK-SPACE"),
+        "hits={:?}",
+        hits(&benign)
+    );
+}
+
+#[tokio::test]
+async fn double_encoded_plus_is_scanned_as_plus_and_as_space() {
+    let plugin = custom_rule_waf(json!([
+        contains_rule("Q-PLUS", "query_values", "{{7+7}}"),
+        contains_rule("Q-SPACE", "query_values", "{{7 7}}"),
+        contains_rule("B-PLUS", "body_text", "{{7+7}}"),
+        contains_rule("B-SPACE", "body_text", "{{7 7}}"),
+        contains_rule("C-PLUS", "cookies", "{{7+7}}"),
+        contains_rule("C-SPACE", "cookies", "{{7 7}}"),
+    ]));
+
+    // `%252B` is `+` to an application that percent-decodes twice and a space
+    // to one that decodes a third time; both readings are scanned.
+    let attack = "q=%257B%257B7%252B7%257D%257D";
+    let query = scan_query(&plugin, attack).await;
+    assert!(
+        hit(&query, "Q-PLUS") && hit(&query, "Q-SPACE"),
+        "hits={:?}",
+        hits(&query)
+    );
+    let body = scan_body(
+        &plugin,
+        "application/x-www-form-urlencoded",
+        attack.as_bytes(),
+    )
+    .await;
+    assert!(
+        hit(&body, "B-PLUS") && hit(&body, "B-SPACE"),
+        "hits={:?}",
+        hits(&body)
+    );
+    let (_, cookie) = scan_cookie(&plugin, attack).await;
+    assert!(
+        hit(&cookie, "C-PLUS") && hit(&cookie, "C-SPACE"),
+        "hits={:?}",
+        hits(&cookie)
+    );
+
+    // A literal `+` is a space to every form decoder at every depth.
+    let benign = "q=%257B%257B7+7%257D%257D";
+    let query = scan_query(&plugin, benign).await;
+    assert!(!hit(&query, "Q-PLUS"), "hits={:?}", hits(&query));
+    let body = scan_body(
+        &plugin,
+        "application/x-www-form-urlencoded",
+        benign.as_bytes(),
+    )
+    .await;
+    assert!(!hit(&body, "B-PLUS"), "hits={:?}", hits(&body));
+    let (_, cookie) = scan_cookie(&plugin, benign).await;
+    assert!(!hit(&cookie, "C-PLUS"), "hits={:?}", hits(&cookie));
 }

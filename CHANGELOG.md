@@ -209,14 +209,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `file:\/\/\/etc\/passwd` reach the SQLi, SSRF, and LFI rules as the JSON
   parser delivers them. The IIS / classic ASP and JavaScript `unescape()` form
   `%uXXXX` is decoded in query values and bodies, in the same single pass as
-  `%XX`, so `%2B` and `%u002B` stay `+`. Cookie crumbs are scanned both raw
-  and percent-decoded (`%XX`, `%u`, and the bounded layered percent decode),
-  since PHP, Express `cookie-parser`, and Rails unescape cookie values before
-  binding them; the header is split on `;` first, so an encoded `%3B` cannot
-  forge an extra crumb. `body_json_path` values, already unescaped by the JSON
-  parser, do not have their single-character escapes resolved a second time,
-  and collapsing a run of backslashes no longer counts as an unreduced layer
-  for the `FE-ENCODING-001` residual.
+  `%XX`, so `%2B` and `%u002B` stay `+`; the layered decode also scans its
+  second-to-last round, so a double-encoded `%252B` is seen as `+` as well as
+  a space. Cookie crumbs are scanned both raw and percent-decoded (`%XX`,
+  `%u`, `+` as a space and, when the crumb also holds a `%`, as `+`, and the
+  bounded layered percent decode), since PHP, Express `cookie-parser`, and
+  Rails unescape cookie values before binding them; an Express `j:` JSON
+  cookie also has its `\uXXXX` / `\xXX` escapes resolved. The header is split
+  on `;` first, so an encoded `%3B` cannot forge an extra crumb.
+  `body_json_path` values, already unescaped by the JSON parser, do not have
+  their single-character escapes resolved a second time. For the
+  `FE-ENCODING-001` residual, collapsing a run of backslashes no longer counts
+  as an unreduced layer, while a `\u` / `\x` escape of punctuation, a space,
+  or a control character behind a backslash run of any length still does.
 
 ### Performance
 
