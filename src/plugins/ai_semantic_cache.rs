@@ -4595,6 +4595,12 @@ impl Plugin for AiSemanticCache {
         "ai_semantic_cache"
     }
 
+    // Every short-circuit is a cached provider response (a cache HIT), never
+    // a rejection of this plugin's own.
+    fn rejects_with_origin_response(&self) -> bool {
+        true
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_SEMANTIC_CACHE
     }

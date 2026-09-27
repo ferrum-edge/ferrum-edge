@@ -6751,6 +6751,13 @@ impl Plugin for AiFederation {
         "ai_federation"
     }
 
+    // The short-circuit is the federated provider's response (or a
+    // provider-failure envelope standing in for it), not a gateway policy
+    // rejection.
+    fn rejects_with_origin_response(&self) -> bool {
+        true
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_FEDERATION
     }

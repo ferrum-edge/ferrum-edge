@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Diagnostic references for every gateway-authored error, with rejection and
+  per-attempt detail** (#5846). `FERRUM_DIAGNOSTIC_REFS` takes a new `all`
+  value: besides the responses `errors` already references (those carrying the
+  gateway's own `X-Gateway-Error`), plugin rejections (for example `key_auth`
+  `401`, `access_control` `403`, `rate_limiting` `429`), gateway policy fences,
+  and routing `404`s now carry an `X-Ferrum-Diagnostic-Ref`, including gRPC
+  Trailers-Only rejections, on HTTP/1.1, HTTP/2, and HTTP/3. A response is
+  referenced only when its rejection site recorded it, for the status the head
+  carries, before the head was written. A backend's own error response never
+  is, whether relayed to the client or replayed by a plugin (a
+  `response_caching` or `ai_semantic_cache` hit, a `request_deduplication`
+  replay, a `serverless_function` terminate reply, an `ai_federation` provider
+  response). Such a reference resolves with a `null` `gateway_error`. In both
+  modes the `GET /diagnostics/v1/refs/{ref}` detail gains an optional
+  `rejection` object (`source` `plugin`/`gateway`/`routing`, the rejecting
+  `phase` from a compiled-in set or `other`, and the `plugin` name when known)
+  and an optional `attempts` list: one entry per backend attempt actually sent,
+  retries included, with its dispatch outcome, backend status or granular
+  `error_class`, and for a TLS failure a closed `tls` object naming the
+  certificate verification reason (`expired`, `unknown_issuer`, ...) or the
+  received alert (`unknown_ca`, ...). At most 8 attempts are listed
+  (`attempts_omitted` counts the rest). Every value is a compiled-in label or a
+  plugin type name; bodies, headers, paths, credentials, certificate contents,
+  and raw error text are never recorded. `off` is unchanged and `errors`
+  references the same responses as before; its lookup bodies now also carry the
+  optional `attempts` list and, for a `5xx` rejection, the `rejection` object —
+  an additive change, and a detail with neither keeps its previous shape.
+  Lookup scope, namespace binding, uniform `404`s, and rate limits are
+  unchanged. The references are still resolvable only on the process that
+  minted them.
+
 - **Opt-in WebSocket `permessage-deflate` passthrough** (#5769). A new
   per-proxy `websocket_permessage_deflate` field takes `strip` (default,
   unchanged behavior) or `passthrough`. With `passthrough`, the client's RFC 7692

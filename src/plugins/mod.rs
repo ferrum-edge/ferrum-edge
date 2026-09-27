@@ -3732,6 +3732,34 @@ impl RequestContext {
         self.backend_dispatch_state
     }
 
+    /// Record one completed backend attempt in the request's diagnostic
+    /// reference detail (issue #5846): once for each attempt the retry loop
+    /// replaces with another, and once for the attempt whose outcome the
+    /// client sees. A no-op when `FERRUM_DIAGNOSTIC_REFS` is off.
+    pub(crate) fn record_backend_attempt(
+        &self,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+        response_status: Option<u16>,
+    ) {
+        if let Some(slot) = self.diagnostic_slot.as_ref() {
+            slot.record_attempt(error_class, request_on_wire, response_status);
+        }
+    }
+
+    /// Whether this request's short-circuit response is an origin-authored
+    /// representation a plugin replayed or relayed rather than a rejection
+    /// the gateway authored: a `response_caching` HIT/REVALIDATED, a
+    /// `request_deduplication` idempotent replay, an `ai_semantic_cache` hit,
+    /// or a `serverless_function` terminate reply. Such a response never
+    /// carries a diagnostic reference (issue #5846), whatever its status.
+    pub(crate) fn serves_origin_representation(&self) -> bool {
+        self.finalized_response_replay
+            || self.semantic_cache_response_replay
+            || self.serverless_terminate_response
+            || self.serverless_grpc_terminate_frame.is_some()
+    }
+
     /// Phase of the matched route rule's total request deadline that produced
     /// this request's gateway-authored `504`, when one did.
     pub(crate) fn route_request_timeout_phase(&self) -> Option<&'static str> {
@@ -10353,6 +10381,18 @@ pub trait Plugin: Send + Sync {
     /// Ordinary body transforms that only need to affect the backend-visible
     /// bytes should keep using `transform_request_body` instead.
     fn normalizes_buffered_request_body_before_before_proxy(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when every `Reject`/`RejectBinary` this plugin returns
+    /// is an origin-authored representation (a cached backend response, a
+    /// federated provider response) rather than a rejection of its own.
+    ///
+    /// Gateway diagnostic references (issue #5846) never mark such a response
+    /// as a gateway rejection, whatever its status. Plugins whose short-circuit
+    /// is origin content only on some paths mark the request instead
+    /// (`RequestContext::serves_origin_representation`).
+    fn rejects_with_origin_response(&self) -> bool {
         false
     }
 

@@ -1697,10 +1697,16 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 `GET /diagnostics/v1/refs/{ref}` resolves an opaque `X-Ferrum-Diagnostic-Ref`
 response header to the gateway's own detail about that response (issue
-#5767). References are minted only when `FERRUM_DIAGNOSTIC_REFS=errors`, only
-on HTTP/1.1, HTTP/2, and HTTP/3 proxy responses that carry the gateway's own
-`X-Gateway-Error` token, and only the gateway process that served the response
-can resolve them. See
+#5767). With `FERRUM_DIAGNOSTIC_REFS=errors`, references are minted only on
+HTTP/1.1, HTTP/2, and HTTP/3 proxy responses that carry the gateway's own
+`X-Gateway-Error` token. With `FERRUM_DIAGNOSTIC_REFS=all` (issue #5846), every
+other gateway-authored error response carries one too — plugin rejections
+(`401`, `403`, `429`, ...), gateway policy fences, and routing `404`s — with a
+`null` `gateway_error` and a `detail.rejection` naming the rejecting phase and
+plugin. A backend's own error response never carries a reference, whether
+relayed to the client or replayed by a plugin (a cache hit, an idempotent
+replay, a serverless terminate reply, a federated provider response). Only the
+gateway process that served the response can resolve it. See
 [error_classification.md](error_classification.md#gateway-diagnostic-references)
 for the contract and bounds.
 
@@ -1738,14 +1744,43 @@ curl -H "Authorization: Bearer $DIAGNOSTICS_TOKEN" \
     "backend_dispatch": "pre_wire_failure",
     "proxy_id": "orders-api",
     "backend_target": "https://orders.internal:8443",
-    "duration_bucket": "lt_100ms"
+    "duration_bucket": "lt_100ms",
+    "attempts": [
+      {"attempt": 1, "backend_dispatch": "pre_wire_failure", "error_class": "dns_lookup_error"}
+    ]
   }
 }
 ```
 
+`detail.attempts` lists every backend attempt in dispatch order (at most 8;
+`detail.attempts_omitted` counts the rest), each with its dispatch outcome, the
+backend `status` or granular `error_class`, and for a TLS failure a closed
+`tls` object such as `{"failure": "certificate_verification", "reason":
+"expired"}` or `{"failure": "alert_received", "reason": "unknown_ca"}`. An
+`all`-mode reference on a plugin rejection resolves to, for example:
+
+```json
+{
+  "status": 401,
+  "gateway_error": null,
+  "detail_available": true,
+  "detail": {
+    "backend_dispatch": "not_dispatched",
+    "proxy_id": "orders-api",
+    "rejection": {"source": "plugin", "phase": "authenticate", "plugin": "key_auth"}
+  }
+}
+```
+
+(other fields elided). `rejection.source` is `plugin`, `gateway` (a policy
+fence such as `allowed_methods` or `overload`), or `routing`
+(`route_not_found`, `mesh_registry_only`). Both objects are absent when they do
+not apply, so an `errors`-mode body without retries or a rejection keeps its
+#5767 shape.
+
 | Status | When |
 |---|---|
-| `200` | Resolved. `detail` is `null` (and `detail_available` is `false`) until the request's terminal transaction record exists — a streamed response records it when its body ends — and for the overload and stale-configuration fences, which answer before a request context exists |
+| `200` | Resolved. `detail` is `null` (and `detail_available` is `false`) until the request's terminal transaction record exists — a streamed response records it when its body ends — and, in `errors` mode, for the overload and stale-configuration fences, which answer before a request context exists (`all` mode records their detail) |
 | `401` | Missing or invalid admin JWT |
 | `403` | The JWT lacks the `diagnostics:read` scope or carries no `ns` claim. Decided from the credential alone, before the reference is read. The attempt still counts against the rate limit |
 | `404` | Malformed, unknown, expired, or evicted reference; a reference outside the token's `ns` namespaces; or references are off. All identical, so references cannot be probed |

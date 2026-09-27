@@ -1017,6 +1017,28 @@ pub mod _test_support {
         ctx.record_backend_dispatch_outcome(error_class, request_on_wire);
     }
 
+    /// Attach a gateway diagnostic-reference slot to a request context, as
+    /// the HTTP frontends do when `FERRUM_DIAGNOSTIC_REFS` is enabled, so
+    /// external tests can observe what the rejection and attempt recording
+    /// sites write into it.
+    pub fn set_diagnostic_slot_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        slot: Arc<crate::diagnostic_ref::DiagnosticSlot>,
+    ) {
+        ctx.set_diagnostic_slot(Some(slot));
+    }
+
+    /// Record one backend attempt through the request context, as the retry
+    /// loops and final dispatch sites do.
+    pub fn record_backend_attempt_for_test(
+        ctx: &crate::plugins::RequestContext,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+        response_status: Option<u16>,
+    ) {
+        ctx.record_backend_attempt(error_class, request_on_wire, response_status);
+    }
+
     /// Model the transport-owned empty-body proof for direct plugin lifecycle
     /// tests that do not enter through an HTTP proxy body-drain path.
     pub fn set_replay_request_body_empty_proven_for_test(
