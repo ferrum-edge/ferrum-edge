@@ -2501,19 +2501,20 @@ mod tests {
         };
         // Release the port from a plain OS thread, well inside the pass-wide
         // rebind budget but after its first attempt has collided with it.
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let releaser_released = released.clone();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(350));
             drop(occupied);
+            releaser_released.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
-        let reconcile_started = std::time::Instant::now();
         let failures = manager.reconcile().await;
-        let reconcile_elapsed = reconcile_started.elapsed();
-        releaser.join().expect("releaser thread");
         assert!(
-            reconcile_elapsed >= std::time::Duration::from_millis(300),
-            "reconcile returned before the held socket was released: {reconcile_elapsed:?}"
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "reconcile returned before the held socket was released"
         );
+        releaser.join().expect("releaser thread");
         assert!(
             failures.iter().any(|failure| {
                 failure.port == port
