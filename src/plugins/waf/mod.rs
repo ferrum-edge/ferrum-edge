@@ -36,8 +36,8 @@ use std::time::Duration;
 use self::defaults::default_rules;
 use self::exemptions::CompiledExemptions;
 use self::rules::{
-    CompiledRules, RuleAction, RuleHit, RuleTarget, Severity, WafRule, compile_rules,
-    parse_custom_rule, parse_rule_action, parse_rule_overrides,
+    CompiledRule, CompiledRules, ParanoiaLevels, RuleAction, RuleHit, RuleTarget, Severity,
+    WafRule, compile_rules, parse_custom_rule, parse_rule_action, parse_rule_overrides,
 };
 use self::scan::ScanOutcome;
 use self::stream::{
@@ -62,7 +62,9 @@ use crate::util::unknown_keys::reject_unknown_keys;
 const WAF_CONFIG_KEYS: &[&str] = &[
     "mode",
     "default_rule_action",
+    "category_modes",
     "paranoia_level",
+    "detection_paranoia_level",
     "request_inspection",
     "request_body_inspection",
     "response_inspection",
@@ -163,6 +165,8 @@ impl BodyDirection {
 struct WafConfig {
     mode: GlobalMode,
     paranoia_level: u8,
+    /// `>= paranoia_level`. Rules between the two levels are detection-only.
+    detection_paranoia_level: u8,
     request_inspection: bool,
     request_body_inspection: bool,
     response_inspection: bool,
@@ -196,6 +200,16 @@ struct ScoringConfig {
 impl ScoringConfig {
     fn weight(&self, severity: Severity) -> u32 {
         self.weights[severity as usize]
+    }
+
+    /// Anomaly-score contribution of one matched rule. Detection-only rules
+    /// observe a higher paranoia level without participating in the blocking
+    /// posture, so they contribute nothing.
+    fn contribution(&self, rule: &CompiledRule) -> u32 {
+        if rule.detection_only {
+            return 0;
+        }
+        rule.score.unwrap_or_else(|| self.weight(rule.severity))
     }
 }
 
@@ -240,12 +254,11 @@ impl Waf {
         if self.config.mode != GlobalMode::Enforce || !self.compiled.response_header_rules_active {
             return false;
         }
-        if self.config.scoring.is_some() {
-            return true;
-        }
+        let scoring_enabled = self.config.scoring.is_some();
         self.compiled.rules.iter().any(|rule| {
-            rule.action == RuleAction::Enforce
-                && matches!(&rule.target, self::rules::RuleTarget::ResponseHeaders)
+            matches!(&rule.target, self::rules::RuleTarget::ResponseHeaders)
+                && !rule.detection_only
+                && (scoring_enabled || rule.action == RuleAction::Enforce)
         })
     }
 
@@ -281,7 +294,9 @@ impl Waf {
             };
             let reads_direction =
                 reads_body || encoding == Some(index) || overlong_utf8 == Some(index);
-            reads_direction && (scoring_enabled || rule.action == RuleAction::Enforce)
+            reads_direction
+                && !rule.detection_only
+                && (scoring_enabled || rule.action == RuleAction::Enforce)
         })
     }
 
@@ -348,6 +363,21 @@ impl Waf {
         if !(1..=4).contains(&paranoia_level) {
             return Err("waf: `paranoia_level` must be from 1 to 4".to_string());
         }
+        // Detection-only paranoia band (CRS `detection_paranoia_level`): rules
+        // above `paranoia_level` but within this level are compiled and
+        // reported, never blocking or scoring. Defaults to the blocking level,
+        // i.e. no band.
+        let detection_paranoia_level =
+            optional_u8(object, "detection_paranoia_level")?.unwrap_or(paranoia_level);
+        if !(1..=4).contains(&detection_paranoia_level) {
+            return Err("waf: `detection_paranoia_level` must be from 1 to 4".to_string());
+        }
+        if detection_paranoia_level < paranoia_level {
+            return Err(
+                "waf: `detection_paranoia_level` must be greater than or equal to `paranoia_level`"
+                    .to_string(),
+            );
+        }
 
         let request_inspection = optional_bool(object, "request_inspection")?.unwrap_or(true);
         let request_body_inspection =
@@ -393,6 +423,7 @@ impl Waf {
         let default_rule_action = optional_string(object, "default_rule_action")?
             .map(|raw| parse_rule_action(&raw, "default_rule_action"))
             .transpose()?;
+        let category_modes = parse_category_modes(object.get("category_modes"))?;
         let rule_overrides = parse_rule_overrides(object.get("rule_overrides"))?;
         let default_action = match mode {
             GlobalMode::Enforce => RuleAction::Enforce,
@@ -421,8 +452,12 @@ impl Waf {
             &disabled_default_rules,
             &rule_modes,
             default_rule_action,
+            &category_modes,
             &rule_overrides,
-            paranoia_level,
+            ParanoiaLevels {
+                blocking: paranoia_level,
+                detection: detection_paranoia_level,
+            },
         )?;
         if compiled.is_empty() && stream.is_none() && mode != GlobalMode::Disabled {
             return Err(
@@ -448,6 +483,7 @@ impl Waf {
         let config = WafConfig {
             mode,
             paranoia_level,
+            detection_paranoia_level,
             request_inspection,
             request_body_inspection,
             response_inspection,
@@ -686,10 +722,11 @@ impl Waf {
     fn finish_scan(
         &self,
         ctx: &mut RequestContext,
-        outcome: ScanOutcome,
+        mut outcome: ScanOutcome,
         phase: WafScorePhase,
         timeout_enforces: bool,
     ) -> PluginResult {
+        self.record_detection_hits(ctx, &mut outcome);
         if outcome.hits.is_empty() {
             // A replaceable phase that re-ran CLEAN retires its own previous
             // contribution: that evidence is not in the representation the
@@ -893,6 +930,42 @@ impl Waf {
         Ok((&body[..self.config.max_scan_bytes], true))
     }
 
+    /// Move detection-only hits out of `outcome` and report them on their own.
+    ///
+    /// What remains in `outcome.hits` is exactly the blocking posture's
+    /// evidence, so a scan whose only hits are detection-only takes the clean
+    /// path: it neither changes `waf.action`, `waf.severity`, `waf.target`, or
+    /// `waf.rule_hits`, nor scores. The band's hits are published as
+    /// `waf.detection_rule_hits` (plus `waf.detection_paranoia`), so an
+    /// operator can measure what raising `paranoia_level` would flag before
+    /// doing it.
+    fn record_detection_hits(&self, ctx: &mut RequestContext, outcome: &mut ScanOutcome) {
+        if !self.compiled.detection_rules_active {
+            return;
+        }
+        let mut detection_ids: Vec<&str> = Vec::new();
+        {
+            let observer: &RequestContext = ctx;
+            outcome.hits.retain(|hit| {
+                let rule = &self.compiled.rules[hit.rule_index];
+                if !rule.detection_only {
+                    return true;
+                }
+                detection_ids.push(rule.id.as_str());
+                self.warn_hit(observer, hit);
+                false
+            });
+        }
+        if detection_ids.is_empty() || !self.config.log_to_metadata {
+            return;
+        }
+        ctx.merge_waf_metadata("waf.detection_rule_hits", &detection_ids.join(","));
+        ctx.set_waf_metadata(
+            "waf.detection_paranoia",
+            self.config.detection_paranoia_level.to_string(),
+        );
+    }
+
     fn record_hits(
         &self,
         ctx: &mut RequestContext,
@@ -913,8 +986,7 @@ impl Waf {
                 targets.push(hit.target_name);
             }
             if let Some(scoring) = &self.config.scoring {
-                let contribution = rule.score.unwrap_or_else(|| scoring.weight(rule.severity));
-                phase_score = phase_score.saturating_add(contribution);
+                phase_score = phase_score.saturating_add(scoring.contribution(rule));
             }
             if enforce_actions
                 && rule.action == RuleAction::Enforce
@@ -1102,7 +1174,7 @@ impl Waf {
             rule_name = %rule.name,
             severity = %rule.severity.as_str(),
             category = %rule.category,
-            action = %rule.action.effective_log_action(globally_enforcing),
+            action = %rule.effective_log_action(globally_enforcing),
             rule_action = %rule.action,
             target_field = %hit.target_name,
             client_ip = %ctx.client_ip,
@@ -2158,10 +2230,10 @@ fn validate_enforce_mode_has_enforcing_rules(
         return Ok(());
     }
     if scoring.is_some_and(|scoring| {
-        compiled.rules.iter().any(|rule| {
-            surfaces.inspects(&rule.target)
-                && rule.score.unwrap_or_else(|| scoring.weight(rule.severity)) > 0
-        })
+        compiled
+            .rules
+            .iter()
+            .any(|rule| surfaces.inspects(&rule.target) && scoring.contribution(rule) > 0)
     }) {
         return Ok(());
     }
@@ -2267,6 +2339,26 @@ fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String>
         block_threshold,
         weights,
     }))
+}
+
+/// `category_modes`: bulk action per built-in rule category. Keys are
+/// operator-supplied category names, validated against the built-in pack at
+/// compile time.
+fn parse_category_modes(value: Option<&Value>) -> Result<HashMap<String, RuleAction>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(HashMap::new()),
+        Some(Value::Object(map)) => {
+            let mut parsed = HashMap::with_capacity(map.len());
+            for (category, value) in map {
+                let Some(raw) = value.as_str() else {
+                    return Err("waf: category_modes values must be strings".to_string());
+                };
+                parsed.insert(category.clone(), parse_rule_action(raw, "category_modes")?);
+            }
+            Ok(parsed)
+        }
+        Some(_) => Err("waf: `category_modes` must be an object".to_string()),
+    }
 }
 
 fn parse_rule_modes(value: Option<&Value>) -> Result<HashMap<String, RuleAction>, String> {

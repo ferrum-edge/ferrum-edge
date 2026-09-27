@@ -354,12 +354,16 @@ impl WafWsSession {
         let mut score: u32 = 0;
         for hit in &outcome.hits {
             let rule = &self.waf.compiled.rules[hit.rule_index];
-            highest = highest.max(rule.severity);
+            // A detection-only rule is logged below but takes no part in the
+            // message decision: no severity, no score, never blocking.
+            if !rule.detection_only {
+                highest = highest.max(rule.severity);
+            }
             if let Some(scoring) = &self.waf.config.scoring {
-                let contribution = rule.score.unwrap_or_else(|| scoring.weight(rule.severity));
-                score = score.saturating_add(contribution);
+                score = score.saturating_add(scoring.contribution(rule));
             }
             if enforcing_globally
+                && !rule.detection_only
                 && rule.action == RuleAction::Enforce
                 && first_blocking_rule.is_none()
             {
@@ -376,7 +380,7 @@ impl WafWsSession {
                     rule_name = %rule.name,
                     severity = %rule.severity.as_str(),
                     category = %rule.category,
-                    action = %rule.action.effective_log_action(enforcing_globally),
+                    action = %rule.effective_log_action(enforcing_globally),
                     rule_action = %rule.action,
                     target_field = %hit.target_name,
                     "WAF rule matched on a WebSocket message"

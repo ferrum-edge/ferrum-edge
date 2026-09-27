@@ -933,3 +933,46 @@ async fn a_non_utf8_binary_filter_miss_is_still_blocked() {
         assert_policy_close(&outgoing);
     }
 }
+
+#[tokio::test]
+async fn detection_band_rules_never_close_a_websocket_session() {
+    // `DETECT-ONLY` sits in the `detection_paranoia_level` band: it is scanned
+    // and logged, but it neither blocks nor scores, even with an `enforce`
+    // action and a threshold its weight alone would cross. `CUSTOM-L1` proves
+    // the session still enforces its blocking-level rules.
+    let plugins = vec![waf(json!({
+        "include_default_rules": false,
+        "paranoia_level": 1,
+        "detection_paranoia_level": 2,
+        "scoring": { "block_threshold": 1 },
+        "custom_rules": [
+            {
+                "id": "DETECT-ONLY",
+                "category": "custom",
+                "severity": "critical",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": "band-token",
+                "action": "enforce",
+                "paranoia_min": 2
+            },
+            {
+                "id": "CUSTOM-L1",
+                "category": "custom",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": PROHIBITED,
+                "action": "enforce"
+            }
+        ]
+    }))];
+    let ctx = upgrade_ctx("/ws");
+
+    let detected = Message::Text("band-token".into());
+    let outgoing = relay_to_backend(&plugins, &ctx, detected.clone()).await;
+    assert_eq!(outgoing, detected, "a detection-only hit must forward");
+
+    let blocked = Message::Text(PROHIBITED.into());
+    let outgoing = relay_to_backend(&plugins, &ctx, blocked).await;
+    assert_policy_close(&outgoing);
+}

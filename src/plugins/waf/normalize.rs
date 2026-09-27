@@ -588,6 +588,13 @@ pub(super) fn canonical_query_component_views(raw: &str) -> CanonicalQueryViews<
     CanonicalQueryViews { primary, variants }
 }
 
+/// A query parameter's name as the application reads it: one percent-decode
+/// plus `+`→space, the primary view of [`canonical_query_component_views`].
+/// Field exclusions compare configured names against this.
+pub(super) fn query_component_name(raw: &str) -> Cow<'_, str> {
+    percent_decode_plus(raw)
+}
+
 fn has_decodable_marker(text: &str) -> bool {
     text.as_bytes()
         .iter()

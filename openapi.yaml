@@ -27929,7 +27929,8 @@ components:
         Plugin: waf — OWASP-style content-pattern threat detection for HTTP-family
         requests and optional responses. Fixed-shape objects reject unknown keys;
         intentionally open maps are rule_modes / rule_overrides (rule-id keys),
-        conditions.headers, and global_exemptions.header_present.
+        category_modes (built-in category keys, validated against the rule
+        pack), conditions.headers, and global_exemptions.header_present.
         On an upgraded WebSocket session the same body rule sets govern complete
         application messages: client-to-backend messages use the request body
         rules (request_inspection + request_body_inspection), backend-to-client
@@ -27978,6 +27979,35 @@ components:
           minimum: 1
           maximum: 4
           default: 1
+        detection_paranoia_level:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 4
+          description: >-
+            Detection-only paranoia band. Defaults to paranoia_level (no band)
+            and must be at least paranoia_level. Rules whose paranoia_min is
+            above paranoia_level but within this level are compiled and
+            scanned as detection-only: always monitor (only an explicit
+            rule_modes enforce entry promotes one), zero anomaly-score
+            contribution, never an enforcing body policy, and never an
+            admission enforcement path. Their hits are reported in
+            waf.detection_rule_hits and waf.detection_paranoia instead of
+            waf.rule_hits, and a request with only detection hits keeps
+            waf.action=clean.
+        category_modes:
+          type: [object, "null"]
+          additionalProperties:
+            type: string
+            enum:
+              [enforce, block, reject, monitor, log, warn, disabled, disable, "off"]
+          description: >-
+            Per-category action for built-in rules, keyed by rule-pack
+            category (for example sqli, xss, encoding_evasion). Precedence,
+            lowest first: default_rule_action, category_modes,
+            rule_overrides.action, rule_modes. Naming an opt-in category such
+            as encoding_evasion promotes its rules. Custom rules keep their own
+            action. A category no built-in rule carries is rejected. Values
+            accept the same aliases as default_rule_action.
         request_inspection:
           type: [boolean, "null"]
           default: true
@@ -28131,6 +28161,38 @@ components:
                 items:
                   type: string
                   minLength: 1
+              exclude:
+                type: [object, "null"]
+                additionalProperties: false
+                description: >-
+                  Field exclusions: stop this one rule inspecting the named
+                  fields while it keeps inspecting every other field, and every
+                  other rule keeps inspecting these. query_params names are
+                  compared after one percent-decode (case-sensitive) and apply
+                  to query_keys, query_values, and full_url rules; a full_url
+                  match is re-verified against the URL rebuilt without the
+                  excluded pairs, and FE-HPP-001 drops them before comparing
+                  duplicates. headers are case-insensitive and apply to
+                  header_names, header_values, and response_headers rules.
+                  cookies are cookie names and apply to cookies rules. An
+                  exclusion that does not fit the rule's target, or an empty
+                  object, is rejected.
+                properties:
+                  query_params:
+                    type: [array, "null"]
+                    items:
+                      type: string
+                      minLength: 1
+                  headers:
+                    type: [array, "null"]
+                    items:
+                      type: string
+                      minLength: 1
+                  cookies:
+                    type: [array, "null"]
+                    items:
+                      type: string
+                      minLength: 1
               conditions:
                 type: [object, "null"]
                 additionalProperties: false

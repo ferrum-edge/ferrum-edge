@@ -39,7 +39,12 @@ const RULE_OVERRIDE_KEYS: &[&str] = &[
     "fp_filters",
     "conditions",
     "score",
+    "exclude",
 ];
+
+/// Fixed-shape `rule_overrides[<id>].exclude` keys. Each value is an open
+/// list of operator-defined field names.
+const FIELD_EXCLUSION_KEYS: &[&str] = &["query_params", "headers", "cookies"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Severity {
@@ -308,6 +313,63 @@ pub(super) struct WafRule {
     pub(super) query_scan_mirror: QueryScanMirror,
 }
 
+/// Named request fields one rule must not inspect (CRS-style target
+/// exclusions), from `rule_overrides[<id>].exclude`.
+///
+/// Narrower than disabling the rule or scoping it with `conditions`: the rule
+/// keeps inspecting every other field of the same request. Names are matched
+/// exactly as the application sees them — query parameter names after
+/// percent-decoding (case-sensitive), header names case-insensitively, cookie
+/// names case-sensitively.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct FieldExclusions {
+    pub(super) query_params: Vec<String>,
+    /// Lowercased at parse time.
+    pub(super) headers: Vec<String>,
+    pub(super) cookies: Vec<String>,
+}
+
+impl FieldExclusions {
+    pub(super) fn excludes_query_param(&self, name: &str) -> bool {
+        self.query_params.iter().any(|excluded| excluded == name)
+    }
+
+    pub(super) fn excludes_header(&self, name: &str) -> bool {
+        self.headers
+            .iter()
+            .any(|excluded| excluded.eq_ignore_ascii_case(name))
+    }
+
+    pub(super) fn excludes_cookie(&self, name: &str) -> bool {
+        self.cookies.iter().any(|excluded| excluded == name)
+    }
+}
+
+/// The request field a matched value came from, as far as exclusions care.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Field<'a> {
+    /// A surface with no per-field identity: path, method, bodies.
+    Whole,
+    Header(&'a str),
+    ResponseHeader(&'a str),
+    QueryParam(&'a str),
+    Cookie(&'a str),
+    /// The whole request URL. A rule with query-parameter exclusions cannot
+    /// tell which pair a whole-URL match came from, so it re-verifies against
+    /// the URL rebuilt without its excluded pairs.
+    Url {
+        path: &'a str,
+        query: UrlQuery<'a>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum UrlQuery<'a> {
+    None,
+    Raw(&'a str),
+    Materialized(&'a HashMap<String, String>),
+}
+
 #[derive(Debug)]
 pub(super) struct CompiledRule {
     pub(super) id: String,
@@ -320,9 +382,31 @@ pub(super) struct CompiledRule {
     fp_filters: Option<RegexSet>,
     pub(super) cidr: Option<IpCidr>,
     pub(super) score: Option<u32>,
+    /// Compiled only because it sits in the `detection_paranoia_level` band
+    /// above `paranoia_level`. Always `Monitor`, contributes nothing to anomaly
+    /// scoring, never counts as an enforcing policy, and reports through its
+    /// own `waf.detection_rule_hits` field so it cannot disturb the blocking
+    /// posture's metadata.
+    pub(super) detection_only: bool,
+    pub(super) exclusions: Option<FieldExclusions>,
+    /// This rule's own matcher, compiled only for a `full_url` regex-family
+    /// rule with query-parameter exclusions, to re-verify a whole-URL hit
+    /// against the URL without the excluded pairs.
+    pub(super) url_recheck: Option<Regex>,
 }
 
 impl CompiledRule {
+    /// The `action` field for `log_to_stdout` diagnostics: the rule's
+    /// effective direct outcome, or `detection_only` for a rule compiled only
+    /// for the detection paranoia band.
+    pub(super) fn effective_log_action(&self, globally_enforcing: bool) -> &'static str {
+        if self.detection_only {
+            "detection_only"
+        } else {
+            self.action.effective_log_action(globally_enforcing)
+        }
+    }
+
     pub(super) fn matches_conditions(&self, ctx: &RequestContext) -> bool {
         self.conditions
             .as_ref()
@@ -419,6 +503,9 @@ pub(super) struct CompiledRules {
     pub(super) request_cheap_rules_active: bool,
     pub(super) response_header_rules_active: bool,
     pub(super) response_body_rules_active: bool,
+    /// At least one rule compiled as detection-only. Lets the scan decision
+    /// skip the detection-hit split entirely when no band is configured.
+    pub(super) detection_rules_active: bool,
 }
 
 impl CompiledRules {
@@ -486,16 +573,31 @@ impl IpCidr {
     }
 }
 
+/// Paranoia configuration for one compilation.
+///
+/// Rules with `paranoia_min <= blocking` compile normally. Rules in the band
+/// `blocking < paranoia_min <= detection` compile as detection-only (see
+/// [`CompiledRule::detection_only`]). Anything above `detection` is compiled
+/// out, except that an explicit `rule_modes: enforce` still force-compiles a
+/// rule as a normal enforcing rule.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ParanoiaLevels {
+    pub(super) blocking: u8,
+    pub(super) detection: u8,
+}
+
 pub(super) fn compile_rules(
     mut rules: Vec<(WafRule, bool)>,
     disabled_default_rules: &HashSet<String>,
     rule_modes: &HashMap<String, RuleAction>,
     default_rule_action: Option<RuleAction>,
+    category_modes: &HashMap<String, RuleAction>,
     rule_overrides: &HashMap<String, RuleOverride>,
-    paranoia_level: u8,
+    paranoia: ParanoiaLevels,
 ) -> Result<CompiledRules, String> {
     let mut seen = HashSet::new();
     let mut seen_default = HashSet::new();
+    let mut seen_default_categories = HashSet::new();
     let mut compiled_rules = Vec::new();
     let mut builders = RuleSetBuilders::default();
     let mut next_custom_index = 0usize;
@@ -523,6 +625,7 @@ pub(super) fn compile_rules(
         }
         if is_default {
             seen_default.insert(rule.id.clone());
+            seen_default_categories.insert(rule.category.clone());
         }
         // Per-rule overrides apply to built-ins and custom rules alike, and
         // before the paranoia gate so an override can raise/lower visibility.
@@ -543,20 +646,33 @@ pub(super) fn compile_rules(
                 rule.score = Some(score);
             }
         }
+        // Validated before any paranoia / disabled filtering, so an exclusion
+        // attached to the wrong rule fails even while that rule is inactive.
+        let exclusions = rule_overrides
+            .get(&rule.id)
+            .and_then(|ov| ov.exclude.clone());
+        if let Some(exclusions) = &exclusions {
+            validate_field_exclusions(&rule, exclusions).map_err(with_rule_context)?;
+        }
         // An explicit `rule_modes: enforce` entry force-compiles a rule even
         // when its `paranoia_min` exceeds the active paranoia level; a Monitor
-        // or Disabled entry never resurrects a paranoia-filtered rule.
-        if rule.paranoia_min > paranoia_level
-            && rule_modes.get(&rule.id) != Some(&RuleAction::Enforce)
-        {
+        // or Disabled entry never resurrects a paranoia-filtered rule. Between
+        // the blocking and detection levels a rule is kept as detection-only.
+        let force_enforced = rule_modes.get(&rule.id) == Some(&RuleAction::Enforce);
+        let detection_only = rule.paranoia_min > paranoia.blocking && !force_enforced;
+        if detection_only && rule.paranoia_min > paranoia.detection {
             continue;
         }
-        // Bulk + per-rule action resolution is compile-time only. An explicit
-        // `rule_modes` or `rule_overrides.action` entry still wins; OptInEnforce
-        // built-ins skip bulk Enforce so noisy heuristics stay monitor under
-        // the recommended starting posture.
+        // Bulk + per-rule action resolution is compile-time only. Precedence,
+        // lowest first: `default_rule_action`, `category_modes`,
+        // `rule_overrides.action`, `rule_modes`. OptInEnforce built-ins skip
+        // bulk Enforce so noisy heuristics stay monitor under the recommended
+        // starting posture; naming their category explicitly is an opt-in.
         if is_default {
             apply_default_rule_action(&mut rule, default_rule_action);
+            if let Some(action) = category_modes.get(&rule.category) {
+                rule.action = *action;
+            }
         }
         if let Some(ov) = rule_overrides.get(&rule.id)
             && let Some(action) = ov.action
@@ -571,6 +687,12 @@ pub(super) fn compile_rules(
         }
         if rule.action == RuleAction::Disabled {
             continue;
+        }
+        if detection_only {
+            // Observe what a higher paranoia level would flag without letting
+            // it block: whatever action resolution chose, the band is
+            // monitor-only.
+            rule.action = RuleAction::Monitor;
         }
 
         let fp_filters = compile_fp_filters(&rule).map_err(with_rule_context)?;
@@ -592,6 +714,22 @@ pub(super) fn compile_rules(
             .transpose()
             .map_err(|e| with_rule_context(format!("waf: rule {:?}: {e}", rule.id)))?;
 
+        let url_recheck = match (&exclusions, &rule.target, rule.match_kind) {
+            (
+                Some(exclusions),
+                RuleTarget::FullUrl,
+                MatchKind::Regex | MatchKind::Literal | MatchKind::Contains | MatchKind::Equals,
+            ) if !exclusions.query_params.is_empty() => {
+                Some(Regex::new(&rule_pattern(&rule)).map_err(|_| {
+                    with_rule_context(format!(
+                        "waf: rule {:?} pattern is invalid or too complex",
+                        rule.id
+                    ))
+                })?)
+            }
+            _ => None,
+        };
+
         let rule_index = compiled_rules.len();
         let compiled = CompiledRule {
             id: rule.id.clone(),
@@ -604,6 +742,9 @@ pub(super) fn compile_rules(
             fp_filters,
             cidr,
             score: rule.score,
+            detection_only,
+            exclusions,
+            url_recheck,
         };
         builders
             .add_rule(rule_index, &rule)
@@ -621,6 +762,21 @@ pub(super) fn compile_rules(
         return Err(format!(
             "waf: `disabled_default_rules` references unknown default rule id(s): {:?}",
             unknown_disabled.join(", ")
+        ));
+    }
+
+    // A category name that no built-in rule carries would silently tune
+    // nothing; refuse it like an unknown rule id.
+    let mut unknown_categories: Vec<&str> = category_modes
+        .keys()
+        .filter(|category| !seen_default_categories.contains(category.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unknown_categories.is_empty() {
+        unknown_categories.sort_unstable();
+        return Err(format!(
+            "waf: `category_modes` references unknown built-in rule category(ies): {:?}",
+            unknown_categories.join(", ")
         ));
     }
 
@@ -822,8 +978,10 @@ impl RuleSetBuilders {
     }
 
     fn finish(self, rules: Vec<CompiledRule>) -> Result<CompiledRules, String> {
+        let detection_rules_active = rules.iter().any(|rule| rule.detection_only);
         Ok(CompiledRules {
             rules,
+            detection_rules_active,
             header_names: self.header_names.finish_text("header_names")?,
             header_values: self.header_values.finish_text("header_values")?,
             query_keys: self.query_keys.finish_text("query_keys")?,
@@ -986,6 +1144,7 @@ pub(super) struct RuleOverride {
     pub(super) fp_filters: Option<Vec<String>>,
     pub(super) conditions: Option<Conditions>,
     pub(super) score: Option<u32>,
+    pub(super) exclude: Option<FieldExclusions>,
 }
 
 pub(super) fn parse_rule_overrides(
@@ -1032,6 +1191,10 @@ pub(super) fn parse_rule_overrides(
                     })
                     .transpose()?;
                 let score = optional_u32(object, "score")?;
+                let exclude = object
+                    .get("exclude")
+                    .map(|value| parse_field_exclusions(value, &format!("{path}.exclude")))
+                    .transpose()?;
                 out.insert(
                     id.clone(),
                     RuleOverride {
@@ -1041,6 +1204,7 @@ pub(super) fn parse_rule_overrides(
                         fp_filters,
                         conditions,
                         score,
+                        exclude,
                     },
                 );
             }
@@ -1051,6 +1215,70 @@ pub(super) fn parse_rule_overrides(
             other = other.to_string()
         )),
     }
+}
+
+fn parse_field_exclusions(value: &Value, path: &str) -> Result<FieldExclusions, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "waf: `rule_overrides.exclude` must be an object".to_string())?;
+    // The path carries an operator-supplied rule id; only the fixed schema
+    // context may survive rendering.
+    reject_unknown_keys(
+        object,
+        path,
+        FIELD_EXCLUSION_KEYS,
+        "waf: `config.rule_overrides.exclude`: ",
+    )?;
+    let exclusions = FieldExclusions {
+        query_params: optional_string_vec(object, "query_params")?.unwrap_or_default(),
+        headers: optional_string_vec(object, "headers")?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect(),
+        cookies: optional_string_vec(object, "cookies")?.unwrap_or_default(),
+    };
+    if exclusions == FieldExclusions::default() {
+        return Err(
+            "waf: `rule_overrides.exclude` must name at least one query_params, headers, or \
+             cookies entry"
+                .to_string(),
+        );
+    }
+    Ok(exclusions)
+}
+
+/// Refuse exclusions a rule could never apply, so a field list attached to the
+/// wrong rule fails loudly instead of silently excluding nothing.
+fn validate_field_exclusions(rule: &WafRule, exclusions: &FieldExclusions) -> Result<(), String> {
+    let (query, headers, cookies) = match &rule.target {
+        RuleTarget::QueryKeys | RuleTarget::QueryValues | RuleTarget::FullUrl => {
+            (true, false, false)
+        }
+        RuleTarget::HeaderNames | RuleTarget::HeaderValues(_) | RuleTarget::ResponseHeaders => {
+            (false, true, false)
+        }
+        RuleTarget::Cookies => (false, false, true),
+        RuleTarget::UrlPath
+        | RuleTarget::Method
+        | RuleTarget::BodyText
+        | RuleTarget::BodyJsonPath(_)
+        | RuleTarget::ResponseBody => (false, false, false),
+    };
+    for (kind, named, supported) in [
+        ("query_params", !exclusions.query_params.is_empty(), query),
+        ("headers", !exclusions.headers.is_empty(), headers),
+        ("cookies", !exclusions.cookies.is_empty(), cookies),
+    ] {
+        if named && !supported {
+            return Err(format!(
+                "waf: rule {:?} inspects `{}`, which has no {kind} to exclude",
+                rule.id,
+                rule.target.log_target()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn parse_custom_rule(
@@ -1412,7 +1640,11 @@ mod tests {
             &HashMap::new(),
             None,
             &HashMap::new(),
-            1,
+            &HashMap::new(),
+            ParanoiaLevels {
+                blocking: 1,
+                detection: 1,
+            },
         )
         .expect("compile");
         let set = &compiled.body_bytes.as_ref().unwrap().set;
@@ -1445,7 +1677,11 @@ mod tests {
             &HashMap::new(),
             None,
             &HashMap::new(),
-            1,
+            &HashMap::new(),
+            ParanoiaLevels {
+                blocking: 1,
+                detection: 1,
+            },
         )
         .expect("compile");
         let set = &compiled.body_bytes.as_ref().unwrap().set;
@@ -1477,7 +1713,11 @@ mod tests {
             &HashMap::new(),
             None,
             &HashMap::new(),
-            1,
+            &HashMap::new(),
+            ParanoiaLevels {
+                blocking: 1,
+                detection: 1,
+            },
         )
         .expect("compile");
         assert!(compiled.method.as_ref().unwrap().set.is_match("PROPFIND"));
@@ -1512,7 +1752,11 @@ mod tests {
             &modes,
             None,
             &HashMap::new(),
-            1,
+            &HashMap::new(),
+            ParanoiaLevels {
+                blocking: 1,
+                detection: 1,
+            },
         )
         .unwrap_err();
         assert!(err.contains("unknown rule id"));
@@ -1548,7 +1792,11 @@ mod tests {
             &modes,
             None,
             &HashMap::new(),
-            1,
+            &HashMap::new(),
+            ParanoiaLevels {
+                blocking: 1,
+                detection: 1,
+            },
         )
         .expect("compile");
         assert!(compiled.method.as_ref().unwrap().set.is_match("PROPFIND"));
@@ -1591,7 +1839,11 @@ mod tests {
             &HashMap::new(),
             Some(RuleAction::Enforce),
             &HashMap::new(),
-            1,
+            &HashMap::new(),
+            ParanoiaLevels {
+                blocking: 1,
+                detection: 1,
+            },
         )
         .expect("compile");
         assert_eq!(compiled.rules[0].id, "CORE-001");
@@ -1607,7 +1859,11 @@ mod tests {
             &modes,
             Some(RuleAction::Enforce),
             &HashMap::new(),
-            1,
+            &HashMap::new(),
+            ParanoiaLevels {
+                blocking: 1,
+                detection: 1,
+            },
         )
         .expect("compile");
         assert_eq!(compiled.rules[1].action, RuleAction::Enforce);
@@ -1620,7 +1876,11 @@ mod tests {
             &modes,
             Some(RuleAction::Disabled),
             &HashMap::new(),
-            1,
+            &HashMap::new(),
+            ParanoiaLevels {
+                blocking: 1,
+                detection: 1,
+            },
         )
         .expect("compile");
         assert_eq!(compiled.rules.len(), 1);
