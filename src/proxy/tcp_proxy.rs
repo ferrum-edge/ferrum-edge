@@ -932,6 +932,42 @@ where
     .await
 }
 
+/// First-failure message the relay watchdogs record when the idle window
+/// expires. The failure is side-less: `(Unknown, ReadWriteTimeout, None)`.
+/// Shared by every emission site and [`relay_failure_is_idle_expiry`], so the
+/// idle window stays distinguishable from the half-close cap, which records
+/// the same side-less tuple.
+#[doc(hidden)]
+pub const STREAM_RELAY_IDLE_TIMEOUT_MESSAGE: &str = "idle timeout";
+
+/// First-failure message the userspace relay records when the half-close cap
+/// (`FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS`) expires. Side-less like the idle
+/// window, but measured from the half-close regardless of activity, so it can
+/// cut a direction that is still streaming.
+#[doc(hidden)]
+pub const STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE: &str = "tcp half-close max wait exceeded";
+
+/// Whether a relay's first failure is its idle window expiring: nothing moved
+/// in either direction for the whole window, so the relay ended on a quiet
+/// tunnel rather than cutting a byte stream short. The half-close cap, a
+/// backend read/write deadline, a socket error, and a revocation all return
+/// `false`.
+#[doc(hidden)]
+pub fn relay_failure_is_idle_expiry(failure: &StreamFirstFailure) -> bool {
+    let (direction, class, side, message) = failure;
+    if *direction != Direction::Unknown
+        || side.is_some()
+        || !matches!(class, ErrorClass::ReadWriteTimeout)
+    {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    if message.starts_with(STREAM_SPLICE_IDLE_TIMEOUT_PREFIX) {
+        return true;
+    }
+    message == STREAM_RELAY_IDLE_TIMEOUT_MESSAGE
+}
+
 /// Sentinel prefix used by the Linux splice paths
 /// (`io_uring_splice_direction`, `libc_splice_loop`) to signal that the
 /// idle timer expired. The splice blocking-thread wrappers
@@ -2667,10 +2703,12 @@ async fn run_tcp_accept_loop(
                             return; // close connection immediately
                         }
                         // Parse the PROXY header from the raw TcpStream. The header precedes
-                        // the TLS ClientHello so we read it before any TLS handshake.
-                        match crate::proxy::proxy_protocol::read_proxy_header(
+                        // the TLS ClientHello so we read it before any TLS handshake. The
+                        // TcpStream reader peeks the v1 line and consumes exactly the header.
+                        match crate::proxy::proxy_protocol::read_proxy_header_accepting_tcp(
                             &mut stream,
                             None, // use default 5s safety timeout
+                            crate::proxy::proxy_protocol::AcceptedProxyVersions::Any,
                         )
                         .await
                         {
@@ -8991,7 +9029,7 @@ fn phase1_watchdog_failure(
             Direction::Unknown,
             ErrorClass::ReadWriteTimeout,
             None,
-            "idle timeout".to_string(),
+            STREAM_RELAY_IDLE_TIMEOUT_MESSAGE.to_string(),
         ));
     }
     None
@@ -9679,7 +9717,7 @@ where
                         Direction::Unknown,
                         ErrorClass::ReadWriteTimeout,
                         None,
-                        "idle timeout".to_string(),
+                        STREAM_RELAY_IDLE_TIMEOUT_MESSAGE.to_string(),
                     ));
                 }
                 if let Some(cap) = half_close_cap
@@ -9690,7 +9728,7 @@ where
                         Direction::Unknown,
                         ErrorClass::ReadWriteTimeout,
                         None,
-                        "tcp half-close max wait exceeded".to_string(),
+                        STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE.to_string(),
                     ));
                 }
                 None
@@ -9998,7 +10036,7 @@ async fn bidirectional_splice(
                             Direction::Unknown,
                             ErrorClass::ReadWriteTimeout,
                             None,
-                            "idle timeout".to_string(),
+                            STREAM_RELAY_IDLE_TIMEOUT_MESSAGE.to_string(),
                         ));
                         break;
                     }
@@ -10185,7 +10223,7 @@ where
                             Direction::Unknown,
                             ErrorClass::ReadWriteTimeout,
                             None,
-                            "idle timeout".to_string(),
+                            STREAM_RELAY_IDLE_TIMEOUT_MESSAGE.to_string(),
                         ));
                     }
                 }
@@ -10196,7 +10234,7 @@ where
                         Direction::Unknown,
                         ErrorClass::ReadWriteTimeout,
                         None,
-                        "tcp half-close max wait exceeded".to_string(),
+                        STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE.to_string(),
                     ));
                 }
             }
@@ -10205,7 +10243,7 @@ where
                     Direction::Unknown,
                     ErrorClass::ReadWriteTimeout,
                     None,
-                    "tcp half-close max wait exceeded".to_string(),
+                    STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE.to_string(),
                 ));
             }
         }

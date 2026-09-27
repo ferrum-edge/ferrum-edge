@@ -133,8 +133,8 @@ pub mod ws_message_size_limiting;
 pub mod ws_rate_limiting;
 
 pub use builtin_parity::{
-    BUILTIN_PLUGIN_PARITY_META, BuiltinPluginClassification, BuiltinPluginParityMeta,
-    builtin_plugin_parity_meta,
+    BUILTIN_PLUGIN_PARITY_META, BUILTIN_WEBSOCKET_FRAMING_PLUGINS, BuiltinPluginClassification,
+    BuiltinPluginParityMeta, builtin_plugin_parity_meta,
 };
 pub use utils::PluginHttpClient;
 
@@ -2573,6 +2573,11 @@ pub struct RequestContext {
     /// Latest dispatch outcome, retaining possible execution across retries.
     /// Only trusted transport code may set this; it is not serialized.
     backend_dispatch_state: BackendDispatchState,
+    /// Diagnostic-reference slot of this request (issue #5767). `None` unless
+    /// `FERRUM_DIAGNOSTIC_REFS` enabled the store. Set only by the HTTP
+    /// frontends; the terminal transaction log records the request's detail
+    /// into it. Not visible to plugins and not serialized.
+    diagnostic_slot: Option<Arc<crate::diagnostic_ref::DiagnosticSlot>>,
     /// Whether the gateway selected the health-neutral retained-response
     /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) or its deterministic
     /// JSON output-policy counterpart (`502`) for this request.
@@ -3727,6 +3732,53 @@ impl RequestContext {
         self.backend_dispatch_state
     }
 
+    /// Record one completed backend attempt in the request's diagnostic
+    /// reference detail (issue #5846): once for each attempt the retry loop
+    /// replaces with another, and once for the attempt whose outcome the
+    /// client sees. A no-op when `FERRUM_DIAGNOSTIC_REFS` is off.
+    pub(crate) fn record_backend_attempt(
+        &self,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+        response_status: Option<u16>,
+    ) {
+        if let Some(slot) = self.diagnostic_slot.as_ref() {
+            slot.record_attempt(error_class, request_on_wire, response_status);
+        }
+    }
+
+    /// Whether this request's short-circuit response is an origin-authored
+    /// representation a plugin replayed or relayed rather than a rejection
+    /// the gateway authored: a `response_caching` HIT/REVALIDATED, a
+    /// `request_deduplication` idempotent replay, an `ai_semantic_cache` hit,
+    /// or a `serverless_function` terminate reply. Such a response never
+    /// carries a diagnostic reference (issue #5846), whatever its status.
+    pub(crate) fn serves_origin_representation(&self) -> bool {
+        self.finalized_response_replay
+            || self.semantic_cache_response_replay
+            || self.serverless_terminate_response
+            || self.serverless_grpc_terminate_frame.is_some()
+    }
+
+    /// Phase of the matched route rule's total request deadline that produced
+    /// this request's gateway-authored `504`, when one did.
+    pub(crate) fn route_request_timeout_phase(&self) -> Option<&'static str> {
+        self.route_request_timeout_phase
+    }
+
+    /// This request's diagnostic-reference slot (issue #5767).
+    pub(crate) fn diagnostic_slot(&self) -> Option<&Arc<crate::diagnostic_ref::DiagnosticSlot>> {
+        self.diagnostic_slot.as_ref()
+    }
+
+    /// Attach the frontend's diagnostic-reference slot (issue #5767).
+    pub(crate) fn set_diagnostic_slot(
+        &mut self,
+        slot: Option<Arc<crate::diagnostic_ref::DiagnosticSlot>>,
+    ) {
+        self.diagnostic_slot = slot;
+    }
+
     /// Carry a final-request-body hook context's plugin state back onto the
     /// live request context.
     ///
@@ -3879,6 +3931,7 @@ impl RequestContext {
             charged_backend_deadline_terminal: false,
             route_request_timeout_phase: None,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
+            diagnostic_slot: None,
             gateway_capacity_response_selected: false,
             gateway_representation_response_selected: false,
             final_body_policy_terminal_replacement: false,
@@ -5368,6 +5421,7 @@ impl RequestContext {
             charged_backend_deadline_terminal: self.charged_backend_deadline_terminal,
             route_request_timeout_phase: self.route_request_timeout_phase,
             backend_dispatch_state: self.backend_dispatch_state,
+            diagnostic_slot: self.diagnostic_slot.clone(),
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,
             final_body_policy_terminal_replacement: self.final_body_policy_terminal_replacement,
@@ -8867,6 +8921,15 @@ pub async fn log_with_mirror(
         }
     }
     let summary = stamped.as_deref().unwrap_or(summary);
+    // Gateway diagnostic reference (issue #5767): the terminal summary is the
+    // authoritative description of the client-visible outcome, so it is the
+    // detail a reference minted for this response resolves to. The first record
+    // wins: a detached delivery already recorded it before spawning.
+    if let Some(slot) = ctx.diagnostic_slot()
+        && slot.detail().is_none()
+    {
+        crate::diagnostic_ref::record_request_detail(slot, summary, ctx);
+    }
     let precompute_mesh_key = plugins
         .iter()
         .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
@@ -8976,6 +9039,13 @@ pub fn spawn_bounded_terminal_summary_log(
     summary: TransactionSummary,
     ctx: &RequestContext,
 ) {
+    // Gateway diagnostic reference (issue #5767): record the detail on the
+    // request task, before admission, so a delivery refused by
+    // `FERRUM_LOG_DELIVERY_MAX_TASKS` cannot leave the client's reference
+    // without its detail. The spawned `log_with_mirror` then finds it set.
+    if let Some(slot) = ctx.diagnostic_slot() {
+        crate::diagnostic_ref::record_request_detail(slot, &summary, ctx);
+    }
     let plugins = plugins.to_vec();
     let ctx = ctx.clone();
     let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
@@ -10311,6 +10381,18 @@ pub trait Plugin: Send + Sync {
     /// Ordinary body transforms that only need to affect the backend-visible
     /// bytes should keep using `transform_request_body` instead.
     fn normalizes_buffered_request_body_before_before_proxy(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when every `Reject`/`RejectBinary` this plugin returns
+    /// is an origin-authored representation (a cached backend response, a
+    /// federated provider response) rather than a rejection of its own.
+    ///
+    /// Gateway diagnostic references (issue #5846) never mark such a response
+    /// as a gateway rejection, whatever its status. Plugins whose short-circuit
+    /// is origin content only on some paths mark the request instead
+    /// (`RequestContext::serves_origin_representation`).
+    fn rejects_with_origin_response(&self) -> bool {
         false
     }
 

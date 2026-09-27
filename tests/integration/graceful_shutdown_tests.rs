@@ -95,6 +95,7 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -633,6 +634,7 @@ async fn http3_listener_shutdown_with_no_connections_returns_promptly() {
                 client_crls: Arc::new(Vec::new()),
                 started_tx: None,
                 frontend_tls_reload: None,
+                udp_port_hold: None,
             },
         )
         .await;
@@ -694,6 +696,7 @@ async fn http3_listener_shutdown_with_zero_drain_returns_immediately() {
                 client_crls: Arc::new(Vec::new()),
                 started_tx: None,
                 frontend_tls_reload: None,
+                udp_port_hold: None,
             },
         )
         .await;

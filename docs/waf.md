@@ -685,10 +685,12 @@ exists, and none is needed:
   runs. Physical fragments are metered separately, and a message that never
   completes is bounded by `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
   `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`, which close both peers.
-- `permessage-deflate` is never negotiated end to end: the client's
-  `Sec-WebSocket-Extensions` offer is stripped before the backend handshake and
-  no negotiated extension is echoed back to the client. Payloads reaching the
-  WAF are therefore always uncompressed.
+- `permessage-deflate` is never negotiated end to end on a route the WAF
+  protects: the client's `Sec-WebSocket-Extensions` offer is stripped before the
+  backend handshake and no negotiated extension is echoed back to the client.
+  Payloads reaching the WAF are therefore always uncompressed. Config validation
+  refuses `websocket_permessage_deflate: passthrough` on any proxy where a `waf`
+  instance is effective (directly, through a proxy group, or as a global).
 
 **Fail-closed behavior** mirrors the HTTP body path, with the connection Close
 taking the place of an HTTP rejection response:

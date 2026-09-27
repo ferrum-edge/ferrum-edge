@@ -62,6 +62,7 @@ use crate::config::types::{
     max_credentials_per_type,
 };
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
+use crate::diagnostic_ref::DIAGNOSTICS_READ_SCOPE;
 use crate::grpc::cp_server::DpNodeRegistry;
 use crate::grpc::dp_client::DpCpConnectionState;
 use crate::grpc::mesh_registry::MeshNodeRegistry;
@@ -2670,6 +2671,98 @@ fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bo
         .is_some()
 }
 
+/// Throttles the `diagnostic_ref_lookup` audit event for refused (`403`) and
+/// rate-limited (`429`) attempts; the metric still counts every attempt.
+static DIAGNOSTIC_REF_LOOKUP_AUDIT: crate::diagnostic_ref::DiagnosticRefLookupAudit =
+    crate::diagnostic_ref::DiagnosticRefLookupAudit::new();
+
+/// `GET /diagnostics/v1/refs/{ref}`: resolve a gateway diagnostic reference
+/// (issue #5767).
+///
+/// Every attempt is charged against its JWT `sub`'s share of the lookup rate
+/// limit first (`429` + `Retry-After`), including one then refused for its
+/// credential; only an attempt whose credential passes the scope and `ns`
+/// checks is also charged against the global budget. Requires the
+/// `diagnostics:read` JWT scope and an `ns` claim (`403` otherwise; both
+/// depend only on the credential, never on the reference). A malformed,
+/// unknown, expired, or evicted reference, one minted for a namespace the
+/// token does not name, and every reference while the feature is off all
+/// answer the same `404`, so references cannot be probed.
+/// Every `200`/`404` emits one `audit.event = "diagnostic_ref_lookup"` event at
+/// WARN, visible at the default log level; `403` and `429` events are
+/// throttled to one per second each, carrying how many were suppressed.
+///
+/// `diagnostics_read_granted` comes from the claims the main admin gate
+/// already verified for this request; the token is not verified twice.
+fn diagnostic_ref_lookup_response(
+    auth: &AuditActor,
+    diagnostics_read_granted: bool,
+    reference: &str,
+) -> Response<Full<Bytes>> {
+    use crate::diagnostic_ref::DiagnosticRefLookup;
+
+    let outcome = crate::diagnostic_ref::authorize_lookup(
+        crate::diagnostic_ref::active_store(),
+        &auth.sub,
+        diagnostics_read_granted,
+        &auth.allowed_namespaces,
+        reference,
+        Instant::now(),
+    );
+    // The path segment is caller-controlled: only the fixed reference shape
+    // (prefix plus lowercase hex) is ever echoed into the audit event.
+    let logged_reference = if crate::diagnostic_ref::is_well_formed_ref(reference) {
+        reference
+    } else {
+        "malformed"
+    };
+    let result = outcome.result();
+    let now_ms = crate::socket_opts::monotonic_now_ms();
+    if let Some(suppressed) = DIAGNOSTIC_REF_LOOKUP_AUDIT.admit(result, now_ms) {
+        warn!(
+            audit.event = "diagnostic_ref_lookup",
+            actor = %auth.sub,
+            reference = %logged_reference,
+            result = result.as_str(),
+            suppressed_since_last = suppressed,
+            "Diagnostic reference lookup"
+        );
+    }
+    match outcome {
+        DiagnosticRefLookup::Found(view) => match serde_json::to_value(&*view) {
+            Ok(body) => json_response(StatusCode::OK, &body),
+            Err(_) => json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Diagnostic reference could not be rendered"}),
+            ),
+        },
+        DiagnosticRefLookup::NotFound => json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "Diagnostic reference not found"}),
+        ),
+        DiagnosticRefLookup::MissingScope => json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Diagnostic reference lookups require the `diagnostics:read` \
+                     JWT scope"}),
+        ),
+        DiagnosticRefLookup::MissingNamespaceBinding => json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Diagnostic reference lookups require a namespace-bound admin \
+                     JWT (`ns` claim)"}),
+        ),
+        DiagnosticRefLookup::RateLimited => {
+            let mut response = json_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &json!({"error": "Diagnostic reference lookup rate limit exceeded"}),
+            );
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            response
+        }
+    }
+}
+
 /// `401` response for `/metrics` when the caller is not authorized to scrape.
 /// Advertises the supported credential scheme so well-behaved scrapers can
 /// retry with a token.
@@ -3469,6 +3562,8 @@ async fn handle_admin_request_inner(
         metrics_output.push_str(&crate::notifications::render_delivery_prometheus());
         metrics_output.push_str(&crate::plugins::kafka_logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
+        // Diagnostic reference store (issue #5767); empty while it is off.
+        metrics_output.push_str(&crate::diagnostic_ref::render_prometheus());
         // Data-path families (issue #4156): load shedding, upstream health,
         // circuit-breaker state, backend retries, pool saturation, and frontend
         // TLS admission. Sampled here on the cold scrape path from state the
@@ -3501,10 +3596,14 @@ async fn handle_admin_request_inner(
         return Ok(resp);
     }
 
-    // Authenticate
-    let auth = match state.jwt_manager.verify_request(auth_header.as_deref()) {
+    // Authenticate. The `diagnostics:read` scope is read from the same verified
+    // claims, so the diagnostic reference lookup never re-verifies the token.
+    let (auth, diagnostics_read) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
         Ok(token_data) => match AuditActor::from_claims(&token_data.claims) {
-            Ok(actor) => actor,
+            Ok(actor) => {
+                let diagnostics_read = token_data.claims.grants_scope(DIAGNOSTICS_READ_SCOPE);
+                (actor, diagnostics_read)
+            }
             Err(message) => {
                 return Ok(json_response(
                     StatusCode::UNAUTHORIZED,
@@ -3624,6 +3723,23 @@ async fn handle_admin_request_inner(
             .body(Full::new(Bytes::from(status_output)))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
         return Ok(resp);
+    }
+
+    // Gateway diagnostic reference lookup (issue #5767). Dispatched before the
+    // `X-Ferrum-Namespace` gate on purpose: the header selects nothing here.
+    // The reference's own namespace is checked against the JWT `ns` claim, and
+    // the answer never depends on which namespace the caller asked for.
+    if path.starts_with("/diagnostics/") {
+        let diagnostic_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        if let (Method::GET, ["diagnostics", "v1", "refs", reference]) =
+            (method.clone(), diagnostic_segments.as_slice())
+        {
+            return Ok(diagnostic_ref_lookup_response(
+                &auth,
+                diagnostics_read,
+                reference,
+            ));
+        }
     }
 
     // Extract namespace from X-Ferrum-Namespace header (defaults to "ferrum")

@@ -2646,6 +2646,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         compiled_stream_match: None,
         tcp_idle_timeout_seconds: None,
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
         allowed_methods: None,
         allowed_ws_origins: Vec::new(),
         created_at: now,

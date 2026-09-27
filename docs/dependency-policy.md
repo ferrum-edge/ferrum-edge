@@ -77,6 +77,7 @@ surface drifts.
 | `tokio-tungstenite-004-fragment-accounting-delegator` | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::set_fragment_accounting()` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Same accounting gap on the async wrapper, which hides the codec behind `SplitStream` after `split()` | Upstream ships the equivalent delegator alongside the tungstenite hook | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
 | `dimpl-001-certificate-chain-and-key-zeroization` | `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
 | `hyper-util-001-release-h1-sender-on-dispatch-close` | `hyper-util` | 0.1.21 | Legacy client releases an HTTP/1 connection's only request sender once its dispatcher stops reading, so a request stranded by a close during enqueue fails as unsent | **Deliberate fork** — no upstream PR; upstream issue [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) (hyper-util has issues disabled; filed on hyper, where the stranding dispatcher lives) ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | tokio's unbounded `send` checks for closure and publishes in two steps; a backend RST/FIN on the pooled connection between them strands the request in a channel nobody reads, and hyper-util holds the last sender, so reqwest's `send()` hung until `backend_read_timeout_ms` (504) instead of failing fast (#5714) | A hyper-util release stops holding the only HTTP/1 sender after its dispatcher closes, or a hyper release stops stranding a racing send | [docs/upstream-hyper-util-patches/001-…](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md) |
+| `hyper-001-upgraded-h2-connect-error-reset` | `hyper` | 1.9.0 | `Upgraded::reset_with_connect_error()` resets an upgraded HTTP/2 `CONNECT` stream with `RST_STREAM(CONNECT_ERROR)` in place of the clean `END_STREAM` | **Deliberate fork** — unfiled upstream; issue and PR drafts staged, filing awaits owner approval ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | hyper's upgraded HTTP/2 stream is private and dropping or shutting it down always sends `END_STREAM`, so an HBONE relay that ended on a socket error looked like a normal close to the peer; RFC 9113 §8.5 names `CONNECT_ERROR` for a failed tunnel (#5781). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `hyper` advisories against 1.9.0 manually | A hyper release can reset an upgraded HTTP/2 stream with a chosen error code | [docs/upstream-hyper-patches/001-…](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md) |
 
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/vendored-patch-lifecycle.json`,
 > `docs/upstream-*-patches/`, and the vendored-patch scripts are owned via
@@ -96,10 +97,11 @@ tungstenite #556 / tokio-tungstenite #380); the weekly
 merges. Every other row in the inventory table is marked **Deliberate fork**
 (`upstream.filing: deliberate_fork_unfiled` in the lifecycle JSON), including
 sqlx-core, reqwest 002–004, h3 002–005, both h3-quinn patches, the tungstenite /
-tokio-tungstenite extensions other than lossless takeover, dimpl, and
+tokio-tungstenite extensions other than lossless takeover, dimpl,
 hyper-util (which has upstream issue
 [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) but no
-upstream PR). These are not untracked TODOs; they are carried as
+upstream PR), and hyper (issue and PR drafts staged in its patch docs, not yet
+filed). These are not untracked TODOs; they are carried as
 **deliberate, time-boxed forks** and are governed as follows:
 
 - **Owner.** The dependency-governance owner in
@@ -393,6 +395,16 @@ of the vendor copy and must keep passing after retirement:
   state it leaves behind rather than scheduling it. The `pooled_http1` tests in
   that module run the step `Client::try_send_request` takes after queuing a
   request (`await_pooled_response`) against a real pooled HTTP/1 connection.
+- An HBONE relay that ends on a socket error resets its CONNECT stream with
+  `RST_STREAM(CONNECT_ERROR)`, while a normal close still ends it with
+  `END_STREAM` (issue #5781) — the vendored hyper regressions
+  (`proto::h2::upgrade::ferrum_connect_error_reset_tests`), run with
+  `cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset`,
+  plus the gateway tests in `tests/integration/mesh_hbone_tests.rs`
+  (`hbone_relay_backend_reset_sends_rst_stream_connect_error`,
+  `hbone_relay_backend_close_still_ends_stream_cleanly`,
+  `egress_udp_relay_socket_error_sends_rst_stream_connect_error`,
+  `egress_udp_relay_tunnel_close_still_ends_stream_cleanly`).
 
 CI gates these vendored-patch contracts in the `Vendored Patch Regressions`
 job in `.github/workflows/ci.yml`. Keep that job in sync with this list when
@@ -882,6 +894,6 @@ covers, so it must not be replaced with a prebuilt artifact.
 - `docs/upstream-sqlx-patches/`, `docs/upstream-reqwest-patches/`,
   `docs/upstream-h3-patches/`, `docs/upstream-h3-quinn-patches/`,
   `docs/upstream-tungstenite-patches/`, `docs/upstream-dimpl-patches/`,
-  `docs/upstream-hyper-util-patches/` —
+  `docs/upstream-hyper-util-patches/`, `docs/upstream-hyper-patches/` —
   per-patch detail and retirement plans.
 - `Cargo.toml` `[patch.crates-io]` — the active vendored patches.

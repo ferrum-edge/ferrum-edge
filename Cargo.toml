@@ -678,6 +678,20 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # `vendor/hyper-util-0.1.21-ferrum-patched/`, and update both lockfiles and the
 # drift manifest. See
 # `docs/upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md`.
+#
+# We also carry a vendored copy of hyper 1.9.0 that adds
+# `Upgraded::reset_with_connect_error()`, which resets an upgraded HTTP/2
+# CONNECT stream with `RST_STREAM(CONNECT_ERROR)` (issue #5781). Stock hyper's
+# upgraded HTTP/2 stream is private, and dropping or shutting it down always
+# sends a clean `END_STREAM`, so an HBONE relay that ended on a socket error
+# looked exactly like a normal close to the peer. RFC 9113 section 8.5 names
+# `CONNECT_ERROR` as the signal for a tunnel whose connection failed.
+#
+# Retirement plan: when a hyper release can reset an upgraded HTTP/2 stream
+# with a chosen error code, remove the `hyper` line below, drop
+# `vendor/hyper-1.9.0-ferrum-patched/`, move the HBONE relays to the upstream
+# API, and update the three lockfiles and the drift manifest. See
+# `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md`.
 [patch.crates-io]
 sqlx-core = { path = "vendor/sqlx-core-0.8.6-ferrum-patched" }
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
@@ -687,3 +701,4 @@ tungstenite = { path = "vendor/tungstenite-0.29.0-ferrum-patched" }
 tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
 dimpl = { path = "vendor/dimpl-0.6.1-ferrum-patched" }
 hyper-util = { path = "vendor/hyper-util-0.1.21-ferrum-patched" }
+hyper = { path = "vendor/hyper-1.9.0-ferrum-patched" }

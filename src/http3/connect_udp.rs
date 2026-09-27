@@ -2364,6 +2364,7 @@ pub(crate) async fn handle_h3_connect_udp(
     let response_header_write_bound =
         crate::proxy::auth_lifetime::ComposedAuthBound::compose(None, auth_deadline);
     let auth_latch = ctx.authorization_termination_latch();
+    let response = crate::diagnostic_ref::stamp_h3_response(response);
     let header_write = crate::http3::stream_util::await_authorized_headers_write(
         response_header_write_bound,
         crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,

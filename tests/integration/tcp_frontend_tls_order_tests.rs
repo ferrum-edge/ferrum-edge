@@ -113,6 +113,7 @@ fn tcp_tls_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[Strin
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(0),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,

@@ -35,6 +35,7 @@ A feature-by-feature summary of Ferrum Edge. Each item links to, or is detailed 
 - Configurable path stripping and backend path prefixing
 - Per-proxy HTTP method filtering (`allowed_methods`) with 405 Method Not Allowed responses and terminal transaction logging (`rejection_phase: allowed_methods`)
 - Per-proxy WebSocket Origin validation (`allowed_ws_origins`) for CSWSH protection (RFC 6455 §10.2)
+- Opt-in per-proxy WebSocket `permessage-deflate` passthrough (`websocket_permessage_deflate: passthrough`, RFC 7692) on H1/H2/H3, refused on proxies with WebSocket frame-inspecting plugins
 
 ## Load Balancing
 

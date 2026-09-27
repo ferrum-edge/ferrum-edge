@@ -148,7 +148,13 @@ sustained.
   recovery counters once each, and the active gauge returns to `0` once the
   half is live again. On the `quic` half only the HTTP/3 listener is reaped and
   retried, so HTTP/1.1 and HTTP/2 keep serving that port and its routes stay
-  admitted.
+  admitted. The QUIC rebind retries `Address already in use` while the dead
+  endpoint, or a UDP/DTLS stream proxy handing the port back, releases its UDP
+  socket, so that brief release is not reported as `bind_failed`. Each pass
+  has two independent 2-second budgets for this: one for sockets Ferrum's UDP
+  port ledger shows held or just closed, started by the first such collision,
+  and one from the start of the pass for retired QUIC halves the ledger has no
+  entry for. One pass can therefore wait up to about 4 seconds in total.
 - `class_flip_deferred` means a frontend TLS-class change is waiting for the
   previous accept sockets to close; `retirement_pending` is the same fail-closed
   wait for another bind-identity change.
@@ -476,6 +482,10 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_destination_active_requests` | gauge | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Active upstream requests currently holding a DestinationRule http2MaxRequests permit. |
 | `ferrum_destination_active_requests_admitted_total` | counter | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Upstream requests admitted through the DestinationRule http2MaxRequests breaker. |
 | `ferrum_destination_active_requests_rejected_total` | counter | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Upstream requests shed because their destination was at its http2MaxRequests ceiling. |
+| `ferrum_diagnostic_ref_lookups_total` | counter | `result` | `diagnostic_refs` | `documented_only` | `conditional` | Authenticated admin diagnostic reference lookups, by bounded result. |
+| `ferrum_diagnostic_refs_entries` | gauge | — | `diagnostic_refs` | `documented_only` | `conditional` | Diagnostic references currently retained in the bounded in-memory store. |
+| `ferrum_diagnostic_refs_evicted_total` | counter | `reason` | `diagnostic_refs` | `documented_only` | `conditional` | Diagnostic references removed from the store before lookup, by bounded reason. |
+| `ferrum_diagnostic_refs_minted_total` | counter | — | `diagnostic_refs` | `documented_only` | `conditional` | Diagnostic references minted on gateway-authored error responses. |
 | `ferrum_dp_config_cp_connected` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP currently has a ConfigSync stream to some control plane (1) or none (0). |
 | `ferrum_dp_config_max_stale_seconds` | gauge | `namespace` | `dp_config` | `dashboard` | `conditional` | Configured maximum applied-snapshot age before the DP degrades readiness (0 = bound disabled). |
 | `ferrum_dp_config_new_traffic_blocked` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP is refusing new HTTP/TCP/UDP-session/DTLS-session admissions because its configuration is stale (1) or not (0). |
