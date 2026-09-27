@@ -9769,7 +9769,10 @@ components:
             on the HTTP path.
 
             Only valid for tcp / tcp_tls / udp / dtls stream proxies. Setting it on an
-            HTTP-family proxy produces a validation error (use X-Forwarded-For there).
+            HTTP-family proxy produces a validation error: HTTP-family proxies share the
+            global HTTP/HTTPS listeners, which enable inbound PROXY protocol listener-wide
+            with the FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP / FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS
+            environment settings instead.
 
             Default: null / false (disabled; socket peer is always used as client_ip).
         backend_proxy_protocol:

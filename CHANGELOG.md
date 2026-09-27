@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Inbound PROXY protocol on the HTTP/HTTPS proxy listeners** (#5768). The
+  new `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` and
+  `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS` settings (`off` by default, or `v1`,
+  `v2`, `auto`) make the global proxy listener read a PROXY v1/v2 header, so
+  an L4 load balancer such as AWS NLB or HAProxy in TCP mode can pass the
+  client address through TLS it does not terminate. Before, Ferrum answered
+  that header with `400 Bad Request` on HTTP and a TLS `decode_error` alert on
+  HTTPS. When enabled, the header is required. A peer outside the new
+  `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS` list is dropped at accept. A
+  connection without a valid header of the accepted version within 5 seconds
+  is closed before any TLS or HTTP parsing. The header's source address
+  replaces the socket peer for the whole connection, so
+  `FERRUM_TRUSTED_PROXIES` and `X-Forwarded-For` are evaluated against the
+  real client, not the load balancer. HTTP/3, Gateway API listener ports, and
+  mesh listeners are not covered. Startup fails if the trusted list is empty,
+  malformed, or covers a whole address family while a listener enables the
+  setting.
+
 ## [0.9.8] - 2026-09-27
 
 ### Changed

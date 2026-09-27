@@ -5,7 +5,8 @@
 //! `AsyncRead` through the tokio compat layer).
 
 use ferrum_edge::proxy::proxy_protocol::{
-    ProxyProtocolError, ProxyProtocolResult, apply_proxy_result, read_proxy_header,
+    AcceptedProxyVersions, ProxyProtocolError, ProxyProtocolResult, apply_proxy_result,
+    read_proxy_header, read_proxy_header_accepting,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -487,4 +488,51 @@ async fn v1_exact_max_length_accepted() {
         .await
         .expect("should succeed");
     assert!(matches!(result, ProxyProtocolResult::NoAddress));
+}
+
+// ── Version-restricted reads (issue #5768) ────────────────────────────────────
+
+async fn parse_accepting(
+    data: &[u8],
+    accepted: AcceptedProxyVersions,
+) -> (Result<ProxyProtocolResult, ProxyProtocolError>, u64) {
+    let mut cursor = std::io::Cursor::new(data.to_vec());
+    let result = read_proxy_header_accepting(&mut cursor, Some(1), accepted).await;
+    (result, cursor.position())
+}
+
+const V1_TCP4: &[u8] = b"PROXY TCP4 192.168.1.50 192.168.1.1 12345 80\r\n";
+
+#[tokio::test]
+async fn v1_only_accepts_v1_and_refuses_v2() {
+    let (result, _) = parse_accepting(V1_TCP4, AcceptedProxyVersions::V1Only).await;
+    assert!(matches!(result, Ok(ProxyProtocolResult::Forwarded { .. })));
+
+    let v2 = v2_header_tcp4([10, 0, 0, 1], [10, 0, 0, 2], 1000, 443);
+    let (result, consumed) = parse_accepting(&v2, AcceptedProxyVersions::V1Only).await;
+    assert!(matches!(result, Err(ProxyProtocolError::VersionNotAccepted("v2"))));
+    assert_eq!(consumed, 6, "only the signature prefix is read");
+}
+
+#[tokio::test]
+async fn v2_only_accepts_v2_and_refuses_v1() {
+    let v2 = v2_header_tcp4([10, 0, 0, 1], [10, 0, 0, 2], 1000, 443);
+    let (result, _) = parse_accepting(&v2, AcceptedProxyVersions::V2Only).await;
+    assert!(matches!(result, Ok(ProxyProtocolResult::Forwarded { .. })));
+
+    let (result, consumed) = parse_accepting(V1_TCP4, AcceptedProxyVersions::V2Only).await;
+    assert!(matches!(result, Err(ProxyProtocolError::VersionNotAccepted("v1"))));
+    assert_eq!(consumed, 6, "only the signature prefix is read");
+}
+
+#[tokio::test]
+async fn any_accepts_both_versions_and_matches_read_proxy_header() {
+    let v2 = v2_header_tcp4([10, 0, 0, 1], [10, 0, 0, 2], 1000, 443);
+    for header in [V1_TCP4.to_vec(), v2] {
+        let (result, consumed) = parse_accepting(&header, AcceptedProxyVersions::Any).await;
+        assert!(matches!(result, Ok(ProxyProtocolResult::Forwarded { .. })));
+        assert_eq!(consumed, header.len() as u64, "whole header consumed");
+    }
+    let (result, _) = parse_accepting(b"GET / HTTP/1.1\r\n", AcceptedProxyVersions::Any).await;
+    assert!(matches!(result, Err(ProxyProtocolError::InvalidSignature)));
 }

@@ -47,6 +47,7 @@ pub mod deferred_log;
 /// hyper's HTTP/1 `header_read_timeout` cannot see, without closing idle
 /// keep-alive after the first request.
 pub(crate) mod frontend_admission;
+pub mod frontend_proxy_protocol;
 pub mod gateway_listener;
 pub mod gateway_listener_status;
 pub mod grpc_proxy;
@@ -20648,8 +20649,30 @@ pub async fn start_proxy_listener_with_bound_listener(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
-    start_proxy_listener_with_bound_listener_and_mesh_direction(
-        listener, state, shutdown, tls_config, None,
+    run_bound_proxy_listener(listener, state, shutdown, tls_config, None, None).await
+}
+
+/// [`start_proxy_listener_with_bound_listener`] for a process-global HTTP/HTTPS
+/// proxy listener with its inbound PROXY protocol policy (issue #5768).
+///
+/// `None` is exactly [`start_proxy_listener_with_bound_listener`]. `Some`
+/// requires every accepted connection to come from a trusted load balancer and
+/// to begin with an accepted PROXY header, consumed before TLS or HTTP parsing;
+/// see [`frontend_proxy_protocol`].
+pub async fn start_proxy_listener_with_bound_listener_and_proxy_protocol(
+    listener: TcpListener,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    frontend_proxy_protocol: Option<Arc<frontend_proxy_protocol::FrontendProxyProtocol>>,
+) -> Result<(), anyhow::Error> {
+    run_bound_proxy_listener(
+        listener,
+        state,
+        shutdown,
+        tls_config,
+        None,
+        frontend_proxy_protocol,
     )
     .await
 }
@@ -20670,6 +20693,17 @@ pub async fn start_proxy_listener_with_bound_listener_and_mesh_direction(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+) -> Result<(), anyhow::Error> {
+    run_bound_proxy_listener(listener, state, shutdown, tls_config, mesh_direction, None).await
+}
+
+async fn run_bound_proxy_listener(
+    listener: TcpListener,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    frontend_proxy_protocol: Option<Arc<frontend_proxy_protocol::FrontendProxyProtocol>>,
 ) -> Result<(), anyhow::Error> {
     let state = Arc::new(state);
     // Optional connection limit, mirroring the bound-port path. The semaphore
@@ -20703,6 +20737,7 @@ pub async fn start_proxy_listener_with_bound_listener_and_mesh_direction(
         0,
         SourceIpOverride::none(),
         None,
+        frontend_proxy_protocol,
     )
     .await;
     Ok(())
@@ -21031,6 +21066,25 @@ pub async fn start_proxy_listener_with_tls_and_signal(
     tls_config: Option<Arc<rustls::ServerConfig>>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
+    start_global_proxy_listener_with_tls_and_signal(
+        addr, state, shutdown, tls_config, None, started_tx,
+    )
+    .await
+}
+
+/// [`start_proxy_listener_with_tls_and_signal`] for a process-global HTTP/HTTPS
+/// proxy listener with its inbound PROXY protocol policy (issue #5768).
+///
+/// `None` is exactly [`start_proxy_listener_with_tls_and_signal`]; see
+/// [`frontend_proxy_protocol`] for what `Some` enforces.
+pub async fn start_global_proxy_listener_with_tls_and_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    frontend_proxy_protocol: Option<Arc<frontend_proxy_protocol::FrontendProxyProtocol>>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
         addr,
         state,
@@ -21041,6 +21095,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
         },
         None,
         false,
+        frontend_proxy_protocol,
         started_tx,
     )
     .await
@@ -21076,6 +21131,7 @@ pub(crate) async fn start_mesh_plaintext_listener_with_signal(
         },
         mesh_direction,
         dual_stack,
+        None,
         started_tx,
     )
     .await
@@ -21147,6 +21203,25 @@ pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
     tls_slot: crate::tls::SharedFrontendTls,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
+    start_global_proxy_listener_with_dynamic_tls_and_signal(
+        addr, state, shutdown, tls_slot, None, started_tx,
+    )
+    .await
+}
+
+/// [`start_proxy_listener_with_dynamic_tls_and_signal`] for the process-global
+/// HTTPS proxy listener with its inbound PROXY protocol policy (issue #5768).
+///
+/// `None` is exactly [`start_proxy_listener_with_dynamic_tls_and_signal`]; see
+/// [`frontend_proxy_protocol`] for what `Some` enforces.
+pub async fn start_global_proxy_listener_with_dynamic_tls_and_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_slot: crate::tls::SharedFrontendTls,
+    frontend_proxy_protocol: Option<Arc<frontend_proxy_protocol::FrontendProxyProtocol>>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
         addr,
         state,
@@ -21157,6 +21232,7 @@ pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
         },
         None,
         false,
+        frontend_proxy_protocol,
         started_tx,
     )
     .await
@@ -21190,6 +21266,7 @@ pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
         ListenerTlsSource::MeshInbound { allows_plaintext },
         mesh_direction,
         dual_stack,
+        None,
         started_tx,
     )
     .await
@@ -21710,6 +21787,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     tls_source: ListenerTlsSource,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     dual_stack: bool,
+    frontend_proxy_protocol: Option<Arc<frontend_proxy_protocol::FrontendProxyProtocol>>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
@@ -21788,6 +21866,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
             let shutdown_rx = shutdown.clone();
+            let frontend_proxy_protocol = frontend_proxy_protocol.clone();
 
             handles.push(tokio::spawn(async move {
                 run_accept_loop(
@@ -21800,6 +21879,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
                     i,
                     SourceIpOverride::none(),
                     None,
+                    frontend_proxy_protocol,
                 )
                 .await;
             }));
@@ -21824,6 +21904,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             0,
             SourceIpOverride::none(),
             None,
+            frontend_proxy_protocol,
         )
         .await;
 
@@ -21848,6 +21929,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             0,
             SourceIpOverride::none(),
             None,
+            frontend_proxy_protocol,
         )
         .await;
     }
@@ -21947,6 +22029,10 @@ async fn run_accept_loop(
     // pod instead of loopback.
     source_ip_override: SourceIpOverride,
     node_waypoint_expected_pod_uid: Option<[u8; 16]>,
+    // Inbound PROXY protocol policy (issue #5768). `Some` only on a
+    // process-global HTTP/HTTPS proxy listener that opted in; every other
+    // listener passes `None` and pays nothing for it.
+    frontend_proxy_protocol: Option<Arc<frontend_proxy_protocol::FrontendProxyProtocol>>,
 ) {
     let frontend_bound_addr = listener.local_addr().ok();
     let frontend_listen_port = frontend_bound_addr.map(|addr| addr.port());
@@ -21991,6 +22077,19 @@ async fn run_accept_loop(
                             drop(stream); // TCP RST
                             continue;
                         }
+                        // Inbound PROXY protocol (issue #5768): an enabled
+                        // listener admits only its trusted load balancers, so a
+                        // direct-connect peer is dropped here — before a permit,
+                        // a task, or a single read. Disabled listeners carry
+                        // `None` and skip this entirely.
+                        let frontend_proxy_protocol = match frontend_proxy_protocol.as_ref() {
+                            Some(policy) if !policy.trusts(&remote_addr.ip()) => {
+                                policy.log_untrusted_peer(&remote_addr);
+                                drop(stream);
+                                continue;
+                            }
+                            policy => policy.cloned(),
+                        };
                         // Acquire connection permit before spawning. This avoids
                         // creating tasks that queue on the semaphore under floods —
                         // over-limit connections are dropped immediately with zero
@@ -22189,6 +22288,25 @@ async fn run_accept_loop(
                             // Track this connection for graceful drain.
                             // The guard decrements the counter on drop (all exit paths).
                             let _conn_guard = crate::overload::ConnectionGuard::new(&state.overload);
+
+                            // Consume the PROXY header before TLS or HTTP
+                            // parsing (issue #5768). Its source address replaces
+                            // the socket peer for the whole connection, so
+                            // `FERRUM_TRUSTED_PROXIES` / X-Forwarded-For are then
+                            // evaluated against the real client, never the load
+                            // balancer. Any failure closes without a response.
+                            let mut stream = stream;
+                            let remote_addr = if let Some(policy) = frontend_proxy_protocol {
+                                match policy.read_client_addr(&mut stream, remote_addr).await {
+                                    Ok(client_addr) => client_addr,
+                                    Err(error) => {
+                                        policy.log_invalid_header(&remote_addr, &error);
+                                        return;
+                                    }
+                                }
+                            } else {
+                                remote_addr
+                            };
 
                             // PeerAuthentication PERMISSIVE, and direct dials
                             // spanning TLS plus DISABLE app-port modes, must
