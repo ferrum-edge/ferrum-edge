@@ -1,6 +1,7 @@
 //! Hosted socket regressions for recovery, TLS names, and retry policy lanes.
 use super::*;
 use ferrum_edge::config::types::{BackoffStrategy, ResolvedPortOverride, RetryConfig, Upstream};
+use ferrum_edge::proxy::stream_listener::UdpListenerTaskHold;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
 
@@ -579,5 +580,80 @@ async fn healthy_stream_listener_keeps_serving_across_supervisor_tick() {
     assert_eq!(byte, *b"b");
     drop(client);
     drop(socket);
+    manager.shutdown_all().await;
+}
+
+/// Issue #5855: a UDP listener task binds its socket after the pass that
+/// spawned it published its failures and checked the QUIC release log, and it
+/// rides out a handoff with a budget of its own. A QUIC socket that closes only
+/// after that budget ran out can land between the task's last bind attempt and
+/// its failure report, and the supervisor then judges that release against
+/// failures that do not include this port yet and skips it. The task must wake
+/// the supervisor itself when it reports a failure on a port released since it
+/// was spawned, or the port waits for the 30-second tick.
+///
+/// Fences in the task hand the port to the stand-in QUIC half before its bind
+/// and put the release inside that window. The supervisor starts only after
+/// the release, so it never sees the release itself, exactly as if it had
+/// already judged and skipped it: only the task's own wakeup can retry the
+/// port before the tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_before_a_udp_listener_task_reports_its_bind_failure_wakes_the_supervisor() {
+    let port = ports::unbound_udp_port().await.expect("reserve a UDP port");
+    let manager = Arc::new(create_manager(GatewayConfig {
+        proxies: vec![create_stream_proxy(
+            "udp-late-task-failure",
+            BackendScheme::Udp,
+            port,
+        )],
+        ..empty_config()
+    }));
+    let before_bind = UdpListenerTaskHold::new();
+    let before_failure_report = UdpListenerTaskHold::new();
+    manager.set_udp_listener_task_holds_for_test(
+        Some(Arc::clone(&before_bind)),
+        Some(Arc::clone(&before_failure_report)),
+    );
+
+    // The pass probes a free port, spawns the listener task and publishes no
+    // failure, so its own release check has nothing to find. The task took its
+    // fences when it was spawned; clear them so the retry is not held.
+    assert!(manager.reconcile().await.is_empty());
+    manager.set_udp_listener_task_holds_for_test(None, None);
+
+    // A Gateway QUIC half takes the port before the task binds.
+    before_bind.wait_entered().await;
+    let occupied = std::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], port)))
+        .expect("the QUIC stand-in takes the port");
+    let ledger = Arc::clone(manager.udp_port_handoff());
+    let quic_hold = ledger.hold(port, UdpPortOwner::GatewayQuic);
+    quic_hold.arm();
+    before_bind.wait_release().await;
+
+    // The task's bind retries the handoff until its own budget runs out and
+    // fails; the QUIC socket closes before that failure is reported.
+    before_failure_report.wait_entered().await;
+    assert!(
+        ledger.handoff_retries() >= 1,
+        "the task's bind must have collided with the QUIC half and retried"
+    );
+    drop(occupied);
+    drop(quic_hold);
+    manager.start_supervisor();
+    before_failure_report.wait_release().await;
+
+    manager
+        .wait_until_started(Duration::from_secs(10))
+        .await
+        .expect("the task's failure report must wake the supervisor to retry the released port");
+    assert!(
+        manager
+            .stream_bind_failures()
+            .iter()
+            .all(|failure| failure.listen_port != port),
+        "{:?}",
+        manager.stream_bind_failures()
+    );
+
     manager.shutdown_all().await;
 }

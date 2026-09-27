@@ -83,12 +83,15 @@
 //!
 //! `FERRUM_WEBSOCKET_TUNNEL_MODE` does not apply to H3 — there is no raw
 //! TCP underneath QUIC, and the H3-side bytes already pass through the
-//! pump tasks regardless. This module always passes
-//! `websocket_tunnel_mode = false` to `run_websocket_proxy`. Operators
-//! who enabled tunnel mode for H1/H2 throughput get H3 frame-parsing
-//! semantics automatically — frame-level plugins (`on_ws_frame`,
-//! `ws_rate_limit`, `ws_message_size_limiting`, `ws_frame_logging`) work
-//! on H3 sessions whether or not tunnel mode is set globally.
+//! pump tasks regardless. Operators who enabled tunnel mode for H1/H2
+//! throughput get H3 frame-parsing semantics automatically — frame-level
+//! plugins (`on_ws_frame`, `ws_rate_limit`, `ws_message_size_limiting`,
+//! `ws_frame_logging`) work on H3 sessions whether or not tunnel mode is set
+//! globally. The one exception is a `websocket_permessage_deflate:
+//! passthrough` session that actually negotiated the extension (issue #5769):
+//! its RSV1-compressed frames cannot pass the frame parser, so it is relayed
+//! as raw bytes between the duplex half and the backend. The offer is only
+//! forwarded when no plugin on the chain requires the parsed relay.
 //!
 //! ## Circuit breaker + load balancer accounting
 //!
@@ -262,7 +265,8 @@ fn collect_forwardable_h3_headers(
         // The WebSocket bridge cannot encode/decode permessage-deflate, so the
         // client's extension offer must not reach the backend (it would set
         // rsv1 and the session would be torn down). Mirrors the H1/H2 strip in
-        // proxy::is_websocket_backend_strip_header.
+        // proxy::is_websocket_backend_strip_header. A passthrough proxy re-adds
+        // only the permessage-deflate elements (issue #5769).
         "sec-websocket-extensions",
         "host",
         "transfer-encoding",
@@ -729,6 +733,13 @@ pub(crate) async fn handle_h3_websocket(
     crate::modes::mesh::hbone::strip_egress_baggage_in_vec(
         &mut client_headers,
         &state.mesh_egress_strip_baggage_keys,
+    );
+    // RFC 7692 passthrough (issue #5769), the same shared gate as H1/H2.
+    let ws_deflate_offered = crate::proxy::forward_permessage_deflate_offer(
+        proxy.websocket_permessage_deflate,
+        requires_websocket_framing,
+        &mut client_headers,
+        &proxy_headers,
     );
 
     // ── Backend WebSocket handshake (reuses H1.1 Upgrade path) ──────
@@ -1413,6 +1424,17 @@ pub(crate) async fn handle_h3_websocket(
     if let Some(proto) = backend_handshake.negotiated_subprotocol().cloned() {
         response_builder = response_builder.header("sec-websocket-protocol", proto);
     }
+    // Forward the backend's permessage-deflate answer only when this upgrade
+    // offered it; a negotiated session is relayed as raw bytes below.
+    let ws_negotiated_deflate = if ws_deflate_offered {
+        backend_handshake.negotiated_permessage_deflate().cloned()
+    } else {
+        None
+    };
+    let ws_tunnel = ws_negotiated_deflate.is_some();
+    if let Some(extensions) = ws_negotiated_deflate {
+        response_builder = response_builder.header("sec-websocket-extensions", extensions);
+    }
     let response = match response_builder.body(()) {
         Ok(r) => r,
         Err(e) => {
@@ -1588,11 +1610,16 @@ pub(crate) async fn handle_h3_websocket(
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
     let adaptive_buf = state.adaptive_buffer.clone();
+    let tunnel_safety_cap = crate::proxy::websocket_tunnel_idle_disabled_safety_cap(
+        state.env_config.tcp_half_close_max_wait_seconds,
+    );
 
     // ── Run the shared frame-relay code (same as H1/H2) ─────────────
     //
-    // tunnel mode is forced off — QUIC ≠ TCP, there is no raw socket to
-    // splice. The same shared `run_websocket_proxy` handles per-frame
+    // tunnel mode is off unless a passthrough session negotiated
+    // permessage-deflate — QUIC ≠ TCP, there is no raw socket to splice,
+    // but the duplex half carries the same frame bytes. The same shared
+    // `run_websocket_proxy` handles per-frame
     // plugins, cancellation, and on_ws_disconnect bookkeeping. Dispatch
     // on Direct vs Mesh so both backend transports share one relay
     // (issue #3620). The client-trust session is the same transport-owned
@@ -1613,8 +1640,8 @@ pub(crate) async fn handle_h3_websocket(
                 ws_connection_permit,
                 max_ws_frame,
                 ws_write_buf,
-                false, // H3 always frame-parses; tunnel mode is H1-only
-                crate::proxy::WS_DRAIN_GRACE,
+                ws_tunnel,
+                tunnel_safety_cap,
                 ws_idle_tracker,
                 ws_session_deadline,
                 ws_shutdown_rx.clone(),
@@ -1639,8 +1666,8 @@ pub(crate) async fn handle_h3_websocket(
                 ws_connection_permit,
                 max_ws_frame,
                 ws_write_buf,
-                false,
-                crate::proxy::WS_DRAIN_GRACE,
+                ws_tunnel,
+                tunnel_safety_cap,
                 ws_idle_tracker,
                 ws_session_deadline,
                 ws_shutdown_rx.clone(),

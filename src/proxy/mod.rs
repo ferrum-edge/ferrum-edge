@@ -167,6 +167,7 @@ pub mod tcp_proxy;
 pub mod udp_batch;
 pub mod udp_placement_cleanup;
 pub mod udp_placement_migration;
+pub mod udp_port_handoff;
 pub mod udp_proxy;
 pub mod unix_backend;
 pub mod unix_backend_pool;
@@ -4429,6 +4430,7 @@ pub(crate) async fn apply_buffered_request_body_normalization_before_before_prox
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.as_ref());
                 return reject;
             }
         }
@@ -4495,6 +4497,7 @@ pub(crate) async fn apply_client_request_contract_validation(
         match result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.as_ref());
                 return reject;
             }
         }
@@ -6347,6 +6350,9 @@ async fn run_final_request_body_hook_chain(
             | crate::plugins::RequestPluginDeadlineResult::Completed(
                 reject @ PluginResult::RejectBinary { .. },
             ) => {
+                if let Some(ctx) = ctx.as_deref() {
+                    crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.as_ref());
+                }
                 return crate::plugins::RequestPluginDeadlineResult::Completed(reject);
             }
             crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded => {
@@ -15173,6 +15179,15 @@ async fn handle_websocket_request_authenticated(
         &state.mesh_egress_strip_baggage_keys,
     );
 
+    // RFC 7692 passthrough (issue #5769). Default `strip` proxies
+    // short-circuit inside the shared gate.
+    let ws_deflate_offered = forward_permessage_deflate_offer(
+        proxy.websocket_permessage_deflate,
+        requires_websocket_framing,
+        &mut client_headers,
+        &proxy_headers,
+    );
+
     // Connect to backend BEFORE sending 101 to client.
     // If the backend is unreachable, we return 502 instead of a premature 101.
     // Supports retry with upstream target rotation for connection failures.
@@ -16167,6 +16182,17 @@ async fn handle_websocket_request_authenticated(
     if let Some(proto) = backend_handshake.negotiated_subprotocol().cloned() {
         ws_resp_builder = ws_resp_builder.header("sec-websocket-protocol", proto);
     }
+    // Forward the backend's permessage-deflate answer only when this upgrade
+    // offered it. Same post-policy placement as the subprotocol.
+    let ws_negotiated_deflate = if ws_deflate_offered {
+        backend_handshake.negotiated_permessage_deflate().cloned()
+    } else {
+        None
+    };
+    let ws_deflate_negotiated = ws_negotiated_deflate.is_some();
+    if let Some(extensions) = ws_negotiated_deflate {
+        ws_resp_builder = ws_resp_builder.header("sec-websocket-extensions", extensions);
+    }
 
     let upgrade_response = ws_resp_builder
         .body(ProxyBody::empty())
@@ -16194,7 +16220,10 @@ async fn handle_websocket_request_authenticated(
     let ws_conn_id = state.ws_connection_counter.fetch_add(1, Ordering::Relaxed);
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
-    let ws_tunnel = state.websocket_tunnel_mode;
+    // A negotiated permessage-deflate session carries RSV1-compressed frames
+    // the parsed relay would reject, so it always uses the raw relay. The
+    // offer was only forwarded with no framing plugin on the chain.
+    let ws_tunnel = state.websocket_tunnel_mode || ws_deflate_negotiated;
     let ws_tunnel_idle_disabled_safety_cap =
         websocket_tunnel_idle_disabled_safety_cap(state.env_config.tcp_half_close_max_wait_seconds);
     let ws_fragment_policy = WsFragmentPolicy::from_env(&state.env_config);
@@ -16621,10 +16650,135 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             // not reach the backend: a deflate-capable backend would accept it,
             // set rsv1 on data frames, and the bridge would tear the session
             // down with a protocol error. Strip the offer so no extension is
-            // ever negotiated end to end.
+            // ever negotiated end to end. A `websocket_permessage_deflate:
+            // passthrough` proxy re-adds only the permessage-deflate elements
+            // through `forward_permessage_deflate_offer` (issue #5769).
             | "sec-websocket-extensions"
             | "x-geo-country"
         )
+}
+
+/// The only WebSocket extension a `websocket_permessage_deflate: passthrough`
+/// proxy negotiates end to end (RFC 7692).
+const PERMESSAGE_DEFLATE_EXTENSION: &str = "permessage-deflate";
+
+/// Keep only the `permessage-deflate` elements of a `Sec-WebSocket-Extensions`
+/// value (RFC 6455 §9.1 `extension-list`).
+///
+/// Each kept element is passed through byte-for-byte apart from surrounding
+/// whitespace, so offer parameters and the backend's negotiated parameters
+/// reach the other side unchanged. Every other extension token is dropped, and
+/// empty list elements are ignored (RFC 9110 §5.6.1). Returns `None` when no
+/// `permessage-deflate` element remains or the value is malformed (an
+/// unterminated quoted-string), so a garbled offer or answer fails closed to
+/// "no extension" — today's default.
+pub fn retain_permessage_deflate_extensions(value: &str) -> Option<String> {
+    let mut kept = String::new();
+    let mut element_start = 0usize;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    fn keep_element(element: &str, kept: &mut String) {
+        let element = element.trim();
+        let name = element.split(';').next().unwrap_or_default().trim();
+        if name.eq_ignore_ascii_case(PERMESSAGE_DEFLATE_EXTENSION) {
+            if !kept.is_empty() {
+                kept.push_str(", ");
+            }
+            kept.push_str(element);
+        }
+    }
+    for (index, byte) in value.bytes().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_quotes = true,
+            b',' => {
+                keep_element(&value[element_start..index], &mut kept);
+                element_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if in_quotes {
+        return None;
+    }
+    keep_element(&value[element_start..], &mut kept);
+    (!kept.is_empty()).then_some(kept)
+}
+
+/// The RFC 7692 passthrough gate shared by the H1/H2 and HTTP/3 WebSocket
+/// paths (issue #5769): only a `passthrough` proxy whose plugin chain never
+/// needs the parsed relay forwards the client's `permessage-deflate` offer.
+/// `strip` proxies and framing-dependent chains return `false` without
+/// touching `client_headers`. Returns whether an offer was forwarded.
+pub(crate) fn forward_permessage_deflate_offer(
+    mode: crate::config::types::WebSocketPermessageDeflate,
+    requires_websocket_framing: bool,
+    client_headers: &mut Vec<(String, String)>,
+    proxy_headers: &HashMap<String, String>,
+) -> bool {
+    mode.is_passthrough()
+        && !requires_websocket_framing
+        && push_permessage_deflate_offer(client_headers, proxy_headers)
+}
+
+/// Forward the client's `permessage-deflate` offer to the backend handshake of
+/// a `websocket_permessage_deflate: passthrough` proxy (issue #5769).
+///
+/// Reads the plugin-sanitized request headers, so a plugin that removed or
+/// rewrote the offer is honored, and refuses an offer the client nominated as
+/// hop-by-hop through `Connection`. Returns whether an offer was forwarded;
+/// only then may the backend's answer reach the client.
+pub(crate) fn push_permessage_deflate_offer(
+    client_headers: &mut Vec<(String, String)>,
+    proxy_headers: &HashMap<String, String>,
+) -> bool {
+    let Some((_, value)) =
+        proxy_header_entry_case_insensitive(proxy_headers, "sec-websocket-extensions")
+    else {
+        return false;
+    };
+    if headers_mod::parse_connection_listed_from_str_map(proxy_headers)
+        .iter()
+        .any(|listed| listed.eq_ignore_ascii_case("sec-websocket-extensions"))
+    {
+        return false;
+    }
+    let Some(offer) = retain_permessage_deflate_extensions(value) else {
+        return false;
+    };
+    client_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("sec-websocket-extensions"));
+    client_headers.push(("sec-websocket-extensions".to_string(), offer));
+    true
+}
+
+/// The `permessage-deflate` part of a backend handshake answer, or `None`.
+///
+/// Every `Sec-WebSocket-Extensions` field line is considered; a non-visible
+/// ASCII value fails closed. The caller forwards the result only when
+/// [`push_permessage_deflate_offer`] actually offered the extension.
+pub(crate) fn permessage_deflate_answer(
+    headers: &hyper::HeaderMap,
+) -> Option<hyper::header::HeaderValue> {
+    let mut values = headers
+        .get_all(hyper::header::SEC_WEBSOCKET_EXTENSIONS)
+        .iter();
+    let first = values.next()?.to_str().ok()?;
+    let mut joined = first.to_string();
+    for value in values {
+        joined.push_str(", ");
+        joined.push_str(value.to_str().ok()?);
+    }
+    let answer = retain_permessage_deflate_extensions(&joined)?;
+    hyper::header::HeaderValue::from_str(&answer).ok()
 }
 
 fn push_forwardable_header_override(
@@ -17176,9 +17330,12 @@ pub(crate) fn websocket_backend_tls_sni_unsupported(proxy: &Proxy) -> bool {
 /// that offered a subprotocol list see no negotiated value and fail
 /// application-level handshakes.
 ///
-/// `Sec-WebSocket-Extensions` is intentionally NOT forwarded: the bridge
-/// doesn't speak `permessage-deflate` end-to-end, so signalling a negotiated
-/// extension would lead the client to decode raw frames as compressed.
+/// `negotiated_permessage_deflate` carries only the `permessage-deflate` part
+/// of the backend's `Sec-WebSocket-Extensions` answer. The frontend forwards it
+/// solely for a `websocket_permessage_deflate: passthrough` proxy that offered
+/// the extension, and then relays the session as raw bytes: the frame bridge
+/// cannot decode RSV1-compressed frames (issue #5769). Every other path keeps
+/// the extension stripped end to end.
 /// Backend WebSocket transport: TLS (or plain) over the byte-level idle
 /// activity adapter over TCP. The `WsActivityIo` layer sits UNDER the
 /// framer so fragmented-message read progress refreshes the shared idle
@@ -17190,6 +17347,7 @@ pub type BackendWsStream =
 pub(crate) struct BackendWsHandshake {
     pub stream: BackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
 }
 
 /// Backend WebSocket transport for a mesh egress session: the raw WebSocket
@@ -17203,6 +17361,7 @@ type MeshBackendWsStream = WebSocketStream<WsActivityIo<crate::proxy::hbone_pool
 pub(crate) struct MeshBackendWsHandshake {
     pub stream: MeshBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
 }
 
 /// Backend WebSocket transport for a sidecar-ingress Unix-domain backend
@@ -17218,6 +17377,7 @@ type UnixBackendWsStream = WebSocketStream<WsActivityIo<tokio::net::UnixStream>>
 pub(crate) struct UnixBackendWsHandshake {
     pub stream: UnixBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
     conn_lease: unix_backend_pool::UnixWebSocketConnLease,
 }
 
@@ -17243,6 +17403,16 @@ impl WsBackendHandshake {
             Self::Mesh(handshake) => handshake.negotiated_subprotocol.as_ref(),
             #[cfg(unix)]
             Self::Unix(handshake) => handshake.negotiated_subprotocol.as_ref(),
+        }
+    }
+
+    /// The backend's `permessage-deflate` answer (see [`BackendWsHandshake`]).
+    pub(crate) fn negotiated_permessage_deflate(&self) -> Option<&hyper::header::HeaderValue> {
+        match self {
+            Self::Direct(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
+            Self::Mesh(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
+            #[cfg(unix)]
+            Self::Unix(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
         }
     }
 }
@@ -17455,10 +17625,12 @@ pub(crate) async fn connect_websocket_backend(
         .headers()
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
+    let negotiated_permessage_deflate = permessage_deflate_answer(backend_response.headers());
 
     Ok(BackendWsHandshake {
         stream: backend_ws_stream,
         negotiated_subprotocol,
+        negotiated_permessage_deflate,
     })
 }
 
@@ -17624,10 +17796,12 @@ async fn connect_unix_websocket_backend(
         .headers()
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
+    let negotiated_permessage_deflate = permessage_deflate_answer(response.headers());
 
     Ok(UnixBackendWsHandshake {
         stream,
         negotiated_subprotocol,
+        negotiated_permessage_deflate,
         conn_lease,
     })
 }
@@ -17962,6 +18136,7 @@ pub(crate) async fn connect_mesh_websocket_backend(
             Ok(MeshBackendWsHandshake {
                 stream,
                 negotiated_subprotocol: ws_tunnel.negotiated_subprotocol,
+                negotiated_permessage_deflate: ws_tunnel.negotiated_permessage_deflate,
             })
         }
         MeshWsEgress::AmbientHbone => {
@@ -18182,10 +18357,12 @@ pub(crate) async fn connect_mesh_websocket_backend(
                 .headers()
                 .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
                 .cloned();
+            let negotiated_permessage_deflate = permessage_deflate_answer(response.headers());
 
             Ok(MeshBackendWsHandshake {
                 stream,
                 negotiated_subprotocol,
+                negotiated_permessage_deflate,
             })
         }
     }
@@ -19003,7 +19180,9 @@ pub(crate) fn publish_ws_policy_close(
 /// disabled by configuration.
 pub(crate) const WS_DRAIN_GRACE: Duration = Duration::from_secs(30);
 
-fn websocket_tunnel_idle_disabled_safety_cap(tcp_half_close_max_wait_seconds: u64) -> Duration {
+pub(crate) fn websocket_tunnel_idle_disabled_safety_cap(
+    tcp_half_close_max_wait_seconds: u64,
+) -> Duration {
     if tcp_half_close_max_wait_seconds == 0 {
         return WS_DRAIN_GRACE;
     }
@@ -23060,9 +23239,16 @@ async fn log_rejected_request_with_path_and_backend_state(
     request_path_override: Option<&str>,
     include_backend_target: bool,
 ) {
+    // Gateway diagnostic references (issue #5846): every plugin and gateway
+    // rejection passes through here before its response head is written, so
+    // this is where the rejecting phase (and plugin, when its dispatcher noted
+    // one) is recorded with the head's status. In `all` mode that record is
+    // what gives a rejection without `X-Gateway-Error` its reference.
+    crate::diagnostic_ref::record_rejection(ctx, rejection_phase, status_code);
     // With no plugin there is no log consumer, unless a gateway diagnostic
-    // reference (issue #5767) will resolve to this rejection's detail.
-    let diagnostic_detail_wanted = ctx.diagnostic_slot().is_some() && status_code >= 500;
+    // reference (issues #5767, #5846) will resolve to this rejection's detail.
+    let diagnostic_detail_wanted = ctx.diagnostic_slot().is_some()
+        && (status_code >= 500 || crate::diagnostic_ref::gateway_rejections_enabled());
     if plugins.is_empty() && !diagnostic_detail_wanted {
         return;
     }
@@ -29604,6 +29790,11 @@ async fn handle_backend_admission_rejection(
     apply_grpc_reject_metadata(ctx, &reject);
     let grpc_web_response =
         build_grpc_web_reject_response(plugins, ctx, grpc_web_error_content_type, &reject).await;
+    crate::diagnostic_ref::record_admission_rejection(
+        ctx,
+        &rejection.plugin_name,
+        reject.http_status.as_u16(),
+    );
     log_rejected_request_with_path(
         plugins,
         ctx,
@@ -30194,6 +30385,7 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
                 }
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.as_ref());
                 return reject;
             }
         }
@@ -30775,6 +30967,10 @@ pub async fn run_authentication_phase_with_envelope(
             // even when no gateway Consumer record exists.
             let mut last_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
             let mut server_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
+            // Which plugin produced each retained rejection, for the gateway
+            // diagnostic reference detail (issue #5846).
+            let mut last_reject_plugin: Option<&Arc<dyn Plugin>> = None;
+            let mut server_reject_plugin: Option<&Arc<dyn Plugin>> = None;
             for auth_plugin in auth_plugins {
                 if !auth_plugin.authentication_applies(ctx) {
                     continue;
@@ -30808,9 +31004,11 @@ pub async fn run_authentication_phase_with_envelope(
                             if reject.0 >= 500 {
                                 if server_reject.is_none() {
                                     server_reject = Some(reject);
+                                    server_reject_plugin = Some(auth_plugin);
                                 }
                             } else {
                                 last_reject = Some(reject);
+                                last_reject_plugin = Some(auth_plugin);
                             }
                         }
                     }
@@ -30836,6 +31034,9 @@ pub async fn run_authentication_phase_with_envelope(
                 None
             } else {
                 let used_missing_reject = server_reject.is_none() && last_reject.is_none();
+                if let Some(plugin) = server_reject_plugin.or(last_reject_plugin) {
+                    crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.as_ref());
+                }
                 let mut reject = server_reject
                     .or(last_reject)
                     .unwrap_or_else(|| missing_authentication_reject(auth_plugins, ctx));
@@ -30868,6 +31069,7 @@ pub async fn run_authentication_phase_with_envelope(
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
+                            crate::diagnostic_ref::note_rejecting_plugin(ctx, auth_plugin.as_ref());
                             let mut reject = (reject.status_code, reject.body, reject.headers);
                             attach_auth_rejection_set_cookie(ctx, &mut reject.2);
                             return Some(adapt_auth_reject_for_openai_envelope(
@@ -31017,6 +31219,17 @@ async fn handle_proxy_request_on_frontend_port(
     })
 }
 
+/// HTTP status of an admission fence's response head, recorded with the
+/// fence's diagnostic rejection: a gRPC fence answers Trailers-Only `200`
+/// carrying its `grpc-status`.
+fn admission_fence_head_status(is_grpc: bool, status: StatusCode) -> u16 {
+    if is_grpc {
+        StatusCode::OK.as_u16()
+    } else {
+        status.as_u16()
+    }
+}
+
 /// Connection-scoped and process-wide admission fences, then the routed
 /// request pipeline. Only [`handle_proxy_request_on_frontend_port`] calls this.
 #[allow(clippy::too_many_arguments)]
@@ -31049,6 +31262,11 @@ async fn admit_proxy_request_on_frontend_port(
             );
         }
         record_request(&state, 400);
+        crate::diagnostic_ref::record_admission_fence(
+            connection_metadata.diagnostic_slot.as_ref(),
+            "h1_framing_unverified",
+            StatusCode::BAD_REQUEST.as_u16(),
+        );
         let mut response = build_response(StatusCode::BAD_REQUEST, error_body);
         response.headers_mut().insert(
             hyper::header::CONNECTION,
@@ -31075,6 +31293,11 @@ async fn admit_proxy_request_on_frontend_port(
     if crate::dp_config_freshness::new_traffic_blocked() {
         let is_grpc = grpc_proxy::is_grpc_request(&req);
         record_request(&state, 503);
+        crate::diagnostic_ref::record_admission_fence(
+            connection_metadata.diagnostic_slot.as_ref(),
+            "config_stale",
+            admission_fence_head_status(is_grpc, StatusCode::SERVICE_UNAVAILABLE),
+        );
         if is_grpc {
             return Ok(grpc_proxy::build_grpc_error_response(
                 grpc_proxy::grpc_status::UNAVAILABLE,
@@ -31111,6 +31334,11 @@ async fn admit_proxy_request_on_frontend_port(
         session.record_fenced();
         let is_grpc = grpc_proxy::is_grpc_request(&req);
         record_request(&state, 401);
+        crate::diagnostic_ref::record_admission_fence(
+            connection_metadata.diagnostic_slot.as_ref(),
+            "client_trust_withdrawn",
+            admission_fence_head_status(is_grpc, StatusCode::UNAUTHORIZED),
+        );
         if is_grpc {
             return Ok(grpc_proxy::build_grpc_error_response(
                 grpc_proxy::grpc_status::UNAUTHENTICATED,
@@ -31155,6 +31383,11 @@ async fn admit_proxy_request_on_frontend_port(
     {
         let is_grpc = grpc_proxy::is_grpc_request(&req);
         record_request(&state, 503);
+        crate::diagnostic_ref::record_admission_fence(
+            connection_metadata.diagnostic_slot.as_ref(),
+            "overload",
+            admission_fence_head_status(is_grpc, StatusCode::SERVICE_UNAVAILABLE),
+        );
         if is_grpc {
             return Ok(grpc_proxy::build_grpc_error_response(
                 grpc_proxy::grpc_status::UNAVAILABLE,
@@ -32186,6 +32419,12 @@ async fn handle_proxy_request_inner(
                             request_uses_grpc_content_type,
                             grpc_web_response_content_type,
                         );
+                        crate::diagnostic_ref::record_route_miss(
+                            ctx.diagnostic_slot(),
+                            crate::diagnostic_ref::MESH_REGISTRY_ONLY_PHASE,
+                            start_time,
+                            response.status().as_u16(),
+                        );
                         record_status(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -32197,6 +32436,12 @@ async fn handle_proxy_request_inner(
                         &EMPTY_HEADERS,
                         request_uses_grpc_content_type,
                         grpc_web_response_content_type,
+                    );
+                    crate::diagnostic_ref::record_route_miss(
+                        ctx.diagnostic_slot(),
+                        crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE,
+                        start_time,
+                        response.status().as_u16(),
                     );
                     record_status(&state, response.status().as_u16());
                     return Ok(response);
@@ -32493,6 +32738,7 @@ async fn handle_proxy_request_inner(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
+                    crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
                     let plugin_reject = plugin_result_into_reject_parts(reject)
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
@@ -32915,6 +33161,7 @@ async fn handle_proxy_request_inner(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
+                    crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
                     let plugin_reject = plugin_result_into_reject_parts(reject)
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
@@ -35920,6 +36167,12 @@ async fn handle_proxy_request_inner(
         let grpc_method = hyper::Method::POST; // gRPC always uses POST
         let grpc_req_headers = grpc_replay_headers;
 
+        // Diagnostic reference detail (issue #5846): set once the retry loop
+        // has recorded the attempt behind `grpc_result`, and cleared by every
+        // retry dispatch, so a loop that ends without dispatching again (a
+        // backoff deadline, an open breaker) records no attempt that was never
+        // sent.
+        let mut grpc_last_attempt_recorded = false;
         // gRPC retry loop — retries on connection failures
         if grpc_has_retry && let Some(retry_config) = &proxy.retry {
             let mut grpc_attempt = 0u32;
@@ -36092,6 +36345,19 @@ async fn handle_proxy_request_inner(
                     }
                 }
 
+                // Diagnostic reference detail (issue #5846): this attempt is
+                // settled and a retry replaces it.
+                if dispatch_error == Some(retry::ErrorClass::TlsError)
+                    && let Err(error) = &grpc_result
+                {
+                    crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
+                }
+                ctx.record_backend_attempt(
+                    dispatch_error,
+                    dispatch_error.is_none_or(retry::request_reached_wire),
+                    None,
+                );
+                grpc_last_attempt_recorded = true;
                 // The failed attempt's route budget ends here: backoff is bounded
                 // by the RPC's total deadline alone.
                 ctx.end_grpc_route_attempt();
@@ -36425,6 +36691,7 @@ async fn handle_proxy_request_inner(
                     ctx.grpc_deadline_at(),
                 )
                 .await;
+                grpc_last_attempt_recorded = false;
                 if charge_grpc_route_attempt_budget_expiry(&ctx, &mut grpc_result) {
                     // As for the initial attempt: the charged terminal bounds
                     // its hooks by the marker.
@@ -36541,6 +36808,18 @@ async fn handle_proxy_request_inner(
             dispatch_error,
             dispatch_error.is_none_or(retry::request_reached_wire),
         );
+        if !grpc_last_attempt_recorded {
+            if dispatch_error == Some(retry::ErrorClass::TlsError)
+                && let Err(error) = &grpc_result
+            {
+                crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
+            }
+            ctx.record_backend_attempt(
+                dispatch_error,
+                dispatch_error.is_none_or(retry::request_reached_wire),
+                None,
+            );
+        }
         match grpc_result {
             Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {
                 let grpc_backend_admission_elapsed = grpc_backend_admission_started_at.elapsed();
@@ -38801,6 +39080,12 @@ async fn handle_proxy_request_inner(
     // committed attempt's streaming response body.
     let route_attempt_timeout = ctx.route_attempt_timeout();
     let mut route_attempt_deadline: Option<tokio::time::Instant> = None;
+    // Diagnostic reference detail (issue #5846): set once the retry loop has
+    // recorded the attempt behind `result`, and cleared by every retry
+    // dispatch, so a loop that ends without dispatching again (a backoff
+    // deadline, an open breaker, a refused rotated target) records no attempt
+    // that was never sent.
+    let mut last_attempt_recorded = false;
     // `mut`: the pre-commitment authorization terminal below neutralizes the
     // health inputs of a dispatch the gateway itself cancelled (#3815).
     let (mut backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
@@ -39094,6 +39379,14 @@ async fn handle_proxy_request_inner(
                 }
             }
 
+            // Diagnostic reference detail (issue #5846): this attempt is settled
+            // and a retry replaces it.
+            ctx.record_backend_attempt(
+                result.error_class,
+                !result.connection_error,
+                Some(result.status_code),
+            );
+            last_attempt_recorded = true;
             // A gRPC-flavored request's route attempt budget ends with the
             // failed attempt, so backoff is bounded by its total deadline alone.
             ctx.end_grpc_route_attempt();
@@ -39580,6 +39873,7 @@ async fn handle_proxy_request_inner(
                     route_deadline_expiry_response(expiry, true, &mut route_request_timeout_phase)
                 }
             };
+            last_attempt_recorded = false;
             if charge_generic_grpc_route_attempt_budget_expiry(
                 &ctx,
                 owned_proxy_headers_ref.unwrap_or(&ctx.headers),
@@ -39772,6 +40066,13 @@ async fn handle_proxy_request_inner(
     )
     .is_some();
     ctx.record_backend_dispatch_outcome(backend_resp.error_class, !backend_resp.connection_error);
+    if !last_attempt_recorded {
+        ctx.record_backend_attempt(
+            backend_resp.error_class,
+            !backend_resp.connection_error,
+            Some(backend_resp.status_code),
+        );
+    }
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
@@ -43561,6 +43862,9 @@ pub(crate) async fn proxy_to_backend_retry(
                 };
             }
             let error_class = retry::classify_reqwest_error(&e);
+            if error_class == retry::ErrorClass::TlsError {
+                crate::diagnostic_ref::note_backend_tls_failure(request_ctx.diagnostic_slot(), &e);
+            }
             if error_class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
             }
@@ -46192,6 +46496,10 @@ async fn proxy_to_backend(
                             backend_admission_started_at,
                             &e,
                         );
+                        crate::diagnostic_ref::note_backend_tls_failure(
+                            request_ctx.diagnostic_slot(),
+                            &e,
+                        );
                         return backend_dispatch_response(
                             http2_pool_sender_error_response(state, proxy, &e, resolved_ip.clone()),
                             None,
@@ -47719,6 +48027,9 @@ async fn proxy_to_backend(
                 );
             }
             let error_class = retry::classify_reqwest_error(&e);
+            if error_class == retry::ErrorClass::TlsError {
+                crate::diagnostic_ref::note_backend_tls_failure(request_ctx.diagnostic_slot(), &e);
+            }
             if error_class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
             }

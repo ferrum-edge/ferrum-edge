@@ -33,6 +33,29 @@ pub const BUILTIN_RESPONSE_BODY_PRODUCERS: &[&str] = &[
     "sse",
 ];
 
+/// Built-ins that can require the parsed WebSocket relay — an instance may
+/// return `true` from [`super::Plugin::requires_websocket_framing`] because it
+/// runs `on_ws_frame` or publishes parser-level size limits.
+///
+/// Membership is a config-independent security declaration used by config
+/// admission for `websocket_permessage_deflate: passthrough`: a negotiated
+/// `permessage-deflate` session is relayed as raw bytes, so no member may be
+/// effective on a passthrough proxy. Listing a built-in here is conservative
+/// (it is refused even when a particular config would not parse frames); a
+/// built-in that can require framing but is missing here would let a proxy
+/// accept compression the plugin then cannot see, so
+/// `tests/unit/plugins/plugin_doc_parity_tests.rs` pins the set against the
+/// documented `on_ws_frame` / parser-limit phases. Out-of-tree plugins declare
+/// the capability by overriding `requires_ws_frame_hooks()`,
+/// `websocket_size_limits()`, or `requires_websocket_framing()`; admission
+/// constructs them and asks the instance.
+pub const BUILTIN_WEBSOCKET_FRAMING_PLUGINS: &[&str] = &[
+    "waf",
+    "ws_frame_logging",
+    "ws_message_size_limiting",
+    "ws_rate_limiting",
+];
+
 /// The declared response-body production contract for a plugin name.
 ///
 /// Unknown names — every out-of-tree plugin — resolve to

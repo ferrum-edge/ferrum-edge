@@ -276,6 +276,7 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,

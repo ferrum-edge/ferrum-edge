@@ -2585,6 +2585,55 @@ pub enum ResponseBodyMode {
     Buffer,
 }
 
+/// Per-proxy handling of the RFC 7692 `permessage-deflate` WebSocket extension.
+///
+/// - **Strip** (default): the client's `Sec-WebSocket-Extensions` offer never
+///   reaches the backend and no extension is negotiated end to end, so every
+///   message stays inspectable by plugins that parse WebSocket frames.
+/// - **Passthrough**: `permessage-deflate` offer elements reach the backend
+///   unchanged and the backend's `permessage-deflate` answer reaches the
+///   client unchanged, on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+///   Extended CONNECT. Every other extension token is still stripped. A
+///   session that actually negotiates the extension is relayed as raw bytes,
+///   so config validation refuses this mode on any proxy that has a plugin
+///   requiring the parsed WebSocket relay
+///   ([`crate::plugins::Plugin::requires_websocket_framing`]), attached
+///   directly, through a proxy group, or inherited from a global plugin.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSocketPermessageDeflate {
+    #[default]
+    Strip,
+    Passthrough,
+}
+
+impl WebSocketPermessageDeflate {
+    /// Wire / SQL form (`"strip"` / `"passthrough"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strip => "strip",
+            Self::Passthrough => "passthrough",
+        }
+    }
+
+    /// Parse the wire / SQL form. Unknown values are rejected, never defaulted.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "strip" => Some(Self::Strip),
+            "passthrough" => Some(Self::Passthrough),
+            _ => None,
+        }
+    }
+
+    pub fn is_strip(&self) -> bool {
+        matches!(self, Self::Strip)
+    }
+
+    pub fn is_passthrough(&self) -> bool {
+        matches!(self, Self::Passthrough)
+    }
+}
+
 /// Outbound PROXY protocol version written on backend TCP connects.
 ///
 /// When set on a `tcp` / `tcps` stream proxy, Ferrum prepends a PROXY
@@ -3041,6 +3090,11 @@ pub struct Proxy {
     /// idle window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket_idle_timeout_seconds: Option<u64>,
+    /// RFC 7692 `permessage-deflate` handling for WebSocket upgrades on this
+    /// proxy: `strip` (default) or `passthrough`. See
+    /// [`WebSocketPermessageDeflate`]. Only valid on HTTP-family proxies.
+    #[serde(default, skip_serializing_if = "WebSocketPermessageDeflate::is_strip")]
+    pub websocket_permessage_deflate: WebSocketPermessageDeflate,
     /// Optional list of allowed HTTP methods (e.g., ["GET", "POST"]).
     /// When `None` (default), all methods are allowed. When `Some`, requests
     /// with methods not in the list receive 405 Method Not Allowed.
@@ -8565,6 +8619,14 @@ impl Proxy {
 
         if is_stream_proxy && self.response_body_mode != ResponseBodyMode::Stream {
             errors.push("Stream proxies (TCP/UDP) must use response_body_mode 'stream'".into());
+        }
+
+        if is_stream_proxy && self.websocket_permessage_deflate.is_passthrough() {
+            errors.push(
+                "Stream proxies (TCP/UDP) carry no WebSocket upgrade; \
+                 `websocket_permessage_deflate` must be 'strip'"
+                    .into(),
+            );
         }
 
         if errors.is_empty() {

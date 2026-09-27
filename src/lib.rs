@@ -1017,6 +1017,28 @@ pub mod _test_support {
         ctx.record_backend_dispatch_outcome(error_class, request_on_wire);
     }
 
+    /// Attach a gateway diagnostic-reference slot to a request context, as
+    /// the HTTP frontends do when `FERRUM_DIAGNOSTIC_REFS` is enabled, so
+    /// external tests can observe what the rejection and attempt recording
+    /// sites write into it.
+    pub fn set_diagnostic_slot_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        slot: Arc<crate::diagnostic_ref::DiagnosticSlot>,
+    ) {
+        ctx.set_diagnostic_slot(Some(slot));
+    }
+
+    /// Record one backend attempt through the request context, as the retry
+    /// loops and final dispatch sites do.
+    pub fn record_backend_attempt_for_test(
+        ctx: &crate::plugins::RequestContext,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+        response_status: Option<u16>,
+    ) {
+        ctx.record_backend_attempt(error_class, request_on_wire, response_status);
+    }
+
     /// Model the transport-owned empty-body proof for direct plugin lifecycle
     /// tests that do not enter through an HTTP proxy body-drain path.
     pub fn set_replay_request_body_empty_proven_for_test(
@@ -4454,7 +4476,8 @@ pub mod _test_support {
     }
 
     pub use crate::proxy::tcp_proxy::{
-        StreamCopyResult, StreamIoSide, relay_failure_is_client_facing,
+        STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE, STREAM_RELAY_IDLE_TIMEOUT_MESSAGE, StreamCopyResult,
+        StreamIoSide, relay_failure_is_client_facing, relay_failure_is_idle_expiry,
     };
 
     /// Reach into `tcp_proxy` to exercise the `Direction` + IO-side →
@@ -7657,6 +7680,49 @@ pub mod _test_support {
         proxy_headers: &HashMap<String, String>,
     ) -> Vec<(String, String)> {
         crate::proxy::collect_forwardable_websocket_headers(raw_headers, proxy_headers)
+    }
+
+    /// Forward a `permessage-deflate` offer the way a passthrough proxy does;
+    /// returns whether an offer was forwarded (issue #5769).
+    pub fn push_permessage_deflate_offer_for_test(
+        client_headers: &mut Vec<(String, String)>,
+        proxy_headers: &HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::push_permessage_deflate_offer(client_headers, proxy_headers)
+    }
+
+    /// The runtime passthrough gate both WebSocket upgrade paths use; returns
+    /// whether an offer was forwarded (issue #5769).
+    pub fn forward_permessage_deflate_offer_for_test(
+        mode: crate::config::types::WebSocketPermessageDeflate,
+        requires_websocket_framing: bool,
+        client_headers: &mut Vec<(String, String)>,
+        proxy_headers: &HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::forward_permessage_deflate_offer(
+            mode,
+            requires_websocket_framing,
+            client_headers,
+            proxy_headers,
+        )
+    }
+
+    /// The backend `permessage-deflate` answer a passthrough proxy forwards.
+    pub fn permessage_deflate_answer_for_test(
+        headers: &hyper::HeaderMap,
+    ) -> Option<hyper::header::HeaderValue> {
+        crate::proxy::permessage_deflate_answer(headers)
+    }
+
+    /// Refusals for `websocket_permessage_deflate: passthrough` proxies whose
+    /// effective plugin chain requires the parsed WebSocket relay.
+    pub fn websocket_permessage_deflate_passthrough_errors_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Vec<String> {
+        crate::plugin_cache::websocket_permessage_deflate_passthrough_errors(
+            config,
+            &crate::plugins::PluginHttpClient::default(),
+        )
     }
 
     pub struct NormalizedRejectResponse {

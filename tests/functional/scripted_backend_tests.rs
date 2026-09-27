@@ -26,6 +26,8 @@ use crate::scaffolding::{
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
@@ -162,6 +164,19 @@ async fn backend_accepts_then_resets_maps_to_connection_reset() {
 
     let client = harness.http_client().expect("client");
     let result = client.get(&harness.proxy_url("/api/x")).await;
+    // The exact transport message varies across platforms and error phases.
+    let reset_signal = |logs: &str| {
+        logs.contains("reset")
+            || logs.contains("Reset")
+            || logs.contains("connection closed")
+            || logs.contains("request_error")
+            || logs.contains("Backend request failed")
+    };
+    // Wait for the non-blocking log writer to flush this one request; a
+    // single snapshot right after the response can miss the error line.
+    harness
+        .wait_for_log_contains(reset_signal, Duration::from_secs(3))
+        .await;
     let logs = require_logs(&harness);
     eprintln!(
         "RST fixture: port={backend_port} accepted={} resets={} step_errors={:?}\n{logs}",
@@ -179,14 +194,8 @@ async fn backend_accepts_then_resets_maps_to_connection_reset() {
         "fixture never executed Reset"
     );
 
-    // The exact transport message varies across platforms and error phases.
-    let observed = logs.contains("reset")
-        || logs.contains("Reset")
-        || logs.contains("connection closed")
-        || logs.contains("request_error")
-        || logs.contains("Backend request failed");
     assert!(
-        observed,
+        reset_signal(&logs),
         "expected reset/error signal in gateway logs:\n{logs}"
     );
 }
@@ -2812,4 +2821,889 @@ async fn diagnostic_refs_replace_backend_forged_references() {
         ok.headers()
     );
     drop(backends);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Gateway diagnostic references: `all` mode, rejection and attempt detail
+// (#5846).
+// ────────────────────────────────────────────────────────────────────────────
+
+const DIAGNOSTIC_API_KEY: &str = "diagnostic-ref-invalid-api-key-value";
+
+/// File-mode config for the `all`-mode tests: a `key_auth` route whose
+/// backend is never reached, a route to a backend that answers its own `404`,
+/// and a retrying route to a refused port.
+fn diagnostic_all_mode_yaml(refused_port: u16, backend_404_port: u16) -> String {
+    to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [
+            {
+                "id": "diag-secure",
+                "listen_path": "/secure",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": refused_port,
+                "strip_listen_path": true,
+                "plugins": [{"plugin_config_id": "diag-key-auth"}],
+            },
+            {
+                "id": "diag-backend-404",
+                "listen_path": "/backend-404",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": backend_404_port,
+                "strip_listen_path": true,
+                "response_body_mode": "buffer",
+            },
+            {
+                "id": "diag-retry",
+                "listen_path": "/retry",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": refused_port,
+                "strip_listen_path": true,
+                "backend_connect_timeout_ms": 2000,
+                "retry": {
+                    "max_retries": 2,
+                    "retry_on_connect_failure": true,
+                    "retryable_methods": ["GET"],
+                    "backoff": {"fixed": {"delay_ms": 10}},
+                },
+            },
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "diag-key-auth",
+            "plugin_name": "key_auth",
+            "scope": "proxy",
+            "proxy_id": "diag-secure",
+            "enabled": true,
+            "config": {"key_location": "header:X-Api-Key"},
+        }],
+    }))
+}
+
+/// A backend that answers its own `404` to every request.
+fn spawn_backend_404(listener: tokio::net::TcpListener) -> ScriptedHttp1Backend {
+    ScriptedHttp1Backend::builder(listener)
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 404,
+            reason: "Not Found".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Connection".into(),
+            value: "close".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "2".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"no".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend")
+}
+
+/// The single reference on a gateway rejection that carries no
+/// `X-Gateway-Error` token.
+fn rejection_reference(headers: &http::HeaderMap) -> String {
+    assert!(
+        !headers.contains_key("x-gateway-error"),
+        "a plugin or routing rejection carries no X-Gateway-Error: {headers:?}"
+    );
+    let references: Vec<&str> = headers
+        .get_all("x-ferrum-diagnostic-ref")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    assert_eq!(references.len(), 1, "exactly one reference: {headers:?}");
+    assert!(references[0].starts_with("fd1_"), "{references:?}");
+    references[0].to_string()
+}
+
+// With `FERRUM_DIAGNOSTIC_REFS=all`, a plugin rejection (`key_auth` 401) and a
+// routing miss (404) carry a reference that resolves to the rejecting phase
+// and plugin; a backend's own 404 carries none; and a retried connection
+// failure resolves to one entry per backend attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn diagnostic_refs_all_mode_marks_plugin_and_routing_rejections() {
+    let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_404_port = reservation.port;
+    let backend = spawn_backend_404(reservation.into_listener());
+    let gateway = TestGateway::builder()
+        .mode_file(diagnostic_all_mode_yaml(refused.port, backend_404_port))
+        .log_level("warn")
+        .jwt_secret(DIAGNOSTIC_JWT_SECRET)
+        .jwt_issuer(DIAGNOSTIC_JWT_ISSUER)
+        .env("FERRUM_DIAGNOSTIC_REFS", "all")
+        .env("FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND", "1000")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let admin = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("admin client");
+    let reader = diagnostic_token(json!({"scope": "diagnostics:read", "ns": ["ferrum"]}));
+
+    // Plugin rejection: `key_auth` refuses an unknown key with 401.
+    let rejected = client
+        .get(gateway.proxy_url("/secure/orders"))
+        .header("X-Api-Key", DIAGNOSTIC_API_KEY)
+        .send()
+        .await
+        .expect("key_auth response");
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    let plugin_ref = rejection_reference(rejected.headers());
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{plugin_ref}"));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    assert_eq!(body["status"], 401, "{body}");
+    assert!(body["gateway_error"].is_null(), "{body}");
+    assert_eq!(body["detail_available"], true, "{body}");
+    let detail = &body["detail"];
+    assert_eq!(detail["backend_dispatch"], "not_dispatched", "{body}");
+    assert_eq!(detail["proxy_id"], "diag-secure", "{body}");
+    assert_eq!(detail["rejection"]["source"], "plugin", "{body}");
+    assert_eq!(detail["rejection"]["phase"], "authenticate", "{body}");
+    assert_eq!(detail["rejection"]["plugin"], "key_auth", "{body}");
+    assert!(detail.get("attempts").is_none(), "{body}");
+    let rendered = body.to_string();
+    for leaked in [DIAGNOSTIC_API_KEY, "/orders", "X-Api-Key"] {
+        assert!(!rendered.contains(leaked), "leaked {leaked}: {rendered}");
+    }
+
+    // Routing miss: no proxy matches.
+    let miss = client
+        .get(gateway.proxy_url("/no-such-route"))
+        .send()
+        .await
+        .expect("route miss response");
+    assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+    let route_ref = rejection_reference(miss.headers());
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{route_ref}"));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    assert_eq!(body["status"], 404, "{body}");
+    assert!(body["gateway_error"].is_null(), "{body}");
+    let detail = &body["detail"];
+    assert_eq!(detail["backend_dispatch"], "not_dispatched", "{body}");
+    assert!(detail["proxy_id"].is_null(), "{body}");
+    assert_eq!(detail["rejection"]["source"], "routing", "{body}");
+    assert_eq!(detail["rejection"]["phase"], "route_not_found", "{body}");
+    assert!(!body.to_string().contains("no-such-route"), "{body}");
+
+    // A backend's own 404 is relayed, not authored: no reference.
+    let relayed = client
+        .get(gateway.proxy_url("/backend-404/thing"))
+        .send()
+        .await
+        .expect("backend 404 response");
+    assert_eq!(relayed.status(), StatusCode::NOT_FOUND);
+    assert!(
+        !relayed.headers().contains_key("x-ferrum-diagnostic-ref"),
+        "a backend-authored error never carries a reference: {:?}",
+        relayed.headers()
+    );
+
+    // Retried connection failure: one attempt entry per dispatch.
+    let retried = client
+        .get(gateway.proxy_url("/retry"))
+        .send()
+        .await
+        .expect("retry response");
+    let retry_ref = gateway_error_reference(retried.status(), retried.headers());
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{retry_ref}"));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    assert_eq!(body["gateway_error"], "connection_failure", "{body}");
+    let attempts = body["detail"]["attempts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("per-attempt detail: {body}"));
+    // The first dispatch plus two retries.
+    assert_eq!(attempts.len(), 3, "{body}");
+    for (index, attempt) in attempts.iter().enumerate() {
+        assert_eq!(attempt["attempt"], index + 1, "{body}");
+        assert_eq!(attempt["backend_dispatch"], "pre_wire_failure", "{body}");
+        assert!(attempt["error_class"].is_string(), "{body}");
+        assert!(attempt.get("status").is_none(), "{body}");
+    }
+    drop(backend);
+}
+
+// `errors` keeps its #5767 contract: a plugin rejection and a routing miss
+// carry no `X-Gateway-Error`, so they carry no reference either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn diagnostic_refs_errors_mode_leaves_plugin_and_routing_rejections_unmarked() {
+    let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_404_port = reservation.port;
+    let backend = spawn_backend_404(reservation.into_listener());
+    let gateway = TestGateway::builder()
+        .mode_file(diagnostic_all_mode_yaml(refused.port, backend_404_port))
+        .log_level("warn")
+        .env("FERRUM_DIAGNOSTIC_REFS", "errors")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+
+    let rejected = client
+        .get(gateway.proxy_url("/secure/orders"))
+        .header("X-Api-Key", DIAGNOSTIC_API_KEY)
+        .send()
+        .await
+        .expect("key_auth response");
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    let miss = client
+        .get(gateway.proxy_url("/no-such-route"))
+        .send()
+        .await
+        .expect("route miss response");
+    assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+    for (label, headers) in [
+        ("plugin 401", rejected.headers()),
+        ("route 404", miss.headers()),
+    ] {
+        assert!(
+            !headers.contains_key("x-ferrum-diagnostic-ref"),
+            "{label}: `errors` must not reference a response without X-Gateway-Error: \
+             {headers:?}"
+        );
+    }
+
+    // The gateway-authored connection failure is still referenced.
+    let retried = client
+        .get(gateway.proxy_url("/retry"))
+        .send()
+        .await
+        .expect("retry response");
+    let _ = gateway_error_reference(retried.status(), retried.headers());
+    drop(backend);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// `all` mode: origin-authored replays and frontend admission fences (#5846).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Plain HTTP/1.1 origin that answers its own cacheable `status` error and
+/// counts every request it serves. The gateway's h2c capability probe fails to
+/// parse as HTTP/1.1, so it is never counted.
+async fn serve_cacheable_error_origin(
+    listener: tokio::net::TcpListener,
+    hits: Arc<AtomicUsize>,
+    status: u16,
+) {
+    use http_body_util::Full;
+    use hyper::body::Incoming;
+    use hyper_util::rt::TokioIo;
+
+    const BODY: &[u8] = br#"{"error":"no such order"}"#;
+    while let Ok((stream, _)) = listener.accept().await {
+        let hits = Arc::clone(&hits);
+        tokio::spawn(async move {
+            let service = hyper::service::service_fn(move |_request: hyper::Request<Incoming>| {
+                hits.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    hyper::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .header("cache-control", "max-age=60")
+                        .header("content-length", BODY.len())
+                        .body(Full::new(bytes::Bytes::from_static(BODY)))
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+    }
+}
+
+/// Plain HTTP/1.1 origin that counts every request and then holds it without
+/// answering, so each one stays in flight at the gateway.
+async fn serve_stalling_origin(listener: tokio::net::TcpListener, held: Arc<AtomicUsize>) {
+    use http_body_util::Full;
+    use hyper::body::Incoming;
+    use hyper_util::rt::TokioIo;
+
+    while let Ok((stream, _)) = listener.accept().await {
+        let held = Arc::clone(&held);
+        tokio::spawn(async move {
+            let service = hyper::service::service_fn(move |_request: hyper::Request<Incoming>| {
+                held.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    hyper::Response::builder().body(Full::new(bytes::Bytes::new()))
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+    }
+}
+
+// A backend's own error replayed by `response_caching` is origin content, not
+// a plugin rejection: in `all` mode neither the relayed MISS nor the cached
+// HIT carries a reference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn diagnostic_refs_all_mode_leaves_cached_backend_errors_unmarked() {
+    let reservation = reserve_port().await.expect("reserve origin port");
+    let origin_port = reservation.port;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let origin = tokio::spawn(serve_cacheable_error_origin(
+        reservation.into_listener(),
+        Arc::clone(&hits),
+        404,
+    ));
+    let config = to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [{
+            "id": "diag-cached",
+            "listen_path": "/cached",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": origin_port,
+            "strip_listen_path": true,
+            "pool_enable_http2": false,
+            "plugins": [{"plugin_config_id": "diag-cache"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "diag-cache",
+            "plugin_name": "response_caching",
+            "scope": "proxy",
+            "proxy_id": "diag-cached",
+            "enabled": true,
+            "config": {},
+        }],
+    }));
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .env("FERRUM_DIAGNOSTIC_REFS", "all")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+
+    // The first request relays the origin's 404 (MISS) and stores it; the
+    // second is served from the cache without reaching the origin (HIT).
+    for (label, origin_hits) in [("relayed", 1usize), ("cached", 1)] {
+        let response = client
+            .get(gateway.proxy_url("/cached/orders/7"))
+            .send()
+            .await
+            .expect("cached route response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{label}");
+        assert_eq!(hits.load(Ordering::SeqCst), origin_hits, "{label}");
+        assert!(
+            !response.headers().contains_key("x-ferrum-diagnostic-ref"),
+            "{label}: a backend-authored 404 carries no reference: {:?}",
+            response.headers()
+        );
+    }
+    origin.abort();
+}
+
+// In `all` mode a plugin `401`, a routing `404`, and the frontend overload
+// fence each carry one reference, and each resolves to the rejection that
+// authored it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn diagnostic_refs_all_mode_marks_plugin_routing_and_overload_rejections() {
+    let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let reservation = reserve_port().await.expect("reserve stalling origin port");
+    let stall_port = reservation.port;
+    let held = Arc::new(AtomicUsize::new(0));
+    let origin = tokio::spawn(serve_stalling_origin(
+        reservation.into_listener(),
+        Arc::clone(&held),
+    ));
+    let config = to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [
+            {
+                "id": "diag-secure",
+                "listen_path": "/secure",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": refused.port,
+                "strip_listen_path": true,
+                "plugins": [{"plugin_config_id": "diag-key-auth"}],
+            },
+            {
+                "id": "diag-stall",
+                "listen_path": "/stall",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": stall_port,
+                "strip_listen_path": true,
+                "pool_enable_http2": false,
+                "backend_read_timeout_ms": 60_000,
+            },
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "diag-key-auth",
+            "plugin_name": "key_auth",
+            "scope": "proxy",
+            "proxy_id": "diag-secure",
+            "enabled": true,
+            "config": {"key_location": "header:X-Api-Key"},
+        }],
+    }));
+    // Three in-flight requests are critical pressure; one is below the
+    // shedding threshold, so the plugin and routing checks are never shed.
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .jwt_secret(DIAGNOSTIC_JWT_SECRET)
+        .jwt_issuer(DIAGNOSTIC_JWT_ISSUER)
+        .env("FERRUM_DIAGNOSTIC_REFS", "all")
+        .env("FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND", "1000")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_MAX_REQUESTS", "3")
+        .env("FERRUM_OVERLOAD_CHECK_INTERVAL_MS", "100")
+        .env("FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD", "0.6")
+        .env("FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD", "0.9")
+        .env("FERRUM_SHUTDOWN_DRAIN_SECONDS", "0")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let admin = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("admin client");
+    let reader = diagnostic_token(json!({"scope": "diagnostics:read", "ns": ["ferrum"]}));
+
+    // Plugin rejection: `key_auth` refuses an unknown key with 401.
+    let rejected = client
+        .get(gateway.proxy_url("/secure/orders"))
+        .header("X-Api-Key", DIAGNOSTIC_API_KEY)
+        .send()
+        .await
+        .expect("key_auth response");
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    let plugin_ref = rejection_reference(rejected.headers());
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{plugin_ref}"));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    assert_eq!(body["status"], 401, "{body}");
+    let rejection = &body["detail"]["rejection"];
+    assert_eq!(rejection["source"], "plugin", "{body}");
+    assert_eq!(rejection["phase"], "authenticate", "{body}");
+    assert_eq!(rejection["plugin"], "key_auth", "{body}");
+
+    // Routing miss: no proxy matches.
+    let miss = client
+        .get(gateway.proxy_url("/no-such-route"))
+        .send()
+        .await
+        .expect("route miss response");
+    assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+    let route_ref = rejection_reference(miss.headers());
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{route_ref}"));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    assert_eq!(body["status"], 404, "{body}");
+    let rejection = &body["detail"]["rejection"];
+    assert_eq!(rejection["source"], "routing", "{body}");
+    assert_eq!(rejection["phase"], "route_not_found", "{body}");
+
+    // Overload fence: hold three requests at the stalling origin, then wait
+    // for the frontend admission fence to refuse new work.
+    let mut stalled = Vec::new();
+    for _ in 0..3 {
+        let url = gateway.proxy_url("/stall/hold");
+        stalled.push(tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .pool_max_idle_per_host(0)
+                .http1_only()
+                .build()
+                .expect("stall client");
+            client.get(url).send().await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while held.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("three requests must be held at the origin");
+    let fenced = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = client
+                .get(gateway.proxy_url("/no-such-route"))
+                .send()
+                .await
+                .expect("admission response");
+            if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the overload fence must refuse new requests");
+    let token = fenced
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|value| value.to_str().ok());
+    assert_eq!(token, Some("overload"), "{:?}", fenced.headers());
+    let references: Vec<&str> = fenced
+        .headers()
+        .get_all("x-ferrum-diagnostic-ref")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    assert_eq!(references.len(), 1, "{:?}", fenced.headers());
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{}", references[0]));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    assert_eq!(body["status"], 503, "{body}");
+    assert_eq!(body["gateway_error"], "overload", "{body}");
+    assert_eq!(body["detail_available"], true, "{body}");
+    let detail = &body["detail"];
+    assert_eq!(detail["backend_dispatch"], "not_dispatched", "{body}");
+    assert!(detail["proxy_id"].is_null(), "{body}");
+    assert_eq!(detail["rejection"]["source"], "gateway", "{body}");
+    assert_eq!(detail["rejection"]["phase"], "overload", "{body}");
+    assert!(detail["rejection"].get("plugin").is_none(), "{body}");
+
+    for request in stalled {
+        request.abort();
+    }
+    origin.abort();
+}
+
+// Only attempts actually sent are listed. The first connection failure opens
+// the route's circuit breaker, so the retry loop stops before dispatching again:
+// the detail lists that one attempt, not a second copy of it for the retry that
+// never left the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn diagnostic_refs_list_only_attempts_actually_sent() {
+    let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let config = to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [{
+            "id": "diag-breaker",
+            "listen_path": "/breaker",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": refused.port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "retry": {
+                "max_retries": 3,
+                "retry_on_connect_failure": true,
+                "retryable_methods": ["GET"],
+                "backoff": {"fixed": {"delay_ms": 10}},
+            },
+            "circuit_breaker": {
+                "failure_threshold": 1,
+                "timeout_seconds": 60,
+                "success_threshold": 1,
+            },
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    }));
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .jwt_secret(DIAGNOSTIC_JWT_SECRET)
+        .jwt_issuer(DIAGNOSTIC_JWT_ISSUER)
+        .env("FERRUM_DIAGNOSTIC_REFS", "all")
+        .env("FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND", "1000")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let admin = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("admin client");
+    let reader = diagnostic_token(json!({"scope": "diagnostics:read", "ns": ["ferrum"]}));
+
+    let response = client
+        .get(gateway.proxy_url("/breaker"))
+        .send()
+        .await
+        .expect("breaker route response");
+    let reference = gateway_error_reference(response.status(), response.headers());
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{reference}"));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    let attempts = body["detail"]["attempts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("per-attempt detail: {body}"));
+    assert_eq!(attempts.len(), 1, "{body}");
+    let first = &attempts[0];
+    assert_eq!(first["attempt"], 1, "{body}");
+    assert_eq!(first["backend_dispatch"], "pre_wire_failure", "{body}");
+    assert!(body["detail"].get("attempts_omitted").is_none(), "{body}");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Origin-served replays in `errors` mode and the route-deadline backoff exit
+// (#5860).
+// ────────────────────────────────────────────────────────────────────────────
+
+// In `errors` mode a backend `502` that `response_caching` stored (502 listed
+// in `cacheable_status_codes`) and then replays is origin content: the relayed
+// MISS keeps its #5767 reference, the cached HIT carries none. A
+// gateway-generated `502` on a route with the same plugin is still referenced.
+//
+// This is a regression guard, not proof of the #5860 skip: on HTTP/1.1 the
+// gateway adds `X-Gateway-Error` after the cache stores the entry, so the
+// replayed 502 carries no token and gets no reference even without the skip.
+// `diagnostic_ref_tests` proves the skip itself on a flagged, token-bearing
+// response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn diagnostic_refs_errors_mode_leaves_cached_replays_unmarked() {
+    let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let reservation = reserve_port().await.expect("reserve origin port");
+    let origin_port = reservation.port;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let origin = tokio::spawn(serve_cacheable_error_origin(
+        reservation.into_listener(),
+        Arc::clone(&hits),
+        502,
+    ));
+    let cache_config = json!({"cacheable_status_codes": [200, 502]});
+    let config = to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [
+            {
+                "id": "diag-cached-502",
+                "listen_path": "/cached",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": origin_port,
+                "strip_listen_path": true,
+                "pool_enable_http2": false,
+                "plugins": [{"plugin_config_id": "diag-cache-502"}],
+            },
+            {
+                "id": "diag-refused-502",
+                "listen_path": "/refused",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": refused.port,
+                "strip_listen_path": true,
+                "backend_connect_timeout_ms": 2000,
+                "plugins": [{"plugin_config_id": "diag-cache-refused"}],
+            },
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "diag-cache-502",
+                "plugin_name": "response_caching",
+                "scope": "proxy",
+                "proxy_id": "diag-cached-502",
+                "enabled": true,
+                "config": cache_config.clone(),
+            },
+            {
+                "id": "diag-cache-refused",
+                "plugin_name": "response_caching",
+                "scope": "proxy",
+                "proxy_id": "diag-refused-502",
+                "enabled": true,
+                "config": cache_config,
+            },
+        ],
+    }));
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .env("FERRUM_DIAGNOSTIC_REFS", "errors")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+
+    // The first request relays the origin's 502 (MISS) and stores it.
+    let relayed = client
+        .get(gateway.proxy_url("/cached/orders/7"))
+        .send()
+        .await
+        .expect("relayed response");
+    assert_eq!(relayed.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let token = relayed
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|value| value.to_str().ok());
+    assert_eq!(token, Some("backend_error"), "{:?}", relayed.headers());
+    assert_eq!(
+        relayed
+            .headers()
+            .get_all("x-ferrum-diagnostic-ref")
+            .iter()
+            .count(),
+        1,
+        "the relayed MISS keeps its `errors` reference: {:?}",
+        relayed.headers()
+    );
+
+    // The second is served from the cache without reaching the origin (HIT).
+    let cached = client
+        .get(gateway.proxy_url("/cached/orders/7"))
+        .send()
+        .await
+        .expect("cached response");
+    assert_eq!(cached.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "served from the cache");
+    assert!(
+        !cached.headers().contains_key("x-ferrum-diagnostic-ref"),
+        "a replayed 502 is origin content, not a gateway error: {:?}",
+        cached.headers()
+    );
+
+    // A gateway-generated connection failure is still referenced.
+    let generated = client
+        .get(gateway.proxy_url("/refused"))
+        .send()
+        .await
+        .expect("refused response");
+    let _ = gateway_error_reference(generated.status(), generated.headers());
+    origin.abort();
+}
+
+// A retry loop that ends because the route rule's total deadline expired
+// during backoff sends no further attempt: the detail lists only the attempt
+// that led into the backoff, not a second copy for the `504` the deadline
+// produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn diagnostic_refs_route_deadline_backoff_lists_only_attempts_sent() {
+    let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let config = to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [{
+            "id": "diag-backoff",
+            "listen_path": "/backoff",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": refused.port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "retry": {
+                "max_retries": 3,
+                "retry_on_connect_failure": true,
+                "retryable_methods": ["GET"],
+                "backoff": {"fixed": {"delay_ms": 10_000}},
+            },
+            "plugins": [{"plugin_config_id": "diag-backoff-deadline"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        // The rule's destination is the proxy's own backend, so only its
+        // total deadline applies.
+        "plugin_configs": [{
+            "id": "diag-backoff-deadline",
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "proxy",
+            "proxy_id": "diag-backoff",
+            "enabled": true,
+            "config": {"rules": [{
+                "match": {},
+                "destination": {"backend_host": "127.0.0.1", "backend_port": refused.port},
+                "request_timeout_ms": 1000,
+            }]},
+        }],
+    }));
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .jwt_secret(DIAGNOSTIC_JWT_SECRET)
+        .jwt_issuer(DIAGNOSTIC_JWT_ISSUER)
+        .env("FERRUM_DIAGNOSTIC_REFS", "all")
+        .env("FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND", "1000")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let admin = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("admin client");
+    let reader = diagnostic_token(json!({"scope": "diagnostics:read", "ns": ["ferrum"]}));
+
+    let started = Instant::now();
+    let response = client
+        .get(gateway.proxy_url("/backoff"))
+        .send()
+        .await
+        .expect("backoff route response");
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the route deadline, not the 10s backoff, ends the loop"
+    );
+    let token = response
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|value| value.to_str().ok());
+    assert_eq!(token, Some("request_timeout"), "{:?}", response.headers());
+    let references: Vec<&str> = response
+        .headers()
+        .get_all("x-ferrum-diagnostic-ref")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    assert_eq!(references.len(), 1, "{:?}", response.headers());
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{}", references[0]));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    assert_eq!(body["status"], 504, "{body}");
+    assert_eq!(body["gateway_error"], "request_timeout", "{body}");
+    assert_eq!(body["detail_available"], true, "{body}");
+    let detail = &body["detail"];
+    assert_eq!(detail["route_timeout_phase"], "retry_backoff", "{body}");
+    let attempts = detail["attempts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("per-attempt detail: {body}"));
+    assert_eq!(attempts.len(), 1, "{body}");
+    let first = &attempts[0];
+    assert_eq!(first["attempt"], 1, "{body}");
+    assert_eq!(first["backend_dispatch"], "pre_wire_failure", "{body}");
+    assert!(first["error_class"].is_string(), "{body}");
+    assert!(detail.get("attempts_omitted").is_none(), "{body}");
 }

@@ -208,6 +208,7 @@ mod udp_amplification_tests;
 mod udp_auth_lifetime_tests;
 mod udp_dtls_idle_activity_tests;
 mod udp_egress_isolation_tests;
+mod udp_port_handoff_tests;
 #[cfg(feature = "bench-udp-profile")]
 mod udp_profile_tests;
 mod udp_reply_stop_tests;
@@ -227,6 +228,7 @@ mod websocket_drain_accounting_tests;
 mod websocket_fragment_metering_tests;
 mod websocket_frame_delivery_tests;
 mod websocket_frame_plugin_composition_tests;
+mod websocket_permessage_deflate_tests;
 mod websocket_relay_join_tests;
 mod websocket_retry_circuit_tests;
 mod websocket_selected_target_policy_tests;
