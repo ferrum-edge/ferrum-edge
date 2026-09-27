@@ -91,12 +91,43 @@ pub struct GlobalListenerPolicies {
 }
 
 /// Resolve both global listener policies from `env` (see
-/// [`FrontendProxyProtocol::for_listener`]).
+/// [`FrontendProxyProtocol::for_listener`]). The trusted source list is parsed
+/// once and shared by both listeners.
 pub fn global_listener_policies(env: &EnvConfig) -> Result<GlobalListenerPolicies, String> {
+    let mut trusted_sources = None;
     Ok(GlobalListenerPolicies {
-        http: FrontendProxyProtocol::for_listener(env, FrontendProxyListener::Http)?,
-        https: FrontendProxyProtocol::for_listener(env, FrontendProxyListener::Https)?,
+        http: FrontendProxyProtocol::build(env, FrontendProxyListener::Http, &mut trusted_sources)?,
+        https: FrontendProxyProtocol::build(
+            env,
+            FrontendProxyListener::Https,
+            &mut trusted_sources,
+        )?,
     })
+}
+
+/// Parse `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS` for the enabled
+/// `listener`, refusing a list that trusts nobody or everybody.
+fn parse_trusted_sources(
+    env: &EnvConfig,
+    listener: FrontendProxyListener,
+) -> Result<TrustedProxies, String> {
+    let raw = &env.frontend_proxy_protocol_trusted_cidrs;
+    let trusted_sources =
+        TrustedProxies::parse_strict(raw, FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS_KEY)?;
+    if trusted_sources.is_empty() {
+        return Err(format!(
+            "{} enables inbound PROXY protocol but {FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS_KEY} \
+             is empty",
+            listener.mode_env_key()
+        ));
+    }
+    if TrustedProxies::cidr_list_permits_all(raw) {
+        return Err(format!(
+            "{FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS_KEY} admits every source address of an \
+             address family"
+        ));
+    }
+    Ok(trusted_sources)
 }
 
 /// Resolved inbound PROXY protocol policy for one enabled listener.
@@ -104,7 +135,7 @@ pub fn global_listener_policies(env: &EnvConfig) -> Result<GlobalListenerPolicie
 pub struct FrontendProxyProtocol {
     listener: FrontendProxyListener,
     accepted: AcceptedProxyVersions,
-    trusted_sources: TrustedProxies,
+    trusted_sources: Arc<TrustedProxies>,
 }
 
 impl FrontendProxyProtocol {
@@ -118,6 +149,16 @@ impl FrontendProxyProtocol {
         env: &EnvConfig,
         listener: FrontendProxyListener,
     ) -> Result<Option<Arc<Self>>, String> {
+        Self::build(env, listener, &mut None)
+    }
+
+    /// [`Self::for_listener`], reusing the trusted source list in `shared` when
+    /// an earlier listener already parsed it and storing it there otherwise.
+    fn build(
+        env: &EnvConfig,
+        listener: FrontendProxyListener,
+        shared: &mut Option<Arc<TrustedProxies>>,
+    ) -> Result<Option<Arc<Self>>, String> {
         let mode = match listener {
             FrontendProxyListener::Http => env.frontend_proxy_protocol_http,
             FrontendProxyListener::Https => env.frontend_proxy_protocol_https,
@@ -128,22 +169,14 @@ impl FrontendProxyProtocol {
             FrontendProxyProtocolMode::V2 => AcceptedProxyVersions::V2Only,
             FrontendProxyProtocolMode::Auto => AcceptedProxyVersions::Any,
         };
-        let raw = &env.frontend_proxy_protocol_trusted_cidrs;
-        let trusted_sources =
-            TrustedProxies::parse_strict(raw, FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS_KEY)?;
-        if trusted_sources.is_empty() {
-            return Err(format!(
-                "{} enables inbound PROXY protocol but {FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS_KEY} \
-                 is empty",
-                listener.mode_env_key()
-            ));
-        }
-        if TrustedProxies::cidr_list_permits_all(raw) {
-            return Err(format!(
-                "{FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS_KEY} admits every source address of an \
-                 address family"
-            ));
-        }
+        let trusted_sources = match shared.clone() {
+            Some(trusted_sources) => trusted_sources,
+            None => {
+                let trusted_sources = Arc::new(parse_trusted_sources(env, listener)?);
+                *shared = Some(Arc::clone(&trusted_sources));
+                trusted_sources
+            }
+        };
         tracing::info!(
             listener = listener.label(),
             mode = %mode,

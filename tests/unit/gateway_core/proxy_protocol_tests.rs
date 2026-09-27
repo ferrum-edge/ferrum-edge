@@ -510,7 +510,10 @@ async fn v1_only_accepts_v1_and_refuses_v2() {
 
     let v2 = v2_header_tcp4([10, 0, 0, 1], [10, 0, 0, 2], 1000, 443);
     let (result, consumed) = parse_accepting(&v2, AcceptedProxyVersions::V1Only).await;
-    assert!(matches!(result, Err(ProxyProtocolError::VersionNotAccepted("v2"))));
+    assert!(matches!(
+        result,
+        Err(ProxyProtocolError::VersionNotAccepted("v2"))
+    ));
     assert_eq!(consumed, 6, "only the signature prefix is read");
 }
 
@@ -521,7 +524,10 @@ async fn v2_only_accepts_v2_and_refuses_v1() {
     assert!(matches!(result, Ok(ProxyProtocolResult::Forwarded { .. })));
 
     let (result, consumed) = parse_accepting(V1_TCP4, AcceptedProxyVersions::V2Only).await;
-    assert!(matches!(result, Err(ProxyProtocolError::VersionNotAccepted("v1"))));
+    assert!(matches!(
+        result,
+        Err(ProxyProtocolError::VersionNotAccepted("v1"))
+    ));
     assert_eq!(consumed, 6, "only the signature prefix is read");
 }
 

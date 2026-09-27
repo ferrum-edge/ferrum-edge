@@ -12,12 +12,15 @@
 //! * untrusted peers, missing / malformed / wrong-version / stalled headers
 //!   are closed with no response and never reach the backend
 //! * a listener with the setting `off` is unchanged
+//! * the bind-by-address dynamic-TLS entry point the database and DP modes use
+//!   carries the policy into every accept loop
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::Full;
@@ -35,9 +38,22 @@ use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::env_config::FrontendProxyProtocolMode as Mode;
 use ferrum_edge::config::types::{GatewayConfig, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::proxy::frontend_proxy_protocol::{FrontendProxyListener, FrontendProxyProtocol};
+use ferrum_edge::proxy::frontend_proxy_protocol::{
+    FrontendProxyListener, FrontendProxyProtocol, global_listener_policies,
+};
 use ferrum_edge::proxy::proxy_protocol::encode_v2_proxy_header;
-use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener_and_proxy_protocol};
+use ferrum_edge::proxy::{
+    ProxyState, start_global_proxy_listener_with_dynamic_tls_and_signal,
+    start_proxy_listener_with_bound_listener_and_proxy_protocol,
+};
+use ferrum_edge::tls::SharedFrontendTls;
+
+#[path = "../../scaffolding/port_registry.rs"]
+#[allow(dead_code)] // shared allocator; this target uses only the lease API
+mod port_registry;
+#[allow(dead_code)]
+#[path = "../../scaffolding/ports.rs"]
+mod ports;
 
 /// Upper bound for any single expected outcome. The header deadline is 5s, so
 /// a stalled-header close must land inside this window too.
@@ -47,6 +63,11 @@ const V2_SIG: &[u8; 12] = b"\r\n\r\n\x00\r\nQUIT\n";
 /// First bytes of a direct client's TLS ClientHello (handshake record, TLS 1.0
 /// record version, then the ClientHello message type); not a PROXY signature.
 const TLS_RECORD_PREFIX: &[u8] = &[0x16, 0x03, 0x01, 0x00, 0x05, 0x01];
+/// Accept loops sharing one listen socket in the multi-loop test.
+const ACCEPT_THREADS: usize = 4;
+/// Connections per scenario in the multi-loop test, so each accept loop is
+/// likely to take at least one of them.
+const ACCEPT_LOOP_PROBES: usize = 16;
 
 struct Backend {
     port: u16,
@@ -118,25 +139,7 @@ impl Gateway {
         trusted_proxies: &str,
         tls_config: Option<Arc<rustls::ServerConfig>>,
     ) -> Self {
-        let (http_mode, https_mode) = match listener_kind {
-            FrontendProxyListener::Http => (mode, Mode::Off),
-            FrontendProxyListener::Https => (Mode::Off, mode),
-        };
-        let env = EnvConfig {
-            mode: ferrum_edge::config::env_config::OperatingMode::File,
-            log_level: "error".into(),
-            proxy_http_port: 0,
-            proxy_https_port: 0,
-            admin_http_port: 0,
-            admin_https_port: 0,
-            max_connections: 0,
-            shutdown_drain_seconds: 1,
-            trusted_proxies: trusted_proxies.to_string(),
-            frontend_proxy_protocol_http: http_mode,
-            frontend_proxy_protocol_https: https_mode,
-            frontend_proxy_protocol_trusted_cidrs: trusted_cidrs.to_string(),
-            ..EnvConfig::default()
-        };
+        let env = listener_env(listener_kind, mode, trusted_cidrs, trusted_proxies);
         let policy = FrontendProxyProtocol::for_listener(&env, listener_kind)
             .expect("valid PROXY protocol policy");
         assert_eq!(
@@ -144,25 +147,7 @@ impl Gateway {
             mode.is_enabled(),
             "a policy exists exactly when the listener enables PROXY protocol"
         );
-
-        let proxy: Proxy = serde_json::from_value(json!({
-            "id": "pp-listener",
-            "listen_path": "/pp",
-            "backend_scheme": "http",
-            "backend_host": "127.0.0.1",
-            "backend_port": backend_port,
-            "strip_listen_path": false
-        }))
-        .expect("test proxy");
-        let config = GatewayConfig {
-            version: "1".to_string(),
-            proxies: vec![proxy],
-            loaded_at: Utc::now(),
-            ..GatewayConfig::default()
-        };
-        let state = ProxyState::new(config, DnsCache::new(DnsConfig::default()), env, None, None)
-            .expect("proxy state")
-            .0;
+        let state = proxy_state(backend_port, env);
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -214,6 +199,57 @@ impl Gateway {
         let _ = self.shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(5), self.server).await;
     }
+}
+
+/// `EnvConfig` for one global proxy listener. `mode` / `trusted_cidrs` feed the
+/// same fields the env vars do.
+fn listener_env(
+    listener_kind: FrontendProxyListener,
+    mode: Mode,
+    trusted_cidrs: &str,
+    trusted_proxies: &str,
+) -> EnvConfig {
+    let (http_mode, https_mode) = match listener_kind {
+        FrontendProxyListener::Http => (mode, Mode::Off),
+        FrontendProxyListener::Https => (Mode::Off, mode),
+    };
+    EnvConfig {
+        mode: ferrum_edge::config::env_config::OperatingMode::File,
+        log_level: "error".into(),
+        proxy_http_port: 0,
+        proxy_https_port: 0,
+        admin_http_port: 0,
+        admin_https_port: 0,
+        max_connections: 0,
+        shutdown_drain_seconds: 1,
+        trusted_proxies: trusted_proxies.to_string(),
+        frontend_proxy_protocol_http: http_mode,
+        frontend_proxy_protocol_https: https_mode,
+        frontend_proxy_protocol_trusted_cidrs: trusted_cidrs.to_string(),
+        ..EnvConfig::default()
+    }
+}
+
+/// Proxy state with one route, `/pp`, to the echo backend on `backend_port`.
+fn proxy_state(backend_port: u16, env: EnvConfig) -> ProxyState {
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "pp-listener",
+        "listen_path": "/pp",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": backend_port,
+        "strip_listen_path": false
+    }))
+    .expect("test proxy");
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![proxy],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    ProxyState::new(config, DnsCache::new(DnsConfig::default()), env, None, None)
+        .expect("proxy state")
+        .0
 }
 
 fn v1_header(src: &str) -> Vec<u8> {
@@ -624,5 +660,93 @@ async fn https_listener_refuses_a_client_hello_without_a_header() {
     assert_eq!(backend.requests.load(Ordering::SeqCst), 0);
 
     gateway.shutdown().await;
+    backend.task.abort();
+}
+
+/// Start the global HTTPS listener the way the database and DP modes do: bound
+/// by address through the dynamic-TLS entry point, with [`ACCEPT_THREADS`]
+/// accept loops sharing the socket and the policy from
+/// `global_listener_policies`.
+async fn start_dynamic_tls_gateway(
+    backend_port: u16,
+    trusted_cidrs: &str,
+    tls_config: Arc<rustls::ServerConfig>,
+) -> Gateway {
+    let env = EnvConfig {
+        accept_threads: ACCEPT_THREADS,
+        ..listener_env(FrontendProxyListener::Https, Mode::V2, trusted_cidrs, "")
+    };
+    let policy = global_listener_policies(&env)
+        .expect("valid PROXY protocol policies")
+        .https;
+    assert!(policy.is_some(), "the HTTPS listener enables PROXY protocol");
+    let state = proxy_state(backend_port, env);
+    let slot: SharedFrontendTls = Arc::new(ArcSwap::new(Arc::new(Some(tls_config))));
+
+    for attempt in 1..=5 {
+        let port = ports::reserve_port()
+            .await
+            .expect("reserve proxy port")
+            .drop_and_take_port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(start_global_proxy_listener_with_dynamic_tls_and_signal(
+            addr,
+            state.clone(),
+            shutdown_rx,
+            Arc::clone(&slot),
+            policy.clone(),
+            Some(started_tx),
+        ));
+        if let Ok(Ok(())) = tokio::time::timeout(WINDOW, started_rx).await {
+            return Gateway {
+                addr,
+                shutdown_tx,
+                server,
+            };
+        }
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        eprintln!("dynamic-TLS listener attempt {attempt} did not start; retrying");
+    }
+    panic!("dynamic-TLS listener did not bind after retries");
+}
+
+/// The database and DP modes serve HTTPS through
+/// `start_global_proxy_listener_with_dynamic_tls_and_signal` with several
+/// accept loops. Whichever loop accepts a connection must enforce the policy:
+/// a trusted balancer's header source becomes the client, and an untrusted
+/// peer is dropped without a response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_tls_listener_enforces_the_policy_on_every_accept_loop() {
+    let backend = start_echo_backend().await;
+    let (tls_config, ca_pem) = frontend_tls_pair();
+
+    let gateway = start_dynamic_tls_gateway(backend.port, "127.0.0.1", tls_config.clone()).await;
+    for i in 0..ACCEPT_LOOP_PROBES {
+        let client = format!("203.0.113.{}", i + 1);
+        let header = v2_header(&client);
+        let mut tls = tls_connect_after_header(gateway.addr, &ca_pem, &header).await;
+        send(&mut tls, &get_request("")).await;
+        let response = read_response(&mut tls).await;
+        assert_ok_with_xff(&response, &client);
+    }
+    gateway.shutdown().await;
+
+    let gateway = start_dynamic_tls_gateway(backend.port, "10.0.0.0/8", tls_config).await;
+    for _ in 0..ACCEPT_LOOP_PROBES {
+        let mut stream = gateway.connect().await;
+        // The write may already fail against the dropped socket; the read decides.
+        let _ = stream.write_all(&v2_header(CLIENT)).await;
+        assert_closed_without_response(&mut stream, "untrusted peer, dynamic TLS").await;
+    }
+    gateway.shutdown().await;
+
+    assert_eq!(
+        backend.requests.load(Ordering::SeqCst),
+        ACCEPT_LOOP_PROBES,
+        "only the trusted balancer's connections reach the backend"
+    );
     backend.task.abort();
 }
