@@ -7314,6 +7314,12 @@ struct RequestConnectionMetadata {
     /// own downstream writes (native HTTP/3).
     authorization_connection_closer:
         Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
+    /// This request's diagnostic-reference slot (issue #5767), set by
+    /// [`handle_proxy_request_on_frontend_port`] only when
+    /// `FERRUM_DIAGNOSTIC_REFS` enabled the store. The request context carries
+    /// it to the terminal transaction log, which records the detail the
+    /// response's reference resolves to.
+    diagnostic_slot: Option<Arc<crate::diagnostic_ref::DiagnosticSlot>>,
 }
 
 static H1_FRAMING_OBSERVER_FAILED_WARN: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter =
@@ -14567,6 +14573,7 @@ async fn handle_connection(
             // a CRL or client-CA withdrawal could revoke.
             client_trust_session: None,
             authorization_connection_closer: Some(authorization_closer.clone()),
+            diagnostic_slot: None,
         };
         async move {
             let mut response = handle_proxy_request_on_frontend_port(
@@ -22797,6 +22804,7 @@ async fn handle_tls_connection(
             websocket_shutdown_rx: Some(websocket_shutdown_rx.clone()),
             client_trust_session: client_trust_session.clone(),
             authorization_connection_closer: Some(authorization_closer.clone()),
+            diagnostic_slot: None,
         };
         async move {
             let mut response = handle_proxy_request_on_frontend_port(
@@ -23052,7 +23060,10 @@ async fn log_rejected_request_with_path_and_backend_state(
     request_path_override: Option<&str>,
     include_backend_target: bool,
 ) {
-    if plugins.is_empty() {
+    // With no plugin there is no log consumer, unless a gateway diagnostic
+    // reference (issue #5767) will resolve to this rejection's detail.
+    let diagnostic_detail_wanted = ctx.diagnostic_slot().is_some() && status_code >= 500;
+    if plugins.is_empty() && !diagnostic_detail_wanted {
         return;
     }
 
@@ -30958,8 +30969,58 @@ pub async fn handle_proxy_request(
     .await
 }
 
+/// HTTP/1.1 and HTTP/2 frontend service boundary: every response the gateway
+/// hands hyper for a proxy-port request passes through here, including the
+/// admission fences that answer before routing.
+///
+/// Gateway diagnostic references (issue #5767) are stamped here, after every
+/// builder, hook, and policy phase, so the reference is the last word on the
+/// response head and no earlier phase can forge, replace, or duplicate it. With
+/// `FERRUM_DIAGNOSTIC_REFS=off` (the default) this is one `OnceLock` load plus
+/// one header removal: the header is gateway-owned either way, so a plugin- or
+/// hook-written copy never reaches the client.
 #[allow(clippy::too_many_arguments)]
 async fn handle_proxy_request_on_frontend_port(
+    req: Request<Incoming>,
+    state: Arc<ProxyState>,
+    remote_addr: SocketAddr,
+    is_tls: bool,
+    tls_client_cert_der: Option<Arc<Vec<u8>>>,
+    tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
+    mut connection_metadata: RequestConnectionMetadata,
+) -> Result<Response<ProxyBody>, hyper::Error> {
+    let diagnostic = crate::diagnostic_ref::RequestDiagnostic::begin(
+        crate::diagnostic_ref::DiagnosticProtocol::from_http_version(req.version()),
+    );
+    connection_metadata.diagnostic_slot = diagnostic.as_ref().map(|diagnostic| diagnostic.slot());
+    let response = admit_proxy_request_on_frontend_port(
+        req,
+        state,
+        remote_addr,
+        is_tls,
+        tls_client_cert_der,
+        tls_client_cert_chain_der,
+        mtls_auth_connection_cache,
+        connection_metadata,
+    )
+    .await;
+    response.map(|mut resp| {
+        match &diagnostic {
+            Some(diagnostic) => {
+                let status = resp.status().as_u16();
+                diagnostic.stamp(status, resp.headers_mut());
+            }
+            None => crate::diagnostic_ref::strip_response_header(resp.headers_mut()),
+        }
+        resp
+    })
+}
+
+/// Connection-scoped and process-wide admission fences, then the routed
+/// request pipeline. Only [`handle_proxy_request_on_frontend_port`] calls this.
+#[allow(clippy::too_many_arguments)]
+async fn admit_proxy_request_on_frontend_port(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
     remote_addr: SocketAddr,
@@ -31248,6 +31309,7 @@ async fn handle_proxy_request_inner(
     ctx.websocket_shutdown_rx = connection_metadata.websocket_shutdown_rx;
     ctx.client_trust_session = connection_metadata.client_trust_session;
     ctx.authorization_connection_closer = connection_metadata.authorization_connection_closer;
+    ctx.set_diagnostic_slot(connection_metadata.diagnostic_slot);
     if let Some(identity) = connection_metadata.node_waypoint_identity {
         // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
         // identity is the authenticated source workload for policy. It
@@ -40785,7 +40847,14 @@ async fn handle_proxy_request_inner(
     // five times and dropped — at the cost of an rfc3339 timestamp string, a
     // `clone_log_metadata` projection, and a handful of owned clones per
     // request (issue #5537).
-    let terminal_summary_has_no_consumer = plugins.is_empty() && ctx.mirror_result_rxs.is_empty();
+    //
+    // A gateway diagnostic reference (issue #5767) resolves to this summary, so
+    // with references on, a response that can carry `X-Gateway-Error` has a
+    // consumer even when no plugin or mirror does.
+    let diagnostic_detail_wanted = ctx.diagnostic_slot().is_some()
+        && (response_status >= 500 || backend_resp.connection_error);
+    let terminal_summary_has_no_consumer =
+        plugins.is_empty() && ctx.mirror_result_rxs.is_empty() && !diagnostic_detail_wanted;
     // A streaming response still owes the runtime metrics its terminal
     // accounting after the body ends. Hand the body a compact terminal that
     // records exactly what the summary path would have recorded, without the
@@ -40799,7 +40868,10 @@ async fn handle_proxy_request_inner(
         terminal_summary_has_no_consumer && !body_will_stream && backend_error_class.is_some();
     let needs_transaction_summary = !compact_terminal_only
         && !buffered_terminal_outcome_only
-        && (!plugins.is_empty() || body_will_stream || backend_error_class.is_some());
+        && (!plugins.is_empty()
+            || body_will_stream
+            || backend_error_class.is_some()
+            || diagnostic_detail_wanted);
     // A streaming terminal's summary is captured here, at header commit, but
     // its logger is built at the very end of this function: the logger owns a
     // `RequestContext`, and every remaining handler read of `ctx` happens

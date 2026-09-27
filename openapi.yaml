@@ -205,6 +205,8 @@ tags:
     description: CP/DP cluster status and operational introspection
   - name: Backend Capabilities
     description: Inspect and force-refresh the per-backend-target protocol classification cache (H1/H2/H3/h2c/gRPC)
+  - name: Diagnostics
+    description: Resolve opaque gateway diagnostic references (X-Ferrum-Diagnostic-Ref) to scoped, operator-only detail
   - name: Node-Waypoint
     description: Inspect the per-pod identity index used by node-waypoint topology (mesh-only)
   - name: Service-Waypoint
@@ -2472,6 +2474,126 @@ paths:
                     type: string
 
   # ── Node-Waypoint identities (mesh NodeWaypoint topology) ───────────
+  /diagnostics/v1/refs/{ref}:
+    get:
+      operationId: getDiagnosticRef
+      summary: Resolve a gateway diagnostic reference
+      description: |
+        Resolves an opaque `X-Ferrum-Diagnostic-Ref` value to the gateway-owned
+        detail behind it (issue #5767). With `FERRUM_DIAGNOSTIC_REFS=errors`,
+        every HTTP/1.1, HTTP/2, and HTTP/3 proxy response that carries the
+        gateway's own `X-Gateway-Error` token also carries a reference of the
+        form `fd1_` plus 32 lowercase hex digits (128 CSPRNG bits). The
+        reference embeds nothing; the detail is retained only in the memory of
+        the gateway process that served the response, for
+        `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900) and at most
+        `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` references (oldest evicted first).
+        Query the admin listener of that same process.
+
+        **Authorization.** A valid admin JWT is required (`401` otherwise), and
+        it must carry both the `diagnostics:read` scope (a `scope` claim that is
+        an OAuth 2.0 space-delimited string or an array of strings; the admin
+        `role` never implies it) and an `ns` claim (`403` otherwise). These two
+        checks depend only on the credential, never on the reference. The
+        `X-Ferrum-Namespace` header is ignored.
+
+        **No probing.** A malformed, unknown, expired, or evicted reference, a
+        reference minted for a namespace the token's `ns` claim does not name,
+        and every reference while the feature is off all answer the same
+        `404`.
+
+        **Rate limit and audit.** Every attempt is charged against its JWT
+        `sub`'s share of the lookup budget before the credential checks,
+        including one then refused with `403`; one `sub` may use at most half
+        of `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10, at
+        least 1) per second. Only an attempt whose credential carries the
+        `diagnostics:read` scope and an `ns` claim is also charged against the
+        global per-second budget, so refused credentials cannot exhaust it;
+        `429` with `Retry-After: 1` above either. Every `200` and `404` emits one WARN-level
+        `audit.event = "diagnostic_ref_lookup"` event naming the JWT subject,
+        the reference (or `malformed`), and the result; `403` and `429` events
+        are throttled to one per second each and carry
+        `suppressed_since_last`. `ferrum_diagnostic_ref_lookups_total{result}`
+        counts every attempt.
+
+        The response is versioned by `schema_version`. It never contains
+        request or response bodies, headers, paths, query strings,
+        credentials, client addresses, or raw error text.
+      tags: [Diagnostics]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: ref
+          in: path
+          required: true
+          description: The `X-Ferrum-Diagnostic-Ref` value.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Reference resolved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagnosticRefLookup"
+              examples:
+                connection_failure:
+                  summary: A DNS failure behind a `connection_failure` token
+                  value:
+                    schema_version: ferrum.diagnostic_ref.v1
+                    ref: fd1_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
+                    namespace: ferrum
+                    created_at: "2026-09-27T10:15:02.114Z"
+                    expires_at: "2026-09-27T10:30:02.114Z"
+                    protocol: http2
+                    status: 502
+                    gateway_error: connection_failure
+                    detail_available: true
+                    detail:
+                      error_class: dns_lookup_error
+                      body_error_class: null
+                      rejection_phase: null
+                      route_timeout_phase: null
+                      backend_dispatch: pre_wire_failure
+                      proxy_id: orders-api
+                      backend_target: "https://orders.internal:8443"
+                      duration_bucket: lt_100ms
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            The admin JWT lacks the `diagnostics:read` scope or carries no `ns`
+            claim. The attempt still counts against the lookup rate limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: |
+            Malformed, unknown, expired, or evicted reference; a reference
+            outside the token's namespaces; or diagnostic references are off.
+            All cases answer identically.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: |
+            Lookup rate limit exceeded, globally or for this JWT `sub`; retry
+            after the indicated delay.
+          headers:
+            Retry-After:
+              description: Always `1`.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
   /node-waypoint/identities:
     get:
       operationId: getNodeWaypointIdentities
@@ -37291,6 +37413,126 @@ components:
             class preserves that classification instead of downgrading
             it (the record is then intentionally stale).
 
+    DiagnosticRefLookup:
+      type: object
+      description: |
+        Versioned diagnostic reference detail (`schema_version`
+        `ferrum.diagnostic_ref.v1`). Additive fields may appear within a
+        schema version; a breaking change bumps it.
+      required:
+        - schema_version
+        - ref
+        - namespace
+        - created_at
+        - expires_at
+        - protocol
+        - status
+        - gateway_error
+        - detail_available
+        - detail
+      properties:
+        schema_version:
+          type: string
+          enum: [ferrum.diagnostic_ref.v1]
+        ref:
+          type: string
+          pattern: "^fd1_[0-9a-f]{32}$"
+          description: The resolved reference.
+        namespace:
+          type: string
+          description: Data-plane namespace of the gateway that minted the reference.
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: When the reference stops resolving (earlier if evicted).
+        protocol:
+          type: string
+          enum: [http1, http2, http3]
+          description: Client-facing protocol of the response that carried the reference.
+        status:
+          type: integer
+          minimum: 100
+          maximum: 599
+          description: Client-visible HTTP status of that response.
+        gateway_error:
+          type: string
+          enum:
+            - connection_failure
+            - backend_timeout
+            - backend_error
+            - circuit_breaker_open
+            - overload
+            - config_stale
+            - concurrency_limit
+            - request_timeout
+          description: The public `X-Gateway-Error` token of that response.
+        detail_available:
+          type: boolean
+          description: |
+            `false` until the request's terminal transaction record exists (a
+            streamed response records it when its body ends), and for the
+            gateway admission fences (overload, stale configuration) that answer
+            before a request context exists.
+        detail:
+          oneOf:
+            - $ref: "#/components/schemas/DiagnosticRefDetail"
+            - type: "null"
+    DiagnosticRefDetail:
+      type: object
+      description: |
+        Operator-only detail copied from the request's terminal transaction
+        record. Every string is a closed vocabulary or operator configuration.
+      required:
+        - error_class
+        - body_error_class
+        - rejection_phase
+        - route_timeout_phase
+        - backend_dispatch
+        - proxy_id
+        - backend_target
+        - duration_bucket
+      properties:
+        error_class:
+          type: [string, "null"]
+          description: |
+            Granular backend dispatch classification, as the access log names
+            it (for example `dns_lookup_error`, `connection_refused`,
+            `tls_error`, `read_write_timeout`).
+        body_error_class:
+          type: [string, "null"]
+          description: Classification of a failure while streaming the response body.
+        rejection_phase:
+          type: [string, "null"]
+          enum:
+            - circuit_breaker_open
+            - concurrency_limit
+            - overload
+            - config_stale
+            - null
+          description: Gateway rejection phase, when the gateway refused the request itself.
+        route_timeout_phase:
+          type: [string, "null"]
+          enum: [before_dispatch, dispatch, retry_backoff, null]
+          description: Phase of a route rule's total request deadline that produced a `504`.
+        backend_dispatch:
+          type: string
+          enum: [not_dispatched, pre_wire_failure, ambiguous_failure, backend_response]
+          description: Whether and how far the request reached a backend.
+        proxy_id:
+          type: [string, "null"]
+          description: ID of the matched proxy.
+        backend_target:
+          type: [string, "null"]
+          description: |
+            Backend origin (`scheme://host:port`) the request was dispatched
+            to. Userinfo, path, query, and fragment are removed.
+        duration_bucket:
+          type: string
+          enum: [lt_10ms, lt_100ms, lt_1s, lt_10s, ge_10s, unknown]
+          description: Coarse total request duration.
     BackendCapabilitiesResponse:
       type: object
       required: [entries]

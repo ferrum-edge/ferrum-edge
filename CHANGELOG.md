@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Gateway-owned diagnostic references (#5767). With the new
+  `FERRUM_DIAGNOSTIC_REFS=errors` (default `off`), every HTTP/1.1, HTTP/2, and
+  HTTP/3 response that carries the gateway's own `X-Gateway-Error` token also
+  carries an opaque `X-Ferrum-Diagnostic-Ref: fd1_<32 hex>` header: 128 bits
+  from the process CSPRNG with no embedded cause, route, backend, or tenant.
+  An operator tool resolves it with the new admin
+  `GET /diagnostics/v1/refs/{ref}`, which requires an admin JWT carrying the
+  `diagnostics:read` scope and an `ns` claim. The versioned body
+  (`ferrum.diagnostic_ref.v1`) names the precise `error_class`, how far the
+  request reached a backend, the route-deadline or rejection phase, the
+  matched proxy, the backend origin, and a duration bucket. It never carries
+  bodies, headers, paths, credentials, or raw error text. A reference outside
+  the token's namespaces answers `404` like an unknown one. Every lookup
+  attempt, including one refused with `403`, is charged to its JWT `sub`'s
+  share (half of `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND`, default 10);
+  only an attempt whose credential passes the scope and `ns` checks also
+  spends the global budget, so refused credentials cannot lock out operators.
+  Every attempt is audit-logged (refused and rate-limited events throttled to
+  one per second). References live only in process
+  memory (roughly 0.5–1 KB each), bounded by
+  `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900) and
+  `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` (default 10000, oldest evicted first),
+  with four new `ferrum_diagnostic_ref*` families on `/metrics`. The public
+  eight-token `X-Gateway-Error` vocabulary is unchanged.
+
 - **Inbound PROXY protocol on the HTTP/HTTPS proxy listeners** (#5768). The
   new `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` and
   `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS` settings (`off` by default, or `v1`,
@@ -41,6 +66,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `X-Ferrum-Diagnostic-Ref` is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS`
+  says (#5767): a backend or serverless-function copy, in the headers or the
+  trailers, is stripped at every backend response boundary, as
+  `X-Gateway-Error` already is (#5759), and a plugin- or hook-written copy is
+  stripped at the final client boundary, so neither a backend nor a plugin can
+  pre-seed or forge a reference.
 - WAF normalization now matches the decoders protected backends run, closing
   three encoding bypasses. JSON / JavaScript single-character string escapes
   (`\t`, `\n`, `\r`, `\f`, `\b`, `\v`, `\/`, `\"`, `\'`, `\\`) are
@@ -52,6 +83,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PHP, Express `cookie-parser`, and Rails unescape cookie values before binding
   them; the header is split on `;` first, so an encoded `%3B` cannot forge an
   extra crumb.
+
+### Performance
+
+- **PROXY v1 header read on the HTTP/HTTPS proxy listeners and stream
+  proxies** (#5839). A listener with inbound PROXY protocol in `v1` or `auto`
+  mode, and a TCP stream proxy with `stream_proxy_protocol`, now peeks the v1
+  line and consumes it with one exact-length read, instead of one read per
+  byte (up to about 100 syscalls per connection). Only the header is consumed;
+  the TLS ClientHello, HTTP request, or stream payload that follows it is left
+  for the next reader. Size limit, 5-second deadline, and refusal behavior are
+  unchanged.
 
 ## [0.9.8] - 2026-09-27
 

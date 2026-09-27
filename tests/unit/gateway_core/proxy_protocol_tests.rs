@@ -6,9 +6,12 @@
 
 use ferrum_edge::proxy::proxy_protocol::{
     AcceptedProxyVersions, ProxyProtocolError, ProxyProtocolResult, apply_proxy_result,
-    read_proxy_header, read_proxy_header_accepting,
+    read_proxy_header, read_proxy_header_accepting, read_proxy_header_accepting_tcp, v1_line_end,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 // Helper: feed raw bytes into read_proxy_header
 async fn parse_bytes(data: &[u8]) -> Result<ProxyProtocolResult, ProxyProtocolError> {
@@ -541,4 +544,316 @@ async fn any_accepts_both_versions_and_matches_read_proxy_header() {
     }
     let (result, _) = parse_accepting(b"GET / HTTP/1.1\r\n", AcceptedProxyVersions::Any).await;
     assert!(matches!(result, Err(ProxyProtocolError::InvalidSignature)));
+}
+
+// ── Peek-based v1 reads on a raw TcpStream (issue #5839) ──────────────────────
+
+/// A connected loopback pair: `(client, accepted)`. The client writes the
+/// PROXY header; the accepted side is what the listener parses.
+async fn tcp_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("listener addr");
+    let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    let client = client.expect("connect");
+    client.set_nodelay(true).expect("nodelay");
+    (client, accepted.expect("accept").0)
+}
+
+async fn parse_tcp(
+    stream: &mut TcpStream,
+    accepted: AcceptedProxyVersions,
+) -> Result<ProxyProtocolResult, ProxyProtocolError> {
+    read_proxy_header_accepting_tcp(stream, Some(2), accepted).await
+}
+
+/// Everything left in `stream` after the header: the client must have shut
+/// down its write half so this terminates.
+async fn remaining_bytes(stream: &mut TcpStream) -> Vec<u8> {
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest))
+        .await
+        .expect("remaining bytes within the deadline")
+        .expect("read remaining bytes");
+    rest
+}
+
+fn assert_v1_tcp4_forwarded(result: Result<ProxyProtocolResult, ProxyProtocolError>) {
+    match result {
+        Ok(ProxyProtocolResult::Forwarded { src, dst }) => {
+            assert_eq!(src, "192.168.1.50:12345".parse::<SocketAddr>().unwrap());
+            assert_eq!(dst, "192.168.1.1:80".parse::<SocketAddr>().unwrap());
+        }
+        other => panic!("expected Forwarded, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tcp_v1_header_in_one_segment_leaves_following_request_bytes() {
+    let (mut client, mut server) = tcp_pair().await;
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let mut segment = V1_TCP4.to_vec();
+    segment.extend_from_slice(request);
+    client.write_all(&segment).await.unwrap();
+    client.shutdown().await.unwrap();
+
+    assert_v1_tcp4_forwarded(parse_tcp(&mut server, AcceptedProxyVersions::V1Only).await);
+    assert_eq!(
+        remaining_bytes(&mut server).await,
+        request,
+        "request bytes after the CRLF must stay in the socket for Hyper"
+    );
+}
+
+#[tokio::test]
+async fn tcp_v1_header_leaves_a_following_client_hello_untouched() {
+    let (mut client, mut server) = tcp_pair().await;
+    // TLS handshake record header + ClientHello type and a few body bytes.
+    let client_hello = [0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x03];
+    let mut segment = V1_TCP4.to_vec();
+    segment.extend_from_slice(&client_hello);
+    client.write_all(&segment).await.unwrap();
+    client.shutdown().await.unwrap();
+
+    assert_v1_tcp4_forwarded(parse_tcp(&mut server, AcceptedProxyVersions::Any).await);
+    assert_eq!(remaining_bytes(&mut server).await, client_hello);
+}
+
+#[tokio::test]
+async fn tcp_v1_header_split_across_delayed_writes() {
+    let (mut client, mut server) = tcp_pair().await;
+    let request = b"GET / HTTP/1.1\r\n\r\n";
+    let writer = tokio::spawn(async move {
+        // Split mid-token, then between CR and LF, with the request riding in
+        // the same write as the final LF.
+        let (head, lf) = V1_TCP4.split_at(V1_TCP4.len() - 1);
+        for chunk in [&head[..3], &head[3..9], &head[9..27], &head[27..]] {
+            client.write_all(chunk).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let mut last = lf.to_vec();
+        last.extend_from_slice(request);
+        client.write_all(&last).await.unwrap();
+        client.shutdown().await.unwrap();
+        client
+    });
+
+    assert_v1_tcp4_forwarded(parse_tcp(&mut server, AcceptedProxyVersions::V1Only).await);
+    assert_eq!(remaining_bytes(&mut server).await, request);
+    drop(writer.await.unwrap());
+}
+
+#[tokio::test]
+async fn tcp_v1_oversized_header_without_crlf_is_refused() {
+    let (mut client, mut server) = tcp_pair().await;
+    let mut oversized = b"PROXY UNKNOWN ".to_vec();
+    oversized.resize(200, b'x');
+    client.write_all(&oversized).await.unwrap();
+    client.shutdown().await.unwrap();
+
+    let err = parse_tcp(&mut server, AcceptedProxyVersions::V1Only)
+        .await
+        .expect_err("a line with no CRLF inside the cap must be refused");
+    assert!(matches!(err, ProxyProtocolError::V1TooLong), "{err:?}");
+    // Exactly the capped 109 bytes were consumed, as with the byte-wise reader.
+    assert_eq!(remaining_bytes(&mut server).await.len(), 200 - 109);
+}
+
+#[tokio::test]
+async fn tcp_v1_oversized_header_split_across_writes_is_refused() {
+    let (mut client, mut server) = tcp_pair().await;
+    let writer = tokio::spawn(async move {
+        client.write_all(b"PROXY UNKNOWN ").await.unwrap();
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if client.write_all(&[b'x'; 20]).await.is_err() {
+                break;
+            }
+        }
+        client
+    });
+
+    let err = parse_tcp(&mut server, AcceptedProxyVersions::Any)
+        .await
+        .expect_err("oversized line must be refused");
+    assert!(matches!(err, ProxyProtocolError::V1TooLong), "{err:?}");
+    drop(server);
+    drop(writer.await.unwrap());
+}
+
+#[tokio::test]
+async fn tcp_v1_exact_max_length_accepted() {
+    let (mut client, mut server) = tcp_pair().await;
+    let mut header = b"PROXY UNKNOWN ".to_vec();
+    header.resize(107, b'x');
+    header.extend_from_slice(b"\r\nnext");
+    client.write_all(&header).await.unwrap();
+    client.shutdown().await.unwrap();
+
+    let result = parse_tcp(&mut server, AcceptedProxyVersions::V1Only).await;
+    assert!(
+        matches!(result, Ok(ProxyProtocolResult::NoAddress)),
+        "{result:?}"
+    );
+    assert_eq!(remaining_bytes(&mut server).await, b"next");
+}
+
+#[tokio::test]
+async fn tcp_v1_peer_close_mid_header_is_an_io_error() {
+    let (mut client, mut server) = tcp_pair().await;
+    client.write_all(b"PROXY TCP4 10.0.0.1 10.").await.unwrap();
+    client.shutdown().await.unwrap();
+
+    let err = parse_tcp(&mut server, AcceptedProxyVersions::V1Only)
+        .await
+        .expect_err("a truncated header must fail");
+    match err {
+        ProxyProtocolError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+        other => panic!("expected an UnexpectedEof I/O error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tcp_v1_peer_close_after_lone_cr_is_an_io_error() {
+    let (mut client, mut server) = tcp_pair().await;
+    let (head, _lf) = V1_TCP4.split_at(V1_TCP4.len() - 1);
+    client.write_all(head).await.unwrap();
+    client.shutdown().await.unwrap();
+
+    let err = parse_tcp(&mut server, AcceptedProxyVersions::V1Only)
+        .await
+        .expect_err("a header without its LF must fail");
+    assert!(matches!(err, ProxyProtocolError::Io(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn tcp_v1_stalled_partial_header_times_out() {
+    let (mut client, mut server) = tcp_pair().await;
+    client.write_all(b"PROXY TCP4 192.168.1.50").await.unwrap();
+
+    let started = std::time::Instant::now();
+    let err = read_proxy_header_accepting_tcp(&mut server, Some(1), AcceptedProxyVersions::V1Only)
+        .await
+        .expect_err("a stalled header must time out");
+    assert!(matches!(err, ProxyProtocolError::Timeout), "{err:?}");
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    drop(client);
+}
+
+#[tokio::test]
+async fn tcp_v1_deadline_is_total_across_peek_rounds() {
+    let (mut client, mut server) = tcp_pair().await;
+    // Every byte arrives well inside the deadline of the previous one, so only
+    // a deadline spanning the whole header (not one per peek) can fire.
+    let writer = tokio::spawn(async move {
+        client.write_all(b"PROXY TCP4 ").await.unwrap();
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if client.write_all(b"1").await.is_err() {
+                break;
+            }
+        }
+        client
+    });
+
+    let started = std::time::Instant::now();
+    let err = read_proxy_header_accepting_tcp(&mut server, Some(1), AcceptedProxyVersions::Any)
+        .await
+        .expect_err("a trickled header must hit the total deadline");
+    let elapsed = started.elapsed();
+    assert!(matches!(err, ProxyProtocolError::Timeout), "{err:?}");
+    assert!(elapsed >= Duration::from_millis(900), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(2500), "{elapsed:?}");
+    drop(server);
+    writer.abort();
+}
+
+#[test]
+fn v1_line_end_pairs_a_consumed_cr_with_a_new_lf() {
+    // Round one consumed through the CR; round two peeked only the LF.
+    let line = b"PROXY UNKNOWN\r\n";
+    assert_eq!(v1_line_end(line, 14, 15), Some(15));
+}
+
+#[test]
+fn v1_line_end_finds_crlf_entirely_in_new_bytes() {
+    let line = b"PROXY UNKNOWN\r\nGET / HTTP/1.1";
+    assert_eq!(v1_line_end(line, 6, 15), Some(15));
+    // Bytes after the terminator are never included in the line end.
+    assert_eq!(v1_line_end(line, 6, line.len()), Some(15));
+    assert_eq!(v1_line_end(line, 13, line.len()), Some(15));
+}
+
+#[test]
+fn v1_line_end_ignores_a_lone_cr() {
+    assert_eq!(v1_line_end(b"PROXY A\rB\r", 6, 10), None);
+    assert_eq!(v1_line_end(b"PROXY A\rB", 6, 9), None);
+    // A CR consumed earlier followed by a non-LF new byte is not a terminator.
+    assert_eq!(v1_line_end(b"PROXY A\rB", 8, 9), None);
+}
+
+#[test]
+fn v1_line_end_never_rematches_a_crlf_in_consumed_bytes() {
+    // The CRLF at 7..9 lies entirely in the consumed prefix.
+    let stale = b"PROXY A\r\nBC";
+    assert_eq!(v1_line_end(stale, 9, 11), None);
+    let later = b"PROXY A\r\nBC\r\n";
+    assert_eq!(v1_line_end(later, 9, 13), Some(13));
+}
+
+#[test]
+fn v1_line_end_without_new_bytes_is_none() {
+    let line = b"PROXY UNKNOWN\r\n";
+    assert_eq!(v1_line_end(line, 15, 15), None);
+    assert_eq!(v1_line_end(line, 14, 14), None);
+    assert_eq!(v1_line_end(line, 10, 4), None);
+    // `available` past the buffer is clamped rather than panicking.
+    assert_eq!(v1_line_end(line, 6, 500), Some(15));
+}
+
+#[tokio::test]
+async fn tcp_reader_matches_the_generic_reader() {
+    let mut exact_max = b"PROXY UNKNOWN ".to_vec();
+    exact_max.resize(107, b'x');
+    exact_max.extend_from_slice(b"\r\n");
+    let v2 = v2_header_tcp4([10, 0, 0, 1], [10, 0, 0, 2], 1000, 443);
+    let cases: Vec<Vec<u8>> = vec![
+        V1_TCP4.to_vec(),
+        b"PROXY TCP6 2001:db8::1 2001:db8::2 1000 443\r\n".to_vec(),
+        b"PROXY UNKNOWN\r\n".to_vec(),
+        b"PROXY TCP5 1.2.3.4 5.6.7.8 1 2\r\n".to_vec(),
+        b"PROXY TCP4 1.2.3.4 5.6.7.8 100\r\n".to_vec(),
+        b"PROXY TCP4 1.2.3.4 5.6.7.8 1 \xff\r\n".to_vec(),
+        b"PROXY \r\n".to_vec(),
+        exact_max,
+        v2,
+        b"GET / HTTP/1.1\r\n".to_vec(),
+    ];
+    for accepted in [
+        AcceptedProxyVersions::Any,
+        AcceptedProxyVersions::V1Only,
+        AcceptedProxyVersions::V2Only,
+    ] {
+        for case in &cases {
+            let (generic, generic_consumed) = parse_accepting(case, accepted).await;
+
+            let (mut client, mut server) = tcp_pair().await;
+            client.write_all(case).await.unwrap();
+            client.shutdown().await.unwrap();
+            let tcp = parse_tcp(&mut server, accepted).await;
+            let tcp_consumed = case.len() - remaining_bytes(&mut server).await.len();
+
+            assert_eq!(
+                format!("{tcp:?}"),
+                format!("{generic:?}"),
+                "outcome differs for {:?} ({accepted:?})",
+                String::from_utf8_lossy(case)
+            );
+            assert_eq!(
+                tcp_consumed as u64,
+                generic_consumed,
+                "consumed bytes differ for {:?} ({accepted:?})",
+                String::from_utf8_lossy(case)
+            );
+        }
+    }
 }

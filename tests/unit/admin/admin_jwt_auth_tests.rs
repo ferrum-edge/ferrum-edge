@@ -198,6 +198,47 @@ fn test_admin_role_claim_parses_and_requires_explicit_role() {
     );
 }
 
+/// Issue #5767: the `diagnostics:read` capability comes only from an explicit
+/// `scope` claim (OAuth 2.0 space-delimited string or string array). A
+/// malformed claim, a substring, or the `admin` role never grants it.
+#[test]
+fn test_scope_claim_grants_only_an_exact_listed_scope() {
+    let now = Utc::now();
+    let mut claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "diagnostics-reader".to_string(),
+        iat: now.timestamp(),
+        nbf: now.timestamp(),
+        exp: (now + Duration::seconds(1800)).timestamp(),
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({"role": "viewer", "scope": "config:read diagnostics:read"}),
+    };
+    assert!(claims.grants_scope("diagnostics:read"));
+    assert!(claims.grants_scope("config:read"));
+    assert!(!claims.grants_scope("diagnostics"));
+
+    claims.additional = json!({"role": "viewer", "scope": ["diagnostics:read"]});
+    assert!(claims.grants_scope("diagnostics:read"));
+
+    let denied = [
+        json!({"role": "admin"}),
+        json!({"role": "admin", "scope": null}),
+        json!({"role": "admin", "scope": "diagnostics:readwrite"}),
+        json!({"role": "admin", "scope": "Diagnostics:Read"}),
+        json!({"role": "admin", "scope": {"diagnostics:read": true}}),
+        json!({"role": "admin", "scope": [["diagnostics:read"]]}),
+        json!({"role": "admin", "scope": [7]}),
+        json!({"role": "admin", "scope": ""}),
+    ];
+    for additional in denied {
+        claims.additional = additional.clone();
+        assert!(
+            !claims.grants_scope("diagnostics:read"),
+            "{additional} must not grant diagnostics:read"
+        );
+    }
+}
+
 #[test]
 fn test_admin_role_claim_rejects_unknown_role() {
     let now = Utc::now();

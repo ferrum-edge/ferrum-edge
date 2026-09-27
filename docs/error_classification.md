@@ -318,8 +318,8 @@ Metrics and logs keep the granular class so PromQL and log alerts can split
 `port_exhaustion`. Values on every surface are compiled-in `&'static str` —
 never an error message, never a client- or backend-influenced string.
 
-`X-Gateway-Error` and `X-Gateway-Upstream-Status` are gateway-owned. Both
-names live in one shared list
+`X-Gateway-Error`, `X-Gateway-Upstream-Status`, and `X-Ferrum-Diagnostic-Ref`
+are gateway-owned. All three names live in one shared list
 ([`GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`](../src/proxy/headers.rs)).
 Every dispatch path strips a backend-supplied copy, in the response headers or
 the trailers, before any gateway value is written. That covers HTTP/1.1,
@@ -372,7 +372,8 @@ bodies. Only the HTTP header section carries the gateway's own token (see the
 [`grpc_web` plugin](plugins.md#grpc_web) for the pass-through relay).
 
 The headers are not authenticated, though: a client should trust them only on
-a response it received from a gateway it authenticated.
+a response it received from a gateway it authenticated. When a client needs to
+confirm what the gateway saw, use a diagnostic reference (below).
 
 ### Header tokens (`X-Gateway-Error`)
 
@@ -429,6 +430,83 @@ empty label. They are omitted from the access log in that case;
 `metadata.rejection_phase` still names the fence where there is one. Stream disconnects keep
 the granular `ErrorClass::as_str` values (19 compiled-in variants) and add
 that optional label on `ferrum_stream_disconnects_total`.
+
+## Gateway diagnostic references
+
+`X-Gateway-Error` stays coarse on purpose: one `connection_failure` covers DNS,
+TCP, TLS, pool, and egress-policy failures, and the precise class reaches only
+the access log. Diagnostic references (issue #5767) let an authorized operator
+tool resolve one specific response to the gateway's own detail without
+widening the public header surface. The feature is additive and off by
+default.
+
+**Enable.** Set `FERRUM_DIAGNOSTIC_REFS=errors` (see
+[configuration.md](configuration.md#observability)). Every HTTP/1.1, HTTP/2,
+and HTTP/3 response that carries the gateway's own `X-Gateway-Error` token then
+also carries:
+
+```
+X-Ferrum-Diagnostic-Ref: fd1_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
+```
+
+The value is `fd1_` plus 128 bits from the process CSPRNG in lowercase hex. It
+embeds nothing: no cause, route, backend, tenant, time, or counter. A response
+without an `X-Gateway-Error` token never carries a reference, and a request
+never carries two.
+
+**Ownership.** The header is gateway-owned whatever the setting. A backend or
+serverless-function copy, in the headers or the trailers, is stripped at every
+backend response boundary. The reference is stamped as the last step before the
+response head reaches the client — after every builder, plugin hook, and policy
+phase — and that final client boundary first removes any copy a plugin or hook
+wrote, even while the feature is off. A client therefore never sees a reference
+the gateway did not mint, and cannot pre-seed one.
+
+**Resolve.** `GET /diagnostics/v1/refs/{ref}` on the admin listener of the
+same gateway process (see [admin_api.md](admin_api.md#diagnostic-references)).
+It requires an admin JWT with the `diagnostics:read` scope and an `ns` claim
+that names the gateway's namespace. An unknown, expired, evicted, or
+out-of-namespace reference answers `404` indistinguishably. The versioned body
+(`schema_version: ferrum.diagnostic_ref.v1`) names the public token and status,
+the protocol, and — once the request's terminal transaction record exists —
+the granular `error_class`, the body-streaming class, the gateway rejection
+phase, the route-deadline phase, how far the request reached a backend
+(`not_dispatched`, `pre_wire_failure`, `ambiguous_failure`,
+`backend_response`), the matched `proxy_id`, the backend origin
+(`scheme://host:port`), and a coarse duration bucket. It never carries bodies,
+headers, paths, query strings, credentials, client addresses, or raw error
+text.
+
+**Bounds.** References live only in process memory, in 16 independently locked
+shards, for `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900). At most
+`FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` (default 10000) are retained; a full shard
+evicts its oldest reference. Each retained reference costs roughly 0.5–1 KB,
+so the default holds about 5–10 MB and the 1000000 maximum up to about
+0.5–1 GB. A restart forgets every reference. Lookup attempts are admitted at
+`FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) per second, with
+one JWT `sub` limited to half of that (at least 1). Every attempt counts
+against its `sub`'s share, including one refused with `403`; only an attempt
+whose credential passes the scope and `ns` checks also spends the global
+budget, so refused credentials cannot exhaust it. `429` answers above either
+budget. Each
+`200`/`404` emits one WARN-level `audit.event = "diagnostic_ref_lookup"` event;
+`403` and `429` events are throttled to one per second each. `/metrics` exports
+`ferrum_diagnostic_refs_minted_total`, `ferrum_diagnostic_refs_entries`,
+`ferrum_diagnostic_refs_evicted_total{reason}`, and
+`ferrum_diagnostic_ref_lookups_total{result}` while the feature is on.
+
+**Cost.** Off: one `OnceLock` load per HTTP-family request and one header
+removal per response head. On: one small
+shared slot per request; on a response that carries `X-Gateway-Error`, one
+CSPRNG read and one short shard-lock critical section. Detail is copied from
+the terminal transaction summary only for a 5xx or a classified dispatch error.
+
+**Not covered yet.** Gateway-authored responses without an `X-Gateway-Error`
+token (plugin `401`/`403`/`429` rejections, routing `404`s) carry no reference;
+there is no `all` mode. The detail records the final attempt's outcome, not a
+per-attempt history (TLS alert detail per retry, per-attempt timing). A
+reference resolves only on the gateway process that minted it; there is no
+cross-replica or CP-side lookup.
 
 ## Adding a new error path
 

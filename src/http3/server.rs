@@ -2192,7 +2192,7 @@ async fn handle_h3_connection(
                     };
                     match resolved {
                         Ok((req, stream)) => {
-                            if let Err(e) = handle_h3_request(
+                            let request = handle_h3_request(
                                 req,
                                 stream,
                                 state,
@@ -2209,9 +2209,14 @@ async fn handle_h3_connection(
                                 peer_connection,
                                 stream_client_trust,
                                 stream_shutdown,
-                            )
-                            .await
-                            {
+                            );
+                            tokio::pin!(request);
+                            // Gateway diagnostic references (issue #5767): the
+                            // request task carries its slot so every response
+                            // head written deep inside it is stamped. A
+                            // pass-through when the store is off (the default).
+                            let result = crate::diagnostic_ref::run_h3_request(request).await;
+                            if let Err(e) = result {
                                 error!("HTTP/3 request error: {}", e);
                             }
                         }
@@ -2548,6 +2553,9 @@ async fn handle_h3_request(
     // Carry the operator's response-body ceiling so the buffered representation
     // gate bounds its decompression by the same limit the wire path enforces.
     ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
+    // The task-scoped diagnostic-reference slot (issue #5767), so the terminal
+    // transaction log can record the detail this request's reference names.
+    ctx.set_diagnostic_slot(crate::diagnostic_ref::current_h3_slot());
     let mut request_scheme = "https";
     ctx.request_is_secure = true;
     ctx.metadata
@@ -10012,6 +10020,7 @@ async fn handle_h3_request(
                 &response_body,
             );
         }
+        let resp = crate::diagnostic_ref::stamp_h3_response(resp);
         let response_headers_sent = await_buffered_h3_write!(stream.send_response(resp));
         if response_headers_sent
             && !response_body.is_empty()
@@ -14376,6 +14385,7 @@ async fn dispatch_grpc_native_h3(
         grpc_deadline_at,
         auth_deadline_plan,
     );
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     let response_header_write = crate::http3::stream_util::await_response_write_before_deadline(
         response_header_write_bound.deadline(),
         send_half.send_response(resp),
@@ -16924,6 +16934,7 @@ async fn send_h3_response_with_recv_halt(
         .header("content-type", "application/json")
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     stream
         .send_data(Bytes::copy_from_slice(body.as_bytes()))
@@ -17151,6 +17162,7 @@ async fn send_h3_pre_sanitized_reject_response_with_recv_halt(
     let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 reject response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     // Callers that flow through `apply_reject_after_proxy_and_synthetic_body_hooks`
     // already applied shared HEAD/204/205/304 no-body preparation. Skip DATA
@@ -17847,6 +17859,7 @@ async fn send_h3_aggregate_sse_response(
     let deadline = aggregate_sse_bound.deadline().unwrap_or(body.deadline());
     let auth_latch = ctx.authorization_termination_latch();
     let auth_family = crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http;
+    let response = crate::diagnostic_ref::stamp_h3_response(response);
 
     let (headers_write, head_offered) =
         crate::http3::stream_util::await_offered_authorized_headers_write(
@@ -18050,6 +18063,7 @@ where
     let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC error response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     stream.finish().await?;
     Ok(())
@@ -18578,6 +18592,7 @@ where
             let framed_body = framed_body.clone();
             let resp = h3_framed_unary_initial_response(&normalized.headers)
                 .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC framed reject: {}", e))?;
+            let resp = crate::diagnostic_ref::stamp_h3_response(resp);
             stream.send_response(resp).await?;
             stream.send_data(framed_body).await?;
             let trailers =
@@ -18681,6 +18696,7 @@ where
     let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC reject response: {}", e))?;
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     stream.finish().await?;
     Ok(())
