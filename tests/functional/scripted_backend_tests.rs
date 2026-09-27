@@ -164,6 +164,19 @@ async fn backend_accepts_then_resets_maps_to_connection_reset() {
 
     let client = harness.http_client().expect("client");
     let result = client.get(&harness.proxy_url("/api/x")).await;
+    // The exact transport message varies across platforms and error phases.
+    let reset_signal = |logs: &str| {
+        logs.contains("reset")
+            || logs.contains("Reset")
+            || logs.contains("connection closed")
+            || logs.contains("request_error")
+            || logs.contains("Backend request failed")
+    };
+    // Wait for the non-blocking log writer to flush this one request; a
+    // single snapshot right after the response can miss the error line.
+    harness
+        .wait_for_log_contains(reset_signal, Duration::from_secs(3))
+        .await;
     let logs = require_logs(&harness);
     eprintln!(
         "RST fixture: port={backend_port} accepted={} resets={} step_errors={:?}\n{logs}",
@@ -181,14 +194,8 @@ async fn backend_accepts_then_resets_maps_to_connection_reset() {
         "fixture never executed Reset"
     );
 
-    // The exact transport message varies across platforms and error phases.
-    let observed = logs.contains("reset")
-        || logs.contains("Reset")
-        || logs.contains("connection closed")
-        || logs.contains("request_error")
-        || logs.contains("Backend request failed");
     assert!(
-        observed,
+        reset_signal(&logs),
         "expected reset/error signal in gateway logs:\n{logs}"
     );
 }

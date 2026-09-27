@@ -106,6 +106,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An HBONE relay that ends on a socket error now resets its HTTP/2 CONNECT
+  stream with `RST_STREAM(CONNECT_ERROR)` (RFC 9113 §8.5) instead of closing it
+  with a clean `END_STREAM` (#5781). This covers the byte-stream relay (for
+  example, a backend that resets the connection) and the datagram relay (a
+  `tunnel_read_error`, `tunnel_write_error`, `app_send_error`, or
+  `app_recv_error` ending). Before, the client could not tell a failed tunnel
+  from a normal close, and a truncated byte stream looked complete. A peer
+  close, idle expiry, write stall, relay timeout, or admission revocation still
+  ends the stream with `END_STREAM`. A byte-stream failure after the backend's
+  FIN was already relayed stays `END_STREAM`, because the stream's send side
+  has finished. Resetting an upgraded stream needs a vendored hyper 1.9.0
+  (`vendor/hyper-1.9.0-ferrum-patched/`) that adds
+  `Upgraded::reset_with_connect_error()`; see
+  `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/`.
 - With `FERRUM_DIAGNOSTIC_REFS=errors`, a response a plugin replayed or
   relayed as origin content no longer gets an `X-Ferrum-Diagnostic-Ref`, even
   when it carries an `X-Gateway-Error` token (#5860). For example, a

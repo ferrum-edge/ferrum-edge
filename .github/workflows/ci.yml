@@ -1716,6 +1716,21 @@ jobs:
           cargo test --manifest-path vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml --features full --lib ferrum_release_on_close_tests
           cargo test --manifest-path vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml --features full --test legacy_client
 
+      - name: Run vendored hyper upgraded-stream reset regressions
+        # An HBONE relay that ends on a socket error must reset its upgraded
+        # HTTP/2 CONNECT stream with RST_STREAM(CONNECT_ERROR) instead of the
+        # clean END_STREAM a drop sends (issue #5781). The module also checks
+        # that a plain drop and a completed shutdown still end the stream
+        # with END_STREAM. The vendored crate denies warnings under
+        # `all(test, feature = "full")`, so cap lints: a newer toolchain lint
+        # must not fail an unmodified upstream file. Its standalone lockfile
+        # resolves fresh, so pin h2 to the release the gateway ships.
+        env:
+          RUSTFLAGS: "--cap-lints=warn"
+        run: |
+          cargo update --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml -p h2 --precise 0.4.19
+          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset
+
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:

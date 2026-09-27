@@ -4386,11 +4386,20 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   terminator owns — ownership-scoped inventory, Sidecar-only loopback privilege —
   and ordinary UDP then screens concrete DNS answers immediately before dial,
   the same contract as the byte-stream relay),
-  and frames replies back. **How a destination relay ends (issue #5765):** the
-  CONNECT stream always closes with a clean HTTP/2 `END_STREAM` — hyper's
-  upgraded stream has no reset, and the framing has no error record — so the
-  client cannot tell a socket error from an idle or peer close. The gateway
-  records the difference instead: the transaction line carries
+  and frames replies back. **How a destination relay ends (issues #5765,
+  #5781):** a relay that ended on a socket error (`tunnel_read_error`,
+  `tunnel_write_error`, `app_send_error`, `app_recv_error`) resets the CONNECT
+  stream with `RST_STREAM(CONNECT_ERROR)` (RFC 9113 §8.5), so the client can
+  tell it from a normal close; every other ending closes it with a clean
+  HTTP/2 `END_STREAM`. The framing itself has no error record. The
+  byte-stream relay follows the same rule: a socket error on either side
+  resets the stream with `CONNECT_ERROR`, while a clean close, a timeout, or
+  a revocation ends it with `END_STREAM`. A reset is only possible while the
+  stream's send side is still open, so a failure after the relay already
+  half-closed the stream toward the client (the backend sent FIN first)
+  leaves that `END_STREAM` in place. Resetting needs a vendored hyper
+  (`docs/upstream-hyper-patches/`). The gateway also records why the relay
+  ended: the transaction line carries
   `hbone.udp.termination_reason` (`tunnel_closed`, `idle_timeout`, `revoked`,
   `tunnel_read_error`, `tunnel_write_error`, `tunnel_write_stalled`,
   `app_send_error`, or `app_recv_error`). Only `tunnel_closed` and
