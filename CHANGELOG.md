@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Gateway-terminated WebSocket `permessage-deflate`** (#5769). A new
+  `terminate` value for the per-proxy `websocket_permessage_deflate` field makes
+  the gateway an RFC 7692 endpoint on each leg: it answers the client's offer
+  itself (honoring `server_no_context_takeover` / `server_max_window_bits`),
+  sends the backend its own `permessage-deflate` offer, and the two legs
+  negotiate independently on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+  Extended CONNECT. Every message is inflated beneath the frame relay, so every
+  frame and body-inspecting plugin — the WAF WebSocket scanner included — sees
+  plaintext and none is refused, and it is re-deflated toward each leg that
+  negotiated compression after the plugins run. Control frames are never
+  compressed, fragmentation and context takeover are handled, and RSV1 misuse
+  fails the connection as before. Decompression is bounded: a compressed frame
+  may not exceed the frame ceiling, a frame may not inflate past it, and a
+  message may not inflate past the new
+  `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default `0`: the
+  reassembled-message ceiling); inflation stops one byte past a limit and the
+  session closes with 1009 (1007 for corrupt data). An invalid backend answer
+  refuses the upgrade with 502. `strip` (default) and `passthrough` are
+  unchanged and pay nothing. Stream proxies must keep `strip`. No schema change:
+  the existing `proxies.websocket_permessage_deflate` column stores the new
+  value. **Upgrade note:** a DP that predates `terminate` rejects a namespace
+  snapshot that uses it; upgrade every DP before enabling `terminate` on the CP.
+
 - **Diagnostic references for every gateway-authored error, with rejection and
   per-attempt detail** (#5846). `FERRUM_DIAGNOSTIC_REFS` takes a new `all`
   value: besides the responses `errors` already references (those carrying the

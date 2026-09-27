@@ -1,7 +1,7 @@
 //! `websocket_permessage_deflate` proxy field: serde shape, per-proxy field
 //! validation, and the plugin-graph admission gate that refuses `passthrough`
 //! whenever a plugin requiring the parsed WebSocket relay is effective on the
-//! proxy (issue #5769).
+//! proxy, while `terminate` keeps every plugin (issue #5769).
 
 use ferrum_edge::_test_support::{
     collect_rejecting_runtime_config_errors_for_test,
@@ -114,7 +114,7 @@ fn passthrough_round_trips_and_unknown_values_are_rejected() {
     let mode = rendered["websocket_permessage_deflate"].as_str();
     assert_eq!(mode, Some("passthrough"));
 
-    for bad in ["terminate", "Passthrough", ""] {
+    for bad in ["Terminate", "Passthrough", "deflate", ""] {
         let parsed = serde_json::from_value::<Proxy>(proxy_json(bad, &[]));
         assert!(parsed.is_err(), "{bad:?} must not deserialize");
     }
@@ -129,6 +129,68 @@ fn passthrough_round_trips_and_unknown_values_are_rejected() {
     assert_eq!(WebSocketPermessageDeflate::parse("deflate"), None);
     assert_eq!(passthrough.as_str(), "passthrough");
     assert_eq!(strip.as_str(), "strip");
+}
+
+#[test]
+fn terminate_round_trips_through_serde_and_the_sql_form() {
+    let proxy = proxy("terminate", &[]);
+    assert!(proxy.websocket_permessage_deflate.is_terminate());
+    assert!(!proxy.websocket_permessage_deflate.is_passthrough());
+    let rendered = serde_json::to_value(&proxy).expect("serialize proxy");
+    let mode = rendered["websocket_permessage_deflate"].as_str();
+    assert_eq!(mode, Some("terminate"));
+
+    let terminate = WebSocketPermessageDeflate::Terminate;
+    assert_eq!(terminate.as_str(), "terminate");
+    assert_eq!(
+        WebSocketPermessageDeflate::parse("terminate"),
+        Some(terminate)
+    );
+    assert_eq!(WebSocketPermessageDeflate::parse("Terminate"), None);
+}
+
+#[test]
+fn terminate_is_valid_on_http_proxies() {
+    let result = proxy("terminate", &[]).validate_fields();
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[test]
+fn terminate_is_rejected_on_stream_proxies() {
+    for scheme in [BackendScheme::Tcp, BackendScheme::Udp] {
+        let mut proxy = proxy("terminate", &[]);
+        proxy.listen_path = None;
+        proxy.backend_scheme = Some(scheme);
+        proxy.listen_port = Some(5432);
+        let errors = proxy.validate_fields().unwrap_err();
+        assert!(
+            mentions_field(&errors),
+            "{scheme:?} stream proxy must refuse terminate, got: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn terminate_keeps_every_frame_plugin() {
+    // Terminate inflates messages before the relay, so frame-parsing plugins
+    // (the WAF included) keep working and are never refused.
+    for name in [
+        "waf",
+        "ws_rate_limiting",
+        "ws_frame_logging",
+        "ws_message_size_limiting",
+    ] {
+        let global = plugin("global-1", name, "global", true);
+        let config = graph(proxy("terminate", &[]), vec![global]);
+        assert_admitted(&config);
+        let errors = collect_rejecting_runtime_config_errors_for_test(&config);
+        assert!(
+            !mentions_field(&errors),
+            "terminate next to {name} must load: {errors:?}"
+        );
+    }
+    let waf = plugin("waf-1", "waf", "proxy", true);
+    assert_admitted(&graph(proxy("terminate", &["waf-1"]), vec![waf]));
 }
 
 #[test]

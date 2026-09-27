@@ -36,6 +36,7 @@ A feature-by-feature summary of Ferrum Edge. Each item links to, or is detailed 
 - Per-proxy HTTP method filtering (`allowed_methods`) with 405 Method Not Allowed responses and terminal transaction logging (`rejection_phase: allowed_methods`)
 - Per-proxy WebSocket Origin validation (`allowed_ws_origins`) for CSWSH protection (RFC 6455 §10.2)
 - Opt-in per-proxy WebSocket `permessage-deflate` passthrough (`websocket_permessage_deflate: passthrough`, RFC 7692) on H1/H2/H3, refused on proxies with WebSocket frame-inspecting plugins
+- Opt-in per-proxy gateway-terminated WebSocket `permessage-deflate` (`websocket_permessage_deflate: terminate`) on H1/H2/H3: independent client/backend negotiation, plaintext for every frame plugin including the WAF, re-deflate per leg, and bounded decompression (1009)
 
 ## Load Balancing
 

@@ -229,6 +229,7 @@ mod websocket_fragment_metering_tests;
 mod websocket_frame_delivery_tests;
 mod websocket_frame_plugin_composition_tests;
 mod websocket_permessage_deflate_tests;
+mod websocket_permessage_deflate_terminate_tests;
 mod websocket_relay_join_tests;
 mod websocket_retry_circuit_tests;
 mod websocket_selected_target_policy_tests;

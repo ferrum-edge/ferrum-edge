@@ -393,7 +393,9 @@ plugin_configs:
 By default the gateway strips the client's `Sec-WebSocket-Extensions` offer before
 the backend handshake, so RFC 7692 `permessage-deflate` is never negotiated end to
 end and every message stays inspectable by WebSocket frame plugins
-(`websocket_permessage_deflate: strip`).
+(`websocket_permessage_deflate: strip`). Two opt-in modes enable compression:
+`passthrough` (below) and gateway-terminated `terminate`
+([below](#gateway-terminated-compression-terminate)).
 
 A proxy can opt into `websocket_permessage_deflate: passthrough`. The client's
 `permessage-deflate` offer elements then reach the backend unchanged, and the
@@ -418,6 +420,70 @@ proxy's live plugin chain requires framing. Stream proxies (`tcp`/`tcps`/`udp`/
 In CP/DP deployments, upgrade every DP before enabling passthrough on the CP. A
 proxy rejects unknown fields, so a DP that predates `websocket_permessage_deflate`
 rejects the whole namespace snapshot from a CP that sends it.
+
+### Gateway-terminated compression (`terminate`)
+
+`websocket_permessage_deflate: terminate` keeps compression and inspection on the
+same route. The gateway is an RFC 7692 endpoint on each leg, and the two legs
+negotiate independently, on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+Extended CONNECT alike:
+
+- **Client leg.** The gateway answers the first valid `permessage-deflate`
+  element of the client's offer itself. It honors `server_no_context_takeover`
+  and `server_max_window_bits` (echoing them in its answer) and never asks the
+  client to limit its own window. Elements with unknown or duplicate parameters,
+  or window bits outside 8–15, are declined; other extension tokens are dropped.
+  A client that does not offer the extension gets an uncompressed leg.
+- **Backend leg.** The backend receives the gateway's own offer,
+  `Sec-WebSocket-Extensions: permessage-deflate`, whatever the client offered.
+  The answer must be one valid `permessage-deflate` element without
+  `client_max_window_bits` (which the gateway did not offer); anything else fails
+  the upgrade with 502 (`rejection_phase: websocket_permessage_deflate`). A
+  backend that declines gets an uncompressed leg.
+
+Every message is inflated before the shared frame relay parses it, so every frame
+and body-inspecting plugin — the WAF WebSocket scanner, `ws_message_size_limiting`,
+`ws_rate_limiting`, `ws_frame_logging`, custom `on_ws_frame` hooks — sees
+plaintext, and none is refused on a `terminate` proxy. After the plugins run, the
+gateway re-deflates each Text or Binary message toward a leg that negotiated
+compression, with that leg's context-takeover choice. Control frames are never
+compressed, and a compressed message may arrive fragmented (RSV1 on its first
+frame only). RSV1 on a control or continuation frame, or on a leg that did not
+negotiate the extension, fails the connection exactly as without it.
+
+Decompression is bounded per leg:
+
+- a compressed wire frame may not exceed the frame ceiling
+  (`FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`, or a lower `ws_message_size_limiting`
+  `max_frame_bytes`), and one frame may not inflate past it;
+- a message may not inflate past
+  `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default `0`: the
+  reassembled-message ceiling, 4x the frame ceiling or a lower
+  `max_message_bytes`);
+- inflation stops one byte past a limit and the session closes with 1009 in both
+  directions; corrupt compressed data closes with 1007;
+- the LZ77 window is the RFC 7692 maximum of 32 KiB, so each negotiated leg holds
+  a fixed-size DEFLATE decompressor and compressor (a few hundred KiB) plus
+  buffers bounded by the frame and message ceilings.
+
+Frame and message ceilings, fragment metering, and the incomplete-message bounds
+all apply to the decompressed messages the plugins see, and the wire
+fragmentation is preserved. Terminate costs CPU on both legs; a session whose
+peers both decline compression uses the ordinary relay (including
+`FERRUM_WEBSOCKET_TUNNEL_MODE`), while a negotiated session always uses the parsed
+relay. Byte counters and `ws_frame_logging` sizes are decompressed sizes. As with
+`passthrough`, upgrade every DP before enabling `terminate` on the CP: a DP that
+predates the value rejects the namespace snapshot.
+
+```yaml
+proxies:
+  - id: chat
+    listen_path: /chat
+    backend_scheme: http
+    backend_host: chat.internal
+    backend_port: 8080
+    websocket_permessage_deflate: terminate
+```
 
 ```yaml
 proxies:

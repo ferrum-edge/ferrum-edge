@@ -332,6 +332,7 @@ fn proxy_routing_and_stream_controls_match_runtime() {
             (json!({"udp_max_response_amplification_factor": 0.5}), true),
             (json!({"websocket_permessage_deflate": "strip"}), true),
             (json!({"websocket_permessage_deflate": "passthrough"}), true),
+            (json!({"websocket_permessage_deflate": "terminate"}), true),
             (
                 json!({"websocket_permessage_deflate": "Passthrough"}),
                 false,
@@ -375,6 +376,7 @@ fn proxy_routing_and_stream_controls_match_runtime() {
                 ("stream_match", json!({}), matches!(scheme, "tcp" | "tcps")),
                 ("response_body_mode", json!("buffer"), false),
                 ("websocket_permessage_deflate", json!("passthrough"), false),
+                ("websocket_permessage_deflate", json!("terminate"), false),
                 ("websocket_permessage_deflate", json!("strip"), true),
                 ("websocket_permessage_deflate", json!("bogus"), false),
                 (

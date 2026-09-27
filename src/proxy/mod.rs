@@ -172,6 +172,7 @@ pub mod udp_proxy;
 pub mod unix_backend;
 pub mod unix_backend_pool;
 pub mod upload_pump;
+pub mod ws_permessage_deflate;
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
@@ -15187,6 +15188,12 @@ async fn handle_websocket_request_authenticated(
         &mut client_headers,
         &proxy_headers,
     );
+    // RFC 7692 terminate (issue #5769): each leg negotiates on its own.
+    let ws_deflate_termination = begin_permessage_deflate_termination(
+        proxy.websocket_permessage_deflate,
+        &mut client_headers,
+        &proxy_headers,
+    );
 
     // Connect to backend BEFORE sending 101 to client.
     // If the backend is unreachable, we return 502 instead of a premature 101.
@@ -16033,6 +16040,42 @@ async fn handle_websocket_request_authenticated(
         ));
     }
 
+    let ws_deflate_negotiation = match ws_deflate_termination {
+        None => ws_permessage_deflate::NegotiatedTermination::default(),
+        Some(handshake) => match complete_permessage_deflate_termination(
+            handshake,
+            &backend_handshake,
+            state
+                .env_config
+                .websocket_permessage_deflate_max_message_bytes,
+        ) {
+            Ok(negotiated) => negotiated,
+            Err(reason) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    reason,
+                    "Rejecting WebSocket upgrade: invalid backend permessage-deflate answer"
+                );
+                log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    502,
+                    start_time,
+                    "websocket_permessage_deflate",
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                record_request(&state, 502);
+                return Ok(build_websocket_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    r#"{"error":"Backend WebSocket extension negotiation failed"}"#,
+                    &initial_response_header_policy_plugins,
+                ));
+            }
+        },
+    };
+
     let ws_lb_guard =
         LoadBalancerConnectionGuard::new(current_target.as_deref(), upstream_balancer.as_deref());
     if let Some(permits) = backend_admission_permits.as_ref() {
@@ -16193,6 +16236,11 @@ async fn handle_websocket_request_authenticated(
     if let Some(extensions) = ws_negotiated_deflate {
         ws_resp_builder = ws_resp_builder.header("sec-websocket-extensions", extensions);
     }
+    // A `terminate` proxy answers the client with the gateway's own agreement.
+    if let Some(extensions) = ws_deflate_negotiation.client_response {
+        ws_resp_builder = ws_resp_builder.header("sec-websocket-extensions", extensions);
+    }
+    let ws_deflate_session = ws_deflate_negotiation.session;
 
     let upgrade_response = ws_resp_builder
         .body(ProxyBody::empty())
@@ -16357,7 +16405,7 @@ async fn handle_websocket_request_authenticated(
                 let relay_result = match backend_handshake {
                     WsBackendHandshake::Direct(handshake) => {
                         let handshake = *handshake;
-                        run_websocket_proxy(
+                        run_websocket_session(
                             client_io,
                             handshake.stream,
                             &proxy_id,
@@ -16378,12 +16426,13 @@ async fn handle_websocket_request_authenticated(
                             ws_fragment_policy,
                             &adaptive_buf,
                             ws_client_trust_session,
+                            ws_deflate_session,
                         )
                         .await
                     }
                     WsBackendHandshake::Mesh(handshake) => {
                         let handshake = *handshake;
-                        run_websocket_proxy(
+                        run_websocket_session(
                             client_io,
                             handshake.stream,
                             &proxy_id,
@@ -16404,6 +16453,7 @@ async fn handle_websocket_request_authenticated(
                             ws_fragment_policy,
                             &adaptive_buf,
                             ws_client_trust_session,
+                            ws_deflate_session,
                         )
                         .await
                     }
@@ -16413,7 +16463,7 @@ async fn handle_websocket_request_authenticated(
                     // dedicated connection is owned by this session and closes
                     // with it; it is never returned to the #3731 idle pool.
                     //
-                    // Boxed so this third `run_websocket_proxy` monomorphization
+                    // Boxed so this third `run_websocket_session` monomorphization
                     // is not a third inline copy of the relay's state machine in
                     // the spawned session future (which is built on the caller's
                     // stack before `tokio::spawn` moves it to the heap). One
@@ -16421,7 +16471,7 @@ async fn handle_websocket_request_authenticated(
                     #[cfg(unix)]
                     WsBackendHandshake::Unix(handshake) => {
                         let handshake = *handshake;
-                        let relay_result = Box::pin(run_websocket_proxy(
+                        let relay_result = Box::pin(run_websocket_session(
                             client_io,
                             handshake.stream,
                             &proxy_id,
@@ -16442,6 +16492,7 @@ async fn handle_websocket_request_authenticated(
                             ws_fragment_policy,
                             &adaptive_buf,
                             ws_client_trust_session,
+                            ws_deflate_session,
                         ))
                         .await;
                         // This is the Unix pool's per-target PHYSICAL
@@ -16728,6 +16779,46 @@ pub(crate) fn forward_permessage_deflate_offer(
     mode.is_passthrough()
         && !requires_websocket_framing
         && push_permessage_deflate_offer(client_headers, proxy_headers)
+}
+
+/// Start a `websocket_permessage_deflate: terminate` upgrade (issue #5769),
+/// shared by the H1/H2 and HTTP/3 WebSocket paths: answer the client's offer
+/// from the plugin-sanitized request headers and give the backend the
+/// gateway's own offer. `None` for every other mode, which leaves
+/// `client_headers` untouched.
+pub(crate) fn begin_permessage_deflate_termination(
+    mode: crate::config::types::WebSocketPermessageDeflate,
+    client_headers: &mut Vec<(String, String)>,
+    proxy_headers: &HashMap<String, String>,
+) -> Option<ws_permessage_deflate::TerminationHandshake> {
+    if !mode.is_terminate() {
+        return None;
+    }
+    let offer = proxy_header_entry_case_insensitive(proxy_headers, "sec-websocket-extensions")
+        .map(|(_, value)| value.as_str());
+    let connection_listed = headers_mod::parse_connection_listed_from_str_map(proxy_headers)
+        .iter()
+        .any(|listed| listed.eq_ignore_ascii_case("sec-websocket-extensions"));
+    Some(ws_permessage_deflate::offer_termination(
+        offer,
+        connection_listed,
+        client_headers,
+    ))
+}
+
+/// Finish a `terminate` negotiation against the backend's handshake answer.
+/// An invalid answer is an error: RFC 7692 §7 requires the client (here the
+/// gateway) to fail the connection.
+pub(crate) fn complete_permessage_deflate_termination(
+    handshake: ws_permessage_deflate::TerminationHandshake,
+    backend_handshake: &WsBackendHandshake,
+    max_decompressed_message_bytes: usize,
+) -> Result<ws_permessage_deflate::NegotiatedTermination, &'static str> {
+    let answer = match backend_handshake.negotiated_permessage_deflate() {
+        Some(value) => Some(value.to_str().map_err(|_| "non-ASCII extension answer")?),
+        None => None,
+    };
+    handshake.complete(answer, max_decompressed_message_bytes)
 }
 
 /// Forward the client's `permessage-deflate` offer to the backend handshake of
@@ -19057,6 +19148,20 @@ pub(crate) fn ws_capacity_error_class(_size: usize, client_to_backend: bool) -> 
     }
 }
 
+/// Directional class for a terminated `permessage-deflate` read fault: a size
+/// limit is the same body-too-large class as a parser capacity overflow, and
+/// corrupt compressed data is a protocol error.
+pub(crate) fn ws_permessage_deflate_error_class(
+    fault: ws_permessage_deflate::PermessageDeflateFault,
+    client_to_backend: bool,
+) -> retry::ErrorClass {
+    if fault.is_size_limit() {
+        ws_capacity_error_class(0, client_to_backend)
+    } else {
+        retry::ErrorClass::ProtocolError
+    }
+}
+
 /// Bounded, non-secret RFC 6455 Close 1009 for global parser capacity overflow.
 pub(crate) fn ws_global_capacity_close_frame() -> CloseFrame {
     CloseFrame {
@@ -19572,6 +19677,123 @@ where
     writer.flush().await
 }
 
+/// Entry point for every frontend's WebSocket relay (H1 Upgrade, H2 and H3
+/// Extended CONNECT).
+///
+/// `permessage_deflate` is `Some` only for a `websocket_permessage_deflate:
+/// terminate` session in which at least one leg negotiated RFC 7692
+/// compression (issue #5769). That session runs the parsed relay over
+/// inflating transports ([`ws_permessage_deflate::PermessageDeflateIo`]) with
+/// per-leg encoders, never tunnel mode, because the two legs may disagree on
+/// compression and every message must reach the plugins as plaintext. It is
+/// boxed and type-erased so it is one relay instantiation for every transport
+/// pair and adds nothing to the size of the ordinary session future.
+///
+/// Every other session (`strip`, `passthrough`, or a `terminate` session whose
+/// peers both declined) goes straight to [`run_websocket_proxy`] with the
+/// identity codec, exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_websocket_session<C, B>(
+    client_io: C,
+    backend_ws_stream: WebSocketStream<B>,
+    proxy_id: &str,
+    connection_id: u64,
+    ws_framing_plugins: Vec<Arc<dyn Plugin>>,
+    ws_frame_plugins: Vec<Arc<dyn Plugin>>,
+    ws_disconnect_plugins: Vec<Arc<dyn Plugin>>,
+    session_meta: WsSessionMeta,
+    ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    max_websocket_frame_size_bytes: usize,
+    websocket_write_buffer_size: usize,
+    websocket_tunnel_mode: bool,
+    websocket_tunnel_idle_disabled_safety_cap: Duration,
+    ws_idle_tracker: Option<Arc<WsIdleTracker>>,
+    session_deadline: WsSessionDeadline,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    overload: Arc<crate::overload::OverloadState>,
+    fragment_policy: WsFragmentPolicy,
+    adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
+    client_trust: Option<crate::tls::ClientTrustSession>,
+    permessage_deflate: Option<ws_permessage_deflate::WsDeflateTermination>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(permessage_deflate) = permessage_deflate else {
+        return run_websocket_proxy(
+            client_io,
+            backend_ws_stream,
+            proxy_id,
+            connection_id,
+            ws_framing_plugins,
+            ws_frame_plugins,
+            ws_disconnect_plugins,
+            session_meta,
+            ws_connection_permit,
+            max_websocket_frame_size_bytes,
+            websocket_write_buffer_size,
+            websocket_tunnel_mode,
+            websocket_tunnel_idle_disabled_safety_cap,
+            ws_idle_tracker,
+            session_deadline,
+            shutdown_rx,
+            overload,
+            fragment_policy,
+            adaptive_buffer,
+            client_trust,
+            ws_permessage_deflate::PlainOutbound,
+            ws_permessage_deflate::PlainOutbound,
+        )
+        .await;
+    };
+    // Boxed as a whole, so the terminated branch's framer rebuild and relay
+    // occupy heap, not the caller's session future.
+    Box::pin(async move {
+        // The client framer's ceilings, computed exactly as the relay computes
+        // them, bound the client-leg inflater; the backend framer's own
+        // configuration bounds the backend-leg inflater.
+        let client_limits = EffectiveWsSizeLimits::from_plugins(
+            max_websocket_frame_size_bytes,
+            &ws_framing_plugins,
+        );
+        let streams = permessage_deflate
+            .wrap(
+                client_io,
+                backend_ws_stream,
+                client_limits.max_frame_bytes,
+                client_limits.max_message_bytes,
+            )
+            .await;
+        run_websocket_proxy(
+            streams.client_io,
+            streams.backend,
+            proxy_id,
+            connection_id,
+            ws_framing_plugins,
+            ws_frame_plugins,
+            ws_disconnect_plugins,
+            session_meta,
+            ws_connection_permit,
+            max_websocket_frame_size_bytes,
+            websocket_write_buffer_size,
+            false,
+            websocket_tunnel_idle_disabled_safety_cap,
+            ws_idle_tracker,
+            session_deadline,
+            shutdown_rx,
+            overload,
+            fragment_policy,
+            adaptive_buffer,
+            client_trust,
+            streams.to_backend,
+            streams.to_client,
+        )
+        .await
+    })
+    .await
+}
+
 /// Generic over the client transport type `C`. The H1/H2 frontend passes
 /// `TokioIo::new(upgraded)` (hyper's `Upgraded` adapted to tokio AsyncRead+AsyncWrite);
 /// the H3 frontend (RFC 9220 Extended CONNECT) passes a `tokio::io::DuplexStream`
@@ -19592,8 +19814,13 @@ where
 /// — so H1, H2, and H3 all run this framer with `accept_unmasked_frames` off:
 /// masked client frames are unmasked here, and an unmasked one is a protocol
 /// error that closes the client with 1002 (issue #5011).
+///
+/// Frontends call [`run_websocket_session`], which dispatches here: with the
+/// identity [`ws_permessage_deflate::PlainOutbound`] codec for ordinary
+/// sessions, or over inflating transports with per-leg encoders for a
+/// `websocket_permessage_deflate: terminate` session (issue #5769).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_websocket_proxy<C, B>(
+pub(crate) async fn run_websocket_proxy<C, B, E>(
     client_io: C,
     mut backend_ws_stream: WebSocketStream<B>,
     proxy_id: &str,
@@ -19618,6 +19845,10 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     // not admitted on a client certificate, in which case the stop arbiter
     // registers no additional waker at all.
     client_trust: Option<crate::tls::ClientTrustSession>,
+    // Applied to each message after every plugin has seen it, just before it
+    // is written toward the backend / client (RFC 7692 re-deflate).
+    mut to_backend_codec: E,
+    mut to_client_codec: E,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -19628,6 +19859,7 @@ where
     // fast path is H1-only; both transports satisfy the bound, so the early
     // return below stays generic.
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    E: ws_permessage_deflate::WsOutboundCodec,
 {
     // Issue #3857: the HTTP connection guard is dropped when
     // `serve_connection_with_upgrades` returns, which for an H1 upgrade is
@@ -20104,6 +20336,10 @@ where
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
                             let delivery =
                                 prepare_ws_frame_deliveries(&ctb_plugins, &outgoing);
+                            // RFC 7692 terminate: re-deflate toward a backend
+                            // leg that negotiated compression, after every
+                            // plugin saw the plaintext. Identity otherwise.
+                            let outgoing = to_backend_codec.encode(outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_ctb.cancelled() => {
@@ -20280,6 +20516,24 @@ where
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
                                 retry::ErrorClass::ProtocolError
+                            } else if let Some(fault) =
+                                ws_permessage_deflate::permessage_deflate_fault(&e)
+                            {
+                                let limit_kind = fault.kind();
+                                warn_sampled!(
+                                    proxy_id = %proxy_id_ctb,
+                                    connection_id,
+                                    direction = "client->backend",
+                                    limit_kind,
+                                    "WebSocket permessage-deflate input rejected before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(fault.close_frame()),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                ws_permessage_deflate_error_class(fault, true)
                             } else {
                                 error!("Error receiving from client: {}", e);
                                 let class = retry::classify_boxed_error(&e);
@@ -20443,6 +20697,9 @@ where
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
                             let delivery =
                                 prepare_ws_frame_deliveries(&btc_plugins, &outgoing);
+                            // Mirror of c2b: re-deflate toward a client leg
+                            // that negotiated compression.
+                            let outgoing = to_client_codec.encode(outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_btc.cancelled() => {
@@ -20604,6 +20861,24 @@ where
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
                                 retry::ErrorClass::ProtocolError
+                            } else if let Some(fault) =
+                                ws_permessage_deflate::permessage_deflate_fault(&e)
+                            {
+                                let limit_kind = fault.kind();
+                                warn_sampled!(
+                                    proxy_id = %proxy_id_btc,
+                                    connection_id,
+                                    direction = "backend->client",
+                                    limit_kind,
+                                    "WebSocket permessage-deflate input rejected before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(fault.close_frame()),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                ws_permessage_deflate_error_class(fault, false)
                             } else {
                                 error!("Error receiving from backend: {}", e);
                                 let class = retry::classify_boxed_error(&e);

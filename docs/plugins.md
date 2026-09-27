@@ -5371,7 +5371,8 @@ because a WebSocket message carries no `Content-Type`. Control frames
 (Ping/Pong/Close) are never scanned as application payload, messages arrive
 reassembled and uncompressed (`permessage-deflate` is never negotiated end to
 end; `websocket_permessage_deflate: passthrough` is refused on a proxy where
-`waf` is effective), and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout` close the
+`waf` is effective, and with `terminate` the gateway inflates every message
+before the scanner sees it), and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout` close the
 connection with RFC 6455 code 1008 and a fixed reason that never echoes message
 bytes, on the same terms as the HTTP body path — the session policy resolved at
 upgrade mirrors `request_body_policy_enforces` / `response_body_policy_enforces`,

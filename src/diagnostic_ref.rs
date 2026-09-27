@@ -193,6 +193,7 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     "websocket_per_ip_connection_limit",
     "websocket_credential_expired",
     "websocket_max_lifetime",
+    "websocket_permessage_deflate",
     "grpc_deadline_preflight",
     "grpc_deadline_upload_before_authenticate",
     "grpc_deadline_upload_before_authorize",
