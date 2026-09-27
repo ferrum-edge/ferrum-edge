@@ -5328,7 +5328,12 @@ stays monitor-only. `fail_closed`, `scan_truncated`, and `skip` do not satisfy
 the gate. `mode: monitor` with zero enforcing rules remains valid. SSRF
 metadata/private-IP and dangerous-scheme signatures cover both request bodies
 and decoded query values at paranoia 1 (`FE-SSRF-001`/`002` and the `-Q`
-mirrors); see [waf.md](waf.md#built-in-rule-pack). Invalid WAF configuration is
+mirrors). The pack also covers blind, enumeration, and error-based SQLi,
+cookie-borne SQLi/XSS/traversal, Shellshock, OGNL/Struts, PHP and Node.js code
+injection, command execution without a `;cmd` chain, CRLF response splitting,
+restricted-file probes on the canonical path (`.git/`, `.env`, `.aws/`, …),
+executable multipart uploads, and YAML/JSON deserialization gadgets; see
+[waf.md](waf.md#built-in-rule-pack). Invalid WAF configuration is
 security-fatal at startup/reload, so the gateway does not silently serve
 without the intended inspection.
 

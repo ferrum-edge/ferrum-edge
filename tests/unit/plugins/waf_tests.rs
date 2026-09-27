@@ -4517,13 +4517,10 @@ async fn ssrf_query_benign_urls_and_unclaimed_forms_are_clean() {
     let _ = plugin.authorize(&mut path_version).await;
     assert!(!monitored(&path_version, "FE-SSRF-001-Q"));
 
-    // Existing SSRF rules claim dotted IPv4 + metadata.google.internal only.
-    let ipv6 = authorize_query(
-        &plugin,
-        "/w/rec",
-        "u=http://[fd00:ec2::254]/latest/meta-data/",
-    )
-    .await;
+    // Level-1 SSRF rules claim dotted IPv4 and named metadata endpoints only;
+    // alternate loopback spellings (`[::1]`, decimal, hex) are FE-SSRF-003 at
+    // paranoia level 2.
+    let ipv6 = authorize_query(&plugin, "/w/rec", "u=http://[::1]/latest/meta-data/").await;
     assert!(!monitored(&ipv6, "FE-SSRF-001-Q"));
     let decimal = authorize_query(&plugin, "/w/rec", "u=http://2130706433/").await;
     assert!(!monitored(&decimal, "FE-SSRF-001-Q"));
