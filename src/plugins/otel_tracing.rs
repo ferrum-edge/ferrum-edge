@@ -58,13 +58,13 @@ use super::{
 
 mod attempt_spans;
 
+use attempt_spans::{AttemptSpanSink, BackendAttemptAttributes};
 pub(crate) use attempt_spans::{
     BackendAttemptSpan, BackendAttemptTrace, note_backend_connection_established,
     note_backend_connection_reused, note_backend_connection_setup_started,
     note_backend_dns_resolution, note_backend_tcp_connect, note_backend_tls_handshake,
     poll_backend_attempt,
 };
-use attempt_spans::{AttemptSpanSink, BackendAttemptAttributes};
 
 const TRACEPARENT_HEADER: &str = "traceparent";
 const TRACESTATE_HEADER: &str = "tracestate";
