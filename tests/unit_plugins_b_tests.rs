@@ -109,6 +109,7 @@ mod unit {
         mod validator_diagnostic_redaction_tests;
         mod waf_body_charset_parity_tests;
         mod waf_tests;
+        mod waf_unlisted_content_type_tests;
         mod workload_metrics_custom_env_tags_tests;
         mod workload_metrics_tests;
         mod ws_frame_logging_tests;
