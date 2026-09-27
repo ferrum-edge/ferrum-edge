@@ -1,4 +1,7 @@
-use super::{AutoBool, BackendAllowIps, ConfFile, DbTlsMode, OperatingMode, resolve_var};
+use super::{
+    AutoBool, BackendAllowIps, ConfFile, DbTlsMode, FrontendProxyProtocolMode, OperatingMode,
+    resolve_var,
+};
 use std::collections::HashMap;
 
 pub(crate) trait EnvValue: Sized {
@@ -156,6 +159,18 @@ impl EnvValue for BackendAllowIps {
             "public" => Ok(Self::Public),
             "both" => Ok(Self::Both),
             _ => Err(invalid_env_value(key, raw, "private, public, or both")),
+        }
+    }
+}
+
+impl EnvValue for FrontendProxyProtocolMode {
+    fn parse_env(raw: &str, key: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "v1" => Ok(Self::V1),
+            "v2" => Ok(Self::V2),
+            "auto" => Ok(Self::Auto),
+            _ => Err(invalid_env_value(key, raw, "off, v1, v2, or auto")),
         }
     }
 }

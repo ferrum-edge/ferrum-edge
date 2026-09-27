@@ -927,9 +927,10 @@ fn test_udp_and_dtls_proxies_accept_stream_proxy_protocol() {
 
 #[test]
 fn test_http_proxy_still_rejects_stream_proxy_protocol() {
-    // The HTTP family resolves the client IP from X-Forwarded-For; neither
-    // PROXY framing applies there, so the field must stay a validation error
-    // rather than becoming silently inert.
+    // HTTP-family proxies share the global HTTP/HTTPS listeners, so a
+    // per-proxy flag cannot decide how a listener reads its first bytes. The
+    // field must stay a validation error rather than becoming silently inert,
+    // and the diagnostic must point at the listener-level setting (#5768).
     let mut http = make_stream_proxy("http-pp", BackendScheme::Https, 8555);
     http.listen_port = None;
     http.listen_path = Some("/api".to_string());
@@ -944,6 +945,12 @@ fn test_http_proxy_still_rejects_stream_proxy_protocol() {
     assert!(
         errors.iter().any(|e| e.contains("stream_proxy_protocol")),
         "expected a stream_proxy_protocol rejection, got: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP")),
+        "the rejection must name the listener-level setting, got: {errors:?}"
     );
 }
 

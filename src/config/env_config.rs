@@ -897,6 +897,46 @@ impl std::fmt::Display for BackendAllowIps {
     }
 }
 
+/// Inbound PROXY protocol posture of one process-global HTTP-family proxy
+/// listener (`FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` /
+/// `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS`, issue #5768).
+///
+/// Every enabled value makes the header **required**: a connection that does
+/// not begin with an accepted PROXY header, or whose socket peer is outside
+/// `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS`, is closed before TLS or HTTP
+/// parsing. There is no optional mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrontendProxyProtocolMode {
+    /// No PROXY header is read (default). The listener behaves exactly as it
+    /// did before the setting existed.
+    #[default]
+    Off,
+    /// Require a PROXY v1 (text) header.
+    V1,
+    /// Require a PROXY v2 (binary) header.
+    V2,
+    /// Require a PROXY v1 or v2 header, auto-detected from its signature.
+    Auto,
+}
+
+impl FrontendProxyProtocolMode {
+    /// Whether this listener reads (and requires) a PROXY header.
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+}
+
+impl std::fmt::Display for FrontendProxyProtocolMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "off"),
+            Self::V1 => write!(f, "v1"),
+            Self::V2 => write!(f, "v2"),
+            Self::Auto => write!(f, "auto"),
+        }
+    }
+}
+
 /// Database TLS policy shared by SQL backends and MongoDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbTlsMode {
@@ -3473,6 +3513,20 @@ pub struct EnvConfig {
     /// the X-Forwarded-For walk. If it is present but rejected, the socket IP
     /// remains the source of truth.
     pub real_ip_header: Option<String>,
+    /// Inbound PROXY protocol on the plaintext `FERRUM_PROXY_HTTP_PORT`
+    /// listener (`FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP`). Default `off`.
+    pub frontend_proxy_protocol_http: FrontendProxyProtocolMode,
+    /// Inbound PROXY protocol on the TLS `FERRUM_PROXY_HTTPS_PORT` listener
+    /// (`FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS`); the header precedes the TLS
+    /// ClientHello. Default `off`. HTTP/3 (QUIC) is never covered.
+    pub frontend_proxy_protocol_https: FrontendProxyProtocolMode,
+    /// Comma-separated CIDRs/IPs of the L4 load balancers allowed to send a
+    /// PROXY header to the HTTP/HTTPS listeners
+    /// (`FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS`). Required, strictly
+    /// parsed, and never a catch-all when either listener enables PROXY
+    /// protocol. Independent of `FERRUM_TRUSTED_PROXIES`, which keeps deciding
+    /// whose `X-Forwarded-For` / real-IP header is believed.
+    pub frontend_proxy_protocol_trusted_cidrs: String,
 
     /// HMAC-SHA256 server secret for the basic_auth plugin. Mandatory when that
     /// plugin is enabled; must be a unique random value of at least 32 bytes.
@@ -4285,6 +4339,9 @@ impl Default for EnvConfig {
             via_pseudonym: "ferrum-edge".into(),
             add_forwarded_header: false,
             real_ip_header: None,
+            frontend_proxy_protocol_http: FrontendProxyProtocolMode::Off,
+            frontend_proxy_protocol_https: FrontendProxyProtocolMode::Off,
+            frontend_proxy_protocol_trusted_cidrs: String::new(),
             basic_auth_hmac_secret: None,
             datagram_proxy_protocol_secret: None,
             plugin_http_slow_threshold_ms: 1000,
@@ -5015,6 +5072,9 @@ impl EnvConfig {
             add_via_header: bool = "FERRUM_ADD_VIA_HEADER" => true;
             via_pseudonym: String = "FERRUM_VIA_PSEUDONYM" => "ferrum-edge".to_string();
             add_forwarded_header: bool = "FERRUM_ADD_FORWARDED_HEADER" => false;
+            frontend_proxy_protocol_http: FrontendProxyProtocolMode = "FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP" => FrontendProxyProtocolMode::Off;
+            frontend_proxy_protocol_https: FrontendProxyProtocolMode = "FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS" => FrontendProxyProtocolMode::Off;
+            frontend_proxy_protocol_trusted_cidrs: String = "FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS" => String::new();
             basic_auth_hmac_secret: Option<String> = "FERRUM_BASIC_AUTH_HMAC_SECRET";
             datagram_proxy_protocol_secret: Option<String> = "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET";
             plugin_http_slow_threshold_ms: u64 = "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS" => 1000u64;
@@ -5799,6 +5859,9 @@ impl EnvConfig {
             via_pseudonym,
             add_forwarded_header,
             real_ip_header,
+            frontend_proxy_protocol_http,
+            frontend_proxy_protocol_https,
+            frontend_proxy_protocol_trusted_cidrs,
             basic_auth_hmac_secret,
             datagram_proxy_protocol_secret,
             plugin_http_slow_threshold_ms,
@@ -8017,6 +8080,9 @@ impl EnvConfig {
         // rather than quietly shrinking the trust set at runtime.
         self.validate_trusted_proxies()?;
 
+        // Inbound PROXY protocol on the global HTTP/HTTPS listeners (#5768).
+        self.validate_frontend_proxy_protocol()?;
+
         // The datagram client-address envelope's MAC key (issue #3289).
         self.validate_datagram_proxy_protocol_secret()?;
 
@@ -8174,6 +8240,66 @@ impl EnvConfig {
                 )
             )
         })?;
+        Ok(())
+    }
+
+    /// Validate inbound PROXY protocol on the process-global HTTP/HTTPS proxy
+    /// listeners (issue #5768).
+    ///
+    /// `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS` is parsed strictly
+    /// whenever it is set, for the same reason as `FERRUM_TRUSTED_PROXIES`: a
+    /// typo must not silently move a trust boundary. When either listener
+    /// enables PROXY protocol the list must also be non-empty and must not
+    /// admit every source of an address family — a trusted PROXY header lets
+    /// its sender choose the client address outright, so a catch-all list
+    /// would let any direct client spoof any source IP. The setting only
+    /// exists on the global proxy listeners, which run in database, file, and
+    /// dp modes; enabling it anywhere else is refused rather than silently
+    /// ignored.
+    fn validate_frontend_proxy_protocol(&self) -> Result<(), String> {
+        const TRUSTED_KEY: &str = "FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS";
+        let raw = &self.frontend_proxy_protocol_trusted_cidrs;
+        let trusted = crate::util::cidr::CidrSet::parse_strict(raw).map_err(|e| {
+            format!(
+                "Invalid {TRUSTED_KEY} {}: {e}. Every entry must be a valid IP or CIDR and \
+                 empty comma segments are rejected.",
+                crate::startup::quoted_config_value(TRUSTED_KEY, raw)
+            )
+        })?;
+        let mut enabled = Vec::with_capacity(2);
+        if self.frontend_proxy_protocol_http.is_enabled() {
+            enabled.push("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP");
+        }
+        if self.frontend_proxy_protocol_https.is_enabled() {
+            enabled.push("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS");
+        }
+        if enabled.is_empty() {
+            return Ok(());
+        }
+        let keys = enabled.join(" / ");
+        if !matches!(
+            self.mode,
+            OperatingMode::Database | OperatingMode::File | OperatingMode::DataPlane
+        ) {
+            return Err(format!(
+                "{keys} enables inbound PROXY protocol, which only applies to the global \
+                 HTTP/HTTPS proxy listeners of database, file, and dp modes; unset it for \
+                 this mode"
+            ));
+        }
+        if trusted.is_empty() {
+            return Err(format!(
+                "{keys} enables inbound PROXY protocol but {TRUSTED_KEY} is empty; list the \
+                 load balancer source CIDRs allowed to send the PROXY header"
+            ));
+        }
+        if trusted.permits_all_family() {
+            return Err(format!(
+                "{TRUSTED_KEY} admits every source address of an address family; a trusted \
+                 PROXY header chooses the client address, so a catch-all list would let any \
+                 direct client spoof its source IP. List only the load balancer ranges"
+            ));
+        }
         Ok(())
     }
 
