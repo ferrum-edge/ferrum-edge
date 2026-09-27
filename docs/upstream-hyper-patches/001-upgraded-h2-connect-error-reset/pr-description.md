@@ -28,7 +28,9 @@ Add one public method:
 impl Upgraded {
     /// Resets an HTTP/2 upgrade's stream with `RST_STREAM(CONNECT_ERROR)`.
     ///
-    /// Returns `true` if the reset was queued. Returns `false` and does
+    /// Returns `true` if the reset was requested. A send task that is
+    /// already finishing the stream with `END_STREAM` still wins, so `true`
+    /// does not guarantee a reset reaches the wire. Returns `false` and does
     /// nothing if this is not an HTTP/2 upgrade, if a reset was already
     /// queued, or if the stream's send side has already finished.
     #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]

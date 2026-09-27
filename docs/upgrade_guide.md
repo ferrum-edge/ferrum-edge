@@ -26,6 +26,26 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased
+
+**HBONE relay socket errors reset the CONNECT stream (#5781).** When an HBONE
+TCP or UDP relay ends on a socket error (for example the backend connection is
+reset, or a datagram send fails), the gateway now ends the HTTP/2 `CONNECT`
+stream with `RST_STREAM(CONNECT_ERROR)` (RFC 9113 §8.5) instead of a clean
+`END_STREAM`. A peer close, idle expiry, write stall, timeout, or fence
+revocation still ends with `END_STREAM`. HBONE clients that treated every
+tunnel end as a normal close now see a stream error on a failed relay; a
+truncated byte stream is no longer reported as complete.
+
+**Dependencies**
+
+- **Vendored hyper:** hyper 1.9.0 is now a path-sourced fork
+  (`vendor/hyper-1.9.0-ferrum-patched/`) that adds
+  `Upgraded::reset_with_connect_error()`; see the
+  [patch README](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md).
+  `cargo deny` may not match RUSTSEC `hyper` advisories against a path source,
+  so hyper advisories are checked manually.
+
 ## Upgrading to 0.9.8
 
 v0.9.8 makes native HTTP/3 enforce HTTPRoute rule `timeouts`, changes the

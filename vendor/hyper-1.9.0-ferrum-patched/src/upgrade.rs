@@ -171,7 +171,9 @@ impl Upgraded {
     /// reset in place of the `END_STREAM`. Data written but not yet sent may
     /// be discarded.
     ///
-    /// Returns `true` if the reset was queued. Returns `false` and does
+    /// Returns `true` if the reset was requested. A send task that is
+    /// already finishing the stream with `END_STREAM` still wins, so `true`
+    /// does not guarantee a reset reaches the wire. Returns `false` and does
     /// nothing if this is not an HTTP/2 upgrade, if a reset was already
     /// queued, or if the stream's send side has already finished (for
     /// example after a completed shutdown).

@@ -526,7 +526,9 @@ fn end_hbone_connect_stream(upgraded: TokioIo<hyper::upgrade::Upgraded>, reset: 
     let mut upgraded = upgraded.into_inner();
     if reset && !upgraded.reset_with_connect_error() {
         // The stream's send side already finished (a completed half-close, or
-        // the peer reset it); there is nothing left to signal.
+        // the peer reset it); there is nothing left to signal. After a
+        // completed half-close the drop below yields RST_STREAM(CANCEL), which
+        // hyper peers read as a clean EOF.
         debug!("HBONE CONNECT stream already closed; no RST_STREAM sent");
     }
 }
@@ -2672,6 +2674,8 @@ where
             let payload = match read {
                 Ok(Some(payload)) => payload,
                 Ok(None) => return HboneUdpRelayEnd::TunnelClosed,
+                // Framing errors from the tunnel peer itself (`InvalidData`,
+                // `UnexpectedEof`) also reset the stream; that is intentional.
                 Err(e) => return HboneUdpRelayEnd::TunnelReadFailed(e.kind()),
             };
             to_app_activity.store(

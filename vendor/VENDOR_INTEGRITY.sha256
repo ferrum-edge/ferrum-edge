@@ -268,7 +268,7 @@ de143e994e0021c1d54a7214f1748712e166d37a6496e783ee589956677ce034  vendor/hyper-1
 ad742e754791d64715a57c930113598c0b28f0026a58b63d60963c6b9f6f1ac2  vendor/hyper-1.9.0-ferrum-patched/src/service/service.rs
 7d2fcf8701722456979edf7e8431efee235f838c6f70f66c28ce8e3a36d514b6  vendor/hyper-1.9.0-ferrum-patched/src/service/util.rs
 a766c472433c7569440862e978eceeea78220af170220e9fdc90b71bab731344  vendor/hyper-1.9.0-ferrum-patched/src/trace.rs
-c15dccee6c78c0de52c4b157bafa0ff6ef8c6826709b7d8252133a066303ab5e  vendor/hyper-1.9.0-ferrum-patched/src/upgrade.rs
+607473d985bbca3c952ee961c5f72e5eab305b82d368cf74261520350b247cf2  vendor/hyper-1.9.0-ferrum-patched/src/upgrade.rs
 9f90c6c77ac3a8a32612779fd7bd07e064ec918db13e1b19d6521baf74c68ed1  vendor/hyper-util-0.1.21-ferrum-patched/CHANGELOG.md
 be68258b960525839b23a699362c550c7c5e73934cabd9dfe1b2a3fdebb37a2e  vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml
 9e0a97848ea543aef745c98e84fde696a9a3e0735538f6daefdd3cb1942effc1  vendor/hyper-util-0.1.21-ferrum-patched/LICENSE
