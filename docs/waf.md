@@ -494,6 +494,53 @@ excluded too, and a plugin configured with only `text/plain` inspects neither.
 `text/json` is in the default allowlist as an explicit entry, since it carries no
 suffix to key off.
 
+### Bodies outside the scan scope: `on_unlisted_content_type`
+
+The `Content-Type` a client declares is attacker-controlled, and many backends
+parse a body without consulting it: a Go handler that `json.Unmarshal`s the
+raw body, Flask's `get_json(force=True)`, a framework with a default body
+parser. Relabelling a JSON injection payload as `application/octet-stream`,
+`text/csv`, or sending it with no `Content-Type` at all used to skip every
+body rule silently. `on_unlisted_content_type` decides what happens to a
+request body whose type is outside the scan scope — not in
+`body_content_types` (including the `+json` / `+xml` suffix mapping), a
+multipart body while `inspect_multipart` is off, or a missing/unknown type
+while `inspect_binary_body` is off:
+
+| Value | Non-empty unlisted body |
+| --- | --- |
+| `allow` (default) | forwarded uninspected, as before |
+| `fail_closed` | rejected when an enforcing request-body policy applies to this request (an applicable `action: enforce` body rule, or anomaly scoring over one), so an enforcing rule cannot be sidestepped by relabelling; otherwise forwarded and recorded |
+| `block` | rejected while `mode: enforce` — a strict allowlist of inspectable types |
+
+The decision is exact: when a value could refuse the request, the WAF asks the
+gateway to buffer that body and decides over the **finalized** backend-visible
+headers and the actual bytes, so an empty upload always passes and an HTTP/2
+or HTTP/3 body sent without `Content-Length` is still caught. Bodies that
+could not be refused keep the streaming path. It applies only to
+`body_methods`, to non-exempt requests, and when this instance inspects
+request bodies at all; WebSocket messages carry no `Content-Type` and are
+always scanned.
+
+A rejection sets `waf.action=blocked`, `waf.block_reason=content_type`, and
+`waf.body_uninspected=content_type`. A body that is recorded but not refused
+(`fail_closed` with no enforcing body rule here, or `mode: monitor`) carries
+`waf.body_uninspected=content_type` without the block fields; in `monitor`
+mode this is observed from the declared framing (`Content-Length` > 0 or
+`Transfer-Encoding`) without buffering, so stage the setting in `monitor`
+first to see which routes carry unlisted bodies. Under `mode: enforce`,
+`block` is itself a reachable admission enforcement path when request-body
+inspection is on.
+
+Before switching to `block`, list every type your backends legitimately
+accept: add them to `body_content_types` (scanned as text), turn on
+`inspect_multipart` for uploads, or exempt upload-only routes with
+`global_exemptions`. gRPC (`application/grpc`) bodies are unlisted by default,
+so a `block` WAF on a gRPC route refuses them unless listed or exempted.
+Bodies on methods outside `body_methods` (for example a `GET` with a body)
+are not governed; add the method to `body_methods` if a backend reads such
+bodies.
+
 Response inspection is **off by default**. Enable `response_inspection` (and
 `response_body_inspection` for body rules) to run the disclosure and
 data-leak rules.
@@ -875,14 +922,14 @@ logging sinks are configured (stdout, http, tcp, kafka, loki, …):
 `waf.block_reason`, `waf.scoring_instance`, `waf.would_block_reason`,
 `waf.paranoia`, plus `waf.scan_truncated` / `waf.scan_timed_out` /
 `waf.body_too_large` / `waf.body_too_large_target` (`request_body` or
-`response_body`). All of these are fixed-cardinality; body bytes are never
+`response_body`) / `waf.body_uninspected` (`content_type`). All of these are fixed-cardinality; body bytes are never
 logged. Blocked
 requests reject before backend dispatch and still produce a transaction summary
 carrying these fields, so blocks are visible in the same per-request log line as
 allowed traffic.
 
 `waf.block_reason` names why a request was blocked: `rule`, `score`,
-`body_too_large`, or `scan_timeout` for HTTP-family traffic, and `tcp_require_tls`,
+`body_too_large`, `content_type`, or `scan_timeout` for HTTP-family traffic, and `tcp_require_tls`,
 `first_bytes_unavailable`, or `signature` for stream (TCP/UDP) traffic. Stream
 inspection additionally records `waf.would_block_reason` (the same stream value
 set) on `monitor`-mode connections that *would* have blocked under `enforce`,
@@ -927,6 +974,7 @@ fire, then switch to `enforce`.
 | `on_scan_timeout` | enum | `log_and_allow` | `allow` / `block` / `fail_closed` / `log_and_allow` |
 | `max_scan_bytes` | int | `1048576` | body scan cap |
 | `on_body_too_large` | enum | `fail_closed` | `fail_closed` / `scan_truncated` / `skip` / `block` |
+| `on_unlisted_content_type` | enum | `allow` | `allow` / `fail_closed` / `block`; request bodies whose `Content-Type` is outside the scan scope (see [Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type)) |
 | `body_methods` | string[] | `[POST,PUT,PATCH]` | methods whose bodies are scanned |
 | `body_content_types` | string[] | `[application/json, text/json, application/x-www-form-urlencoded, application/xml, text/xml, text/plain, text/html]` | inspectable base content types; `+json` / `+xml` suffixed types match via their base family |
 | `inspect_multipart` | bool | `false` | scan multipart bodies |
