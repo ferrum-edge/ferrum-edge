@@ -2665,8 +2665,11 @@ paths:
           headers:
             X-Ferrum-Diagnostic-Owner-Replica:
               description: |
-                Replica id embedded in a replica-tagged (`fd2_`) reference that
-                another gateway process minted. Sent only on that miss, and only
+                Replica id read from the caller's replica-tagged (`fd2_`)
+                reference when it names a replica other than this gateway
+                process. Any well-formed foreign tag is echoed, including a
+                stale or forged one: the gateway does not check that the named
+                replica exists. Sent only on that miss, and only
                 when the token carries `diagnostics:read` and an `ns` claim
                 naming this gateway's namespace. Never sent with any other
                 status.

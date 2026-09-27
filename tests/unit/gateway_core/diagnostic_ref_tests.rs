@@ -1853,6 +1853,29 @@ fn reference_formats_resolve_only_on_a_store_that_mints_them() {
 }
 
 #[test]
+fn re_spelling_a_reference_misses_on_the_store_that_minted_its_key() {
+    let untagged = default_store();
+    let tagged = tagged_store(REPLICA_A);
+    let v1 = mint(&untagged, 502, "connection_failure");
+    let v2 = mint(&tagged, 502, "connection_failure");
+    let now = Instant::now();
+    let v1_key = &v1[DIAGNOSTIC_REF_PREFIX.len()..];
+    let v2_key = &v2[v2.len() - 32..];
+
+    // Each key is live in the store that minted it; only the spelling differs.
+    let tagged_as_v1 = format!("{DIAGNOSTIC_REF_PREFIX}{v2_key}");
+    let untagged_as_v2 = format!("{DIAGNOSTIC_REF_TAGGED_PREFIX}1a2b3c4d_{v1_key}");
+    let tagged_as_other = format!("{DIAGNOSTIC_REF_TAGGED_PREFIX}f00dcafe_{v2_key}");
+    assert!(tagged.lookup_at(now, &tagged_as_v1).is_none());
+    assert!(untagged.lookup_at(now, &untagged_as_v2).is_none());
+    assert!(tagged.lookup_at(now, &tagged_as_other).is_none());
+
+    // The spelling each store mints still resolves.
+    assert!(untagged.lookup_at(now, &v1).is_some());
+    assert!(tagged.lookup_at(now, &v2).is_some());
+}
+
+#[test]
 fn owner_hint_is_one_header_and_leaves_the_miss_body_alone() {
     let mut headers = http::HeaderMap::new();
     headers.insert("content-type", "application/json".parse().unwrap());
@@ -1884,6 +1907,8 @@ fn replica_info_metric_is_exported_only_when_tagged() {
 
     let tagged = tagged_store(REPLICA_A).render_prometheus();
     let expected = [
+        "# HELP ferrum_diagnostic_ref_replica_info Replica id this gateway process embeds in its \
+         diagnostic references (value is always 1).",
         "# TYPE ferrum_diagnostic_ref_replica_info gauge",
         "ferrum_diagnostic_ref_replica_info{replica_id=\"1a2b3c4d\"} 1",
     ];

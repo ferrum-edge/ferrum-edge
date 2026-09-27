@@ -1721,8 +1721,9 @@ process's `200` body adds `replica_id`. Asked for a reference another replica
 minted, a gateway answers the same `404` and body as any miss plus
 `X-Ferrum-Diagnostic-Owner-Replica: <replica id>`, only when the token carries
 `diagnostics:read` and an `ns` claim naming the answering gateway's namespace.
-Operator tooling then sends the lookup to the replica whose startup log or
-`ferrum_diagnostic_ref_replica_info{replica_id}` metric shows that id; the
+Operator tooling then sends the lookup to the replica whose
+`ferrum_diagnostic_ref_replica_info{replica_id}` metric (or INFO-level startup
+log) shows that id; the
 control plane does not proxy lookups. `fd1_` references keep resolving on the
 untagged gateway that minted them. See
 [error_classification.md](error_classification.md#lookup-across-replicas).

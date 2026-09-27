@@ -33,7 +33,9 @@ Keep the store per process, and make the reference name its owner.
    CSPRNG failure at startup fails startup rather than silently minting
    untagged references. The default stays `false`, so the #5767 promise that a
    reference embeds nothing still holds unless the operator opts in.
-2. **Discovery.** The process logs its replica id once at startup, exports
+2. **Discovery.** The process logs its replica id once at startup (at INFO,
+   so only with `FERRUM_LOG_LEVEL=info` or finer; the default `warn` hides
+   it), exports
    `ferrum_diagnostic_ref_replica_info{replica_id} 1` on `/metrics` (joined by
    Prometheus to the target's pod and instance labels), and returns it as
    `replica_id` in its own `200` lookup body.
@@ -62,8 +64,11 @@ not mint with the plain `404`, since an `fd1_` reference names no owner.
 
 Untagged references are unlinkable. With the tag, anyone who collects
 references, clients included, can tell which responses one process served and
-estimate how many processes answered, until the next restart. Nothing else is
-revealed. That is the reason the tag is opt-in and derived from nothing.
+estimate how many processes answered, until the next restart. Id churn over
+time also shows when processes restart, how a rollout proceeds, and whether a
+load balancer keeps a client on one process. The id names no host, pod, node,
+or address. That exposure is the reason the tag is opt-in and derived from
+nothing.
 
 ## Rejected Alternatives
 
@@ -104,8 +109,8 @@ revealed. That is the reason the tag is opt-in and derived from nothing.
 
 - Operator tooling resolves a tagged reference in at most two admin requests:
   any replica, then the one the hint names (or directly, by parsing the
-  replica id from the reference and looking it up in the startup log or the
-  `ferrum_diagnostic_ref_replica_info` series).
+  replica id from the reference and looking it up in the
+  `ferrum_diagnostic_ref_replica_info` series, or in the INFO startup log).
 - A restarted replica draws a new id; references it minted before the restart
   were already lost with its memory, so the hint then names an id no process
   reports, which is the correct answer.

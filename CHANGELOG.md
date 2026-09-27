@@ -18,8 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body as any miss, plus an `X-Ferrum-Diagnostic-Owner-Replica` header naming
   the owner, only for a token with `diagnostics:read` and an `ns` claim naming
   the answering process's namespace. The owning process's `200` body adds
-  `replica_id`; the id is logged at startup and exported as
-  `ferrum_diagnostic_ref_replica_info{replica_id}`. `fd1_` references keep
+  `replica_id`; the id is logged at startup at INFO and exported as
+  `ferrum_diagnostic_ref_replica_info{replica_id}`. Setting the flag while
+  `FERRUM_DIAGNOSTIC_REFS=off` logs a startup warning. `fd1_` references keep
   resolving on the untagged process that minted them, and the control plane
   does not proxy lookups. See `docs/plans/diagnostic_ref_cross_replica_adr.md`
   for the design and rejected alternatives.

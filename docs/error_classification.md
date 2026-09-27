@@ -593,9 +593,11 @@ CSPRNG when the store is installed. It is derived from nothing: no host name,
 pod name, node, address, or namespace, and a restart draws a new one, just as
 a restart forgets every reference. It is logged once at startup
 (`replica_id` on the INFO line "Diagnostic references carry this process's
-replica id") and exported as
+replica id", visible only with `FERRUM_LOG_LEVEL=info` or finer; the default
+`warn` hides it) and exported as
 `ferrum_diagnostic_ref_replica_info{replica_id="1a2b3c4d"} 1` on `/metrics`,
 so a Prometheus query joins it to the scrape target's pod and instance labels.
+The metric needs no log level, so it is the discovery path to rely on.
 The owning replica's lookup body carries it as `replica_id`.
 
 A lookup that reaches another replica:
@@ -622,7 +624,10 @@ never resolves.
 **What the tag reveals.** Untagged references are unlinkable. A tagged
 reference lets anyone who collects references (a client included) tell which
 responses one process served and roughly how many processes answered them,
-until the next restart. It reveals nothing else, which is why it is opt-in.
+until the next restart. Watching the ids change over time also shows when
+processes restart, how a rollout proceeds, and whether a load balancer keeps a
+client on one process. It names no host, pod, node, or address. That exposure
+is why the tag is opt-in.
 
 **Rejected alternatives** (see
 [the ADR](plans/diagnostic_ref_cross_replica_adr.md)):

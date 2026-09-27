@@ -2786,6 +2786,25 @@ async fn diagnostic_refs_name_the_owning_replica_only_to_authorized_callers() {
     assert_eq!(owner_replica.len(), 8, "{reference}");
     assert_eq!(key.len(), 32, "{reference}");
 
+    // The test relies on the two processes drawing different replica ids,
+    // which fails only with probability 2^-32.
+    let peer_reference = client
+        .get(peer.proxy_url("/api/diagnostic"))
+        .send()
+        .await
+        .expect("peer proxy response")
+        .headers()
+        .get("x-ferrum-diagnostic-ref")
+        .and_then(|value| value.to_str().ok())
+        .expect("one peer-minted reference")
+        .to_string();
+    let peer_replica = peer_reference
+        .strip_prefix("fd2_")
+        .and_then(|rest| rest.split_once('_'))
+        .map(|(replica, _)| replica)
+        .expect("peer fd2_ reference");
+    assert_ne!(peer_replica, owner_replica, "the two processes drew one replica id");
+
     let admin = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
