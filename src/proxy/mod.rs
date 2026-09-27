@@ -35783,28 +35783,34 @@ async fn handle_proxy_request_inner(
             if grpc_has_retry {
                 grpc_replay_headers = grpc_headers.clone();
             }
-            let result = grpc_proxy::proxy_grpc_request_core(
-                grpc_method,
-                grpc_headers,
-                grpc_req_body.clone(),
-                crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
-                grpc_dispatch_proxy,
-                &grpc_backend_url,
-                // The transport materialized for THIS target before any dial:
-                // the direct pool for an untagged target, the nested-HTTP/2
-                // HBONE transport for an Ambient `mesh.hbone` one. A
-                // `mesh.mtls` target never reaches here — it is routed onto the
-                // generic mesh-mTLS path by `grpc_mesh_dispatch_falls_through`
-                // and defensively refused by the screen above (issues #2003,
-                // #3284, #3728).
-                &grpc_transport,
-                &state.dns_cache,
-                owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
-                grpc_should_stream,
-                effective_max_response_body_size_bytes,
-                ctx.grpc_deadline_at(),
-            )
-            .await;
+            let headers_view = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+            // The attempt's `otel_tracing` CLIENT span (issue #5864).
+            let attempt_span = ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
+            let result = {
+                let attempt = grpc_proxy::proxy_grpc_request_core(
+                    grpc_method,
+                    grpc_headers,
+                    grpc_req_body.clone(),
+                    crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                    grpc_dispatch_proxy,
+                    &grpc_backend_url,
+                    // The transport materialized for THIS target before any dial:
+                    // the direct pool for an untagged target, the nested-HTTP/2
+                    // HBONE transport for an Ambient `mesh.hbone` one. A
+                    // `mesh.mtls` target never reaches here — it is routed onto the
+                    // generic mesh-mTLS path by `grpc_mesh_dispatch_falls_through`
+                    // and defensively refused by the screen above (issues #2003,
+                    // #3284, #3728).
+                    &grpc_transport,
+                    &state.dns_cache,
+                    attempt_span.headers(headers_view),
+                    grpc_should_stream,
+                    effective_max_response_body_size_bytes,
+                    ctx.grpc_deadline_at(),
+                );
+                tokio::pin!(attempt);
+                attempt_span.scope(attempt).await
+            };
             (result, grpc_req_body)
         } else {
             // Fast path: no plugin body hooks needed
@@ -35947,41 +35953,47 @@ async fn handle_proxy_request_inner(
                     Arc::clone(&ctx.bytes_sent_observed),
                     request_bytes_latch,
                 );
-                let result = grpc_proxy::proxy_grpc_request_streaming(
-                    request,
-                    grpc_dispatch_proxy,
-                    &grpc_backend_url,
-                    // Same materialized transport as the buffered arms. A
-                    // fully-streamed (non-replayable) upload can therefore ride
-                    // the Ambient HBONE tunnel's nested HTTP/2 connection with
-                    // frames committed incrementally and no retry (issue #3728).
-                    &grpc_transport,
-                    &state.dns_cache,
-                    owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
-                    effective_max_grpc_recv_size_bytes,
-                    body_size_exceeded,
-                    upload_observer,
-                    ctx.grpc_deadline_at(),
-                    &mut held_frontend_grpc_upload,
-                    // Scans the upload's own framing: a pass-through
-                    // gRPC-Web upload counts decoded message frames only.
-                    Some(
-                        crate::plugins::mesh::prometheus_helpers::GrpcMessageTap::new(
-                            Arc::clone(&ctx.grpc_request_messages_observed),
-                            crate::plugins::grpc_web::request_upload_grpc_message_framing(&ctx),
+                let headers_view = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+                // The attempt's `otel_tracing` CLIENT span (issue #5864).
+                let attempt_span = ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
+                let result = {
+                    let attempt = grpc_proxy::proxy_grpc_request_streaming(
+                        request,
+                        grpc_dispatch_proxy,
+                        &grpc_backend_url,
+                        // Same materialized transport as the buffered arms. A
+                        // fully-streamed (non-replayable) upload can therefore ride
+                        // the Ambient HBONE tunnel's nested HTTP/2 connection with
+                        // frames committed incrementally and no retry (issue #3728).
+                        &grpc_transport,
+                        &state.dns_cache,
+                        attempt_span.headers(headers_view),
+                        effective_max_grpc_recv_size_bytes,
+                        body_size_exceeded,
+                        upload_observer,
+                        ctx.grpc_deadline_at(),
+                        &mut held_frontend_grpc_upload,
+                        // Scans the upload's own framing: a pass-through
+                        // gRPC-Web upload counts decoded message frames only.
+                        Some(
+                            crate::plugins::mesh::prometheus_helpers::GrpcMessageTap::new(
+                                Arc::clone(&ctx.grpc_request_messages_observed),
+                                crate::plugins::grpc_web::request_upload_grpc_message_framing(&ctx),
+                            ),
                         ),
-                    ),
-                    // The buffered arms `fetch_max` the collected length into
-                    // this counter; the streamed arm has no collected length,
-                    // so the body publishes its forwarded DATA tally at upload
-                    // termination instead (GHSA-8x5h-g4xh-hgc9).
-                    Some(request_bytes_accounting),
-                    // Same absolute plan the buffered gRPC arms use (#3815);
-                    // the fully-streamed upload gets the gateway-owned pump
-                    // instead of a bounded collect.
-                    grpc_buffered_upload_auth_deadline.as_ref(),
-                )
-                .await;
+                        // The buffered arms `fetch_max` the collected length into
+                        // this counter; the streamed arm has no collected length,
+                        // so the body publishes its forwarded DATA tally at upload
+                        // termination instead (GHSA-8x5h-g4xh-hgc9).
+                        Some(request_bytes_accounting),
+                        // Same absolute plan the buffered gRPC arms use (#3815);
+                        // the fully-streamed upload gets the gateway-owned pump
+                        // instead of a bounded collect.
+                        grpc_buffered_upload_auth_deadline.as_ref(),
+                    );
+                    tokio::pin!(attempt);
+                    attempt_span.scope(attempt).await
+                };
                 (result, Bytes::new())
             } else {
                 // Mixed path: collect request body up-front (required for
@@ -36080,23 +36092,30 @@ async fn handle_proxy_request_inner(
                         if grpc_has_retry {
                             grpc_replay_headers = grpc_headers.clone();
                         }
-                        let result = grpc_proxy::proxy_grpc_request_core(
-                            grpc_method,
-                            grpc_headers,
-                            grpc_req_body.clone(),
-                            crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
-                            grpc_dispatch_proxy,
-                            &grpc_backend_url,
-                            // The same materialized transport as the split-path
-                            // call above (issues #2003, #3284, #3728).
-                            &grpc_transport,
-                            &state.dns_cache,
-                            owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
-                            grpc_should_stream,
-                            effective_max_response_body_size_bytes,
-                            ctx.grpc_deadline_at(),
-                        )
-                        .await;
+                        let headers_view = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+                        // The attempt's `otel_tracing` CLIENT span (issue #5864).
+                        let attempt_span =
+                            ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
+                        let result = {
+                            let attempt = grpc_proxy::proxy_grpc_request_core(
+                                grpc_method,
+                                grpc_headers,
+                                grpc_req_body.clone(),
+                                crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                                grpc_dispatch_proxy,
+                                &grpc_backend_url,
+                                // The same materialized transport as the split-path
+                                // call above (issues #2003, #3284, #3728).
+                                &grpc_transport,
+                                &state.dns_cache,
+                                attempt_span.headers(headers_view),
+                                grpc_should_stream,
+                                effective_max_response_body_size_bytes,
+                                ctx.grpc_deadline_at(),
+                            );
+                            tokio::pin!(attempt);
+                            attempt_span.scope(attempt).await
+                        };
                         (result, grpc_req_body)
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::TimedOut) => {
@@ -36671,26 +36690,32 @@ async fn handle_proxy_request_inner(
                 // A fresh route attempt budget for this retry (a no-op unless the
                 // matched rule carries one), still capped by the total deadline.
                 ctx.begin_grpc_route_attempt();
-                grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
-                    grpc_method.clone(),
-                    grpc_req_headers.clone(),
-                    grpc_body_bytes.clone(),
-                    // A retry replays the complete request, trailers included.
-                    crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
-                    grpc_retry_effective_proxy.as_ref(),
-                    &grpc_backend_url,
-                    // The transport re-materialized for THIS attempt's target:
-                    // the loop re-screens every rotated target above and refuses
-                    // any class this pipeline cannot carry before reaching here
-                    // (issues #2003, #3728).
-                    &grpc_retry_transport,
-                    &state.dns_cache,
-                    owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
-                    grpc_should_stream,
-                    effective_max_response_body_size_bytes,
-                    ctx.grpc_deadline_at(),
-                )
-                .await;
+                let headers_view = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+                // The attempt's `otel_tracing` CLIENT span (issue #5864).
+                let attempt_span = ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
+                grpc_result = {
+                    let attempt = grpc_proxy::proxy_grpc_request_from_bytes(
+                        grpc_method.clone(),
+                        grpc_req_headers.clone(),
+                        grpc_body_bytes.clone(),
+                        // A retry replays the complete request, trailers included.
+                        crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                        grpc_retry_effective_proxy.as_ref(),
+                        &grpc_backend_url,
+                        // The transport re-materialized for THIS attempt's target:
+                        // the loop re-screens every rotated target above and refuses
+                        // any class this pipeline cannot carry before reaching here
+                        // (issues #2003, #3728).
+                        &grpc_retry_transport,
+                        &state.dns_cache,
+                        attempt_span.headers(headers_view),
+                        grpc_should_stream,
+                        effective_max_response_body_size_bytes,
+                        ctx.grpc_deadline_at(),
+                    );
+                    tokio::pin!(attempt);
+                    attempt_span.scope(attempt).await
+                };
                 grpc_last_attempt_recorded = false;
                 if charge_grpc_route_attempt_budget_expiry(&ctx, &mut grpc_result) {
                     // As for the initial attempt: the charged terminal bounds
@@ -39102,19 +39127,26 @@ async fn handle_proxy_request_inner(
         // and the rule's per-attempt budget starts there. It also keeps the
         // retained request body if the budget cancels the attempt.
         let initial_attempt_handoff = BackendAttemptHandoff::default();
-        let initial_attempt = await_route_request_deadline(
+        // The attempt's `otel_tracing` CLIENT span (issue #5864): the backend
+        // receives the attempt's own `traceparent` when a trace is installed.
+        let initial_attempt_span = ctx.begin_backend_attempt_span(
+            &current_url,
+            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+        );
+        let initial_attempt = await_backend_attempt_route_deadline(
             route_request_deadline,
             RouteAttemptBudget::from_handoff(
                 route_attempt_timeout,
                 initial_attempt_handoff.marker(),
                 &mut route_attempt_deadline,
             ),
+            initial_attempt_span.trace(),
             proxy_to_backend(
                 &state,
                 &proxy,
                 &current_url,
                 &method,
-                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                initial_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
                 client_request_body,
                 upstream_target.as_deref(),
                 &plugins,
@@ -39141,6 +39173,9 @@ async fn handle_proxy_request_inner(
         )
         .await;
         let initial_handed_to_backend = initial_attempt_handoff.handed_to_backend();
+        // The attempt span starts where the backend dial / send began, after
+        // the dispatch prepared the request (issue #5864).
+        initial_attempt_span.handed_off_at(backend_admission_started_at);
         let initial_dispatch = match initial_attempt {
             Ok(dispatch) => dispatch,
             Err(expiry) => route_deadline_dispatch_result(
@@ -39779,16 +39814,25 @@ async fn handle_proxy_request_inner(
             ctx.begin_grpc_route_attempt();
             let retry_attempt_budget =
                 RouteAttemptBudget::from_start(route_attempt_timeout, &mut route_attempt_deadline);
+            // This retry's own `otel_tracing` CLIENT span and `traceparent`
+            // (issue #5864).
+            let retry_attempt_span = ctx.begin_backend_attempt_span(
+                &current_url,
+                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+            );
+            let retry_attempt_headers =
+                retry_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers));
             let attempt_result = if retry_dispatch_hbone || retry_dispatch_mesh_mtls {
-                match await_route_request_deadline(
+                match await_backend_attempt_route_deadline(
                     route_request_deadline,
                     retry_attempt_budget,
+                    retry_attempt_span.trace(),
                     proxy_to_backend_mesh_retry(
                         &state,
                         &proxy,
                         &current_url,
                         &method,
-                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        retry_attempt_headers,
                         current_target.as_deref(),
                         retained_body.as_ref(),
                         mesh_retry_headers.as_deref(),
@@ -39815,15 +39859,16 @@ async fn handle_proxy_request_inner(
                     }
                 }
             } else if current_dispatch_h3 {
-                await_route_request_deadline(
+                await_backend_attempt_route_deadline(
                     route_request_deadline,
                     retry_attempt_budget,
+                    retry_attempt_span.trace(),
                     proxy_to_backend_http3_retry(
                         &state,
                         &proxy,
                         &current_url,
                         &method,
-                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        retry_attempt_headers,
                         current_target.as_deref(),
                         retained_body.as_deref(),
                         should_stream,
@@ -39837,15 +39882,16 @@ async fn handle_proxy_request_inner(
                 )
                 .await
             } else {
-                await_route_request_deadline(
+                await_backend_attempt_route_deadline(
                     route_request_deadline,
                     retry_attempt_budget,
+                    retry_attempt_span.trace(),
                     proxy_to_backend_retry(
                         &state,
                         &proxy,
                         &current_url,
                         &method,
-                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        retry_attempt_headers,
                         current_target.as_deref(),
                         retained_body.as_deref(),
                         should_stream,
@@ -39918,19 +39964,25 @@ async fn handle_proxy_request_inner(
         let mut body_hook_ctx = deferred_body_hook_ctx.take();
         // See `initial_attempt_handoff` in the retry arm above.
         let dispatch_attempt_handoff = BackendAttemptHandoff::default();
-        let dispatch_attempt = await_route_request_deadline(
+        // See `initial_attempt_span` in the retry arm above.
+        let dispatch_attempt_span = ctx.begin_backend_attempt_span(
+            &backend_url,
+            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+        );
+        let dispatch_attempt = await_backend_attempt_route_deadline(
             route_request_deadline,
             RouteAttemptBudget::from_handoff(
                 route_attempt_timeout,
                 dispatch_attempt_handoff.marker(),
                 &mut route_attempt_deadline,
             ),
+            dispatch_attempt_span.trace(),
             proxy_to_backend(
                 &state,
                 &proxy,
                 &backend_url,
                 &method,
-                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                dispatch_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
                 client_request_body,
                 upstream_target.as_deref(),
                 &plugins,
@@ -39957,6 +40009,8 @@ async fn handle_proxy_request_inner(
         )
         .await;
         let dispatch_handed_to_backend = dispatch_attempt_handoff.handed_to_backend();
+        // See `initial_attempt_span.handed_off_at` in the retry arm above.
+        dispatch_attempt_span.handed_off_at(backend_admission_started_at);
         let dispatch = match dispatch_attempt {
             Ok(dispatch) => dispatch,
             Err(expiry) => route_deadline_dispatch_result(
@@ -50671,12 +50725,29 @@ pub(crate) fn await_route_request_deadline<F>(
 where
     F: std::future::Future,
 {
+    await_backend_attempt_route_deadline(deadline, attempt_budget, None, attempt)
+}
+
+/// [`await_route_request_deadline`] for a backend attempt begun with
+/// `RequestContext::begin_backend_attempt_span`: every poll of the attempt runs
+/// in the attempt's `otel_tracing` scope (issue #5864). With `trace` `None`
+/// this is exactly [`await_route_request_deadline`].
+pub(crate) fn await_backend_attempt_route_deadline<F>(
+    deadline: Option<tokio::time::Instant>,
+    attempt_budget: Option<RouteAttemptBudget<'_>>,
+    trace: Option<Arc<crate::plugins::otel_tracing::BackendAttemptTrace>>,
+    attempt: F,
+) -> RouteDeadlineAttempt<'_, F>
+where
+    F: std::future::Future,
+{
     RouteDeadlineAttempt {
         attempt,
         sleep: None,
         deadline,
         attempt_budget,
         started: false,
+        trace,
     }
 }
 
@@ -50696,6 +50767,7 @@ pin_project_lite::pin_project! {
         deadline: Option<tokio::time::Instant>,
         attempt_budget: Option<RouteAttemptBudget<'a>>,
         started: bool,
+        trace: Option<Arc<crate::plugins::otel_tracing::BackendAttemptTrace>>,
     }
 }
 
@@ -50705,7 +50777,12 @@ impl<F: std::future::Future> std::future::Future for RouteDeadlineAttempt<'_, F>
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         if this.deadline.is_none() && this.attempt_budget.is_none() {
-            return this.attempt.poll(cx).map(Ok);
+            return crate::plugins::otel_tracing::poll_backend_attempt(
+                this.trace.as_ref(),
+                this.attempt,
+                cx,
+            )
+            .map(Ok);
         }
         let deadline = *this.deadline;
         // The first poll: a spent total budget refuses the attempt before any
@@ -50719,7 +50796,11 @@ impl<F: std::future::Future> std::future::Future for RouteDeadlineAttempt<'_, F>
         if let Some(budget) = this.attempt_budget.as_mut() {
             budget.arm_if_handed_over();
         }
-        if let Poll::Ready(output) = this.attempt.poll(cx) {
+        if let Poll::Ready(output) = crate::plugins::otel_tracing::poll_backend_attempt(
+            this.trace.as_ref(),
+            this.attempt.as_mut(),
+            cx,
+        ) {
             // An attempt handed to the backend and answered within the same
             // poll still starts its budget, which then bounds the committed
             // attempt's streaming body.
@@ -66302,7 +66383,7 @@ mod tests {
             .expect("retry-loop call to proxy_grpc_request_from_bytes not found");
         let call_tail = &loop_body[call_idx..];
         let call_end = call_tail
-            .find(")\n                .await")
+            .find(");\n                    tokio::pin!(attempt);")
             .expect("end of retry-loop call not found");
         let call_args = &call_tail[..call_end];
 

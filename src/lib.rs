@@ -1039,6 +1039,46 @@ pub mod _test_support {
         ctx.record_backend_attempt(error_class, request_on_wire, response_status);
     }
 
+    /// Begin a backend attempt's `otel_tracing` CLIENT span (issue #5864) as
+    /// the retry loops' dispatch sites do, drive `attempt` in the attempt's
+    /// scope as they poll the dispatch, and return the header map the attempt
+    /// dispatched with the attempt's output.
+    pub async fn run_backend_attempt_for_test<F: std::future::Future>(
+        ctx: &crate::plugins::RequestContext,
+        backend_url: &str,
+        headers: &HashMap<String, String>,
+        attempt: F,
+    ) -> (HashMap<String, String>, F::Output) {
+        let span = ctx.begin_backend_attempt_span(backend_url, headers);
+        let dispatched = span.headers(headers).clone();
+        let attempt = std::pin::pin!(attempt);
+        let output = span.scope(attempt).await;
+        (dispatched, output)
+    }
+
+    /// Report, as the connection pools do, that the backend attempt being
+    /// polled rides a pooled connection it did not open.
+    pub fn note_backend_connection_reused_for_test() {
+        crate::plugins::otel_tracing::note_backend_connection_reused();
+    }
+
+    /// Report, as the connection pools do, a connection the backend attempt
+    /// being polled established, with the setup phases the pool timed.
+    pub fn note_backend_connection_setup_for_test(
+        setup: Duration,
+        dns: Duration,
+        tcp_connect: Duration,
+        tls_handshake: Option<Duration>,
+    ) {
+        crate::plugins::otel_tracing::note_backend_connection_setup_started();
+        crate::plugins::otel_tracing::note_backend_dns_resolution(dns);
+        crate::plugins::otel_tracing::note_backend_tcp_connect(tcp_connect);
+        if let Some(tls_handshake) = tls_handshake {
+            crate::plugins::otel_tracing::note_backend_tls_handshake(tls_handshake);
+        }
+        crate::plugins::otel_tracing::note_backend_connection_established(setup);
+    }
+
     /// Model the transport-owned empty-body proof for direct plugin lifecycle
     /// tests that do not enter through an HTTP proxy body-drain path.
     pub fn set_replay_request_body_empty_proven_for_test(

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`otel_tracing` CLIENT span per backend attempt** (#5864). With an `endpoint`
+  configured, every sampled request now also exports one `CLIENT` span per
+  backend attempt, retries included, as a child of the gateway's `SERVER` span.
+  Each carries the attempt number, `http.request.resend_count` and a
+  `gateway.backend.retry_reason` on retries, `server.address`/`server.port`
+  for the attempt's target, and the backend status or the gateway error class
+  (`error.type`). The backend receives that attempt's span as its `traceparent`
+  parent, so its own `SERVER` span nests under the attempt; the client-facing
+  echo still names the gateway `SERVER` span. The direct HTTP/2 and gRPC
+  connection pools report whether the attempt reused a pooled connection and,
+  when it set one up, the setup, DNS, TCP connect, and TLS handshake durations
+  they measured. Every other transport omits these attributes rather than
+  reporting zero. Attempts are instrumented on the HTTP/1.1/HTTP/2 backend
+  loop, the native gRPC loop, and the HTTP/3 frontend's buffered retry loop.
+  Other dispatch paths keep the previous `traceparent` and export no attempt
+  span. `SERVER` spans are unchanged. With tracing absent, unsampled, or in
+  propagation-only mode, each hook costs one check and allocates nothing.
+
 - **Diagnostic references for every gateway-authored error, with rejection and
   per-attempt detail** (#5846). `FERRUM_DIAGNOSTIC_REFS` takes a new `all`
   value: besides the responses `errors` already references (those carrying the
