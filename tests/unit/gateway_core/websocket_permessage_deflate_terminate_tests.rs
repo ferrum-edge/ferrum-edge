@@ -352,7 +352,7 @@ fn whole_backend_extension_answer_is_validated() {
         ],
         &[HeaderValue::from_static("permessage-deflate, x-other")],
         &[HeaderValue::from_static("permessage-deflate; x=\"1")],
-        &[non_ascii.clone()],
+        std::slice::from_ref(&non_ascii),
     ];
     for lines in refused {
         assert!(finish(lines).is_err(), "answer {lines:?} must be refused");
