@@ -27,6 +27,7 @@ use crate::scaffolding::backends::{
 };
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{reserve_port, reserve_refused_tcp_port};
+use crate::scaffolding::to_file_mode_yaml;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
@@ -221,7 +222,7 @@ async fn http1_status_retry_exports_one_client_span_per_attempt() {
         "plugin_configs": [otel_plugin(&collector)],
     });
     let harness = GatewayHarness::builder()
-        .file_config(serde_yaml::to_string(&config).expect("yaml"))
+        .file_config(to_file_mode_yaml(&config))
         .pool_warmup_enabled(false)
         .spawn()
         .await
@@ -407,7 +408,7 @@ async fn grpc_attempt_spans_cover_connect_retries_and_pooled_connection_reuse() 
         "plugin_configs": [otel_plugin(&collector)],
     });
     let harness = GatewayHarness::builder()
-        .file_config(serde_yaml::to_string(&config).expect("yaml"))
+        .file_config(to_file_mode_yaml(&config))
         .pool_warmup_enabled(false)
         .spawn()
         .await
@@ -572,7 +573,7 @@ async fn client_abort_mid_attempt_exports_the_cancelled_attempt_span() {
         "plugin_configs": [otel_plugin(&collector)],
     });
     let harness = GatewayHarness::builder()
-        .file_config(serde_yaml::to_string(&config).expect("yaml"))
+        .file_config(to_file_mode_yaml(&config))
         .pool_warmup_enabled(false)
         .spawn()
         .await
