@@ -581,6 +581,9 @@ async fn response_body_production_declarations_match_the_built_in_producers() {
 
 #[tokio::test]
 async fn websocket_framing_declarations_match_the_built_in_frame_plugins() {
+    // Same guards (and lock order) as the protocol-matrix test, which proves
+    // every built-in constructs from `minimal_plugin_config` under them.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     let _registry = super::plugin_utils::log_schema_registry_guard();
     use ferrum_edge::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS;
 
@@ -606,10 +609,12 @@ async fn websocket_framing_declarations_match_the_built_in_frame_plugins() {
             continue;
         }
 
+        // Every non-framing built-in must construct, so this drift check can
+        // never pass while silently checking nothing.
         let config = minimal_plugin_config(entry.name);
-        let Ok(Some(plugin)) = create_plugin(entry.name, &config) else {
-            continue;
-        };
+        let plugin = create_plugin(entry.name, &config)
+            .unwrap_or_else(|e| panic!("create_plugin({}) failed: {e}", entry.name))
+            .unwrap_or_else(|| panic!("create_plugin({}) returned None", entry.name));
         assert!(
             !plugin.requires_websocket_framing(),
             "{} requires the parsed WebSocket relay but is missing from \

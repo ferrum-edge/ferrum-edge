@@ -734,10 +734,13 @@ pub(crate) async fn handle_h3_websocket(
         &mut client_headers,
         &state.mesh_egress_strip_baggage_keys,
     );
-    // RFC 7692 passthrough (issue #5769), identical gate to H1/H2.
-    let ws_deflate_offered = proxy.websocket_permessage_deflate.is_passthrough()
-        && !requires_websocket_framing
-        && crate::proxy::push_permessage_deflate_offer(&mut client_headers, &proxy_headers);
+    // RFC 7692 passthrough (issue #5769), the same shared gate as H1/H2.
+    let ws_deflate_offered = crate::proxy::forward_permessage_deflate_offer(
+        proxy.websocket_permessage_deflate,
+        requires_websocket_framing,
+        &mut client_headers,
+        &proxy_headers,
+    );
 
     // ── Backend WebSocket handshake (reuses H1.1 Upgrade path) ──────
     //

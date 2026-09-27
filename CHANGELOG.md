@@ -23,7 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attached directly, through a proxy group, or inherited from a global plugin;
   the runtime also keeps stripping the offer whenever the live chain needs
   framing. SQL stores gain a `proxies.websocket_permessage_deflate` column in the
-  baseline schema; recreate development databases.
+  `V001` baseline schema. **Upgrade notes:** an existing SQLite, PostgreSQL, or
+  MySQL database created by v0.9.8 or earlier fails startup with a `V001`
+  checksum mismatch; recreate it and re-import its configuration. MongoDB is
+  unaffected. `Proxy` rejects unknown fields, so a DP that predates this field
+  rejects the whole namespace snapshot from a CP that sends it: upgrade every DP
+  before enabling `passthrough` on the CP.
 
 - Gateway-owned diagnostic references (#5767). With the new
   `FERRUM_DIAGNOSTIC_REFS=errors` (default `off`), every HTTP/1.1, HTTP/2, and

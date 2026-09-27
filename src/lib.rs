@@ -7668,6 +7668,22 @@ pub mod _test_support {
         crate::proxy::push_permessage_deflate_offer(client_headers, proxy_headers)
     }
 
+    /// The runtime passthrough gate both WebSocket upgrade paths use; returns
+    /// whether an offer was forwarded (issue #5769).
+    pub fn forward_permessage_deflate_offer_for_test(
+        mode: crate::config::types::WebSocketPermessageDeflate,
+        requires_websocket_framing: bool,
+        client_headers: &mut Vec<(String, String)>,
+        proxy_headers: &HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::forward_permessage_deflate_offer(
+            mode,
+            requires_websocket_framing,
+            client_headers,
+            proxy_headers,
+        )
+    }
+
     /// The backend `permessage-deflate` answer a passthrough proxy forwards.
     pub fn permessage_deflate_answer_for_test(
         headers: &hyper::HeaderMap,

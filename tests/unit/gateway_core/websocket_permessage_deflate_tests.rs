@@ -5,9 +5,10 @@
 use std::collections::HashMap;
 
 use ferrum_edge::_test_support::{
-    collect_forwardable_websocket_headers_for_test, permessage_deflate_answer_for_test,
-    push_permessage_deflate_offer_for_test,
+    collect_forwardable_websocket_headers_for_test, forward_permessage_deflate_offer_for_test,
+    permessage_deflate_answer_for_test, push_permessage_deflate_offer_for_test,
 };
+use ferrum_edge::config::types::WebSocketPermessageDeflate;
 use ferrum_edge::proxy::retain_permessage_deflate_extensions;
 use hyper::HeaderMap;
 use hyper::header::{HeaderValue, SEC_WEBSOCKET_EXTENSIONS};
@@ -110,11 +111,47 @@ fn passthrough_offer_forwards_only_permessage_deflate() {
         "x-webkit-deflate-frame, permessage-deflate; client_max_window_bits".to_string(),
     )]);
     let mut client_headers = vec![("x-app".to_string(), "kept".to_string())];
-    assert!(push_permessage_deflate_offer_for_test(&mut client_headers, &proxy_headers));
+    assert!(push_permessage_deflate_offer_for_test(
+        &mut client_headers,
+        &proxy_headers
+    ));
     assert_eq!(
         extensions_header(&client_headers),
         vec!["permessage-deflate; client_max_window_bits"]
     );
+}
+
+#[test]
+fn runtime_gate_forwards_only_for_passthrough_without_framing() {
+    let proxy_headers = HashMap::from([(
+        "sec-websocket-extensions".to_string(),
+        "permessage-deflate; client_max_window_bits".to_string(),
+    )]);
+    let cases = [
+        (WebSocketPermessageDeflate::Strip, false, false),
+        (WebSocketPermessageDeflate::Strip, true, false),
+        (WebSocketPermessageDeflate::Passthrough, true, false),
+        (WebSocketPermessageDeflate::Passthrough, false, true),
+    ];
+    for (mode, requires_framing, expected) in cases {
+        let mut client_headers = vec![("x-app".to_string(), "kept".to_string())];
+        let forwarded = forward_permessage_deflate_offer_for_test(
+            mode,
+            requires_framing,
+            &mut client_headers,
+            &proxy_headers,
+        );
+        assert_eq!(
+            forwarded, expected,
+            "mode {mode:?}, requires_framing {requires_framing}"
+        );
+        let expected_offer: Vec<&str> = if expected {
+            vec!["permessage-deflate; client_max_window_bits"]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(extensions_header(&client_headers), expected_offer);
+    }
 }
 
 #[test]

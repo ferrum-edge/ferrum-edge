@@ -332,7 +332,10 @@ fn proxy_routing_and_stream_controls_match_runtime() {
             (json!({"udp_max_response_amplification_factor": 0.5}), true),
             (json!({"websocket_permessage_deflate": "strip"}), true),
             (json!({"websocket_permessage_deflate": "passthrough"}), true),
-            (json!({"websocket_permessage_deflate": "Passthrough"}), false),
+            (
+                json!({"websocket_permessage_deflate": "Passthrough"}),
+                false,
+            ),
             (json!({"websocket_permessage_deflate": null}), false),
         ] {
             let mut body = proxy();

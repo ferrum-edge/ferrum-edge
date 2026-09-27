@@ -316,7 +316,11 @@ async fn h1_upgrade(proxy_port: u16, path: &str) -> (TcpStream, String, Vec<u8>)
 async fn h2_extended_connect(
     proxy_port: u16,
     path: &str,
-) -> (http::StatusCode, http::HeaderMap, TokioIo<hyper::upgrade::Upgraded>) {
+) -> (
+    http::StatusCode,
+    http::HeaderMap,
+    TokioIo<hyper::upgrade::Upgraded>,
+) {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect h2 gateway");
@@ -370,13 +374,20 @@ async fn functional_ws_deflate_http1_strip_and_passthrough() {
         header_values(&head, "sec-websocket-extensions").is_empty(),
         "a strip proxy must not answer with an extension: {head}"
     );
-    assert_eq!(backend.next_offer().await, None, "strip must drop the offer");
+    assert_eq!(
+        backend.next_offer().await,
+        None,
+        "strip must drop the offer"
+    );
     let first = read_exact_after(&mut stream, &mut pending, plain_server_frame().len()).await;
     assert_eq!(first, plain_server_frame());
     drop(stream);
 
     let (mut stream, head, mut pending) = h1_upgrade(port, "/deflate").await;
-    assert!(head.starts_with("HTTP/1.1 101"), "passthrough upgrade: {head}");
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "passthrough upgrade: {head}"
+    );
     assert_eq!(
         header_values(&head, "sec-websocket-extensions"),
         vec![FORWARDED_ANSWER]
@@ -395,7 +406,11 @@ async fn functional_ws_deflate_h2_extended_connect_strip_and_passthrough() {
     let (status, headers, mut io) = h2_extended_connect(port, "/strip").await;
     assert_eq!(status, http::StatusCode::OK);
     assert!(extension_answer(&headers).is_empty());
-    assert_eq!(backend.next_offer().await, None, "strip must drop the offer");
+    assert_eq!(
+        backend.next_offer().await,
+        None,
+        "strip must drop the offer"
+    );
     let first = read_exact_after(&mut io, &mut Vec::new(), plain_server_frame().len()).await;
     assert_eq!(first, plain_server_frame());
     drop(io);
@@ -448,7 +463,11 @@ async fn functional_ws_deflate_http3_strip_and_passthrough() {
     };
     assert_eq!(strip.status, http::StatusCode::OK);
     assert!(extension_answer(&strip.headers).is_empty());
-    assert_eq!(backend.next_offer().await, None, "strip must drop the offer");
+    assert_eq!(
+        backend.next_offer().await,
+        None,
+        "strip must drop the offer"
+    );
     let first = strip
         .recv_raw_exact(plain_server_frame().len())
         .await

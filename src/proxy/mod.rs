@@ -15174,12 +15174,14 @@ async fn handle_websocket_request_authenticated(
         &state.mesh_egress_strip_baggage_keys,
     );
 
-    // RFC 7692 passthrough (issue #5769): only an opted-in proxy whose plugin
-    // chain never needs the parsed relay forwards the client's
-    // permessage-deflate offer. Default `strip` proxies short-circuit here.
-    let ws_deflate_offered = proxy.websocket_permessage_deflate.is_passthrough()
-        && !requires_websocket_framing
-        && push_permessage_deflate_offer(&mut client_headers, &proxy_headers);
+    // RFC 7692 passthrough (issue #5769). Default `strip` proxies
+    // short-circuit inside the shared gate.
+    let ws_deflate_offered = forward_permessage_deflate_offer(
+        proxy.websocket_permessage_deflate,
+        requires_websocket_framing,
+        &mut client_headers,
+        &proxy_headers,
+    );
 
     // Connect to backend BEFORE sending 101 to client.
     // If the backend is unreachable, we return 502 instead of a premature 101.
@@ -16645,7 +16647,7 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             // down with a protocol error. Strip the offer so no extension is
             // ever negotiated end to end. A `websocket_permessage_deflate:
             // passthrough` proxy re-adds only the permessage-deflate elements
-            // through `push_permessage_deflate_offer` (issue #5769).
+            // through `forward_permessage_deflate_offer` (issue #5769).
             | "sec-websocket-extensions"
             | "x-geo-country"
         )
@@ -16707,6 +16709,22 @@ pub fn retain_permessage_deflate_extensions(value: &str) -> Option<String> {
     (!kept.is_empty()).then_some(kept)
 }
 
+/// The RFC 7692 passthrough gate shared by the H1/H2 and HTTP/3 WebSocket
+/// paths (issue #5769): only a `passthrough` proxy whose plugin chain never
+/// needs the parsed relay forwards the client's `permessage-deflate` offer.
+/// `strip` proxies and framing-dependent chains return `false` without
+/// touching `client_headers`. Returns whether an offer was forwarded.
+pub(crate) fn forward_permessage_deflate_offer(
+    mode: crate::config::types::WebSocketPermessageDeflate,
+    requires_websocket_framing: bool,
+    client_headers: &mut Vec<(String, String)>,
+    proxy_headers: &HashMap<String, String>,
+) -> bool {
+    mode.is_passthrough()
+        && !requires_websocket_framing
+        && push_permessage_deflate_offer(client_headers, proxy_headers)
+}
+
 /// Forward the client's `permessage-deflate` offer to the backend handshake of
 /// a `websocket_permessage_deflate: passthrough` proxy (issue #5769).
 ///
@@ -16745,7 +16763,9 @@ pub(crate) fn push_permessage_deflate_offer(
 pub(crate) fn permessage_deflate_answer(
     headers: &hyper::HeaderMap,
 ) -> Option<hyper::header::HeaderValue> {
-    let mut values = headers.get_all(hyper::header::SEC_WEBSOCKET_EXTENSIONS).iter();
+    let mut values = headers
+        .get_all(hyper::header::SEC_WEBSOCKET_EXTENSIONS)
+        .iter();
     let first = values.next()?.to_str().ok()?;
     let mut joined = first.to_string();
     for value in values {

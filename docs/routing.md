@@ -415,6 +415,10 @@ config. As a second guard, the runtime keeps stripping the offer whenever the
 proxy's live plugin chain requires framing. Stream proxies (`tcp`/`tcps`/`udp`/
 `dtls`) must keep `strip`.
 
+In CP/DP deployments, upgrade every DP before enabling passthrough on the CP. A
+proxy rejects unknown fields, so a DP that predates `websocket_permessage_deflate`
+rejects the whole namespace snapshot from a CP that sends it.
+
 ```yaml
 proxies:
   - id: chat

@@ -12647,9 +12647,6 @@ fn list_namespace_name(row: &AnyRow) -> Result<String, anyhow::Error> {
         })
 }
 
-/// Decode a nullable TEXT/MEDIUMTEXT column. `Ok(None)` preserves SQL NULL;
-/// non-NULL Blob/text values that are not valid UTF-8 still reject the row so
-/// trust/routing material cannot silently become `None`.
 /// Decode `proxies.websocket_permessage_deflate`. An unknown stored value
 /// rejects the row instead of silently falling back to either mode.
 fn decode_websocket_permessage_deflate(
@@ -12659,12 +12656,18 @@ fn decode_websocket_permessage_deflate(
     match optional_utf8_text_column(row, "websocket_permessage_deflate")? {
         Some(value) => crate::config::types::WebSocketPermessageDeflate::parse(value.trim())
             .ok_or_else(|| {
-                anyhow::anyhow!("Proxy {:?}: invalid websocket_permessage_deflate value", pid)
+                anyhow::anyhow!(
+                    "Proxy {:?}: invalid websocket_permessage_deflate value",
+                    pid
+                )
             }),
         None => Ok(crate::config::types::WebSocketPermessageDeflate::Strip),
     }
 }
 
+/// Decode a nullable TEXT/MEDIUMTEXT column. `Ok(None)` preserves SQL NULL;
+/// non-NULL Blob/text values that are not valid UTF-8 still reject the row so
+/// trust/routing material cannot silently become `None`.
 fn optional_utf8_text_column(row: &AnyRow, column: &str) -> Result<Option<String>, anyhow::Error> {
     match row.try_get::<Option<String>, _>(column) {
         Ok(value) => Ok(value),
