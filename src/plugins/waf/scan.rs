@@ -444,8 +444,9 @@ impl Waf {
                 continue;
             };
             self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
-            let (variants, _) = normalize::decoded_variants_with_residual(text);
-            for variant in variants {
+            // `text` is already JSON-unescaped; its single-character escapes
+            // are not resolved a second time.
+            for variant in normalize::decoded_json_value_variants(text) {
                 self.push_json_path_hit_if_matched(outcome, path_rule, &variant, text, subject);
             }
         }
@@ -496,18 +497,15 @@ impl Waf {
     /// Rails unescape them first. A WAF that only scans the raw crumb misses
     /// `pref=%3Cscript%3E`; one that only scans the decoded form misses a raw
     /// payload a non-decoding backend reads verbatim. So the raw crumb is
-    /// always scanned and every distinct decoded view is scanned beside it,
-    /// through the same bounded canonical decode query components use.
-    /// Splitting on `;` happens first, so an encoded `%3B` cannot forge an
-    /// extra crumb. A crumb with nothing to decode costs no allocation.
+    /// always scanned and every distinct decoded view is scanned beside it.
+    /// Cookie views take percent decoding only (`%XX`, `%uXXXX`, `+`, and the
+    /// bounded layered percent decode): JSON string escapes and HTML entities
+    /// are not cookie encodings, and resolving them would turn an Express
+    /// `j:` JSON cookie's `\n` into a control character. Splitting on `;`
+    /// happens first, so an encoded `%3B` cannot forge an extra crumb. A crumb
+    /// with nothing to decode costs no allocation.
     fn scan_cookies(&self, outcome: &mut ScanOutcome, header: &str, subject: ScanSubject<'_>) {
-        if self.compiled.cookies.is_none()
-            && !self
-                .compiled
-                .text_cidr_rules
-                .iter()
-                .any(|&index| matches!(self.compiled.rules[index].target, RuleTarget::Cookies))
-        {
+        if !self.compiled.cookie_rules_active {
             return;
         }
         for cookie in header.split(';') {
@@ -516,7 +514,7 @@ impl Waf {
                 continue;
             }
             self.scan_cookie_view(outcome, cookie, subject);
-            let views = normalize::canonical_query_component_views(cookie);
+            let views = normalize::canonical_cookie_views(cookie);
             for view in views.iter().filter(|view| *view != cookie) {
                 self.scan_cookie_view(outcome, view, subject);
             }

@@ -256,3 +256,155 @@ async fn an_encoded_semicolon_cannot_forge_an_extra_cookie_crumb() {
     let (real, _) = scan_cookie(&plugin, "session=1; role=admin").await;
     assert!(matches!(real, PluginResult::Reject { .. }));
 }
+
+#[tokio::test]
+async fn backslash_runs_alone_do_not_raise_a_residual_encoding_signal() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "scan_budget_ms": 0,
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+
+    // A run of backslashes halves on every decode round, so ordinary
+    // backslash-heavy text is still "changing" at the round cap. None of it
+    // hides a percent, `\u` / `\x`, or entity layer.
+    let quote_4x = format!(r#"{{"v":"{}"ok"}}"#, "\\".repeat(15));
+    let unc_2x = format!(
+        r#"{{"cfg":"{{\"share\":\"{}new-host{}share\"}}"}}"#,
+        "\\".repeat(8),
+        "\\".repeat(8)
+    );
+    let latex = format!(r#"{{"tex":"a{}newline b"}}"#, "\\".repeat(16));
+    let regex = format!(r#"{{"re":"^{}d+$"}}"#, "\\".repeat(16));
+    for body in [quote_4x, unc_2x, latex, regex] {
+        let request = scan_body(&plugin, "application/json", body.as_bytes()).await;
+        assert!(
+            !hit(&request, "FE-ENCODING-001"),
+            "{body:?} must not be flagged as residual encoding; hits={:?}",
+            hits(&request)
+        );
+    }
+
+    // A real code-point escape still pending behind the backslash layers at
+    // the cap, and a deep percent or entity stack, remain residuals.
+    let deep_unicode = format!(r#"{{"v":"{}u003cscript"}}"#, "\\".repeat(8));
+    for body in [
+        deep_unicode.as_bytes(),
+        b"q=%2525253Cscript%2525253E".as_slice(),
+        b"q=&amp;amp;amp;lt;script&amp;amp;amp;gt;".as_slice(),
+    ] {
+        let request = scan_body(&plugin, "text/plain", body).await;
+        assert!(
+            hit(&request, "FE-ENCODING-001"),
+            "{:?} must be flagged; hits={:?}",
+            String::from_utf8_lossy(body),
+            hits(&request)
+        );
+    }
+}
+
+#[tokio::test]
+async fn cookie_views_decode_percent_escapes_only() {
+    let plugin = monitor_waf();
+    // Express `j:` JSON cookie whose string holds `\n` (percent-encoded as
+    // `%5Cn`): the application reads a backslash and an `n`, never a LF.
+    let (_, json_cookie) = scan_cookie(&plugin, "prefs=j%3A%7B%22m%22%3A%22a%5Cnb%22%7D").await;
+    assert!(
+        !hit(&json_cookie, "FE-COOKIE-001"),
+        "hits={:?}",
+        hits(&json_cookie)
+    );
+    // An HTML numeric entity is not a cookie encoding either.
+    let (_, entity_cookie) = scan_cookie(&plugin, "note=a&#10;b").await;
+    assert!(
+        !hit(&entity_cookie, "FE-COOKIE-001"),
+        "hits={:?}",
+        hits(&entity_cookie)
+    );
+
+    // Percent-encoded control characters, single or layered, still reach the
+    // rule, as does a raw one.
+    for cookie in ["lang=en%0Ab", "lang=en%250Ab", "lang=en%u000Ab"] {
+        let (_, request) = scan_cookie(&plugin, cookie).await;
+        assert!(
+            hit(&request, "FE-COOKIE-001"),
+            "{cookie:?} must be recognised; hits={:?}",
+            hits(&request)
+        );
+    }
+}
+
+#[tokio::test]
+async fn percent_encoded_plus_decodes_to_plus_not_space() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "scan_budget_ms": 0,
+        "custom_rules": [{
+            "id": "Q-SSTI",
+            "category": "custom",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "{{7+7}}"
+        }]
+    }))
+    .unwrap();
+
+    // A form decoder turns `%2B` / `%u002B` into `+`; only a literal `+` is a
+    // space.
+    for query in ["q=%7B%7B7%2B7%7D%7D", "q=%7B%7B7%u002B7%7D%7D"] {
+        let request = scan_query(&plugin, query).await;
+        assert!(
+            hit(&request, "Q-SSTI"),
+            "{query:?} must decode to `{{{{7+7}}}}`; hits={:?}",
+            hits(&request)
+        );
+    }
+
+    let benign = scan_query(&plugin, "q=%7B%7B7+7%7D%7D").await;
+    assert!(!hit(&benign, "Q-SSTI"), "hits={:?}", hits(&benign));
+}
+
+#[tokio::test]
+async fn json_path_values_are_not_json_unescaped_twice() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "scan_budget_ms": 0,
+        "custom_rules": [
+            {
+                "id": "JP-LF",
+                "category": "custom",
+                "target": { "type": "body_json_path", "path": "path" },
+                "pattern": "[\\r\\n]"
+            },
+            {
+                "id": "JP-XSS",
+                "category": "custom",
+                "target": { "type": "body_json_path", "path": "path" },
+                "match_kind": "contains",
+                "pattern": "<script"
+            }
+        ]
+    }))
+    .unwrap();
+
+    // The parser yields `C:\new` — a backslash and an `n`, not a line feed.
+    let benign = scan_body(&plugin, "application/json", br#"{"path":"C:\\new"}"#).await;
+    assert!(!hit(&benign, "JP-LF"), "hits={:?}", hits(&benign));
+
+    // A JSON `\n` IS a line feed in the parsed value.
+    let lf = scan_body(&plugin, "application/json", br#"{"path":"a\nb"}"#).await;
+    assert!(hit(&lf, "JP-LF"), "hits={:?}", hits(&lf));
+
+    // A code-point escape left in the parsed value still gets the second,
+    // application-level decode.
+    let xss = scan_body(
+        &plugin,
+        "application/json",
+        br#"{"path":"\\u003cscript\\u003e"}"#,
+    )
+    .await;
+    assert!(hit(&xss, "JP-XSS"), "hits={:?}", hits(&xss));
+}

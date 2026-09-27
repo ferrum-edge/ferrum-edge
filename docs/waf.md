@@ -145,17 +145,24 @@ matching request and response bodies, the WAF also scans **decoded variants**:
   `union<TAB>select`, `\"1\"=\"1` as `"1"="1`, and `file:\/\/\/etc\/passwd`
   as `file:///etc/passwd`. `\\` is one backslash, exactly as the parser reads
   it; the layered decode still reduces a deliberate double escape
-  (`\\u003c` → `\u003c` → `<`) one layer per round.
+  (`\\u003c` → `\u003c` → `<`) one layer per round. A `body_json_path` value
+  has already been through the JSON parser, so only its `\uXXXX` / `\u{...}` /
+  `\xXX` escapes are decoded again; `C:\new` in a parsed value stays a
+  backslash and an `n`. A run of backslashes halves each round, but that
+  collapse alone never counts as an unreduced layer for the `FE-ENCODING-001`
+  residual described below, so multiply-stringified JSON, UNC paths, and regex
+  or LaTeX source are not flagged.
 - HTML entities — `&lt;`, `&#60;`, `&#x3c;`
 - Percent-encoding — `%XX`, the IIS / classic ASP and JavaScript `unescape()`
-  form `%uXXXX` (`%u003cscript%u003e`), and `+`-as-space (form bodies)
+  form `%uXXXX` (`%u003cscript%u003e`), and `+`-as-space (form bodies), in one
+  pass: only a literal `+` is a space, so `%2B` and `%u002B` decode to `+`
 - a fully layered decode for stacked encodings
 
 So a `<script>` written as `\u003cscript\u003e`, `&lt;script&gt;`,
 `%3Cscript%3E`, or `%u003cscript%u003e` in a body is still caught by the
-script-tag rule. The layered
-escape decoders are content-type-agnostic (an attacker controls the declared
-`Content-Type`) and bounded to a small number of variants.
+script-tag rule. The layered escape decoders are content-type-agnostic (an
+attacker controls the declared `Content-Type`) and bounded to a small number of
+variants.
 
 UTF-16 / UTF-32 transcoding does **not** decide whether a body is
 scanned. The `body_content_types`, `inspect_multipart`, and
@@ -247,11 +254,14 @@ Cookie values are scanned **both** as sent and as decoded. Frameworks disagree
 about cookies: the Servlet API and Go's `net/http` hand the application the raw
 octets, while PHP (`urldecode`, so `+` is a space), Express `cookie-parser`
 (`decodeURIComponent`), and Rails unescape them first. Each `name=value` crumb
-is therefore matched raw, and every distinct view produced by the same bounded
-canonical decode query components use is matched beside it, so
+is therefore matched raw and beside its percent-decoded views — `%XX`,
+`%uXXXX`, `+` as a space, and the bounded layered percent decode — so
 `pref=%3Cscript%3E` and `lang=en%0d%0aSet-Cookie:…` reach the cookie rules.
-The header is split on `;` before decoding, so an encoded `%3B` cannot forge an
-extra crumb. As with queries, decoding is inspection-only.
+Cookies get percent decoding only: JSON string escapes and HTML entities are
+not cookie encodings, so an Express `j:` JSON cookie whose string holds `\n`
+is not read as a line feed. The header is split on `;` before decoding, so an
+encoded `%3B` cannot forge an extra crumb. As with queries, decoding is
+inspection-only.
 
 The layered decode runs a bounded number of rounds (a cost guard against
 decompression-style blowups), so double- and triple-stacked encodings are fully

@@ -208,11 +208,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoded, so `{"q":"1 union\tselect …"}`, `admin\" or \"1\"=\"1`, and
   `file:\/\/\/etc\/passwd` reach the SQLi, SSRF, and LFI rules as the JSON
   parser delivers them. The IIS / classic ASP and JavaScript `unescape()` form
-  `%uXXXX` is decoded in query values and bodies. Cookie crumbs are scanned
-  both raw and decoded (percent, `%u`, and the bounded layered decode), since
-  PHP, Express `cookie-parser`, and Rails unescape cookie values before binding
-  them; the header is split on `;` first, so an encoded `%3B` cannot forge an
-  extra crumb.
+  `%uXXXX` is decoded in query values and bodies, in the same single pass as
+  `%XX`, so `%2B` and `%u002B` stay `+`. Cookie crumbs are scanned both raw
+  and percent-decoded (`%XX`, `%u`, and the bounded layered percent decode),
+  since PHP, Express `cookie-parser`, and Rails unescape cookie values before
+  binding them; the header is split on `;` first, so an encoded `%3B` cannot
+  forge an extra crumb. `body_json_path` values, already unescaped by the JSON
+  parser, do not have their single-character escapes resolved a second time,
+  and collapsing a run of backslashes no longer counts as an unreduced layer
+  for the `FE-ENCODING-001` residual.
 
 ### Performance
 

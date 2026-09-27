@@ -15,8 +15,6 @@
 
 use std::borrow::Cow;
 
-use percent_encoding::percent_decode_str;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Utf16Endian {
     Little,
@@ -79,6 +77,19 @@ const MAX_BRACED_ESCAPE_HEX_DIGITS: usize = 6;
 /// residual flag share a single layered decode pass rather than running it
 /// twice.
 pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) {
+    decoded_variants(text, StringEscapes::All)
+}
+
+/// Decoded variants of a string a JSON parser already unescaped (a JSON-path
+/// rule's value). The single-character escapes (`\n`, `\"`, `\\`, …) were
+/// resolved once by that parser, so they are not resolved a second time —
+/// `C:\new` in the parsed value stays a backslash and an `n`. The residual
+/// flag is not reported: JSON-path rules do not raise encoding evasion.
+pub(super) fn decoded_json_value_variants(text: &str) -> Vec<String> {
+    decoded_variants(text, StringEscapes::CodePointsOnly).0
+}
+
+fn decoded_variants(text: &str, escapes: StringEscapes) -> (Vec<String>, bool) {
     if !has_decodable_marker(text) {
         return (Vec::new(), false);
     }
@@ -87,10 +98,10 @@ pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) 
     // entities). The single-layer decodes are kept as well because a layered
     // percent-decode can mangle a body that merely contains a literal `%`,
     // and we still want the JSON/HTML-only decode to fire in that case.
-    let (layered, converged) = layered_decode_inner(text);
+    let (layered, converged) = layered_decode_inner(text, escapes);
     let candidates = [
         Cow::Owned(layered),
-        unicode_unescape(text),
+        string_unescape(text, escapes),
         html_entity_decode(text),
         percent_decode_plus(text),
     ];
@@ -588,6 +599,35 @@ pub(super) fn canonical_query_component_views(raw: &str) -> CanonicalQueryViews<
     CanonicalQueryViews { primary, variants }
 }
 
+/// Inspection views of one `name=value` cookie crumb: the percent decode
+/// (`%XX`, `%uXXXX`, `+` → space) and, when that is itself still
+/// percent-encoded, the layered percent decode capped at
+/// [`MAX_DECODE_ROUNDS`].
+///
+/// Callers split the `Cookie` header on `;` first, so `%3B` cannot forge an
+/// extra crumb. Only percent decoding applies — the unescape PHP, Express
+/// `cookie-parser`, and Rails perform on cookie values. JSON string escapes
+/// and HTML entities are not cookie encodings: an Express `j:` JSON cookie
+/// whose string holds `\n` is ordinary text to the application, and decoding
+/// it would hand the control-character rule a line feed nobody receives.
+pub(super) fn canonical_cookie_views(raw: &str) -> CanonicalQueryViews<'_> {
+    let primary = percent_decode_plus(raw);
+    let mut variants = Vec::new();
+    if let Cow::Owned(first) = &primary {
+        let mut layered: Option<String> = None;
+        for _ in 1..MAX_DECODE_ROUNDS {
+            let current = layered.as_deref().unwrap_or(first.as_str());
+            let next = match percent_decode_plus(current) {
+                Cow::Owned(next) => next,
+                Cow::Borrowed(_) => break,
+            };
+            layered = Some(next);
+        }
+        variants.extend(layered);
+    }
+    CanonicalQueryViews { primary, variants }
+}
+
 fn has_decodable_marker(text: &str) -> bool {
     text.as_bytes()
         .iter()
@@ -595,9 +635,9 @@ fn has_decodable_marker(text: &str) -> bool {
 }
 
 /// One round of the layered decode: percent, then unicode, then HTML entity.
-fn decode_round(text: &str) -> String {
+fn decode_round(text: &str, escapes: StringEscapes) -> String {
     let percent = percent_decode_plus(text).into_owned();
-    let unicode = unicode_unescape(&percent).into_owned();
+    let unicode = string_unescape(&percent, escapes).into_owned();
     html_entity_decode(&unicode).into_owned()
 }
 
@@ -610,100 +650,164 @@ fn decode_round(text: &str) -> String {
 /// by exhausting the iteration count: a payload that finishes decoding on the
 /// final allowed round (e.g. triple percent-encoding with a 3-round cap) has
 /// converged and must not be reported as a residual.
-fn layered_decode_inner(text: &str) -> (String, bool) {
+fn layered_decode_inner(text: &str, escapes: StringEscapes) -> (String, bool) {
     let mut current = text.to_string();
     let mut converged = true;
     for round in 0..MAX_DECODE_ROUNDS {
-        let next = decode_round(&current);
+        let next = decode_round(&current, escapes);
         if next == current {
             // Reached a fixed point before the cap — fully reduced.
             break;
         }
         current = next;
         // The last permitted round still changed the value; if a further round
-        // would change it again the payload is stacked deeper than the cap.
+        // would peel another real layer the payload is stacked deeper than the
+        // cap. Backslash-run collapsing alone is not such a layer.
         if round + 1 == MAX_DECODE_ROUNDS {
-            converged = decode_round(&current) == current;
+            converged = !has_pending_decode(&current);
         }
     }
     (current, converged)
 }
 
 /// Percent-decode (`%XX` and `%uXXXX`) and translate `+` to space
-/// (form-encoding). Lossy on invalid UTF-8 sequences, which is fine for
-/// pattern detection.
-fn percent_decode_plus(text: &str) -> Cow<'_, str> {
-    if !text.as_bytes().contains(&b'%') {
-        if text.as_bytes().contains(&b'+') {
-            return Cow::Owned(text.replace('+', " "));
-        }
-        return Cow::Borrowed(text);
-    }
-    let decoded = if has_percent_u_escape(text) {
-        Cow::Owned(percent_decode_with_u_escapes(text))
-    } else {
-        percent_decode_str(text).decode_utf8_lossy()
-    };
-    if decoded.as_bytes().contains(&b'+') {
-        Cow::Owned(decoded.replace('+', " "))
-    } else {
-        decoded
-    }
-}
-
-/// Whether `text` carries at least one well-formed `%uXXXX` escape.
+/// (form-encoding) in a single pass. Lossy on invalid UTF-8 sequences, which
+/// is fine for pattern detection.
 ///
 /// `%uXXXX` is not RFC 3986 percent-encoding, but IIS / classic ASP decode it
 /// in the query string and form body, and JavaScript `unescape()` decodes it
 /// too, so `%u003cscript%u003e` reaches such an application as `<script>`.
-/// The standard `%XX` decoder leaves it untouched (`%u0` is not a valid
-/// octet), so without this the payload never reaches a rule.
-fn has_percent_u_escape(text: &str) -> bool {
-    text.as_bytes().windows(6).any(is_percent_u_escape)
-}
-
-fn is_percent_u_escape(bytes: &[u8]) -> bool {
-    matches!(bytes, [b'%', b'u' | b'U', a, b, c, d, ..]
-        if [a, b, c, d].iter().all(|digit| digit.is_ascii_hexdigit()))
-}
-
-/// Single-pass decode of `%XX` octets and `%uXXXX` code units, matching the
-/// one-pass behavior of the decoders that honor `%u`: a `%u0025` yields a
-/// literal `%` that is not decoded again within the same round (the layered
-/// decode's next round handles deliberate stacking). Octets are collected as
-/// bytes and read as lossy UTF-8, exactly like the `%XX`-only path; a lone
-/// surrogate code unit becomes `U+FFFD`.
-fn percent_decode_with_u_escapes(text: &str) -> String {
+///
+/// One pass matches the form decoders this models: only a literal `+` is a
+/// space, so `%2B` and `%u002B` decode to `+`, and a `%u0025` yields a literal
+/// `%` that is not decoded again within the same round (the layered decode's
+/// next round handles deliberate stacking). A lone surrogate code unit becomes
+/// `U+FFFD`. Text with nothing to decode is returned without copying.
+fn percent_decode_plus(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
+    let Some(first) = bytes.iter().position(|&byte| matches!(byte, b'%' | b'+')) else {
+        return Cow::Borrowed(text);
+    };
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&bytes[..first]);
+    let mut changed = false;
+    let mut i = first;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest[0] == b'+' {
+            out.push(b' ');
+            changed = true;
+            i += 1;
+        } else if let Some(unit) = percent_u_unit(rest) {
+            let ch = char::from_u32(unit).unwrap_or(char::REPLACEMENT_CHARACTER);
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            changed = true;
+            i += 6;
+        } else if let Some(octet) = percent_octet(rest) {
+            out.push(octet);
+            changed = true;
+            i += 3;
+        } else {
+            out.push(rest[0]);
+            i += 1;
+        }
+    }
+    if !changed {
+        return Cow::Borrowed(text);
+    }
+    let decoded = match String::from_utf8(out) {
+        Ok(decoded) => decoded,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    };
+    Cow::Owned(decoded)
+}
+
+/// The code unit of a well-formed `%uXXXX` escape at the start of `bytes`.
+fn percent_u_unit(bytes: &[u8]) -> Option<u32> {
+    match bytes {
+        [b'%', b'u' | b'U', digits @ ..] => hex_n(digits.get(..4)?),
+        _ => None,
+    }
+}
+
+/// The octet of a well-formed `%XX` escape at the start of `bytes`.
+fn percent_octet(bytes: &[u8]) -> Option<u8> {
+    match bytes {
+        [b'%', digits @ ..] => hex2(digits.get(..2)?),
+        _ => None,
+    }
+}
+
+/// Whether one more decode round would still peel a percent, `\u` / `\x`,
+/// or HTML-entity layer from `text`. This is the residual probe applied after
+/// the last permitted round of [`layered_decode_inner`].
+///
+/// Two kinds of change are deliberately not counted: `+` → space, and the
+/// JSON / JavaScript single-character escapes (`\n`, `\"`, `\\`, …). A run
+/// of backslashes halves on every round, so ordinary multiply-stringified
+/// JSON, doubly escaped UNC paths, and regex or LaTeX source would otherwise
+/// still be "decoding" at the cap without hiding anything the other decoders
+/// would reveal. A `\\` pair is still consumed as one token, exactly as
+/// [`string_unescape`] reads it, so `\\u003c` is literal text here too.
+fn has_pending_decode(text: &str) -> bool {
+    let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if is_percent_u_escape(&bytes[i..]) {
-                // Four validated hex digits always fit a `u16`.
-                let unit = hex_n(&bytes[i + 2..i + 6]).unwrap_or(0xFFFD);
-                let ch = char::from_u32(unit).unwrap_or(char::REPLACEMENT_CHARACTER);
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                i += 6;
-                continue;
+        let rest = &bytes[i..];
+        match rest[0] {
+            b'%' if percent_u_unit(rest).is_some() || percent_octet(rest).is_some() => {
+                return true;
             }
-            if let Some(octet) = bytes.get(i + 1..i + 3).and_then(hex2) {
-                out.push(octet);
-                i += 3;
-                continue;
+            b'\\' => {
+                if let Some((_, consumed)) = decode_escape(&rest[1..]) {
+                    if !rest.get(1).copied().is_some_and(is_single_char_escape) {
+                        return true;
+                    }
+                    i += consumed;
+                }
             }
+            _ => {}
         }
-        out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    html_entity_decode(text).as_ref() != text
+}
+
+fn is_single_char_escape(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'n' | b't' | b'r' | b'f' | b'b' | b'v' | b'/' | b'"' | b'\'' | b'\\'
+    )
+}
+
+/// Which backslash escapes [`string_unescape`] resolves.
+#[derive(Clone, Copy)]
+enum StringEscapes {
+    /// Raw request or response text: every JSON / JavaScript escape.
+    All,
+    /// A value a JSON parser already unescaped: only the code-point escapes
+    /// (`\uXXXX`, `\u{...}`, `\xXX`) that model a second, application-level
+    /// decode. The single-character escapes were resolved once already.
+    CodePointsOnly,
+}
+
+impl StringEscapes {
+    fn decode(self, after: &[u8]) -> Option<(u32, usize)> {
+        let escape = decode_escape(after)?;
+        let single_char = after.first().copied().is_some_and(is_single_char_escape);
+        match self {
+            Self::CodePointsOnly if single_char => None,
+            Self::All | Self::CodePointsOnly => Some(escape),
+        }
+    }
 }
 
 /// Decode JSON/JavaScript string escapes: `\uXXXX` (with surrogate pairs),
 /// `\u{XXXX}`, `\xXX`, and the single-character escapes (`\n`, `\t`, `\r`,
 /// `\f`, `\b`, `\v`, `\/`, `\"`, `\'`, `\\`). Unrecognized escapes keep
-/// their literal backslash.
+/// their literal backslash. `escapes` narrows the set for text a JSON parser
+/// already unescaped once (see [`StringEscapes`]).
 ///
 /// The single-character escapes are not cosmetic. A JSON or JavaScript parser
 /// resolves them before the application sees the value, so
@@ -711,7 +815,7 @@ fn percent_decode_with_u_escapes(text: &str) -> String {
 /// `\"1\"=\"1` as `"1"="1`, and `file:\/\/\/etc\/passwd` as
 /// `file:///etc/passwd` — while the raw bytes carry a backslash where every
 /// signature expects whitespace, a quote, or a slash.
-fn unicode_unescape(text: &str) -> Cow<'_, str> {
+fn string_unescape(text: &str, escapes: StringEscapes) -> Cow<'_, str> {
     let bytes = text.as_bytes();
     if !bytes.contains(&b'\\') {
         return Cow::Borrowed(text);
@@ -720,7 +824,7 @@ fn unicode_unescape(text: &str) -> Cow<'_, str> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'\\' {
-            if let Some((cp, consumed)) = decode_escape(&bytes[i + 1..]) {
+            if let Some((cp, consumed)) = escapes.decode(&bytes[i + 1..]) {
                 push_cp(&mut out, cp);
                 i += 1 + consumed;
                 continue;
@@ -970,6 +1074,10 @@ fn dec_n(bytes: &[u8]) -> Option<u32> {
 mod tests {
     use super::*;
 
+    fn unicode_unescape(text: &str) -> Cow<'_, str> {
+        string_unescape(text, StringEscapes::All)
+    }
+
     #[test]
     fn unicode_unescape_decodes_json_payload() {
         assert_eq!(unicode_unescape(r"<script>"), "<script>");
@@ -1095,8 +1203,8 @@ mod tests {
         // The decoded value a caller scans: a within-cap stack reduces fully,
         // and a beyond-cap stack reduces by exactly MAX_DECODE_ROUNDS layers
         // (leaving residual encoding the caller flags as evasion).
-        assert_eq!(layered_decode_inner("%25253Cx").0, "<x");
-        assert_eq!(layered_decode_inner("%2525253Cx").0, "%3Cx");
+        assert_eq!(layered_decode_inner("%25253Cx", StringEscapes::All).0, "<x");
+        assert_eq!(layered_decode_inner("%2525253Cx", StringEscapes::All).0, "%3Cx");
     }
 
     #[test]
