@@ -6,7 +6,7 @@
 
 use ferrum_edge::proxy::proxy_protocol::{
     AcceptedProxyVersions, ProxyProtocolError, ProxyProtocolResult, apply_proxy_result,
-    read_proxy_header, read_proxy_header_accepting, read_proxy_header_accepting_tcp,
+    read_proxy_header, read_proxy_header_accepting, read_proxy_header_accepting_tcp, v1_line_end,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -737,6 +737,77 @@ async fn tcp_v1_stalled_partial_header_times_out() {
     assert!(matches!(err, ProxyProtocolError::Timeout), "{err:?}");
     assert!(started.elapsed() >= Duration::from_millis(900));
     drop(client);
+}
+
+#[tokio::test]
+async fn tcp_v1_deadline_is_total_across_peek_rounds() {
+    let (mut client, mut server) = tcp_pair().await;
+    // Every byte arrives well inside the deadline of the previous one, so only
+    // a deadline spanning the whole header (not one per peek) can fire.
+    let writer = tokio::spawn(async move {
+        client.write_all(b"PROXY TCP4 ").await.unwrap();
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if client.write_all(b"1").await.is_err() {
+                break;
+            }
+        }
+        client
+    });
+
+    let started = std::time::Instant::now();
+    let err = read_proxy_header_accepting_tcp(&mut server, Some(1), AcceptedProxyVersions::Any)
+        .await
+        .expect_err("a trickled header must hit the total deadline");
+    let elapsed = started.elapsed();
+    assert!(matches!(err, ProxyProtocolError::Timeout), "{err:?}");
+    assert!(elapsed >= Duration::from_millis(900), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(2500), "{elapsed:?}");
+    drop(server);
+    writer.abort();
+}
+
+#[test]
+fn v1_line_end_pairs_a_consumed_cr_with_a_new_lf() {
+    // Round one consumed through the CR; round two peeked only the LF.
+    let line = b"PROXY UNKNOWN\r\n";
+    assert_eq!(v1_line_end(line, 14, 15), Some(15));
+}
+
+#[test]
+fn v1_line_end_finds_crlf_entirely_in_new_bytes() {
+    let line = b"PROXY UNKNOWN\r\nGET / HTTP/1.1";
+    assert_eq!(v1_line_end(line, 6, 15), Some(15));
+    // Bytes after the terminator are never included in the line end.
+    assert_eq!(v1_line_end(line, 6, line.len()), Some(15));
+    assert_eq!(v1_line_end(line, 13, line.len()), Some(15));
+}
+
+#[test]
+fn v1_line_end_ignores_a_lone_cr() {
+    assert_eq!(v1_line_end(b"PROXY A\rB\r", 6, 10), None);
+    assert_eq!(v1_line_end(b"PROXY A\rB", 6, 9), None);
+    // A CR consumed earlier followed by a non-LF new byte is not a terminator.
+    assert_eq!(v1_line_end(b"PROXY A\rB", 8, 9), None);
+}
+
+#[test]
+fn v1_line_end_never_rematches_a_crlf_in_consumed_bytes() {
+    // The CRLF at 7..9 lies entirely in the consumed prefix.
+    let stale = b"PROXY A\r\nBC";
+    assert_eq!(v1_line_end(stale, 9, 11), None);
+    let later = b"PROXY A\r\nBC\r\n";
+    assert_eq!(v1_line_end(later, 9, 13), Some(13));
+}
+
+#[test]
+fn v1_line_end_without_new_bytes_is_none() {
+    let line = b"PROXY UNKNOWN\r\n";
+    assert_eq!(v1_line_end(line, 15, 15), None);
+    assert_eq!(v1_line_end(line, 14, 14), None);
+    assert_eq!(v1_line_end(line, 10, 4), None);
+    // `available` past the buffer is clamped rather than panicking.
+    assert_eq!(v1_line_end(line, 6, 500), Some(15));
 }
 
 #[tokio::test]

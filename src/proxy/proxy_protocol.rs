@@ -331,15 +331,8 @@ async fn parse_v1_peek(
             )));
         }
         let available = filled + peeked;
-        // A CR consumed in an earlier round may pair with an LF peeked now.
-        let search_from = filled - 1;
-        let terminator = line[search_from..available]
-            .windows(2)
-            .position(|pair| pair == b"\r\n");
-        let end = match terminator {
-            Some(offset) => search_from + offset + 2,
-            None => available,
-        };
+        let terminator = v1_line_end(&line, filled, available);
+        let end = terminator.unwrap_or(available);
         stream.read_exact(&mut line[filled..end]).await?;
         filled = end;
         if terminator.is_some() {
@@ -348,6 +341,26 @@ async fn parse_v1_peek(
     }
     // `line[..filled]` now contains "PROXY ...\r\n". Strip trailing CRLF.
     parse_v1_bytes(&line[..filled - 2])
+}
+
+/// Locate the end of a PROXY v1 line during an incremental peek read.
+///
+/// `line[..filled]` holds bytes already consumed from the socket (always the
+/// 6-byte `PROXY ` prefix at least, none of them ending the line) and
+/// `line[filled..available]` holds newly peeked bytes. Returns the index just
+/// past the first CRLF that ends inside the new bytes, so a CR consumed in an
+/// earlier round pairs with an LF peeked now, while a CRLF lying entirely in
+/// consumed bytes is never matched again. `None` means no terminator yet.
+pub fn v1_line_end(line: &[u8], filled: usize, available: usize) -> Option<usize> {
+    let available = available.min(line.len());
+    let search_from = filled.saturating_sub(1);
+    if available < search_from + 2 {
+        return None;
+    }
+    line[search_from..available]
+        .windows(2)
+        .position(|pair| pair == b"\r\n")
+        .map(|offset| search_from + offset + 2)
 }
 
 fn parse_v1_bytes(line: &[u8]) -> Result<ProxyProtocolResult, ProxyProtocolError> {

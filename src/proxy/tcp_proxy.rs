@@ -2667,10 +2667,12 @@ async fn run_tcp_accept_loop(
                             return; // close connection immediately
                         }
                         // Parse the PROXY header from the raw TcpStream. The header precedes
-                        // the TLS ClientHello so we read it before any TLS handshake.
-                        match crate::proxy::proxy_protocol::read_proxy_header(
+                        // the TLS ClientHello so we read it before any TLS handshake. The
+                        // TcpStream reader peeks the v1 line and consumes exactly the header.
+                        match crate::proxy::proxy_protocol::read_proxy_header_accepting_tcp(
                             &mut stream,
                             None, // use default 5s safety timeout
+                            crate::proxy::proxy_protocol::AcceptedProxyVersions::Any,
                         )
                         .await
                         {
